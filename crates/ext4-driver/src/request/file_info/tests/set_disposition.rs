@@ -20,6 +20,15 @@ fn extended_disposition_decodes_non_posix_and_on_close_semantics() {
     );
     assert_eq!(
         super::decode_extended_disposition(
+            wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK
+        ),
+        Ok(super::FileDispositionRequest::delete(
+            super::FileDispositionTarget::Mutable,
+            super::DeleteReadonlyRequest::Enforce
+        ))
+    );
+    assert_eq!(
+        super::decode_extended_disposition(
             wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
         ),
         Ok(super::FileDispositionRequest::delete(
@@ -72,7 +81,6 @@ fn extended_disposition_decodes_non_posix_and_on_close_semantics() {
     );
     for unsupported in [
         wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS,
-        wdk_sys::FILE_DISPOSITION_DELETE | wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK,
         wdk_sys::FILE_DISPOSITION_DELETE
             | wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS
             | wdk_sys::FILE_DISPOSITION_ON_CLOSE,

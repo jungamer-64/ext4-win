@@ -29,6 +29,8 @@ enum SetFilePlan {
     },
     /// Validate and publish one identity-bound delete-pending target.
     Disposition {
+        /// Stable FCB whose shared deletion state is selected.
+        fcb: NonNull<FileControlBlock>,
         /// Target ext4 inode identity.
         node: NodeId,
         /// Prepared exact parent/name identity.
@@ -77,6 +79,13 @@ mod set_path_tests;
 pub(crate) enum SetFileResolution {
     /// No ext4 mutation was staged; all requested control-plane work is complete.
     Complete(IrpCompletion),
+    /// A regular-file disposition must flush image/data sections outside the actor.
+    PrepareDeletion {
+        /// Stable FCB whose stream gate must be acquired.
+        fcb: NonNull<FileControlBlock>,
+        /// Exact regular-file inode bound to that FCB.
+        node: NodeId,
+    },
     /// Ext4 mutation requires commit and the driver publication is fully prepared.
     Mutation(SetFilePublication),
 }
@@ -95,6 +104,62 @@ pub(crate) enum SetFilePublication {
         /// Fully allocated notification sequence.
         notifications: Box<RenameDirectoryNameChanges>,
     },
+}
+
+/// Fully allocated regular-file disposition retained while Cc/MM runs outside the actor.
+#[derive(Debug)]
+pub(crate) struct PendingDispositionDeletion {
+    /// Stable FCB whose shared deletion state will be published.
+    fcb: NonNull<FileControlBlock>,
+    /// Target ext4 inode identity.
+    node: NodeId,
+    /// Prepared exact parent/name identity allocated before Cc/MM.
+    pending: PendingFileDeletion,
+    /// Whether publication creates ordinary state or reaffirms create-time delete-on-close.
+    publication: DeletePendingPublication,
+    /// Read-only validation policy retained across the external preflight.
+    readonly: DeleteReadonlyPolicy,
+}
+
+impl PendingDispositionDeletion {
+    /// Returns the exact native stream gate target.
+    pub(crate) const fn stream_target(&self) -> (NonNull<FileControlBlock>, NodeId) {
+        (self.fcb, self.node)
+    }
+
+    /// Verifies that the still-live request retains the same FILE_OBJECT/FCB/node identity.
+    /// # Errors
+    ///
+    /// Returns an invariant error if a suspended operation no longer describes the captured
+    /// disposition authority.
+    fn validate_request(&self, request: &mut PendingIrpLease<'_>) -> DriverResult<()> {
+        request.with_active(|active| {
+            let current = active.current_stack()?;
+            let file_object = current.file_object()?;
+            let stack = current.set_file()?;
+            if !matches!(
+                stack.information_class(),
+                SetFileInformationClass::Disposition | SetFileInformationClass::DispositionEx
+            ) {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            let opened = OpenedObject::decode(file_object)?;
+            if opened.file_control_block_address() != self.fcb || opened.node() != self.node {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            opened.require_delete_access()
+        })
+    }
+
+    /// Publishes the already validated deletion state without allocation or ordinary failure.
+    fn publish(self, operations: &mut MountedVolumeAccess<'_>) {
+        match self.publication {
+            DeletePendingPublication::Publish => {
+                operations.set_file_delete_pending(self.fcb, self.pending);
+            }
+            DeletePendingPublication::AlreadyPublishedByCreate => drop(self.pending),
+        }
+    }
 }
 
 impl SetFilePublication {
@@ -123,7 +188,27 @@ pub(super) fn set_file_information(
     mut request: PendingIrpLease<'_>,
     operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    pending_disposition: &mut Option<PendingDispositionDeletion>,
+    prepared_deletion: Option<&PreparedStreamDeletion>,
 ) -> DriverResult<SetFileResolution> {
+    if let Some(pending) = pending_disposition.as_ref() {
+        pending.validate_request(&mut request)?;
+        let (fcb, node) = pending.stream_target();
+        if !prepared_deletion.is_some_and(|prepared| prepared.authorizes(fcb, node)) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        validate_pending_deletion(
+            mutation,
+            node,
+            pending.pending.target_ref(),
+            pending.readonly,
+        )?;
+        let Some(pending) = pending_disposition.take() else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        pending.publish(operations);
+        return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
+    }
     let plan = request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
@@ -213,18 +298,25 @@ pub(super) fn set_file_information(
             }
         }
         SetFilePlan::Disposition {
+            fcb,
             node,
             pending,
             publication,
             readonly,
         } => {
             validate_pending_deletion(mutation, node, pending.target_ref(), readonly)?;
-            match publication {
-                DeletePendingPublication::Publish { fcb } => {
-                    operations.set_file_delete_pending(fcb, pending);
-                }
-                DeletePendingPublication::AlreadyPublishedByCreate => drop(pending),
+            let pending = PendingDispositionDeletion {
+                fcb,
+                node,
+                pending,
+                publication,
+                readonly,
+            };
+            if matches!(node, NodeId::File(_)) {
+                *pending_disposition = Some(pending);
+                return Ok(SetFileResolution::PrepareDeletion { fcb, node });
             }
+            pending.publish(operations);
             return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
         }
         SetFilePlan::Link { mutation: request } => {
@@ -396,12 +488,10 @@ impl FileDispositionTarget {
 }
 
 /// Post-validation mutation selected without optional FCB authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DeletePendingPublication {
     /// Publish a new cancellable disposition state to this exact FCB.
-    Publish {
-        /// Stable FCB whose shared deletion state is mutated.
-        fcb: NonNull<FileControlBlock>,
-    },
+    Publish,
     /// Create already published the mandatory delete-on-close state.
     AlreadyPublishedByCreate,
 }
@@ -495,9 +585,7 @@ fn disposition_plan(
             let (pending, publication) = match request.target {
                 FileDispositionTarget::Mutable => (
                     opened.prepare_pending_deletion()?,
-                    DeletePendingPublication::Publish {
-                        fcb: opened.file_control_block_address(),
-                    },
+                    DeletePendingPublication::Publish,
                 ),
                 FileDispositionTarget::CreateDeleteOnClose => (
                     PendingFileDeletion::try_from_delete_on_close(opened.location())?,
@@ -505,6 +593,7 @@ fn disposition_plan(
                 ),
             };
             Ok(SetFilePlan::Disposition {
+                fcb: opened.file_control_block_address(),
                 node: opened.node(),
                 pending,
                 publication,
@@ -517,8 +606,9 @@ fn disposition_plan(
 /// Decodes the supported non-POSIX subset of `FILE_DISPOSITION_INFORMATION_EX`.
 /// # Errors
 ///
-/// Returns not-supported when a delete requests POSIX or image-section semantics, when ON_CLOSE
-/// requests POSIX mode, or when unknown flags are present.
+/// Returns not-supported when a delete or ON_CLOSE update requests POSIX semantics, or when unknown
+/// flags are present. The force-image flag is accepted because every supported non-POSIX delete
+/// executes the image/data-section preflight.
 fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispositionRequest> {
     const KNOWN_FLAGS: wdk_sys::ULONG = wdk_sys::FILE_DISPOSITION_DELETE
         | wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS
@@ -530,10 +620,9 @@ fn decode_extended_disposition(flags: wdk_sys::ULONG) -> DriverResult<FileDispos
     }
     let delete = flags & wdk_sys::FILE_DISPOSITION_DELETE != 0;
     let posix = flags & wdk_sys::FILE_DISPOSITION_POSIX_SEMANTICS != 0;
-    let force_image_check = flags & wdk_sys::FILE_DISPOSITION_FORCE_IMAGE_SECTION_CHECK != 0;
     let on_close = flags & wdk_sys::FILE_DISPOSITION_ON_CLOSE != 0;
     let ignore_readonly = flags & wdk_sys::FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE != 0;
-    if (delete && (posix || force_image_check)) || (on_close && posix) {
+    if (delete && posix) || (on_close && posix) {
         return Err(DriverError::NotSupported);
     }
     let target = if on_close {
