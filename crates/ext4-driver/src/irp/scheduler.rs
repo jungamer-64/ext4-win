@@ -195,6 +195,8 @@ pub(crate) enum Phase {
     Registering,
     /// A completion envelope owns the lower lifetime.
     Lower,
+    /// A non-cancellable PASSIVE_LEVEL cache work envelope owns the operation.
+    Cache,
 }
 
 /// Resource ownership retained after an intent grant.
@@ -552,7 +554,7 @@ impl Scheduler {
             Phase::Lower => CancelDisposition::CancelLower,
             Phase::Retry => CancelDisposition::AwaitRetry,
             Phase::Registering | Phase::Actor => CancelDisposition::AwaitRegistration,
-            Phase::Vacant => CancelDisposition::Ignored,
+            Phase::Cache | Phase::Vacant => CancelDisposition::Ignored,
         }
     }
 
@@ -1038,6 +1040,7 @@ mod tests {
             (Phase::Retry, CancelDisposition::AwaitRetry),
             (Phase::Registering, CancelDisposition::AwaitRegistration),
             (Phase::Lower, CancelDisposition::CancelLower),
+            (Phase::Cache, CancelDisposition::Ignored),
         ] {
             let slot = require_some!(scheduler.reserve());
             assert!(scheduler.set_phase(slot, phase));

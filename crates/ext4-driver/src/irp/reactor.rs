@@ -24,6 +24,8 @@ use crate::state::{KernelDevice, KernelFileObject, MountedVolumeAccess, MountedV
 #[cfg(not(test))]
 use super::ActiveCancelDestination;
 #[cfg(not(test))]
+use super::cache::CacheWorkEnvelope;
+#[cfg(not(test))]
 use super::lower::{LowerCompletionEnvelope, LowerCompletionRoute, PublishedLowerRequest};
 #[cfg(not(test))]
 use super::scheduler::{
@@ -763,6 +765,8 @@ pub(crate) struct CompletionReactor {
     completion_head: UnsafeCell<LIST_ENTRY>,
     /// Completed mount length-query envelopes kept type-separated from storage commands.
     length_completion_head: UnsafeCell<LIST_ENTRY>,
+    /// Completed Cache Manager work envelopes kept type-separated from lower I/O.
+    cache_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Pending plus active operation count, bounded by `MAX_OPERATIONS`.
     admitted: AtomicUsize,
     /// Auto-reset event signaled only when a concrete event is published.
@@ -854,6 +858,7 @@ impl CompletionReactor {
                     pending_head: UnsafeCell::new(LIST_ENTRY::default()),
                     completion_head: UnsafeCell::new(LIST_ENTRY::default()),
                     length_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
+                    cache_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
                     admitted: AtomicUsize::new(0),
                     wake_event: wdk_sys::KEVENT::default(),
                     retry_ready: AtomicU64::new(0),
@@ -884,6 +889,10 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
             initialize_list_head(reactor.length_completion_head.get());
+        }
+        unsafe {
+            // SAFETY: This is an exclusive, final-address list head before reactor publication.
+            initialize_list_head(reactor.cache_completion_head.get());
         }
         #[cfg(not(test))]
         for timer in &reactor.retry_timers {
@@ -1548,11 +1557,16 @@ impl CompletionReactor {
             // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
             list_is_empty(reactor.length_completion_head.get())
         };
+        let cache_completion_list_empty = unsafe {
+            // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
+            list_is_empty(reactor.cache_completion_head.get())
+        };
         if reactor.state() != ReactorState::Stopped
             || reactor.admitted.load(Ordering::Acquire) != 0
             || reactor.has_active()
             || !completion_list_empty
             || !length_completion_list_empty
+            || !cache_completion_list_empty
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -1658,6 +1672,7 @@ impl CompletionReactor {
             }
             progressed |= self.drain_storage_completions();
             progressed |= self.drain_length_completions();
+            progressed |= self.drain_cache_completions();
             progressed |= self.drain_active_cancels();
             progressed |= self.drain_retry_events();
             progressed |= self.admit_pending_requests();
@@ -1670,11 +1685,16 @@ impl CompletionReactor {
                 // SAFETY: The sole reactor actor observes this initialized inbox list.
                 list_is_empty(self.length_completion_head.get())
             };
+            let cache_completion_list_empty = unsafe {
+                // SAFETY: The sole reactor actor observes this initialized inbox list.
+                list_is_empty(self.cache_completion_head.get())
+            };
             if self.state() == ReactorState::Draining
                 && self.admitted.load(Ordering::Acquire) == 0
                 && !self.has_active()
                 && completion_list_empty
                 && length_completion_list_empty
+                && cache_completion_list_empty
             {
                 self.lifecycle
                     .store(ReactorState::Stopped.as_raw(), Ordering::Release);
@@ -2098,6 +2118,70 @@ impl CompletionReactor {
         }
     }
 
+    /// Allocates and queues one PASSIVE_LEVEL Cache Manager call outside actor ownership.
+    #[cfg(not(test))]
+    fn submit_cache_work(
+        &self,
+        index: usize,
+        work: crate::irp::CacheWork,
+        suspended: SuspendedOperation,
+    ) {
+        let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let rundown = match self.completion_rundown.acquire() {
+            Ok(Some(rundown)) => rundown,
+            Ok(None) => {
+                self.set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::CacheCompleted(work.failed(DriverError::InvalidDeviceRequest)),
+                );
+                return;
+            }
+            Err(error) => {
+                self.set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::CacheCompleted(work.failed(error)),
+                );
+                return;
+            }
+        };
+        let prepared = match CacheWorkEnvelope::try_new(
+            self.device,
+            NonNull::from(self),
+            identity,
+            work,
+            suspended,
+            rundown,
+        ) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let (error, work, suspended) = failure.into_parts();
+                self.set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::CacheCompleted(work.failed(error)),
+                );
+                return;
+            }
+        };
+        if self.consume_cancellation_before_effect(index) {
+            let (_work, suspended) = CacheWorkEnvelope::cancel_before_queue(prepared);
+            self.set_ready_operation_event(
+                index,
+                suspended,
+                CompletionEvent::Core(OperationEvent::CancelRequested),
+            );
+            return;
+        }
+        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Cache)) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        CacheWorkEnvelope::queue(prepared);
+    }
+
     /// Builds, registers, and submits one lower storage command with ownership-preserving errors.
     #[cfg(not(test))]
     fn submit_storage(
@@ -2480,6 +2564,102 @@ impl CompletionReactor {
                     self.set_ready_length_failure(index, suspended, error);
                 }
             }
+        }
+        progressed
+    }
+
+    /// Links one completed Cache Manager work envelope into its type-separated inbox.
+    /// # Safety
+    ///
+    /// `envelope` must be uniquely worker-owned, unlinked, nonpaged, and protected by this
+    /// reactor's completion rundown lease.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the work callback transfers one completed intrusive envelope under the reactor lock"
+    )]
+    pub(super) unsafe fn enqueue_cache_completion(&self, envelope: NonNull<CacheWorkEnvelope>) {
+        let old_irql = unsafe {
+            // SAFETY: Stable reactor lock serializes work callbacks and inbox removal.
+            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+        };
+        let node = unsafe {
+            // SAFETY: Completion owns this live envelope until its node is linked below.
+            envelope.as_ref().node_ptr()
+        };
+        unsafe {
+            // SAFETY: The reactor lock is held and `node` is live and unlinked.
+            insert_tail_list(self.cache_completion_head.get(), node);
+        }
+        unsafe {
+            // SAFETY: Releases the exact acquisition above.
+            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+        }
+        self.wake();
+    }
+
+    /// Removes one completed cache work envelope, if present.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the reactor lock protects the typed cache-completion intrusive list"
+    )]
+    fn pop_cache_completion(&self) -> Option<NonNull<CacheWorkEnvelope>> {
+        let old_irql = unsafe {
+            // SAFETY: Stable reactor lock serializes cache-completion list access.
+            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+        };
+        let node = unsafe {
+            // SAFETY: The reactor lock is held for this initialized completion list.
+            remove_head_list(self.cache_completion_head.get())
+        };
+        unsafe {
+            // SAFETY: Releases the exact acquisition above.
+            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+        }
+        node.map(|node| unsafe {
+            // SAFETY: The cache envelope's node is its first field.
+            CacheWorkEnvelope::from_node(node)
+        })
+    }
+
+    /// Reclaims and routes every completed Cache Manager work item.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "inbox removal grants unique ownership of the completed cache envelope"
+    )]
+    fn drain_cache_completions(&self) -> bool {
+        let mut progressed = false;
+        while let Some(envelope) = self.pop_cache_completion() {
+            progressed = true;
+            let identity = unsafe {
+                // SAFETY: Inbox ownership retains the complete envelope through this observation.
+                envelope.as_ref().identity()
+            };
+            let index = identity.index();
+            let entered = self.with_scheduler(|scheduler| {
+                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Cache))
+            });
+            if entered != Some(identity)
+                || !self.with_payloads(|payloads| {
+                    payloads
+                        .get(index)
+                        .is_some_and(|slot| matches!(slot.payload, SlotPayload::Empty))
+                })
+            {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            let envelope = unsafe {
+                // SAFETY: Inbox removal and exact slot-generation validation grant unique ownership.
+                Box::from_raw(envelope.as_ptr())
+            };
+            let (suspended, completion) = CacheWorkEnvelope::reclaim(envelope);
+            self.set_ready_operation_event(
+                index,
+                suspended,
+                CompletionEvent::CacheCompleted(completion),
+            );
         }
         progressed
     }
@@ -3376,6 +3556,29 @@ mod tests {
                 suspended,
             } => {
                 drop(request);
+                drop(suspended);
+            }
+            OperationTransition::SubmitCacheWork { work, suspended } => {
+                let _failed_boundary: fn(
+                    crate::irp::CacheWork,
+                    DriverError,
+                ) -> crate::irp::CacheWorkCompletion = crate::irp::CacheWork::failed;
+                let completion = work.execute();
+                let event = CompletionEvent::CacheCompleted(completion);
+                let CompletionEvent::CacheCompleted(completion) = event else {
+                    return;
+                };
+                match completion {
+                    crate::irp::CacheWorkCompletion::Read(result) => {
+                        let _result = result;
+                    }
+                    crate::irp::CacheWorkCompletion::Write(result)
+                    | crate::irp::CacheWorkCompletion::Flush(result)
+                    | crate::irp::CacheWorkCompletion::Purge(result)
+                    | crate::irp::CacheWorkCompletion::Uninitialize(result) => {
+                        let _result = result;
+                    }
+                }
                 drop(suspended);
             }
             OperationTransition::SubmitClosingLower {

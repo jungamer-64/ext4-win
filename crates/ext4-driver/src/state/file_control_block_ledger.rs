@@ -19,6 +19,15 @@ struct DeferredStreamLease {
     fcb: NonNull<FileControlBlock>,
 }
 
+/// Node-kind constraint established before a deferred stream lease can inspect native sections.
+#[derive(Clone, Copy, Debug)]
+enum DeferredStreamTarget {
+    /// Paging I/O is valid only for a regular-file stream.
+    RegularFile,
+    /// Cache-map lifetime applies to any namespace-node FILE_OBJECT.
+    Node,
+}
+
 /// One explicit FCB retention authority used while durable metadata is published outside the
 /// ledger resource.
 #[derive(Debug)]
@@ -36,6 +45,15 @@ pub(crate) struct PagingStreamLease {
     file_object: KernelFileObject,
     /// Typed inode identity fixed while the ledger resource was held.
     file: FileNodeId,
+}
+
+/// One stream retained while a PASSIVE_LEVEL cache worker calls Cc/MM outside the actor.
+#[derive(Debug)]
+pub(crate) struct CacheStreamLease {
+    /// Sole retention authority for this cache work item.
+    retained: DeferredStreamLease,
+    /// FILE_OBJECT whose private cache map participates in the operation.
+    file_object: KernelFileObject,
 }
 
 #[expect(
@@ -94,11 +112,95 @@ impl PagingStreamLease {
 
 #[expect(
     unsafe_code,
+    reason = "the deferred ledger lease retains the exact FCB pointer for every worker call"
+)]
+impl CacheStreamLease {
+    /// Returns the retained stream after the ledger has released its lifetime resource.
+    fn stream(&self) -> &FileControlBlock {
+        unsafe {
+            // SAFETY: `retained` keeps this exact table entry alive through the worker call.
+            self.retained.fcb.as_ref()
+        }
+    }
+
+    /// Reads cached bytes into the pre-captured system mapping.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager or representation failure.
+    pub(crate) fn read(
+        &self,
+        offset: i64,
+        length: usize,
+        output: Option<NonNull<u8>>,
+    ) -> DriverResult<usize> {
+        self.stream().stream_context.cached_read(
+            self.file_object.as_non_null(),
+            offset,
+            length,
+            output,
+        )
+    }
+
+    /// Accepts a within-EOF write from the pre-captured system mapping.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager or representation failure.
+    pub(crate) fn write(
+        &self,
+        offset: i64,
+        input: Option<NonNull<u8>>,
+        length: usize,
+    ) -> DriverResult<()> {
+        self.stream().stream_context.cached_write(
+            self.file_object.as_non_null(),
+            offset,
+            input,
+            length,
+        )
+    }
+
+    /// Flushes every dirty page in the shared stream cache.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager flush status.
+    pub(crate) fn flush(&self) -> DriverResult<()> {
+        self.stream().stream_context.flush_cache()
+    }
+
+    /// Flushes and purges the shared cache before direct or size-changing I/O.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager coherency status.
+    pub(crate) fn purge(&self) -> DriverResult<()> {
+        self.stream().stream_context.coherency_flush_and_purge()
+    }
+
+    /// Releases this FILE_OBJECT's private cache map.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager exception status.
+    pub(crate) fn uninitialize(&self) -> DriverResult<()> {
+        self.stream()
+            .stream_context
+            .uninitialize_cache_map(self.file_object.as_non_null())
+    }
+}
+
+#[expect(
+    unsafe_code,
     reason = "the ledger and top-level paging IRP retain every raw identity until operation drop"
 )]
 // SAFETY: The ledger-owned deferred count retains the FCB and VCB. The FILE_OBJECT is used only
 // for identity comparison while the top-level paging IRP remains owned by the same operation.
 unsafe impl Send for PagingStreamLease {}
+
+#[expect(
+    unsafe_code,
+    reason = "the work envelope and deferred lease retain every raw cache identity until completion"
+)]
+// SAFETY: The worker owns this lease exclusively. Its operation-owned IRP retains FILE_OBJECT and
+// buffer mappings, while the ledger count retains the FCB and VCB until the envelope is reclaimed.
+unsafe impl Send for CacheStreamLease {}
 
 #[expect(
     unsafe_code,
@@ -715,15 +817,57 @@ impl FileControlBlockLedger {
     ///
     /// Returns an object, ownership, stream-kind, or deferred-lease failure without publishing a
     /// partial lease.
-    #[expect(
-        unsafe_code,
-        reason = "the active FILE_OBJECT and ledger resource retain every decoded native identity"
-    )]
     pub(super) fn acquire_paging_stream_lease(
         &self,
         file_object: ActiveFileObject<'_>,
         volume: NonNull<VolumeControlBlock>,
     ) -> DriverResult<PagingStreamLease> {
+        let (retained, node) = self.acquire_deferred_stream_lease(
+            file_object,
+            volume,
+            DeferredStreamTarget::RegularFile,
+        )?;
+        let NodeId::File(file) = node else {
+            return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
+        };
+        Ok(PagingStreamLease {
+            _retained: retained,
+            file_object: file_object.address(),
+            file,
+        })
+    }
+
+    /// Acquires one stream lease for a PASSIVE_LEVEL cache worker without retaining ledger locks.
+    /// # Errors
+    ///
+    /// Returns an object, ownership, section-identity, or deferred-lease failure.
+    pub(super) fn acquire_cache_stream_lease(
+        &self,
+        file_object: ActiveFileObject<'_>,
+        volume: NonNull<VolumeControlBlock>,
+    ) -> DriverResult<CacheStreamLease> {
+        let (retained, _node) =
+            self.acquire_deferred_stream_lease(file_object, volume, DeferredStreamTarget::Node)?;
+        Ok(CacheStreamLease {
+            retained,
+            file_object: file_object.address(),
+        })
+    }
+
+    /// Validates one shared FILE_OBJECT stream identity and grants its deferred lifetime lease.
+    /// # Errors
+    ///
+    /// Returns an object, ownership, section-identity, or finite lease-budget failure.
+    #[expect(
+        unsafe_code,
+        reason = "the active FILE_OBJECT and ledger resource retain every decoded native identity"
+    )]
+    fn acquire_deferred_stream_lease(
+        &self,
+        file_object: ActiveFileObject<'_>,
+        volume: NonNull<VolumeControlBlock>,
+        target: DeferredStreamTarget,
+    ) -> DriverResult<(DeferredStreamLease, NodeId)> {
         let _guard = self.lock.acquire();
         let object = file_object.as_ref();
         if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
@@ -732,8 +876,8 @@ impl FileControlBlockLedger {
         let header =
             NonNull::new(object.FsContext.cast::<c_void>()).ok_or(DriverError::InvalidParameter)?;
         let fcb = unsafe {
-            // SAFETY: The active paging IRP retains its FILE_OBJECT and stream header while the
-            // owning ledger resource prevents concurrent FCB table removal.
+            // SAFETY: The active IRP retains its FILE_OBJECT and stream header while the owning
+            // ledger resource prevents concurrent FCB table removal.
             StreamContext::decode_owner(header, StreamOwnerKind::Node)?
         }
         .cast::<FileControlBlock>();
@@ -754,9 +898,10 @@ impl FileControlBlockLedger {
         if stream.owner() != NonNull::from(self) || stream.volume() != volume {
             return Err(DriverError::InvalidDeviceRequest);
         }
-        let NodeId::File(file) = stream.node() else {
+        let node = stream.node();
+        if matches!(target, DeferredStreamTarget::RegularFile) && !matches!(node, NodeId::File(_)) {
             return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-        };
+        }
         let sections = unsafe {
             // SAFETY: The same active FILE_OBJECT and retained FCB own this embedded section store.
             StreamContext::decode_section_objects(header)?
@@ -772,14 +917,13 @@ impl FileControlBlockLedger {
             state.as_mut()
         }
         .acquire_deferred_lease()?;
-        Ok(PagingStreamLease {
-            _retained: DeferredStreamLease {
+        Ok((
+            DeferredStreamLease {
                 owner: NonNull::from(self),
                 fcb,
             },
-            file_object: file_object.address(),
-            file,
-        })
+            node,
+        ))
     }
 
     /// Releases one deferred stream lease and destroys the FCB only after native residency drains.

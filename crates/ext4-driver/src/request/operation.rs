@@ -702,6 +702,22 @@ enum ReadOperationState {
         /// Operation-owned storage transcript.
         read: EpochReadOperation,
     },
+    /// Cached read is executing outside the actor and retains its publication range.
+    Cached {
+        /// Unique top-level completion authority retaining the output mapping.
+        owned: OwnedIrp,
+        /// Validated start for synchronous position publication.
+        start: ext4_core::FileOffset,
+        /// Maximum Cache Manager transfer selected before submission.
+        requested: usize,
+    },
+    /// Direct read waits for Cache Manager coherency before entering the ext4 read path.
+    Purging {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Immutable read transcript retained without being advanced.
+        read: EpochReadOperation,
+    },
     /// Terminal completion consumed the IRP; only the box remains to be dropped.
     Terminal,
 }
@@ -816,12 +832,81 @@ impl MountedVolumeOperation for ReadRequestOperation {
         event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        let event = event.into_core();
         let state = core::mem::replace(&mut self.state, ReadOperationState::Terminal);
-        let ReadOperationState::Running { mut owned, read } = state else {
-            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                .bugcheck();
+        let (mut owned, read, event, cache_prepared) = match (state, event) {
+            (
+                ReadOperationState::Cached {
+                    mut owned,
+                    start,
+                    requested,
+                },
+                CompletionEvent::CacheCompleted(crate::irp::CacheWorkCompletion::Read(result)),
+            ) => {
+                let result = crate::request::file_info::finish_cached_read(
+                    owned.request(),
+                    start,
+                    requested,
+                    result,
+                );
+                return Self::complete(owned, result);
+            }
+            (
+                ReadOperationState::Purging { owned, read },
+                CompletionEvent::CacheCompleted(crate::irp::CacheWorkCompletion::Purge(result)),
+            ) => match result {
+                Ok(()) => (owned, read, OperationEvent::Admitted, true),
+                Err(error) => return Self::complete(owned, Err(error)),
+            },
+            (ReadOperationState::Running { owned, read }, event) => {
+                (owned, read, event.into_core(), false)
+            }
+            _ => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
         };
+        if !cache_prepared
+            && matches!(event, OperationEvent::Admitted)
+            && matches!(self.request, PreparedReadRequest::Data(_))
+        {
+            let PreparedReadRequest::Data(authority) = &self.request else {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            };
+            let plan = match crate::request::file_info::prepare_read_cache_plan(
+                owned.request(),
+                authority,
+                access,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => return Self::complete(owned, Err(error)),
+            };
+            match plan {
+                crate::request::file_info::ReadCachePlan::Cached {
+                    work,
+                    start,
+                    requested,
+                } => {
+                    self.state = ReadOperationState::Cached {
+                        owned,
+                        start,
+                        requested,
+                    };
+                    return OperationTransition::SubmitCacheWork {
+                        work,
+                        suspended: self,
+                    };
+                }
+                crate::request::file_info::ReadCachePlan::PurgeBeforeDirect(work) => {
+                    self.state = ReadOperationState::Purging { owned, read };
+                    return OperationTransition::SubmitCacheWork {
+                        work,
+                        suspended: self,
+                    };
+                }
+                crate::request::file_info::ReadCachePlan::Direct => {}
+            }
+        }
         let request = &self.request;
         let transition =
             read.run(
@@ -1577,6 +1662,10 @@ impl MountedVolumeOperation for VolumeControlOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
+            CompletionEvent::CacheCompleted(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             CompletionEvent::VolumeFailed(error) => {
                 let state =
                     core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
@@ -1814,6 +1903,13 @@ pub(crate) enum FlushRequestKind {
 enum FlushOperationState {
     /// IRP target has not yet been validated on the reactor thread.
     Ready(OwnedIrp),
+    /// One file stream is flushing dirty Cache Manager pages outside the actor.
+    CacheFlushing {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Validated durability scope resumed after successful cache writeback.
+        scope: crate::state::VolumeFlushScope,
+    },
     /// IRP waits behind the selected volume durability barrier.
     Waiting {
         /// Unique top-level completion authority.
@@ -1916,10 +2012,89 @@ impl FlushRequestOperation {
         })
     }
 
+    /// Captures a node stream lease for file-specific `FlushBuffers` requests.
+    /// # Errors
+    ///
+    /// Returns a FILE_OBJECT, stream-identity, or lease failure before worker submission.
+    fn prepare_cache_flush(
+        &self,
+        owned: &mut OwnedIrp,
+        access: &MountedVolumeAccess<'_>,
+    ) -> DriverResult<Option<crate::irp::CacheWork>> {
+        if self.kind == FlushRequestKind::Shutdown {
+            return Ok(None);
+        }
+        owned.request().with_active(|active| {
+            let file_object = match active.current_stack()?.file_object() {
+                Ok(file_object) => file_object,
+                Err(DriverError::InvalidParameter) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            match crate::state::OpenedFileObject::decode(file_object)? {
+                crate::state::OpenedFileObject::Node(_) => access
+                    .acquire_cache_stream_lease(file_object)
+                    .map(crate::irp::CacheWork::flush)
+                    .map(Some),
+                crate::state::OpenedFileObject::Volume(_) => Ok(None),
+            }
+        })
+    }
+
     /// Completes and consumes the top-level flush IRP.
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
         let _status = owned.complete_result(result);
         OperationTransition::Complete
+    }
+
+    /// Continues the journal and lower-device durability sequence after cache writeback.
+    fn continue_after_cache_flush(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        scope: crate::state::VolumeFlushScope,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        if let crate::state::VolumeFlushScope::RawDevice(_) = scope {
+            let request = StorageRequest::Flush {
+                target: ext4_core::StorageTarget::Filesystem,
+            };
+            let expected = StorageRequestIdentity::from_request(&request);
+            self.state = FlushOperationState::InFlight {
+                owned,
+                expected,
+                scope,
+            };
+            return OperationTransition::SubmitLower {
+                devices: self.devices,
+                request,
+                suspended: self,
+            };
+        }
+        match self.kind {
+            FlushRequestKind::FlushBuffers => {
+                self.state = FlushOperationState::Waiting {
+                    owned,
+                    transition: None,
+                };
+                OperationTransition::Wait {
+                    condition: WaitCondition::VolumeDurability,
+                    suspended: self,
+                }
+            }
+            FlushRequestKind::Shutdown => {
+                let transition = match access.prepare_shutdown() {
+                    Ok(transition) => transition,
+                    Err(error) => return Self::complete(owned, Err(error)),
+                };
+                self.state = FlushOperationState::Waiting {
+                    owned,
+                    transition: Some(transition),
+                };
+                OperationTransition::WaitForClosingDrain {
+                    condition: WaitCondition::JournalClean,
+                    suspended: self,
+                }
+            }
+        }
     }
 
     /// Drives one uninterruptible shutdown durability transition.
@@ -1962,6 +2137,24 @@ impl MountedVolumeOperation for FlushRequestOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
+            CompletionEvent::CacheCompleted(completion) => {
+                let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
+                let (
+                    FlushOperationState::CacheFlushing { owned, scope },
+                    crate::irp::CacheWorkCompletion::Flush(result),
+                ) = (state, completion)
+                else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                        .bugcheck()
+                };
+                return match result {
+                    Ok(()) => self.continue_after_cache_flush(owned, scope, access),
+                    Err(error) => {
+                        access.record_cache_writeback_failure(error.ntstatus());
+                        Self::complete(owned, Err(error))
+                    }
+                };
+            }
             CompletionEvent::VolumeFailed(error) => {
                 let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
                 let FlushOperationState::Waiting { owned, transition } = state else {
@@ -1981,47 +2174,18 @@ impl MountedVolumeOperation for FlushRequestOperation {
                         Ok(scope) => scope,
                         Err(error) => return Self::complete(owned, Err(error)),
                     };
-                    if let crate::state::VolumeFlushScope::RawDevice(_) = scope {
-                        let request = StorageRequest::Flush {
-                            target: ext4_core::StorageTarget::Filesystem,
-                        };
-                        let expected = StorageRequestIdentity::from_request(&request);
-                        self.state = FlushOperationState::InFlight {
-                            owned,
-                            expected,
-                            scope,
-                        };
-                        return OperationTransition::SubmitLower {
-                            devices: self.devices,
-                            request,
+                    let work = match self.prepare_cache_flush(&mut owned, access) {
+                        Ok(work) => work,
+                        Err(error) => return Self::complete(owned, Err(error)),
+                    };
+                    if let Some(work) = work {
+                        self.state = FlushOperationState::CacheFlushing { owned, scope };
+                        OperationTransition::SubmitCacheWork {
+                            work,
                             suspended: self,
-                        };
-                    }
-                    match self.kind {
-                        FlushRequestKind::FlushBuffers => {
-                            self.state = FlushOperationState::Waiting {
-                                owned,
-                                transition: None,
-                            };
-                            OperationTransition::Wait {
-                                condition: WaitCondition::VolumeDurability,
-                                suspended: self,
-                            }
                         }
-                        FlushRequestKind::Shutdown => {
-                            let transition = match access.prepare_shutdown() {
-                                Ok(transition) => transition,
-                                Err(error) => return Self::complete(owned, Err(error)),
-                            };
-                            self.state = FlushOperationState::Waiting {
-                                owned,
-                                transition: Some(transition),
-                            };
-                            OperationTransition::WaitForClosingDrain {
-                                condition: WaitCondition::JournalClean,
-                                suspended: self,
-                            }
-                        }
+                    } else {
+                        self.continue_after_cache_flush(owned, scope, access)
                     }
                 }
                 OperationEvent::CancelRequested => {
@@ -2038,6 +2202,10 @@ impl MountedVolumeOperation for FlushRequestOperation {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
+            FlushOperationState::CacheFlushing { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             FlushOperationState::Waiting { owned, transition } => match event {
                 OperationEvent::BarrierReleased(permit) => {
                     let expected_identity = match self.kind {
@@ -2422,6 +2590,31 @@ enum CheckpointIoPhase {
 /// Explicit ownership phase of one journaled mutation operation.
 #[derive(Debug)]
 enum MutationOperationState {
+    /// A within-EOF cached write is executing outside the actor.
+    CacheWriting {
+        /// Unique top-level completion authority retaining the input mapping.
+        owned: OwnedIrp,
+        /// Cursor and successful byte count fixed before Cache Manager acceptance.
+        publication: crate::request::file_info::PreparedWritePublication,
+    },
+    /// A journaled write waits for shared-cache flush and purge.
+    CachePurging {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Immutable epoch pinned for the first resolve attempt.
+        epoch: EpochLease,
+        /// Restartable core resolve state entered only after coherency succeeds.
+        resolve: MutationResolveOperation,
+    },
+    /// Cleanup waits for its FILE_OBJECT private cache map to detach.
+    CacheUninitializing {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Immutable epoch pinned for any cleanup deletion resolve.
+        epoch: EpochLease,
+        /// Restartable cleanup resolve entered after cache-map detachment returns.
+        resolve: MutationResolveOperation,
+    },
     /// Read-only resolution against one immutable epoch.
     Resolving {
         /// Unique top-level completion authority.
@@ -2519,6 +2712,8 @@ struct MutationRequestOperation {
     write_effect_observed: bool,
     /// CLEANUP alone must consume its per-handle terminal barrier before releasing handle state.
     cleanup_barrier_released: bool,
+    /// Cache-map teardown failure returned only after cleanup-owned releases have completed.
+    cleanup_cache_error: Option<DriverError>,
     /// Current consuming state.
     state: MutationOperationState,
 }
@@ -2576,6 +2771,7 @@ impl MutationRequestOperation {
                 cleanup_deletion: None,
                 write_effect_observed: false,
                 cleanup_barrier_released: false,
+                cleanup_cache_error: None,
                 state: MutationOperationState::Resolving {
                     owned,
                     epoch,
@@ -2592,7 +2788,22 @@ impl MutationRequestOperation {
     }
 
     /// Completes one top-level success with its major-function-specific ownership protocol.
-    fn complete_success(owned: OwnedIrp, completion: TopLevelCompletion) -> OperationTransition {
+    fn complete_success(
+        &self,
+        owned: OwnedIrp,
+        completion: TopLevelCompletion,
+    ) -> OperationTransition {
+        if let Some(error) = self.cleanup_cache_error {
+            match completion {
+                TopLevelCompletion::Normal(_) => {
+                    let _status = owned.complete_result(Err(error));
+                }
+                TopLevelCompletion::Create(_) => {
+                    let _status = owned.complete_create_result(Err(error));
+                }
+            }
+            return OperationTransition::Complete;
+        }
         match completion {
             TopLevelCompletion::Normal(completion) => {
                 let _status = owned.complete(completion);
@@ -2823,7 +3034,7 @@ impl MutationRequestOperation {
                 &mut pass,
             ) {
                 Ok(DriverResolveDisposition::Complete(completion)) => {
-                    return Self::complete_success(owned, completion);
+                    return self.complete_success(owned, completion);
                 }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
                     publication = Some(prepared);
@@ -3233,6 +3444,71 @@ impl MountedVolumeOperation for MutationRequestOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
+            CompletionEvent::CacheCompleted(completion) => {
+                let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
+                match (state, completion) {
+                    (
+                        MutationOperationState::CacheWriting { owned, publication },
+                        crate::irp::CacheWorkCompletion::Write(result),
+                    ) => {
+                        return match crate::request::file_info::finish_cached_write(
+                            publication,
+                            result,
+                        ) {
+                            Ok(completion) => self.complete_success(
+                                owned,
+                                TopLevelCompletion::Normal(completion),
+                            ),
+                            Err(error) => {
+                                access.record_cache_writeback_failure(error.ntstatus());
+                                self.complete_error(owned, error)
+                            }
+                        };
+                    }
+                    (
+                        MutationOperationState::CachePurging {
+                            owned,
+                            epoch,
+                            resolve,
+                        },
+                        crate::irp::CacheWorkCompletion::Purge(result),
+                    ) => {
+                        return match result {
+                            Ok(()) => self.advance_resolution(
+                                owned,
+                                epoch,
+                                resolve,
+                                OperationEvent::Admitted,
+                                access,
+                            ),
+                            Err(error) => self.complete_error(owned, error),
+                        };
+                    }
+                    (
+                        MutationOperationState::CacheUninitializing {
+                            owned,
+                            epoch,
+                            resolve,
+                        },
+                        crate::irp::CacheWorkCompletion::Uninitialize(result),
+                    ) => {
+                        if let Err(error) = result {
+                            self.cleanup_cache_error = Some(error);
+                        }
+                        return self.advance_resolution(
+                            owned,
+                            epoch,
+                            resolve,
+                            OperationEvent::Admitted,
+                            access,
+                        );
+                    }
+                    _ => {
+                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                            .bugcheck()
+                    }
+                }
+            }
             CompletionEvent::VolumeFailed(error) => {
                 let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
                 let MutationOperationState::AwaitingCommit { owned, .. } = state else {
@@ -3272,10 +3548,75 @@ impl MountedVolumeOperation for MutationRequestOperation {
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
         match state {
             MutationOperationState::Resolving {
-                owned,
+                mut owned,
                 epoch,
                 resolve,
-            } => self.advance_resolution(owned, epoch, resolve, event, access),
+            } => {
+                if matches!(event, OperationEvent::Admitted) {
+                    if self.request.kind() == MutationRequestKind::Cleanup {
+                        let work = match crate::request::file_info::prepare_cleanup_cache_work(
+                            owned.request(),
+                            access,
+                        ) {
+                            Ok(work) => work,
+                            Err(error) => return self.complete_error(owned, error),
+                        };
+                        if let Some(work) = work {
+                            self.state = MutationOperationState::CacheUninitializing {
+                                owned,
+                                epoch,
+                                resolve,
+                            };
+                            return OperationTransition::SubmitCacheWork {
+                                work,
+                                suspended: self,
+                            };
+                        }
+                    }
+                    if let PreparedMutationRequest::DataWrite(authority) = &self.request {
+                        let plan = match crate::request::file_info::prepare_write_cache_plan(
+                            owned.request(),
+                            authority,
+                            access,
+                        ) {
+                            Ok(plan) => plan,
+                            Err(error) => return self.complete_error(owned, error),
+                        };
+                        match plan {
+                            crate::request::file_info::WriteCachePlan::Cached {
+                                work,
+                                publication,
+                            } => {
+                                self.state =
+                                    MutationOperationState::CacheWriting { owned, publication };
+                                return OperationTransition::SubmitCacheWork {
+                                    work,
+                                    suspended: self,
+                                };
+                            }
+                            crate::request::file_info::WriteCachePlan::PurgeBeforeDirect(work) => {
+                                self.state = MutationOperationState::CachePurging {
+                                    owned,
+                                    epoch,
+                                    resolve,
+                                };
+                                return OperationTransition::SubmitCacheWork {
+                                    work,
+                                    suspended: self,
+                                };
+                            }
+                            crate::request::file_info::WriteCachePlan::Direct => {}
+                        }
+                    }
+                }
+                self.advance_resolution(owned, epoch, resolve, event, access)
+            }
+            MutationOperationState::CacheWriting { .. }
+            | MutationOperationState::CachePurging { .. }
+            | MutationOperationState::CacheUninitializing { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             MutationOperationState::AwaitingIntent {
                 owned,
                 resolved,
@@ -3445,6 +3786,9 @@ impl MountedVolumeOperation for MutationRequestOperation {
             | (
                 MutationOperationState::AwaitingIntent { .. }
                 | MutationOperationState::AwaitingCommit { .. }
+                | MutationOperationState::CacheWriting { .. }
+                | MutationOperationState::CachePurging { .. }
+                | MutationOperationState::CacheUninitializing { .. }
                 | MutationOperationState::AwaitingVisibility { .. }
                 | MutationOperationState::PublishingDurable { .. }
                 | MutationOperationState::AwaitingCheckpoint(_)
@@ -3466,7 +3810,10 @@ impl InfalliblePublication for MutationRequestOperation {
             MutationOperationState::PublishingCheckpoint { epoch, .. } => {
                 PublicationAuthority::Checkpoint { epoch: *epoch }
             }
-            MutationOperationState::Resolving { .. }
+            MutationOperationState::CacheWriting { .. }
+            | MutationOperationState::CachePurging { .. }
+            | MutationOperationState::CacheUninitializing { .. }
+            | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }
             | MutationOperationState::CommitIo { .. }
@@ -3512,7 +3859,7 @@ impl InfalliblePublication for MutationRequestOperation {
                 let completion = effect.publish(access);
                 match stream_projection {
                     Ok(()) => {
-                        let _complete = Self::complete_success(owned, completion);
+                        let _complete = self.complete_success(owned, completion);
                     }
                     Err(error) => {
                         access.record_publication_failure(error.ntstatus());
@@ -3536,7 +3883,10 @@ impl InfalliblePublication for MutationRequestOperation {
                 access.publish_checkpoint(durability, publication, epoch);
                 self.state = MutationOperationState::Terminal;
             }
-            MutationOperationState::Resolving { .. }
+            MutationOperationState::CacheWriting { .. }
+            | MutationOperationState::CachePurging { .. }
+            | MutationOperationState::CacheUninitializing { .. }
+            | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }
             | MutationOperationState::CommitIo { .. }

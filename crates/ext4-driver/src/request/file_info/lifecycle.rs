@@ -2,6 +2,29 @@
 
 use super::*;
 
+/// Captures FILE_OBJECT cache-map teardown work before cleanup releases handle-owned state.
+/// # Errors
+///
+/// Returns a FILE_OBJECT, stream-identity, or lease failure before worker submission.
+pub(crate) fn prepare_cleanup_cache_work(
+    mut request: PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<Option<crate::irp::CacheWork>> {
+    request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        if file_object.has_no_file_system_contexts() {
+            return Ok(None);
+        }
+        match OpenedFileObject::decode(file_object)? {
+            OpenedFileObject::Node(_) => operations
+                .acquire_cache_stream_lease(file_object)
+                .map(crate::irp::CacheWork::uninitialize)
+                .map(Some),
+            OpenedFileObject::Volume(_) => Ok(None),
+        }
+    })
+}
+
 /// Captures one opened-handle lifecycle capability while the top-level IRP retains its contexts.
 /// # Errors
 ///

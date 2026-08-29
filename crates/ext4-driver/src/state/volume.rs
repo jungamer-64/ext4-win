@@ -826,6 +826,20 @@ impl MountedVolumeAccess<'_> {
             .acquire_paging_stream_lease(file_object, NonNull::from(&*self.volume))
     }
 
+    /// Retains one node stream while a PASSIVE_LEVEL worker executes Cache Manager work.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT stream identity is malformed, belongs to another
+    /// mounted volume, or the finite deferred-lease count is exhausted.
+    pub(crate) fn acquire_cache_stream_lease(
+        &self,
+        file_object: ActiveFileObject<'_>,
+    ) -> DriverResult<CacheStreamLease> {
+        self.volume
+            .file_control_blocks
+            .acquire_cache_stream_lease(file_object, NonNull::from(&*self.volume))
+    }
+
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
     /// # Errors
     ///
@@ -1132,6 +1146,11 @@ impl MountedVolumeAccess<'_> {
     /// Records an exact post-commit Cc/MM publication failure.
     pub(crate) fn record_publication_failure(&mut self, status: wdk_sys::NTSTATUS) {
         self.volume.runtime.record_publication_failure(status);
+    }
+
+    /// Records an exact Cache Manager dirty-page writeback failure.
+    pub(crate) fn record_cache_writeback_failure(&mut self, status: wdk_sys::NTSTATUS) {
+        self.volume.runtime.record_cache_writeback_failure(status);
     }
 
     /// Current committed volume identity.
