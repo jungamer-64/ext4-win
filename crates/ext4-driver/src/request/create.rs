@@ -1532,67 +1532,6 @@ fn path_components(units: &[u16]) -> DriverResult<DriverVec<CreatePathComponent>
     Ok(components)
 }
 
-/// Attaches the inode's advanced header and this handle's CCB to the FILE_OBJECT.
-/// # Errors
-///
-/// Returns an error when the shared FCB cannot be opened or the handle context cannot be attached.
-fn initialize_file_object(
-    file_object: UninitializedFileObject<'_>,
-    vcb: NonNull<crate::state::VolumeControlBlock>,
-    stream_sizes: NodeStreamSizes,
-    node_mode: OpenedNodeMode,
-    location: OpenedLocation,
-    policy: CreateHandlePolicy,
-) -> DriverResult<NonNull<FileControlBlock>> {
-    let node = stream_sizes.node();
-    let handle = memory::boxed_try_with(|| {
-        OpenedHandle::new(
-            node,
-            node_mode,
-            location,
-            policy.handle_deletion(),
-            policy.data_transfer_mode(),
-            policy.regular_file_write_access(),
-        )
-    })?;
-    let fcb = open_shared_file_control_block(
-        &file_object,
-        vcb,
-        stream_sizes,
-        policy.granted_access(),
-        policy.existing_operation_access(),
-        policy.share_access(),
-        policy.oplock_policy(),
-    )?;
-    publish_node_stream(file_object, fcb, handle, policy.file_object_flags());
-    Ok(fcb)
-}
-
-/// Opens the shared FCB for a node and records the create share-access claim.
-/// # Errors
-///
-/// Returns an error when the VCB cannot open an FCB for `node` or Windows share-access checking
-/// rejects the new handle.
-fn open_shared_file_control_block(
-    file_object: &UninitializedFileObject<'_>,
-    vcb: NonNull<crate::state::VolumeControlBlock>,
-    stream_sizes: NodeStreamSizes,
-    desired_access: GrantedAccess,
-    existing_operation_access: ExistingOperationAccess,
-    share_access: ShareAccess,
-    oplock_policy: crate::irp::OplockCreatePolicy,
-) -> DriverResult<NonNull<FileControlBlock>> {
-    VolumeControlBlock::open_existing_file_control_block(
-        vcb,
-        stream_sizes,
-        file_object.kernel_file_object(),
-        desired_access,
-        existing_operation_access,
-        share_access,
-        oplock_policy,
-    )
-}
-
 /// Driver publication seed built during a restartable mutation resolve pass.
 #[derive(Debug)]
 pub(crate) struct PendingCreatePublication {
