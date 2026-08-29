@@ -516,6 +516,30 @@ impl FileControlBlockOpenState {
         }
     }
 
+    /// Aborts the exact final-cleanup deletion before any lower write can have taken effect.
+    ///
+    /// This is distinct from a disposition cancellation: it is legal for create-time
+    /// delete-on-close as well, but only after the last active handle has entered cleanup and the
+    /// deletion attempt itself failed before an uncertain external effect.
+    pub(super) fn abort_cleanup_delete(
+        &mut self,
+        target: NonNull<FileDeleteTarget>,
+    ) -> Option<PendingFileDeletion> {
+        if self.share_access.OpenCount != 0 {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+        match core::mem::replace(&mut self.deletion, FileDeletionState::Live) {
+            FileDeletionState::Pending(pending) if pending.target() == target => Some(pending),
+            FileDeletionState::Deleted => {
+                self.deletion = FileDeletionState::Deleted;
+                None
+            }
+            FileDeletionState::Live | FileDeletionState::Pending(_) => {
+                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
+            }
+        }
+    }
+
     /// Computes one additional FILE_OBJECT reference without mutating state.
     /// # Errors
     ///

@@ -1397,7 +1397,7 @@ fn stream_size_change_plan_excludes_non_file_metadata() -> Result<(), DriverErro
     nodes.try_push(changed)?;
     let updates = super::PreparedStreamSizePublications { nodes };
 
-    let mut plan = ledger.prepare_stream_size_changes(&updates)?;
+    let mut plan = ledger.prepare_stream_size_changes(&updates, None)?;
     assert!(plan.next().is_none());
     assert!(plan.into_prepared()?.is_none());
 
@@ -1587,6 +1587,7 @@ fn file_deletion_state_is_shared_and_waits_for_final_active_cleanup() {
 
     let completed = state.complete_delete(target);
     assert_eq!(completed.target(), target);
+    assert!(state.abort_cleanup_delete(target).is_none());
     assert!(state.delete_pending());
     assert_eq!(
         state.deletion.ensure_openable(),
@@ -1725,4 +1726,36 @@ fn delete_on_close_pending_cannot_be_cancelled_or_replaced() {
         state.cleanup_disposition(),
         super::FileCleanupDisposition::Delete(mandatory_target)
     );
+}
+
+/// # Panics
+///
+/// Panics when a pre-effect cleanup failure cannot terminate mandatory deletion ownership without
+/// weakening ordinary disposition cancellation rules.
+#[test]
+fn final_cleanup_failure_can_abort_exact_delete_on_close_target() {
+    let name = Ext4Name::new(b"mapped-delete-on-close");
+    assert!(name.is_ok());
+    let Ok(name) = name else {
+        return;
+    };
+    let location = OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &name);
+    assert!(location.is_ok());
+    let Ok(location) = location else {
+        return;
+    };
+    let pending = super::PendingFileDeletion::try_from_delete_on_close(&location);
+    assert!(pending.is_ok());
+    let Ok(pending) = pending else {
+        return;
+    };
+    let target = pending.target();
+    let mut state = FileControlBlockOpenState::new();
+
+    assert!(state.set_delete_pending(pending).is_none());
+    assert!(state.clear_delete_pending().is_none());
+    let aborted = state.abort_cleanup_delete(target);
+    assert!(aborted.is_some());
+    assert_eq!(state.deletion.ensure_openable(), Ok(()));
+    assert!(!state.delete_pending());
 }

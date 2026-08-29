@@ -297,6 +297,56 @@ ext4win_stream_release_section_mutation(_In_ PEXT4WIN_STREAM_CONTEXT stream)
         EXT4WIN_SECTION_MUTATION_IDLE);
 }
 
+static VOID
+ext4win_stream_begin_section_mutation(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    for (;;) {
+        if (InterlockedCompareExchange(
+                &stream->SectionMutationState,
+                EXT4WIN_SECTION_MUTATION_PREPARING,
+                EXT4WIN_SECTION_MUTATION_IDLE) == EXT4WIN_SECTION_MUTATION_IDLE) {
+            break;
+        }
+        (VOID)KeWaitForSingleObject(
+            &stream->SectionMutationReleased,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL);
+    }
+    KeClearEvent(&stream->SectionMutationReleased);
+}
+
+static NTSTATUS
+ext4win_stream_seal_section_mutation(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    NTSTATUS status;
+
+    status = STATUS_SUCCESS;
+    ExAcquireResourceExclusiveLite(&stream->PagingIoResource, TRUE);
+    if (InterlockedCompareExchange(
+            &stream->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_SEALED,
+            EXT4WIN_SECTION_MUTATION_PREPARING) != EXT4WIN_SECTION_MUTATION_PREPARING) {
+        status = STATUS_INTERNAL_ERROR;
+    }
+    ExReleaseResourceLite(&stream->PagingIoResource);
+    return status;
+}
+
+static NTSTATUS
+ext4win_stream_end_section_mutation(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    if (InterlockedCompareExchange(
+            &stream->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_SEALED,
+            EXT4WIN_SECTION_MUTATION_SEALED) != EXT4WIN_SECTION_MUTATION_SEALED) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    ext4win_stream_release_section_mutation(stream);
+    return STATUS_SUCCESS;
+}
+
 static BOOLEAN
 ext4win_stream_acquire_fast_io_main(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
@@ -922,21 +972,7 @@ ext4win_stream_begin_size_change(
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
-    for (;;) {
-        if (InterlockedCompareExchange(
-                &stream->SectionMutationState,
-                EXT4WIN_SECTION_MUTATION_PREPARING,
-                EXT4WIN_SECTION_MUTATION_IDLE) == EXT4WIN_SECTION_MUTATION_IDLE) {
-            break;
-        }
-        (VOID)KeWaitForSingleObject(
-            &stream->SectionMutationReleased,
-            Executive,
-            KernelMode,
-            FALSE,
-            NULL);
-    }
-    KeClearEvent(&stream->SectionMutationReleased);
+    ext4win_stream_begin_section_mutation(stream);
 
     file_size.QuadPart = new_file_size;
     io_status.Status = STATUS_SUCCESS;
@@ -971,17 +1007,68 @@ ext4win_stream_begin_size_change(
     ExReleaseResourceLite(&stream->MainResource);
 
     if (NT_SUCCESS(status)) {
-        ExAcquireResourceExclusiveLite(&stream->PagingIoResource, TRUE);
-        if (InterlockedCompareExchange(
-                &stream->SectionMutationState,
-                EXT4WIN_SECTION_MUTATION_SEALED,
-                EXT4WIN_SECTION_MUTATION_PREPARING) !=
-            EXT4WIN_SECTION_MUTATION_PREPARING) {
-            status = STATUS_INTERNAL_ERROR;
-        }
-        ExReleaseResourceLite(&stream->PagingIoResource);
+        status = ext4win_stream_seal_section_mutation(stream);
     }
 
+    if (!NT_SUCCESS(status)) {
+        ext4win_stream_release_section_mutation(stream);
+    }
+    return status;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_begin_delete(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    IO_STATUS_BLOCK io_status;
+    NTSTATUS status;
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    ext4win_stream_begin_section_mutation(stream);
+
+    io_status.Status = STATUS_SUCCESS;
+    io_status.Information = 0;
+    status = STATUS_SUCCESS;
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    __try {
+        if (!MmFlushImageSection(&stream->SectionObjects, MmFlushForDelete)) {
+            status = STATUS_CANNOT_DELETE;
+        }
+        else if ((stream->SectionObjects.DataSectionObject != NULL) ||
+                 (stream->SectionObjects.SharedCacheMap != NULL)) {
+            CcCoherencyFlushAndPurgeCache(
+                &stream->SectionObjects,
+                NULL,
+                0,
+                &io_status,
+                0);
+            status = io_status.Status;
+            if (status == STATUS_CACHE_PAGE_LOCKED) {
+                status = STATUS_CANNOT_DELETE;
+            }
+        }
+        if (NT_SUCCESS(status) &&
+            ((stream->SectionObjects.DataSectionObject != NULL) ||
+             (stream->SectionObjects.ImageSectionObject != NULL))) {
+            status = STATUS_CANNOT_DELETE;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+
+    if (NT_SUCCESS(status)) {
+        status = ext4win_stream_seal_section_mutation(stream);
+    }
     if (!NT_SUCCESS(status)) {
         ext4win_stream_release_section_mutation(stream);
     }
@@ -999,14 +1086,21 @@ ext4win_stream_end_size_change(_In_ PVOID stream_header)
     if (stream == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (InterlockedCompareExchange(
-            &stream->SectionMutationState,
-            EXT4WIN_SECTION_MUTATION_SEALED,
-            EXT4WIN_SECTION_MUTATION_SEALED) != EXT4WIN_SECTION_MUTATION_SEALED) {
-        return STATUS_INVALID_DEVICE_STATE;
+    return ext4win_stream_end_section_mutation(stream);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_end_delete(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
     }
-    ext4win_stream_release_section_mutation(stream);
-    return STATUS_SUCCESS;
+    return ext4win_stream_end_section_mutation(stream);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)

@@ -904,10 +904,11 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn prepare_stream_size_changes(
         &self,
         updates: &PreparedStreamSizePublications,
+        deletion: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
         self.volume
             .file_control_blocks
-            .prepare_stream_size_changes(updates)
+            .prepare_stream_size_changes(updates, deletion)
     }
 
     /// Verifies that retained native gates still match the latest resolved size projection.
@@ -918,10 +919,25 @@ impl MountedVolumeAccess<'_> {
         &self,
         updates: &PreparedStreamSizePublications,
         prepared: &PreparedStreamSizeChanges,
+        deletion: Option<NodeId>,
     ) -> DriverResult<bool> {
         self.volume
             .file_control_blocks
-            .prepared_stream_size_changes_match(updates, prepared)
+            .prepared_stream_size_changes_match(updates, prepared, deletion)
+    }
+
+    /// Retains one exact cleanup FCB for native stream-deletion preparation.
+    /// # Errors
+    ///
+    /// Returns an ownership or deferred-lease failure before any Cc/MM call is submitted.
+    pub(crate) fn prepare_stream_deletion(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        node: NodeId,
+    ) -> DriverResult<Option<StreamDeletionLease>> {
+        self.volume
+            .file_control_blocks
+            .prepare_stream_deletion(fcb, node)
     }
 
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
