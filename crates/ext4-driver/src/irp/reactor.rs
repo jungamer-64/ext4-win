@@ -331,6 +331,8 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
 pub(crate) enum CompletionEvent {
     /// A filesystem event with its original consuming grant or lower completion.
     Core(OperationEvent),
+    /// One PASSIVE_LEVEL Cache Manager work item returned to the unique reactor owner.
+    CacheCompleted(crate::irp::CacheWorkCompletion),
     /// The volume can no longer satisfy a pre-effect commit or durability wait.
     VolumeFailed(DriverError),
 }
@@ -341,7 +343,7 @@ impl CompletionEvent {
     pub(crate) fn into_core(self) -> OperationEvent {
         match self {
             Self::Core(event) => event,
-            Self::VolumeFailed(_) => {
+            Self::CacheCompleted(_) | Self::VolumeFailed(_) => {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             }
         }
@@ -441,6 +443,13 @@ pub(crate) enum OperationTransition {
         /// Owned core clean-close transfer.
         request: StorageRequest,
         /// Close operation that must continue even when top-level cancellation is pending.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// Execute one prepared Cache Manager call outside the actor and requester threads.
+    SubmitCacheWork {
+        /// Fully captured Cc/MM operation whose stream lease owns every referenced identity.
+        work: crate::irp::CacheWork,
+        /// Operation moved by value into the work-item completion envelope.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Atomically acquire a resolved mutation's full resource set.
@@ -1814,6 +1823,9 @@ impl CompletionReactor {
                     suspended,
                     EffectCancellation::ContinueClosing,
                 );
+            }
+            OperationTransition::SubmitCacheWork { work, suspended } => {
+                self.submit_cache_work(index, work, suspended);
             }
             OperationTransition::RequestIntent { request, suspended } => {
                 let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
