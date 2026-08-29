@@ -75,10 +75,10 @@ pub(crate) use wdk_sys::ntddk::{
     IoAllocateWorkItem, IoCancelIrp, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp,
     IoFreeIrp, IoFreeMdl, IoFreeWorkItem, IoGetRequestorProcess, IoQueueWorkItem,
     IoRegisterShutdownNotification, IoReleaseVpbSpinLock, IoSetCompletionRoutineEx,
-    IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeInitializeDpc,
-    KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer, KeReleaseSpinLock, KeSetEvent,
-    KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages,
-    ObfDereferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
+    IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeCancelTimer,
+    KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer,
+    KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool,
+    MmUnlockPages, ObfDereferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
     ZwWaitForSingleObject,
 };
 

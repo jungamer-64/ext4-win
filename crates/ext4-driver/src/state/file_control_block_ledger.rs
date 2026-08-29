@@ -758,6 +758,93 @@ impl FileControlBlockLedger {
         drop(removed);
     }
 
+    /// Advances every waiting native resident to one due delayed-close observation.
+    ///
+    /// This mutates only ledger-owned progress. The later Cc/MM observation is deliberately made
+    /// after releasing the executive resource.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes table traversal and lifetime mutation"
+    )]
+    pub(super) fn mark_native_residency_rechecks_due(&self) -> bool {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table traversal and open-state mutation.
+            &*self.table.get()
+        };
+        let mut changed = false;
+        for fcb in table.iter() {
+            let state = unsafe {
+                // SAFETY: The table owns every FCB and the resource remains held for this pass.
+                &mut *fcb.open_state.get()
+            };
+            changed |= state.mark_native_residency_recheck_due();
+        }
+        changed
+    }
+
+    /// Executes one bounded pass over due native residents outside the ledger resource.
+    ///
+    /// Each selected FCB first receives an explicit deferred lease. Dropping that lease performs
+    /// the fresh Cc/MM observation and either reclaims the drained stream or returns it to the
+    /// shared timer's waiting set.
+    #[cfg(not(test))]
+    pub(super) fn recheck_due_native_residency(&self) {
+        while let Some(lease) = self.try_acquire_native_residency_recheck() {
+            drop(lease);
+        }
+    }
+
+    /// Returns whether the driver-owned delayed-close set is nonempty.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes table traversal and lifetime observation"
+    )]
+    pub(super) fn native_residency_recheck_pending(&self) -> bool {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table and lifetime observation.
+            &*self.table.get()
+        };
+        table.iter().any(|fcb| {
+            let state = unsafe {
+                // SAFETY: The table owns this FCB and the resource remains held for observation.
+                &*fcb.open_state.get()
+            };
+            state.native_residency_recheck_pending()
+        })
+    }
+
+    /// Retains one due FCB before its native section pointers are inspected without the resource.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes table traversal and lease acquisition"
+    )]
+    fn try_acquire_native_residency_recheck(&self) -> Option<DeferredStreamLease> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table traversal and lifetime mutation.
+            &*self.table.get()
+        };
+        for candidate in table.iter() {
+            let fcb = NonNull::from(candidate.as_ref());
+            let state = unsafe {
+                // SAFETY: The table owns this FCB and the resource remains held for mutation.
+                &mut *candidate.open_state.get()
+            };
+            if state.try_acquire_native_residency_recheck() {
+                return Some(DeferredStreamLease {
+                    owner: NonNull::from(self),
+                    fcb,
+                });
+            }
+        }
+        None
+    }
+
     /// Looks up current streams at durable publication and retains each through a short explicit
     /// lease while the ledger resource is released for the native Cc/MM call.
     /// # Errors

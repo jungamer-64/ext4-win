@@ -528,6 +528,40 @@ impl FileControlBlockOpenState {
         self.lifetime = self.lifetime.without_deferred_lease(native_resident);
         matches!(self.lifetime, StreamLifetimeState::Reclaimable)
     }
+
+    /// Makes a previously observed native resident eligible for one actor-owned recheck pass.
+    #[cfg(not(test))]
+    pub(super) fn mark_native_residency_recheck_due(&mut self) -> bool {
+        let (lifetime, changed) = self.lifetime.with_due_native_residency_recheck();
+        self.lifetime = lifetime;
+        changed
+    }
+
+    /// Acquires one explicit lease for a due native-residency observation.
+    ///
+    /// Counter exhaustion leaves the due obligation intact so a later actor pass can retry after
+    /// another deferred operation releases its lease.
+    #[cfg(not(test))]
+    pub(super) fn try_acquire_native_residency_recheck(&mut self) -> bool {
+        let (lifetime, acquired) = self.lifetime.with_native_residency_recheck_lease();
+        self.lifetime = lifetime;
+        acquired
+    }
+
+    /// Returns whether the stream requires delayed native-residency maintenance.
+    #[cfg(not(test))]
+    pub(super) const fn native_residency_recheck_pending(&self) -> bool {
+        self.lifetime.native_residency_recheck_pending()
+    }
+}
+
+/// Actor-owned progress of one native cache/section residency observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum NativeResidencyRecheck {
+    /// The last observation found a native resident; wait before polling Cc/MM again.
+    Waiting,
+    /// The shared delayed-close timer fired and one fresh observation is due.
+    Due,
 }
 
 /// Lifetime of one inode stream independent of any particular handle.
@@ -540,10 +574,17 @@ pub(super) enum StreamLifetimeState {
         /// Oplock continuations, paging operations, or workers retaining the stream.
         deferred_leases: u32,
     },
-    /// No FILE_OBJECT remains, but native or deferred work still retains the stream.
-    CachedOrMappedResident {
-        /// Explicit worker/oplock/paging leases independent of native section residency.
+    /// No FILE_OBJECT or native section remains, but explicit work retains the stream.
+    DeferredOnly {
+        /// Nonzero worker/oplock/paging lease count.
+        deferred_leases: NonZeroU32,
+    },
+    /// No FILE_OBJECT remains, but a native cache map or section still retains the stream.
+    NativeResident {
+        /// Explicit worker/oplock/paging leases that coexist with native residency.
         deferred_leases: u32,
+        /// Delayed-close polling progress owned by the volume reactor actor.
+        recheck: NativeResidencyRecheck,
     },
     /// No handle or resident lease remains and the ledger may destroy the stream.
     Reclaimable,
@@ -567,7 +608,13 @@ impl StreamLifetimeState {
                     .ok_or(DriverError::TooManyOpenReferences)?,
                 deferred_leases,
             }),
-            Self::CachedOrMappedResident { deferred_leases } => Ok(Self::OpenHandles {
+            Self::DeferredOnly { deferred_leases } => Ok(Self::OpenHandles {
+                handles: NonZeroU32::MIN,
+                deferred_leases: deferred_leases.get(),
+            }),
+            Self::NativeResident {
+                deferred_leases, ..
+            } => Ok(Self::OpenHandles {
                 handles: NonZeroU32::MIN,
                 deferred_leases,
             }),
@@ -593,13 +640,21 @@ impl StreamLifetimeState {
                 handles,
                 deferred_leases,
             } if handles == NonZeroU32::MIN => {
-                if native_resident || deferred_leases != 0 {
-                    Self::CachedOrMappedResident { deferred_leases }
+                if native_resident {
+                    Self::NativeResident {
+                        deferred_leases,
+                        recheck: NativeResidencyRecheck::Waiting,
+                    }
+                } else if let Some(deferred_leases) = NonZeroU32::new(deferred_leases) {
+                    Self::DeferredOnly { deferred_leases }
                 } else {
                     Self::Reclaimable
                 }
             }
-            Self::OpenHandles { .. } | Self::CachedOrMappedResident { .. } | Self::Reclaimable => {
+            Self::OpenHandles { .. }
+            | Self::DeferredOnly { .. }
+            | Self::NativeResident { .. }
+            | Self::Reclaimable => {
                 KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
             }
         }
@@ -620,10 +675,21 @@ impl StreamLifetimeState {
                     .checked_add(1)
                     .ok_or(DriverError::InsufficientResources)?,
             }),
-            Self::CachedOrMappedResident { deferred_leases } => Ok(Self::CachedOrMappedResident {
+            Self::DeferredOnly { deferred_leases } => Ok(Self::DeferredOnly {
+                deferred_leases: deferred_leases
+                    .get()
+                    .checked_add(1)
+                    .and_then(NonZeroU32::new)
+                    .ok_or(DriverError::InsufficientResources)?,
+            }),
+            Self::NativeResident {
+                deferred_leases,
+                recheck,
+            } => Ok(Self::NativeResident {
                 deferred_leases: deferred_leases
                     .checked_add(1)
                     .ok_or(DriverError::InsufficientResources)?,
+                recheck,
             }),
             Self::Reclaimable => {
                 KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
@@ -643,22 +709,89 @@ impl StreamLifetimeState {
                     KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
                 }),
             },
-            Self::CachedOrMappedResident { deferred_leases } if deferred_leases > 1 => {
-                Self::CachedOrMappedResident {
-                    deferred_leases: deferred_leases.checked_sub(1).unwrap_or_else(|| {
-                        KernelWideInconsistency::file_control_block_ownership_corruption()
-                            .bugcheck()
-                    }),
+            Self::DeferredOnly { deferred_leases } => {
+                let remaining = deferred_leases.get() - 1;
+                if native_resident {
+                    Self::NativeResident {
+                        deferred_leases: remaining,
+                        recheck: NativeResidencyRecheck::Waiting,
+                    }
+                } else if let Some(deferred_leases) = NonZeroU32::new(remaining) {
+                    Self::DeferredOnly { deferred_leases }
+                } else {
+                    Self::Reclaimable
                 }
             }
-            Self::CachedOrMappedResident { deferred_leases: 1 } if native_resident => {
-                Self::CachedOrMappedResident { deferred_leases: 0 }
+            Self::NativeResident {
+                deferred_leases,
+                recheck: _,
+            } if deferred_leases != 0 => {
+                let remaining = deferred_leases.checked_sub(1).unwrap_or_else(|| {
+                    KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+                });
+                if native_resident {
+                    Self::NativeResident {
+                        deferred_leases: remaining,
+                        recheck: NativeResidencyRecheck::Waiting,
+                    }
+                } else if let Some(deferred_leases) = NonZeroU32::new(remaining) {
+                    Self::DeferredOnly { deferred_leases }
+                } else {
+                    Self::Reclaimable
+                }
             }
-            Self::CachedOrMappedResident { deferred_leases: 1 } => Self::Reclaimable,
-            Self::OpenHandles { .. } | Self::CachedOrMappedResident { .. } | Self::Reclaimable => {
+            Self::OpenHandles { .. } | Self::NativeResident { .. } | Self::Reclaimable => {
                 KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
             }
         }
+    }
+
+    /// Makes one waiting native resident eligible for a new Cc/MM observation.
+    pub(super) const fn with_due_native_residency_recheck(self) -> (Self, bool) {
+        match self {
+            Self::NativeResident {
+                deferred_leases,
+                recheck: NativeResidencyRecheck::Waiting,
+            } => (
+                Self::NativeResident {
+                    deferred_leases,
+                    recheck: NativeResidencyRecheck::Due,
+                },
+                true,
+            ),
+            Self::OpenHandles { .. }
+            | Self::DeferredOnly { .. }
+            | Self::NativeResident { .. }
+            | Self::Reclaimable => (self, false),
+        }
+    }
+
+    /// Adds the lease that pins one FCB while its due Cc/MM observation runs outside the ledger.
+    pub(super) const fn with_native_residency_recheck_lease(self) -> (Self, bool) {
+        match self {
+            Self::NativeResident {
+                deferred_leases,
+                recheck: NativeResidencyRecheck::Due,
+            } => match deferred_leases.checked_add(1) {
+                Some(deferred_leases) => (
+                    Self::NativeResident {
+                        deferred_leases,
+                        recheck: NativeResidencyRecheck::Waiting,
+                    },
+                    true,
+                ),
+                None => (self, false),
+            },
+            Self::OpenHandles { .. }
+            | Self::DeferredOnly { .. }
+            | Self::NativeResident { .. }
+            | Self::Reclaimable => (self, false),
+        }
+    }
+
+    /// Returns whether native cache/section residency still owns delayed-close maintenance.
+    pub(super) const fn native_residency_recheck_pending(self) -> bool {
+        matches!(self, Self::NativeResident { .. })
     }
 }
 
