@@ -19,12 +19,12 @@ use super::{
     DirectoryChangeAction, DriverDeviceKind, FileControlBlock, FileControlBlockLedger,
     FileControlBlockOpenState, FileObjectCloseKind, HandleAdmissionState, HandleDeletion,
     KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
-    NoIntermediateTransfer, OpenedDirectory, OpenedFileObject, OpenedHandle, OpenedLocation,
-    OpenedNodeMode, OpenedObject, OpenedRegularFile, OpenedVolumeHandle, RawExtentPolicy,
-    RawVolumeAccess, RawVolumeIoPermit, RawVolumeOperationKind, RawWriteOutcome,
-    RetirementAdmission, StreamLifetimeState, TransferBufferAlignment, TransferSectorSize,
-    UninitializedFileObject, VolumeControlBlock, VolumeHandleCleanup, VolumeRetirement,
-    select_close_release_plan, shutdown_registration_status,
+    NativeResidencyRecheck, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
+    OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
+    OpenedVolumeHandle, RawExtentPolicy, RawVolumeAccess, RawVolumeIoPermit,
+    RawVolumeOperationKind, RawWriteOutcome, RetirementAdmission, StreamLifetimeState,
+    TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
+    VolumeHandleCleanup, VolumeRetirement, select_close_release_plan, shutdown_registration_status,
 };
 
 /// # Errors
@@ -1253,7 +1253,33 @@ fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
     let resident = open.without_handle(true);
     assert_eq!(
         resident,
-        StreamLifetimeState::CachedOrMappedResident { deferred_leases: 0 }
+        StreamLifetimeState::NativeResident {
+            deferred_leases: 0,
+            recheck: NativeResidencyRecheck::Waiting,
+        }
+    );
+    assert!(resident.native_residency_recheck_pending());
+    let (due, changed) = resident.with_due_native_residency_recheck();
+    assert!(changed);
+    assert_eq!(
+        due,
+        StreamLifetimeState::NativeResident {
+            deferred_leases: 0,
+            recheck: NativeResidencyRecheck::Due,
+        }
+    );
+    let (rechecking, acquired) = due.with_native_residency_recheck_lease();
+    assert!(acquired);
+    assert_eq!(
+        rechecking,
+        StreamLifetimeState::NativeResident {
+            deferred_leases: 1,
+            recheck: NativeResidencyRecheck::Waiting,
+        }
+    );
+    assert_eq!(
+        rechecking.without_deferred_lease(false),
+        StreamLifetimeState::Reclaimable
     );
     let reopened = resident.with_additional_handle();
     assert_eq!(reopened, Ok(open));
@@ -1265,11 +1291,20 @@ fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
         let without_handle = leased.without_handle(false);
         assert_eq!(
             without_handle,
-            StreamLifetimeState::CachedOrMappedResident { deferred_leases: 1 }
+            StreamLifetimeState::DeferredOnly {
+                deferred_leases: NonZeroU32::MIN,
+            }
         );
         assert_eq!(
             without_handle.without_deferred_lease(false),
             StreamLifetimeState::Reclaimable
+        );
+        assert_eq!(
+            without_handle.without_deferred_lease(true),
+            StreamLifetimeState::NativeResident {
+                deferred_leases: 0,
+                recheck: NativeResidencyRecheck::Waiting,
+            }
         );
     }
 }

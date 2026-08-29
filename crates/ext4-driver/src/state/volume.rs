@@ -674,6 +674,30 @@ impl MountedVolumeAccess<'_> {
         self.begin_retirement()
     }
 
+    /// Returns whether one or more handle-free streams still have native cache/section residents.
+    #[cfg(not(test))]
+    pub(crate) fn delayed_close_pending(&self) -> bool {
+        self.volume
+            .file_control_blocks
+            .native_residency_recheck_pending()
+    }
+
+    /// Consumes one shared delayed-close timer event and rechecks every resident stream once.
+    ///
+    /// Native Cc/MM inspection occurs outside the ledger resource. If this pass drains the final
+    /// namespace stream after logical dismount, it also owns the unique physical-retirement
+    /// transition.
+    #[cfg(not(test))]
+    pub(crate) fn expire_delayed_close_timer(&mut self) -> VolumeRetirement {
+        self.volume
+            .file_control_blocks
+            .mark_native_residency_rechecks_due();
+        self.volume
+            .file_control_blocks
+            .recheck_due_native_residency();
+        self.begin_retirement()
+    }
+
     /// Atomically moves the actor-owned volume into its one physical-retirement transition.
     fn begin_retirement(&mut self) -> VolumeRetirement {
         let namespace_empty = self.volume.file_control_blocks.is_empty();
