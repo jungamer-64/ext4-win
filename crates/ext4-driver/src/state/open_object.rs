@@ -2247,7 +2247,8 @@ fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileContr
 ///
 /// A base filesystem's device deletion is a prerequisite for this callback, not work that can
 /// be deferred to it. Control retirement belongs to prepare-unload; mounted-device retirement
-/// belongs to dismount/last-close. No driver-global resources survive those owners.
+/// belongs to dismount/last-close. Operational tracing is unregistered only after this check
+/// proves that every device, volume, stream, and copied event-write capability has retired.
 ///
 /// # Safety
 /// The I/O Manager must invoke this as the registered unload routine for its live driver object.
@@ -2264,6 +2265,7 @@ pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
     if !driver.DeviceObject.is_null() {
         KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
     }
+    crate::kernel::operational_trace::unregister_published();
 }
 
 /// Decodes the immutable device kind independently of the actor's lifetime.

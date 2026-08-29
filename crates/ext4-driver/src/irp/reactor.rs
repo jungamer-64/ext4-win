@@ -16,6 +16,7 @@ use wdk_sys::{PIO_CSQ, STATUS_SUCCESS};
 use crate::kernel::ffi;
 use crate::kernel::{
     fatal::KernelWideInconsistency,
+    operational_trace::OperationalTrace,
     status::{DriverError, DriverResult},
 };
 use crate::memory::InPlaceInitialization;
@@ -946,6 +947,8 @@ pub(crate) struct CompletionReactor {
     cancel_envelopes: [ActiveCancelEnvelope; MAX_OPERATIONS],
     /// Device object owning this stable extension.
     device: KernelDevice,
+    /// Write-only operational event capability retained no longer than this device.
+    trace: OperationalTrace,
     /// Device-specific authority entered only by the sole reactor actor.
     target: UnsafeCell<ReactorTarget>,
 }
@@ -1001,6 +1004,7 @@ impl CompletionReactor {
         reactor: *mut Self,
         device: KernelDevice,
         target: ReactorTarget,
+        trace: OperationalTrace,
     ) -> DriverResult<()> {
         let completion_rundown = CompletionRundown::try_new()?;
         let mut initialization = unsafe {
@@ -1029,6 +1033,7 @@ impl CompletionReactor {
                     delayed_close_timer_state: UnsafeCell::new(DelayedCloseTimerState::Idle),
                     cancel_envelopes: core::array::from_fn(ActiveCancelEnvelope::inert),
                     device,
+                    trace,
                     target: UnsafeCell::new(target),
                 },
             )?
@@ -2011,7 +2016,9 @@ impl CompletionReactor {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             };
             owned.install_active_cancellation(NonNull::from(envelope));
-            match self.with_target(|target| crate::request::dispatch::admit_owned(owned, target)) {
+            match self.with_target(|target| {
+                crate::request::dispatch::admit_owned(owned, target, self.trace)
+            }) {
                 Ok(operation) => {
                     self.install_admitted_at(index, operation);
                 }
@@ -3760,6 +3767,7 @@ mod tests {
 
     use ext4_core::OperationEvent;
 
+    use crate::kernel::operational_trace::OperationalTrace;
     use crate::kernel::status::DriverError;
     use crate::kernel::storage::StorageFailureClass;
     use crate::memory;
@@ -4045,6 +4053,7 @@ mod tests {
                 storage.as_mut_ptr(),
                 device,
                 super::ReactorTarget::ControlDevice,
+                OperationalTrace::host_test(),
             )
         };
         assert!(initialized.is_ok());

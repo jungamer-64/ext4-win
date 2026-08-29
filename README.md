@@ -57,9 +57,18 @@ valid-data length are published together after the corresponding ext4 commit.
 Sparse holes count toward the logical section bound, not the physical
 allocation charge returned by file-information queries.
 
-These stream contracts do not establish Cache Manager, mapped-writeback,
-oplock, Fast I/O, or raw-volume-write completion. Those paths and their elevated
-live-driver gates remain required before claiming a complete Windows FSD.
+The driver source now includes shared Cache Manager stream residency, mapped
+section coordination, oplock control, Fast I/O callbacks, and locked/dismounted
+raw-volume transfer state. A DriverEntry-owned operational ETW provider records
+only fixed path identifiers, `NTSTATUS` values, and outcomes; it cannot carry
+file names, offsets, lengths, or file data. The provider is unregistered only
+after DriverUnload has observed that all driver devices and their copied trace
+capabilities have retired.
+
+Compilation, host tests, and linked-entry-point checks do not establish live
+Cache Manager reentry, mapped writeback, oplock breaks, Fast I/O selection, or
+raw-sector effects. Those claims still require the dedicated elevated
+live-volume gate and its exact signed artifact evidence.
 
 ## Build and evaluate
 

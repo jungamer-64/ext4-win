@@ -75,10 +75,14 @@ The allocation-free Rust audit starts at mounted-volume durable publication,
 including both epoch replacement and stream-size publication. The link-map
 contract also requires the native advanced-header allocation, owner/section
 decoding, size access, destruction, Cache Manager, oplock FSCTL, Fast I/O
-registration/read/write, and raw-volume admission boundaries. Retaining these
-linked entry points does not establish their live behavior; Cache Manager
-reentry, oplock breaks, mapped writeback, and raw-sector effects require the
-dedicated live-volume gate.
+registration/read/write, raw-volume admission, and operational ETW
+register/write/unregister boundaries, including the underlying kernel ETW
+imports. The checked-in trace schema carries one fixed event identifier,
+`NTSTATUS`, and outcome per record; it has no field for file names, offsets,
+lengths, pointers, or file data. Retaining these linked entry points does not
+establish their live behavior; Cache Manager reentry, oplock breaks, mapped
+writeback, Fast I/O selection, ETW observation, and raw-sector effects require
+the dedicated live-volume gate.
 
 Successful bundles are atomically published below
 `target/verified-production/<artifact-id>/`. The versioned manifest binds the

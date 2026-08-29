@@ -224,6 +224,7 @@ impl DeviceExtensionHeader {
         kind: DeviceExtensionKind,
         device: KernelDevice,
         target: ReactorTarget,
+        trace: OperationalTrace,
     ) -> DriverResult<()> {
         let mut initialization = unsafe {
             // SAFETY: The caller exclusively owns final-address uninitialized extension storage.
@@ -240,7 +241,7 @@ impl DeviceExtensionHeader {
         header.dispatch.initialize();
         unsafe {
             // SAFETY: The actor slot is uninitialized, aligned, and already at its final address.
-            CompletionReactor::initialize_at(header.reactor.get().cast(), device, target)?;
+            CompletionReactor::initialize_at(header.reactor.get().cast(), device, target, trace)?;
         }
         initialization.publish();
         Ok(())
@@ -463,7 +464,7 @@ impl ControlDeviceExtension {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn initialize(device: KernelDevice) -> Result<(), wdk_sys::NTSTATUS> {
+    fn initialize(device: KernelDevice, trace: OperationalTrace) -> Result<(), wdk_sys::NTSTATUS> {
         let device_object = unsafe {
             // SAFETY: `device` is the newly created control device object.
             device.as_ptr().as_ref()
@@ -494,6 +495,7 @@ impl ControlDeviceExtension {
                 DeviceExtensionKind::CONTROL,
                 device,
                 ReactorTarget::ControlDevice,
+                trace,
             )
         }
         .map_err(|error| error.ntstatus())?;
@@ -612,7 +614,10 @@ impl ControlDevice {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) fn create(driver: PDRIVER_OBJECT) -> Result<Self, wdk_sys::NTSTATUS> {
+    pub(crate) fn create(
+        driver: PDRIVER_OBJECT,
+        trace: OperationalTrace,
+    ) -> Result<Self, wdk_sys::NTSTATUS> {
         let extension_size =
             wdk_sys::ULONG::try_from(core::mem::size_of::<ControlDeviceExtension>())
                 .map_err(|_| DriverError::InvalidParameter.ntstatus())?;
@@ -651,7 +656,7 @@ impl ControlDevice {
         }) else {
             return Err(DriverError::InternalInvariantViolation.ntstatus());
         };
-        if let Err(status) = ControlDeviceExtension::initialize(device) {
+        if let Err(status) = ControlDeviceExtension::initialize(device, trace) {
             unsafe {
                 // SAFETY: Extension initialization failed before any device publication.
                 ffi::IoDeleteDevice(device.as_ptr());

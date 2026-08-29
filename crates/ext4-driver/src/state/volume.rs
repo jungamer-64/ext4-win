@@ -5,6 +5,8 @@ use super::*;
 #[derive(Debug)]
 /// Volume control block stored in a mounted volume device extension.
 pub(crate) struct VolumeControlBlock {
+    /// Write-only operational event capability inherited from the driver registration owner.
+    pub(super) trace: OperationalTrace,
     /// Volume-wide opaque FsRtl notification state. This field drops before filesystem state so
     /// pending notify IRPs cannot outlive the mounted namespace they observe.
     pub(super) directory_change_notifier: DirectoryChangeNotifier,
@@ -476,6 +478,18 @@ impl MountedVolumeRef {
     pub(super) const fn as_non_null(self) -> NonNull<VolumeControlBlock> {
         self.volume
     }
+
+    /// Attenuates the stable mounted identity to its write-only trace capability.
+    #[expect(
+        unsafe_code,
+        reason = "the FCB construction lease retains the heap-stable VCB while copying one scalar capability"
+    )]
+    pub(super) fn trace(self) -> OperationalTrace {
+        unsafe {
+            // SAFETY: The ledger creates FCBs only while this mounted VCB is actor-owned and live.
+            self.volume.as_ref().trace
+        }
+    }
 }
 
 /// Non-cloneable mounted-volume authority owned only by the WDK reactor shell.
@@ -519,6 +533,13 @@ unsafe impl Send for MountedVolumeBinding {}
 pub(crate) struct MountedVolumeAccess<'volume> {
     /// Unique VCB borrow that cannot cross a scheduler transition or lower submission.
     volume: &'volume mut VolumeControlBlock,
+}
+
+impl MountedVolumeAccess<'_> {
+    /// Returns the write-only operational event capability for this mounted volume.
+    pub(crate) const fn operational_trace(&self) -> OperationalTrace {
+        self.volume.trace
+    }
 }
 
 /// VPB-visible effect produced when a direct-volume handle is cleaned up.
