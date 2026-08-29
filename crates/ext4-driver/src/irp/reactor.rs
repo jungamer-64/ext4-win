@@ -30,6 +30,9 @@ use super::ActiveCancelDestination;
 use super::cache::CacheWorkEnvelope;
 #[cfg(not(test))]
 use super::lower::{LowerCompletionEnvelope, LowerCompletionRoute, PublishedLowerRequest};
+use super::oplock::{OplockCheck, OplockContinuation};
+#[cfg(not(test))]
+use super::oplock::{OplockEnvelope, OplockSubmission, PublishedOplockRequest};
 #[cfg(not(test))]
 use super::scheduler::{
     Admission as SchedulerAdmission, AdmissionStart, CancelDisposition, HandleId, IntentDisposition,
@@ -464,6 +467,15 @@ pub(crate) enum OperationTransition {
         /// Operation resumed only after cache work, then re-resolved before requesting intent.
         suspended: Box<dyn CompletionOperation>,
     },
+    /// Transfer one break-causing top-level IRP to the stream-owned FsRtl oplock package.
+    CheckOplock {
+        /// Stream lease and normalized FsRtl flags prepared before delegation.
+        check: OplockCheck,
+        /// Unique driver completion authority transferred only after envelope allocation.
+        owned: OwnedIrp,
+        /// Operation that can accept the IRP again only after FsRtl returns it.
+        suspended: Box<dyn OplockContinuation>,
+    },
     /// Atomically acquire a resolved mutation's full resource set.
     RequestIntent {
         /// Stable FIFO/resource request.
@@ -608,6 +620,9 @@ enum SlotPayload {
     /// Completion envelope owning lower lifetime and cancellation identity.
     #[cfg(not(test))]
     Lower(PublishedReactorLower),
+    /// FsRtl-owned top-level IRP and its stable oplock continuation identity.
+    #[cfg(not(test))]
+    Oplock(PublishedOplockRequest),
 }
 
 impl fmt::Debug for SlotPayload {
@@ -620,6 +635,8 @@ impl fmt::Debug for SlotPayload {
             Self::Retry(_) => formatter.write_str("Retry"),
             #[cfg(not(test))]
             Self::Lower(_) => formatter.write_str("Lower"),
+            #[cfg(not(test))]
+            Self::Oplock(_) => formatter.write_str("Oplock"),
         }
     }
 }
@@ -917,6 +934,8 @@ pub(crate) struct CompletionReactor {
     length_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Completed Cache Manager work envelopes kept type-separated from lower I/O.
     cache_completion_head: UnsafeCell<LIST_ENTRY>,
+    /// Completed oplock-wait envelopes kept type-separated from all lower and worker callbacks.
+    oplock_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Pending plus active operation count, bounded by `MAX_OPERATIONS`.
     admitted: AtomicUsize,
     /// Auto-reset event signaled only when a concrete event is published.
@@ -1018,6 +1037,7 @@ impl CompletionReactor {
                     completion_head: UnsafeCell::new(LIST_ENTRY::default()),
                     length_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
                     cache_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
+                    oplock_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
                     admitted: AtomicUsize::new(0),
                     wake_event: wdk_sys::KEVENT::default(),
                     retry_ready: AtomicU64::new(0),
@@ -1056,6 +1076,10 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
             initialize_list_head(reactor.cache_completion_head.get());
+        }
+        unsafe {
+            // SAFETY: This is an exclusive, final-address list head before reactor publication.
+            initialize_list_head(reactor.oplock_completion_head.get());
         }
         #[cfg(not(test))]
         for timer in &reactor.retry_timers {
@@ -1647,6 +1671,21 @@ impl CompletionReactor {
                     }
                 });
             }
+            CancelDisposition::CancelOplock => {
+                self.with_payloads(|payloads| {
+                    let Some(slot) = payloads.get(index) else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    let SlotPayload::Oplock(oplock) = &slot.payload else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    unsafe {
+                        // SAFETY: Phase::Oplock retains this exact FsRtl publication until callback
+                        // reclamation detaches the slot.
+                        (*oplock).cancel();
+                    }
+                });
+            }
         }
     }
 
@@ -1737,6 +1776,10 @@ impl CompletionReactor {
             // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
             list_is_empty(reactor.cache_completion_head.get())
         };
+        let oplock_completion_list_empty = unsafe {
+            // SAFETY: Rundown is closed and teardown exclusively owns this initialized list.
+            list_is_empty(reactor.oplock_completion_head.get())
+        };
         if reactor.state() != ReactorState::Stopped
             || reactor.admitted.load(Ordering::Acquire) != 0
             || reactor.has_active()
@@ -1745,6 +1788,7 @@ impl CompletionReactor {
             || !completion_list_empty
             || !length_completion_list_empty
             || !cache_completion_list_empty
+            || !oplock_completion_list_empty
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -1854,6 +1898,7 @@ impl CompletionReactor {
             progressed |= self.drain_storage_completions();
             progressed |= self.drain_length_completions();
             progressed |= self.drain_cache_completions();
+            progressed |= self.drain_oplock_completions();
             progressed |= self.drain_active_cancels();
             progressed |= self.drain_retry_events();
             progressed |= self.admit_pending_requests();
@@ -1871,6 +1916,10 @@ impl CompletionReactor {
                 // SAFETY: The sole reactor actor observes this initialized inbox list.
                 list_is_empty(self.cache_completion_head.get())
             };
+            let oplock_completion_list_empty = unsafe {
+                // SAFETY: The sole reactor actor observes this initialized inbox list.
+                list_is_empty(self.oplock_completion_head.get())
+            };
             if self.state() == ReactorState::Draining
                 && self.admitted.load(Ordering::Acquire) == 0
                 && !self.has_active()
@@ -1879,6 +1928,7 @@ impl CompletionReactor {
                 && completion_list_empty
                 && length_completion_list_empty
                 && cache_completion_list_empty
+                && oplock_completion_list_empty
             {
                 self.lifecycle
                     .store(ReactorState::Stopped.as_raw(), Ordering::Release);
@@ -2117,6 +2167,13 @@ impl CompletionReactor {
                 }
                 self.submit_cache_work(index, work, suspended);
                 self.grant_available_intents();
+            }
+            OperationTransition::CheckOplock {
+                check,
+                owned,
+                suspended,
+            } => {
+                self.submit_oplock_check(index, check, owned, suspended);
             }
             OperationTransition::RequestIntent { request, suspended } => {
                 let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
@@ -2438,7 +2495,9 @@ impl CompletionReactor {
                 return;
             }
         };
-        if self.consume_cancellation_before_effect(index) {
+        // An empty poll cannot revoke cancellation: unlike a lower write, delegation to FsRtl
+        // starts a cancellable wait whose cancel routine remains externally owned until callback.
+        if self.cancellation_is_pending(index) {
             let (_work, suspended) = CacheWorkEnvelope::cancel_before_queue(prepared);
             self.set_ready_operation_event(
                 index,
@@ -2451,6 +2510,112 @@ impl CompletionReactor {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         CacheWorkEnvelope::queue(prepared);
+    }
+
+    /// Allocates one stable continuation and delegates an IRP without retaining driver completion
+    /// authority while FsRtl owns an oplock-break wait.
+    #[cfg(not(test))]
+    fn submit_oplock_check(
+        &self,
+        index: usize,
+        check: OplockCheck,
+        owned: OwnedIrp,
+        suspended: Box<dyn OplockContinuation>,
+    ) {
+        let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let rundown = match self.completion_rundown.acquire() {
+            Ok(Some(rundown)) => rundown,
+            Ok(None) => {
+                let operation = suspended
+                    .resume_after_oplock(owned, DriverError::InvalidDeviceRequest.ntstatus());
+                self.set_ready_operation_event(
+                    index,
+                    operation,
+                    CompletionEvent::Core(OperationEvent::Admitted),
+                );
+                return;
+            }
+            Err(error) => {
+                let operation = suspended.resume_after_oplock(owned, error.ntstatus());
+                self.set_ready_operation_event(
+                    index,
+                    operation,
+                    CompletionEvent::Core(OperationEvent::Admitted),
+                );
+                return;
+            }
+        };
+        let prepared = match OplockEnvelope::try_new(
+            NonNull::from(self),
+            identity,
+            check,
+            owned,
+            suspended,
+            rundown,
+        ) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let (error, _check, owned, suspended) = failure.into_parts();
+                let operation = suspended.resume_after_oplock(owned, error.ntstatus());
+                self.set_ready_operation_event(
+                    index,
+                    operation,
+                    CompletionEvent::Core(OperationEvent::Admitted),
+                );
+                return;
+            }
+        };
+        if self.consume_cancellation_before_effect(index) {
+            let (_check, owned, suspended) = OplockEnvelope::cancel_before_submit(prepared);
+            let operation = suspended.resume_after_oplock(owned, STATUS_SUCCESS);
+            self.set_ready_operation_event(
+                index,
+                operation,
+                CompletionEvent::Core(OperationEvent::CancelRequested),
+            );
+            return;
+        }
+        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Oplock)) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let publication = prepared.publication();
+        self.install_payload(index, SlotPayload::Oplock(publication));
+        match OplockEnvelope::submit(prepared) {
+            OplockSubmission::Immediate { envelope, status } => {
+                self.take_oplock_slot(index, NonNull::from(envelope.as_ref()));
+                let (owned, suspended, status) =
+                    OplockEnvelope::reclaim_immediate(envelope, status);
+                self.restore_oplock_operation(index, owned, suspended, status);
+            }
+            OplockSubmission::Pending => {
+                if self.cancellation_is_pending(index) {
+                    self.request_active_cancel(index);
+                }
+            }
+        }
+    }
+
+    /// Reinstalls driver cancellation only after FsRtl has returned the exact IRP.
+    #[cfg(not(test))]
+    fn restore_oplock_operation(
+        &self,
+        index: usize,
+        mut owned: OwnedIrp,
+        suspended: Box<dyn OplockContinuation>,
+        status: NTSTATUS,
+    ) {
+        let envelope = self.cancel_envelopes.get(index).unwrap_or_else(|| {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+        });
+        owned.install_active_cancellation(NonNull::from(envelope));
+        let operation = suspended.resume_after_oplock(owned, status);
+        self.set_ready_operation_event(
+            index,
+            operation,
+            CompletionEvent::Core(OperationEvent::Admitted),
+        );
     }
 
     /// Builds, registers, and submits one lower storage command with ownership-preserving errors.
@@ -2931,6 +3096,111 @@ impl CompletionReactor {
                 suspended,
                 CompletionEvent::CacheCompleted(completion),
             );
+        }
+        progressed
+    }
+
+    /// Links one completed oplock wait into its type-separated inbox.
+    /// # Safety
+    ///
+    /// `envelope` must be uniquely callback-owned, unlinked, nonpaged, and protected by this
+    /// reactor's completion rundown lease.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the FsRtl callback transfers one completed intrusive envelope under the reactor lock"
+    )]
+    pub(super) unsafe fn enqueue_oplock_completion(&self, envelope: NonNull<OplockEnvelope>) {
+        let old_irql = unsafe {
+            // SAFETY: Stable reactor lock serializes callbacks and typed inbox removal.
+            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+        };
+        let node = unsafe {
+            // SAFETY: Completion owns this live envelope until its node is linked below.
+            envelope.as_ref().node_ptr()
+        };
+        unsafe {
+            // SAFETY: The reactor lock is held and `node` is live and unlinked.
+            insert_tail_list(self.oplock_completion_head.get(), node);
+        }
+        unsafe {
+            // SAFETY: Releases the exact acquisition above.
+            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+        }
+        self.wake();
+    }
+
+    /// Removes one completed oplock envelope, if present.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the reactor lock protects the typed oplock-completion intrusive list"
+    )]
+    fn pop_oplock_completion(&self) -> Option<NonNull<OplockEnvelope>> {
+        let old_irql = unsafe {
+            // SAFETY: Stable reactor lock serializes oplock-completion list access.
+            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+        };
+        let node = unsafe {
+            // SAFETY: The reactor lock is held for this initialized completion list.
+            remove_head_list(self.oplock_completion_head.get())
+        };
+        unsafe {
+            // SAFETY: Releases the exact acquisition above.
+            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+        }
+        node.map(|node| unsafe {
+            // SAFETY: The oplock envelope's node is its first field.
+            OplockEnvelope::from_node(node)
+        })
+    }
+
+    /// Detaches the exact FsRtl cancellation publication before its envelope can be reclaimed.
+    #[cfg(not(test))]
+    fn take_oplock_slot(&self, index: usize, envelope: NonNull<OplockEnvelope>) {
+        self.with_payloads(|payloads| {
+            let Some(slot) = payloads.get_mut(index) else {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            };
+            let identifies = matches!(
+                &slot.payload,
+                SlotPayload::Oplock(publication) if publication.identifies(envelope)
+            );
+            if !identifies {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            slot.payload = SlotPayload::Empty;
+        });
+    }
+
+    /// Reclaims every completed FsRtl wait and restores driver IRP/cancel ownership.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "inbox removal grants unique ownership of the completed oplock envelope"
+    )]
+    fn drain_oplock_completions(&self) -> bool {
+        let mut progressed = false;
+        while let Some(envelope) = self.pop_oplock_completion() {
+            progressed = true;
+            let identity = unsafe {
+                // SAFETY: Inbox ownership retains the complete envelope through this observation.
+                envelope.as_ref().identity()
+            };
+            let index = identity.index();
+            let entered = self.with_scheduler(|scheduler| {
+                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Oplock))
+            });
+            if entered != Some(identity) {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            self.take_oplock_slot(index, envelope);
+            let envelope = unsafe {
+                // SAFETY: Inbox removal and generation validation grant unique box ownership.
+                Box::from_raw(envelope.as_ptr())
+            };
+            let (owned, suspended, status) = OplockEnvelope::reclaim_completed(envelope);
+            self.restore_oplock_operation(index, owned, suspended, status);
         }
         progressed
     }
@@ -3870,6 +4140,15 @@ mod tests {
                 target: _target,
                 suspended,
             } => {
+                drop(suspended);
+            }
+            OperationTransition::CheckOplock {
+                check,
+                owned,
+                suspended,
+            } => {
+                drop(check);
+                drop(owned);
                 drop(suspended);
             }
             OperationTransition::SubmitLower {

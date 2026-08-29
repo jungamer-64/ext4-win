@@ -903,6 +903,20 @@ impl MountedVolumeAccess<'_> {
             .acquire_paging_stream_lease(file_object, NonNull::from(&*self.volume))
     }
 
+    /// Retains one node stream while FsRtl owns a pending oplock-break IRP.
+    /// # Errors
+    ///
+    /// Returns an error when the FILE_OBJECT stream identity is malformed, belongs to another
+    /// mounted volume, or the finite deferred-lease count is exhausted.
+    pub(crate) fn acquire_oplock_stream_lease(
+        &self,
+        file_object: ActiveFileObject<'_>,
+    ) -> DriverResult<OplockStreamLease> {
+        self.volume
+            .file_control_blocks
+            .acquire_oplock_stream_lease(file_object, NonNull::from(&*self.volume))
+    }
+
     /// Retains one node stream while a PASSIVE_LEVEL worker executes Cache Manager work.
     /// # Errors
     ///

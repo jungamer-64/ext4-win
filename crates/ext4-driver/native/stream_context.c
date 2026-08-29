@@ -7,6 +7,9 @@
 #define EXT4WIN_SECTION_MUTATION_PREPARING ((LONG)1)
 #define EXT4WIN_SECTION_MUTATION_SEALED ((LONG)2)
 
+extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
+extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
+
 typedef struct _EXT4WIN_STREAM_CONTEXT {
     FSRTL_ADVANCED_FCB_HEADER Header;
     FAST_MUTEX HeaderMutex;
@@ -597,6 +600,46 @@ ext4win_stream_oplock_fsctrl(
     ext4win_stream_refresh_fast_io_projection(stream);
     ExReleaseResourceLite(&stream->MainResource);
     ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CONTROL, status);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_check_oplock(
+    _In_ PVOID stream_header,
+    _Inout_ PIRP irp,
+    _In_ ULONG flags,
+    _In_ PVOID continuation)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        (stream->ByteRangeLocks == NULL) || (irp == NULL) ||
+        (continuation == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        status = FsRtlCheckOplockEx(
+            &stream->Header.Oplock,
+            irp,
+            flags,
+            continuation,
+            ext4win_oplock_wait_complete,
+            ext4win_oplock_prepost);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK, status);
     return status;
 }
 

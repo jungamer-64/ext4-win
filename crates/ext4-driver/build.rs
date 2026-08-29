@@ -167,7 +167,7 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
 /// Returns an input or I/O error when the checked-in schema is incomplete, duplicated, malformed,
 /// or cannot be written to Cargo's output directory.
 fn write_operational_trace_contract() -> Result<(), io::Error> {
-    const EVENT_RECORDS: [(&str, &str); 16] = [
+    const EVENT_RECORDS: [(&str, &str); 17] = [
         ("event_cached_read", "CACHED_READ"),
         ("event_cached_write", "CACHED_WRITE"),
         ("event_cache_flush", "CACHE_FLUSH"),
@@ -184,6 +184,7 @@ fn write_operational_trace_contract() -> Result<(), io::Error> {
         ("event_raw_read", "RAW_READ"),
         ("event_raw_write", "RAW_WRITE"),
         ("event_raw_flush", "RAW_FLUSH"),
+        ("event_oplock_check", "OPLOCK_CHECK"),
     ];
     const OUTCOME_RECORDS: [(&str, &str); 5] = [
         ("outcome_selected", "SELECTED"),

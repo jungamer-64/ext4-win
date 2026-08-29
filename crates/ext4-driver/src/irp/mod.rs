@@ -27,6 +27,7 @@ mod create;
 mod dispatch;
 mod lifecycle;
 pub(crate) mod lower;
+mod oplock;
 pub(crate) mod reactor;
 mod scheduler;
 mod stack;
@@ -50,6 +51,7 @@ pub(crate) use create::*;
 pub(crate) use dispatch::*;
 pub(crate) use lifecycle::*;
 use lifecycle::{KernelIrp, PendingIrp, copy_requestor_input_window, copy_requestor_output_window};
+pub(crate) use oplock::{OplockCheck, OplockContinuation};
 pub(crate) use reactor::CompletionReactor;
 pub(crate) use stack::*;
 

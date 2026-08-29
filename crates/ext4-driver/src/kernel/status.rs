@@ -42,6 +42,8 @@ pub(crate) enum DriverError {
     PrivilegeRecordingFailed(NTSTATUS),
     /// Cache Manager or Memory Manager rejected an operation with this exact status.
     CacheManagerFailure(NTSTATUS),
+    /// FsRtl rejected or cancelled an oplock-conflicting operation with this exact status.
+    OplockFailure(NTSTATUS),
     /// The target inode has entered the terminal delete-pending namespace state.
     DeletePending,
     /// CLEANUP closed ordinary admission for this FILE_OBJECT.
@@ -132,7 +134,8 @@ impl DriverError {
             Self::AccessDenied => STATUS_ACCESS_DENIED,
             Self::SecurityCheckFailed(status)
             | Self::PrivilegeRecordingFailed(status)
-            | Self::CacheManagerFailure(status) => status,
+            | Self::CacheManagerFailure(status)
+            | Self::OplockFailure(status) => status,
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),
             Self::DeviceBusy => ntstatus(0xC000_009E),
@@ -343,6 +346,15 @@ mod tests {
     fn cache_manager_failures_preserve_native_status() {
         let fault = wdk_sys::STATUS_IO_DEVICE_ERROR;
         assert_eq!(DriverError::CacheManagerFailure(fault).ntstatus(), fault);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when an FsRtl oplock result loses its exact NTSTATUS identity.
+    #[test]
+    fn oplock_failures_preserve_native_status() {
+        let cancelled = wdk_sys::STATUS_CANCELLED;
+        assert_eq!(DriverError::OplockFailure(cancelled).ntstatus(), cancelled);
     }
 
     /// # Panics

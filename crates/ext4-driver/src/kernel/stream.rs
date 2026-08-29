@@ -291,6 +291,32 @@ impl StreamContext {
         }
     }
 
+    /// Delegates one break-causing IRP to the stream-owned FsRtl oplock package.
+    ///
+    /// # Safety
+    ///
+    /// `irp` must be the unique live top-level IRP and `continuation` must remain at a stable
+    /// nonpaged address until either this call returns a non-pending status or the registered
+    /// wait-completion callback publishes it exactly once.
+    #[cfg(not(test))]
+    pub(crate) unsafe fn check_oplock(
+        &self,
+        irp: NonNull<wdk_sys::IRP>,
+        flags: u32,
+        continuation: NonNull<c_void>,
+    ) -> NTSTATUS {
+        unsafe {
+            // SAFETY: The caller supplies the consuming IRP and stable continuation capabilities
+            // documented above; native SEH contains FsRtl exceptions at the C boundary.
+            ext4win_stream_check_oplock(
+                self.header.as_ptr(),
+                irp.as_ptr(),
+                flags,
+                continuation.as_ptr(),
+            )
+        }
+    }
+
     /// Transfers one live lock-control IRP to the bound FsRtl FILE_LOCK package.
     ///
     /// # Safety
@@ -907,6 +933,12 @@ unsafe extern "system" {
         irp: *mut wdk_sys::IRP,
         open_count: wdk_sys::ULONG,
         flags: wdk_sys::ULONG,
+    ) -> NTSTATUS;
+    fn ext4win_stream_check_oplock(
+        stream_header: wdk_sys::PVOID,
+        irp: *mut wdk_sys::IRP,
+        flags: wdk_sys::ULONG,
+        continuation: wdk_sys::PVOID,
     ) -> NTSTATUS;
     fn ext4win_stream_process_file_lock(
         stream_header: wdk_sys::PVOID,

@@ -47,6 +47,42 @@ pub(crate) struct PagingStreamLease {
     file: FileNodeId,
 }
 
+/// One node stream retained while an IRP is delegated to the FsRtl oplock package.
+#[derive(Debug)]
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "host tests validate lease residency but cannot enter the native FsRtl consumer"
+    )
+)]
+pub(crate) struct OplockStreamLease {
+    /// Sole retention authority spanning break notification, wait, and reactor resumption.
+    retained: DeferredStreamLease,
+}
+
+impl OplockStreamLease {
+    /// Returns the retained stream boundary containing the FsRtl oplock package.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "host tests cannot enter the native FsRtl consumer"
+        )
+    )]
+    #[expect(
+        unsafe_code,
+        reason = "the deferred ledger lease retains the exact FCB behind this raw stable identity"
+    )]
+    pub(crate) fn stream_context(&self) -> &StreamContext {
+        let fcb = unsafe {
+            // SAFETY: This deferred lease prevents ledger removal of the exact retained FCB.
+            self.retained.fcb.as_ref()
+        };
+        &fcb.stream_context
+    }
+}
+
 /// One shared stream cache retained while a PASSIVE_LEVEL worker calls Cc/MM outside the actor.
 #[derive(Debug)]
 pub(crate) struct StreamCacheLease {
@@ -1753,6 +1789,21 @@ impl FileControlBlockLedger {
             file_object: file_object.address(),
             file,
         })
+    }
+
+    /// Acquires one node-stream lease before the caller delegates an IRP to FsRtl.
+    /// # Errors
+    ///
+    /// Returns an object, ownership, section-identity, or deferred-lease failure without
+    /// publishing any oplock continuation.
+    pub(super) fn acquire_oplock_stream_lease(
+        &self,
+        file_object: ActiveFileObject<'_>,
+        volume: NonNull<VolumeControlBlock>,
+    ) -> DriverResult<OplockStreamLease> {
+        let (retained, _node) =
+            self.acquire_deferred_stream_lease(file_object, volume, DeferredStreamTarget::Node)?;
+        Ok(OplockStreamLease { retained })
     }
 
     /// Acquires one stream lease for a PASSIVE_LEVEL cache worker without retaining ledger locks.
