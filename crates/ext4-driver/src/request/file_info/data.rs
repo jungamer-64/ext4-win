@@ -93,9 +93,11 @@ pub(crate) fn prepare_read_cache_plan(
             resolve_read_start(&opened, DataIoKind::Handle, stack.starting_point())?,
             stack.length().as_usize(),
         )?;
-        let stream = access.acquire_cache_stream_lease(file_object)?;
+        let file_cache = access.acquire_file_object_cache_lease(file_object)?;
         if matches!(opened.data_transfer_mode(), DataTransferMode::Direct(_)) {
-            return Ok(ReadCachePlan::PurgeBeforeDirect(CacheWork::purge(stream)));
+            return Ok(ReadCachePlan::PurgeBeforeDirect(CacheWork::purge(
+                file_cache.into_stream(),
+            )));
         }
         if !stack.length().is_empty()
             && !opened.file_control_block().permits_byte_range_read(
@@ -118,7 +120,7 @@ pub(crate) fn prepare_read_cache_plan(
         let offset =
             i64::try_from(range.start().bytes()).map_err(|_| DriverError::InvalidParameter)?;
         Ok(ReadCachePlan::Cached {
-            work: CacheWork::read(stream, offset, requested, output),
+            work: CacheWork::read(file_cache, offset, requested, output),
             start: range.start(),
             requested,
         })
@@ -200,7 +202,7 @@ pub(crate) fn prepare_write_cache_plan(
                 return Err(DriverError::FileLockConflict);
             }
         }
-        let stream = access.acquire_cache_stream_lease(file_object)?;
+        let file_cache = access.acquire_file_object_cache_lease(file_object)?;
         let end = range.start().checked_add_len(range.length())?.bytes();
         let write_through = file_object.as_ref().Flags & wdk_sys::FO_WRITE_THROUGH != 0;
         if matches!(selected, SelectedWriteStart::EndOfFile)
@@ -208,7 +210,9 @@ pub(crate) fn prepare_write_cache_plan(
             || write_through
             || end > eof
         {
-            return Ok(WriteCachePlan::PurgeBeforeDirect(CacheWork::purge(stream)));
+            return Ok(WriteCachePlan::PurgeBeforeDirect(CacheWork::purge(
+                file_cache.into_stream(),
+            )));
         }
         let offset =
             i64::try_from(range.start().bytes()).map_err(|_| DriverError::InvalidParameter)?;
@@ -219,7 +223,7 @@ pub(crate) fn prepare_write_cache_plan(
             range.length(),
         )?;
         Ok(WriteCachePlan::Cached {
-            work: CacheWork::write(stream, offset, input, range.length()),
+            work: CacheWork::write(file_cache, offset, input, range.length()),
             publication: PreparedWritePublication {
                 completion,
                 position,

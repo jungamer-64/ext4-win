@@ -12,7 +12,7 @@ use core::fmt;
 use wdk_sys::LIST_ENTRY;
 
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::state::CacheStreamLease;
+use crate::state::{FileObjectCacheLease, StreamCacheLease};
 
 #[cfg(not(test))]
 use crate::kernel::{fatal::KernelWideInconsistency, ffi};
@@ -34,7 +34,7 @@ pub(crate) enum CacheWork {
     /// Read cached bytes into a system-addressable top-level IRP mapping.
     Read {
         /// Stream retained independently from the handle CCB.
-        stream: CacheStreamLease,
+        file_object: FileObjectCacheLease,
         /// Signed Windows byte offset validated before worker submission.
         offset: i64,
         /// Maximum transfer byte count.
@@ -45,7 +45,7 @@ pub(crate) enum CacheWork {
     /// Accept one within-EOF write into Cache Manager.
     Write {
         /// Stream retained independently from the handle CCB.
-        stream: CacheStreamLease,
+        file_object: FileObjectCacheLease,
         /// Signed Windows byte offset validated before worker submission.
         offset: i64,
         /// Readable system mapping retained by the suspended IRP.
@@ -56,17 +56,17 @@ pub(crate) enum CacheWork {
     /// Flush every dirty cached page for one stream.
     Flush {
         /// Stream retained through flush completion.
-        stream: CacheStreamLease,
+        stream: StreamCacheLease,
     },
     /// Flush and purge one stream before direct or size-changing I/O.
     Purge {
         /// Stream retained through the coherency boundary.
-        stream: CacheStreamLease,
+        stream: StreamCacheLease,
     },
     /// Release one FILE_OBJECT's private cache map.
     Uninitialize {
         /// Stream and FILE_OBJECT identity retained through uninitialization.
-        stream: CacheStreamLease,
+        file_object: FileObjectCacheLease,
     },
 }
 
@@ -88,13 +88,13 @@ pub(crate) enum CacheWorkCompletion {
 impl CacheWork {
     /// Builds one cached read after range, mapping, and stream lease capture.
     pub(crate) const fn read(
-        stream: CacheStreamLease,
+        file_object: FileObjectCacheLease,
         offset: i64,
         length: usize,
         output: Option<NonNull<u8>>,
     ) -> Self {
         Self::Read {
-            stream,
+            file_object,
             offset,
             length,
             output,
@@ -103,13 +103,13 @@ impl CacheWork {
 
     /// Builds one within-EOF cached write after range, mapping, and stream lease capture.
     pub(crate) const fn write(
-        stream: CacheStreamLease,
+        file_object: FileObjectCacheLease,
         offset: i64,
         input: Option<NonNull<u8>>,
         length: usize,
     ) -> Self {
         Self::Write {
-            stream,
+            file_object,
             offset,
             input,
             length,
@@ -117,39 +117,39 @@ impl CacheWork {
     }
 
     /// Builds one stream flush.
-    pub(crate) const fn flush(stream: CacheStreamLease) -> Self {
+    pub(crate) const fn flush(stream: StreamCacheLease) -> Self {
         Self::Flush { stream }
     }
 
     /// Builds one stream coherency flush/purge.
-    pub(crate) const fn purge(stream: CacheStreamLease) -> Self {
+    pub(crate) const fn purge(stream: StreamCacheLease) -> Self {
         Self::Purge { stream }
     }
 
     /// Builds one FILE_OBJECT cache-map uninitialization.
-    pub(crate) const fn uninitialize(stream: CacheStreamLease) -> Self {
-        Self::Uninitialize { stream }
+    pub(crate) const fn uninitialize(file_object: FileObjectCacheLease) -> Self {
+        Self::Uninitialize { file_object }
     }
 
     /// Executes the sole native Cc/MM call selected before the actor suspended.
     pub(super) fn execute(self) -> CacheWorkCompletion {
         match self {
             Self::Read {
-                stream,
+                file_object,
                 offset,
                 length,
                 output,
-            } => CacheWorkCompletion::Read(stream.read(offset, length, output)),
+            } => CacheWorkCompletion::Read(file_object.read(offset, length, output)),
             Self::Write {
-                stream,
+                file_object,
                 offset,
                 input,
                 length,
-            } => CacheWorkCompletion::Write(stream.write(offset, input, length)),
+            } => CacheWorkCompletion::Write(file_object.write(offset, input, length)),
             Self::Flush { stream } => CacheWorkCompletion::Flush(stream.flush()),
             Self::Purge { stream } => CacheWorkCompletion::Purge(stream.purge()),
-            Self::Uninitialize { stream } => {
-                CacheWorkCompletion::Uninitialize(stream.uninitialize())
+            Self::Uninitialize { file_object } => {
+                CacheWorkCompletion::Uninitialize(file_object.uninitialize())
             }
         }
     }

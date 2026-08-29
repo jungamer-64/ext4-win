@@ -2032,7 +2032,8 @@ impl FlushRequestOperation {
             };
             match crate::state::OpenedFileObject::decode(file_object)? {
                 crate::state::OpenedFileObject::Node(_) => access
-                    .acquire_cache_stream_lease(file_object)
+                    .acquire_file_object_cache_lease(file_object)
+                    .map(crate::state::FileObjectCacheLease::into_stream)
                     .map(crate::irp::CacheWork::flush)
                     .map(Some),
                 crate::state::OpenedFileObject::Volume(_) => Ok(None),
