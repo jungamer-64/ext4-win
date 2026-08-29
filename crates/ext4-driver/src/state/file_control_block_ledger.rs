@@ -296,12 +296,12 @@ impl Drop for PreparedStreamSizeChange {
     }
 }
 
-/// Exact regular-file stream retained before a cleanup namespace deletion calls Cc/MM.
+/// Exact regular-file stream retained before a namespace deletion calls Cc/MM.
 #[derive(Debug)]
 pub(crate) struct StreamDeletionLease {
     /// Shared stream retained independently from the cleaned-up handle.
     stream: StreamCacheLease,
-    /// Typed inode identity fixed by the cleanup deletion state machine.
+    /// Typed inode identity fixed by the deletion state machine.
     node: NodeId,
 }
 
@@ -320,7 +320,7 @@ impl StreamDeletionLease {
     }
 }
 
-/// Successful stream-deletion gate retained through durable unlink publication.
+/// Successful stream-deletion gate retained through disposition publication or durable unlink.
 #[derive(Debug)]
 pub(crate) struct PreparedStreamDeletion {
     /// Stream lease released only after the native gate is ended.
@@ -333,6 +333,11 @@ impl PreparedStreamDeletion {
     /// Returns the exact inode excluded from a weaker size-change gate.
     pub(crate) const fn node(&self) -> NodeId {
         self.node
+    }
+
+    /// Returns whether this native gate authorizes the exact FCB/node pair.
+    pub(crate) fn authorizes(&self, fcb: NonNull<FileControlBlock>, node: NodeId) -> bool {
+        self.node == node && self.stream.retained.fcb == fcb
     }
 }
 
@@ -1464,10 +1469,10 @@ impl FileControlBlockLedger {
         Ok(expected == prepared.prepared.len())
     }
 
-    /// Retains the exact cleaned-up regular-file stream for native deletion preparation.
+    /// Retains the exact regular-file stream for native deletion preparation.
     ///
     /// Directories and symbolic links cannot own Windows data/image sections and therefore need no
-    /// native gate. A regular-file cleanup FCB must still be the ledger's exact node owner.
+    /// native gate. A regular-file FCB must still be the ledger's exact node owner.
     /// # Errors
     ///
     /// Returns an ownership invariant or finite deferred-lease failure before any Cc/MM call.

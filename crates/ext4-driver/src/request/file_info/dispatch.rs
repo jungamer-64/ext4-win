@@ -21,8 +21,16 @@ pub(crate) fn set(
     request: PendingIrpLease<'_>,
     operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    pending_disposition: &mut Option<PendingDispositionDeletion>,
+    prepared_deletion: Option<&PreparedStreamDeletion>,
 ) -> DriverResult<SetFileResolution> {
-    set_file_information(request, operations, mutation)
+    set_file_information(
+        request,
+        operations,
+        mutation,
+        pending_disposition,
+        prepared_deletion,
+    )
 }
 
 /// Transfers one queued directory-change IRP to the VCB's FsRtl notification list.

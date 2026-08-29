@@ -2792,7 +2792,7 @@ enum MutationOperationState {
         /// Stronger cleanup-deletion gate retained while other streams prepare size changes.
         deletion: Option<crate::state::PreparedStreamDeletion>,
     },
-    /// A cleanup deletion flushes image/data sections outside the actor.
+    /// A disposition or cleanup deletion flushes image/data sections outside the actor.
     PreparingDeletion {
         /// Unique top-level completion authority.
         owned: OwnedIrp,
@@ -2904,6 +2904,8 @@ struct MutationRequestOperation {
     crypto: CngOperation,
     /// Cleanup deletion plan retained across resolve suspension.
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
+    /// Fully allocated disposition state retained while its native preflight runs.
+    disposition_deletion: Option<crate::request::file_info::PendingDispositionDeletion>,
     /// Whether a successful pre-commit write has made abort/replay relevant.
     write_effect_observed: bool,
     /// CLEANUP alone must consume its per-handle terminal barrier before releasing handle state.
@@ -2918,6 +2920,13 @@ struct MutationRequestOperation {
 enum DriverResolveDisposition {
     /// Request completed without staging a filesystem mutation.
     Complete(TopLevelCompletion),
+    /// A regular-file disposition must establish a native deletion gate outside the actor.
+    PrepareDispositionDeletion {
+        /// Stable FCB retained by the pending SET_INFORMATION IRP.
+        fcb: core::ptr::NonNull<crate::state::FileControlBlock>,
+        /// Exact regular-file inode bound to that FCB.
+        node: ext4_core::NodeId,
+    },
     /// Core mutation and corresponding post-commit driver values were staged.
     Mutation(PendingDriverPublication),
 }
@@ -2965,6 +2974,7 @@ impl MutationRequestOperation {
                 request,
                 crypto,
                 cleanup_deletion: None,
+                disposition_deletion: None,
                 write_effect_observed: false,
                 cleanup_barrier_released: false,
                 cleanup_cache_error: None,
@@ -3038,6 +3048,8 @@ impl MutationRequestOperation {
     fn execute_resolve(
         request: &PreparedMutationRequest,
         cleanup_deletion: &mut Option<crate::request::file_info::PendingCleanupDeletion>,
+        disposition_deletion: &mut Option<crate::request::file_info::PendingDispositionDeletion>,
+        prepared_deletion: Option<&crate::state::PreparedStreamDeletion>,
         owned: &mut OwnedIrp,
         operations: &mut crate::state::MountedVolumeAccess<'_>,
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
@@ -3068,10 +3080,19 @@ impl MutationRequestOperation {
                 }
             }
             PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
-                match crate::request::file_info::set(owned.request(), operations, mutation)? {
+                match crate::request::file_info::set(
+                    owned.request(),
+                    operations,
+                    mutation,
+                    disposition_deletion,
+                    prepared_deletion,
+                )? {
                     crate::request::file_info::SetFileResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Normal(completion)),
                     ),
+                    crate::request::file_info::SetFileResolution::PrepareDeletion { fcb, node } => {
+                        Ok(DriverResolveDisposition::PrepareDispositionDeletion { fcb, node })
+                    }
                     crate::request::file_info::SetFileResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
                             PendingDriverPublication::SetFile(publication),
@@ -3251,12 +3272,33 @@ impl MutationRequestOperation {
             match Self::execute_resolve(
                 request,
                 &mut self.cleanup_deletion,
+                &mut self.disposition_deletion,
+                deletion.as_ref(),
                 &mut owned,
                 operations,
                 &mut pass,
             ) {
                 Ok(DriverResolveDisposition::Complete(completion)) => {
                     return self.complete_success(owned, completion);
+                }
+                Ok(DriverResolveDisposition::PrepareDispositionDeletion { fcb, node }) => {
+                    drop(pass);
+                    let stream = match operations.prepare_stream_deletion(fcb, node) {
+                        Ok(Some(stream)) => stream,
+                        Ok(None) => {
+                            return self
+                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                        }
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    self.state = MutationOperationState::PreparingDeletion {
+                        owned,
+                        size_changes,
+                    };
+                    return OperationTransition::SubmitCacheWork {
+                        work: crate::irp::CacheWork::prepare_deletion(stream),
+                        suspended: self,
+                    };
                 }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
                     publication = Some(prepared);
