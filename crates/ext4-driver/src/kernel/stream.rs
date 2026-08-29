@@ -403,26 +403,6 @@ impl StreamContext {
         }
     }
 
-    /// Ensures that this FILE_OBJECT has a private cache map bound to the shared stream sections.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager exception status when initialization fails.
-    pub(crate) fn initialize_cache_map(
-        &self,
-        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
-    ) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The active FILE_OBJECT retains this stream and its shared sections.
-                ext4win_stream_cache_initialize(self.header.as_ptr(), _file_object.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        Ok(())
-    }
-
     /// Copies cached bytes into one system-addressable IRP buffer.
     /// # Errors
     ///
@@ -801,11 +781,6 @@ unsafe extern "system" {
         file_size: i64,
         valid_data_length: i64,
         allocation_charge: i64,
-    ) -> NTSTATUS;
-
-    fn ext4win_stream_cache_initialize(
-        stream_header: wdk_sys::PVOID,
-        file_object: *mut wdk_sys::FILE_OBJECT,
     ) -> NTSTATUS;
 
     fn ext4win_stream_cache_read(

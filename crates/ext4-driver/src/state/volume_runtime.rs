@@ -30,6 +30,11 @@ pub(crate) enum VolumeFailureState {
         /// Exact Cc/MM status returned to the committing IRP and later operations.
         status: NTSTATUS,
     },
+    /// Cache Manager could not establish dirty-page writeback durability.
+    CacheWritebackFailed {
+        /// Exact Cc status returned to this and every later mutation or flush.
+        status: NTSTATUS,
+    },
     /// Lower reads are no longer trustworthy.
     Failed,
 }
@@ -45,7 +50,7 @@ impl VolumeFailureState {
             Self::DegradedReadOnly | Self::RecoveryRequired | Self::Failed => {
                 Err(DriverError::VolumeDismounted)
             }
-            Self::CommittedButUnpublished { status } => {
+            Self::CommittedButUnpublished { status } | Self::CacheWritebackFailed { status } => {
                 Err(DriverError::CacheManagerFailure(status))
             }
         }
@@ -57,7 +62,9 @@ impl VolumeFailureState {
     /// Returns [`DriverError::VolumeDismounted`] when recovery is required or reads are failed.
     pub(crate) fn authorize_read(self) -> DriverResult<()> {
         match self {
-            Self::Operational | Self::DegradedReadOnly => Ok(()),
+            Self::Operational | Self::DegradedReadOnly | Self::CacheWritebackFailed { .. } => {
+                Ok(())
+            }
             Self::RecoveryRequired | Self::Failed => Err(DriverError::VolumeDismounted),
             Self::CommittedButUnpublished { status } => {
                 Err(DriverError::CacheManagerFailure(status))
@@ -72,6 +79,7 @@ impl VolumeFailureState {
             Self::DegradedReadOnly
             | Self::RecoveryRequired
             | Self::CommittedButUnpublished { .. }
+            | Self::CacheWritebackFailed { .. }
             | Self::Failed => self,
         }
     }
@@ -80,7 +88,10 @@ impl VolumeFailureState {
     const fn durability_unknown(self) -> Self {
         match self {
             Self::Operational | Self::DegradedReadOnly => Self::RecoveryRequired,
-            Self::RecoveryRequired | Self::CommittedButUnpublished { .. } | Self::Failed => self,
+            Self::RecoveryRequired
+            | Self::CommittedButUnpublished { .. }
+            | Self::CacheWritebackFailed { .. }
+            | Self::Failed => self,
         }
     }
 
@@ -94,9 +105,21 @@ impl VolumeFailureState {
         match self {
             Self::Failed => Self::Failed,
             Self::CommittedButUnpublished { status } => Self::CommittedButUnpublished { status },
-            Self::Operational | Self::DegradedReadOnly | Self::RecoveryRequired => {
-                Self::CommittedButUnpublished { status }
-            }
+            Self::Operational
+            | Self::DegradedReadOnly
+            | Self::RecoveryRequired
+            | Self::CacheWritebackFailed { .. } => Self::CommittedButUnpublished { status },
+        }
+    }
+
+    /// Preserves the first exact Cache Manager writeback failure as terminal mutation authority.
+    const fn cache_writeback_failed(self, status: NTSTATUS) -> Self {
+        match self {
+            Self::Operational | Self::DegradedReadOnly => Self::CacheWritebackFailed { status },
+            Self::RecoveryRequired
+            | Self::CommittedButUnpublished { .. }
+            | Self::CacheWritebackFailed { .. }
+            | Self::Failed => self,
         }
     }
 }
@@ -488,6 +511,11 @@ impl VolumeRuntime {
         self.failure = self.failure.publication_failed(status);
     }
 
+    /// Records the exact dirty-page writeback failure returned by Cache Manager.
+    pub(crate) fn record_cache_writeback_failure(&mut self, status: NTSTATUS) {
+        self.failure = self.failure.cache_writeback_failed(status);
+    }
+
     /// Current volume identity from the selected immutable epoch.
     pub(crate) fn identity(&self) -> ext4_core::VolumeIdentity {
         self.current_epoch().identity()
@@ -596,6 +624,26 @@ mod tests {
         assert_eq!(
             publication.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
             publication
+        );
+        let writeback =
+            VolumeFailureState::Operational.cache_writeback_failed(publication_status);
+        assert_eq!(writeback.authorize_read(), Ok(()));
+        assert_eq!(
+            writeback.authorize_mutation(),
+            Err(crate::kernel::status::DriverError::CacheManagerFailure(
+                publication_status
+            ))
+        );
+        assert_eq!(
+            writeback.cache_writeback_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
+            writeback
+        );
+        assert_eq!(writeback.durability_unknown(), writeback);
+        assert_eq!(
+            writeback.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
+            VolumeFailureState::CommittedButUnpublished {
+                status: wdk_sys::STATUS_INSUFFICIENT_RESOURCES,
+            }
         );
     }
 

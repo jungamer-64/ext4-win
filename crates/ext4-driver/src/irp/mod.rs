@@ -18,6 +18,7 @@ use crate::state::{
 use crate::wire::{LittleEndianInput, WireOffset};
 
 mod buffer;
+mod cache;
 mod cancel;
 mod capture;
 mod completion;
@@ -32,6 +33,7 @@ mod stack;
 
 pub(crate) use buffer::*;
 use buffer::{mdl_data_buffer_address, stack_flag};
+pub(crate) use cache::{CacheWork, CacheWorkCompletion};
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRead, PreparedRequest,

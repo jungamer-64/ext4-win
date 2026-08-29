@@ -419,15 +419,13 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
         Ok(device_kind) => device_kind,
         Err(error) => return received.complete_result(Err(error)),
     };
-    if device_kind == DriverDeviceKind::MountedVolume {
-        if major == DispatchMajor::FileSystemControl {
-            match received.with_active(super::file_info::oplock_control) {
-                Ok(Some(file_control_block)) => {
-                    return received.delegate_oplock(file_control_block);
-                }
-                Ok(None) => {}
-                Err(error) => return received.complete_result(Err(error)),
+    if device_kind == DriverDeviceKind::MountedVolume && major == DispatchMajor::FileSystemControl {
+        match received.with_active(super::file_info::oplock_control) {
+            Ok(Some(file_control_block)) => {
+                return received.delegate_oplock(file_control_block);
             }
+            Ok(None) => {}
+            Err(error) => return received.complete_result(Err(error)),
         }
     }
     match dispatch_policy(device_kind, major) {

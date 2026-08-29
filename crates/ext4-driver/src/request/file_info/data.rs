@@ -1,6 +1,7 @@
 //! Cached, direct, and windowed file-data transfer protocols.
 
 use super::*;
+use crate::{irp::CacheWork, state::DataTransferMode};
 
 /// Maximum requestor data bytes copied through driver-owned memory at one time.
 const MAX_DATA_TRANSFER_WINDOW_BYTES: usize = 65_536;
@@ -12,6 +13,40 @@ pub(crate) enum RegularFileDataAuthority {
     Handle,
     /// Paging I/O owns an FCB ledger lease independent of handle-local cleanup state.
     Paging(PagingStreamLease),
+}
+
+/// Cache work selected for one admitted regular-file read.
+#[derive(Debug)]
+pub(crate) enum ReadCachePlan {
+    /// Cached bytes will complete the request after worker return.
+    Cached {
+        /// Sole Cc operation executed outside the actor.
+        work: CacheWork,
+        /// Range start used for synchronous cursor publication.
+        start: FileOffset,
+        /// Maximum worker transfer validated before submission.
+        requested: usize,
+    },
+    /// A direct handle must first flush and purge any shared cached state.
+    PurgeBeforeDirect(CacheWork),
+    /// Paging I/O already uses its independent stream authority and bypasses handle cache policy.
+    Direct,
+}
+
+/// Cache work selected for one admitted regular-file write.
+#[derive(Debug)]
+pub(crate) enum WriteCachePlan {
+    /// A within-EOF write will complete when Cache Manager accepts every byte.
+    Cached {
+        /// Sole cache call executed outside the actor.
+        work: CacheWork,
+        /// Infallible cursor and byte-count publication prepared before cache acceptance.
+        publication: PreparedWritePublication,
+    },
+    /// Direct, write-through, append, or extending I/O first establishes cache coherency.
+    PurgeBeforeDirect(CacheWork),
+    /// Paging writeback uses its independent stream lease and journal path directly.
+    Direct,
 }
 
 /// Captures the exact stream authority required by one regular-file data IRP.
@@ -31,6 +66,178 @@ pub(crate) fn prepare_regular_file_data_authority(
                 .map(RegularFileDataAuthority::Paging)
         }
     })
+}
+
+/// Selects cached read completion or a coherency purge before the direct path.
+/// # Errors
+///
+/// Returns a range, mapping, byte-lock, stream-lease, or FILE_OBJECT failure before worker
+/// submission.
+pub(crate) fn prepare_read_cache_plan(
+    mut request: PendingIrpLease<'_>,
+    authority: &RegularFileDataAuthority,
+    access: &MountedVolumeAccess<'_>,
+) -> DriverResult<ReadCachePlan> {
+    if matches!(authority, RegularFileDataAuthority::Paging(_)) {
+        return Ok(ReadCachePlan::Direct);
+    }
+    let stack = request.prepared_read()?.stack();
+    let output = request.prepared_read()?.output_address();
+    request.with_active(|active| {
+        if active.data_io_kind() != DataIoKind::Handle {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let file_object = active.current_stack()?.file_object()?;
+        let opened = OpenedRegularFile::decode(file_object)?;
+        let range = ResolvedFileRange::new(
+            resolve_read_start(&opened, DataIoKind::Handle, stack.starting_point())?,
+            stack.length().as_usize(),
+        )?;
+        let stream = access.acquire_cache_stream_lease(file_object)?;
+        if matches!(opened.data_transfer_mode(), DataTransferMode::Direct(_)) {
+            return Ok(ReadCachePlan::PurgeBeforeDirect(CacheWork::purge(stream)));
+        }
+        if !stack.length().is_empty()
+            && !opened.file_control_block().permits_byte_range_read(
+                active.requestor_process()?,
+                opened.file_object(),
+                range.start(),
+                range.length(),
+                stack.key(),
+            )?
+        {
+            return Err(DriverError::FileLockConflict);
+        }
+        let eof = u64::try_from(opened.file_control_block().stream_sizes()?.file_size())
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        let available = eof.saturating_sub(range.start().bytes());
+        let requested = core::cmp::min(
+            range.length(),
+            usize::try_from(available).unwrap_or(usize::MAX),
+        );
+        let offset =
+            i64::try_from(range.start().bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(ReadCachePlan::Cached {
+            work: CacheWork::read(stream, offset, requested, output),
+            start: range.start(),
+            requested,
+        })
+    })
+}
+
+/// Publishes a successful cached read after the worker has released every Cc resource.
+/// # Errors
+///
+/// Returns the exact worker failure or a retained FILE_OBJECT invariant failure.
+pub(crate) fn finish_cached_read(
+    mut request: PendingIrpLease<'_>,
+    start: FileOffset,
+    requested: usize,
+    result: DriverResult<usize>,
+) -> DriverResult<IrpCompletion> {
+    let transferred = result?;
+    if transferred > requested {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    let publication = request.with_active(|active| {
+        let file_object = active.current_stack()?.file_object()?;
+        OpenedRegularFile::decode(file_object)?.prepare_current_file_position_update(
+            DataIoKind::Handle,
+            start,
+            transferred,
+        )
+    })?;
+    publication.publish();
+    IrpCompletion::from_usize(transferred)
+}
+
+/// Selects cached acceptance or a coherency purge before the journaled write path.
+/// # Errors
+///
+/// Returns an access, range, buffer, byte-lock, stream-size, or stream-lease failure before any
+/// Cache Manager effect is submitted.
+pub(crate) fn prepare_write_cache_plan(
+    mut request: PendingIrpLease<'_>,
+    authority: &RegularFileDataAuthority,
+    access: &MountedVolumeAccess<'_>,
+) -> DriverResult<WriteCachePlan> {
+    if matches!(authority, RegularFileDataAuthority::Paging(_)) {
+        return Ok(WriteCachePlan::Direct);
+    }
+    let prepared = request.prepared_write()?;
+    let stack = prepared.stack();
+    let input = prepared.input_address();
+    request.with_active(|active| {
+        if active.data_io_kind() != DataIoKind::Handle {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let file_object = active.current_stack()?.file_object()?;
+        let opened = OpenedRegularFile::decode(file_object)?;
+        let selected = select_write_start(
+            opened.write_access(),
+            DataIoKind::Handle,
+            stack.starting_point(),
+        )?;
+        let eof = u64::try_from(opened.file_control_block().stream_sizes()?.file_size())
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        let start = match selected {
+            SelectedWriteStart::Absolute(start) => start,
+            SelectedWriteStart::CurrentFilePosition => opened.current_file_position()?,
+            SelectedWriteStart::EndOfFile => FileOffset::from_bytes(eof),
+        };
+        let range = ResolvedFileRange::new(start, stack.length().as_usize())?;
+        let mode = opened.data_transfer_mode();
+        mode.validate_range(range.start().bytes(), range.length())?;
+        if !stack.length().is_empty() {
+            mode.validate_buffer(input.ok_or(DriverError::InternalInvariantViolation)?)?;
+            if !opened.file_control_block().permits_byte_range_write(
+                active.requestor_process()?,
+                opened.file_object(),
+                range.start(),
+                range.length(),
+                stack.key(),
+            )? {
+                return Err(DriverError::FileLockConflict);
+            }
+        }
+        let stream = access.acquire_cache_stream_lease(file_object)?;
+        let end = range.start().checked_add_len(range.length())?.bytes();
+        let write_through = file_object.as_ref().Flags & wdk_sys::FO_WRITE_THROUGH != 0;
+        if matches!(selected, SelectedWriteStart::EndOfFile)
+            || matches!(mode, DataTransferMode::Direct(_))
+            || write_through
+            || end > eof
+        {
+            return Ok(WriteCachePlan::PurgeBeforeDirect(CacheWork::purge(stream)));
+        }
+        let offset =
+            i64::try_from(range.start().bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        let completion = IrpCompletion::from_usize(range.length())?;
+        let position = opened.prepare_current_file_position_update(
+            DataIoKind::Handle,
+            range.start(),
+            range.length(),
+        )?;
+        Ok(WriteCachePlan::Cached {
+            work: CacheWork::write(stream, offset, input, range.length()),
+            publication: PreparedWritePublication {
+                completion,
+                position,
+            },
+        })
+    })
+}
+
+/// Publishes cached-write completion only after Cache Manager accepted the exact prepared range.
+/// # Errors
+///
+/// Returns the exact Cache Manager failure without publishing a successful cursor or byte count.
+pub(crate) fn finish_cached_write(
+    publication: PreparedWritePublication,
+    result: DriverResult<()>,
+) -> DriverResult<IrpCompletion> {
+    result?;
+    Ok(publication.publish())
 }
 
 /// One non-empty, bounded interval selected from a pending data-transfer IRP.
