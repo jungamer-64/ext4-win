@@ -14,8 +14,8 @@ use wdk_sys::LIST_ENTRY;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
     CompletedVolumeLockStreamDrain, FileObjectCacheLease, PreparedStreamDeletion,
-    PreparedStreamSizeChange, StreamCacheLease, StreamDeletionLease, StreamSizeChangeLease,
-    VolumeLockStreamDrainLease,
+    PreparedStreamSizeChange, PreparedStreamWriteOpen, StreamCacheLease, StreamDeletionLease,
+    StreamSizeChangeLease, StreamWriteOpenLease, VolumeLockStreamDrainLease,
 };
 
 #[cfg(not(test))]
@@ -82,6 +82,11 @@ pub(crate) enum CacheWork {
         /// Exact cleaned-up stream retained independently from its handle.
         stream: StreamDeletionLease,
     },
+    /// Establish one image-section gate for an existing regular-file write-open.
+    PrepareWriteOpen {
+        /// Exact resident stream retained independently from the pending create handle.
+        stream: StreamWriteOpenLease,
+    },
     /// Release one FILE_OBJECT's private cache map.
     Uninitialize {
         /// Stream and FILE_OBJECT identity retained through uninitialization.
@@ -106,6 +111,8 @@ pub(crate) enum CacheWorkCompletion {
     PrepareSizeChange(DriverResult<PreparedStreamSizeChange>),
     /// Native deletion gate acquisition status and release authority.
     PrepareDeletion(DriverResult<PreparedStreamDeletion>),
+    /// Native write-open gate acquisition status and release authority.
+    PrepareWriteOpen(DriverResult<PreparedStreamWriteOpen>),
     /// Private cache-map uninitialization status.
     Uninitialize(DriverResult<()>),
 }
@@ -166,6 +173,11 @@ impl CacheWork {
         Self::PrepareDeletion { stream }
     }
 
+    /// Builds one existing write-open image-section gate.
+    pub(crate) const fn prepare_write_open(stream: StreamWriteOpenLease) -> Self {
+        Self::PrepareWriteOpen { stream }
+    }
+
     /// Builds one FILE_OBJECT cache-map uninitialization.
     pub(crate) const fn uninitialize(file_object: FileObjectCacheLease) -> Self {
         Self::Uninitialize { file_object }
@@ -197,6 +209,9 @@ impl CacheWork {
             Self::PrepareDeletion { stream } => {
                 CacheWorkCompletion::PrepareDeletion(stream.execute())
             }
+            Self::PrepareWriteOpen { stream } => {
+                CacheWorkCompletion::PrepareWriteOpen(stream.execute())
+            }
             Self::Uninitialize { file_object } => {
                 CacheWorkCompletion::Uninitialize(file_object.uninitialize())
             }
@@ -213,6 +228,7 @@ impl CacheWork {
             Self::DrainForVolumeLock { .. } => CacheWorkCompletion::DrainForVolumeLock(Err(error)),
             Self::PrepareSizeChange { .. } => CacheWorkCompletion::PrepareSizeChange(Err(error)),
             Self::PrepareDeletion { .. } => CacheWorkCompletion::PrepareDeletion(Err(error)),
+            Self::PrepareWriteOpen { .. } => CacheWorkCompletion::PrepareWriteOpen(Err(error)),
             Self::Uninitialize { .. } => CacheWorkCompletion::Uninitialize(Err(error)),
         }
     }

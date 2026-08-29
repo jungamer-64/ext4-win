@@ -623,6 +623,49 @@ impl StreamContext {
         }
     }
 
+    /// Flushes an executable image and blocks new section acquisition through write-open publish.
+    /// # Errors
+    ///
+    /// Returns sharing-violation while an executable image cannot be removed, or the exact native
+    /// synchronization failure.
+    pub(crate) fn begin_write_open(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live stream and the caller retains it through gate release.
+                ext4win_stream_begin_write_open(self.header.as_ptr())
+            };
+            if status == wdk_sys::STATUS_SHARING_VIOLATION {
+                Err(DriverError::ShareAccessConflict)
+            } else {
+                cache_status(status)
+            }
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Releases one successfully acquired write-open section gate.
+    /// # Errors
+    ///
+    /// Returns an invariant native status if no matching write-open gate remains active.
+    pub(crate) fn end_write_open(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The matching successful begin call retained this same stream identity.
+                ext4win_stream_end_write_open(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
     /// Releases this FILE_OBJECT's private cache map without destroying shared stream sections.
     /// # Errors
     ///
@@ -927,6 +970,10 @@ unsafe extern "system" {
     fn ext4win_stream_begin_delete(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_end_delete(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
+    fn ext4win_stream_begin_write_open(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
+    fn ext4win_stream_end_write_open(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_cache_uninitialize(
         stream_header: wdk_sys::PVOID,

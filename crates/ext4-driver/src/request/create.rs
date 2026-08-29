@@ -15,7 +15,7 @@ use crate::{
         CreateTransferBuffering, ExistingOperationAccess, GrantedAccess, PendingIrpLease,
         RegularFileWriteAccess, ShareAccess,
     },
-    kernel::status::{DriverError, DriverResult},
+    kernel::status::{DriverError, DriverResult, STATUS_RETRY},
     memory::{self, DriverVec},
     request::{
         ea::CreateEa,
@@ -25,11 +25,11 @@ use crate::{
     },
     state::{
         ChildCreationTarget, DataTransferMode, DirectoryChange, DirectoryChangeAction,
-        FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeAccess,
-        NoIntermediateTransfer, NodeStreamSizes, OpenedHandle, OpenedLocation, OpenedNodeMode,
-        OpenedObject, OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion,
-        RawVolumeAccess, UninitializedFileObject, VolumeControlBlock, WriteCommitment,
-        abandon_file_control_block,
+        ExistingStreamResidency, FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject,
+        MountedVolumeAccess, NoIntermediateTransfer, NodeStreamSizes, OpenedHandle, OpenedLocation,
+        OpenedNodeMode, OpenedObject, OpenedVolumeHandle, PendingChildCreation,
+        PendingFileDeletion, PreparedStreamWriteOpen, RawVolumeAccess, UninitializedFileObject,
+        VolumeControlBlock, WriteCommitment, abandon_file_control_block,
     },
 };
 
@@ -46,13 +46,25 @@ pub(crate) fn execute(
     request: PendingIrpLease<'_>,
     operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    pending_existing: &mut Option<PendingExistingCreateOpen>,
+    prepared_write_open: Option<&PreparedStreamWriteOpen>,
 ) -> DriverResult<CreateResolution> {
+    if pending_existing.is_some() {
+        return resume_existing_open(
+            request,
+            operations,
+            mutation,
+            pending_existing,
+            prepared_write_open,
+        );
+    }
     let mounted_volume = operations.file_object_owner();
     open_or_create(
         PreparedCreateRequest::decode(request, mounted_volume)?,
         mounted_volume,
         operations,
         mutation,
+        pending_existing,
     )
 }
 
@@ -61,6 +73,13 @@ pub(crate) fn execute(
 pub(crate) enum CreateResolution {
     /// No filesystem mutation was staged and the create may complete immediately.
     Complete(CreateCompletion),
+    /// A resident regular-file write-open must flush its executable image outside the actor.
+    PrepareWriteOpen {
+        /// Exact FCB whose provisional share claim retains the stream.
+        fcb: NonNull<FileControlBlock>,
+        /// Exact regular-file inode resolved by create.
+        node: NodeId,
+    },
     /// A missing child was staged and every driver publication value was preallocated.
     Mutation(Box<PendingCreatePublication>),
 }
@@ -333,6 +352,7 @@ fn open_or_create(
     mounted_volume: NonNull<VolumeControlBlock>,
     operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    pending_existing: &mut Option<PendingExistingCreateOpen>,
 ) -> DriverResult<CreateResolution> {
     let PreparedCreateRequest {
         mut owner,
@@ -378,9 +398,8 @@ fn open_or_create(
                 },
                 operations,
                 mutation,
+                pending_existing,
             )
-            .map(CreateCompletion::Handle)
-            .map(CreateResolution::Complete)
         }
         CreateTargetLookup::Missing { parent, name } => {
             let requirement = owner.parameters().target_requirement();
@@ -416,8 +435,8 @@ fn open_or_create(
                 location,
                 target,
                 stream_sizes,
-            )
-            .map(CreateCompletion::Handle)
+            )?
+            .publish(None, operations)
             .map(CreateResolution::Complete)
         }
         CreateTargetLookup::ReparseSymlink {
@@ -541,7 +560,7 @@ enum TargetDirectoryLeaf {
 }
 
 /// Per-handle policy decoded from one create/open request.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CreateHandlePolicy {
     /// Access explicitly requested for the returned handle.
     granted_access: GrantedAccess,
@@ -923,6 +942,266 @@ struct ExistingNodeTarget {
     location: OpenedLocation,
 }
 
+/// Native image-section work required before an existing handle claim may be published.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingWriteOpenRequirement {
+    /// No older stream existed, or the requested handle has no regular-file data-write authority.
+    NotRequired,
+    /// A resident regular-file stream must exclude an executable image before attachment.
+    FlushImageSection,
+}
+
+impl ExistingWriteOpenRequirement {
+    /// Selects the native gate for an already classified regular-file admission.
+    const fn for_regular_file(
+        write_access: RegularFileWriteAccess,
+        residency: ExistingStreamResidency,
+    ) -> Self {
+        match (write_access, residency) {
+            (
+                RegularFileWriteAccess::AppendOnly | RegularFileWriteAccess::Positional,
+                ExistingStreamResidency::Resident,
+            ) => Self::FlushImageSection,
+            (RegularFileWriteAccess::Denied, _)
+            | (
+                RegularFileWriteAccess::AppendOnly | RegularFileWriteAccess::Positional,
+                ExistingStreamResidency::FirstOpen,
+            ) => Self::NotRequired,
+        }
+    }
+}
+
+/// Fully allocated existing-node open retained while an image-section check runs outside the actor.
+#[derive(Debug)]
+pub(crate) struct PendingExistingCreateOpen {
+    /// Rollback-owning FCB reference and provisional share claim.
+    claim: PendingFileControlBlockClaim,
+    /// Exact inode resolved before the native call.
+    node: NodeId,
+    /// Reparse interpretation selected for the handle.
+    node_mode: OpenedNodeMode,
+    /// Separately owned namespace identity used for post-worker revalidation.
+    validation_location: OpenedLocation,
+    /// Complete authorized handle policy fixed before the native call.
+    policy: CreateHandlePolicy,
+    /// Fully allocated per-handle context consumed only by FILE_OBJECT attachment.
+    handle: Box<OpenedHandle>,
+    /// Optional prevalidated delete-on-close publication.
+    pending_deletion: Option<PendingFileDeletion>,
+    /// Windows create information returned after successful attachment.
+    action: CreateAction,
+    /// Whether native image-section exclusion is required for this exact claim.
+    write_open: ExistingWriteOpenRequirement,
+}
+
+impl PendingExistingCreateOpen {
+    /// Allocates and admits every resource needed before any MM call can occur.
+    /// # Errors
+    ///
+    /// Returns allocation, FILE_OBJECT validation, FCB admission, share, or oplock errors.
+    fn prepare(
+        request: &mut AuthorizedCreateCompletionOwner<'_>,
+        target: ExistingNodeTarget,
+        stream_sizes: NodeStreamSizes,
+        policy: CreateHandlePolicy,
+        pending_deletion: Option<PendingFileDeletion>,
+        action: CreateAction,
+    ) -> DriverResult<Self> {
+        let ExistingNodeTarget {
+            volume,
+            node,
+            node_mode,
+            location,
+        } = target;
+        if stream_sizes.node() != node {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let validation_location = location.try_to_owned_location()?;
+        let handle = memory::boxed_try_with(|| {
+            OpenedHandle::new(
+                node,
+                node_mode,
+                location,
+                policy.handle_deletion(),
+                policy.data_transfer_mode(),
+                policy.regular_file_write_access(),
+            )
+        })?;
+        let file_object =
+            request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
+        let admission = VolumeControlBlock::open_existing_file_control_block(
+            volume,
+            stream_sizes,
+            file_object,
+            policy.granted_access(),
+            policy.existing_operation_access(),
+            policy.share_access(),
+            policy.oplock_policy(),
+        )?;
+        let write_open = match node {
+            NodeId::File(_) => ExistingWriteOpenRequirement::for_regular_file(
+                policy.regular_file_write_access(),
+                admission.residency(),
+            ),
+            NodeId::Directory(_) | NodeId::Symlink(_) => ExistingWriteOpenRequirement::NotRequired,
+        };
+        Ok(Self {
+            claim: PendingFileControlBlockClaim {
+                fcb: admission.file_control_block(),
+                file_object,
+            },
+            node,
+            node_mode,
+            validation_location,
+            policy,
+            handle,
+            pending_deletion,
+            action,
+            write_open,
+        })
+    }
+
+    /// Returns the exact resident stream that needs native image-section exclusion.
+    fn write_open_target(&self) -> Option<(NonNull<FileControlBlock>, NodeId)> {
+        match self.write_open {
+            ExistingWriteOpenRequirement::NotRequired => None,
+            ExistingWriteOpenRequirement::FlushImageSection => {
+                Some((self.claim.file_control_block(), self.node))
+            }
+        }
+    }
+
+    /// Publishes the provisional claim after validating the matching native gate, when required.
+    /// # Errors
+    ///
+    /// Returns an invariant error unless the supplied gate matches this exact FCB and inode.
+    fn publish(
+        self,
+        gate: Option<&PreparedStreamWriteOpen>,
+        operations: &mut MountedVolumeAccess<'_>,
+    ) -> DriverResult<CreateCompletion> {
+        match (self.write_open, gate) {
+            (ExistingWriteOpenRequirement::NotRequired, None) => {}
+            (ExistingWriteOpenRequirement::FlushImageSection, Some(gate))
+                if gate.authorizes(self.claim.file_control_block(), self.node) => {}
+            (ExistingWriteOpenRequirement::NotRequired, Some(_))
+            | (ExistingWriteOpenRequirement::FlushImageSection, None | Some(_)) => {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+        }
+        let Self {
+            claim,
+            handle,
+            policy,
+            pending_deletion,
+            action,
+            ..
+        } = self;
+        let (fcb, file_object) = claim.consume();
+        publish_node_stream_raw(file_object, fcb, handle, policy.file_object_flags());
+        if let Some(pending) = pending_deletion {
+            operations.set_file_delete_pending(fcb, pending);
+        }
+        Ok(CreateCompletion::Handle(action))
+    }
+}
+
+/// Resumes an existing-node create after its native write-open gate completed.
+/// # Errors
+///
+/// Returns security, namespace, reparse, or exact-gate validation failures. A stale namespace or
+/// reparse projection returns the private retry status so operation ownership can restart cleanly.
+fn resume_existing_open(
+    mut request: PendingIrpLease<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
+    read: &mut impl CommittedReadPass,
+    pending_existing: &mut Option<PendingExistingCreateOpen>,
+    prepared_write_open: Option<&PreparedStreamWriteOpen>,
+) -> DriverResult<CreateResolution> {
+    let pending = pending_existing
+        .as_ref()
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    let (device, parameters, file_object) = request.with_active(|active| {
+        let current = active.current_stack()?;
+        let file_object = current.file_object()?;
+        let stack = current.create()?;
+        let parameters = stack.parameters();
+        parameters.validate_supported_flags()?;
+        let file_object = UninitializedFileObject::decode(file_object)?;
+        Ok::<_, DriverError>((
+            active.device(),
+            parameters,
+            file_object.kernel_file_object(),
+        ))
+    })?;
+    if file_object != pending.claim.file_object() {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    operations.authorize_create()?;
+    operations.ensure_node_openable(pending.node)?;
+    revalidate_existing_open(pending, read)?;
+    let owner = CreateCompletionOwner {
+        request,
+        parameters,
+        device,
+    };
+    let owner = owner.authorize_existing(pending.node, read)?;
+    let current_policy =
+        CreateHandlePolicy::from_authorized(parameters, owner.granted_access(), device)?;
+    if current_policy != pending.policy {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    if let Some(deletion) = pending.pending_deletion.as_ref() {
+        crate::request::file_info::validate_pending_deletion(
+            read,
+            pending.node,
+            deletion.target_ref(),
+            crate::request::file_info::DeleteReadonlyPolicy::Enforce,
+        )?;
+    }
+    let pending = pending_existing
+        .take()
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    pending
+        .publish(prepared_write_open, operations)
+        .map(CreateResolution::Complete)
+}
+
+/// Revalidates the exact namespace identity and reparse interpretation without allocating.
+/// # Errors
+///
+/// Returns storage or metadata errors, or the private retry status when identity changed.
+fn revalidate_existing_open(
+    pending: &PendingExistingCreateOpen,
+    read: &mut impl CommittedReadPass,
+) -> DriverResult<()> {
+    let location_matches = match &pending.validation_location {
+        OpenedLocation::Root => {
+            let _root = read.load_directory(DirectoryNodeId::ROOT)?;
+            pending.node == NodeId::Directory(DirectoryNodeId::ROOT)
+        }
+        OpenedLocation::DirectoryEntry { parent, name } => {
+            let parent = read.load_directory(*parent)?;
+            matches!(
+                read.lookup_child(&parent, name)?,
+                ChildLookup::Found(child) if *child.node() == pending.node
+            )
+        }
+        OpenedLocation::FileReference => {
+            read.load_node_by_file_index(pending.node.file_index())? == pending.node
+        }
+    };
+    let current_mode = if NodeSymlinkReparsePoint::load(read, pending.node)?.is_some() {
+        OpenedNodeMode::ReparsePoint
+    } else {
+        OpenedNodeMode::Direct
+    };
+    if !location_matches || current_mode != pending.node_mode {
+        return Err(DriverError::CacheManagerFailure(STATUS_RETRY));
+    }
+    Ok(())
+}
+
 /// Opens an existing path according to the requested disposition and options.
 /// # Errors
 ///
@@ -934,13 +1213,9 @@ fn open_existing_node(
     target: ExistingNodeTarget,
     operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
-) -> DriverResult<CreateAction> {
-    let ExistingNodeTarget {
-        volume,
-        node,
-        node_mode,
-        location,
-    } = target;
+    pending_existing: &mut Option<PendingExistingCreateOpen>,
+) -> DriverResult<CreateResolution> {
+    let node = target.node;
     let parameters = request.parameters();
     let policy = CreateHandlePolicy::from_authorized(
         parameters,
@@ -950,25 +1225,26 @@ fn open_existing_node(
     match disposition {
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
-            let pending = prepare_create_deletion(policy, node, &location, read)?;
+            let pending = prepare_create_deletion(policy, node, &target.location, read)?;
             let stream_sizes = NodeStreamSizes::try_from_storage(
                 read.load_node_storage(node)?,
                 operations.volume_geometry().cluster_size(),
             )?;
-            let fcb = request.with_file_object(|file_object| {
-                initialize_file_object(
-                    file_object,
-                    volume,
-                    stream_sizes,
-                    node_mode,
-                    location,
-                    policy,
-                )
-            })?;
-            if let Some(pending) = pending {
-                operations.set_file_delete_pending(fcb, pending);
+            let pending = PendingExistingCreateOpen::prepare(
+                request,
+                target,
+                stream_sizes,
+                policy,
+                pending,
+                CreateAction::Opened,
+            )?;
+            if let Some((fcb, node)) = pending.write_open_target() {
+                *pending_existing = Some(pending);
+                return Ok(CreateResolution::PrepareWriteOpen { fcb, node });
             }
-            Ok(CreateAction::Opened)
+            pending
+                .publish(None, operations)
+                .map(CreateResolution::Complete)
         }
         CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
         CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
@@ -1065,7 +1341,7 @@ fn open_target_directory(
     location: OpenedLocation,
     target: TargetDirectoryLeaf,
     stream_sizes: NodeStreamSizes,
-) -> DriverResult<CreateAction> {
+) -> DriverResult<PendingExistingCreateOpen> {
     if !create_ea.is_empty() || request.parameters().disposition() != CreateDisposition::Open {
         return Err(DriverError::InvalidParameter);
     }
@@ -1082,21 +1358,23 @@ fn open_target_directory(
         request.granted_access(),
         request.device(),
     )?;
-    request.with_file_object(|file_object| {
-        initialize_file_object(
-            file_object,
-            volume,
-            stream_sizes,
-            OpenedNodeMode::Direct,
-            location,
-            policy,
-        )?;
-        Ok(())
-    })?;
-    Ok(match target {
+    let action = match target {
         TargetDirectoryLeaf::Missing => CreateAction::TargetDoesNotExist,
         TargetDirectoryLeaf::Existing(_) => CreateAction::TargetExists,
-    })
+    };
+    PendingExistingCreateOpen::prepare(
+        request,
+        ExistingNodeTarget {
+            volume,
+            node: NodeId::Directory(directory),
+            node_mode: OpenedNodeMode::Direct,
+            location,
+        },
+        stream_sizes,
+        policy,
+        None,
+        action,
+    )
 }
 
 /// Validates create semantics that are meaningful for a direct volume open.
@@ -1636,6 +1914,16 @@ struct PendingFileControlBlockClaim {
 }
 
 impl PendingFileControlBlockClaim {
+    /// Returns the exact FCB retained by this provisional share claim.
+    const fn file_control_block(&self) -> NonNull<FileControlBlock> {
+        self.fcb
+    }
+
+    /// Returns the exact FILE_OBJECT used for share accounting and later attachment.
+    const fn file_object(&self) -> KernelFileObject {
+        self.file_object
+    }
+
     /// Disarms rollback and returns the exact attachment values.
     fn consume(self) -> (NonNull<FileControlBlock>, KernelFileObject) {
         let claim = core::mem::ManuallyDrop::new(self);
@@ -1656,21 +1944,6 @@ impl Drop for PendingFileControlBlockClaim {
 // SAFETY: The top-level create IRP pins the FILE_OBJECT, and the mounted VCB pins the FCB ledger;
 // only the reactor thread consumes or drops this claim.
 unsafe impl Send for PendingFileControlBlockClaim {}
-
-/// Publishes an inode-wide advanced header, shared section pointers, and one per-handle CCB.
-fn publish_node_stream(
-    file_object: UninitializedFileObject<'_>,
-    fcb: NonNull<FileControlBlock>,
-    handle: Box<OpenedHandle>,
-    file_object_flags: CreateFileObjectFlags,
-) {
-    publish_node_stream_raw(
-        file_object.kernel_file_object(),
-        fcb,
-        handle,
-        file_object_flags,
-    );
-}
 
 /// Publishes prepared node contexts through the stable FILE_OBJECT captured before commit.
 #[expect(
@@ -1868,6 +2141,45 @@ mod tests {
         .apply_to(&mut file_object);
 
         assert_eq!(file_object.Flags, existing | wdk_sys::FO_SYNCHRONOUS_IO);
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a first-open stream or a read-only resident stream requests native MM work.
+    #[test]
+    fn existing_write_open_gate_requires_a_resident_writable_regular_file() {
+        for access in [
+            RegularFileWriteAccess::Denied,
+            RegularFileWriteAccess::AppendOnly,
+            RegularFileWriteAccess::Positional,
+        ] {
+            assert_eq!(
+                ExistingWriteOpenRequirement::for_regular_file(
+                    access,
+                    ExistingStreamResidency::FirstOpen,
+                ),
+                ExistingWriteOpenRequirement::NotRequired
+            );
+        }
+        assert_eq!(
+            ExistingWriteOpenRequirement::for_regular_file(
+                RegularFileWriteAccess::Denied,
+                ExistingStreamResidency::Resident,
+            ),
+            ExistingWriteOpenRequirement::NotRequired
+        );
+        for access in [
+            RegularFileWriteAccess::AppendOnly,
+            RegularFileWriteAccess::Positional,
+        ] {
+            assert_eq!(
+                ExistingWriteOpenRequirement::for_regular_file(
+                    access,
+                    ExistingStreamResidency::Resident,
+                ),
+                ExistingWriteOpenRequirement::FlushImageSection
+            );
+        }
     }
 
     /// # Panics

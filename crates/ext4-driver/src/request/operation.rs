@@ -2799,6 +2799,11 @@ enum MutationOperationState {
         /// Size gates already retained for other streams.
         size_changes: Option<crate::state::PreparedStreamSizeChanges>,
     },
+    /// An existing regular-file create flushes its executable image outside the actor.
+    PreparingWriteOpen {
+        /// Unique top-level create completion authority.
+        owned: OwnedIrp,
+    },
     /// Read-only resolution against one immutable epoch.
     Resolving {
         /// Unique top-level completion authority.
@@ -2906,6 +2911,10 @@ struct MutationRequestOperation {
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Fully allocated disposition state retained while its native preflight runs.
     disposition_deletion: Option<crate::request::file_info::PendingDispositionDeletion>,
+    /// Fully allocated existing-node create retained while its native write-open check runs.
+    pending_existing_create: Option<crate::request::create::PendingExistingCreateOpen>,
+    /// Exact successful native write-open gate retained through FILE_OBJECT attachment.
+    write_open: Option<crate::state::PreparedStreamWriteOpen>,
     /// Whether a successful pre-commit write has made abort/replay relevant.
     write_effect_observed: bool,
     /// CLEANUP alone must consume its per-handle terminal barrier before releasing handle state.
@@ -2916,6 +2925,20 @@ struct MutationRequestOperation {
     state: MutationOperationState,
 }
 
+/// Restart-local driver state consulted by exactly one concrete request surface.
+struct DriverResolveState<'a> {
+    /// Cleanup deletion plan retained across lower-read suspension.
+    cleanup_deletion: &'a mut Option<crate::request::file_info::PendingCleanupDeletion>,
+    /// Disposition deletion plan retained across its native preflight.
+    disposition_deletion: &'a mut Option<crate::request::file_info::PendingDispositionDeletion>,
+    /// Exact successful deletion gate retained for revalidation.
+    prepared_deletion: Option<&'a crate::state::PreparedStreamDeletion>,
+    /// Existing-node create retained across its native write-open preflight.
+    pending_existing_create: &'a mut Option<crate::request::create::PendingExistingCreateOpen>,
+    /// Exact successful write-open gate retained for FILE_OBJECT attachment.
+    write_open: Option<&'a crate::state::PreparedStreamWriteOpen>,
+}
+
 /// Result of one driver request surface invoked inside an ephemeral core resolve pass.
 enum DriverResolveDisposition {
     /// Request completed without staging a filesystem mutation.
@@ -2923,6 +2946,13 @@ enum DriverResolveDisposition {
     /// A regular-file disposition must establish a native deletion gate outside the actor.
     PrepareDispositionDeletion {
         /// Stable FCB retained by the pending SET_INFORMATION IRP.
+        fcb: core::ptr::NonNull<crate::state::FileControlBlock>,
+        /// Exact regular-file inode bound to that FCB.
+        node: ext4_core::NodeId,
+    },
+    /// A resident regular-file create must flush its executable image outside the actor.
+    PrepareWriteOpen {
+        /// Stable FCB retained by the provisional existing-node share claim.
         fcb: core::ptr::NonNull<crate::state::FileControlBlock>,
         /// Exact regular-file inode bound to that FCB.
         node: ext4_core::NodeId,
@@ -2975,6 +3005,8 @@ impl MutationRequestOperation {
                 crypto,
                 cleanup_deletion: None,
                 disposition_deletion: None,
+                pending_existing_create: None,
+                write_open: None,
                 write_effect_observed: false,
                 cleanup_barrier_released: false,
                 cleanup_cache_error: None,
@@ -3029,6 +3061,8 @@ impl MutationRequestOperation {
         owned: OwnedIrp,
         error: DriverError,
     ) -> OperationTransition {
+        drop(self.pending_existing_create.take());
+        drop(self.write_open.take());
         if let Some(deletion) = self.cleanup_deletion.as_mut() {
             deletion.abort_before_failure_completion();
         }
@@ -3047,19 +3081,26 @@ impl MutationRequestOperation {
     /// preparation, or cleanup lifecycle validation.
     fn execute_resolve(
         request: &PreparedMutationRequest,
-        cleanup_deletion: &mut Option<crate::request::file_info::PendingCleanupDeletion>,
-        disposition_deletion: &mut Option<crate::request::file_info::PendingDispositionDeletion>,
-        prepared_deletion: Option<&crate::state::PreparedStreamDeletion>,
+        state: DriverResolveState<'_>,
         owned: &mut OwnedIrp,
         operations: &mut crate::state::MountedVolumeAccess<'_>,
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<DriverResolveDisposition> {
         match request {
             PreparedMutationRequest::Other(MutationRequestKind::Create) => {
-                match crate::request::create::execute(owned.request(), operations, mutation)? {
+                match crate::request::create::execute(
+                    owned.request(),
+                    operations,
+                    mutation,
+                    state.pending_existing_create,
+                    state.write_open,
+                )? {
                     crate::request::create::CreateResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Create(completion)),
                     ),
+                    crate::request::create::CreateResolution::PrepareWriteOpen { fcb, node } => {
+                        Ok(DriverResolveDisposition::PrepareWriteOpen { fcb, node })
+                    }
                     crate::request::create::CreateResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
                             PendingDriverPublication::Create(publication),
@@ -3084,8 +3125,8 @@ impl MutationRequestOperation {
                     owned.request(),
                     operations,
                     mutation,
-                    disposition_deletion,
-                    prepared_deletion,
+                    state.disposition_deletion,
+                    state.prepared_deletion,
                 )? {
                     crate::request::file_info::SetFileResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Normal(completion)),
@@ -3186,7 +3227,7 @@ impl MutationRequestOperation {
                 ))
             }
             PreparedMutationRequest::Other(MutationRequestKind::Cleanup) => {
-                if cleanup_deletion.is_none() {
+                if state.cleanup_deletion.is_none() {
                     match crate::request::file_info::cleanup(owned.request(), operations)? {
                         crate::request::file_info::CleanupResolution::Complete(completion) => {
                             return Ok(DriverResolveDisposition::Complete(
@@ -3194,11 +3235,11 @@ impl MutationRequestOperation {
                             ));
                         }
                         crate::request::file_info::CleanupResolution::Delete(deletion) => {
-                            *cleanup_deletion = Some(deletion);
+                            *state.cleanup_deletion = Some(deletion);
                         }
                     }
                 }
-                let Some(deletion) = cleanup_deletion.as_ref() else {
+                let Some(deletion) = state.cleanup_deletion.as_ref() else {
                     return Err(DriverError::InternalInvariantViolation);
                 };
                 let publication =
@@ -3271,14 +3312,25 @@ impl MutationRequestOperation {
             let mut pass = ready.begin_pass(epoch.epoch(), self.now, &mut self.crypto);
             match Self::execute_resolve(
                 request,
-                &mut self.cleanup_deletion,
-                &mut self.disposition_deletion,
-                deletion.as_ref(),
+                DriverResolveState {
+                    cleanup_deletion: &mut self.cleanup_deletion,
+                    disposition_deletion: &mut self.disposition_deletion,
+                    prepared_deletion: deletion.as_ref(),
+                    pending_existing_create: &mut self.pending_existing_create,
+                    write_open: self.write_open.as_ref(),
+                },
                 &mut owned,
                 operations,
                 &mut pass,
             ) {
                 Ok(DriverResolveDisposition::Complete(completion)) => {
+                    if self.request.kind() == MutationRequestKind::Create {
+                        if self.pending_existing_create.is_some() {
+                            return self
+                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                        }
+                        drop(self.write_open.take());
+                    }
                     return self.complete_success(owned, completion);
                 }
                 Ok(DriverResolveDisposition::PrepareDispositionDeletion { fcb, node }) => {
@@ -3300,11 +3352,42 @@ impl MutationRequestOperation {
                         suspended: self,
                     };
                 }
+                Ok(DriverResolveDisposition::PrepareWriteOpen { fcb, node }) => {
+                    drop(pass);
+                    if size_changes.is_some()
+                        || deletion.is_some()
+                        || self.pending_existing_create.is_none()
+                        || self.write_open.is_some()
+                    {
+                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
+                    let stream = match operations.prepare_stream_write_open(fcb, node) {
+                        Ok(stream) => stream,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    self.state = MutationOperationState::PreparingWriteOpen { owned };
+                    return OperationTransition::SubmitCacheWork {
+                        work: crate::irp::CacheWork::prepare_write_open(stream),
+                        suspended: self,
+                    };
+                }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
+                    if self.pending_existing_create.is_some() || self.write_open.is_some() {
+                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
                     publication = Some(prepared);
                     operations.resolve_mutation(pass, self.ticket)
                 }
                 Err(DriverError::Core(Error::OperationSuspended)) => Err(Error::OperationSuspended),
+                Err(DriverError::CacheManagerFailure(STATUS_RETRY))
+                    if self.request.kind() == MutationRequestKind::Create
+                        && self.pending_existing_create.is_some() =>
+                {
+                    drop(pass);
+                    drop(self.pending_existing_create.take());
+                    drop(self.write_open.take());
+                    return self.restart_resolution(owned, None, None, operations);
+                }
                 Err(error) => return self.complete_error(owned, error),
             }
         };
@@ -3850,6 +3933,26 @@ impl MountedVolumeOperation for MutationRequestOperation {
                             }
                         };
                     }
+                    (
+                        MutationOperationState::PreparingWriteOpen { owned },
+                        crate::irp::CacheWorkCompletion::PrepareWriteOpen(result),
+                    ) => {
+                        return match result {
+                            Ok(write_open) => {
+                                if self.write_open.replace(write_open).is_some() {
+                                    return self.complete_error(
+                                        owned,
+                                        DriverError::InternalInvariantViolation,
+                                    );
+                                }
+                                self.restart_resolution(owned, None, None, access)
+                            }
+                            Err(error) => {
+                                record_cache_coherency_failure(error, access);
+                                self.complete_error(owned, error)
+                            }
+                        };
+                    }
                     _ => {
                         crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                             .bugcheck()
@@ -3980,7 +4083,8 @@ impl MountedVolumeOperation for MutationRequestOperation {
                     .bugcheck()
             }
             MutationOperationState::PreparingSizeChange { owned, .. }
-            | MutationOperationState::PreparingDeletion { owned, .. } => match event {
+            | MutationOperationState::PreparingDeletion { owned, .. }
+            | MutationOperationState::PreparingWriteOpen { owned } => match event {
                 OperationEvent::CancelRequested => {
                     self.complete_error(owned, DriverError::from(Error::OperationCancelled))
                 }
@@ -4259,6 +4363,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 | MutationOperationState::AwaitingCommit { .. }
                 | MutationOperationState::PreparingSizeChange { .. }
                 | MutationOperationState::PreparingDeletion { .. }
+                | MutationOperationState::PreparingWriteOpen { .. }
                 | MutationOperationState::CacheWriting { .. }
                 | MutationOperationState::CachePurging { .. }
                 | MutationOperationState::CacheUninitializing { .. }
@@ -4288,6 +4393,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::CacheUninitializing { .. }
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
+            | MutationOperationState::PreparingWriteOpen { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }
@@ -4367,6 +4473,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::CacheUninitializing { .. }
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
+            | MutationOperationState::PreparingWriteOpen { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }

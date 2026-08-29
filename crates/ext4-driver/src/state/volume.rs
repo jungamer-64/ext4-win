@@ -940,6 +940,20 @@ impl MountedVolumeAccess<'_> {
             .prepare_stream_deletion(fcb, node)
     }
 
+    /// Retains a resident regular-file stream for an existing write-open image check.
+    /// # Errors
+    ///
+    /// Returns a finite deferred-lease failure before any MM call.
+    pub(crate) fn prepare_stream_write_open(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        node: NodeId,
+    ) -> DriverResult<StreamWriteOpenLease> {
+        self.volume
+            .file_control_blocks
+            .prepare_stream_write_open(fcb, node)
+    }
+
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
     /// # Errors
     ///
