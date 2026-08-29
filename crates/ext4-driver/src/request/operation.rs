@@ -1493,6 +1493,19 @@ pub(crate) enum VolumeControlRequestKind {
 enum VolumeControlOperationState {
     /// IRP target and lifecycle transition have not yet been decoded.
     Ready(OwnedIrp),
+    /// Every shared stream cache is being coherently flushed and purged before volume lock.
+    CacheDraining {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Stable direct-volume identities.
+        target: crate::request::file_system_control::DirectVolumeTarget,
+        /// Reversible lock publication retained through the full durability sequence.
+        transition: PreparedVolumeStateTransition,
+        /// Concrete lower devices already selected from the mounted runtime.
+        devices: MountedStorageRoute,
+        /// Remaining preallocated shared-stream cache leases.
+        drain: crate::state::PreparedStreamCacheDrain,
+    },
     /// A prevalidated state transition waits until checkpointing leaves a clean journal.
     Waiting {
         /// Unique top-level completion authority.
@@ -1606,6 +1619,64 @@ impl VolumeControlOperation {
         Self::complete(owned, Err(error))
     }
 
+    /// Submits the next shared-stream drain or advances a completed plan to journal durability.
+    fn continue_lock_cache_drain(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        target: crate::request::file_system_control::DirectVolumeTarget,
+        transition: PreparedVolumeStateTransition,
+        devices: MountedStorageRoute,
+        mut drain: crate::state::PreparedStreamCacheDrain,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        if let Some(stream) = drain.next() {
+            self.state = VolumeControlOperationState::CacheDraining {
+                owned,
+                target,
+                transition,
+                devices,
+                drain,
+            };
+            return OperationTransition::SubmitCacheWork {
+                work: crate::irp::CacheWork::drain_for_volume_lock(stream),
+                suspended: self,
+            };
+        }
+        let completed = match drain.into_completed() {
+            Ok(completed) => completed,
+            Err(error) => return Self::fail_lock_cache_drain(owned, transition, error, access),
+        };
+        if let Err(error) = access.finish_volume_lock_cache_drain(completed) {
+            return Self::fail_lock_cache_drain(owned, transition, error, access);
+        }
+        self.state = VolumeControlOperationState::Waiting {
+            owned,
+            target,
+            transition,
+            devices,
+        };
+        OperationTransition::Wait {
+            condition: WaitCondition::JournalClean,
+            suspended: self,
+        }
+    }
+
+    /// Distinguishes an ordinary mapped-section lock conflict from terminal cache writeback
+    /// failure before aborting the reversible volume-lock attempt.
+    fn fail_lock_cache_drain(
+        owned: OwnedIrp,
+        transition: PreparedVolumeStateTransition,
+        error: DriverError,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        if let DriverError::CacheManagerFailure(status) = error
+            && status != wdk_sys::STATUS_USER_MAPPED_FILE
+        {
+            access.record_cache_writeback_failure(status);
+        }
+        Self::fail_transition(owned, transition, error, access)
+    }
+
     /// Allocates the core clean-close operation from immutable mounted geometry.
     /// # Errors
     ///
@@ -1662,9 +1733,35 @@ impl MountedVolumeOperation for VolumeControlOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
-            CompletionEvent::CacheCompleted(_) => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                    .bugcheck()
+            CompletionEvent::CacheCompleted(completion) => {
+                let state =
+                    core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
+                let (
+                    VolumeControlOperationState::CacheDraining {
+                        owned,
+                        target,
+                        transition,
+                        devices,
+                        drain,
+                    },
+                    crate::irp::CacheWorkCompletion::DrainForVolumeLock(result),
+                ) = (state, completion)
+                else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                        .bugcheck()
+                };
+                return match result {
+                    Ok(completed) => {
+                        let mut drain = drain;
+                        if let Err(error) = drain.record_completion(completed) {
+                            return Self::fail_lock_cache_drain(owned, transition, error, access);
+                        }
+                        self.continue_lock_cache_drain(
+                            owned, target, transition, devices, drain, access,
+                        )
+                    }
+                    Err(error) => Self::fail_lock_cache_drain(owned, transition, error, access),
+                };
             }
             CompletionEvent::VolumeFailed(error) => {
                 let state =
@@ -1711,17 +1808,22 @@ impl MountedVolumeOperation for VolumeControlOperation {
                                 );
                             Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
                         }
-                        VolumeControlRequestKind::Lock | VolumeControlRequestKind::Dismount => {
-                            let transition = if self.kind == VolumeControlRequestKind::Lock {
-                                access.prepare_lock_volume(target.owner())
-                            } else {
-                                access.prepare_dismount_volume(target.owner())
+                        VolumeControlRequestKind::Lock => {
+                            let prepared = match access.prepare_lock_volume(target.owner()) {
+                                Ok(prepared) => prepared,
+                                Err(error) => return Self::complete(owned, Err(error)),
                             };
-                            let transition = match transition {
+                            let (transition, drain) = prepared.into_parts();
+                            let devices = access.storage_route();
+                            self.continue_lock_cache_drain(
+                                owned, target, transition, devices, drain, access,
+                            )
+                        }
+                        VolumeControlRequestKind::Dismount => {
+                            let transition = match access.prepare_dismount_volume(target.owner()) {
                                 Ok(transition) => transition,
                                 Err(error) => return Self::complete(owned, Err(error)),
                             };
-                            let closing = transition.is_clean_close();
                             let devices = access.storage_route();
                             self.state = VolumeControlOperationState::Waiting {
                                 owned,
@@ -1729,17 +1831,9 @@ impl MountedVolumeOperation for VolumeControlOperation {
                                 transition,
                                 devices,
                             };
-                            let condition = WaitCondition::JournalClean;
-                            if closing {
-                                OperationTransition::WaitForClosingDrain {
-                                    condition,
-                                    suspended: self,
-                                }
-                            } else {
-                                OperationTransition::Wait {
-                                    condition,
-                                    suspended: self,
-                                }
+                            OperationTransition::WaitForClosingDrain {
+                                condition: WaitCondition::JournalClean,
+                                suspended: self,
                             }
                         }
                     }
@@ -1858,6 +1952,30 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 let result = close.advance(event);
                 self.drive_clean_close(owned, target, transition, result, access)
             }
+            VolumeControlOperationState::CacheDraining {
+                owned, transition, ..
+            } => match event {
+                OperationEvent::CancelRequested => Self::fail_transition(
+                    owned,
+                    transition,
+                    DriverError::from(Error::OperationCancelled),
+                    access,
+                ),
+                OperationEvent::Admitted
+                | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_)
+                | OperationEvent::BarrierReleased(_) => Self::fail_transition(
+                    owned,
+                    transition,
+                    DriverError::InternalInvariantViolation,
+                    access,
+                ),
+            },
             VolumeControlOperationState::Terminal => OperationTransition::Complete,
         }
     }
@@ -1874,6 +1992,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
             VolumeControlOperationState::Flushing { target, .. }
             | VolumeControlOperationState::CleanClosing { target, .. } => *target,
             VolumeControlOperationState::Ready(_)
+            | VolumeControlOperationState::CacheDraining { .. }
             | VolumeControlOperationState::Waiting { .. }
             | VolumeControlOperationState::Terminal => return,
         };

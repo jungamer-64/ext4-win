@@ -555,6 +555,22 @@ pub(crate) struct PreparedVolumeStateTransition {
     kind: PreparedVolumeStateTransitionKind,
 }
 
+/// Reversible volume-lock transition paired with every stream cache lease it must drain.
+#[derive(Debug)]
+pub(crate) struct PreparedVolumeLock {
+    /// State publication retained until journal and lower-device durability complete.
+    transition: PreparedVolumeStateTransition,
+    /// Preallocated shared-stream cache drain.
+    cache_drain: PreparedStreamCacheDrain,
+}
+
+impl PreparedVolumeLock {
+    /// Separates the state publication from the sequential cache-work plan.
+    pub(crate) fn into_parts(self) -> (PreparedVolumeStateTransition, PreparedStreamCacheDrain) {
+        (self.transition, self.cache_drain)
+    }
+}
+
 #[derive(Debug)]
 /// Lifecycle publication authorized only after its matching durability barrier.
 enum PreparedVolumeStateTransitionKind {
@@ -717,20 +733,36 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn prepare_lock_volume(
         &mut self,
         owner: KernelFileObject,
-    ) -> DriverResult<PreparedVolumeStateTransition> {
+    ) -> DriverResult<PreparedVolumeLock> {
         self.authorize_durability()?;
-        let control = &self.volume.volume_control;
-        let next_state = control.state.begin_lock(owner)?;
-        // A clean lock excludes native section residents and deferred stream work, not only
-        // user handles. Cache draining must retire their ledger entries before this boundary.
-        if !self.volume.file_control_blocks.is_empty() || control.handles.active_handle_count() != 1
-        {
+        let next_state = self.volume.volume_control.state.begin_lock(owner)?;
+        if self.volume.volume_control.handles.active_handle_count() != 1 {
             return Err(DriverError::AccessDenied);
         }
+        let cache_drain = self
+            .volume
+            .file_control_blocks
+            .prepare_volume_lock_cache_drain()?;
         self.volume.volume_control.state = next_state;
-        Ok(PreparedVolumeStateTransition {
-            kind: PreparedVolumeStateTransitionKind::Lock { owner },
+        Ok(PreparedVolumeLock {
+            transition: PreparedVolumeStateTransition {
+                kind: PreparedVolumeStateTransitionKind::Lock { owner },
+            },
+            cache_drain,
         })
+    }
+
+    /// Requires the prepared cache drain to have removed every non-handle stream resident.
+    /// # Errors
+    ///
+    /// Returns access denied for an outstanding operation or the native mapped-file conflict.
+    pub(crate) fn finish_volume_lock_cache_drain(
+        &self,
+        completed: crate::state::CompletedStreamCacheDrain,
+    ) -> DriverResult<()> {
+        self.volume
+            .file_control_blocks
+            .finish_volume_lock_cache_drain(completed)
     }
 
     /// Releases a volume lock owned by the supplied direct-volume FILE_OBJECT.

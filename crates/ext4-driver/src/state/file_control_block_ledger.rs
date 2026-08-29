@@ -63,6 +63,100 @@ pub(crate) struct FileObjectCacheLease {
     file_object: KernelFileObject,
 }
 
+/// Preallocated volume-lock cache drain whose leases cover every current namespace stream.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamCacheDrain {
+    /// Exact ledger whose streams were captured by this plan.
+    owner: NonNull<FileControlBlockLedger>,
+    /// Remaining shared streams; each lease is consumed by exactly one cache work item.
+    remaining: DriverVec<StreamCacheLease>,
+    /// Number of native drain calls that returned success to the actor.
+    completed: usize,
+    /// Immutable number of streams captured before the lock transition was published.
+    total: usize,
+}
+
+impl PreparedStreamCacheDrain {
+    /// Selects one shared stream for coherency flush/purge.
+    pub(crate) fn next(&mut self) -> Option<VolumeLockStreamDrainLease> {
+        self.remaining
+            .pop()
+            .map(|stream| VolumeLockStreamDrainLease { stream })
+    }
+
+    /// Consumes one successful native drain result.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the result belongs to another ledger or exceeds the captured
+    /// stream count.
+    pub(crate) fn record_completion(
+        &mut self,
+        completed: CompletedVolumeLockStreamDrain,
+    ) -> DriverResult<()> {
+        if completed.owner() != self.owner || self.completed >= self.total {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        self.completed = self
+            .completed
+            .checked_add(1)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        drop(completed);
+        Ok(())
+    }
+
+    /// Converts an exhausted plan into authority for the final ledger readiness check.
+    /// # Errors
+    ///
+    /// Returns an invariant error unless every captured stream completed its native drain.
+    pub(crate) fn into_completed(self) -> DriverResult<CompletedStreamCacheDrain> {
+        if !self.remaining.is_empty() || self.completed != self.total {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        Ok(CompletedStreamCacheDrain { owner: self.owner })
+    }
+}
+
+/// One stream selected from a volume-lock drain plan but not yet accepted by Cc/MM.
+#[derive(Debug)]
+pub(crate) struct VolumeLockStreamDrainLease {
+    /// Shared-stream retention spanning the native call.
+    stream: StreamCacheLease,
+}
+
+impl VolumeLockStreamDrainLease {
+    /// Executes the native cache and section drain, returning success authority to the actor.
+    /// # Errors
+    ///
+    /// Returns the exact cache failure or mapped-section conflict status.
+    pub(crate) fn execute(self) -> DriverResult<CompletedVolumeLockStreamDrain> {
+        self.stream.drain_for_volume_lock()?;
+        Ok(CompletedVolumeLockStreamDrain {
+            stream: self.stream,
+        })
+    }
+}
+
+/// Successful native drain for one stream, still retained until the actor records it.
+#[derive(Debug)]
+pub(crate) struct CompletedVolumeLockStreamDrain {
+    /// Lease proving which captured ledger accepted the drain.
+    stream: StreamCacheLease,
+}
+
+impl CompletedVolumeLockStreamDrain {
+    /// Returns the ledger identity carried by the retained stream.
+    fn owner(&self) -> NonNull<FileControlBlockLedger> {
+        self.stream.retained.owner
+    }
+}
+
+/// Authority proving every stream captured for one volume lock completed its native drain.
+#[derive(Debug)]
+pub(crate) struct CompletedStreamCacheDrain {
+    /// Exact ledger for which completion was established.
+    owner: NonNull<FileControlBlockLedger>,
+}
+
 #[expect(
     unsafe_code,
     reason = "the explicit lease retains the exact FCB pointer while publishing outside the ledger"
@@ -144,6 +238,14 @@ impl StreamCacheLease {
     /// Returns the exact Cache Manager coherency status.
     pub(crate) fn purge(&self) -> DriverResult<()> {
         self.stream().stream_context.coherency_flush_and_purge()
+    }
+
+    /// Flushes cached data and releases every unreferenced data or image section before lock.
+    /// # Errors
+    ///
+    /// Returns the exact cache failure or mapped-section conflict status.
+    pub(crate) fn drain_for_volume_lock(&self) -> DriverResult<()> {
+        self.stream().stream_context.drain_cache_for_volume_lock()
     }
 }
 
@@ -779,6 +881,127 @@ impl FileControlBlockLedger {
             release_file_object_lease_in_table(table, fcb, native_resident)
         };
         drop(removed);
+    }
+
+    /// Preallocates and retains every stream whose cache must drain before volume lock.
+    /// # Errors
+    ///
+    /// Returns access denied while any namespace handle remains active, or the exact allocation
+    /// or finite deferred-lease failure before any Cache Manager work is submitted.
+    #[expect(
+        unsafe_code,
+        reason = "two ledger passes separate allocation from validated lease acquisition"
+    )]
+    pub(super) fn prepare_volume_lock_cache_drain(&self) -> DriverResult<PreparedStreamCacheDrain> {
+        let stream_count = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource serializes table and share-state observation.
+                &*self.table.get()
+            };
+            for fcb in table.iter() {
+                let state = unsafe {
+                    // SAFETY: The table owns each FCB and the resource remains held.
+                    &*fcb.open_state.get()
+                };
+                if state.has_active_handle() {
+                    return Err(DriverError::AccessDenied);
+                }
+            }
+            table.len()
+        };
+
+        let mut remaining = DriverVec::try_with_capacity(stream_count)?;
+        let mut failed_lease = None;
+        let acquisition = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource serializes table and lifetime mutation.
+                &*self.table.get()
+            };
+            if table.len() != stream_count {
+                Err(DriverError::InternalInvariantViolation)
+            } else {
+                let mut result = Ok(());
+                for fcb in table.iter() {
+                    let state = unsafe {
+                        // SAFETY: This table owns the FCB while the resource is held.
+                        &mut *fcb.open_state.get()
+                    };
+                    if state.has_active_handle() {
+                        result = Err(DriverError::AccessDenied);
+                        break;
+                    }
+                    if let Err(error) = state.acquire_deferred_lease() {
+                        result = Err(error);
+                        break;
+                    }
+                    let lease = StreamCacheLease {
+                        retained: DeferredStreamLease {
+                            owner: NonNull::from(self),
+                            fcb: NonNull::from(fcb.as_ref()),
+                        },
+                    };
+                    if let Err(error) = remaining.push_reserved_owned(lease) {
+                        let (error, lease) = error.into_parts();
+                        failed_lease = Some(lease);
+                        result = Err(error);
+                        break;
+                    }
+                }
+                result
+            }
+        };
+        drop(failed_lease);
+        acquisition?;
+        Ok(PreparedStreamCacheDrain {
+            owner: NonNull::from(self),
+            remaining,
+            completed: 0,
+            total: stream_count,
+        })
+    }
+
+    /// Requires every active handle, native section, and deferred cache/paging operation to have
+    /// drained after all prepared purge work completes.
+    /// # Errors
+    ///
+    /// Returns access denied while a competing handle or deferred operation remains, and the
+    /// native mapped-file status while a cache map or section still retains a stream.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes final volume-lock readiness observation"
+    )]
+    pub(super) fn finish_volume_lock_cache_drain(
+        &self,
+        completed: CompletedStreamCacheDrain,
+    ) -> DriverResult<()> {
+        if completed.owner != NonNull::from(self) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table and lifetime observation.
+            &*self.table.get()
+        };
+        for fcb in table.iter() {
+            let state = unsafe {
+                // SAFETY: The table owns each FCB and the resource remains held.
+                &*fcb.open_state.get()
+            };
+            if state.has_active_handle() {
+                return Err(DriverError::AccessDenied);
+            }
+            if state.native_residency_recheck_pending() {
+                return Err(DriverError::CacheManagerFailure(
+                    wdk_sys::STATUS_USER_MAPPED_FILE,
+                ));
+            }
+            if !state.volume_lock_ready() {
+                return Err(DriverError::AccessDenied);
+            }
+        }
+        Ok(())
     }
 
     /// Advances every waiting native resident to one due delayed-close observation.

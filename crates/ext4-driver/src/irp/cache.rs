@@ -12,7 +12,10 @@ use core::fmt;
 use wdk_sys::LIST_ENTRY;
 
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::state::{FileObjectCacheLease, StreamCacheLease};
+use crate::state::{
+    CompletedVolumeLockStreamDrain, FileObjectCacheLease, StreamCacheLease,
+    VolumeLockStreamDrainLease,
+};
 
 #[cfg(not(test))]
 use crate::kernel::{fatal::KernelWideInconsistency, ffi};
@@ -63,6 +66,11 @@ pub(crate) enum CacheWork {
         /// Stream retained through the coherency boundary.
         stream: StreamCacheLease,
     },
+    /// Flush cached data and release every unreferenced section before volume lock.
+    DrainForVolumeLock {
+        /// Stream retained through the complete cache and Memory Manager boundary.
+        stream: VolumeLockStreamDrainLease,
+    },
     /// Release one FILE_OBJECT's private cache map.
     Uninitialize {
         /// Stream and FILE_OBJECT identity retained through uninitialization.
@@ -81,6 +89,8 @@ pub(crate) enum CacheWorkCompletion {
     Flush(DriverResult<()>),
     /// Coherency flush/purge status.
     Purge(DriverResult<()>),
+    /// Volume-lock cache and section drain status.
+    DrainForVolumeLock(DriverResult<CompletedVolumeLockStreamDrain>),
     /// Private cache-map uninitialization status.
     Uninitialize(DriverResult<()>),
 }
@@ -126,6 +136,11 @@ impl CacheWork {
         Self::Purge { stream }
     }
 
+    /// Builds one volume-lock cache and section drain.
+    pub(crate) const fn drain_for_volume_lock(stream: VolumeLockStreamDrainLease) -> Self {
+        Self::DrainForVolumeLock { stream }
+    }
+
     /// Builds one FILE_OBJECT cache-map uninitialization.
     pub(crate) const fn uninitialize(file_object: FileObjectCacheLease) -> Self {
         Self::Uninitialize { file_object }
@@ -148,6 +163,9 @@ impl CacheWork {
             } => CacheWorkCompletion::Write(file_object.write(offset, input, length)),
             Self::Flush { stream } => CacheWorkCompletion::Flush(stream.flush()),
             Self::Purge { stream } => CacheWorkCompletion::Purge(stream.purge()),
+            Self::DrainForVolumeLock { stream } => {
+                CacheWorkCompletion::DrainForVolumeLock(stream.execute())
+            }
             Self::Uninitialize { file_object } => {
                 CacheWorkCompletion::Uninitialize(file_object.uninitialize())
             }
@@ -161,6 +179,7 @@ impl CacheWork {
             Self::Write { .. } => CacheWorkCompletion::Write(Err(error)),
             Self::Flush { .. } => CacheWorkCompletion::Flush(Err(error)),
             Self::Purge { .. } => CacheWorkCompletion::Purge(Err(error)),
+            Self::DrainForVolumeLock { .. } => CacheWorkCompletion::DrainForVolumeLock(Err(error)),
             Self::Uninitialize { .. } => CacheWorkCompletion::Uninitialize(Err(error)),
         }
     }

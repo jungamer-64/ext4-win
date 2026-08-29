@@ -616,6 +616,21 @@ where
         }
     }
 
+    /// Inserts an owned value after capacity has already been reserved.
+    ///
+    /// This function never attempts allocation. The original value is returned if the caller's
+    /// reserved-capacity invariant is violated.
+    /// # Errors
+    ///
+    /// Returns [`PushError::CapacityInvariant`] with the original value when no spare capacity
+    /// remains.
+    pub(crate) fn push_reserved_owned(&mut self, value: T) -> Result<(), PushError<T>> {
+        match self.inner.push_within_capacity(value) {
+            Ok(_) => Ok(()),
+            Err(value) => Err(PushError::CapacityInvariant { value }),
+        }
+    }
+
     /// Pushes one `Copy` value and returns only the driver error.
     ///
     /// This is intentionally restricted to `Copy`. On error, discarding the value cannot run a

@@ -1311,6 +1311,57 @@ fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
 
 /// # Errors
 ///
+/// Returns a fixture allocation or native stream-header failure.
+/// # Panics
+///
+/// Panics if volume-lock cache preparation omits the stream or publishes completion before the
+/// selected native drain returns successfully.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture construction returns errors while assertions verify the cache-drain contract"
+)]
+fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Result<(), DriverError>
+{
+    let mut ledger = FileControlBlockLedger::try_new()?;
+    let stream = super::NodeStreamSizes {
+        node: NodeId::Directory(DirectoryNodeId::ROOT),
+        sizes: crate::kernel::stream::StreamSizes::EMPTY,
+    };
+    let fcb = ledger.file_control_block(NonNull::dangling(), stream)?;
+    let fcb_pointer = NonNull::from(fcb.as_ref());
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(fcb)
+        .map_err(|failure| failure.into_parts().0)?;
+
+    let mut drain = ledger.prepare_volume_lock_cache_drain()?;
+    let lease = drain
+        .next()
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    assert!(matches!(
+        drain.into_completed(),
+        Err(DriverError::InternalInvariantViolation)
+    ));
+    drop(lease);
+
+    let mut drain = ledger.prepare_volume_lock_cache_drain()?;
+    let lease = drain
+        .next()
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    let completed = lease.execute()?;
+    drain.record_completion(completed)?;
+    let completed = drain.into_completed()?;
+    assert_eq!(ledger.finish_volume_lock_cache_drain(completed), Ok(()));
+
+    ledger.close(fcb_pointer);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+///
 /// Returns a fixture allocation or native stream-header error.
 /// # Panics
 ///
