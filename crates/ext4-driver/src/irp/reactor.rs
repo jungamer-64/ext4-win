@@ -3901,6 +3901,9 @@ mod tests {
                     crate::irp::CacheWorkCompletion::PrepareDeletion(result) => {
                         let _result = result;
                     }
+                    crate::irp::CacheWorkCompletion::PrepareWriteOpen(result) => {
+                        let _result = result;
+                    }
                 }
                 drop(suspended);
             }
@@ -3911,6 +3914,9 @@ mod tests {
                         let _result = result;
                     }
                     crate::irp::CacheWorkCompletion::PrepareDeletion(result) => {
+                        let _result = result;
+                    }
+                    crate::irp::CacheWorkCompletion::PrepareWriteOpen(result) => {
                         let _result = result;
                     }
                     _ => return,

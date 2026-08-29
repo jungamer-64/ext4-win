@@ -1075,6 +1075,44 @@ ext4win_stream_begin_delete(_In_ PVOID stream_header)
     return status;
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_begin_write_open(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    ext4win_stream_begin_section_mutation(stream);
+
+    status = STATUS_SUCCESS;
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    __try {
+        if (!MmFlushImageSection(&stream->SectionObjects, MmFlushForWrite)) {
+            status = STATUS_SHARING_VIOLATION;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+
+    if (NT_SUCCESS(status)) {
+        status = ext4win_stream_seal_section_mutation(stream);
+    }
+    if (!NT_SUCCESS(status)) {
+        ext4win_stream_release_section_mutation(stream);
+    }
+    return status;
+}
+
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
@@ -1094,6 +1132,20 @@ _Must_inspect_result_
 NTSTATUS
 NTAPI
 ext4win_stream_end_delete(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    return ext4win_stream_end_section_mutation(stream);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_end_write_open(_In_ PVOID stream_header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
 

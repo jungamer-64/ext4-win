@@ -349,6 +349,59 @@ impl Drop for PreparedStreamDeletion {
     }
 }
 
+/// Resident regular-file stream retained before an existing write-open calls MM.
+#[derive(Debug)]
+pub(crate) struct StreamWriteOpenLease {
+    /// Shared stream retained independently from the not-yet-attached create FILE_OBJECT.
+    stream: StreamCacheLease,
+    /// Typed inode identity fixed by create resolution.
+    node: NodeId,
+}
+
+impl StreamWriteOpenLease {
+    /// Flushes an executable image and returns the unique write-open publication gate.
+    /// # Errors
+    ///
+    /// Returns sharing-violation while an image section remains, or the exact native failure.
+    pub(crate) fn execute(self) -> DriverResult<PreparedStreamWriteOpen> {
+        self.stream.stream().stream_context.begin_write_open()?;
+        Ok(PreparedStreamWriteOpen {
+            stream: self.stream,
+            node: self.node,
+        })
+    }
+}
+
+/// Successful write-open gate retained until the exact FILE_OBJECT/FCB claim is published.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamWriteOpen {
+    /// Stream lease released only after the native gate is ended.
+    stream: StreamCacheLease,
+    /// Exact regular-file inode authorized by the image-section check.
+    node: NodeId,
+}
+
+impl PreparedStreamWriteOpen {
+    /// Returns whether this native gate authorizes the exact FCB/node pair.
+    pub(crate) fn authorizes(&self, fcb: NonNull<FileControlBlock>, node: NodeId) -> bool {
+        self.node == node && self.stream.retained.fcb == fcb
+    }
+}
+
+impl Drop for PreparedStreamWriteOpen {
+    fn drop(&mut self) {
+        if self
+            .stream
+            .stream()
+            .stream_context
+            .end_write_open()
+            .is_err()
+        {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+    }
+}
+
 #[expect(
     unsafe_code,
     reason = "the explicit lease retains the exact FCB pointer while publishing outside the ledger"
@@ -719,6 +772,36 @@ struct ExistingFileControlBlockOpen {
     oplock_policy: OplockCreatePolicy,
 }
 
+/// Whether an admitted existing-node claim created or reused the shared stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExistingStreamResidency {
+    /// This claim installed the first FCB, so no prior image section can exist.
+    FirstOpen,
+    /// This claim reused a resident FCB that may own an executable image section.
+    Resident,
+}
+
+/// Exact existing-node FCB/share claim plus its pre-admission residency fact.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExistingFileControlBlockAdmission {
+    /// Open FCB reference and recorded share claim.
+    fcb: NonNull<FileControlBlock>,
+    /// Whether the stream existed before this claim was recorded.
+    residency: ExistingStreamResidency,
+}
+
+impl ExistingFileControlBlockAdmission {
+    /// Returns the exact FCB whose share claim is now rollback-owned by create.
+    pub(crate) const fn file_control_block(self) -> NonNull<FileControlBlock> {
+        self.fcb
+    }
+
+    /// Returns the pre-admission stream residency fact.
+    pub(crate) const fn residency(self) -> ExistingStreamResidency {
+        self.residency
+    }
+}
+
 impl FileControlBlockLedger {
     /// Creates an empty synchronized FCB ledger and its native resource.
     /// # Errors
@@ -738,7 +821,7 @@ impl FileControlBlockLedger {
     fn open_existing(
         &self,
         request: ExistingFileControlBlockOpen,
-    ) -> DriverResult<NonNull<FileControlBlock>> {
+    ) -> DriverResult<ExistingFileControlBlockAdmission> {
         self.open(
             request.volume,
             request.stream,
@@ -772,6 +855,7 @@ impl FileControlBlockLedger {
             share_access,
             FileControlBlockShareCheck::NewNode,
         )
+        .map(ExistingFileControlBlockAdmission::file_control_block)
     }
 
     /// Opens or creates one ledger entry and records the FILE_OBJECT share claim atomically.
@@ -790,7 +874,7 @@ impl FileControlBlockLedger {
         desired_access: GrantedAccess,
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
-    ) -> DriverResult<NonNull<FileControlBlock>> {
+    ) -> DriverResult<ExistingFileControlBlockAdmission> {
         let node = stream.node();
         if let Some(result) =
             self.try_open_present(node, file_object, desired_access, share_access, share_check)
@@ -817,7 +901,10 @@ impl FileControlBlockLedger {
                     share_access,
                     share_check,
                 )
-                .map(|()| fcb)
+                .map(|()| ExistingFileControlBlockAdmission {
+                    fcb,
+                    residency: ExistingStreamResidency::Resident,
+                })
             } else {
                 let fcb = NonNull::from(candidate.as_ref());
                 match table.try_push_owned(candidate) {
@@ -829,7 +916,10 @@ impl FileControlBlockLedger {
                         share_access,
                         share_check,
                     ) {
-                        Ok(()) => Ok(fcb),
+                        Ok(()) => Ok(ExistingFileControlBlockAdmission {
+                            fcb,
+                            residency: ExistingStreamResidency::FirstOpen,
+                        }),
                         Err(error) => {
                             removed = release_file_object_lease_in_table(table, fcb, false);
                             Err(error)
@@ -876,7 +966,7 @@ impl FileControlBlockLedger {
         desired_access: GrantedAccess,
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
-    ) -> Option<DriverResult<NonNull<FileControlBlock>>> {
+    ) -> Option<DriverResult<ExistingFileControlBlockAdmission>> {
         let _guard = self.lock.acquire();
         let table = unsafe {
             // SAFETY: The executive resource serializes table lookup and open-state mutation.
@@ -892,7 +982,10 @@ impl FileControlBlockLedger {
                 share_access,
                 share_check,
             )
-            .map(|()| fcb),
+            .map(|()| ExistingFileControlBlockAdmission {
+                fcb,
+                residency: ExistingStreamResidency::Resident,
+            }),
         )
     }
 
@@ -1513,6 +1606,47 @@ impl FileControlBlockLedger {
         }))
     }
 
+    /// Retains the exact resident regular-file stream reserved by an existing write-open claim.
+    /// # Errors
+    ///
+    /// Returns a finite deferred-lease failure before any MM call.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes resident FCB lookup and deferred-lease acquisition"
+    )]
+    pub(super) fn prepare_stream_write_open(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        node: NodeId,
+    ) -> DriverResult<StreamWriteOpenLease> {
+        if !matches!(node, NodeId::File(_)) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+            &*self.table.get()
+        };
+        if find_file_control_block_in_table(table, node) != Some(fcb) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The ledger resource uniquely serializes this open-state transition.
+            state.as_mut()
+        }
+        .acquire_deferred_lease()?;
+        Ok(StreamWriteOpenLease {
+            stream: StreamCacheLease {
+                retained: DeferredStreamLease {
+                    owner: NonNull::from(self),
+                    fcb,
+                },
+            },
+            node,
+        })
+    }
+
     /// Looks up current streams at durable publication and retains each through a short explicit
     /// lease while the ledger resource is released for the native Cc/MM call.
     /// # Errors
@@ -1893,7 +2027,7 @@ impl VolumeControlBlock {
         existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
         oplock_policy: OplockCreatePolicy,
-    ) -> DriverResult<NonNull<FileControlBlock>> {
+    ) -> DriverResult<ExistingFileControlBlockAdmission> {
         let volume_ptr = volume.as_ptr();
         let file_control_blocks = unsafe {
             // SAFETY: `volume_ptr` identifies the live, stable mounted VCB. `addr_of!` projects
