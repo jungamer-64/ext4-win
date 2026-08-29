@@ -17,14 +17,12 @@ use crate::irp::lower::{
     CompletionRundownLease, LowerBuildError, LowerCompletionRoute, LowerIrpTransfer,
     PreparedLowerIrp,
 };
-use crate::kernel::status::{DriverError, DriverResult};
+use crate::kernel::status::{DriverError, DriverResult, STATUS_RETRY};
 use crate::memory;
 use crate::state::KernelDevice;
 
 /// Retryable lower status `STATUS_DEVICE_BUSY`.
 const STATUS_DEVICE_BUSY: NTSTATUS = i32::from_ne_bytes(0x8000_0011_u32.to_ne_bytes());
-/// Retryable lower status `STATUS_RETRY`.
-const STATUS_RETRY: NTSTATUS = i32::from_ne_bytes(0xC000_022D_u32.to_ne_bytes());
 /// Retryable lower status `STATUS_DEVICE_NOT_READY`.
 const STATUS_DEVICE_NOT_READY: NTSTATUS = i32::from_ne_bytes(0xC000_00A3_u32.to_ne_bytes());
 /// Read-retryable but write-ambiguous status `STATUS_IO_TIMEOUT`.

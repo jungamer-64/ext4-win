@@ -157,6 +157,145 @@ pub(crate) struct CompletedStreamCacheDrain {
     owner: NonNull<FileControlBlockLedger>,
 }
 
+/// Captured stream and exact size-check semantics not yet submitted to Cc/MM.
+#[derive(Debug)]
+pub(crate) struct StreamSizeChangeLease {
+    /// Shared stream retained through native gate acquisition.
+    stream: StreamCacheLease,
+    /// Regular-file identity whose final projection selected this gate.
+    node: NodeId,
+    /// Final native cache-map size tuple selected from the mutation projection.
+    target_sizes: StreamSizes,
+}
+
+impl StreamSizeChangeLease {
+    /// Acquires the native cache/section exclusion gate and returns its unique release authority.
+    /// # Errors
+    ///
+    /// Returns the exact cache failure or mapped-view truncation conflict.
+    pub(crate) fn execute(self) -> DriverResult<PreparedStreamSizeChange> {
+        self.stream
+            .stream()
+            .stream_context
+            .begin_size_change(self.target_sizes.file_size())?;
+        Ok(PreparedStreamSizeChange {
+            stream: self.stream,
+            node: self.node,
+            target_sizes: self.target_sizes,
+        })
+    }
+}
+
+/// Preallocated regular-file size changes selected from the mutation's sole metadata projection.
+#[derive(Debug)]
+pub(crate) struct StreamSizeChangePlan {
+    /// Ledger that granted every retained stream lease.
+    owner: NonNull<FileControlBlockLedger>,
+    /// Native gates not yet submitted to the cache-work executor.
+    remaining: DriverVec<StreamSizeChangeLease>,
+    /// Successfully acquired gates retained until durable size publication.
+    prepared: DriverVec<PreparedStreamSizeChange>,
+    /// Immutable number of stream gates selected before the first native call.
+    total: usize,
+}
+
+impl StreamSizeChangePlan {
+    /// Selects the greatest remaining stream identity for native Cc/MM preparation.
+    ///
+    /// Every plan uses this order, so overlapping multi-stream mutations cannot retain their
+    /// native gates in opposite orders.
+    pub(crate) fn next(&mut self) -> Option<StreamSizeChangeLease> {
+        let index = self
+            .remaining
+            .iter()
+            .enumerate()
+            .max_by_key(|(_index, lease)| lease.node.file_index())
+            .map(|(index, _lease)| index)?;
+        self.remaining.swap_remove(index)
+    }
+
+    /// Retains one successful native gate in this exact mutation plan.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the gate belongs to another ledger or exceeds the
+    /// preallocated plan.
+    pub(crate) fn record_completion(
+        &mut self,
+        completed: PreparedStreamSizeChange,
+    ) -> DriverResult<()> {
+        if completed.owner() != self.owner || self.prepared.len() >= self.total {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        if let Err(error) = self.prepared.push_reserved_owned(completed) {
+            let (error, completed) = error.into_parts();
+            drop(completed);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Converts an exhausted plan to commit-lifetime gate ownership.
+    /// # Errors
+    ///
+    /// Returns an invariant error unless every selected native gate was acquired exactly once.
+    pub(crate) fn into_prepared(self) -> DriverResult<Option<PreparedStreamSizeChanges>> {
+        if !self.remaining.is_empty() || self.prepared.len() != self.total {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        if self.total == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(PreparedStreamSizeChanges {
+                prepared: self.prepared,
+            }))
+        }
+    }
+}
+
+/// All native regular-file size gates retained through one durable metadata publication.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamSizeChanges {
+    /// Drop releases every gate only after the publication owner consumes this value.
+    prepared: DriverVec<PreparedStreamSizeChange>,
+}
+
+/// Successful native size-change gate retained through durable size publication.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamSizeChange {
+    /// Stream lease released only after the native gate is ended.
+    stream: StreamCacheLease,
+    /// Regular-file identity protected by this gate.
+    node: NodeId,
+    /// Exact final cache-map dimensions against which native truncation and purge were performed.
+    target_sizes: StreamSizes,
+}
+
+impl PreparedStreamSizeChange {
+    /// Returns the ledger identity carried by this retained native gate.
+    fn owner(&self) -> NonNull<FileControlBlockLedger> {
+        self.stream.retained.owner
+    }
+
+    /// Returns whether this gate protects the exact final stream projection.
+    fn matches(&self, node: NodeId, target_sizes: StreamSizes) -> bool {
+        self.node == node && self.target_sizes.same_cache_dimensions(target_sizes)
+    }
+}
+
+impl Drop for PreparedStreamSizeChange {
+    fn drop(&mut self) {
+        if self
+            .stream
+            .stream()
+            .stream_context
+            .end_size_change()
+            .is_err()
+        {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+    }
+}
+
 #[expect(
     unsafe_code,
     reason = "the explicit lease retains the exact FCB pointer while publishing outside the ledger"
@@ -1089,6 +1228,164 @@ impl FileControlBlockLedger {
             }
         }
         None
+    }
+
+    /// Preallocates every live regular-file gate implied by the mutation's final size projection.
+    ///
+    /// Directory and symbolic-link metadata publications do not participate in mapped data-file
+    /// truncation. A regular-file FCB that is not currently resident needs no native gate; future
+    /// opens initialize from the durable epoch after publication.
+    /// # Errors
+    ///
+    /// Returns the exact allocation, finite lease, or native stream-snapshot failure before any
+    /// Cache Manager or Memory Manager call is submitted.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes FCB lookup and deferred-lease acquisition"
+    )]
+    pub(super) fn prepare_stream_size_changes(
+        &self,
+        updates: &PreparedStreamSizePublications,
+    ) -> DriverResult<StreamSizeChangePlan> {
+        let capacity = updates.nodes.len();
+        let mut remaining: DriverVec<StreamSizeChangeLease> =
+            DriverVec::try_with_capacity(capacity)?;
+        let prepared: DriverVec<PreparedStreamSizeChange> = DriverVec::try_with_capacity(capacity)?;
+        let mut failed_lease = None;
+        let acquisition = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+                &*self.table.get()
+            };
+            let mut result = Ok(());
+            for (index, update) in updates.nodes.iter().enumerate() {
+                if !matches!(update.node, NodeId::File(_)) {
+                    continue;
+                }
+                if updates
+                    .nodes
+                    .iter()
+                    .take(index)
+                    .any(|earlier| earlier.node == update.node)
+                {
+                    result = Err(DriverError::InternalInvariantViolation);
+                    break;
+                }
+                let Some(fcb) = find_file_control_block_in_table(table, update.node) else {
+                    continue;
+                };
+                let fcb_ref = unsafe {
+                    // SAFETY: The owning table retains this FCB while the resource is held.
+                    fcb.as_ref()
+                };
+                let current = match fcb_ref.stream_sizes() {
+                    Ok(current) => current,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
+                };
+                if current.same_cache_dimensions(update.sizes) {
+                    continue;
+                }
+                let mut state = ledger_file_control_block_open_state(table, fcb);
+                if let Err(error) = unsafe {
+                    // SAFETY: The ledger resource uniquely serializes this open-state transition.
+                    state.as_mut()
+                }
+                .acquire_deferred_lease()
+                {
+                    result = Err(error);
+                    break;
+                }
+                let lease = StreamSizeChangeLease {
+                    stream: StreamCacheLease {
+                        retained: DeferredStreamLease {
+                            owner: NonNull::from(self),
+                            fcb,
+                        },
+                    },
+                    node: update.node,
+                    target_sizes: update.sizes,
+                };
+                if let Err(error) = remaining.push_reserved_owned(lease) {
+                    let (error, lease) = error.into_parts();
+                    failed_lease = Some(lease);
+                    result = Err(error);
+                    break;
+                }
+            }
+            result
+        };
+        drop(failed_lease);
+        acquisition?;
+        let total = remaining.len();
+        Ok(StreamSizeChangePlan {
+            owner: NonNull::from(self),
+            remaining,
+            prepared,
+            total,
+        })
+    }
+
+    /// Verifies that retained native gates cover the exact current size-changing projection.
+    ///
+    /// A false result means the operation must release these gates and repeat preparation before
+    /// it can retain a fresh resource intent. Ledger or stream ownership corruption remains a
+    /// machine invariant failure rather than a retryable mismatch.
+    /// # Errors
+    ///
+    /// Returns a native size snapshot failure or an ownership invariant error.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes FCB lookup while retained gates keep matched streams live"
+    )]
+    pub(super) fn prepared_stream_size_changes_match(
+        &self,
+        updates: &PreparedStreamSizePublications,
+        prepared: &PreparedStreamSizeChanges,
+    ) -> DriverResult<bool> {
+        if prepared
+            .prepared
+            .iter()
+            .any(|change| change.owner() != NonNull::from(self))
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table traversal and FCB size snapshots.
+            &*self.table.get()
+        };
+        let mut expected = 0_usize;
+        for update in updates.nodes.iter() {
+            if !matches!(update.node, NodeId::File(_)) {
+                continue;
+            }
+            let Some(fcb) = find_file_control_block_in_table(table, update.node) else {
+                continue;
+            };
+            let current = unsafe {
+                // SAFETY: The owning table retains this FCB while the ledger resource is held.
+                fcb.as_ref()
+            }
+            .stream_sizes()?;
+            if current.same_cache_dimensions(update.sizes) {
+                continue;
+            }
+            expected = expected
+                .checked_add(1)
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            if !prepared
+                .prepared
+                .iter()
+                .any(|change| change.matches(update.node, update.sizes))
+            {
+                return Ok(false);
+            }
+        }
+        Ok(expected == prepared.prepared.len())
     }
 
     /// Looks up current streams at durable publication and retains each through a short explicit

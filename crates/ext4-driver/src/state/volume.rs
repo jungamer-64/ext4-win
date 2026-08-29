@@ -896,6 +896,34 @@ impl MountedVolumeAccess<'_> {
             .acquire_file_object_cache_lease(file_object, NonNull::from(&*self.volume))
     }
 
+    /// Preallocates native gates for every live regular-file cache-map size changed by one mutation.
+    /// # Errors
+    ///
+    /// Returns the exact allocation, stream-retention, or native size-snapshot failure before the
+    /// first Cache Manager or Memory Manager call is submitted.
+    pub(crate) fn prepare_stream_size_changes(
+        &self,
+        updates: &PreparedStreamSizePublications,
+    ) -> DriverResult<StreamSizeChangePlan> {
+        self.volume
+            .file_control_blocks
+            .prepare_stream_size_changes(updates)
+    }
+
+    /// Verifies that retained native gates still match the latest resolved size projection.
+    /// # Errors
+    ///
+    /// Returns a native size snapshot failure or a cross-volume gate invariant error.
+    pub(crate) fn prepared_stream_size_changes_match(
+        &self,
+        updates: &PreparedStreamSizePublications,
+        prepared: &PreparedStreamSizeChanges,
+    ) -> DriverResult<bool> {
+        self.volume
+            .file_control_blocks
+            .prepared_stream_size_changes_match(updates, prepared)
+    }
+
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
     /// # Errors
     ///

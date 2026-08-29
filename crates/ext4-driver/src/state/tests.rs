@@ -1362,6 +1362,52 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
 
 /// # Errors
 ///
+/// Returns a fixture allocation or native stream-header failure.
+/// # Panics
+///
+/// Panics if directory metadata is misclassified as a mapped regular-file size mutation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture failures use Result; assertions verify the stream-kind gate boundary"
+)]
+fn stream_size_change_plan_excludes_non_file_metadata() -> Result<(), DriverError> {
+    let mut ledger = FileControlBlockLedger::try_new()?;
+    let node = NodeId::Directory(DirectoryNodeId::ROOT);
+    let initial = super::NodeStreamSizes {
+        node,
+        sizes: crate::kernel::stream::StreamSizes::EMPTY,
+    };
+    let changed = super::NodeStreamSizes {
+        node,
+        sizes: crate::kernel::stream::StreamSizes::try_from_ext4(
+            ext4_core::FileSize::from_bytes(9_000),
+            ext4_core::FileAllocationSize::from_bytes(4_096),
+            ext4_core::ClusterSize::new(4_096)?,
+        )?,
+    };
+    let fcb = ledger.file_control_block(NonNull::dangling(), initial)?;
+    let fcb_pointer = NonNull::from(fcb.as_ref());
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(fcb)
+        .map_err(|failure| failure.into_parts().0)?;
+    let mut nodes = crate::memory::DriverVec::new();
+    nodes.try_push(changed)?;
+    let updates = super::PreparedStreamSizePublications { nodes };
+
+    let mut plan = ledger.prepare_stream_size_changes(&updates)?;
+    assert!(plan.next().is_none());
+    assert!(plan.into_prepared()?.is_none());
+
+    ledger.close(fcb_pointer);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+///
 /// Returns a fixture allocation or native stream-header error.
 /// # Panics
 ///

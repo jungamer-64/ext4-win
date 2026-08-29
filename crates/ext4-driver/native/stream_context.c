@@ -2,6 +2,9 @@
 
 #define EXT4WIN_STREAM_POOL_TAG ((ULONG)0x53743445UL)
 #define EXT4WIN_STREAM_SIGNATURE ((ULONG)0x53463445UL)
+#define EXT4WIN_SECTION_MUTATION_IDLE ((LONG)0)
+#define EXT4WIN_SECTION_MUTATION_PREPARING ((LONG)1)
+#define EXT4WIN_SECTION_MUTATION_SEALED ((LONG)2)
 
 typedef struct _EXT4WIN_STREAM_CONTEXT {
     FSRTL_ADVANCED_FCB_HEADER Header;
@@ -15,6 +18,8 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     PVOID Owner;
     PFILE_LOCK ByteRangeLocks;
     PVOID AePushLock;
+    KEVENT SectionMutationReleased;
+    volatile LONG SectionMutationState;
     ULONG Signature;
     ULONG Kind;
     BOOLEAN MainResourceInitialized;
@@ -44,6 +49,75 @@ ext4win_stream_from_header(_In_ PVOID stream_header)
 }
 
 static BOOLEAN
+ext4win_stream_acquire_paging_after_section_mutation(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ BOOLEAN exclusive,
+    _In_ BOOLEAN wait)
+{
+    for (;;) {
+        while (InterlockedCompareExchange(
+                   &stream->SectionMutationState,
+                   EXT4WIN_SECTION_MUTATION_IDLE,
+                   EXT4WIN_SECTION_MUTATION_IDLE) == EXT4WIN_SECTION_MUTATION_SEALED) {
+            if (!wait) {
+                return FALSE;
+            }
+            (VOID)KeWaitForSingleObject(
+                &stream->SectionMutationReleased,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL);
+        }
+        if (exclusive) {
+            if (!ExAcquireResourceExclusiveLite(&stream->PagingIoResource, wait)) {
+                return FALSE;
+            }
+        }
+        else if (!ExAcquireResourceSharedLite(&stream->PagingIoResource, wait)) {
+            return FALSE;
+        }
+        if (InterlockedCompareExchange(
+                &stream->SectionMutationState,
+                EXT4WIN_SECTION_MUTATION_IDLE,
+                EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_SEALED) {
+            return TRUE;
+        }
+        ExReleaseResourceLite(&stream->PagingIoResource);
+        if (!wait) {
+            return FALSE;
+        }
+    }
+}
+
+static VOID
+ext4win_stream_acquire_main_after_sealed_section_mutation(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    for (;;) {
+        while (InterlockedCompareExchange(
+                   &stream->SectionMutationState,
+                   EXT4WIN_SECTION_MUTATION_IDLE,
+                   EXT4WIN_SECTION_MUTATION_IDLE) == EXT4WIN_SECTION_MUTATION_SEALED) {
+            (VOID)KeWaitForSingleObject(
+                &stream->SectionMutationReleased,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL);
+        }
+        ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+        if (InterlockedCompareExchange(
+                &stream->SectionMutationState,
+                EXT4WIN_SECTION_MUTATION_IDLE,
+                EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_SEALED) {
+            return;
+        }
+        ExReleaseResourceLite(&stream->MainResource);
+    }
+}
+
+static BOOLEAN
 NTAPI
 ext4win_acquire_for_lazy_write(
     _In_ PVOID context,
@@ -54,7 +128,7 @@ ext4win_acquire_for_lazy_write(
     if (stream == NULL) {
         return FALSE;
     }
-    return ExAcquireResourceExclusiveLite(&stream->PagingIoResource, wait);
+    return ext4win_stream_acquire_paging_after_section_mutation(stream, TRUE, wait);
 }
 
 static VOID
@@ -79,7 +153,35 @@ ext4win_acquire_for_read_ahead(
     if (stream == NULL) {
         return FALSE;
     }
-    return ExAcquireResourceSharedLite(&stream->MainResource, wait);
+    for (;;) {
+        while (InterlockedCompareExchange(
+                   &stream->SectionMutationState,
+                   EXT4WIN_SECTION_MUTATION_IDLE,
+                   EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_IDLE) {
+            if (!wait) {
+                return FALSE;
+            }
+            (VOID)KeWaitForSingleObject(
+                &stream->SectionMutationReleased,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL);
+        }
+        if (!ExAcquireResourceSharedLite(&stream->MainResource, wait)) {
+            return FALSE;
+        }
+        if (InterlockedCompareExchange(
+                &stream->SectionMutationState,
+                EXT4WIN_SECTION_MUTATION_IDLE,
+                EXT4WIN_SECTION_MUTATION_IDLE) == EXT4WIN_SECTION_MUTATION_IDLE) {
+            return TRUE;
+        }
+        ExReleaseResourceLite(&stream->MainResource);
+        if (!wait) {
+            return FALSE;
+        }
+    }
 }
 
 static VOID
@@ -138,7 +240,72 @@ ext4win_stream_fast_io_candidate(
     if (!ext4win_stream_fast_io_stream(file_object, stream_out) ||
         ((file_object->Flags & FO_NO_INTERMEDIATE_BUFFERING) != 0) ||
         (file_object->PrivateCacheMap == NULL) ||
-        ((file_object->Flags & FO_CACHE_SUPPORTED) == 0)) {
+        ((file_object->Flags & FO_CACHE_SUPPORTED) == 0) ||
+        (InterlockedCompareExchange(
+            &(*stream_out)->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_IDLE,
+            EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_IDLE)) {
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOLEAN
+ext4win_stream_acquire_main_after_section_mutation(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ BOOLEAN exclusive)
+{
+    BOOLEAN waited;
+
+    waited = FALSE;
+    for (;;) {
+        while (InterlockedCompareExchange(
+                   &stream->SectionMutationState,
+                   EXT4WIN_SECTION_MUTATION_IDLE,
+                   EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_IDLE) {
+            waited = TRUE;
+            (VOID)KeWaitForSingleObject(
+                &stream->SectionMutationReleased,
+                Executive,
+                KernelMode,
+                FALSE,
+                NULL);
+        }
+        if (exclusive) {
+            ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+        }
+        else {
+            ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+        }
+        if (InterlockedCompareExchange(
+                &stream->SectionMutationState,
+                EXT4WIN_SECTION_MUTATION_IDLE,
+                EXT4WIN_SECTION_MUTATION_IDLE) == EXT4WIN_SECTION_MUTATION_IDLE) {
+            return waited;
+        }
+        waited = TRUE;
+        ExReleaseResourceLite(&stream->MainResource);
+    }
+}
+
+static VOID
+ext4win_stream_release_section_mutation(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    KeSetEvent(&stream->SectionMutationReleased, IO_NO_INCREMENT, FALSE);
+    (VOID)InterlockedExchange(
+        &stream->SectionMutationState,
+        EXT4WIN_SECTION_MUTATION_IDLE);
+}
+
+static BOOLEAN
+ext4win_stream_acquire_fast_io_main(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    if (InterlockedCompareExchange(
+            &stream->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_IDLE,
+            EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_IDLE) {
+        ExReleaseResourceLite(&stream->MainResource);
         return FALSE;
     }
     return TRUE;
@@ -220,6 +387,11 @@ ext4win_stream_create(
         return status;
     }
     stream->PagingResourceInitialized = TRUE;
+
+    KeInitializeEvent(
+        &stream->SectionMutationReleased,
+        NotificationEvent,
+        TRUE);
 
     stream->AePushLock = FsRtlAllocateAePushLock(NonPagedPoolNx, EXT4WIN_STREAM_POOL_TAG);
     if (stream->AePushLock == NULL) {
@@ -519,7 +691,7 @@ ext4win_stream_cache_initialize(
     }
 
     status = STATUS_SUCCESS;
-    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
     __try {
         if (file_object->PrivateCacheMap == NULL) {
             ext4win_capture_cache_sizes(stream, &sizes);
@@ -558,6 +730,7 @@ ext4win_stream_cache_read(
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
     IO_STATUS_BLOCK io_status;
     LARGE_INTEGER file_offset;
+    LONGLONG current_file_size;
     NTSTATUS status;
 
     if (!ext4win_stream_matches_file_object(stream, file_object) ||
@@ -574,13 +747,24 @@ ext4win_stream_cache_read(
     file_offset.QuadPart = offset;
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    current_file_size = stream->Header.FileSize.QuadPart;
+    ExReleaseFastMutex(&stream->HeaderMutex);
     __try {
-        if (!CcCopyRead(file_object, &file_offset, length, TRUE, buffer, &io_status)) {
-            status = STATUS_CANT_WAIT;
-        } else {
-            status = io_status.Status;
-            *information_out = io_status.Information;
+        if ((offset > current_file_size) ||
+            ((LONGLONG)length > (current_file_size - offset))) {
+            /* A size gate published after this read was planned; resolve against the new epoch. */
+            status = STATUS_RETRY;
+        }
+        else {
+            if (!CcCopyRead(file_object, &file_offset, length, TRUE, buffer, &io_status)) {
+                status = STATUS_CANT_WAIT;
+            }
+            else {
+                status = io_status.Status;
+                *information_out = io_status.Information;
+            }
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -603,6 +787,7 @@ ext4win_stream_cache_write(
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
     LARGE_INTEGER file_offset;
+    LONGLONG current_file_size;
     NTSTATUS status;
 
     if (!ext4win_stream_matches_file_object(stream, file_object) ||
@@ -615,11 +800,21 @@ ext4win_stream_cache_write(
     }
 
     file_offset.QuadPart = offset;
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    current_file_size = stream->Header.FileSize.QuadPart;
+    ExReleaseFastMutex(&stream->HeaderMutex);
     __try {
-        status = CcCopyWrite(file_object, &file_offset, length, TRUE, buffer)
-            ? STATUS_SUCCESS
-            : STATUS_CANT_WAIT;
+        if ((offset > current_file_size) ||
+            ((LONGLONG)length > (current_file_size - offset))) {
+            /* A size gate published after this write was planned; resolve against the new epoch. */
+            status = STATUS_RETRY;
+        }
+        else {
+            status = CcCopyWrite(file_object, &file_offset, length, TRUE, buffer)
+                ? STATUS_SUCCESS
+                : STATUS_CANT_WAIT;
+        }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         status = GetExceptionCode();
@@ -648,7 +843,7 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
     status = STATUS_SUCCESS;
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
     __try {
         CcFlushCache(&stream->SectionObjects, NULL, 0, &io_status);
         status = io_status.Status;
@@ -669,6 +864,7 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
     IO_STATUS_BLOCK io_status;
     NTSTATUS status;
+    BOOLEAN waited;
 
     if (stream == NULL) {
         return STATUS_INVALID_PARAMETER;
@@ -676,26 +872,27 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
-    if ((stream->SectionObjects.DataSectionObject == NULL) &&
-        (stream->SectionObjects.SharedCacheMap == NULL)) {
-        return STATUS_SUCCESS;
-    }
-
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
     status = STATUS_SUCCESS;
-    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    waited = ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
     __try {
-        CcCoherencyFlushAndPurgeCache(
-            &stream->SectionObjects,
-            NULL,
-            0,
-            &io_status,
-            0);
-        status = io_status.Status;
-        /* This informational Cc status means invalidation failed, not coherent success. */
-        if (status == STATUS_CACHE_PAGE_LOCKED) {
-            status = STATUS_USER_MAPPED_FILE;
+        if ((stream->SectionObjects.DataSectionObject != NULL) ||
+            (stream->SectionObjects.SharedCacheMap != NULL)) {
+            CcCoherencyFlushAndPurgeCache(
+                &stream->SectionObjects,
+                NULL,
+                0,
+                &io_status,
+                0);
+            status = io_status.Status;
+            /* This informational Cc status means invalidation failed, not coherent success. */
+            if (status == STATUS_CACHE_PAGE_LOCKED) {
+                status = STATUS_USER_MAPPED_FILE;
+            }
+        }
+        if (NT_SUCCESS(status) && waited) {
+            status = STATUS_RETRY;
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -703,6 +900,113 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
     }
     ExReleaseResourceLite(&stream->MainResource);
     return status;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_begin_size_change(
+    _In_ PVOID stream_header,
+    _In_ LONGLONG new_file_size)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    IO_STATUS_BLOCK io_status;
+    LARGE_INTEGER file_size;
+    LONGLONG current_file_size;
+    NTSTATUS status;
+
+    if ((stream == NULL) || (new_file_size < 0)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    for (;;) {
+        if (InterlockedCompareExchange(
+                &stream->SectionMutationState,
+                EXT4WIN_SECTION_MUTATION_PREPARING,
+                EXT4WIN_SECTION_MUTATION_IDLE) == EXT4WIN_SECTION_MUTATION_IDLE) {
+            break;
+        }
+        (VOID)KeWaitForSingleObject(
+            &stream->SectionMutationReleased,
+            Executive,
+            KernelMode,
+            FALSE,
+            NULL);
+    }
+    KeClearEvent(&stream->SectionMutationReleased);
+
+    file_size.QuadPart = new_file_size;
+    io_status.Status = STATUS_SUCCESS;
+    io_status.Information = 0;
+    status = STATUS_SUCCESS;
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    current_file_size = stream->Header.FileSize.QuadPart;
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    __try {
+        if ((new_file_size < current_file_size) &&
+            !MmCanFileBeTruncated(&stream->SectionObjects, &file_size)) {
+            status = STATUS_USER_MAPPED_FILE;
+        }
+        else if ((stream->SectionObjects.DataSectionObject != NULL) ||
+                 (stream->SectionObjects.SharedCacheMap != NULL)) {
+            CcCoherencyFlushAndPurgeCache(
+                &stream->SectionObjects,
+                NULL,
+                0,
+                &io_status,
+                0);
+            status = io_status.Status;
+            if (status == STATUS_CACHE_PAGE_LOCKED) {
+                status = STATUS_USER_MAPPED_FILE;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+
+    if (NT_SUCCESS(status)) {
+        ExAcquireResourceExclusiveLite(&stream->PagingIoResource, TRUE);
+        if (InterlockedCompareExchange(
+                &stream->SectionMutationState,
+                EXT4WIN_SECTION_MUTATION_SEALED,
+                EXT4WIN_SECTION_MUTATION_PREPARING) !=
+            EXT4WIN_SECTION_MUTATION_PREPARING) {
+            status = STATUS_INTERNAL_ERROR;
+        }
+        ExReleaseResourceLite(&stream->PagingIoResource);
+    }
+
+    if (!NT_SUCCESS(status)) {
+        ext4win_stream_release_section_mutation(stream);
+    }
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_end_size_change(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if (stream == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (InterlockedCompareExchange(
+            &stream->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_SEALED,
+            EXT4WIN_SECTION_MUTATION_SEALED) != EXT4WIN_SECTION_MUTATION_SEALED) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    ext4win_stream_release_section_mutation(stream);
+    return STATUS_SUCCESS;
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -928,7 +1232,9 @@ ext4win_fast_io_read(
         return FALSE;
     }
     handled = FALSE;
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        return FALSE;
+    }
     __try {
         handled = CcCopyRead(file_object, file_offset, length, wait, buffer, io_status);
     }
@@ -970,7 +1276,9 @@ ext4win_fast_io_write(
         return FALSE;
     }
     handled = FALSE;
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        return FALSE;
+    }
     __try {
         handled = CcCopyWrite(file_object, file_offset, length, wait, buffer);
         if (handled) {
@@ -1125,7 +1433,7 @@ ext4win_acquire_file_for_section(_In_ PFILE_OBJECT file_object)
     PEXT4WIN_STREAM_CONTEXT stream;
 
     if (ext4win_stream_fast_io_stream(file_object, &stream)) {
-        ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+        (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
     }
 }
 
@@ -1169,7 +1477,9 @@ ext4win_mdl_read(
     }
     *mdl_chain = NULL;
     handled = TRUE;
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        return FALSE;
+    }
     __try {
         CcMdlRead(file_object, file_offset, length, mdl_chain, io_status);
     }
@@ -1192,7 +1502,7 @@ ext4win_mdl_read_complete(
     BOOLEAN handled;
 
     UNREFERENCED_PARAMETER(device_object);
-    if ((mdl_chain == NULL) || !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+    if ((mdl_chain == NULL) || !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return FALSE;
     }
     handled = TRUE;
@@ -1232,7 +1542,9 @@ ext4win_prepare_mdl_write(
         return FALSE;
     }
     *mdl_chain = NULL;
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        return FALSE;
+    }
     __try {
         CcPrepareMdlWrite(file_object, file_offset, length, mdl_chain, io_status);
     }
@@ -1257,7 +1569,7 @@ ext4win_mdl_write_complete(
 
     UNREFERENCED_PARAMETER(device_object);
     if ((file_offset == NULL) || (mdl_chain == NULL) ||
-        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return FALSE;
     }
     handled = TRUE;
@@ -1286,7 +1598,9 @@ ext4win_acquire_for_mod_write(
         !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ExAcquireResourceSharedLite(&stream->PagingIoResource, TRUE);
+    if (!ext4win_stream_acquire_paging_after_section_mutation(stream, FALSE, TRUE)) {
+        return STATUS_CANT_WAIT;
+    }
     *resource_to_release = &stream->PagingIoResource;
     return STATUS_SUCCESS;
 }
@@ -1322,7 +1636,7 @@ ext4win_acquire_for_cc_flush(
     if (!ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    ext4win_stream_acquire_main_after_sealed_section_mutation(stream);
     return STATUS_SUCCESS;
 }
 
@@ -1397,7 +1711,11 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     }
     if ((stream->SectionObjects.DataSectionObject != NULL) ||
         (stream->SectionObjects.SharedCacheMap != NULL) ||
-        (stream->SectionObjects.ImageSectionObject != NULL)) {
+        (stream->SectionObjects.ImageSectionObject != NULL) ||
+        (InterlockedCompareExchange(
+            &stream->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_IDLE,
+            EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_IDLE)) {
         return STATUS_DEVICE_BUSY;
     }
 
