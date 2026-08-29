@@ -296,6 +296,54 @@ impl Drop for PreparedStreamSizeChange {
     }
 }
 
+/// Exact regular-file stream retained before a cleanup namespace deletion calls Cc/MM.
+#[derive(Debug)]
+pub(crate) struct StreamDeletionLease {
+    /// Shared stream retained independently from the cleaned-up handle.
+    stream: StreamCacheLease,
+    /// Typed inode identity fixed by the cleanup deletion state machine.
+    node: NodeId,
+}
+
+impl StreamDeletionLease {
+    /// Flushes every native section and returns the unique commit-lifetime deletion gate.
+    /// # Errors
+    ///
+    /// Returns cannot-delete while an image or mapped data section remains, or the exact native
+    /// flush failure. A coherent shared cache map remains under delayed-close ownership.
+    pub(crate) fn execute(self) -> DriverResult<PreparedStreamDeletion> {
+        self.stream.stream().stream_context.begin_delete()?;
+        Ok(PreparedStreamDeletion {
+            stream: self.stream,
+            node: self.node,
+        })
+    }
+}
+
+/// Successful stream-deletion gate retained through durable unlink publication.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamDeletion {
+    /// Stream lease released only after the native gate is ended.
+    stream: StreamCacheLease,
+    /// Exact inode whose cleanup deletion this gate authorizes.
+    node: NodeId,
+}
+
+impl PreparedStreamDeletion {
+    /// Returns the exact inode excluded from a weaker size-change gate.
+    pub(crate) const fn node(&self) -> NodeId {
+        self.node
+    }
+}
+
+impl Drop for PreparedStreamDeletion {
+    fn drop(&mut self) {
+        if self.stream.stream().stream_context.end_delete().is_err() {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+    }
+}
+
 #[expect(
     unsafe_code,
     reason = "the explicit lease retains the exact FCB pointer while publishing outside the ledger"
@@ -961,6 +1009,32 @@ impl FileControlBlockLedger {
         drop(completed);
     }
 
+    /// Cancels the exact final-cleanup deletion while no lower effect can be outstanding.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes the exact FCB-owned cleanup target transition"
+    )]
+    pub(super) fn abort_cleanup_delete(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        target: NonNull<FileDeleteTarget>,
+    ) {
+        let aborted = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource serializes lookup and deletion-state mutation.
+                &*self.table.get()
+            };
+            let mut state = ledger_file_control_block_open_state(table, fcb);
+            unsafe {
+                // SAFETY: The FCB was identity-checked against the owning table while locked.
+                state.as_mut()
+            }
+            .abort_cleanup_delete(target)
+        };
+        drop(aborted);
+    }
+
     /// Atomically releases a share claim and the same FILE_OBJECT's final FCB reference.
     #[expect(
         unsafe_code,
@@ -1246,6 +1320,7 @@ impl FileControlBlockLedger {
     pub(super) fn prepare_stream_size_changes(
         &self,
         updates: &PreparedStreamSizePublications,
+        deletion: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
         let capacity = updates.nodes.len();
         let mut remaining: DriverVec<StreamSizeChangeLease> =
@@ -1260,7 +1335,7 @@ impl FileControlBlockLedger {
             };
             let mut result = Ok(());
             for (index, update) in updates.nodes.iter().enumerate() {
-                if !matches!(update.node, NodeId::File(_)) {
+                if !matches!(update.node, NodeId::File(_)) || deletion == Some(update.node) {
                     continue;
                 }
                 if updates
@@ -1345,6 +1420,7 @@ impl FileControlBlockLedger {
         &self,
         updates: &PreparedStreamSizePublications,
         prepared: &PreparedStreamSizeChanges,
+        deletion: Option<NodeId>,
     ) -> DriverResult<bool> {
         if prepared
             .prepared
@@ -1360,7 +1436,7 @@ impl FileControlBlockLedger {
         };
         let mut expected = 0_usize;
         for update in updates.nodes.iter() {
-            if !matches!(update.node, NodeId::File(_)) {
+            if !matches!(update.node, NodeId::File(_)) || deletion == Some(update.node) {
                 continue;
             }
             let Some(fcb) = find_file_control_block_in_table(table, update.node) else {
@@ -1386,6 +1462,50 @@ impl FileControlBlockLedger {
             }
         }
         Ok(expected == prepared.prepared.len())
+    }
+
+    /// Retains the exact cleaned-up regular-file stream for native deletion preparation.
+    ///
+    /// Directories and symbolic links cannot own Windows data/image sections and therefore need no
+    /// native gate. A regular-file cleanup FCB must still be the ledger's exact node owner.
+    /// # Errors
+    ///
+    /// Returns an ownership invariant or finite deferred-lease failure before any Cc/MM call.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes exact FCB lookup and deferred-lease acquisition"
+    )]
+    pub(super) fn prepare_stream_deletion(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        node: NodeId,
+    ) -> DriverResult<Option<StreamDeletionLease>> {
+        if !matches!(node, NodeId::File(_)) {
+            return Ok(None);
+        }
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+            &*self.table.get()
+        };
+        if find_file_control_block_in_table(table, node) != Some(fcb) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The ledger resource uniquely serializes this open-state transition.
+            state.as_mut()
+        }
+        .acquire_deferred_lease()?;
+        Ok(Some(StreamDeletionLease {
+            stream: StreamCacheLease {
+                retained: DeferredStreamLease {
+                    owner: NonNull::from(self),
+                    fcb,
+                },
+            },
+            node,
+        }))
     }
 
     /// Looks up current streams at durable publication and retains each through a short explicit

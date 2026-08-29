@@ -580,6 +580,49 @@ impl StreamContext {
         }
     }
 
+    /// Flushes image/cache sections and blocks new section acquisition until deletion publishes.
+    /// # Errors
+    ///
+    /// Returns cannot-delete while an image or mapped data section cannot be removed. A flushed
+    /// shared cache map may finish its driver-owned delayed close after namespace publication.
+    pub(crate) fn begin_delete(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live stream and the caller retains it through gate release.
+                ext4win_stream_begin_delete(self.header.as_ptr())
+            };
+            if status == wdk_sys::STATUS_CANNOT_DELETE {
+                Err(DriverError::CannotDelete)
+            } else {
+                cache_status(status)
+            }
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
+    /// Releases one successfully acquired stream-deletion section gate.
+    /// # Errors
+    ///
+    /// Returns an invariant native status if no matching deletion gate remains active.
+    pub(crate) fn end_delete(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The matching successful begin call retained this same stream identity.
+                ext4win_stream_end_delete(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
     /// Releases this FILE_OBJECT's private cache map without destroying shared stream sections.
     /// # Errors
     ///
@@ -880,6 +923,10 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     fn ext4win_stream_end_size_change(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
+    fn ext4win_stream_begin_delete(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
+    fn ext4win_stream_end_delete(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_cache_uninitialize(
         stream_header: wdk_sys::PVOID,

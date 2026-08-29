@@ -3898,15 +3898,23 @@ mod tests {
                     crate::irp::CacheWorkCompletion::PrepareSizeChange(result) => {
                         let _result = result;
                     }
+                    crate::irp::CacheWorkCompletion::PrepareDeletion(result) => {
+                        let _result = result;
+                    }
                 }
                 drop(suspended);
             }
             OperationTransition::SubmitCacheWorkAfterIntentRelease { work, suspended } => {
                 let completion = work.execute();
-                let crate::irp::CacheWorkCompletion::PrepareSizeChange(result) = completion else {
-                    return;
-                };
-                let _result = result;
+                match completion {
+                    crate::irp::CacheWorkCompletion::PrepareSizeChange(result) => {
+                        let _result = result;
+                    }
+                    crate::irp::CacheWorkCompletion::PrepareDeletion(result) => {
+                        let _result = result;
+                    }
+                    _ => return,
+                }
                 drop(suspended);
             }
             OperationTransition::SubmitClosingLower {

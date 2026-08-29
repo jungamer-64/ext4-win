@@ -2180,6 +2180,23 @@ pub(crate) fn release_file_share_access(
     owner.release_share_access(fcb, file_object)
 }
 
+/// Aborts one exact final-cleanup deletion before any lower effect became uncertain.
+#[expect(
+    unsafe_code,
+    reason = "the cleanup plan retains the FCB and its owning ledger until this transition returns"
+)]
+pub(crate) fn abort_cleanup_file_delete(
+    fcb: NonNull<FileControlBlock>,
+    target: NonNull<FileDeleteTarget>,
+) {
+    let owner = file_control_block_owner(fcb);
+    let owner = unsafe {
+        // SAFETY: The cleanup plan retains this FCB and therefore its immutable ledger owner.
+        owner.as_ref()
+    };
+    owner.abort_cleanup_delete(fcb, target);
+}
+
 /// Rolls back a pre-attachment FCB reference and its recorded share claim.
 #[expect(
     unsafe_code,

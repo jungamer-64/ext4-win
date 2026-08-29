@@ -128,6 +128,8 @@ pub(crate) struct PendingCleanupDeletion {
     node: NodeId,
     /// Stable FCB-owned target allocation.
     target: NonNull<FileDeleteTarget>,
+    /// Whether dropping before a lower effect must restore the stream to the live namespace state.
+    abort_on_drop: bool,
 }
 
 #[expect(
@@ -137,6 +139,39 @@ pub(crate) struct PendingCleanupDeletion {
 // SAFETY: The per-handle terminal barrier retains the FCB, target, and VCB until this value is
 // consumed; it moves only between the sole reactor thread and lower completion envelopes.
 unsafe impl Send for PendingCleanupDeletion {}
+
+impl PendingCleanupDeletion {
+    /// Returns the exact FCB retained by the cleanup FILE_OBJECT until Close.
+    pub(crate) const fn file_control_block(&self) -> NonNull<FileControlBlock> {
+        self.fcb
+    }
+
+    /// Returns the immutable inode selected by the shared delete-pending transition.
+    pub(crate) const fn node(&self) -> NodeId {
+        self.node
+    }
+
+    /// Prevents rollback after a lower write or flush can have an uncertain external effect.
+    pub(crate) fn preserve_pending_after_uncertain_effect(&mut self) {
+        self.abort_on_drop = false;
+    }
+
+    /// Publishes a pre-effect cleanup failure before the failure completion becomes observable.
+    pub(crate) fn abort_before_failure_completion(&mut self) {
+        if self.abort_on_drop {
+            crate::state::abort_cleanup_file_delete(self.fcb, self.target);
+            self.abort_on_drop = false;
+        }
+    }
+}
+
+impl Drop for PendingCleanupDeletion {
+    fn drop(&mut self) {
+        if self.abort_on_drop {
+            crate::state::abort_cleanup_file_delete(self.fcb, self.target);
+        }
+    }
+}
 
 /// Releases resources owned by one FILE_OBJECT handle lifecycle.
 /// # Errors
@@ -189,9 +224,12 @@ fn cleanup_opened_node(
     file_object.mark_cleanup_complete();
     Ok(match cleanup {
         FileCleanupDisposition::Retained => CleanupPlan::Complete,
-        FileCleanupDisposition::Delete(target) => {
-            CleanupPlan::Delete(PendingCleanupDeletion { fcb, node, target })
-        }
+        FileCleanupDisposition::Delete(target) => CleanupPlan::Delete(PendingCleanupDeletion {
+            fcb,
+            node,
+            target,
+            abort_on_drop: true,
+        }),
     })
 }
 
