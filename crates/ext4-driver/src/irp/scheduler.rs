@@ -197,6 +197,8 @@ pub(crate) enum Phase {
     Lower,
     /// A non-cancellable PASSIVE_LEVEL cache work envelope owns the operation.
     Cache,
+    /// FsRtl owns the top-level IRP while an oplock break is pending.
+    Oplock,
 }
 
 /// Resource ownership retained after an intent grant.
@@ -272,6 +274,8 @@ pub(crate) enum CancelDisposition {
     ResumeOperation,
     /// Shell must propagate cancellation to the active lower request.
     CancelLower,
+    /// Shell must ask the FsRtl oplock package to cancel its delegated top-level IRP.
+    CancelOplock,
     /// Retry remains armed; timer delivery will observe cancellation.
     AwaitRetry,
     /// Registration cannot be interrupted; its result will observe cancellation.
@@ -552,6 +556,7 @@ impl Scheduler {
                 CancelDisposition::ResumeOperation
             }
             Phase::Lower => CancelDisposition::CancelLower,
+            Phase::Oplock => CancelDisposition::CancelOplock,
             Phase::Retry => CancelDisposition::AwaitRetry,
             Phase::Registering | Phase::Actor => CancelDisposition::AwaitRegistration,
             Phase::Cache | Phase::Vacant => CancelDisposition::Ignored,
@@ -1076,6 +1081,7 @@ mod tests {
             (Phase::Registering, CancelDisposition::AwaitRegistration),
             (Phase::Lower, CancelDisposition::CancelLower),
             (Phase::Cache, CancelDisposition::Ignored),
+            (Phase::Oplock, CancelDisposition::CancelOplock),
         ] {
             let slot = require_some!(scheduler.reserve());
             assert!(scheduler.set_phase(slot, phase));
@@ -1133,6 +1139,22 @@ mod tests {
             let waiting = require_some!(scheduler.take_ready());
             assert!(scheduler.complete(waiting));
         }
+    }
+
+    /// # Panics
+    ///
+    /// Panics if observing an empty cancel publication revokes cancellation for a later oplock
+    /// wait.
+    #[test]
+    fn oplock_wait_retains_future_cancellation_after_empty_poll() {
+        let mut scheduler = Scheduler::new();
+        let slot = require_some!(scheduler.reserve());
+        assert!(!scheduler.cancellation_is_pending(slot.index(), false));
+        assert!(scheduler.set_phase(slot, Phase::Oplock));
+        assert_eq!(
+            scheduler.request_cancel(slot.index()),
+            CancelDisposition::CancelOplock
+        );
     }
 
     /// # Panics

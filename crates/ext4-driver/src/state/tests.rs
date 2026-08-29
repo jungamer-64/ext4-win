@@ -1463,6 +1463,52 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
 
 /// # Errors
 ///
+/// Returns a fixture allocation or native stream-header error.
+/// # Panics
+///
+/// Panics if an oplock continuation fails to retain its FCB after the last handle closes.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture failures use Result; assertions verify deferred oplock stream residency"
+)]
+fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), DriverError> {
+    let mut ledger = FileControlBlockLedger::try_new()?;
+    let volume = NonNull::<VolumeControlBlock>::dangling();
+    let stream = super::NodeStreamSizes {
+        node: NodeId::Directory(DirectoryNodeId::ROOT),
+        sizes: crate::kernel::stream::StreamSizes::EMPTY,
+    };
+    let fcb = ledger.file_control_block(
+        volume,
+        stream,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
+    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let header = fcb.stream_header().as_ptr();
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(fcb)
+        .map_err(|failure| failure.into_parts().0)?;
+    let mut file_object = file_object_with_contexts(header, core::ptr::null_mut());
+    let Some(retained_fcb) = ledger.table.get_mut().iter().next() else {
+        return Err(DriverError::InternalInvariantViolation);
+    };
+    file_object.SectionObjectPointer = retained_fcb.stream_section_objects()?.as_ptr();
+
+    let lease = with_active_file_object(&mut file_object, |active| {
+        ledger.acquire_oplock_stream_lease(active, volume)
+    })?;
+    ledger.close(fcb_pointer);
+    assert!(!ledger.is_empty());
+    drop(lease);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+///
 /// Returns a fixture allocation or size conversion error.
 /// # Panics
 ///

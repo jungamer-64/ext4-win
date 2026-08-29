@@ -649,6 +649,36 @@ pub(crate) struct OwnedIrp {
     active_cancellation: Option<cancel::ActiveCancellation>,
 }
 
+/// Top-level IRP context retained while an external FsRtl package owns completion routing.
+///
+/// This value deliberately has no completion API. It can only be reclaimed after the external
+/// completion callback returns the exact IRP to the reactor.
+#[cfg(not(test))]
+#[derive(Debug)]
+pub(super) struct DelegatedIrp {
+    /// Dispatch target whose raw IRP was transferred to FsRtl.
+    target: DispatchTarget,
+    /// Request capture retained independently from the IRP's temporary external owner.
+    context: QueueContextOwnership,
+}
+
+#[cfg(not(test))]
+impl DelegatedIrp {
+    /// Returns the exact live IRP identity transferred to FsRtl.
+    pub(super) const fn irp(&self) -> NonNull<wdk_sys::IRP> {
+        self.target.irp.irp
+    }
+
+    /// Restores unique driver completion authority after the FsRtl callback returns the IRP.
+    pub(super) fn reclaim(self) -> OwnedIrp {
+        OwnedIrp {
+            target: self.target,
+            context: self.context,
+            active_cancellation: None,
+        }
+    }
+}
+
 /// Actor-local request classification after queue metadata ownership is recovered.
 pub(crate) enum ActorRequest<'a> {
     /// Request whose complete classification and requestor state were captured at dispatch.
@@ -803,6 +833,31 @@ impl OwnedIrp {
             // routine, and the selected envelope is stable until this token is dropped.
             cancel::ActiveCancellation::install(self.target.irp.as_ptr(), envelope)
         });
+    }
+
+    /// Returns the exact IRP identity for a prepared external-ownership publication.
+    ///
+    /// This does not transfer completion or cancellation authority. The caller must publish the
+    /// identity only together with a protocol that retains this owner until delegation begins.
+    #[cfg(not(test))]
+    pub(super) const fn external_irp_identity(&self) -> NonNull<wdk_sys::IRP> {
+        self.target.irp.irp
+    }
+
+    /// Removes driver cancel authority and transfers the raw IRP to an external FsRtl package.
+    ///
+    /// The cancel spin lock in `ActiveCancellation::drop` linearizes this handoff after any
+    /// already-selected callback has finished. The returned value retains request capture but has
+    /// no terminal completion authority until its matching external callback reclaims it.
+    #[cfg(not(test))]
+    pub(super) fn delegate_to_fsrtl(self) -> DelegatedIrp {
+        let Self {
+            target,
+            context,
+            active_cancellation,
+        } = self;
+        drop(active_cancellation);
+        DelegatedIrp { target, context }
     }
 
     /// Returns the exhaustive actor-local request classification.

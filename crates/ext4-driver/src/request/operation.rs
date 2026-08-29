@@ -17,7 +17,7 @@ use crate::irp::reactor::{
     ControlDeviceOperation, InfalliblePublication, IntentRequest, MountedVolumeOperation,
     OperationTransition, PublicationAuthority, ReactorTarget, WaitCondition,
 };
-use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
+use crate::irp::{CreateCompletion, IrpCompletion, OplockCheck, OplockContinuation, OwnedIrp};
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
 use crate::kernel::ffi;
@@ -2861,6 +2861,49 @@ enum CheckpointIoPhase {
 /// Explicit ownership phase of one journaled mutation operation.
 #[derive(Debug)]
 enum MutationOperationState {
+    /// A handle mutation is ready to transfer its IRP to the stream oplock package.
+    CheckingOplock {
+        /// Unique top-level completion authority before FsRtl delegation.
+        owned: OwnedIrp,
+        /// Stream lease and normalized check flags.
+        check: OplockCheck,
+        /// Immutable epoch retained through a possible oplock wait.
+        epoch: EpochLease,
+        /// Restartable resolver retained without entering the actor while FsRtl owns the IRP.
+        resolve: MutationResolveOperation,
+    },
+    /// FsRtl owns the raw top-level IRP and the external envelope owns this operation.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "host tests cannot execute the WDK callback that consumes this continuation"
+        )
+    )]
+    OplockDelegated {
+        /// Immutable epoch retained until exact IRP ownership returns.
+        epoch: EpochLease,
+        /// Resolver that has not yet observed an event.
+        resolve: MutationResolveOperation,
+    },
+    /// The reactor restored driver IRP/cancel authority after FsRtl completion.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "host tests cannot execute the WDK callback that constructs this resumed state"
+        )
+    )]
+    OplockReady {
+        /// Unique top-level completion authority returned by FsRtl.
+        owned: OwnedIrp,
+        /// Exact immediate or callback-published oplock status.
+        status: wdk_sys::NTSTATUS,
+        /// Immutable epoch retained across the external wait.
+        epoch: EpochLease,
+        /// Resolver entered only after successful oplock admission.
+        resolve: MutationResolveOperation,
+    },
     /// A within-EOF cached write is executing outside the actor.
     CacheWriting {
         /// Unique top-level completion authority retaining the input mapping.
@@ -3067,6 +3110,67 @@ enum DriverResolveDisposition {
 }
 
 impl MutationRequestOperation {
+    /// Retains the current node stream when this request class can break an oplock.
+    ///
+    /// Position-only updates and paging writeback do not change stream or namespace state, so
+    /// they bypass this break protocol. CREATE and CLEANUP require request-specific protocols and
+    /// therefore remain outside this ordinary-mutation boundary.
+    /// # Errors
+    ///
+    /// Returns request decoding, FILE_OBJECT identity, or finite stream-lease failures before any
+    /// oplock break is initiated.
+    fn prepare_oplock_check(
+        request: &PreparedMutationRequest,
+        owned: &mut OwnedIrp,
+        access: &MountedVolumeAccess<'_>,
+    ) -> DriverResult<Option<OplockCheck>> {
+        let requires_check = match request {
+            PreparedMutationRequest::DataWrite(authority) => {
+                !authority.is_paging()
+                    && !owned
+                        .request()
+                        .prepared_write()?
+                        .stack()
+                        .length()
+                        .is_empty()
+            }
+            PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
+                owned.request().with_active(|active| {
+                    let class = active.current_stack()?.set_file()?.information_class();
+                    Ok::<_, DriverError>(class != crate::irp::SetFileInformationClass::Position)
+                })?
+            }
+            PreparedMutationRequest::Other(
+                MutationRequestKind::SetEa
+                | MutationRequestKind::SetSecurity
+                | MutationRequestKind::SetReparsePoint
+                | MutationRequestKind::DeleteReparsePoint
+                | MutationRequestKind::EnableVerity,
+            ) => true,
+            PreparedMutationRequest::Other(
+                MutationRequestKind::Create
+                | MutationRequestKind::SetVolumeInformation
+                | MutationRequestKind::AddEncryptionKey
+                | MutationRequestKind::RemoveEncryptionKey
+                | MutationRequestKind::Cleanup,
+            ) => false,
+            PreparedMutationRequest::Other(MutationRequestKind::Write) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        };
+        if !requires_check {
+            return Ok(None);
+        }
+        owned.request().with_active(|active| {
+            let file_object = active.current_stack()?.file_object()?;
+            access
+                .acquire_oplock_stream_lease(file_object)
+                .map(OplockCheck::ordinary)
+                .map(Some)
+        })
+    }
+
     /// Allocates one mutation operation after acquiring its stable ticket and epoch lease.
     /// # Errors
     ///
@@ -3079,6 +3183,10 @@ impl MutationRequestOperation {
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
         let request = match PreparedMutationRequest::prepare(kind, &mut owned, access) {
             Ok(request) => request,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
+        let oplock = match Self::prepare_oplock_check(&request, &mut owned, access) {
+            Ok(oplock) => oplock,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         let trace = access.operational_trace();
@@ -3103,28 +3211,39 @@ impl MutationRequestOperation {
         let resolve = MutationResolveOperation::new(access.mounted_profile());
         match memory::boxed_try_map(
             (owned, epoch, crypto, activity, request),
-            |(owned, epoch, crypto, activity, request)| Self {
-                devices,
-                trace,
-                ticket,
-                _activity: activity,
-                now,
-                request,
-                crypto,
-                cleanup_deletion: None,
-                disposition_deletion: None,
-                pending_existing_create: None,
-                write_open: None,
-                write_effect_observed: false,
-                cleanup_barrier_released: false,
-                cleanup_cache_error: None,
-                state: MutationOperationState::Resolving {
-                    owned,
-                    epoch,
-                    resolve,
-                    size_changes: None,
-                    deletion: None,
-                },
+            |(owned, epoch, crypto, activity, request)| {
+                let state = match oplock {
+                    Some(check) => MutationOperationState::CheckingOplock {
+                        owned,
+                        check,
+                        epoch,
+                        resolve,
+                    },
+                    None => MutationOperationState::Resolving {
+                        owned,
+                        epoch,
+                        resolve,
+                        size_changes: None,
+                        deletion: None,
+                    },
+                };
+                Self {
+                    devices,
+                    trace,
+                    ticket,
+                    _activity: activity,
+                    now,
+                    request,
+                    crypto,
+                    cleanup_deletion: None,
+                    disposition_deletion: None,
+                    pending_existing_create: None,
+                    write_open: None,
+                    write_effect_observed: false,
+                    cleanup_barrier_released: false,
+                    cleanup_cache_error: None,
+                    state,
+                }
             },
         ) {
             Ok(operation) => {
@@ -3928,6 +4047,27 @@ impl MutationRequestOperation {
     }
 }
 
+impl OplockContinuation for MutationRequestOperation {
+    fn resume_after_oplock(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        status: wdk_sys::NTSTATUS,
+    ) -> Box<dyn CompletionOperation> {
+        let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
+        let MutationOperationState::OplockDelegated { epoch, resolve } = state else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        self.state = MutationOperationState::OplockReady {
+            owned,
+            status,
+            epoch,
+            resolve,
+        };
+        self
+    }
+}
+
 impl MountedVolumeOperation for MutationRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
@@ -4135,6 +4275,54 @@ impl MountedVolumeOperation for MutationRequestOperation {
         };
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
         match state {
+            MutationOperationState::CheckingOplock {
+                owned,
+                check,
+                epoch,
+                resolve,
+            } => match event {
+                OperationEvent::Admitted => {
+                    self.state = MutationOperationState::OplockDelegated { epoch, resolve };
+                    OperationTransition::CheckOplock {
+                        check,
+                        owned,
+                        suspended: self,
+                    }
+                }
+                OperationEvent::CancelRequested => {
+                    self.complete_error(owned, DriverError::from(Error::OperationCancelled))
+                }
+                _ => self.complete_error(owned, DriverError::InvalidDeviceRequest),
+            },
+            MutationOperationState::OplockReady {
+                owned,
+                status,
+                epoch,
+                resolve,
+            } => match event {
+                OperationEvent::CancelRequested => {
+                    self.complete_error(owned, DriverError::from(Error::OperationCancelled))
+                }
+                OperationEvent::Admitted if status >= STATUS_SUCCESS => self.advance_resolution(
+                    owned,
+                    ResolutionAttempt {
+                        epoch,
+                        resolve,
+                        size_changes: None,
+                        deletion: None,
+                    },
+                    OperationEvent::Admitted,
+                    access,
+                ),
+                OperationEvent::Admitted => {
+                    self.complete_error(owned, DriverError::OplockFailure(status))
+                }
+                _ => self.complete_error(owned, DriverError::InvalidDeviceRequest),
+            },
+            MutationOperationState::OplockDelegated { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             MutationOperationState::Resolving {
                 mut owned,
                 epoch,
@@ -4498,6 +4686,9 @@ impl MountedVolumeOperation for MutationRequestOperation {
             )
             | (
                 MutationOperationState::AwaitingIntent { .. }
+                | MutationOperationState::CheckingOplock { .. }
+                | MutationOperationState::OplockDelegated { .. }
+                | MutationOperationState::OplockReady { .. }
                 | MutationOperationState::AwaitingCommit { .. }
                 | MutationOperationState::PreparingSizeChange { .. }
                 | MutationOperationState::PreparingDeletion { .. }
@@ -4527,6 +4718,9 @@ impl InfalliblePublication for MutationRequestOperation {
                 PublicationAuthority::Checkpoint { epoch: *epoch }
             }
             MutationOperationState::CacheWriting { .. }
+            | MutationOperationState::CheckingOplock { .. }
+            | MutationOperationState::OplockDelegated { .. }
+            | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
             | MutationOperationState::CacheUninitializing { .. }
             | MutationOperationState::PreparingSizeChange { .. }
@@ -4607,6 +4801,9 @@ impl InfalliblePublication for MutationRequestOperation {
                 self.state = MutationOperationState::Terminal;
             }
             MutationOperationState::CacheWriting { .. }
+            | MutationOperationState::CheckingOplock { .. }
+            | MutationOperationState::OplockDelegated { .. }
+            | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
             | MutationOperationState::CacheUninitializing { .. }
             | MutationOperationState::PreparingSizeChange { .. }

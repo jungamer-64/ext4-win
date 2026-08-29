@@ -16,6 +16,7 @@ event_fast_io_mdl_write=13
 event_raw_read=14
 event_raw_write=15
 event_raw_flush=16
+event_oplock_check=17
 outcome_selected=1
 outcome_completed=2
 outcome_fallback=3
