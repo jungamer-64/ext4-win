@@ -758,6 +758,8 @@ pub(super) enum FileControlBlockShareCheck {
 struct ExistingFileControlBlockOpen {
     /// Mounted-volume identity that owns the stream.
     volume: NonNull<VolumeControlBlock>,
+    /// Write-only event capability inherited from the mounted volume owner.
+    trace: OperationalTrace,
     /// Durable size snapshot used if construction creates the FCB.
     stream: NodeStreamSizes,
     /// FILE_OBJECT whose share claim is being published.
@@ -770,6 +772,25 @@ struct ExistingFileControlBlockOpen {
     share_access: ShareAccess,
     /// Requested create-time oplock behavior.
     oplock_policy: OplockCreatePolicy,
+}
+
+/// Common construction and share-admission facts for one ledger open.
+#[derive(Clone, Copy, Debug)]
+struct FileControlBlockOpen {
+    /// Mounted-volume identity that owns the stream.
+    volume: NonNull<VolumeControlBlock>,
+    /// Durable size snapshot used if construction creates the FCB.
+    stream: NodeStreamSizes,
+    /// Write-only event capability inherited from the mounted volume owner.
+    trace: OperationalTrace,
+    /// FILE_OBJECT whose share claim is being published.
+    file_object: KernelFileObject,
+    /// Access already granted by the create security boundary.
+    desired_access: GrantedAccess,
+    /// Requested Windows sharing.
+    share_access: ShareAccess,
+    /// Existing/new-node share and oplock validation policy.
+    share_check: FileControlBlockShareCheck,
 }
 
 /// Whether an admitted existing-node claim created or reused the shared stream.
@@ -822,17 +843,18 @@ impl FileControlBlockLedger {
         &self,
         request: ExistingFileControlBlockOpen,
     ) -> DriverResult<ExistingFileControlBlockAdmission> {
-        self.open(
-            request.volume,
-            request.stream,
-            request.file_object,
-            request.desired_access,
-            request.share_access,
-            FileControlBlockShareCheck::ExistingNode {
+        self.open(FileControlBlockOpen {
+            volume: request.volume,
+            stream: request.stream,
+            trace: request.trace,
+            file_object: request.file_object,
+            desired_access: request.desired_access,
+            share_access: request.share_access,
+            share_check: FileControlBlockShareCheck::ExistingNode {
                 operation_access: request.operation_access,
                 oplock_policy: request.oplock_policy,
             },
-        )
+        })
     }
 
     /// Opens a staged-new-node FCB and atomically records its share claim.
@@ -843,18 +865,20 @@ impl FileControlBlockLedger {
         &self,
         volume: NonNull<VolumeControlBlock>,
         stream: NodeStreamSizes,
+        trace: OperationalTrace,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NonNull<FileControlBlock>> {
-        self.open(
+        self.open(FileControlBlockOpen {
             volume,
             stream,
+            trace,
             file_object,
             desired_access,
             share_access,
-            FileControlBlockShareCheck::NewNode,
-        )
+            share_check: FileControlBlockShareCheck::NewNode,
+        })
         .map(ExistingFileControlBlockAdmission::file_control_block)
     }
 
@@ -866,15 +890,19 @@ impl FileControlBlockLedger {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(super) fn open(
+    fn open(
         &self,
-        volume: NonNull<VolumeControlBlock>,
-        stream: NodeStreamSizes,
-        file_object: KernelFileObject,
-        desired_access: GrantedAccess,
-        share_access: ShareAccess,
-        share_check: FileControlBlockShareCheck,
+        request: FileControlBlockOpen,
     ) -> DriverResult<ExistingFileControlBlockAdmission> {
+        let FileControlBlockOpen {
+            volume,
+            stream,
+            trace,
+            file_object,
+            desired_access,
+            share_access,
+            share_check,
+        } = request;
         let node = stream.node();
         if let Some(result) =
             self.try_open_present(node, file_object, desired_access, share_access, share_check)
@@ -882,7 +910,7 @@ impl FileControlBlockLedger {
             return result;
         }
 
-        let candidate = self.file_control_block(volume, stream)?;
+        let candidate = self.file_control_block(volume, stream, trace)?;
         let mut discarded = None;
         let mut removed = None;
         let result = {
@@ -946,9 +974,10 @@ impl FileControlBlockLedger {
         &self,
         volume: NonNull<VolumeControlBlock>,
         stream: NodeStreamSizes,
+        trace: OperationalTrace,
     ) -> DriverResult<Box<FileControlBlock>> {
         let candidate = memory::boxed_try_with(|| {
-            FileControlBlock::try_new(volume, NonNull::from(self), stream)
+            FileControlBlock::try_new(volume, NonNull::from(self), stream, trace)
         })?;
         candidate.bind_stream_owner()?;
         Ok(candidate)
@@ -1959,13 +1988,19 @@ impl VolumeControlBlock {
     pub(crate) fn from_completed_mount(
         mount: CompletedMount,
         storage: MountedStorage,
+        trace: OperationalTrace,
     ) -> DriverResult<Self> {
         Ok(Self {
+            trace,
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             file_control_blocks: FileControlBlockLedger::try_new()?,
             volume_control: VolumeControlPlane::mounted(),
             runtime: VolumeRuntime::try_new(mount, storage)?,
-            stream_context: StreamContext::try_new(StreamOwnerKind::Volume, StreamSizes::EMPTY)?,
+            stream_context: StreamContext::try_new(
+                StreamOwnerKind::Volume,
+                StreamSizes::EMPTY,
+                trace,
+            )?,
         })
     }
 
@@ -2042,6 +2077,10 @@ impl VolumeControlBlock {
         };
         file_control_blocks.open_existing(ExistingFileControlBlockOpen {
             volume,
+            trace: unsafe {
+                // SAFETY: Actor admission retains this stable mounted VCB through the call.
+                volume.as_ref().trace
+            },
             stream,
             file_object,
             desired_access,
@@ -2101,6 +2140,7 @@ impl PendingChildCreation {
         .open_new(
             self.volume.as_non_null(),
             stream_sizes,
+            self.volume.trace(),
             file_object,
             desired_access,
             share_access,

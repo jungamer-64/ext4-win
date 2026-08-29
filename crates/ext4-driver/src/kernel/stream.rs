@@ -16,6 +16,7 @@ use wdk_sys::{NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
 
 #[cfg(not(test))]
 use crate::kernel::fatal::KernelWideInconsistency;
+use crate::kernel::operational_trace::OperationalTrace;
 use crate::kernel::status::{DriverError, DriverResult};
 
 /// Native stream owner domain encoded beside the advanced FCB header.
@@ -179,7 +180,11 @@ impl StreamContext {
     /// # Errors
     ///
     /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
-    pub(crate) fn try_new(kind: StreamOwnerKind, sizes: StreamSizes) -> DriverResult<Self> {
+    pub(crate) fn try_new(
+        kind: StreamOwnerKind,
+        sizes: StreamSizes,
+        trace: OperationalTrace,
+    ) -> DriverResult<Self> {
         #[cfg(not(test))]
         {
             let mut header = core::ptr::null_mut();
@@ -191,6 +196,7 @@ impl StreamContext {
                     sizes.file_size,
                     sizes.valid_data_length,
                     sizes.allocation_charge,
+                    trace.handle(),
                     core::ptr::addr_of_mut!(header),
                 )
             };
@@ -200,6 +206,7 @@ impl StreamContext {
         }
         #[cfg(test)]
         {
+            let _trace = trace;
             Ok(Self {
                 kind,
                 owner: AtomicPtr::new(core::ptr::null_mut()),
@@ -882,6 +889,7 @@ unsafe extern "system" {
         file_size: i64,
         valid_data_length: i64,
         allocation_charge: i64,
+        trace_registration_handle: u64,
         stream_header_out: *mut wdk_sys::PVOID,
     ) -> NTSTATUS;
 
@@ -993,7 +1001,7 @@ unsafe extern "system" {
 mod tests {
     use ext4_core::{ClusterSize, FileAllocationSize, FileSize};
 
-    use super::{StreamContext, StreamOwnerKind, StreamSizes};
+    use super::{OperationalTrace, StreamContext, StreamOwnerKind, StreamSizes};
     use crate::kernel::status::{DriverError, DriverResult};
 
     /// # Errors
@@ -1093,7 +1101,11 @@ mod tests {
         reason = "fixture failures use Result; assertions check publication"
     )]
     fn header_publication_replaces_all_size_fields_together() -> DriverResult<()> {
-        let stream = StreamContext::try_new(StreamOwnerKind::Node, StreamSizes::EMPTY)?;
+        let stream = StreamContext::try_new(
+            StreamOwnerKind::Node,
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+        )?;
         assert_eq!(stream.sizes()?, StreamSizes::EMPTY);
         let grown = StreamSizes::try_from_ext4(
             FileSize::from_bytes(16_384),

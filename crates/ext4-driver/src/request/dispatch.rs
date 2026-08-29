@@ -572,6 +572,7 @@ fn post_cleanup_lane(
 pub(crate) fn admit_owned(
     mut owned: OwnedIrp,
     target: &mut ReactorTarget,
+    trace: crate::kernel::operational_trace::OperationalTrace,
 ) -> Result<AdmittedOperation, AdmitOperationError> {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum HandleRequestClass {
@@ -845,7 +846,7 @@ pub(crate) fn admit_owned(
     let operation = match admission {
         Admission::Mount(admission) => {
             target.require_control_device();
-            super::operation::mount(owned, admission)
+            super::operation::mount(owned, admission, trace)
         }
         Admission::Read(kind) => {
             target.with_mounted_access(|access| super::operation::read(owned, kind, access))

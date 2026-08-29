@@ -15,6 +15,13 @@ pub(crate) enum RegularFileDataAuthority {
     Paging(PagingStreamLease),
 }
 
+impl RegularFileDataAuthority {
+    /// Reports whether this request owns cleanup-independent paging stream authority.
+    pub(crate) const fn is_paging(&self) -> bool {
+        matches!(self, Self::Paging(_))
+    }
+}
+
 /// Cache work selected for one admitted regular-file read.
 #[derive(Debug)]
 pub(crate) enum ReadCachePlan {

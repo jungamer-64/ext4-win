@@ -52,12 +52,13 @@ impl FileControlBlock {
         volume: NonNull<VolumeControlBlock>,
         owner: NonNull<FileControlBlockLedger>,
         stream: NodeStreamSizes,
+        trace: OperationalTrace,
     ) -> DriverResult<Self> {
         Ok(Self {
             volume,
             owner,
             node: stream.node(),
-            stream_context: StreamContext::try_new(StreamOwnerKind::Node, stream.sizes)?,
+            stream_context: StreamContext::try_new(StreamOwnerKind::Node, stream.sizes, trace)?,
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
         })

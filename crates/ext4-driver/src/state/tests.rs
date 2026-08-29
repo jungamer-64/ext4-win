@@ -58,6 +58,7 @@ fn retired_device_header_rejects_actor_access_and_retains_its_tag() -> Result<()
             DeviceExtensionKind::CONTROL,
             device,
             super::ReactorTarget::ControlDevice,
+            crate::kernel::operational_trace::OperationalTrace::host_test(),
         )?;
     }
     let header = unsafe {
@@ -174,6 +175,7 @@ fn volume_open_flag_selects_typed_volume_contexts() {
     let stream = crate::kernel::stream::StreamContext::try_new(
         crate::kernel::stream::StreamOwnerKind::Volume,
         crate::kernel::stream::StreamSizes::EMPTY,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
     )
     .unwrap_or_else(|_| {
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
@@ -558,6 +560,7 @@ fn test_file_control_block(
                 node,
                 sizes: crate::kernel::stream::StreamSizes::EMPTY,
             },
+            crate::kernel::operational_trace::OperationalTrace::host_test(),
         )
     })
     .unwrap_or_else(|_| {
@@ -1328,7 +1331,11 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
     };
-    let fcb = ledger.file_control_block(NonNull::dangling(), stream)?;
+    let fcb = ledger.file_control_block(
+        NonNull::dangling(),
+        stream,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let fcb_pointer = NonNull::from(fcb.as_ref());
     ledger
         .table
@@ -1386,7 +1393,11 @@ fn stream_size_change_plan_excludes_non_file_metadata() -> Result<(), DriverErro
             ext4_core::ClusterSize::new(4_096)?,
         )?,
     };
-    let fcb = ledger.file_control_block(NonNull::dangling(), initial)?;
+    let fcb = ledger.file_control_block(
+        NonNull::dangling(),
+        initial,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let fcb_pointer = NonNull::from(fcb.as_ref());
     ledger
         .table
@@ -1424,7 +1435,11 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
     };
-    let fcb = ledger.file_control_block(volume, stream)?;
+    let fcb = ledger.file_control_block(
+        volume,
+        stream,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let fcb_pointer = NonNull::from(fcb.as_ref());
     let header = fcb.stream_header().as_ptr();
     ledger
@@ -1477,7 +1492,11 @@ fn size_publication_targets_streams_opened_after_preparation() -> Result<(), Dri
     let publication = super::PreparedStreamSizePublications { nodes };
 
     // Only immutable stream fields are exercised, so the volume identity is never dereferenced.
-    let original = ledger.file_control_block(NonNull::dangling(), initial)?;
+    let original = ledger.file_control_block(
+        NonNull::dangling(),
+        initial,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let original_pointer = NonNull::from(original.as_ref());
     ledger
         .table
@@ -1486,7 +1505,11 @@ fn size_publication_targets_streams_opened_after_preparation() -> Result<(), Dri
         .map_err(|failure| failure.into_parts().0)?;
     ledger.close(original_pointer);
 
-    let reopened = ledger.file_control_block(NonNull::dangling(), initial)?;
+    let reopened = ledger.file_control_block(
+        NonNull::dangling(),
+        initial,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let before = reopened.stream_sizes();
     let reopened_pointer = NonNull::from(reopened.as_ref());
     ledger

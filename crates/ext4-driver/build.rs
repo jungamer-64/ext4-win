@@ -24,6 +24,15 @@ const LIFECYCLE_CONTROL_CONTRACT: &str = "lifecycle-control-v1.txt";
 /// Generated Rust constants consumed by the kernel boundary.
 const LIFECYCLE_CONTROL_RUST: &str = "lifecycle-control-v1.rs";
 
+/// Repository-owned source for the payload-free operational ETW schema.
+const OPERATIONAL_TRACE_CONTRACT: &str = "operational-trace-v1.txt";
+
+/// Generated Rust projection of the operational ETW schema.
+const OPERATIONAL_TRACE_RUST: &str = "operational-trace-v1.rs";
+
+/// Generated native projection of the operational ETW schema.
+const OPERATIONAL_TRACE_HEADER: &str = "operational-trace-v1.h";
+
 /// Prefix shared with the production reachability verifier.
 const ARTIFACT_ID_MARKER: &str = "EXT4WIN_ARTIFACT_ID=";
 
@@ -32,20 +41,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     const DATA_TRANSFER_SOURCE: &str = "native/data_transfer.c";
     const CANCEL_SOURCE: &str = "native/cancel.c";
     const STREAM_CONTEXT_SOURCE: &str = "native/stream_context.c";
+    const OPERATIONAL_TRACE_SOURCE: &str = "native/operational_trace.c";
     const VOLUME_DISCOVERY_SOURCE: &str = "native/volume_discovery.c";
 
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");
     println!("cargo:rerun-if-changed={DATA_TRANSFER_SOURCE}");
     println!("cargo:rerun-if-changed={CANCEL_SOURCE}");
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");
+    println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_SOURCE}");
+    println!("cargo:rerun-if-changed=native/operational_trace.h");
     println!("cargo:rerun-if-changed={VOLUME_DISCOVERY_SOURCE}");
     println!("cargo:rerun-if-changed={LIFECYCLE_CONTROL_CONTRACT}");
+    println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_CONTRACT}");
     println!("cargo:rerun-if-env-changed={ARTIFACT_ID_ENVIRONMENT}");
 
     let artifact_id = production_artifact_id()?;
     println!("cargo:rustc-env={ARTIFACT_ID_ENVIRONMENT}={artifact_id}");
     write_artifact_identity_record(&artifact_id)?;
     write_lifecycle_control_contract()?;
+    write_operational_trace_contract()?;
 
     let config = wdk_build::Config::from_env_auto()?;
     config.configure_binary_build()?;
@@ -58,12 +72,18 @@ fn main() -> Result<(), Box<dyn Error>> {
             native.define(&name, value.as_deref());
         }
     }
+    let out_directory =
+        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")
+        })?);
     native
         .includes(config.include_paths()?)
+        .include(&out_directory)
         .file(SECURITY_CAPTURE_SOURCE)
         .file(DATA_TRANSFER_SOURCE)
         .file(CANCEL_SOURCE)
         .file(STREAM_CONTEXT_SOURCE)
+        .file(OPERATIONAL_TRACE_SOURCE)
         .file(VOLUME_DISCOVERY_SOURCE);
 
     if is_msvc {
@@ -138,6 +158,113 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
             io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")
         })?);
     fs::write(out_directory.join(LIFECYCLE_CONTROL_RUST), generated)
+}
+
+/// Generates the Rust and native projections of the operational ETW contract.
+///
+/// # Errors
+///
+/// Returns an input or I/O error when the checked-in schema is incomplete, duplicated, malformed,
+/// or cannot be written to Cargo's output directory.
+fn write_operational_trace_contract() -> Result<(), io::Error> {
+    const EVENT_RECORDS: [(&str, &str); 16] = [
+        ("event_cached_read", "CACHED_READ"),
+        ("event_cached_write", "CACHED_WRITE"),
+        ("event_cache_flush", "CACHE_FLUSH"),
+        ("event_cache_coherency", "CACHE_COHERENCY"),
+        ("event_paging_read", "PAGING_READ"),
+        ("event_paging_write", "PAGING_WRITE"),
+        ("event_mapped_section", "MAPPED_SECTION"),
+        ("event_mapped_write", "MAPPED_WRITE"),
+        ("event_oplock_control", "OPLOCK_CONTROL"),
+        ("event_fast_io_read", "FAST_IO_READ"),
+        ("event_fast_io_write", "FAST_IO_WRITE"),
+        ("event_fast_io_mdl_read", "FAST_IO_MDL_READ"),
+        ("event_fast_io_mdl_write", "FAST_IO_MDL_WRITE"),
+        ("event_raw_read", "RAW_READ"),
+        ("event_raw_write", "RAW_WRITE"),
+        ("event_raw_flush", "RAW_FLUSH"),
+    ];
+    const OUTCOME_RECORDS: [(&str, &str); 5] = [
+        ("outcome_selected", "SELECTED"),
+        ("outcome_completed", "COMPLETED"),
+        ("outcome_fallback", "FALLBACK"),
+        ("outcome_failed", "FAILED"),
+        ("outcome_pending", "PENDING"),
+    ];
+
+    let records = read_contract_records(OPERATIONAL_TRACE_CONTRACT)?;
+    if required_record(&records, "contract_version")? != "1" {
+        return Err(invalid_contract(
+            "unsupported operational trace contract version",
+        ));
+    }
+    let guid = parse_guid(required_record(&records, "provider_guid")?)?;
+    let mut event_values = Vec::new();
+    let mut outcome_values = Vec::new();
+    let mut rust_projection = String::new();
+    let mut native_projection = String::from("#pragma once\n\n");
+    native_projection.push_str(&format!(
+        "static const GUID EXT4WIN_OPERATIONAL_TRACE_PROVIDER = {{\n\
+             0x{data1:08X}, 0x{data2:04X}, 0x{data3:04X},\n\
+             {{{data4}}}\n\
+         }};\n\
+         #define EXT4WIN_OPERATIONAL_TRACE_KEYWORD ((ULONGLONG)0x1ULL)\n\
+         #define EXT4WIN_OPERATIONAL_TRACE_LEVEL ((UCHAR)4)\n",
+        data1 = guid.0,
+        data2 = guid.1,
+        data3 = guid.2,
+        data4 = render_u8_array(&guid.3),
+    ));
+    for (record, symbol) in EVENT_RECORDS {
+        let value = parse_decimal_u16(required_record(&records, record)?)?;
+        if value == 0 || event_values.contains(&value) {
+            return Err(invalid_contract(
+                "operational trace event identifiers must be unique and nonzero",
+            ));
+        }
+        event_values.push(value);
+        if matches!(
+            symbol,
+            "PAGING_READ" | "PAGING_WRITE" | "RAW_READ" | "RAW_WRITE" | "RAW_FLUSH"
+        ) {
+            rust_projection.push_str(&format!(
+                "/// Stable event identifier generated from the operational trace contract.\n\
+                 pub(crate) const TRACE_EVENT_{symbol}: u16 = {value};\n"
+            ));
+        }
+        native_projection.push_str(&format!(
+            "#define EXT4WIN_TRACE_EVENT_{symbol} ((USHORT){value})\n"
+        ));
+    }
+    for (record, symbol) in OUTCOME_RECORDS {
+        let value = parse_decimal_u32(required_record(&records, record)?)?;
+        if value == 0 || outcome_values.contains(&value) {
+            return Err(invalid_contract(
+                "operational trace outcomes must be unique and nonzero",
+            ));
+        }
+        outcome_values.push(value);
+        if symbol != "FALLBACK" {
+            rust_projection.push_str(&format!(
+                "/// Stable outcome value generated from the operational trace contract.\n\
+                 pub(crate) const TRACE_OUTCOME_{symbol}: u32 = {value};\n"
+            ));
+        }
+        native_projection.push_str(&format!(
+            "#define EXT4WIN_TRACE_OUTCOME_{symbol} ((ULONG){value}UL)\n"
+        ));
+    }
+
+    let out_directory =
+        PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")
+        })?);
+    fs::write(out_directory.join(OPERATIONAL_TRACE_RUST), rust_projection)?;
+    fs::write(
+        out_directory.join(OPERATIONAL_TRACE_HEADER),
+        native_projection,
+    )
 }
 
 /// Reads one unique, nonempty key-value record set.
@@ -226,6 +353,31 @@ fn parse_hex_u32(value: &str) -> Result<u32, io::Error> {
     };
     u32::from_str_radix(digits, 16)
         .map_err(|_| invalid_contract("lifecycle control integer is malformed"))
+}
+
+/// Parses one canonical nonnegative decimal `u16` contract value.
+/// # Errors
+///
+/// Returns an input error when the text is empty, noncanonical, or outside the target domain.
+fn parse_decimal_u16(value: &str) -> Result<u16, io::Error> {
+    let value = parse_decimal_u32(value)?;
+    u16::try_from(value).map_err(|_| invalid_contract("decimal contract value exceeds u16"))
+}
+
+/// Parses one canonical nonnegative decimal `u32` contract value.
+/// # Errors
+///
+/// Returns an input error when the text is empty, noncanonical, or outside the target domain.
+fn parse_decimal_u32(value: &str) -> Result<u32, io::Error> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid_contract("decimal contract value is malformed"));
+    }
+    value
+        .parse()
+        .map_err(|_| invalid_contract("decimal contract value exceeds u32"))
 }
 
 /// Parses the canonical GUID spelling into native fields.

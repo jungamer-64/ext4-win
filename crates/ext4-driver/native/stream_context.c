@@ -1,4 +1,5 @@
 #include <ntifs.h>
+#include "operational_trace.h"
 
 #define EXT4WIN_STREAM_POOL_TAG ((ULONG)0x53743445UL)
 #define EXT4WIN_STREAM_SIGNATURE ((ULONG)0x53463445UL)
@@ -18,6 +19,7 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     PVOID Owner;
     PFILE_LOCK ByteRangeLocks;
     PVOID AePushLock;
+    REGHANDLE TraceRegistrationHandle;
     KEVENT SectionMutationReleased;
     volatile LONG SectionMutationState;
     ULONG Signature;
@@ -30,6 +32,47 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
 
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_CONTEXT, Header) == 0);
 C_ASSERT(sizeof(EXT4WIN_STREAM_CONTEXT) <= MAXSHORT);
+
+static VOID
+ext4win_trace_selected(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ USHORT event_id)
+{
+    ext4win_trace_write(
+        stream->TraceRegistrationHandle,
+        event_id,
+        STATUS_SUCCESS,
+        EXT4WIN_TRACE_OUTCOME_SELECTED);
+}
+
+static VOID
+ext4win_trace_status(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ USHORT event_id,
+    _In_ NTSTATUS status)
+{
+    ext4win_trace_write(
+        stream->TraceRegistrationHandle,
+        event_id,
+        status,
+        status == STATUS_PENDING
+            ? EXT4WIN_TRACE_OUTCOME_PENDING
+            : (NT_SUCCESS(status)
+                ? EXT4WIN_TRACE_OUTCOME_COMPLETED
+                : EXT4WIN_TRACE_OUTCOME_FAILED));
+}
+
+static VOID
+ext4win_trace_fallback(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _In_ USHORT event_id)
+{
+    ext4win_trace_write(
+        stream->TraceRegistrationHandle,
+        event_id,
+        STATUS_NOT_SUPPORTED,
+        EXT4WIN_TRACE_OUTCOME_FALLBACK);
+}
 
 static PEXT4WIN_STREAM_CONTEXT
 ext4win_stream_from_header(_In_ PVOID stream_header)
@@ -128,7 +171,13 @@ ext4win_acquire_for_lazy_write(
     if (stream == NULL) {
         return FALSE;
     }
-    return ext4win_stream_acquire_paging_after_section_mutation(stream, TRUE, wait);
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE);
+    if (!ext4win_stream_acquire_paging_after_section_mutation(stream, TRUE, wait)) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_CANT_WAIT);
+        return FALSE;
+    }
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_SUCCESS);
+    return TRUE;
 }
 
 static VOID
@@ -398,6 +447,7 @@ ext4win_stream_create(
     _In_ LONGLONG file_size,
     _In_ LONGLONG valid_data_length,
     _In_ LONGLONG allocation_charge,
+    _In_ REGHANDLE trace_registration_handle,
     _Outptr_ PVOID *stream_header_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
@@ -407,7 +457,8 @@ ext4win_stream_create(
         return STATUS_INVALID_PARAMETER;
     }
     *stream_header_out = NULL;
-    if ((kind == 0) || (allocation_size < 0) || (file_size < 0) ||
+    if ((kind == 0) || (trace_registration_handle == (REGHANDLE)0) ||
+        (allocation_size < 0) || (file_size < 0) ||
         (allocation_charge < 0) || (allocation_charge > allocation_size) ||
         (valid_data_length != file_size) ||
         (file_size > allocation_size)) {
@@ -422,6 +473,7 @@ ext4win_stream_create(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(stream, sizeof(*stream));
+    stream->TraceRegistrationHandle = trace_registration_handle;
 
     status = ExInitializeResourceLite(&stream->MainResource);
     if (!NT_SUCCESS(status)) {
@@ -528,6 +580,7 @@ ext4win_stream_oplock_fsctrl(
         (stream->ByteRangeLocks == NULL) || (irp == NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CONTROL);
     ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
     FsRtlIncrementLockRequestsInProgress(stream->ByteRangeLocks);
     __try {
@@ -543,6 +596,7 @@ ext4win_stream_oplock_fsctrl(
     FsRtlDecrementLockRequestsInProgress(stream->ByteRangeLocks);
     ext4win_stream_refresh_fast_io_projection(stream);
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CONTROL, status);
     return status;
 }
 
@@ -790,7 +844,9 @@ ext4win_stream_cache_read(
     }
     *information_out = 0;
     status = ext4win_stream_cache_initialize(stream_header, file_object);
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHED_READ);
     if (!NT_SUCCESS(status) || (length == 0)) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_READ, status);
         return status;
     }
 
@@ -821,6 +877,7 @@ ext4win_stream_cache_read(
         status = GetExceptionCode();
     }
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_READ, status);
     return status;
 }
 
@@ -845,7 +902,9 @@ ext4win_stream_cache_write(
         return STATUS_INVALID_PARAMETER;
     }
     status = ext4win_stream_cache_initialize(stream_header, file_object);
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHED_WRITE);
     if (!NT_SUCCESS(status) || (length == 0)) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_WRITE, status);
         return status;
     }
 
@@ -870,6 +929,7 @@ ext4win_stream_cache_write(
         status = GetExceptionCode();
     }
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_WRITE, status);
     return status;
 }
 
@@ -889,6 +949,7 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
     if (stream->SectionObjects.SharedCacheMap == NULL) {
         return STATUS_SUCCESS;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHE_FLUSH);
 
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
@@ -902,6 +963,7 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
         status = GetExceptionCode();
     }
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHE_FLUSH, status);
     return status;
 }
 
@@ -926,6 +988,7 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
     io_status.Information = 0;
     status = STATUS_SUCCESS;
     waited = ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHE_COHERENCY);
     __try {
         if ((stream->SectionObjects.DataSectionObject != NULL) ||
             (stream->SectionObjects.SharedCacheMap != NULL)) {
@@ -949,6 +1012,7 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
         status = GetExceptionCode();
     }
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHE_COHERENCY, status);
     return status;
 }
 
@@ -972,6 +1036,7 @@ ext4win_stream_begin_size_change(
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION);
     ext4win_stream_begin_section_mutation(stream);
 
     file_size.QuadPart = new_file_size;
@@ -1013,6 +1078,7 @@ ext4win_stream_begin_size_change(
     if (!NT_SUCCESS(status)) {
         ext4win_stream_release_section_mutation(stream);
     }
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION, status);
     return status;
 }
 
@@ -1032,6 +1098,7 @@ ext4win_stream_begin_delete(_In_ PVOID stream_header)
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION);
     ext4win_stream_begin_section_mutation(stream);
 
     io_status.Status = STATUS_SUCCESS;
@@ -1072,6 +1139,7 @@ ext4win_stream_begin_delete(_In_ PVOID stream_header)
     if (!NT_SUCCESS(status)) {
         ext4win_stream_release_section_mutation(stream);
     }
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION, status);
     return status;
 }
 
@@ -1090,6 +1158,7 @@ ext4win_stream_begin_write_open(_In_ PVOID stream_header)
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return STATUS_INVALID_DEVICE_STATE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION);
     ext4win_stream_begin_section_mutation(stream);
 
     status = STATUS_SUCCESS;
@@ -1110,6 +1179,7 @@ ext4win_stream_begin_write_open(_In_ PVOID stream_header)
     if (!NT_SUCCESS(status)) {
         ext4win_stream_release_section_mutation(stream);
     }
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION, status);
     return status;
 }
 
@@ -1176,6 +1246,7 @@ ext4win_stream_cache_drain_for_volume_lock(_In_ PVOID stream_header)
         (stream->SectionObjects.ImageSectionObject == NULL)) {
         return STATUS_SUCCESS;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHE_COHERENCY);
 
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
@@ -1209,6 +1280,7 @@ ext4win_stream_cache_drain_for_volume_lock(_In_ PVOID stream_header)
         status = GetExceptionCode();
     }
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHE_COHERENCY, status);
     return status;
 }
 
@@ -1377,8 +1449,10 @@ ext4win_fast_io_read(
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ);
     handled = FALSE;
     if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ);
         return FALSE;
     }
     __try {
@@ -1390,6 +1464,12 @@ ext4win_fast_io_read(
         handled = TRUE;
     }
     ExReleaseResourceLite(&stream->MainResource);
+    if (handled) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ, io_status->Status);
+    }
+    else {
+        ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ);
+    }
     return handled;
 }
 
@@ -1421,8 +1501,10 @@ ext4win_fast_io_write(
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
     handled = FALSE;
     if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
         return FALSE;
     }
     __try {
@@ -1438,6 +1520,12 @@ ext4win_fast_io_write(
         handled = TRUE;
     }
     ExReleaseResourceLite(&stream->MainResource);
+    if (handled) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE, io_status->Status);
+    }
+    else {
+        ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
+    }
     return handled;
 }
 
@@ -1579,7 +1667,9 @@ ext4win_acquire_file_for_section(_In_ PFILE_OBJECT file_object)
     PEXT4WIN_STREAM_CONTEXT stream;
 
     if (ext4win_stream_fast_io_stream(file_object, &stream)) {
+        ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION);
         (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION, STATUS_SUCCESS);
     }
 }
 
@@ -1621,9 +1711,11 @@ ext4win_mdl_read(
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
     *mdl_chain = NULL;
     handled = TRUE;
     if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
         return FALSE;
     }
     __try {
@@ -1634,6 +1726,7 @@ ext4win_mdl_read(
         io_status->Information = 0;
     }
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ, io_status->Status);
     return handled;
 }
 
@@ -1651,12 +1744,19 @@ ext4win_mdl_read_complete(
     if ((mdl_chain == NULL) || !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return FALSE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
     handled = TRUE;
     __try {
         CcMdlReadComplete(file_object, mdl_chain);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         handled = FALSE;
+    }
+    if (handled) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ, STATUS_SUCCESS);
+    }
+    else {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ, STATUS_UNSUCCESSFUL);
     }
     return handled;
 }
@@ -1687,8 +1787,10 @@ ext4win_prepare_mdl_write(
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);
     *mdl_chain = NULL;
     if (!ext4win_stream_acquire_fast_io_main(stream)) {
+        ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);
         return FALSE;
     }
     __try {
@@ -1699,6 +1801,7 @@ ext4win_prepare_mdl_write(
         io_status->Information = 0;
     }
     ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE, io_status->Status);
     return TRUE;
 }
 
@@ -1718,12 +1821,19 @@ ext4win_mdl_write_complete(
         !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return FALSE;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);
     handled = TRUE;
     __try {
         CcMdlWriteComplete(file_object, file_offset, mdl_chain);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         handled = FALSE;
+    }
+    if (handled) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE, STATUS_SUCCESS);
+    }
+    else {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE, STATUS_UNSUCCESSFUL);
     }
     return handled;
 }
@@ -1744,10 +1854,13 @@ ext4win_acquire_for_mod_write(
         !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
     }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE);
     if (!ext4win_stream_acquire_paging_after_section_mutation(stream, FALSE, TRUE)) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_CANT_WAIT);
         return STATUS_CANT_WAIT;
     }
     *resource_to_release = &stream->PagingIoResource;
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_SUCCESS);
     return STATUS_SUCCESS;
 }
 

@@ -40,6 +40,7 @@ use crate::irp::{
 use crate::kernel::cng::CngOperation;
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::ffi;
+use crate::kernel::operational_trace::OperationalTrace;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
 use crate::kernel::stream::{StreamContext, StreamOwnerKind, StreamSizes};

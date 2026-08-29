@@ -21,6 +21,7 @@ use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
 use crate::kernel::ffi;
+use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace};
 use crate::kernel::status::{DriverError, DriverResult, STATUS_FILE_LOCK_CONFLICT, STATUS_RETRY};
 use crate::kernel::storage::{
     ExternalJournalLease, LowerStorageDevice, MountedStorage, MountedStorageRoute,
@@ -194,6 +195,8 @@ struct ExclusiveExternalProbeContext {
 struct MountRequestOperation {
     /// Current consuming ownership phase.
     state: MountRequestState,
+    /// Driver-lifetime event capability propagated into the mounted VCB and its streams.
+    trace: OperationalTrace,
 }
 
 impl MountRequestOperation {
@@ -204,13 +207,17 @@ impl MountRequestOperation {
     fn try_new(
         owned: OwnedIrp,
         admission: MountAdmission,
+        trace: OperationalTrace,
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-        match memory::boxed_try_map((owned, admission), |(owned, admission)| Self {
-            state: MountRequestState::QueryLength { owned, admission },
+        match memory::boxed_try_map((owned, admission, trace), |(owned, admission, trace)| {
+            Self {
+                state: MountRequestState::QueryLength { owned, admission },
+                trace,
+            }
         }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
-                let (error, (owned, _admission)) = error.into_parts();
+                let (error, (owned, _admission, _trace)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
@@ -265,9 +272,10 @@ impl MountRequestOperation {
                 };
                 self.query_next_external_candidate(context)
             }
-            MountTransition::Complete(Ok(completed)) => {
-                Self::complete(owned, Self::publish_mount(admission, devices, completed))
-            }
+            MountTransition::Complete(Ok(completed)) => Self::complete(
+                owned,
+                Self::publish_mount(admission, devices, completed, self.trace),
+            ),
             MountTransition::Complete(Err(Error::InvalidMagic | Error::InvalidSuperblock)) => {
                 Self::complete(owned, Err(DriverError::UnrecognizedVolume))
             }
@@ -430,13 +438,14 @@ impl MountRequestOperation {
         admission: MountAdmission,
         devices: MountedStorage,
         completed: Box<ext4_core::CompletedMount>,
+        trace: OperationalTrace,
     ) -> DriverResult<IrpCompletion> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
         let Some(driver_object) = admission.file_system_device().driver_object() else {
             return Err(DriverError::InvalidParameter);
         };
         let mut vcb = memory::boxed_try_with(move || {
-            VolumeControlBlock::from_completed_mount(*completed, devices)
+            VolumeControlBlock::from_completed_mount(*completed, devices, trace)
         })?;
         vcb.bind_stream_owner()?;
         vcb.initialize_directory_change_notifier()?;
@@ -702,6 +711,11 @@ impl PreparedReadRequest {
             Ok(Self::Other(kind))
         }
     }
+
+    /// Reports whether the operation owns cleanup-independent paging stream authority.
+    const fn is_paging(&self) -> bool {
+        matches!(self, Self::Data(authority) if authority.is_paging())
+    }
 }
 
 /// Explicit ownership phase of one top-level read operation.
@@ -764,6 +778,8 @@ impl ReadRequestOperation {
             Ok(request) => request,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
+        let paging = request.is_paging();
+        let trace = access.operational_trace();
         let crypto = match access.new_crypto_operation() {
             Ok(crypto) => crypto,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
@@ -784,7 +800,16 @@ impl ReadRequestOperation {
                 state: ReadOperationState::Running { owned, read },
             },
         ) {
-            Ok(operation) => Ok(operation),
+            Ok(operation) => {
+                if paging {
+                    trace.record(
+                        OperationalPath::PagingRead,
+                        STATUS_SUCCESS,
+                        OperationalOutcome::Selected,
+                    );
+                }
+                Ok(operation)
+            }
             Err(error) => {
                 let (error, (owned, _epoch, _crypto, _request)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
@@ -972,9 +997,22 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     suspended: self,
                 }
             }
-            ReadTransition::Complete(Ok(result)) => Self::complete(owned, result),
+            ReadTransition::Complete(Ok(result)) => {
+                if self.request.is_paging() {
+                    access
+                        .operational_trace()
+                        .record_result(OperationalPath::PagingRead, &result);
+                }
+                Self::complete(owned, result)
+            }
             ReadTransition::Complete(Err(error)) => {
-                Self::complete(owned, Err(DriverError::from(error)))
+                let result = Err(DriverError::from(error));
+                if self.request.is_paging() {
+                    access
+                        .operational_trace()
+                        .record_result::<IrpCompletion>(OperationalPath::PagingRead, &result);
+                }
+                Self::complete(owned, result)
             }
         }
     }
@@ -1051,6 +1089,8 @@ struct RawVolumeOperation {
     kind: RawVolumeOperationKind,
     /// Mounted lower device route retained independently from the ext4 epoch.
     devices: MountedStorageRoute,
+    /// Write-only operational event capability inherited from the mounted volume.
+    trace: OperationalTrace,
     /// Machine-readable failure selected before the synthetic failed completion arrives.
     lower_failure: Option<StorageFailureClass>,
     /// Current consuming ownership phase.
@@ -1068,13 +1108,22 @@ impl RawVolumeOperation {
         access: &MountedVolumeAccess<'_>,
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
         let devices = access.storage_route();
+        let trace = access.operational_trace();
+        let path = match kind {
+            RawVolumeOperationKind::Read => OperationalPath::RawRead,
+            RawVolumeOperationKind::Write => OperationalPath::RawWrite,
+        };
         match memory::boxed_try_map((owned, kind), |(owned, kind)| Self {
             kind,
             devices,
+            trace,
             lower_failure: None,
             state: RawVolumeOperationState::Ready(owned),
         }) {
-            Ok(operation) => Ok(operation),
+            Ok(operation) => {
+                trace.record(path, STATUS_SUCCESS, OperationalOutcome::Selected);
+                Ok(operation)
+            }
             Err(error) => {
                 let (error, (owned, _kind)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
@@ -1083,24 +1132,57 @@ impl RawVolumeOperation {
     }
 
     /// Completes and consumes one terminal raw-volume IRP.
-    fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
+    fn complete(
+        &self,
+        owned: OwnedIrp,
+        result: DriverResult<IrpCompletion>,
+    ) -> OperationTransition {
+        self.trace.record_result(
+            match self.kind {
+                RawVolumeOperationKind::Read => OperationalPath::RawRead,
+                RawVolumeOperationKind::Write => OperationalPath::RawWrite,
+            },
+            &result,
+        );
         let _status = owned.complete_result(result);
+        OperationTransition::Complete
+    }
+
+    /// Completes an IRP whose committed-progress wrapper does not expose its terminal status.
+    fn complete_with_status(
+        &self,
+        owned: OwnedIrp,
+        result: DriverResult<IrpCompletion>,
+        status: wdk_sys::NTSTATUS,
+    ) -> OperationTransition {
+        self.trace.record_status(
+            match self.kind {
+                RawVolumeOperationKind::Read => OperationalPath::RawRead,
+                RawVolumeOperationKind::Write => OperationalPath::RawWrite,
+            },
+            status,
+        );
+        let _completion_status = owned.complete_result(result);
         OperationTransition::Complete
     }
 
     /// Completes a failed transfer while preserving lower-reported partial write progress.
     fn complete_transfer_failure(&mut self, owned: OwnedIrp, error: Error) -> OperationTransition {
-        let completion = match self.lower_failure.take() {
+        match self.lower_failure.take() {
             Some(StorageFailureClass::DurabilityUnknown { completed }) => {
-                IrpCompletion::from_usize(completed).map(|completion| {
-                    completion.committed_failure(DriverError::RawOutcomeUncertain)
-                })
+                match IrpCompletion::from_usize(completed) {
+                    Ok(completion) => self.complete_with_status(
+                        owned,
+                        Ok(completion.committed_failure(DriverError::RawOutcomeUncertain)),
+                        DriverError::RawOutcomeUncertain.ntstatus(),
+                    ),
+                    Err(error) => self.complete(owned, Err(error)),
+                }
             }
             Some(StorageFailureClass::Terminal | StorageFailureClass::ReadUnreliable) | None => {
-                Err(DriverError::from(error))
+                self.complete(owned, Err(DriverError::from(error)))
             }
-        };
-        Self::complete(owned, completion)
+        }
     }
 }
 
@@ -1121,10 +1203,10 @@ impl MountedVolumeOperation for RawVolumeOperation {
                         access,
                     ) {
                         Ok(prepared) => prepared,
-                        Err(error) => return Self::complete(owned, Err(error)),
+                        Err(error) => return self.complete(owned, Err(error)),
                     };
                     let Some(prepared) = prepared else {
-                        return Self::complete(owned, Ok(IrpCompletion::EMPTY));
+                        return self.complete(owned, Ok(IrpCompletion::EMPTY));
                     };
                     let (target, request, publication, write_through) = prepared.into_parts();
                     let expected = StorageRequestIdentity::from_request(&request);
@@ -1142,7 +1224,7 @@ impl MountedVolumeOperation for RawVolumeOperation {
                     }
                 }
                 OperationEvent::CancelRequested => {
-                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                    self.complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
@@ -1152,7 +1234,7 @@ impl MountedVolumeOperation for RawVolumeOperation {
                 | OperationEvent::VisibilityGranted(_)
                 | OperationEvent::CheckpointGranted(_)
                 | OperationEvent::BarrierReleased(_) => {
-                    Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                    self.complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
             RawVolumeOperationState::Transferring {
@@ -1163,13 +1245,10 @@ impl MountedVolumeOperation for RawVolumeOperation {
                 write_through,
             } => {
                 if matches!(event, OperationEvent::CancelRequested) {
-                    return Self::complete(
-                        owned,
-                        Err(DriverError::from(Error::OperationCancelled)),
-                    );
+                    return self.complete(owned, Err(DriverError::from(Error::OperationCancelled)));
                 }
                 let OperationEvent::StorageCompleted(completion) = event else {
-                    return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
+                    return self.complete(owned, Err(DriverError::InternalInvariantViolation));
                 };
                 let transfer = match expected.complete_transfer(completion) {
                     Ok(transfer) => transfer,
@@ -1187,7 +1266,7 @@ impl MountedVolumeOperation for RawVolumeOperation {
                             publication,
                             &buffer,
                         );
-                        Self::complete(owned, completion)
+                        self.complete(owned, completion)
                     }
                     (
                         RawVolumeOperationKind::Write,
@@ -1198,6 +1277,11 @@ impl MountedVolumeOperation for RawVolumeOperation {
                             target: ext4_core::StorageTarget::Filesystem,
                         };
                         let expected = StorageRequestIdentity::from_request(&request);
+                        self.trace.record(
+                            OperationalPath::RawFlush,
+                            STATUS_SUCCESS,
+                            OperationalOutcome::Selected,
+                        );
                         self.state = RawVolumeOperationState::Flushing {
                             owned,
                             target,
@@ -1212,12 +1296,12 @@ impl MountedVolumeOperation for RawVolumeOperation {
                         }
                     }
                     (RawVolumeOperationKind::Write, CompletedStorageTransfer::Write { .. }) => {
-                        Self::complete(owned, Ok(publication.publish()))
+                        self.complete(owned, Ok(publication.publish()))
                     }
                     (RawVolumeOperationKind::Read, CompletedStorageTransfer::Write { .. })
                     | (RawVolumeOperationKind::Write, CompletedStorageTransfer::Read { .. })
                     | (_, CompletedStorageTransfer::Flush { .. }) => {
-                        Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                        self.complete(owned, Err(DriverError::InternalInvariantViolation))
                     }
                 }
             }
@@ -1230,18 +1314,32 @@ impl MountedVolumeOperation for RawVolumeOperation {
             } => {
                 let OperationEvent::StorageCompleted(completion) = event else {
                     target.mark_write_uncertain(completed);
-                    return Self::complete(
+                    self.trace.record_status(
+                        OperationalPath::RawFlush,
+                        DriverError::RawOutcomeUncertain.ntstatus(),
+                    );
+                    return self.complete_with_status(
                         owned,
                         Ok(publication.committed_failure(DriverError::RawOutcomeUncertain)),
+                        DriverError::RawOutcomeUncertain.ntstatus(),
                     );
                 };
                 match expected.complete(completion) {
-                    Ok(()) => Self::complete(owned, Ok(publication.publish())),
+                    Ok(()) => {
+                        self.trace
+                            .record_status(OperationalPath::RawFlush, STATUS_SUCCESS);
+                        self.complete(owned, Ok(publication.publish()))
+                    }
                     Err(_error) => {
                         target.mark_write_uncertain(completed);
-                        Self::complete(
+                        self.trace.record_status(
+                            OperationalPath::RawFlush,
+                            DriverError::RawOutcomeUncertain.ntstatus(),
+                        );
+                        self.complete_with_status(
                             owned,
                             Ok(publication.committed_failure(DriverError::RawOutcomeUncertain)),
+                            DriverError::RawOutcomeUncertain.ntstatus(),
                         )
                     }
                 }
@@ -2539,6 +2637,11 @@ impl PreparedMutationRequest {
             Self::Other(kind) => *kind,
         }
     }
+
+    /// Reports whether this write owns cleanup-independent paging stream authority.
+    const fn is_paging(&self) -> bool {
+        matches!(self, Self::DataWrite(authority) if authority.is_paging())
+    }
 }
 
 /// Terminal payload appropriate for the top-level IRP's major function.
@@ -2897,6 +3000,8 @@ enum MutationOperationState {
 struct MutationRequestOperation {
     /// Validated mounted lower devices.
     devices: MountedStorageRoute,
+    /// Write-only operational event capability retained with paging writeback continuations.
+    trace: OperationalTrace,
     /// Stable FIFO ticket retained across stale-plan re-resolution.
     ticket: u64,
     /// Close-drain activity retained until every terminal/checkpoint path drops this operation.
@@ -2976,6 +3081,8 @@ impl MutationRequestOperation {
             Ok(request) => request,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
+        let trace = access.operational_trace();
+        let paging = request.is_paging();
         let now = match crate::kernel::time::current_ext4_timestamp() {
             Ok(now) => now,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
@@ -2998,6 +3105,7 @@ impl MutationRequestOperation {
             (owned, epoch, crypto, activity, request),
             |(owned, epoch, crypto, activity, request)| Self {
                 devices,
+                trace,
                 ticket,
                 _activity: activity,
                 now,
@@ -3019,7 +3127,16 @@ impl MutationRequestOperation {
                 },
             },
         ) {
-            Ok(operation) => Ok(operation),
+            Ok(operation) => {
+                if paging {
+                    trace.record(
+                        OperationalPath::PagingWrite,
+                        STATUS_SUCCESS,
+                        OperationalOutcome::Selected,
+                    );
+                }
+                Ok(operation)
+            }
             Err(error) => {
                 let (error, (owned, _epoch, _crypto, _activity, _request)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
@@ -3034,6 +3151,13 @@ impl MutationRequestOperation {
         completion: TopLevelCompletion,
     ) -> OperationTransition {
         if let Some(error) = self.cleanup_cache_error {
+            if self.request.is_paging() {
+                self.trace.record(
+                    OperationalPath::PagingWrite,
+                    error.ntstatus(),
+                    OperationalOutcome::Failed,
+                );
+            }
             match completion {
                 TopLevelCompletion::Normal(_) => {
                     let _status = owned.complete_result(Err(error));
@@ -3043,6 +3167,13 @@ impl MutationRequestOperation {
                 }
             }
             return OperationTransition::Complete;
+        }
+        if self.request.is_paging() {
+            self.trace.record(
+                OperationalPath::PagingWrite,
+                STATUS_SUCCESS,
+                OperationalOutcome::Completed,
+            );
         }
         match completion {
             TopLevelCompletion::Normal(completion) => {
@@ -3061,6 +3192,13 @@ impl MutationRequestOperation {
         owned: OwnedIrp,
         error: DriverError,
     ) -> OperationTransition {
+        if self.request.is_paging() {
+            self.trace.record(
+                OperationalPath::PagingWrite,
+                error.ntstatus(),
+                OperationalOutcome::Failed,
+            );
+        }
         drop(self.pending_existing_create.take());
         drop(self.write_open.take());
         if let Some(deletion) = self.cleanup_deletion.as_mut() {
@@ -4514,8 +4652,9 @@ impl_mounted_operation_adapter!(MutationRequestOperation);
 pub(crate) fn mount(
     owned: OwnedIrp,
     admission: MountAdmission,
+    trace: OperationalTrace,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    MountRequestOperation::try_new(owned, admission)
+    MountRequestOperation::try_new(owned, admission, trace)
 }
 
 /// Allocates one directory-change notification delegation.

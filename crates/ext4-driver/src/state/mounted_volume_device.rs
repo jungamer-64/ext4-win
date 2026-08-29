@@ -93,6 +93,7 @@ impl MountedVolumeDevice {
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
         let transfer_alignment = real_device.transfer_buffer_alignment()?;
+        let trace = vcb.trace;
         let mounted_flag = u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
         let identity = vcb.runtime.identity();
         let [a, b, c, d, ..] = identity.uuid().bytes();
@@ -129,6 +130,7 @@ impl MountedVolumeDevice {
                 DeviceExtensionKind::MOUNTED_VOLUME,
                 device,
                 ReactorTarget::MountedVolume(MountedVolumeBinding::new(vcb)),
+                trace,
             )?;
         }
         if let Err(error) = register_shutdown_notification(device) {

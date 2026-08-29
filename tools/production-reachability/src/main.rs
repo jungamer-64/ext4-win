@@ -80,6 +80,13 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("Fast I/O registration", "ext4win_fast_io_dispatch"),
     ("Fast I/O read callback", "ext4win_fast_io_read"),
     ("Fast I/O write callback", "ext4win_fast_io_write"),
+    ("operational ETW registration", "ext4win_trace_register"),
+    ("operational ETW event emission", "ext4win_trace_write"),
+    ("operational ETW unregister", "ext4win_trace_unregister"),
+    ("kernel ETW provider registration", "EtwRegister"),
+    ("kernel ETW event enable query", "EtwEventEnabled"),
+    ("kernel ETW event write", "EtwWrite"),
+    ("kernel ETW provider unregister", "EtwUnregister"),
     (
         "GPT volume identity query",
         "ext4win_query_volume_partition",
@@ -2330,6 +2337,13 @@ mod tests {
              ext4win_fast_io_dispatch\n\
              ext4win_fast_io_read\n\
              ext4win_fast_io_write\n\
+             ext4win_trace_register\n\
+             ext4win_trace_write\n\
+             ext4win_trace_unregister\n\
+             EtwRegister\n\
+             EtwEventEnabled\n\
+             EtwWrite\n\
+             EtwUnregister\n\
              ext4win_query_volume_partition\n\
              ext4win_read_volume_prefix\n\
              ext4win_announce_volume\n\
