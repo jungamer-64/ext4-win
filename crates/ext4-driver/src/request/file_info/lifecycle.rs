@@ -17,7 +17,7 @@ pub(crate) fn prepare_cleanup_cache_work(
         }
         match OpenedFileObject::decode(file_object)? {
             OpenedFileObject::Node(_) => operations
-                .acquire_cache_stream_lease(file_object)
+                .acquire_file_object_cache_lease(file_object)
                 .map(crate::irp::CacheWork::uninitialize)
                 .map(Some),
             OpenedFileObject::Volume(_) => Ok(None),

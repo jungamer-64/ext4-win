@@ -855,13 +855,13 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns an error when the FILE_OBJECT stream identity is malformed, belongs to another
     /// mounted volume, or the finite deferred-lease count is exhausted.
-    pub(crate) fn acquire_cache_stream_lease(
+    pub(crate) fn acquire_file_object_cache_lease(
         &self,
         file_object: ActiveFileObject<'_>,
-    ) -> DriverResult<CacheStreamLease> {
+    ) -> DriverResult<FileObjectCacheLease> {
         self.volume
             .file_control_blocks
-            .acquire_cache_stream_lease(file_object, NonNull::from(&*self.volume))
+            .acquire_file_object_cache_lease(file_object, NonNull::from(&*self.volume))
     }
 
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.

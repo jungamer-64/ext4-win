@@ -121,49 +121,13 @@ impl PagingStreamLease {
     unsafe_code,
     reason = "the deferred ledger lease retains the exact FCB pointer for every worker call"
 )]
-impl CacheStreamLease {
+impl StreamCacheLease {
     /// Returns the retained stream after the ledger has released its lifetime resource.
     fn stream(&self) -> &FileControlBlock {
         unsafe {
             // SAFETY: `retained` keeps this exact table entry alive through the worker call.
             self.retained.fcb.as_ref()
         }
-    }
-
-    /// Reads cached bytes into the pre-captured system mapping.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager or representation failure.
-    pub(crate) fn read(
-        &self,
-        offset: i64,
-        length: usize,
-        output: Option<NonNull<u8>>,
-    ) -> DriverResult<usize> {
-        self.stream().stream_context.cached_read(
-            self.file_object.as_non_null(),
-            offset,
-            length,
-            output,
-        )
-    }
-
-    /// Accepts a within-EOF write from the pre-captured system mapping.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager or representation failure.
-    pub(crate) fn write(
-        &self,
-        offset: i64,
-        input: Option<NonNull<u8>>,
-        length: usize,
-    ) -> DriverResult<()> {
-        self.stream().stream_context.cached_write(
-            self.file_object.as_non_null(),
-            offset,
-            input,
-            length,
-        )
     }
 
     /// Flushes every dirty page in the shared stream cache.
@@ -181,13 +145,57 @@ impl CacheStreamLease {
     pub(crate) fn purge(&self) -> DriverResult<()> {
         self.stream().stream_context.coherency_flush_and_purge()
     }
+}
+
+impl FileObjectCacheLease {
+    /// Attenuates this FILE_OBJECT authority to the shared stream cache only.
+    pub(crate) fn into_stream(self) -> StreamCacheLease {
+        self.stream
+    }
+
+    /// Reads cached bytes into the pre-captured system mapping.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager or representation failure.
+    pub(crate) fn read(
+        &self,
+        offset: i64,
+        length: usize,
+        output: Option<NonNull<u8>>,
+    ) -> DriverResult<usize> {
+        self.stream.stream().stream_context.cached_read(
+            self.file_object.as_non_null(),
+            offset,
+            length,
+            output,
+        )
+    }
+
+    /// Accepts a within-EOF write from the pre-captured system mapping.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager or representation failure.
+    pub(crate) fn write(
+        &self,
+        offset: i64,
+        input: Option<NonNull<u8>>,
+        length: usize,
+    ) -> DriverResult<()> {
+        self.stream.stream().stream_context.cached_write(
+            self.file_object.as_non_null(),
+            offset,
+            input,
+            length,
+        )
+    }
 
     /// Releases this FILE_OBJECT's private cache map.
     /// # Errors
     ///
     /// Returns the exact Cache Manager exception status.
     pub(crate) fn uninitialize(&self) -> DriverResult<()> {
-        self.stream()
+        self.stream
+            .stream()
             .stream_context
             .uninitialize_cache_map(self.file_object.as_non_null())
     }
@@ -207,7 +215,15 @@ unsafe impl Send for PagingStreamLease {}
 )]
 // SAFETY: The worker owns this lease exclusively. Its operation-owned IRP retains FILE_OBJECT and
 // buffer mappings, while the ledger count retains the FCB and VCB until the envelope is reclaimed.
-unsafe impl Send for CacheStreamLease {}
+unsafe impl Send for StreamCacheLease {}
+
+#[expect(
+    unsafe_code,
+    reason = "the work envelope and IRP retain the exact FILE_OBJECT cache identity"
+)]
+// SAFETY: The containing operation-owned IRP retains FILE_OBJECT while the nested stream lease
+// retains the FCB and VCB through worker completion.
+unsafe impl Send for FileObjectCacheLease {}
 
 #[expect(
     unsafe_code,
@@ -935,15 +951,15 @@ impl FileControlBlockLedger {
     /// # Errors
     ///
     /// Returns an object, ownership, section-identity, or deferred-lease failure.
-    pub(super) fn acquire_cache_stream_lease(
+    pub(super) fn acquire_file_object_cache_lease(
         &self,
         file_object: ActiveFileObject<'_>,
         volume: NonNull<VolumeControlBlock>,
-    ) -> DriverResult<CacheStreamLease> {
+    ) -> DriverResult<FileObjectCacheLease> {
         let (retained, _node) =
             self.acquire_deferred_stream_lease(file_object, volume, DeferredStreamTarget::Node)?;
-        Ok(CacheStreamLease {
-            retained,
+        Ok(FileObjectCacheLease {
+            stream: StreamCacheLease { retained },
             file_object: file_object.address(),
         })
     }
