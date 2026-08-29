@@ -420,35 +420,6 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
         Err(error) => return received.complete_result(Err(error)),
     };
     if device_kind == DriverDeviceKind::MountedVolume {
-        let cache_boundary = match major {
-            DispatchMajor::Read => received.with_active(super::file_info::dispatch_cached_read),
-            DispatchMajor::Write => received.with_active(super::file_info::dispatch_cached_write),
-            DispatchMajor::FlushBuffers => received
-                .with_active(super::file_info::flush_cache_before_queued_flush)
-                .map(|()| None),
-            DispatchMajor::Cleanup | DispatchMajor::Close => received
-                .with_active(super::file_info::uninitialize_cache_before_cleanup)
-                .map(|()| None),
-            DispatchMajor::Create
-            | DispatchMajor::QueryInformation
-            | DispatchMajor::SetInformation
-            | DispatchMajor::QueryVolumeInformation
-            | DispatchMajor::SetVolumeInformation
-            | DispatchMajor::DirectoryControl
-            | DispatchMajor::FileSystemControl
-            | DispatchMajor::DeviceControl
-            | DispatchMajor::QueryEa
-            | DispatchMajor::SetEa
-            | DispatchMajor::LockControl
-            | DispatchMajor::Shutdown
-            | DispatchMajor::QuerySecurity
-            | DispatchMajor::SetSecurity => Ok(None),
-        };
-        match cache_boundary {
-            Ok(Some(completion)) => return received.complete(completion),
-            Ok(None) => {}
-            Err(error) => return received.complete_result(Err(error)),
-        }
         if major == DispatchMajor::FileSystemControl {
             match received.with_active(super::file_info::oplock_control) {
                 Ok(Some(file_control_block)) => {

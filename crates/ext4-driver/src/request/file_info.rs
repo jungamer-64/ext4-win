@@ -22,10 +22,10 @@ use crate::irp::{
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{self, DriverVec};
 use crate::state::{
-    CleanupStart, CloseReleasePlan, DataTransferMode, DirectoryChange, DirectoryChangeAction,
-    DirectoryCursor, DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock,
-    FileDeleteTarget, MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject,
-    OpenedLocation, OpenedObject, OpenedRegularFile, PagingStreamLease, PendingFileDeletion,
+    CleanupStart, CloseReleasePlan, DirectoryChange, DirectoryChangeAction, DirectoryCursor,
+    DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
+    MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation,
+    OpenedObject, OpenedRegularFile, PagingStreamLease, PendingFileDeletion,
     PreparedFilePositionPublication, PreparedHandleAdmission, PreparedOpenedLocationPublication,
     RawVolumeOperationKind, RawVolumeTarget, VolumeHandleCleanup, VolumeRetirement,
     release_cancelled_file_control_block, release_file_control_block,
