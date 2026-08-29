@@ -9,7 +9,6 @@ permissions:
   contents: read
 
 env:
-  RUST_TOOLCHAIN: nightly-2026-08-27
   E2FSPROGS_RELEASE: 1.47.2
 
   # Keep cargo-wdk aligned with the exact windows-drivers-rs revision
@@ -39,7 +38,6 @@ jobs:
       - name: Install pinned Rust toolchain
         run: >
           rustup toolchain install
-          ${{ env.RUST_TOOLCHAIN }}
           --profile minimal
           --component rustfmt
           --component clippy
@@ -61,7 +59,6 @@ jobs:
       - name: Install pinned Rust toolchain
         run: >
           rustup toolchain install
-          ${{ env.RUST_TOOLCHAIN }}
           --profile minimal
           --component rustfmt
           --component clippy
@@ -104,7 +101,6 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           rustup toolchain install `
-            "${{ env.RUST_TOOLCHAIN }}" `
             --profile minimal `
             --component rustfmt `
             --component clippy
