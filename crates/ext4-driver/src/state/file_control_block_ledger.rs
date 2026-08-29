@@ -47,11 +47,18 @@ pub(crate) struct PagingStreamLease {
     file: FileNodeId,
 }
 
-/// One stream retained while a PASSIVE_LEVEL cache worker calls Cc/MM outside the actor.
+/// One shared stream cache retained while a PASSIVE_LEVEL worker calls Cc/MM outside the actor.
 #[derive(Debug)]
-pub(crate) struct CacheStreamLease {
-    /// Sole retention authority for this cache work item.
+pub(crate) struct StreamCacheLease {
+    /// Sole retention authority for shared cache flush/purge work.
     retained: DeferredStreamLease,
+}
+
+/// One FILE_OBJECT cache identity retained while a PASSIVE_LEVEL worker calls Cc/MM.
+#[derive(Debug)]
+pub(crate) struct FileObjectCacheLease {
+    /// Attenuated shared-stream authority used by every cache operation.
+    stream: StreamCacheLease,
     /// FILE_OBJECT whose private cache map participates in the operation.
     file_object: KernelFileObject,
 }
