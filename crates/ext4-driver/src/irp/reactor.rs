@@ -456,6 +456,13 @@ pub(crate) enum OperationTransition {
         /// Operation moved by value into the work-item completion envelope.
         suspended: Box<dyn CompletionOperation>,
     },
+    /// Release a provisional mutation intent before a reentrant Cache Manager call.
+    SubmitCacheWorkAfterIntentRelease {
+        /// Fully captured Cc/MM operation whose stream lease owns every native identity.
+        work: crate::irp::CacheWork,
+        /// Operation resumed only after cache work, then re-resolved before requesting intent.
+        suspended: Box<dyn CompletionOperation>,
+    },
     /// Atomically acquire a resolved mutation's full resource set.
     RequestIntent {
         /// Stable FIFO/resource request.
@@ -2092,6 +2099,17 @@ impl CompletionReactor {
             }
             OperationTransition::SubmitCacheWork { work, suspended } => {
                 self.submit_cache_work(index, work, suspended);
+            }
+            OperationTransition::SubmitCacheWorkAfterIntentRelease { work, suspended } => {
+                let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
+                else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                if !self.with_scheduler(|scheduler| scheduler.release_required_intent(identity)) {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                self.submit_cache_work(index, work, suspended);
+                self.grant_available_intents();
             }
             OperationTransition::RequestIntent { request, suspended } => {
                 let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
@@ -3877,7 +3895,18 @@ mod tests {
                     crate::irp::CacheWorkCompletion::DrainForVolumeLock(result) => {
                         let _result = result;
                     }
+                    crate::irp::CacheWorkCompletion::PrepareSizeChange(result) => {
+                        let _result = result;
+                    }
                 }
+                drop(suspended);
+            }
+            OperationTransition::SubmitCacheWorkAfterIntentRelease { work, suspended } => {
+                let completion = work.execute();
+                let crate::irp::CacheWorkCompletion::PrepareSizeChange(result) = completion else {
+                    return;
+                };
+                let _result = result;
                 drop(suspended);
             }
             OperationTransition::SubmitClosingLower {

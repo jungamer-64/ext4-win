@@ -13,6 +13,11 @@ use wdk_sys::{
     STATUS_UNRECOGNIZED_VOLUME, STATUS_VOLUME_DIRTY,
 };
 
+/// Retry request used when a precomputed cache plan became stale behind a stream-size gate.
+pub(crate) const STATUS_RETRY: NTSTATUS = ntstatus(0xC000_022D);
+/// Byte-range or stream mutation exclusion conflict absent from the generated WDK bindings.
+pub(crate) const STATUS_FILE_LOCK_CONFLICT: NTSTATUS = ntstatus(0xC000_0054);
+
 /// Driver-local result before NTSTATUS completion mapping.
 pub(crate) type DriverResult<T> = Result<T, DriverError>;
 
@@ -154,7 +159,7 @@ impl DriverError {
             Self::FileIsDirectory => ntstatus(0xC000_00BA),
             Self::NotADirectory => ntstatus(0xC000_0103),
             Self::ShareAccessConflict => ntstatus(0xC000_0043),
-            Self::FileLockConflict => ntstatus(0xC000_0054),
+            Self::FileLockConflict => STATUS_FILE_LOCK_CONFLICT,
             Self::OplockNotGranted => ntstatus(0xC000_00E2),
             Self::TooManyOpenReferences => STATUS_INSUFFICIENT_RESOURCES,
             Self::NoMoreFiles => STATUS_NO_MORE_FILES,

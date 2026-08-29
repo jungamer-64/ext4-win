@@ -21,7 +21,7 @@ use crate::irp::{CreateCompletion, IrpCompletion, OwnedIrp};
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
 use crate::kernel::ffi;
-use crate::kernel::status::{DriverError, DriverResult};
+use crate::kernel::status::{DriverError, DriverResult, STATUS_FILE_LOCK_CONFLICT, STATUS_RETRY};
 use crate::kernel::storage::{
     ExternalJournalLease, LowerStorageDevice, MountedStorage, MountedStorageRoute,
     StorageFailureClass,
@@ -33,6 +33,18 @@ use crate::state::{
     MountedVolumeDevice, MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
     PreparedVolumeStateTransition, RawVolumeOperationKind, RawVolumeTarget, VolumeControlBlock,
 };
+
+/// Faults the mounted mutation authority only for real Cc/MM failures, not ordinary conflicts or
+/// the internal stale-plan restart signal.
+fn record_cache_coherency_failure(error: DriverError, access: &mut MountedVolumeAccess<'_>) {
+    if let DriverError::CacheManagerFailure(status) = error
+        && status != wdk_sys::STATUS_USER_MAPPED_FILE
+        && status != STATUS_FILE_LOCK_CONFLICT
+        && status != STATUS_RETRY
+    {
+        access.record_cache_writeback_failure(status);
+    }
+}
 
 /// Implements the shell adapter that alone projects a mounted-volume access capability.
 macro_rules! impl_mounted_operation_adapter {
@@ -824,6 +836,24 @@ impl ReadRequestOperation {
         let _status = owned.complete_result(result);
         OperationTransition::Complete
     }
+
+    /// Reacquires the current durable epoch after a native size gate invalidated a cache plan.
+    fn restart_cache_plan(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let epoch = match access.acquire_epoch() {
+            Ok(epoch) => epoch,
+            Err(error) => return Self::complete(owned, Err(error)),
+        };
+        self.epoch = epoch;
+        self.state = ReadOperationState::Running {
+            owned,
+            read: EpochReadOperation::new(access.mounted_profile()),
+        };
+        self.advance_mounted(CompletionEvent::Core(OperationEvent::Admitted), access)
+    }
 }
 
 impl MountedVolumeOperation for ReadRequestOperation {
@@ -842,20 +872,30 @@ impl MountedVolumeOperation for ReadRequestOperation {
                 },
                 CompletionEvent::CacheCompleted(crate::irp::CacheWorkCompletion::Read(result)),
             ) => {
-                let result = crate::request::file_info::finish_cached_read(
-                    owned.request(),
-                    start,
-                    requested,
-                    result,
-                );
-                return Self::complete(owned, result);
+                if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
+                    return self.restart_cache_plan(owned, access);
+                } else {
+                    let result = crate::request::file_info::finish_cached_read(
+                        owned.request(),
+                        start,
+                        requested,
+                        result,
+                    );
+                    return Self::complete(owned, result);
+                }
             }
             (
                 ReadOperationState::Purging { owned, read },
                 CompletionEvent::CacheCompleted(crate::irp::CacheWorkCompletion::Purge(result)),
             ) => match result {
                 Ok(()) => (owned, read, OperationEvent::Admitted, true),
-                Err(error) => return Self::complete(owned, Err(error)),
+                Err(DriverError::CacheManagerFailure(STATUS_RETRY)) => {
+                    return self.restart_cache_plan(owned, access);
+                }
+                Err(error) => {
+                    record_cache_coherency_failure(error, access);
+                    return Self::complete(owned, Err(error));
+                }
             },
             (ReadOperationState::Running { owned, read }, event) => {
                 (owned, read, event.into_core(), false)
@@ -1669,11 +1709,7 @@ impl VolumeControlOperation {
         error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        if let DriverError::CacheManagerFailure(status) = error
-            && status != wdk_sys::STATUS_USER_MAPPED_FILE
-        {
-            access.record_cache_writeback_failure(status);
-        }
+        record_cache_coherency_failure(error, access);
         Self::fail_transition(owned, transition, error, access)
     }
 
@@ -2270,7 +2306,7 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 return match result {
                     Ok(()) => self.continue_after_cache_flush(owned, scope, access),
                     Err(error) => {
-                        access.record_cache_writeback_failure(error.ntstatus());
+                        record_cache_coherency_failure(error, access);
                         Self::complete(owned, Err(error))
                     }
                 };
@@ -2565,13 +2601,8 @@ impl PendingDriverPublication {
     /// state. No partially prepared value has publication authority on failure.
     fn prepare(
         self,
-        reserved: &ReservedMutation,
-        geometry: ext4_core::VolumeGeometry,
+        stream_sizes: crate::state::PreparedStreamSizePublications,
     ) -> DriverResult<PreparedDriverPublication> {
-        let stream_sizes = crate::state::PreparedStreamSizePublications::try_new(
-            reserved.node_storage_updates(),
-            geometry.cluster_size(),
-        )?;
         let effect = match self {
             Self::Create(publication) => {
                 let publication = (*publication).prepare()?;
@@ -2625,6 +2656,8 @@ struct CommitContext {
     durable_slot: EpochPublicationSlot,
     /// Pre-reserved checkpoint epoch slot.
     checkpoint_slot: EpochPublicationSlot,
+    /// Native cache/section gate retained until durable stream-size publication completes.
+    size_changes: Option<crate::state::PreparedStreamSizeChanges>,
 }
 
 /// Exact write/flush phase awaiting one matching lower completion.
@@ -2735,6 +2768,13 @@ enum MutationOperationState {
         /// Restartable cleanup resolve entered after cache-map detachment returns.
         resolve: MutationResolveOperation,
     },
+    /// A resolved size mutation establishes its native cache/section gate outside the actor.
+    PreparingSizeChange {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Preallocated gates derived under an intent that has already been released.
+        plan: crate::state::StreamSizeChangePlan,
+    },
     /// Read-only resolution against one immutable epoch.
     Resolving {
         /// Unique top-level completion authority.
@@ -2743,6 +2783,8 @@ enum MutationOperationState {
         epoch: EpochLease,
         /// Restartable core resolve state.
         resolve: MutationResolveOperation,
+        /// Native gates already coherent and retained across the latest resolve attempt.
+        size_changes: Option<crate::state::PreparedStreamSizeChanges>,
     },
     /// Resolved resources await atomic intent acquisition.
     AwaitingIntent {
@@ -2752,6 +2794,8 @@ enum MutationOperationState {
         resolved: ResolvedMutation,
         /// Driver publication values prepared by resolve.
         publication: PendingDriverPublication,
+        /// Native gates retained while the resolved projection is revalidated under intent.
+        size_changes: Option<crate::state::PreparedStreamSizeChanges>,
     },
     /// Revalidated reservation and all publication allocations await commit serialization.
     AwaitingCommit {
@@ -2763,6 +2807,8 @@ enum MutationOperationState {
         publication: PreparedDriverPublication,
         /// Both epoch storage reservations allocated before the first write.
         slots: EpochPublicationSlots,
+        /// Native gate retained when this commit changes stream size.
+        size_changes: Option<crate::state::PreparedStreamSizeChanges>,
     },
     /// Commit writes and durability flushes are in progress.
     CommitIo {
@@ -2896,6 +2942,7 @@ impl MutationRequestOperation {
                     owned,
                     epoch,
                     resolve,
+                    size_changes: None,
                 },
             },
         ) {
@@ -3113,6 +3160,7 @@ impl MutationRequestOperation {
     fn restart_resolution(
         self: Box<Self>,
         owned: OwnedIrp,
+        size_changes: Option<crate::state::PreparedStreamSizeChanges>,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let epoch = match access.acquire_epoch() {
@@ -3120,7 +3168,14 @@ impl MutationRequestOperation {
             Err(error) => return self.complete_error(owned, error),
         };
         let resolve = MutationResolveOperation::new(access.mounted_profile());
-        self.advance_resolution(owned, epoch, resolve, OperationEvent::Admitted, access)
+        self.advance_resolution(
+            owned,
+            epoch,
+            resolve,
+            size_changes,
+            OperationEvent::Admitted,
+            access,
+        )
     }
 
     /// Integrates one resolution event and emits only its matching next action.
@@ -3129,6 +3184,7 @@ impl MutationRequestOperation {
         mut owned: OwnedIrp,
         epoch: EpochLease,
         resolve: MutationResolveOperation,
+        size_changes: Option<crate::state::PreparedStreamSizeChanges>,
         event: OperationEvent,
         operations: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
@@ -3140,7 +3196,7 @@ impl MutationRequestOperation {
         // pass. A completed lower read from an older epoch cannot be relabeled with new versions.
         if !operations.is_current_epoch(&epoch) {
             drop(ready);
-            return self.restart_resolution(owned, operations);
+            return self.restart_resolution(owned, size_changes, operations);
         }
         let mut publication = None;
         let resolved = {
@@ -3170,6 +3226,7 @@ impl MutationRequestOperation {
                     owned,
                     epoch,
                     resolve: suspended,
+                    size_changes,
                 };
                 OperationTransition::SubmitLower {
                     devices: self.devices,
@@ -3195,6 +3252,7 @@ impl MutationRequestOperation {
                     owned,
                     resolved,
                     publication,
+                    size_changes,
                 };
                 OperationTransition::RequestIntent {
                     request: IntentRequest::new(self.ticket, requested),
@@ -3571,6 +3629,9 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         MutationOperationState::CacheWriting { owned, publication },
                         crate::irp::CacheWorkCompletion::Write(result),
                     ) => {
+                        if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
+                            return self.restart_resolution(owned, None, access);
+                        }
                         return match crate::request::file_info::finish_cached_write(
                             publication,
                             result,
@@ -3580,7 +3641,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                                 TopLevelCompletion::Normal(completion),
                             ),
                             Err(error) => {
-                                access.record_cache_writeback_failure(error.ntstatus());
+                                record_cache_coherency_failure(error, access);
                                 self.complete_error(owned, error)
                             }
                         };
@@ -3598,10 +3659,17 @@ impl MountedVolumeOperation for MutationRequestOperation {
                                 owned,
                                 epoch,
                                 resolve,
+                                None,
                                 OperationEvent::Admitted,
                                 access,
                             ),
-                            Err(error) => self.complete_error(owned, error),
+                            Err(DriverError::CacheManagerFailure(STATUS_RETRY)) => {
+                                self.restart_resolution(owned, None, access)
+                            }
+                            Err(error) => {
+                                record_cache_coherency_failure(error, access);
+                                self.complete_error(owned, error)
+                            }
                         };
                     }
                     (
@@ -3619,9 +3687,45 @@ impl MountedVolumeOperation for MutationRequestOperation {
                             owned,
                             epoch,
                             resolve,
+                            None,
                             OperationEvent::Admitted,
                             access,
                         );
+                    }
+                    (
+                        MutationOperationState::PreparingSizeChange {
+                            owned,
+                            mut plan,
+                        },
+                        crate::irp::CacheWorkCompletion::PrepareSizeChange(result),
+                    ) => {
+                        return match result {
+                            Ok(size_change) => {
+                                if let Err(error) = plan.record_completion(size_change) {
+                                    return self.complete_error(owned, error);
+                                }
+                                if let Some(stream) = plan.next() {
+                                    self.state = MutationOperationState::PreparingSizeChange {
+                                        owned,
+                                        plan,
+                                    };
+                                    OperationTransition::SubmitCacheWork {
+                                        work: crate::irp::CacheWork::prepare_size_change(stream),
+                                        suspended: self,
+                                    }
+                                } else {
+                                    let size_changes = match plan.into_prepared() {
+                                        Ok(size_changes) => size_changes,
+                                        Err(error) => return self.complete_error(owned, error),
+                                    };
+                                    self.restart_resolution(owned, size_changes, access)
+                                }
+                            }
+                            Err(error) => {
+                                record_cache_coherency_failure(error, access);
+                                self.complete_error(owned, error)
+                            }
+                        };
                     }
                     _ => {
                         crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -3671,8 +3775,9 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 mut owned,
                 epoch,
                 resolve,
+                size_changes,
             } => {
-                if matches!(event, OperationEvent::Admitted) {
+                if matches!(event, OperationEvent::Admitted) && size_changes.is_none() {
                     if self.request.kind() == MutationRequestKind::Cleanup {
                         let work = match crate::request::file_info::prepare_cleanup_cache_work(
                             owned.request(),
@@ -3729,7 +3834,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         }
                     }
                 }
-                self.advance_resolution(owned, epoch, resolve, event, access)
+                self.advance_resolution(owned, epoch, resolve, size_changes, event, access)
             }
             MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CachePurging { .. }
@@ -3737,10 +3842,17 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
+            MutationOperationState::PreparingSizeChange { owned, .. } => match event {
+                OperationEvent::CancelRequested => {
+                    self.complete_error(owned, DriverError::from(Error::OperationCancelled))
+                }
+                _ => self.complete_error(owned, DriverError::InvalidDeviceRequest),
+            },
             MutationOperationState::AwaitingIntent {
                 owned,
                 resolved,
                 publication,
+                size_changes,
             } => {
                 let intent = match event {
                     OperationEvent::IntentGranted(intent) => intent,
@@ -3755,14 +3867,61 @@ impl MountedVolumeOperation for MutationRequestOperation {
                     Ok(reserved) => reserved,
                     Err(Error::ClusterReferenceConflict) => {
                         drop(publication);
-                        return self.restart_resolution(owned, access);
+                        return self.restart_resolution(owned, size_changes, access);
                     }
                     Err(error) => {
                         drop(publication);
                         return self.complete_error(owned, DriverError::from(error));
                     }
                 };
-                let publication = match publication.prepare(&reserved, access.volume_geometry()) {
+                let stream_sizes = match crate::state::PreparedStreamSizePublications::try_new(
+                    reserved.node_storage_updates(),
+                    access.volume_geometry().cluster_size(),
+                ) {
+                    Ok(stream_sizes) => stream_sizes,
+                    Err(error) => return self.complete_error(owned, error),
+                };
+                let size_changes = match size_changes {
+                    Some(prepared) => {
+                        let matches = match access
+                            .prepared_stream_size_changes_match(&stream_sizes, &prepared)
+                        {
+                            Ok(matches) => matches,
+                            Err(error) => return self.complete_error(owned, error),
+                        };
+                        if matches {
+                            Some(prepared)
+                        } else {
+                            drop(prepared);
+                            None
+                        }
+                    }
+                    None => None,
+                };
+                if size_changes.is_none() {
+                    let mut plan = match access.prepare_stream_size_changes(&stream_sizes) {
+                        Ok(plan) => plan,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    if let Some(stream) = plan.next() {
+                        drop(stream_sizes);
+                        drop(publication);
+                        drop(reserved);
+                        self.state = MutationOperationState::PreparingSizeChange { owned, plan };
+                        return OperationTransition::SubmitCacheWorkAfterIntentRelease {
+                            work: crate::irp::CacheWork::prepare_size_change(stream),
+                            suspended: self,
+                        };
+                    }
+                    let empty = match plan.into_prepared() {
+                        Ok(empty) => empty,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    if empty.is_some() {
+                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
+                }
+                let publication = match publication.prepare(stream_sizes) {
                     Ok(publication) => publication,
                     Err(error) => return self.complete_error(owned, error),
                 };
@@ -3778,6 +3937,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                     reserved,
                     publication,
                     slots,
+                    size_changes,
                 };
                 OperationTransition::RequestCommit {
                     ticket: self.ticket,
@@ -3789,6 +3949,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 reserved,
                 publication,
                 slots,
+                size_changes,
             } => {
                 let commit = match event {
                     OperationEvent::CommitGranted(commit) => commit,
@@ -3810,6 +3971,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                     publication,
                     durable_slot,
                     checkpoint_slot,
+                    size_changes,
                 };
                 self.drive_ordered(context, ready.start())
             }
@@ -3906,6 +4068,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
             | (
                 MutationOperationState::AwaitingIntent { .. }
                 | MutationOperationState::AwaitingCommit { .. }
+                | MutationOperationState::PreparingSizeChange { .. }
                 | MutationOperationState::CacheWriting { .. }
                 | MutationOperationState::CachePurging { .. }
                 | MutationOperationState::CacheUninitializing { .. }
@@ -3933,6 +4096,7 @@ impl InfalliblePublication for MutationRequestOperation {
             MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CachePurging { .. }
             | MutationOperationState::CacheUninitializing { .. }
+            | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }
@@ -3963,6 +4127,7 @@ impl InfalliblePublication for MutationRequestOperation {
                     publication,
                     durable_slot,
                     checkpoint_slot,
+                    size_changes,
                 } = context;
                 let PreparedDriverPublication {
                     stream_sizes,
@@ -3993,6 +4158,7 @@ impl InfalliblePublication for MutationRequestOperation {
                         }
                     }
                 }
+                drop(size_changes);
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
             }
             MutationOperationState::PublishingCheckpoint {
@@ -4006,6 +4172,7 @@ impl InfalliblePublication for MutationRequestOperation {
             MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CachePurging { .. }
             | MutationOperationState::CacheUninitializing { .. }
+            | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }

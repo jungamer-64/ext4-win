@@ -13,8 +13,8 @@ use wdk_sys::LIST_ENTRY;
 
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::{
-    CompletedVolumeLockStreamDrain, FileObjectCacheLease, StreamCacheLease,
-    VolumeLockStreamDrainLease,
+    CompletedVolumeLockStreamDrain, FileObjectCacheLease, PreparedStreamSizeChange,
+    StreamCacheLease, StreamSizeChangeLease, VolumeLockStreamDrainLease,
 };
 
 #[cfg(not(test))]
@@ -71,6 +71,11 @@ pub(crate) enum CacheWork {
         /// Stream retained through the complete cache and Memory Manager boundary.
         stream: VolumeLockStreamDrainLease,
     },
+    /// Establish one cache/section gate for a resolved stream-size mutation.
+    PrepareSizeChange {
+        /// Exact retained stream and new-size semantics.
+        stream: StreamSizeChangeLease,
+    },
     /// Release one FILE_OBJECT's private cache map.
     Uninitialize {
         /// Stream and FILE_OBJECT identity retained through uninitialization.
@@ -91,6 +96,8 @@ pub(crate) enum CacheWorkCompletion {
     Purge(DriverResult<()>),
     /// Volume-lock cache and section drain status.
     DrainForVolumeLock(DriverResult<CompletedVolumeLockStreamDrain>),
+    /// Native size-change gate acquisition status and release authority.
+    PrepareSizeChange(DriverResult<PreparedStreamSizeChange>),
     /// Private cache-map uninitialization status.
     Uninitialize(DriverResult<()>),
 }
@@ -141,6 +148,11 @@ impl CacheWork {
         Self::DrainForVolumeLock { stream }
     }
 
+    /// Builds one resolved stream-size cache/section precommit gate.
+    pub(crate) const fn prepare_size_change(stream: StreamSizeChangeLease) -> Self {
+        Self::PrepareSizeChange { stream }
+    }
+
     /// Builds one FILE_OBJECT cache-map uninitialization.
     pub(crate) const fn uninitialize(file_object: FileObjectCacheLease) -> Self {
         Self::Uninitialize { file_object }
@@ -166,6 +178,9 @@ impl CacheWork {
             Self::DrainForVolumeLock { stream } => {
                 CacheWorkCompletion::DrainForVolumeLock(stream.execute())
             }
+            Self::PrepareSizeChange { stream } => {
+                CacheWorkCompletion::PrepareSizeChange(stream.execute())
+            }
             Self::Uninitialize { file_object } => {
                 CacheWorkCompletion::Uninitialize(file_object.uninitialize())
             }
@@ -180,6 +195,7 @@ impl CacheWork {
             Self::Flush { .. } => CacheWorkCompletion::Flush(Err(error)),
             Self::Purge { .. } => CacheWorkCompletion::Purge(Err(error)),
             Self::DrainForVolumeLock { .. } => CacheWorkCompletion::DrainForVolumeLock(Err(error)),
+            Self::PrepareSizeChange { .. } => CacheWorkCompletion::PrepareSizeChange(Err(error)),
             Self::Uninitialize { .. } => CacheWorkCompletion::Uninitialize(Err(error)),
         }
     }

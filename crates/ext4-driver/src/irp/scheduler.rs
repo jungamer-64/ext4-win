@@ -627,6 +627,14 @@ impl Scheduler {
         true
     }
 
+    /// Consumes a required held intent before reentrant external preparation begins.
+    pub(crate) fn release_required_intent(&mut self, identity: SlotId) -> bool {
+        let Some(slot) = self.slot_mut(identity) else {
+            return false;
+        };
+        slot.intent.take().is_some()
+    }
+
     /// Queues one commit request from actor ownership.
     pub(crate) fn request_commit(&mut self, identity: SlotId, ticket: u64) -> bool {
         self.set_phase(identity, Phase::Commit { ticket })
@@ -984,6 +992,33 @@ mod tests {
         assert_eq!(scheduler.grant_next_intent(), Some((first, 1)));
         assert_eq!(scheduler.grant_next_intent(), Some((disjoint, 3)));
         assert_eq!(scheduler.grant_next_intent(), None);
+    }
+
+    /// Verifies reentrant preparation explicitly consumes its provisional intent authority.
+    /// # Panics
+    ///
+    /// Panics if a conflicting paging mutation cannot progress after the size-preparation owner
+    /// releases its grant, or if that grant can be consumed twice.
+    #[test]
+    fn reentrant_preparation_releases_exactly_one_held_intent() {
+        let mut scheduler = Scheduler::new();
+        let preparation = require_some!(scheduler.reserve());
+        let paging = require_some!(scheduler.reserve());
+        let preparation_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
+        let paging_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
+        assert_eq!(
+            scheduler.request_intent(preparation, IntentRequest::new(1, preparation_resources),),
+            Some(super::IntentDisposition::Queued)
+        );
+        assert_eq!(
+            scheduler.request_intent(paging, IntentRequest::new(2, paging_resources)),
+            Some(super::IntentDisposition::Queued)
+        );
+        assert_eq!(scheduler.grant_next_intent(), Some((preparation, 1)));
+        assert_eq!(scheduler.grant_next_intent(), None);
+        assert!(scheduler.release_required_intent(preparation));
+        assert!(!scheduler.release_required_intent(preparation));
+        assert_eq!(scheduler.grant_next_intent(), Some((paging, 2)));
     }
 
     /// Verifies serialized commit selection by mutation ticket.

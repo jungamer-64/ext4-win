@@ -104,6 +104,16 @@ impl StreamSizes {
     pub(crate) const fn allocation_charge(self) -> i64 {
         self.allocation_charge
     }
+
+    /// Returns whether two projections expose the same Cache Manager and Memory Manager bounds.
+    ///
+    /// The physical allocation charge is intentionally excluded: paging writeback may change that
+    /// query projection without changing any native section size.
+    pub(crate) const fn same_cache_dimensions(self, other: Self) -> bool {
+        self.allocation_size == other.allocation_size
+            && self.file_size == other.file_size
+            && self.valid_data_length == other.valid_data_length
+    }
 }
 
 /// Rounds a Windows section bound to the mounted ext4 allocation cluster.
@@ -531,6 +541,45 @@ impl StreamContext {
         }
     }
 
+    /// Flushes the cache and blocks new cache/section acquisition until a size commit publishes.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager status or mapped-view truncation conflict.
+    pub(crate) fn begin_size_change(&self, new_file_size: i64) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live stream and the caller retains it through gate release.
+                ext4win_stream_begin_size_change(self.header.as_ptr(), new_file_size)
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            let _: i64 = new_file_size;
+            Ok(())
+        }
+    }
+
+    /// Releases one successfully acquired size-change cache/section gate.
+    /// # Errors
+    ///
+    /// Returns an invariant native status if no matching gate remains active.
+    pub(crate) fn end_size_change(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The matching successful begin call retained this same stream identity.
+                ext4win_stream_end_size_change(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
     /// Releases this FILE_OBJECT's private cache map without destroying shared stream sections.
     /// # Errors
     ///
@@ -825,6 +874,13 @@ unsafe extern "system" {
 
     fn ext4win_stream_cache_drain_for_volume_lock(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
+    fn ext4win_stream_begin_size_change(
+        stream_header: wdk_sys::PVOID,
+        new_file_size: i64,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_end_size_change(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+
     fn ext4win_stream_cache_uninitialize(
         stream_header: wdk_sys::PVOID,
         file_object: *mut wdk_sys::FILE_OBJECT,
@@ -892,6 +948,42 @@ mod tests {
         assert_eq!(sizes.file_size(), 1_000);
         assert_eq!(sizes.allocation_size, 131_072);
         assert_eq!(sizes.allocation_charge(), 69_632);
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns a size-domain error if fixture construction fails.
+    /// # Panics
+    ///
+    /// Panics if cache-map dimensions include the query-only allocation charge or omit a native
+    /// allocation-bound change.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture failures use Result; assertions check the cache-map size boundary"
+    )]
+    fn cache_dimensions_exclude_charge_but_include_section_bounds() -> DriverResult<()> {
+        let cluster = ClusterSize::new(4_096)?;
+        let baseline = StreamSizes::try_from_ext4(
+            FileSize::from_bytes(4_096),
+            FileAllocationSize::from_bytes(4_096),
+            cluster,
+        )?;
+        let charge_only = StreamSizes::try_from_ext4(
+            FileSize::from_bytes(4_096),
+            FileAllocationSize::from_bytes(0),
+            cluster,
+        )?;
+        let larger_section = StreamSizes::try_from_ext4(
+            FileSize::from_bytes(4_096),
+            FileAllocationSize::from_bytes(8_192),
+            cluster,
+        )?;
+
+        assert_ne!(baseline, charge_only);
+        assert!(baseline.same_cache_dimensions(charge_only));
+        assert!(!baseline.same_cache_dimensions(larger_section));
         Ok(())
     }
 
