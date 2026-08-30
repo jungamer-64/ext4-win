@@ -1510,6 +1510,51 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
 
 /// # Errors
 ///
+/// Returns a fixture allocation, native stream-header, or finite lease failure.
+/// # Panics
+///
+/// Panics if parent lookup invents an absent stream or fails to retain an exact resident stream.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture failures use Result; assertions verify node-scoped parent oplock residency"
+)]
+fn parent_oplock_lease_is_optional_and_node_exact() -> Result<(), DriverError> {
+    let mut ledger = FileControlBlockLedger::try_new()?;
+    assert!(
+        ledger
+            .acquire_parent_oplock_stream_lease(DirectoryNodeId::ROOT)?
+            .is_none()
+    );
+    let stream = super::NodeStreamSizes {
+        node: NodeId::Directory(DirectoryNodeId::ROOT),
+        sizes: crate::kernel::stream::StreamSizes::EMPTY,
+    };
+    let fcb = ledger.file_control_block(
+        NonNull::dangling(),
+        stream,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
+    let fcb_pointer = NonNull::from(fcb.as_ref());
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(fcb)
+        .map_err(|failure| failure.into_parts().0)?;
+
+    let lease = ledger
+        .acquire_parent_oplock_stream_lease(DirectoryNodeId::ROOT)?
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    assert!(lease.identifies(fcb_pointer));
+    ledger.close(fcb_pointer);
+    assert!(!ledger.is_empty());
+    drop(lease);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+///
 /// Returns a fixture allocation or size conversion error.
 /// # Panics
 ///
