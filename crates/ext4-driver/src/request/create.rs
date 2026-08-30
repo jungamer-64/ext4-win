@@ -80,6 +80,13 @@ pub(crate) enum CreateResolution {
         /// Exact regular-file inode resolved by create.
         node: NodeId,
     },
+    /// An existing stream must complete its create-specific oplock conflict protocol.
+    CheckOplock {
+        /// Exact provisional FCB whose oplock package owns the conflict state.
+        fcb: NonNull<FileControlBlock>,
+        /// Normalized create behavior passed to the FsRtl boundary.
+        policy: crate::irp::OplockCreatePolicy,
+    },
     /// A missing child was staged and every driver publication value was preallocated.
     Mutation(Box<PendingCreatePublication>),
 }
@@ -951,6 +958,70 @@ enum ExistingWriteOpenRequirement {
     FlushImageSection,
 }
 
+/// Oplock admission retained by one provisional existing-node create claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingCreateOplockState {
+    /// No break occurred, or the exact requested break protocol completed normally.
+    Ready,
+    /// The successful create must report that its requested nonblocking break is still underway.
+    BreakInProgress,
+    /// FsRtl has not yet observed the create IRP for this resident stream.
+    Check(crate::irp::OplockCreatePolicy),
+}
+
+impl ExistingCreateOplockState {
+    /// Selects whether a provisional existing-node claim must visit FsRtl before publication.
+    const fn from_admission(
+        policy: crate::irp::OplockCreatePolicy,
+        residency: ExistingStreamResidency,
+    ) -> Self {
+        match (policy, residency) {
+            (
+                crate::irp::OplockCreatePolicy::Ordinary
+                | crate::irp::OplockCreatePolicy::CompleteIfOplocked,
+                ExistingStreamResidency::FirstOpen,
+            ) => Self::Ready,
+            (policy, ExistingStreamResidency::Resident)
+            | (
+                policy @ (crate::irp::OplockCreatePolicy::RequireUnbrokenOplock
+                | crate::irp::OplockCreatePolicy::ReserveFilter),
+                ExistingStreamResidency::FirstOpen,
+            ) => Self::Check(policy),
+        }
+    }
+
+    /// Validates a successful FsRtl return and seals the create completion status.
+    /// # Errors
+    ///
+    /// Returns the exact oplock failure, not-supported atomic protocol, or an invariant failure for
+    /// a status that is not legal for the selected create policy.
+    fn accept(&mut self, status: wdk_sys::NTSTATUS) -> DriverResult<()> {
+        let Self::Check(policy) = *self else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        *self = match (policy, status) {
+            (_, status) if status < wdk_sys::STATUS_SUCCESS => {
+                return Err(DriverError::OplockFailure(status));
+            }
+            (crate::irp::OplockCreatePolicy::Ordinary, wdk_sys::STATUS_SUCCESS)
+            | (crate::irp::OplockCreatePolicy::CompleteIfOplocked, wdk_sys::STATUS_SUCCESS) => {
+                Self::Ready
+            }
+            (
+                crate::irp::OplockCreatePolicy::CompleteIfOplocked,
+                wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS,
+            ) => Self::BreakInProgress,
+            (
+                crate::irp::OplockCreatePolicy::RequireUnbrokenOplock
+                | crate::irp::OplockCreatePolicy::ReserveFilter,
+                _,
+            ) => return Err(DriverError::NotSupported),
+            _ => return Err(DriverError::InternalInvariantViolation),
+        };
+        Ok(())
+    }
+}
+
 impl ExistingWriteOpenRequirement {
     /// Selects the native gate for an already classified regular-file admission.
     const fn for_regular_file(
@@ -992,6 +1063,8 @@ pub(crate) struct PendingExistingCreateOpen {
     action: CreateAction,
     /// Whether native image-section exclusion is required for this exact claim.
     write_open: ExistingWriteOpenRequirement,
+    /// Create-specific oplock conflict state sealed before image exclusion or attachment.
+    oplock: ExistingCreateOplockState,
 }
 
 impl PendingExistingCreateOpen {
@@ -1045,6 +1118,10 @@ impl PendingExistingCreateOpen {
             ),
             NodeId::Directory(_) | NodeId::Symlink(_) => ExistingWriteOpenRequirement::NotRequired,
         };
+        let oplock = ExistingCreateOplockState::from_admission(
+            policy.oplock_policy(),
+            admission.residency(),
+        );
         Ok(Self {
             claim: PendingFileControlBlockClaim {
                 fcb: admission.file_control_block(),
@@ -1058,7 +1135,28 @@ impl PendingExistingCreateOpen {
             pending_deletion,
             action,
             write_open,
+            oplock,
         })
+    }
+
+    /// Returns the exact resident stream and policy that must be checked before publication.
+    fn oplock_check_target(
+        &self,
+    ) -> Option<(NonNull<FileControlBlock>, crate::irp::OplockCreatePolicy)> {
+        match self.oplock {
+            ExistingCreateOplockState::Check(policy) => {
+                Some((self.claim.file_control_block(), policy))
+            }
+            ExistingCreateOplockState::Ready | ExistingCreateOplockState::BreakInProgress => None,
+        }
+    }
+
+    /// Seals the exact success status returned by the delegated create conflict check.
+    /// # Errors
+    ///
+    /// Returns the matching oplock or protocol error without consuming the provisional claim.
+    pub(crate) fn accept_oplock_status(&mut self, status: wdk_sys::NTSTATUS) -> DriverResult<()> {
+        self.oplock.accept(status)
     }
 
     /// Returns the exact resident stream that needs native image-section exclusion.
@@ -1089,12 +1187,20 @@ impl PendingExistingCreateOpen {
                 return Err(DriverError::InternalInvariantViolation);
             }
         }
+        let completion = match self.oplock {
+            ExistingCreateOplockState::Ready => CreateCompletion::Handle(self.action),
+            ExistingCreateOplockState::BreakInProgress => {
+                CreateCompletion::OplockBreakInProgress(self.action)
+            }
+            ExistingCreateOplockState::Check(_) => {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+        };
         let Self {
             claim,
             handle,
             policy,
             pending_deletion,
-            action,
             ..
         } = self;
         let (fcb, file_object) = claim.consume();
@@ -1102,7 +1208,7 @@ impl PendingExistingCreateOpen {
         if let Some(pending) = pending_deletion {
             operations.set_file_delete_pending(fcb, pending);
         }
-        Ok(CreateCompletion::Handle(action))
+        Ok(completion)
     }
 }
 
@@ -1150,6 +1256,14 @@ fn resume_existing_open(
         CreateHandlePolicy::from_authorized(parameters, owner.granted_access(), device)?;
     if current_policy != pending.policy {
         return Err(DriverError::InternalInvariantViolation);
+    }
+    if pending.oplock_check_target().is_some() {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    if let Some((fcb, node)) = pending.write_open_target()
+        && prepared_write_open.is_none()
+    {
+        return Ok(CreateResolution::PrepareWriteOpen { fcb, node });
     }
     if let Some(deletion) = pending.pending_deletion.as_ref() {
         crate::request::file_info::validate_pending_deletion(
@@ -1238,6 +1352,10 @@ fn open_existing_node(
                 pending,
                 CreateAction::Opened,
             )?;
+            if let Some((fcb, policy)) = pending.oplock_check_target() {
+                *pending_existing = Some(pending);
+                return Ok(CreateResolution::CheckOplock { fcb, policy });
+            }
             if let Some((fcb, node)) = pending.write_open_target() {
                 *pending_existing = Some(pending);
                 return Ok(CreateResolution::PrepareWriteOpen { fcb, node });
@@ -2008,6 +2126,54 @@ mod tests {
     use crate::irp::ReceivedIrp;
 
     const TEST_FILE_OPEN_DISPOSITION_OPTIONS: wdk_sys::ULONG = 1 << 24;
+
+    /// # Panics
+    ///
+    /// Panics if create oplock admission loses its residency distinction, accepts atomic policies
+    /// without their reservation protocol, or drops the alternate success status.
+    #[test]
+    fn existing_create_oplock_state_is_policy_and_status_exact() {
+        assert_eq!(
+            ExistingCreateOplockState::from_admission(
+                crate::irp::OplockCreatePolicy::Ordinary,
+                ExistingStreamResidency::FirstOpen,
+            ),
+            ExistingCreateOplockState::Ready
+        );
+        assert_eq!(
+            ExistingCreateOplockState::from_admission(
+                crate::irp::OplockCreatePolicy::Ordinary,
+                ExistingStreamResidency::Resident,
+            ),
+            ExistingCreateOplockState::Check(crate::irp::OplockCreatePolicy::Ordinary)
+        );
+
+        let mut complete =
+            ExistingCreateOplockState::Check(crate::irp::OplockCreatePolicy::CompleteIfOplocked);
+        assert_eq!(
+            complete.accept(wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS),
+            Ok(())
+        );
+        assert_eq!(complete, ExistingCreateOplockState::BreakInProgress);
+
+        let mut ordinary =
+            ExistingCreateOplockState::Check(crate::irp::OplockCreatePolicy::Ordinary);
+        assert_eq!(
+            ordinary.accept(wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS),
+            Err(DriverError::InternalInvariantViolation)
+        );
+        assert_eq!(
+            ordinary,
+            ExistingCreateOplockState::Check(crate::irp::OplockCreatePolicy::Ordinary)
+        );
+
+        let mut atomic =
+            ExistingCreateOplockState::Check(crate::irp::OplockCreatePolicy::RequireUnbrokenOplock);
+        assert_eq!(
+            atomic.accept(wdk_sys::STATUS_SUCCESS),
+            Err(DriverError::NotSupported)
+        );
+    }
 
     /// Decodes create parameters through the dispatch boundary.
     /// # Errors

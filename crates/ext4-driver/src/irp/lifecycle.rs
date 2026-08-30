@@ -907,6 +907,9 @@ impl OwnedIrp {
         drop(context);
         match result {
             Ok(CreateCompletion::Handle(action)) => target.irp.complete_create_action(action),
+            Ok(CreateCompletion::OplockBreakInProgress(action)) => {
+                target.irp.complete_create_oplock_break(action)
+            }
             Ok(CreateCompletion::ReparseSymlink(buffer)) => {
                 target.irp.complete_create_symlink_reparse(buffer)
             }
@@ -1192,6 +1195,15 @@ impl KernelIrp {
             wdk_sys::ULONG_PTR::from(action.as_ulong()),
         );
         self.finish_completion(wdk_sys::STATUS_SUCCESS)
+    }
+
+    /// Completes a successful create while preserving its nonblocking oplock-break status.
+    fn complete_create_oplock_break(self, action: CreateAction) -> NTSTATUS {
+        self.write_status_and_information(
+            wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS,
+            wdk_sys::ULONG_PTR::from(action.as_ulong()),
+        );
+        self.finish_completion(wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS)
     }
 
     /// Completes the IRP through the I/O Manager.

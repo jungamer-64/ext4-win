@@ -1806,6 +1806,44 @@ impl FileControlBlockLedger {
         Ok(OplockStreamLease { retained })
     }
 
+    /// Acquires one oplock lease for an exact provisional create claim.
+    /// # Errors
+    ///
+    /// Returns an ownership invariant or finite deferred-lease failure before FsRtl can observe
+    /// the create IRP.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes exact FCB lookup and deferred-lease acquisition"
+    )]
+    pub(super) fn acquire_claimed_oplock_stream_lease(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+    ) -> DriverResult<OplockStreamLease> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+            &*self.table.get()
+        };
+        if !table
+            .iter()
+            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The resource remains held and exact table membership was established above.
+            state.as_mut()
+        }
+        .acquire_deferred_lease()?;
+        Ok(OplockStreamLease {
+            retained: DeferredStreamLease {
+                owner: NonNull::from(self),
+                fcb,
+            },
+        })
+    }
+
     /// Acquires one stream lease for a PASSIVE_LEVEL cache worker without retaining ledger locks.
     /// # Errors
     ///

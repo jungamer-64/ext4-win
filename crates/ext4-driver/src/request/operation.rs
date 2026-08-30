@@ -2858,6 +2858,20 @@ enum CheckpointIoPhase {
     },
 }
 
+/// Resolver continuation selected after an FsRtl oplock conflict boundary returns the IRP.
+#[derive(Debug)]
+enum OplockResume {
+    /// An ordinary handle mutation continues the exact resolver that preceded its break check.
+    ContinueResolution {
+        /// Immutable epoch retained through a possible oplock wait.
+        epoch: EpochLease,
+        /// Resolver that has not yet observed an event.
+        resolve: MutationResolveOperation,
+    },
+    /// An existing-node create restarts resolution and revalidates its provisional claim.
+    RestartExistingCreate,
+}
+
 /// Explicit ownership phase of one journaled mutation operation.
 #[derive(Debug)]
 enum MutationOperationState {
@@ -2867,10 +2881,8 @@ enum MutationOperationState {
         owned: OwnedIrp,
         /// Stream lease and normalized check flags.
         check: OplockCheck,
-        /// Immutable epoch retained through a possible oplock wait.
-        epoch: EpochLease,
-        /// Restartable resolver retained without entering the actor while FsRtl owns the IRP.
-        resolve: MutationResolveOperation,
+        /// Exact continuation selected after FsRtl returns the IRP.
+        resume: OplockResume,
     },
     /// FsRtl owns the raw top-level IRP and the external envelope owns this operation.
     #[cfg_attr(
@@ -2881,10 +2893,8 @@ enum MutationOperationState {
         )
     )]
     OplockDelegated {
-        /// Immutable epoch retained until exact IRP ownership returns.
-        epoch: EpochLease,
-        /// Resolver that has not yet observed an event.
-        resolve: MutationResolveOperation,
+        /// Exact continuation retained until IRP ownership returns.
+        resume: OplockResume,
     },
     /// The reactor restored driver IRP/cancel authority after FsRtl completion.
     #[cfg_attr(
@@ -2899,10 +2909,8 @@ enum MutationOperationState {
         owned: OwnedIrp,
         /// Exact immediate or callback-published oplock status.
         status: wdk_sys::NTSTATUS,
-        /// Immutable epoch retained across the external wait.
-        epoch: EpochLease,
-        /// Resolver entered only after successful oplock admission.
-        resolve: MutationResolveOperation,
+        /// Exact continuation entered only after successful oplock admission.
+        resume: OplockResume,
     },
     /// A within-EOF cached write is executing outside the actor.
     CacheWriting {
@@ -3105,6 +3113,13 @@ enum DriverResolveDisposition {
         /// Exact regular-file inode bound to that FCB.
         node: ext4_core::NodeId,
     },
+    /// An existing-node create must visit its stream oplock package before attachment.
+    CheckOplock {
+        /// Exact FCB retained by the provisional create claim.
+        fcb: core::ptr::NonNull<crate::state::FileControlBlock>,
+        /// Normalized create oplock behavior.
+        policy: crate::irp::OplockCreatePolicy,
+    },
     /// Core mutation and corresponding post-commit driver values were staged.
     Mutation(PendingDriverPublication),
 }
@@ -3216,8 +3231,7 @@ impl MutationRequestOperation {
                     Some(check) => MutationOperationState::CheckingOplock {
                         owned,
                         check,
-                        epoch,
-                        resolve,
+                        resume: OplockResume::ContinueResolution { epoch, resolve },
                     },
                     None => MutationOperationState::Resolving {
                         owned,
@@ -3357,6 +3371,9 @@ impl MutationRequestOperation {
                     ),
                     crate::request::create::CreateResolution::PrepareWriteOpen { fcb, node } => {
                         Ok(DriverResolveDisposition::PrepareWriteOpen { fcb, node })
+                    }
+                    crate::request::create::CreateResolution::CheckOplock { fcb, policy } => {
+                        Ok(DriverResolveDisposition::CheckOplock { fcb, policy })
                     }
                     crate::request::create::CreateResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
@@ -3625,6 +3642,32 @@ impl MutationRequestOperation {
                     self.state = MutationOperationState::PreparingWriteOpen { owned };
                     return OperationTransition::SubmitCacheWork {
                         work: crate::irp::CacheWork::prepare_write_open(stream),
+                        suspended: self,
+                    };
+                }
+                Ok(DriverResolveDisposition::CheckOplock { fcb, policy }) => {
+                    drop(pass);
+                    if size_changes.is_some()
+                        || deletion.is_some()
+                        || self.pending_existing_create.is_none()
+                        || self.write_open.is_some()
+                    {
+                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
+                    let stream = match operations.acquire_claimed_oplock_stream_lease(fcb) {
+                        Ok(stream) => stream,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    let check = match OplockCheck::create(stream, policy) {
+                        Ok(check) => check,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    self.state = MutationOperationState::OplockDelegated {
+                        resume: OplockResume::RestartExistingCreate,
+                    };
+                    return OperationTransition::CheckOplock {
+                        check,
+                        owned,
                         suspended: self,
                     };
                 }
@@ -4054,15 +4097,14 @@ impl OplockContinuation for MutationRequestOperation {
         status: wdk_sys::NTSTATUS,
     ) -> Box<dyn CompletionOperation> {
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
-        let MutationOperationState::OplockDelegated { epoch, resolve } = state else {
+        let MutationOperationState::OplockDelegated { resume } = state else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                 .bugcheck();
         };
         self.state = MutationOperationState::OplockReady {
             owned,
             status,
-            epoch,
-            resolve,
+            resume,
         };
         self
     }
@@ -4278,11 +4320,10 @@ impl MountedVolumeOperation for MutationRequestOperation {
             MutationOperationState::CheckingOplock {
                 owned,
                 check,
-                epoch,
-                resolve,
+                resume,
             } => match event {
                 OperationEvent::Admitted => {
-                    self.state = MutationOperationState::OplockDelegated { epoch, resolve };
+                    self.state = MutationOperationState::OplockDelegated { resume };
                     OperationTransition::CheckOplock {
                         check,
                         owned,
@@ -4297,23 +4338,35 @@ impl MountedVolumeOperation for MutationRequestOperation {
             MutationOperationState::OplockReady {
                 owned,
                 status,
-                epoch,
-                resolve,
+                resume,
             } => match event {
                 OperationEvent::CancelRequested => {
                     self.complete_error(owned, DriverError::from(Error::OperationCancelled))
                 }
-                OperationEvent::Admitted if status >= STATUS_SUCCESS => self.advance_resolution(
-                    owned,
-                    ResolutionAttempt {
-                        epoch,
-                        resolve,
-                        size_changes: None,
-                        deletion: None,
-                    },
-                    OperationEvent::Admitted,
-                    access,
-                ),
+                OperationEvent::Admitted if status >= STATUS_SUCCESS => match resume {
+                    OplockResume::ContinueResolution { epoch, resolve } => self.advance_resolution(
+                        owned,
+                        ResolutionAttempt {
+                            epoch,
+                            resolve,
+                            size_changes: None,
+                            deletion: None,
+                        },
+                        OperationEvent::Admitted,
+                        access,
+                    ),
+                    OplockResume::RestartExistingCreate => {
+                        let result = self
+                            .pending_existing_create
+                            .as_mut()
+                            .ok_or(DriverError::InternalInvariantViolation)
+                            .and_then(|pending| pending.accept_oplock_status(status));
+                        match result {
+                            Ok(()) => self.restart_resolution(owned, None, None, access),
+                            Err(error) => self.complete_error(owned, error),
+                        }
+                    }
+                },
                 OperationEvent::Admitted => {
                     self.complete_error(owned, DriverError::OplockFailure(status))
                 }
