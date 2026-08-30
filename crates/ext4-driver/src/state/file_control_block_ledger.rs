@@ -103,7 +103,7 @@ impl OplockStreamLease {
 
 #[expect(
     unsafe_code,
-    reason = "the retained lease keeps the exact ledger and FCB alive through barrier release"
+    reason = "the mounted operation keeps the exact ledger alive through node reservation release"
 )]
 impl Drop for OplockMutationLease {
     fn drop(&mut self) {
@@ -644,8 +644,8 @@ unsafe impl Send for FileObjectCacheLease {}
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-// SAFETY: Every production and test access to `table` is serialized by `lock`; no reference to
-// the table or an FCB's ledger-owned mutable fields escapes the guard scope.
+// SAFETY: Every production and test access to `table`, `oplock_mutations`, and an FCB's
+// ledger-owned mutable fields is serialized by `lock`; no collection reference escapes the guard.
 unsafe impl Sync for FileControlBlockLedger {}
 
 impl fmt::Debug for FileControlBlockLedger {
@@ -1867,59 +1867,89 @@ impl FileControlBlockLedger {
             // SAFETY: The executive resource serializes table lookup and lifetime mutation.
             &*self.table.get()
         };
-        let (fcb, _node) =
+        let (fcb, node) =
             self.validate_deferred_stream(table, file_object, volume, DeferredStreamTarget::Node)?;
         let mut state = ledger_file_control_block_open_state(table, fcb);
-        unsafe {
+        let lifetime = unsafe {
             // SAFETY: Exact table membership is established while the ledger resource is held.
+            state.as_ref()
+        }
+        .lifetime
+        .with_additional_deferred_lease()?;
+        let mutations = unsafe {
+            // SAFETY: The same ledger resource serializes the node reservation registry.
+            &mut *self.oplock_mutations.get()
+        };
+        begin_oplock_mutation(mutations, node)?;
+        unsafe {
+            // SAFETY: No fallible work remains after the reservation is published.
             state.as_mut()
         }
-        .acquire_oplock_mutation_pair()?;
+        .lifetime = lifetime;
         let owner = NonNull::from(self);
         Ok((
-            OplockMutationLease {
-                retained: DeferredStreamLease { owner, fcb },
-            },
+            OplockMutationLease { owner, node },
             OplockStreamLease {
                 retained: DeferredStreamLease { owner, fcb },
             },
         ))
     }
 
-    /// Retains an already resident parent-directory stream for a namespace oplock check.
+    /// Reserves a parent-directory node against new grants and retains its resident stream, if any.
     /// # Errors
     ///
-    /// Returns a finite deferred-lease failure. Absence is successful because a directory without
-    /// a resident FCB cannot own a stream oplock in this mounted ledger.
+    /// Returns a finite reservation or deferred-lease failure without leaving a reservation active.
+    /// An absent stream still returns mutation authority because a new parent FCB can become
+    /// resident before the namespace mutation publishes.
     #[expect(
         unsafe_code,
         reason = "the ledger resource serializes node lookup and deferred-lease acquisition"
     )]
-    pub(super) fn acquire_parent_oplock_stream_lease(
+    pub(super) fn acquire_parent_oplock_mutation(
         &self,
         parent: DirectoryNodeId,
-    ) -> DriverResult<Option<OplockStreamLease>> {
+    ) -> DriverResult<(OplockMutationLease, Option<OplockStreamLease>)> {
         let _guard = self.lock.acquire();
         let table = unsafe {
             // SAFETY: The executive resource serializes table lookup and lifetime mutation.
             &*self.table.get()
         };
-        let Some(fcb) = find_file_control_block_in_table(table, NodeId::Directory(parent)) else {
-            return Ok(None);
+        let node = NodeId::Directory(parent);
+        let resident = find_file_control_block_in_table(table, node);
+        let prepared_lifetime = if let Some(fcb) = resident {
+            let state = ledger_file_control_block_open_state(table, fcb);
+            Some(
+                unsafe {
+                    // SAFETY: The exact table member remains protected by the ledger resource.
+                    state.as_ref()
+                }
+                .lifetime
+                .with_additional_deferred_lease()?,
+            )
+        } else {
+            None
         };
-        let mut state = ledger_file_control_block_open_state(table, fcb);
-        unsafe {
-            // SAFETY: The ledger resource remains held and the exact table member was selected by
-            // node identity above.
-            state.as_mut()
-        }
-        .acquire_deferred_lease()?;
-        Ok(Some(OplockStreamLease {
-            retained: DeferredStreamLease {
-                owner: NonNull::from(self),
-                fcb,
-            },
-        }))
+        let mutations = unsafe {
+            // SAFETY: The same ledger resource serializes the node reservation registry.
+            &mut *self.oplock_mutations.get()
+        };
+        begin_oplock_mutation(mutations, node)?;
+        let owner = NonNull::from(self);
+        let stream = resident.map(|fcb| {
+            let mut state = ledger_file_control_block_open_state(table, fcb);
+            let lifetime = prepared_lifetime.unwrap_or_else(|| {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            });
+            unsafe {
+                // SAFETY: No fallible work remains after the node reservation was published.
+                state.as_mut()
+            }
+            .lifetime = lifetime;
+            OplockStreamLease {
+                retained: DeferredStreamLease { owner, fcb },
+            }
+        });
+        Ok((OplockMutationLease { owner, node }, stream))
     }
 
     /// Acquires one oplock lease for an exact provisional create claim.
@@ -1983,17 +2013,30 @@ impl FileControlBlockLedger {
         {
             return Err(DriverError::InternalInvariantViolation);
         }
-        let mut state = ledger_file_control_block_open_state(table, fcb);
-        unsafe {
+        let node = unsafe {
             // SAFETY: Exact table membership is established while the ledger resource is held.
+            fcb.as_ref().node()
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        let lifetime = unsafe {
+            // SAFETY: Exact table membership is established while the ledger resource is held.
+            state.as_ref()
+        }
+        .lifetime
+        .with_additional_deferred_lease()?;
+        let mutations = unsafe {
+            // SAFETY: The same ledger resource serializes the node reservation registry.
+            &mut *self.oplock_mutations.get()
+        };
+        begin_oplock_mutation(mutations, node)?;
+        unsafe {
+            // SAFETY: No fallible work remains after the reservation is published.
             state.as_mut()
         }
-        .acquire_oplock_mutation_pair()?;
+        .lifetime = lifetime;
         let owner = NonNull::from(self);
         Ok((
-            OplockMutationLease {
-                retained: DeferredStreamLease { owner, fcb },
-            },
+            OplockMutationLease { owner, node },
             OplockStreamLease {
                 retained: DeferredStreamLease { owner, fcb },
             },
@@ -2017,12 +2060,15 @@ impl FileControlBlockLedger {
         {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         }
-        let state = ledger_file_control_block_open_state(table, fcb);
-        unsafe {
+        let node = unsafe {
             // SAFETY: Exact table membership is established while the ledger resource is held.
-            state.as_ref()
-        }
-        .oplock_grant_available()
+            fcb.as_ref().node()
+        };
+        let mutations = unsafe {
+            // SAFETY: The ledger resource serializes reservation registry observation.
+            &*self.oplock_mutations.get()
+        };
+        oplock_grant_available(mutations, node)
     }
 
     /// Acquires one stream lease for a PASSIVE_LEVEL cache worker without retaining ledger locks.
@@ -2174,29 +2220,18 @@ impl FileControlBlockLedger {
         drop(removed);
     }
 
-    /// Removes one logical mutation count while its separate deferred lease still retains the FCB.
+    /// Removes one node-keyed mutation reservation retained independently from FCB residency.
     #[expect(
         unsafe_code,
-        reason = "the mutation lease retains exact table membership through barrier release"
+        reason = "the mounted operation retains the ledger while its node reservation is released"
     )]
-    fn release_oplock_mutation(&self, fcb: NonNull<FileControlBlock>) {
+    fn release_oplock_mutation(&self, node: NodeId) {
         let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The executive resource serializes table membership and open state.
-            &*self.table.get()
+        let mutations = unsafe {
+            // SAFETY: The executive resource serializes reservation registry mutation.
+            &mut *self.oplock_mutations.get()
         };
-        if !table
-            .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
-        {
-            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-        }
-        let mut state = ledger_file_control_block_open_state(table, fcb);
-        unsafe {
-            // SAFETY: Exact membership and the live mutation lease authorize this decrement.
-            state.as_mut()
-        }
-        .release_oplock_mutation();
+        release_oplock_mutation(mutations, node);
     }
 
     /// Returns the current user-handle count for one table-owned FCB.
@@ -2225,10 +2260,15 @@ impl FileControlBlockLedger {
     )]
     pub(super) fn is_empty(&self) -> bool {
         let _guard = self.lock.acquire();
-        unsafe {
-            // SAFETY: The executive resource serializes table observation.
+        let table_empty = unsafe {
+            // SAFETY: The executive resource serializes FCB table observation.
             (*self.table.get()).is_empty()
-        }
+        };
+        let mutations_empty = unsafe {
+            // SAFETY: The executive resource serializes mutation registry observation.
+            (*self.oplock_mutations.get()).is_empty()
+        };
+        table_empty && mutations_empty
     }
 
     /// Returns whether a currently open inode identity rejects new namespace traversal.
@@ -2574,6 +2614,57 @@ fn release_file_object_lease_in_table(
         Some(removed) => Some(removed),
         None => KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck(),
     }
+}
+
+/// Adds one node-keyed mutation reservation under the caller-held ledger resource.
+/// # Errors
+///
+/// Returns insufficient resources without changing the registry on count or capacity exhaustion.
+fn begin_oplock_mutation(
+    mutations: &mut DriverVec<OplockMutationEntry>,
+    node: NodeId,
+) -> DriverResult<()> {
+    if let Some(entry) = mutations
+        .as_mut_slice()
+        .iter_mut()
+        .find(|entry| entry.node == node)
+    {
+        entry.count = entry
+            .count
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU32::new)
+            .ok_or(DriverError::InsufficientResources)?;
+        return Ok(());
+    }
+    mutations.try_push(OplockMutationEntry {
+        node,
+        count: NonZeroU32::MIN,
+    })
+}
+
+/// Removes one exact node-keyed mutation reservation under the ledger resource.
+fn release_oplock_mutation(mutations: &mut DriverVec<OplockMutationEntry>, node: NodeId) {
+    let Some(index) = mutations.iter().position(|entry| entry.node == node) else {
+        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+    };
+    let Some(entry) = mutations.as_mut_slice().get_mut(index) else {
+        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+    };
+    if entry.count.get() > 1 {
+        entry.count = NonZeroU32::new(entry.count.get() - 1).unwrap_or_else(|| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        return;
+    }
+    if mutations.swap_remove(index).is_none() {
+        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+    }
+}
+
+/// Reports whether a node has no active mutation reservation in the current ledger snapshot.
+fn oplock_grant_available(mutations: &DriverVec<OplockMutationEntry>, node: NodeId) -> bool {
+    mutations.iter().all(|entry| entry.node != node)
 }
 
 /// Finds a VCB-owned FCB by node identity.
