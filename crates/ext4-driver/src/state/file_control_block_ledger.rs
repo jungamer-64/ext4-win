@@ -54,6 +54,13 @@ pub(crate) struct OplockStreamLease {
     retained: DeferredStreamLease,
 }
 
+/// One stream mutation authority that prevents new oplock grants until terminal release.
+#[derive(Debug)]
+pub(crate) struct OplockMutationLease {
+    /// Deferred FCB retention paired with the open-state mutation count.
+    retained: DeferredStreamLease,
+}
+
 impl OplockStreamLease {
     /// Reports whether this lease retains the exact provisional create claim's FCB.
     pub(crate) fn identifies(&self, fcb: NonNull<FileControlBlock>) -> bool {
@@ -78,6 +85,20 @@ impl OplockStreamLease {
             self.retained.fcb.as_ref()
         };
         &fcb.stream_context
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the retained lease keeps the exact ledger and FCB alive through barrier release"
+)]
+impl Drop for OplockMutationLease {
+    fn drop(&mut self) {
+        let owner = unsafe {
+            // SAFETY: This mutation lease retains an entry owned by the exact ledger pointer.
+            self.retained.owner.as_ref()
+        };
+        owner.release_oplock_mutation(self.retained.fcb);
     }
 }
 
@@ -1814,6 +1835,43 @@ impl FileControlBlockLedger {
         Ok(OplockStreamLease { retained })
     }
 
+    /// Acquires a grant barrier and a separate FsRtl check lease for one FILE_OBJECT stream.
+    /// # Errors
+    ///
+    /// Returns an identity, finite-counter, or retention failure without leaving a barrier active.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes exact FILE_OBJECT lookup and pair acquisition"
+    )]
+    pub(super) fn acquire_oplock_mutation(
+        &self,
+        file_object: ActiveFileObject<'_>,
+        volume: NonNull<VolumeControlBlock>,
+    ) -> DriverResult<(OplockMutationLease, OplockStreamLease)> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+            &*self.table.get()
+        };
+        let (fcb, _node) =
+            self.validate_deferred_stream(table, file_object, volume, DeferredStreamTarget::Node)?;
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: Exact table membership is established while the ledger resource is held.
+            state.as_mut()
+        }
+        .acquire_oplock_mutation_pair()?;
+        let owner = NonNull::from(self);
+        Ok((
+            OplockMutationLease {
+                retained: DeferredStreamLease { owner, fcb },
+            },
+            OplockStreamLease {
+                retained: DeferredStreamLease { owner, fcb },
+            },
+        ))
+    }
+
     /// Retains an already resident parent-directory stream for a namespace oplock check.
     /// # Errors
     ///
@@ -1888,6 +1946,71 @@ impl FileControlBlockLedger {
         })
     }
 
+    /// Acquires a grant barrier and check lease for an exact provisional create claim.
+    /// # Errors
+    ///
+    /// Returns an ownership or finite-counter failure before FsRtl observes the create IRP.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes exact provisional FCB pair acquisition"
+    )]
+    pub(super) fn acquire_claimed_oplock_mutation(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+    ) -> DriverResult<(OplockMutationLease, OplockStreamLease)> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+            &*self.table.get()
+        };
+        if !table
+            .iter()
+            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: Exact table membership is established while the ledger resource is held.
+            state.as_mut()
+        }
+        .acquire_oplock_mutation_pair()?;
+        let owner = NonNull::from(self);
+        Ok((
+            OplockMutationLease {
+                retained: DeferredStreamLease { owner, fcb },
+            },
+            OplockStreamLease {
+                retained: DeferredStreamLease { owner, fcb },
+            },
+        ))
+    }
+
+    /// Reports whether the exact table-owned stream currently permits a new oplock grant.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes exact FCB membership and open-state observation"
+    )]
+    pub(super) fn oplock_grant_available(&self, fcb: NonNull<FileControlBlock>) -> bool {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table membership and open state.
+            &*self.table.get()
+        };
+        if !table
+            .iter()
+            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+        {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+        let state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: Exact table membership is established while the ledger resource is held.
+            state.as_ref()
+        }
+        .oplock_grant_available()
+    }
+
     /// Acquires one stream lease for a PASSIVE_LEVEL cache worker without retaining ledger locks.
     /// # Errors
     ///
@@ -1920,48 +2043,11 @@ impl FileControlBlockLedger {
         target: DeferredStreamTarget,
     ) -> DriverResult<(DeferredStreamLease, NodeId)> {
         let _guard = self.lock.acquire();
-        let object = file_object.as_ref();
-        if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
-            return Err(DriverError::ObjectTypeMismatch);
-        }
-        let header =
-            NonNull::new(object.FsContext.cast::<c_void>()).ok_or(DriverError::InvalidParameter)?;
-        let fcb = unsafe {
-            // SAFETY: The active IRP retains its FILE_OBJECT and stream header while the owning
-            // ledger resource prevents concurrent FCB table removal.
-            StreamContext::decode_owner(header, StreamOwnerKind::Node)?
-        }
-        .cast::<FileControlBlock>();
         let table = unsafe {
             // SAFETY: The executive resource serializes table lookup and lifetime mutation.
             &*self.table.get()
         };
-        if !table
-            .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
-        {
-            return Err(DriverError::InvalidParameter);
-        }
-        let stream = unsafe {
-            // SAFETY: Exact pointer membership was established while the ledger resource is held.
-            fcb.as_ref()
-        };
-        if stream.owner() != NonNull::from(self) || stream.volume() != volume {
-            return Err(DriverError::InvalidDeviceRequest);
-        }
-        let node = stream.node();
-        if matches!(target, DeferredStreamTarget::RegularFile) && !matches!(node, NodeId::File(_)) {
-            return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-        }
-        let sections = unsafe {
-            // SAFETY: The same active FILE_OBJECT and retained FCB own this embedded section store.
-            StreamContext::decode_section_objects(header)?
-        };
-        if object.SectionObjectPointer != sections.as_ptr()
-            || sections != stream.stream_section_objects()?
-        {
-            KernelWideInconsistency::file_object_context_corruption().bugcheck();
-        }
+        let (fcb, node) = self.validate_deferred_stream(table, file_object, volume, target)?;
         let mut state = ledger_file_control_block_open_state(table, fcb);
         unsafe {
             // SAFETY: The resource remains held and exact table membership was validated above.
@@ -1975,6 +2061,62 @@ impl FileControlBlockLedger {
             },
             node,
         ))
+    }
+
+    /// Validates one FILE_OBJECT stream against an exact table snapshot held by the caller.
+    /// # Errors
+    ///
+    /// Returns an object, ownership, section-identity, or node-kind failure.
+    #[expect(
+        unsafe_code,
+        reason = "the caller-held ledger resource retains every decoded native stream identity"
+    )]
+    fn validate_deferred_stream(
+        &self,
+        table: &DriverVec<Box<FileControlBlock>>,
+        file_object: ActiveFileObject<'_>,
+        volume: NonNull<VolumeControlBlock>,
+        target: DeferredStreamTarget,
+    ) -> DriverResult<(NonNull<FileControlBlock>, NodeId)> {
+        let object = file_object.as_ref();
+        if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
+            return Err(DriverError::ObjectTypeMismatch);
+        }
+        let header =
+            NonNull::new(object.FsContext.cast::<c_void>()).ok_or(DriverError::InvalidParameter)?;
+        let fcb = unsafe {
+            // SAFETY: The active IRP retains its FILE_OBJECT while the caller-held ledger resource
+            // prevents concurrent removal of the decoded stream owner.
+            StreamContext::decode_owner(header, StreamOwnerKind::Node)?
+        }
+        .cast::<FileControlBlock>();
+        if !table
+            .iter()
+            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+        {
+            return Err(DriverError::InvalidParameter);
+        }
+        let stream = unsafe {
+            // SAFETY: Exact pointer membership was established in the caller-retained table.
+            fcb.as_ref()
+        };
+        if stream.owner() != NonNull::from(self) || stream.volume() != volume {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        let node = stream.node();
+        if matches!(target, DeferredStreamTarget::RegularFile) && !matches!(node, NodeId::File(_)) {
+            return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
+        }
+        let sections = unsafe {
+            // SAFETY: The active FILE_OBJECT and retained table member own this section identity.
+            StreamContext::decode_section_objects(header)?
+        };
+        if object.SectionObjectPointer != sections.as_ptr()
+            || sections != stream.stream_section_objects()?
+        {
+            KernelWideInconsistency::file_object_context_corruption().bugcheck();
+        }
+        Ok((fcb, node))
     }
 
     /// Releases one deferred stream lease and destroys the FCB only after native residency drains.
@@ -2016,6 +2158,31 @@ impl FileControlBlockLedger {
             }
         };
         drop(removed);
+    }
+
+    /// Removes one logical mutation count while its separate deferred lease still retains the FCB.
+    #[expect(
+        unsafe_code,
+        reason = "the mutation lease retains exact table membership through barrier release"
+    )]
+    fn release_oplock_mutation(&self, fcb: NonNull<FileControlBlock>) {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table membership and open state.
+            &*self.table.get()
+        };
+        if !table
+            .iter()
+            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+        {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: Exact membership and the live mutation lease authorize this decrement.
+            state.as_mut()
+        }
+        .release_oplock_mutation();
     }
 
     /// Returns the current user-handle count for one table-owned FCB.

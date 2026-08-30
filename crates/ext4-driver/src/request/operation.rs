@@ -1937,6 +1937,8 @@ enum OplockControlOperationState {
         owned: OwnedIrp,
         /// FCB identity captured from the queued request at operation construction.
         file_control_block: core::ptr::NonNull<crate::state::FileControlBlock>,
+        /// Grant-versus-break semantics captured from the exact queued FSCTL.
+        action: crate::irp::OplockControlAction,
     },
     /// FsRtl or terminal completion consumed the IRP.
     Terminal,
@@ -1955,25 +1957,23 @@ impl OplockControlOperation {
     ///
     /// Returns the still-owned IRP when the target is malformed or operation allocation fails.
     fn try_new(mut owned: OwnedIrp) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-        let file_control_block = match owned
+        let target = match owned
             .request()
             .with_active(crate::request::file_info::oplock_control)
         {
-            Ok(file_control_block) => file_control_block,
+            Ok(target) => target,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
-        match memory::boxed_try_map(
-            (owned, file_control_block),
-            |(owned, file_control_block)| Self {
-                state: OplockControlOperationState::Ready {
-                    owned,
-                    file_control_block,
-                },
+        match memory::boxed_try_map((owned, target), |(owned, target)| Self {
+            state: OplockControlOperationState::Ready {
+                owned,
+                file_control_block: target.file_control_block,
+                action: target.action,
             },
-        ) {
+        }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
-                let (error, (owned, _file_control_block)) = error.into_parts();
+                let (error, (owned, _target)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
@@ -1989,6 +1989,8 @@ impl OplockControlOperation {
     fn delegate(
         mut owned: OwnedIrp,
         expected: core::ptr::NonNull<crate::state::FileControlBlock>,
+        action: crate::irp::OplockControlAction,
+        access: &MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let observed = match owned
             .request()
@@ -1997,8 +1999,13 @@ impl OplockControlOperation {
             Ok(observed) => observed,
             Err(error) => return Self::complete(owned, error),
         };
-        if observed != expected {
+        if observed.file_control_block != expected || observed.action != action {
             return Self::complete(owned, DriverError::InternalInvariantViolation);
+        }
+        if action == crate::irp::OplockControlAction::Grant
+            && !access.oplock_grant_available(expected)
+        {
+            return Self::complete(owned, DriverError::OplockNotGranted);
         }
         let _status = owned.delegate_oplock_control(expected);
         OperationTransition::Complete
@@ -2009,7 +2016,7 @@ impl MountedVolumeOperation for OplockControlOperation {
     fn advance_mounted(
         mut self: Box<Self>,
         event: CompletionEvent,
-        _access: &mut MountedVolumeAccess<'_>,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let event = event.into_core();
         let state = core::mem::replace(&mut self.state, OplockControlOperationState::Terminal);
@@ -2018,9 +2025,10 @@ impl MountedVolumeOperation for OplockControlOperation {
                 OplockControlOperationState::Ready {
                     owned,
                     file_control_block,
+                    action,
                 },
                 OperationEvent::Admitted,
-            ) => Self::delegate(owned, file_control_block),
+            ) => Self::delegate(owned, file_control_block, action, access),
             (OplockControlOperationState::Ready { owned, .. }, OperationEvent::CancelRequested) => {
                 Self::complete(owned, DriverError::from(Error::OperationCancelled))
             }
@@ -3442,6 +3450,15 @@ enum CleanupParentOplockState {
     Authorized(ext4_core::DirectoryNodeId),
 }
 
+/// Initial target-stream break check paired with the grant barrier retained by its mutation.
+#[derive(Debug)]
+struct PreparedMutationOplock {
+    /// FsRtl check lease consumed by the break envelope.
+    check: OplockCheck,
+    /// Logical barrier retained after the check succeeds and until mutation publication.
+    mutation: crate::state::OplockMutationLease,
+}
+
 impl CleanupParentOplockState {
     /// Reports whether this authority covers the exact pending-delete parent.
     fn authorizes(self, parent: ext4_core::DirectoryNodeId) -> bool {
@@ -3640,6 +3657,8 @@ struct MutationRequestOperation {
     request: PreparedMutationRequest,
     /// Mutable CNG objects and work buffers retained through resolve and commit.
     crypto: CngOperation,
+    /// Target-stream grant barrier retained from pre-break admission through mutation publication.
+    oplock_mutation: Option<crate::state::OplockMutationLease>,
     /// Cleanup deletion plan retained across resolve suspension.
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Parent-directory removal check completed for the current cleanup deletion target.
@@ -3731,7 +3750,7 @@ impl MutationRequestOperation {
         request: &PreparedMutationRequest,
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
-    ) -> DriverResult<Option<OplockCheck>> {
+    ) -> DriverResult<Option<PreparedMutationOplock>> {
         let requires_check = match request {
             PreparedMutationRequest::DataWrite(authority) => {
                 !authority.is_paging()
@@ -3768,9 +3787,13 @@ impl MutationRequestOperation {
                         crate::state::OpenedFileObject::Node(opened) => {
                             let deletion = opened.create_deletion();
                             access
-                                .acquire_oplock_stream_lease(file_object)
-                                .map(|stream| OplockCheck::cleanup(stream, deletion))
-                                .map(Some)
+                                .acquire_oplock_mutation(file_object)
+                                .map(|(mutation, stream)| {
+                                    Some(PreparedMutationOplock {
+                                        check: OplockCheck::cleanup(stream, deletion),
+                                        mutation,
+                                    })
+                                })
                         }
                         crate::state::OpenedFileObject::Volume(_) => Ok(None),
                     }
@@ -3787,9 +3810,13 @@ impl MutationRequestOperation {
         owned.request().with_active(|active| {
             let file_object = active.current_stack()?.file_object()?;
             access
-                .acquire_oplock_stream_lease(file_object)
-                .map(OplockCheck::ordinary)
-                .map(Some)
+                .acquire_oplock_mutation(file_object)
+                .map(|(mutation, stream)| {
+                    Some(PreparedMutationOplock {
+                        check: OplockCheck::ordinary(stream),
+                        mutation,
+                    })
+                })
         })
     }
 
@@ -3834,19 +3861,25 @@ impl MutationRequestOperation {
         match memory::boxed_try_map(
             (owned, epoch, crypto, activity, request),
             |(owned, epoch, crypto, activity, request)| {
-                let state = match oplock {
-                    Some(check) => MutationOperationState::CheckingOplock {
-                        owned,
-                        check,
-                        resume: OplockResume::ContinueResolution { epoch, resolve },
-                    },
-                    None => MutationOperationState::Resolving {
-                        owned,
-                        epoch,
-                        resolve,
-                        size_changes: None,
-                        deletion: None,
-                    },
+                let (state, oplock_mutation) = match oplock {
+                    Some(PreparedMutationOplock { check, mutation }) => (
+                        MutationOperationState::CheckingOplock {
+                            owned,
+                            check,
+                            resume: OplockResume::ContinueResolution { epoch, resolve },
+                        },
+                        Some(mutation),
+                    ),
+                    None => (
+                        MutationOperationState::Resolving {
+                            owned,
+                            epoch,
+                            resolve,
+                            size_changes: None,
+                            deletion: None,
+                        },
+                        None,
+                    ),
                 };
                 Self {
                     devices,
@@ -3856,6 +3889,7 @@ impl MutationRequestOperation {
                     now,
                     request,
                     crypto,
+                    oplock_mutation,
                     cleanup_deletion: None,
                     cleanup_parent_oplock: CleanupParentOplockState::Unresolved,
                     disposition_deletion: None,
@@ -4300,14 +4334,18 @@ impl MutationRequestOperation {
                     {
                         return self.complete_error(owned, DriverError::InternalInvariantViolation);
                     }
-                    let stream = match operations.acquire_claimed_oplock_stream_lease(fcb) {
-                        Ok(stream) => stream,
+                    if self.oplock_mutation.is_some() {
+                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
+                    let (mutation, stream) = match operations.acquire_claimed_oplock_mutation(fcb) {
+                        Ok(admission) => admission,
                         Err(error) => return self.complete_error(owned, error),
                     };
                     let check = match OplockCheck::create(stream, policy) {
                         Ok(check) => check,
                         Err(error) => return self.complete_error(owned, error),
                     };
+                    self.oplock_mutation = Some(mutation);
                     self.state = MutationOperationState::OplockDelegated {
                         resume: OplockResume::RestartExistingCreate,
                     };
@@ -4325,6 +4363,9 @@ impl MutationRequestOperation {
                         || self.write_open.is_some()
                     {
                         return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
+                    if !operations.oplock_grant_available(fcb) {
+                        return self.complete_error(owned, DriverError::OplockNotGranted);
                     }
                     let stream = match operations.acquire_claimed_oplock_stream_lease(fcb) {
                         Ok(stream) => stream,
@@ -5538,6 +5579,7 @@ impl InfalliblePublication for MutationRequestOperation {
                 }
                 drop(size_changes);
                 drop(deletion);
+                drop(self.oplock_mutation.take());
                 match stream_projection {
                     Ok(()) => {
                         let _complete = self.complete_success(owned, completion);
