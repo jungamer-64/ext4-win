@@ -13,7 +13,6 @@ use wdk_sys::{NTSTATUS, STATUS_PENDING};
 
 use crate::state::OplockStreamLease;
 
-use super::OplockCreatePolicy;
 #[cfg(not(test))]
 use super::lifecycle::DelegatedIrp;
 use super::lifecycle::OwnedIrp;
@@ -24,6 +23,7 @@ use super::reactor::CompletionOperation;
 use super::reactor::CompletionReactor;
 #[cfg(not(test))]
 use super::scheduler::SlotId;
+use super::{CreateDeletion, OplockCreatePolicy};
 #[cfg(not(test))]
 use crate::kernel::fatal::KernelWideInconsistency;
 #[cfg(not(test))]
@@ -52,6 +52,17 @@ impl OplockCheck {
     /// Builds an ordinary break check for a handle mutation.
     pub(crate) const fn ordinary(stream: OplockStreamLease) -> Self {
         Self { stream, flags: 0 }
+    }
+
+    /// Builds the break check for one node-handle cleanup transition.
+    ///
+    /// FsRtl must see the closing-delete flag only for a handle whose create request selected
+    /// `FILE_DELETE_ON_CLOSE`; a later disposition request does not alter this create-time fact.
+    pub(crate) const fn cleanup(stream: OplockStreamLease, deletion: CreateDeletion) -> Self {
+        Self {
+            stream,
+            flags: cleanup_oplock_flags(deletion),
+        }
     }
 
     /// Builds the break check selected by an existing-stream create request.
@@ -90,6 +101,14 @@ impl OplockCheck {
                 .stream_context()
                 .check_oplock(irp, self.flags, continuation)
         }
+    }
+}
+
+/// Projects the create-time deletion contract into the cleanup-only FsRtl flag.
+const fn cleanup_oplock_flags(deletion: CreateDeletion) -> u32 {
+    match deletion {
+        CreateDeletion::Retain => 0,
+        CreateDeletion::DeleteOnClose => wdk_sys::OPLOCK_FLAG_CLOSING_DELETE_ON_CLOSE,
     }
 }
 
@@ -696,7 +715,8 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
 
 #[cfg(test)]
 mod tests {
-    use super::{OplockCallbackProtocol, classify_atomic_oplock_status};
+    use super::{OplockCallbackProtocol, classify_atomic_oplock_status, cleanup_oplock_flags};
+    use crate::irp::CreateDeletion;
     use crate::kernel::status::DriverError;
 
     /// # Panics
@@ -718,6 +738,19 @@ mod tests {
             Err(DriverError::OplockFailure(
                 wdk_sys::STATUS_CANNOT_BREAK_OPLOCK
             ))
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics if cleanup loses the distinction between ordinary disposition and the exact handle
+    /// originally opened with `FILE_DELETE_ON_CLOSE`.
+    #[test]
+    fn cleanup_oplock_flags_follow_create_time_deletion() {
+        assert_eq!(cleanup_oplock_flags(CreateDeletion::Retain), 0);
+        assert_eq!(
+            cleanup_oplock_flags(CreateDeletion::DeleteOnClose),
+            wdk_sys::OPLOCK_FLAG_CLOSING_DELETE_ON_CLOSE
         );
     }
 
