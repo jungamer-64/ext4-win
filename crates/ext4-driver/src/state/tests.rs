@@ -761,6 +761,62 @@ fn typed_opened_directory_exposes_cursor_without_option() {
 
 /// # Panics
 ///
+/// Panics when a standard oplock FSCTL rejects a live directory stream or selects another FCB.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the stack-local IRP, stack location, FILE_OBJECT, FCB, and CCB remain live together"
+)]
+fn oplock_control_accepts_the_exact_directory_stream() {
+    let volume = NonNull::<VolumeControlBlock>::dangling();
+    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let expected = NonNull::from(fcb.as_ref());
+    let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+    else {
+        return;
+    };
+    let mut file = file_object_with_contexts(
+        fcb.stream_header().as_ptr(),
+        core::ptr::addr_of_mut!(handle).cast(),
+    );
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        FileObject: core::ptr::from_mut(&mut file),
+        MinorFunction: 0,
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    stack.Parameters.FileSystemControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
+        OutputBufferLength: 0,
+        __bindgen_padding_0: 0,
+        InputBufferLength: 0,
+        __bindgen_padding_1: 0,
+        FsControlCode: 0x0009_0240,
+        Type3InputBuffer: core::ptr::null_mut(),
+    };
+    let mut irp = wdk_sys::IRP::default();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::from_mut(&mut stack);
+    let received = unsafe {
+        // SAFETY: Every stack-local object above remains live through the decoder invocation.
+        ReceivedIrp::decode(
+            core::ptr::from_mut(&mut device),
+            core::ptr::from_mut(&mut irp),
+        )
+    };
+    assert!(received.is_ok());
+    if let Ok(mut received) = received {
+        assert_eq!(
+            received.with_active(crate::request::file_info::oplock_control),
+            Ok(expected)
+        );
+    }
+}
+
+/// # Panics
+///
 /// Panics when FsRtl directory-name storage is recreated or relocated between registrations.
 #[test]
 #[expect(

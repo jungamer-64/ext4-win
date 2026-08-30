@@ -854,7 +854,7 @@ pub(crate) fn admit_owned(
             Admission::ByteRangeLock => target
                 .with_mounted_access(|access| super::operation::byte_range_lock(owned, access)),
             Admission::OplockControl => {
-                target.with_mounted_access(|access| super::operation::oplock_control(owned, access))
+                target.with_mounted_access(|_| super::operation::oplock_control(owned))
             }
             Admission::VolumeControl(kind) => {
                 target.with_mounted_access(|_| super::operation::volume_control(owned, kind))

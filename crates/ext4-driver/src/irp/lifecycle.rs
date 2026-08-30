@@ -943,6 +943,35 @@ impl OwnedIrp {
         file_control_block.process_byte_range_lock(target)
     }
 
+    /// Transfers this queued namespace-stream oplock FSCTL's terminal completion to FsRtl.
+    ///
+    /// The caller has serialized the request through the live handle lane and revalidated the
+    /// FILE_OBJECT-to-FCB binding immediately before this consuming transition.
+    #[expect(
+        unsafe_code,
+        reason = "the decoded FCB remains live through the consumed queued IRP and handle lane"
+    )]
+    pub(crate) fn delegate_oplock_control(
+        self,
+        file_control_block: NonNull<FileControlBlock>,
+    ) -> NTSTATUS {
+        let Self {
+            target,
+            context,
+            #[cfg(not(test))]
+            active_cancellation,
+        } = self;
+        #[cfg(not(test))]
+        drop(active_cancellation);
+        drop(context);
+        let file_control_block = unsafe {
+            // SAFETY: Reactor admission decoded this FCB from the same live FILE_OBJECT. The
+            // consumed IRP and its ordinary handle lane retain that object through delegation.
+            file_control_block.as_ref()
+        };
+        file_control_block.process_oplock_fsctrl(target)
+    }
+
     /// Completes the IRP as canceled.
     pub(super) fn complete_cancelled(self) -> NTSTATUS {
         self.complete(IrpCompletion::cancelled())
