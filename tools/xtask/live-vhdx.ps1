@@ -268,10 +268,14 @@ function Get-SessionPartition {
     return $partition
 }
 
-function Mount-SessionNamespace {
+function Import-LiveVolumeBoundary {
     if (-not ('Ext4Win.LiveVolume' -as [type])) {
         Add-Type -Path (Join-Path $RepositoryRoot 'tools\xtask\live-volume.cs')
     }
+}
+
+function Mount-SessionNamespace {
+    Import-LiveVolumeBoundary
     $partition = Get-SessionPartition
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
     $volume = $null
@@ -297,9 +301,7 @@ function Remove-SessionNamespace {
     $item = Get-Item -LiteralPath $mountPath -Force -ErrorAction SilentlyContinue
     if (-not $item) { return }
     if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-        if (-not ('Ext4Win.LiveVolume' -as [type])) {
-            Add-Type -Path (Join-Path $RepositoryRoot 'tools\xtask\live-volume.cs')
-        }
+        Import-LiveVolumeBoundary
         $volume = [Ext4Win.LiveVolume]::AtMountPoint("$mountPath\")
         if ($volume -ne $script:State.volume_name) {
             throw 'session mount point targets a different volume; cleanup refused'
@@ -310,6 +312,52 @@ function Remove-SessionNamespace {
     # Only the empty, generated directory is removed, never its filesystem contents.
     [IO.Directory]::Delete($mountPath, $false)
     Write-Phase 'NamespaceRemoved'
+}
+
+function Dismount-SessionFilesystemForCleanup {
+    $partition = Get-SessionPartition
+    Import-LiveVolumeBoundary
+    $volume = [Ext4Win.LiveVolume]::Find(
+        [uint32]$partition.DiskNumber,
+        [long]$partition.Offset,
+        [long]$partition.Size,
+        [Guid]$script:State.partition_id
+    )
+    $identityMatched = [bool]$volume
+    if ($volume) {
+        if (-not $script:State.Contains('volume_name') -or $script:State.volume_name -ne $volume) {
+            Set-StateValue 'volume_name' $volume
+            Write-Phase 'CleanupVolumeRecognized'
+        }
+    }
+    elseif ($script:State.Contains('volume_name')) {
+        $volume = $script:State.volume_name
+    }
+    else {
+        Write-Phase 'CleanupVolumeAbsent'
+        return
+    }
+
+    $mountState = [Ext4Win.LiveVolume]::MountState($volume)
+    if ($mountState -eq [Ext4Win.LiveVolumeMountState]::Mounted -and -not $identityMatched) {
+        throw 'recorded Mount Manager volume is mounted but no longer matches the session partition'
+    }
+    switch ($mountState) {
+        ([Ext4Win.LiveVolumeMountState]::Mounted) {
+            Write-Phase 'CleanupVolumeDismountRequested'
+            Invoke-Checked 'fsutil.exe' @('volume', 'dismount', $volume) 'cleanup ext4 session volume dismount'
+            Write-Phase 'CleanupVolumeDismounted'
+        }
+        ([Ext4Win.LiveVolumeMountState]::Dismounted) {
+            Write-Phase 'CleanupVolumeAlreadyDismounted'
+        }
+        ([Ext4Win.LiveVolumeMountState]::Absent) {
+            Write-Phase 'CleanupVolumeAbsent'
+        }
+        default {
+            throw 'session volume returned an unknown mount state'
+        }
+    }
 }
 
 function Wait-SessionVolumeRemoval {
@@ -390,7 +438,6 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
 }
 
 function Cleanup-VhdxResources {
-    Remove-SessionNamespace
     if ($script:State.wsl_attached -eq 'true') {
         Write-Phase 'CleanupWslUnmountRequested'
         Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'cleanup WSL VHDX unmount' | Out-Null
@@ -398,6 +445,10 @@ function Cleanup-VhdxResources {
         Write-Phase 'CleanupWslUnmounted'
     }
     $disk = Get-SessionDisk
+    if ($disk) {
+        Dismount-SessionFilesystemForCleanup
+    }
+    Remove-SessionNamespace
     if ($disk) {
         Write-Phase 'CleanupVhdxDismountRequested'
         Dismount-VHD -Path $script:State.vhdx_path
@@ -431,31 +482,10 @@ function Cleanup-DriverLoadResources {
 }
 
 function Cleanup-SessionInternal {
-    $vhdxCleanupError = $null
-    try {
-        Cleanup-VhdxResources
-    }
-    catch {
-        $vhdxCleanupError = $_
-    }
-
-    $driverCleanupError = $null
-    try {
-        Cleanup-DriverLoadResources
-    }
-    catch {
-        $driverCleanupError = $_
-    }
-
-    if ($vhdxCleanupError -and $driverCleanupError) {
-        throw "VHDX cleanup failed ($vhdxCleanupError); mandatory driver-load cleanup also failed ($driverCleanupError)"
-    }
-    if ($vhdxCleanupError) {
-        throw $vhdxCleanupError
-    }
-    if ($driverCleanupError) {
-        throw $driverCleanupError
-    }
+    # Driver retirement consumes the control endpoint. Keep that recovery authority while an
+    # identity-bound volume or VHDX can still require a clean filesystem dismount.
+    Cleanup-VhdxResources
+    Cleanup-DriverLoadResources
     Write-Phase 'Complete'
 }
 

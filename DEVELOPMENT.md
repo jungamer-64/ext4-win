@@ -157,5 +157,8 @@ patterned enumeration, durable flush, clean dismount, driver unload, package
 removal, and VHDX removal to succeed. Lifecycle side effects are preceded by a
 durably flushed phase manifest. Cleanup revalidates the verified bundle
 identity, signer thumbprint, SYS hash, OEM INF, service image path, VHDX path,
-and disk unique ID before acting. Physical disks remain permanently outside
-this workflow.
+and disk unique ID before acting. An interrupted session also queries the exact
+session volume's mounted state before detaching its VHDX. It performs a clean
+filesystem dismount when required and does not consume the driver's unload
+control endpoint until storage cleanup is complete. Physical disks remain
+permanently outside this workflow.
