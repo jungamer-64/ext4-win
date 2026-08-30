@@ -144,7 +144,7 @@ struct ExternalJournalFixture {
 /// Parsed authority for deterministic external-journal fixture reproduction.
 #[derive(Debug, Eq, PartialEq)]
 struct JournalFixtureManifest {
-    /// Exact e2fsprogs release required for byte-for-byte provenance.
+    /// Exact e2fsprogs release required by every interoperability oracle.
     e2fsprogs_version: String,
     /// Stable fake Unix timestamp supplied to every mutating e2fsprogs process.
     fake_time: u64,
@@ -222,11 +222,13 @@ impl JournalInteropCase {
 ///
 /// # Errors
 ///
-/// Returns an error when Linux/e2fsprogs is unavailable, fixture generation fails, the core mount
-/// or close protocol rejects an image, replay differs from the expected latest committed payload,
-/// e2fsck reports damage, or temporary artifact cleanup fails.
+/// Returns an error when Linux or the manifest-pinned e2fsprogs release is unavailable, fixture
+/// generation fails, the core mount or close protocol rejects an image, replay differs from the
+/// expected latest committed payload, e2fsck reports damage, or temporary artifact cleanup fails.
 pub(crate) fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
-    let linux = LinuxEnvironment::require()?;
+    let fixture_directory = journal_fixture_directory(repository_root);
+    let manifest = parse_journal_fixture_manifest(&fixture_directory.join("provenance.manifest"))?;
+    let linux = LinuxEnvironment::require(&manifest.e2fsprogs_version)?;
     let temporary_root = create_task_directory(repository_root, "journal-interop")?;
     let cases = [
         JournalInteropCase {
@@ -272,9 +274,6 @@ pub(crate) fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
         for case in cases {
             verify_linux_generated_journal_case(linux, &temporary_root, case)?;
         }
-        let fixture_directory = journal_fixture_directory(repository_root);
-        let manifest =
-            parse_journal_fixture_manifest(&fixture_directory.join("provenance.manifest"))?;
         for fixture in &manifest.fixtures {
             verify_external_journal_fixture(linux, &fixture_directory, &temporary_root, fixture)?;
         }
@@ -326,10 +325,12 @@ fn verify_internal_mutation_profiles(
 ///
 /// # Errors
 ///
-/// Returns an error when Linux filesystem tools are unavailable, a profile fails, or temporary
-/// artifact cleanup cannot complete.
+/// Returns an error when the manifest-pinned Linux filesystem tools are unavailable, a profile
+/// fails, or temporary artifact cleanup cannot complete.
 pub(crate) fn verify_htree_interop(repository_root: &Path) -> TaskResult<()> {
-    let linux = LinuxEnvironment::require()?;
+    let fixture_directory = journal_fixture_directory(repository_root);
+    let manifest = parse_journal_fixture_manifest(&fixture_directory.join("provenance.manifest"))?;
+    let linux = LinuxEnvironment::require(&manifest.e2fsprogs_version)?;
     let temporary_root = create_task_directory(repository_root, "htree-interop")?;
     let verification = (|| -> TaskResult<()> {
         verify_large_directory_depth_two(linux, &temporary_root)?;
@@ -3215,18 +3216,10 @@ fn is_sha256_hex(value: &str) -> bool {
 /// Returns an error unless the host provides the manifest-pinned e2fsprogs release and root loop
 /// authority, or when regenerated raw bytes/digests differ from the tracked fixtures.
 pub(crate) fn verify_journal_fixture_provenance(repository_root: &Path) -> TaskResult<()> {
-    let linux = LinuxEnvironment::require()?;
     let fixture_directory = journal_fixture_directory(repository_root);
     let manifest_path = fixture_directory.join("provenance.manifest");
     let manifest = parse_journal_fixture_manifest(&manifest_path)?;
-    let actual_version = linux.e2fsprogs_version()?;
-    if actual_version != manifest.e2fsprogs_version {
-        return Err(io::Error::other(format!(
-            "fixture provenance requires e2fsprogs {}, found {actual_version}",
-            manifest.e2fsprogs_version
-        ))
-        .into());
-    }
+    let linux = LinuxEnvironment::require(&manifest.e2fsprogs_version)?;
     linux.require_loop_device_authority()?;
 
     let temporary_root = create_task_directory(repository_root, "journal-fixture-provenance")?;

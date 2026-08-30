@@ -36,12 +36,13 @@ enum LinuxEnvironment {
 const WSL_TOOL_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 impl LinuxEnvironment {
-    /// Discovers and verifies every mandatory e2fsprogs executable.
+    /// Discovers and verifies the manifest-pinned e2fsprogs toolset.
     ///
     /// # Errors
     ///
-    /// Returns an error instead of skipping when Linux, WSL, or any required executable is absent.
-    fn require() -> TaskResult<Self> {
+    /// Returns an error instead of skipping when Linux, WSL, or any required executable is absent,
+    /// or when the installed e2fsprogs release differs from the repository authority.
+    fn require(expected_e2fsprogs_version: &str) -> TaskResult<Self> {
         let environment = if cfg!(target_os = "linux") {
             Self::Native
         } else if cfg!(target_os = "windows") {
@@ -54,7 +55,10 @@ impl LinuxEnvironment {
             .into());
         };
 
-        for tool in ["mke2fs", "debugfs", "e2fsck"] {
+        let actual_e2fsprogs_version = environment.e2fsprogs_version()?;
+        require_e2fsprogs_version(&actual_e2fsprogs_version, expected_e2fsprogs_version)?;
+
+        for tool in ["debugfs", "e2fsck"] {
             let mut command = environment.command(tool);
             command.arg("-V");
 
@@ -213,6 +217,38 @@ impl LinuxEnvironment {
         run_checked_output(free, "free loop-device query")?;
 
         Ok(())
+    }
+}
+
+/// Enforces the repository's exact e2fsprogs release authority.
+///
+/// # Errors
+///
+/// Returns an error when the discovered release differs from the manifest-pinned release.
+fn require_e2fsprogs_version(actual: &str, expected: &str) -> TaskResult<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "ext4 interoperability requires manifest-pinned e2fsprogs {expected}, found {actual}"
+        ))
+        .into())
+    }
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::require_e2fsprogs_version;
+
+    /// The environment contract accepts only the exact manifest release token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if exact equality is rejected or release drift is accepted.
+    #[test]
+    fn e2fsprogs_release_must_match_manifest_exactly() {
+        assert!(require_e2fsprogs_version("1.47.2", "1.47.2").is_ok());
+        assert!(require_e2fsprogs_version("1.47.0", "1.47.2").is_err());
     }
 }
 
