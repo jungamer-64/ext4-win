@@ -20,7 +20,7 @@ use ext4_core::{
     CompletedMount, DeviceLength, DirectoryNodeId, DirectoryScanCursor, DurableMutation, Ext4Name,
     FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile,
     MutationLease, MutationResolvePass, NewDirectoryMetadata, NewFileMetadata, NodeId,
-    NodeStorageSnapshot, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry,
+    NodeMetadataSnapshot, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry,
     VolumeIdentity, WindowsName, XattrName, XattrValue,
 };
 use wdk_sys::{

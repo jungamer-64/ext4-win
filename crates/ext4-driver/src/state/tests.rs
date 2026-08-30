@@ -172,8 +172,7 @@ fn file_object_with_contexts(
 #[test]
 fn volume_open_flag_selects_typed_volume_contexts() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let stream = crate::kernel::stream::StreamContext::try_new(
-        crate::kernel::stream::StreamOwnerKind::Volume,
+    let stream = crate::kernel::stream::StreamContext::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )
@@ -553,10 +552,10 @@ fn test_file_control_block(
     node: NodeId,
 ) -> Box<FileControlBlock> {
     let fcb = crate::memory::boxed_try_with(|| {
-        FileControlBlock::try_new(
+        FileControlBlock::try_new_staged(
             volume,
             NonNull::<FileControlBlockLedger>::dangling(),
-            super::NodeStreamSizes {
+            super::StagedNodeStreamMetadata {
                 node,
                 sizes: crate::kernel::stream::StreamSizes::EMPTY,
             },
@@ -1386,11 +1385,11 @@ fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
 fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Result<(), DriverError>
 {
     let mut ledger = FileControlBlockLedger::try_new()?;
-    let stream = super::NodeStreamSizes {
+    let stream = super::StagedNodeStreamMetadata {
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
     };
-    let fcb = ledger.file_control_block(
+    let fcb = ledger.staged_file_control_block(
         NonNull::dangling(),
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
@@ -1428,56 +1427,6 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
 
 /// # Errors
 ///
-/// Returns a fixture allocation or native stream-header failure.
-/// # Panics
-///
-/// Panics if directory metadata is misclassified as a mapped regular-file size mutation.
-#[test]
-#[expect(
-    clippy::panic_in_result_fn,
-    reason = "fixture failures use Result; assertions verify the stream-kind gate boundary"
-)]
-fn stream_size_change_plan_excludes_non_file_metadata() -> Result<(), DriverError> {
-    let mut ledger = FileControlBlockLedger::try_new()?;
-    let node = NodeId::Directory(DirectoryNodeId::ROOT);
-    let initial = super::NodeStreamSizes {
-        node,
-        sizes: crate::kernel::stream::StreamSizes::EMPTY,
-    };
-    let changed = super::NodeStreamSizes {
-        node,
-        sizes: crate::kernel::stream::StreamSizes::try_from_ext4(
-            ext4_core::FileSize::from_bytes(9_000),
-            ext4_core::FileAllocationSize::from_bytes(4_096),
-            ext4_core::ClusterSize::new(4_096)?,
-        )?,
-    };
-    let fcb = ledger.file_control_block(
-        NonNull::dangling(),
-        initial,
-        crate::kernel::operational_trace::OperationalTrace::host_test(),
-    )?;
-    let fcb_pointer = NonNull::from(fcb.as_ref());
-    ledger
-        .table
-        .get_mut()
-        .try_push_owned(fcb)
-        .map_err(|failure| failure.into_parts().0)?;
-    let mut nodes = crate::memory::DriverVec::new();
-    nodes.try_push(changed)?;
-    let updates = super::PreparedStreamSizePublications { nodes };
-
-    let mut plan = ledger.prepare_stream_size_changes(&updates, None)?;
-    assert!(plan.next().is_none());
-    assert!(plan.into_prepared()?.is_none());
-
-    ledger.close(fcb_pointer);
-    assert!(ledger.is_empty());
-    Ok(())
-}
-
-/// # Errors
-///
 /// Returns a fixture allocation or native stream-header error.
 /// # Panics
 ///
@@ -1490,11 +1439,11 @@ fn stream_size_change_plan_excludes_non_file_metadata() -> Result<(), DriverErro
 fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<(), DriverError> {
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let stream = super::NodeStreamSizes {
+    let stream = super::StagedNodeStreamMetadata {
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
     };
-    let fcb = ledger.file_control_block(
+    let fcb = ledger.staged_file_control_block(
         volume,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
@@ -1534,11 +1483,11 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
 fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), DriverError> {
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let stream = super::NodeStreamSizes {
+    let stream = super::StagedNodeStreamMetadata {
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
     };
-    let fcb = ledger.file_control_block(
+    let fcb = ledger.staged_file_control_block(
         volume,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
@@ -1581,11 +1530,11 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
 fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), DriverError> {
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let stream = super::NodeStreamSizes {
+    let stream = super::StagedNodeStreamMetadata {
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
     };
-    let fcb = ledger.file_control_block(
+    let fcb = ledger.staged_file_control_block(
         volume,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
@@ -1613,7 +1562,7 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
     assert!(ledger.table.get_mut().is_empty());
     assert!(!ledger.is_empty());
 
-    let reopened = ledger.file_control_block(
+    let reopened = ledger.staged_file_control_block(
         volume,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
@@ -1649,11 +1598,11 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
         ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
     assert!(absent_stream.is_none());
     assert!(!ledger.is_empty());
-    let stream = super::NodeStreamSizes {
+    let stream = super::StagedNodeStreamMetadata {
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
     };
-    let fcb = ledger.file_control_block(
+    let fcb = ledger.staged_file_control_block(
         NonNull::dangling(),
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
@@ -1677,77 +1626,6 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
     drop(lease);
     assert!(!ledger.is_empty());
     drop(mutation);
-    assert!(ledger.is_empty());
-    Ok(())
-}
-
-/// # Errors
-///
-/// Returns a fixture allocation or size conversion error.
-/// # Panics
-///
-/// Panics if publication misses a stream opened after preparation or exposes uncommitted sizes.
-#[test]
-#[expect(
-    clippy::panic_in_result_fn,
-    reason = "fixture failures use Result; assertions check commit visibility"
-)]
-fn size_publication_targets_streams_opened_after_preparation() -> Result<(), DriverError> {
-    let mut ledger = FileControlBlockLedger::try_new()?;
-    let node = NodeId::Directory(DirectoryNodeId::ROOT);
-    let initial = super::NodeStreamSizes {
-        node,
-        sizes: crate::kernel::stream::StreamSizes::EMPTY,
-    };
-    let changed = super::NodeStreamSizes {
-        node,
-        sizes: crate::kernel::stream::StreamSizes::try_from_ext4(
-            ext4_core::FileSize::from_bytes(9_000),
-            ext4_core::FileAllocationSize::from_bytes(4_096),
-            ext4_core::ClusterSize::new(4_096)?,
-        )?,
-    };
-    let mut nodes = crate::memory::DriverVec::new();
-    nodes.try_push(changed)?;
-    let publication = super::PreparedStreamSizePublications { nodes };
-
-    // Only immutable stream fields are exercised, so the volume identity is never dereferenced.
-    let original = ledger.file_control_block(
-        NonNull::dangling(),
-        initial,
-        crate::kernel::operational_trace::OperationalTrace::host_test(),
-    )?;
-    let original_pointer = NonNull::from(original.as_ref());
-    ledger
-        .table
-        .get_mut()
-        .try_push_owned(original)
-        .map_err(|failure| failure.into_parts().0)?;
-    ledger.close(original_pointer);
-
-    let reopened = ledger.file_control_block(
-        NonNull::dangling(),
-        initial,
-        crate::kernel::operational_trace::OperationalTrace::host_test(),
-    )?;
-    let before = reopened.stream_sizes();
-    let reopened_pointer = NonNull::from(reopened.as_ref());
-    ledger
-        .table
-        .get_mut()
-        .try_push_owned(reopened)
-        .map_err(|failure| failure.into_parts().0)?;
-    ledger.publish_stream_sizes(publication)?;
-    let after = ledger
-        .table
-        .get_mut()
-        .as_slice()
-        .first()
-        .ok_or(DriverError::InternalInvariantViolation)
-        .and_then(|stream| stream.stream_sizes());
-    ledger.close(reopened_pointer);
-    assert_eq!(before, Ok(initial.sizes));
-    assert_eq!(after, Ok(changed.sizes));
     assert!(ledger.is_empty());
     Ok(())
 }

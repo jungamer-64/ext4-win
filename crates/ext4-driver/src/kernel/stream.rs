@@ -6,8 +6,10 @@ use core::ptr::NonNull;
 #[cfg(test)]
 use core::cell::UnsafeCell;
 #[cfg(test)]
-use core::sync::atomic::{AtomicPtr, Ordering};
-use ext4_core::{ClusterSize, FileAllocationSize, FileSize};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use ext4_core::{
+    ClusterSize, EpochSequence, FileAllocationSize, FileSize, NodeId, NodeMetadataSnapshot,
+};
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -117,6 +119,50 @@ impl StreamSizes {
     }
 }
 
+/// Fixed native input used to publish the Fast I/O query projection with stream sizes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+struct NativeStreamMetadata {
+    /// Monotonic committed epoch that owns every remaining field.
+    epoch: u64,
+    /// Unix seconds converted to Windows time by the native boundary.
+    creation_time_seconds: u32,
+    /// Unix seconds converted to Windows time by the native boundary.
+    last_access_time_seconds: u32,
+    /// Unix seconds converted to Windows time by the native boundary.
+    last_write_time_seconds: u32,
+    /// Unix seconds converted to Windows time by the native boundary.
+    change_time_seconds: u32,
+    /// Complete Windows file-attribute projection.
+    file_attributes: u32,
+    /// Windows-visible namespace link count.
+    number_of_links: u32,
+    /// `1` for directories and `0` for file-like nodes.
+    directory: u32,
+}
+
+impl NativeStreamMetadata {
+    /// Builds one native projection from a coherent core snapshot and its committed epoch.
+    fn from_snapshot(snapshot: NodeMetadataSnapshot, epoch: EpochSequence) -> Self {
+        let times = snapshot.times();
+        let directory = matches!(snapshot.node(), NodeId::Directory(_));
+        Self {
+            epoch: epoch.get(),
+            creation_time_seconds: times.created().seconds(),
+            last_access_time_seconds: times.accessed().seconds(),
+            last_write_time_seconds: times.modified().seconds(),
+            change_time_seconds: times.changed().seconds(),
+            file_attributes: snapshot.windows_file_attributes(),
+            number_of_links: if directory {
+                1
+            } else {
+                u32::from(snapshot.links_count().get())
+            },
+            directory: u32::from(directory),
+        }
+    }
+}
+
 /// Rounds a Windows section bound to the mounted ext4 allocation cluster.
 /// # Errors
 ///
@@ -156,6 +202,12 @@ pub(crate) struct StreamContext {
     /// Host equivalent of the native header mutex and size fields.
     #[cfg(test)]
     sizes: Mutex<StreamSizes>,
+    /// Host equivalent of the native epoch-tagged Fast I/O query projection.
+    #[cfg(test)]
+    metadata: Mutex<Option<NativeStreamMetadata>>,
+    /// Host equivalent of the ledger-derived native delete-pending projection.
+    #[cfg(test)]
+    delete_pending: AtomicBool,
 }
 
 impl core::fmt::Debug for StreamContext {
@@ -173,29 +225,78 @@ impl core::fmt::Debug for StreamContext {
     reason = "the audited wrapper is the sole Rust boundary for the opaque native advanced FCB header"
 )]
 impl StreamContext {
-    /// Allocates a native advanced header in an unbound construction state.
+    /// Allocates a node advanced header in an unbound construction state.
     ///
     /// The enclosing Rust owner must reach stable storage and call [`Self::bind_owner`] before the
     /// header can be published to a `FILE_OBJECT`.
     /// # Errors
     ///
     /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_staged_node(
+        sizes: StreamSizes,
+        trace: OperationalTrace,
+    ) -> DriverResult<Self> {
+        Self::try_new(StreamOwnerKind::Node, sizes, None, trace)
+    }
+
+    /// Allocates a node advanced header with one coherent committed metadata projection.
+    ///
+    /// The enclosing Rust owner must reach stable storage and call [`Self::bind_owner`] before the
+    /// header can be published to a `FILE_OBJECT`.
+    /// # Errors
+    ///
+    /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
+    pub(crate) fn try_new_committed_node(
+        sizes: StreamSizes,
+        snapshot: NodeMetadataSnapshot,
+        epoch: EpochSequence,
+        trace: OperationalTrace,
+    ) -> DriverResult<Self> {
+        Self::try_new(
+            StreamOwnerKind::Node,
+            sizes,
+            Some(NativeStreamMetadata::from_snapshot(snapshot, epoch)),
+            trace,
+        )
+    }
+
+    /// Allocates the raw-volume advanced header without a node metadata projection.
+    /// # Errors
+    ///
+    /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
+    pub(crate) fn try_new_volume(
+        sizes: StreamSizes,
+        trace: OperationalTrace,
+    ) -> DriverResult<Self> {
+        Self::try_new(StreamOwnerKind::Volume, sizes, None, trace)
+    }
+
+    /// Allocates the opaque native stream with its owner-domain-specific metadata state.
+    /// # Errors
+    ///
+    /// Returns an allocation or invariant error when the native stream cannot be constructed.
+    fn try_new(
         kind: StreamOwnerKind,
         sizes: StreamSizes,
+        metadata: Option<NativeStreamMetadata>,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
         #[cfg(not(test))]
         {
             let mut header = core::ptr::null_mut();
+            let metadata_pointer = metadata
+                .as_ref()
+                .map_or(core::ptr::null(), core::ptr::from_ref);
             let status = unsafe {
-                // SAFETY: Native code writes one opaque pointer on success and owns partial cleanup.
+                // SAFETY: Native code borrows the optional fixed input for this call, writes one
+                // opaque pointer on success, and owns every partial-allocation cleanup path.
                 ext4win_stream_create(
                     kind.native_tag(),
                     sizes.allocation_size,
                     sizes.file_size,
                     sizes.valid_data_length,
                     sizes.allocation_charge,
+                    metadata_pointer,
                     trace.handle(),
                     core::ptr::addr_of_mut!(header),
                 )
@@ -207,11 +308,16 @@ impl StreamContext {
         #[cfg(test)]
         {
             let _trace = trace;
+            if (kind == StreamOwnerKind::Volume) && metadata.is_some() {
+                return Err(DriverError::InternalInvariantViolation);
+            }
             Ok(Self {
                 kind,
                 owner: AtomicPtr::new(core::ptr::null_mut()),
                 section_objects: UnsafeCell::new(wdk_sys::SECTION_OBJECT_POINTERS::default()),
                 sizes: Mutex::new(sizes),
+                metadata: Mutex::new(metadata),
+                delete_pending: AtomicBool::new(false),
             })
         }
     }
@@ -457,6 +563,86 @@ impl StreamContext {
                 .lock()
                 .map(|sizes| *sizes)
                 .map_err(|_| DriverError::InternalInvariantViolation)
+        }
+    }
+
+    /// Publishes one epoch-tagged node metadata snapshot and its complete size tuple.
+    ///
+    /// The native boundary updates the advanced header, Fast I/O query records, and any live Cache
+    /// Manager map under one stream resource. Callers may invoke this only after ext4 durability
+    /// and visibility publication for `epoch`.
+    /// # Errors
+    ///
+    /// Returns the exact Cache Manager status or an invariant error for a malformed stream or
+    /// non-monotonic epoch.
+    pub(crate) fn publish_node_metadata(
+        &self,
+        sizes: StreamSizes,
+        snapshot: NodeMetadataSnapshot,
+        epoch: EpochSequence,
+    ) -> DriverResult<()> {
+        if self.kind != StreamOwnerKind::Node {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let metadata = NativeStreamMetadata::from_snapshot(snapshot, epoch);
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live node header; native code borrows the complete fixed
+                // projection and contains every Cc exception before returning an NTSTATUS.
+                ext4win_stream_publish_metadata(
+                    self.header.as_ptr(),
+                    sizes.allocation_size,
+                    sizes.file_size,
+                    sizes.valid_data_length,
+                    sizes.allocation_charge,
+                    core::ptr::from_ref(&metadata),
+                )
+            };
+            native_status(status)
+        }
+        #[cfg(test)]
+        {
+            let mut current_metadata = self
+                .metadata
+                .lock()
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            if current_metadata
+                .as_ref()
+                .is_some_and(|current| metadata.epoch <= current.epoch)
+            {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            let mut current_sizes = self
+                .sizes
+                .lock()
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            *current_sizes = sizes;
+            *current_metadata = Some(metadata);
+            Ok(())
+        }
+    }
+
+    /// Updates the native projection derived from ledger-owned delete-pending state.
+    /// # Errors
+    ///
+    /// Returns an invariant error when this is not a live node stream.
+    pub(crate) fn set_delete_pending(&self, pending: bool) -> DriverResult<()> {
+        if self.kind != StreamOwnerKind::Node {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The ledger retains this FCB and serializes the authoritative transition.
+                ext4win_stream_set_delete_pending(self.header.as_ptr(), u8::from(pending))
+            };
+            native_status(status)
+        }
+        #[cfg(test)]
+        {
+            self.delete_pending.store(pending, Ordering::Release);
+            Ok(())
         }
     }
 
@@ -929,6 +1115,7 @@ unsafe extern "system" {
         file_size: i64,
         valid_data_length: i64,
         allocation_charge: i64,
+        metadata: *const NativeStreamMetadata,
         trace_registration_handle: u64,
         stream_header_out: *mut wdk_sys::PVOID,
     ) -> NTSTATUS;
@@ -987,6 +1174,20 @@ unsafe extern "system" {
         allocation_charge_out: *mut i64,
     ) -> NTSTATUS;
 
+    fn ext4win_stream_publish_metadata(
+        stream_header: wdk_sys::PVOID,
+        allocation_size: i64,
+        file_size: i64,
+        valid_data_length: i64,
+        allocation_charge: i64,
+        metadata: *const NativeStreamMetadata,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_set_delete_pending(
+        stream_header: wdk_sys::PVOID,
+        pending: wdk_sys::BOOLEAN,
+    ) -> NTSTATUS;
+
     fn ext4win_stream_cache_read(
         stream_header: wdk_sys::PVOID,
         file_object: *mut wdk_sys::FILE_OBJECT,
@@ -1043,7 +1244,7 @@ unsafe extern "system" {
 mod tests {
     use ext4_core::{ClusterSize, FileAllocationSize, FileSize};
 
-    use super::{OperationalTrace, StreamContext, StreamOwnerKind, StreamSizes};
+    use super::{NativeStreamMetadata, OperationalTrace, Ordering, StreamContext, StreamSizes};
     use crate::kernel::status::{DriverError, DriverResult};
 
     /// # Errors
@@ -1133,38 +1334,61 @@ mod tests {
 
     /// # Errors
     ///
-    /// Returns a stream-construction or publication error.
+    /// Returns a stream-construction error.
     /// # Panics
     ///
-    /// Panics if growth or truncation fails to replace the complete published tuple.
+    /// Panics if a staged stream accidentally exposes query metadata before commit publication.
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
         reason = "fixture failures use Result; assertions check publication"
     )]
-    fn header_publication_replaces_all_size_fields_together() -> DriverResult<()> {
-        let stream = StreamContext::try_new(
-            StreamOwnerKind::Node,
-            StreamSizes::EMPTY,
-            OperationalTrace::host_test(),
-        )?;
+    fn staged_stream_withholds_fast_query_metadata() -> DriverResult<()> {
+        let stream =
+            StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
         assert_eq!(stream.sizes()?, StreamSizes::EMPTY);
-        let grown = StreamSizes::try_from_ext4(
-            FileSize::from_bytes(16_384),
-            FileAllocationSize::from_bytes(8_192),
-            ClusterSize::new(4_096)?,
-        )?;
-        stream.set_sizes(grown)?;
-        assert_eq!(stream.sizes()?, grown);
-        let truncated = StreamSizes::try_from_ext4(
-            FileSize::from_bytes(4_097),
-            FileAllocationSize::from_bytes(4_096),
-            ClusterSize::new(4_096)?,
-        )?;
-        stream.set_sizes(truncated)?;
-        assert_eq!(stream.sizes()?, truncated);
-        assert_eq!(truncated.valid_data_length, 4_097);
-        assert_eq!(truncated.allocation_size, 8_192);
+        assert!(
+            stream
+                .metadata
+                .lock()
+                .is_ok_and(|metadata| metadata.is_none())
+        );
+        Ok(())
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the Rust metadata input no longer matches the fixed native ABI.
+    #[test]
+    fn native_stream_metadata_layout_matches_c_boundary() {
+        assert_eq!(core::mem::size_of::<NativeStreamMetadata>(), 40);
+        assert_eq!(core::mem::offset_of!(NativeStreamMetadata, epoch), 0);
+        assert_eq!(
+            core::mem::offset_of!(NativeStreamMetadata, creation_time_seconds),
+            8
+        );
+        assert_eq!(core::mem::offset_of!(NativeStreamMetadata, directory), 32);
+    }
+
+    /// # Errors
+    ///
+    /// Returns a stream-construction or projection error.
+    /// # Panics
+    ///
+    /// Panics if the production setter does not preserve the requested delete projection.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture failures use Result; assertions check the delete projection"
+    )]
+    fn delete_pending_projection_tracks_each_requested_state() -> DriverResult<()> {
+        let stream =
+            StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        assert!(!stream.delete_pending.load(Ordering::Acquire));
+        stream.set_delete_pending(true)?;
+        assert!(stream.delete_pending.load(Ordering::Acquire));
+        stream.set_delete_pending(false)?;
+        assert!(!stream.delete_pending.load(Ordering::Acquire));
         Ok(())
     }
 

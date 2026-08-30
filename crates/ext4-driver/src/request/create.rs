@@ -25,12 +25,13 @@ use crate::{
         security::CreateSecurityDescriptor,
     },
     state::{
-        ChildCreationTarget, DataTransferMode, DirectoryChange, DirectoryChangeAction,
-        ExistingStreamResidency, FileControlBlock, HandleDeletion, KernelDevice, KernelFileObject,
-        MountedVolumeAccess, NoIntermediateTransfer, NodeStreamSizes, OpenedHandle, OpenedLocation,
-        OpenedNodeMode, OpenedObject, OpenedVolumeHandle, PendingChildCreation,
-        PendingFileDeletion, PreparedStreamWriteOpen, RawVolumeAccess, UninitializedFileObject,
-        VolumeControlBlock, WriteCommitment, abandon_file_control_block,
+        ChildCreationTarget, CommittedNodeStreamMetadata, DataTransferMode, DirectoryChange,
+        DirectoryChangeAction, ExistingStreamResidency, FileControlBlock, HandleDeletion,
+        KernelDevice, KernelFileObject, MountedVolumeAccess, NoIntermediateTransfer,
+        NodeStreamMetadata, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
+        OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, PreparedStreamWriteOpen,
+        RawVolumeAccess, StagedNodeStreamMetadata, UninitializedFileObject, VolumeControlBlock,
+        WriteCommitment, abandon_file_control_block,
     },
 };
 
@@ -447,10 +448,13 @@ fn open_or_create(
             let requirement = owner.parameters().target_requirement();
             let mut owner =
                 owner.authorize_target_directory(directory, target, requirement, mutation)?;
-            let stream_sizes = NodeStreamSizes::try_from_storage(
-                mutation.load_node_storage(NodeId::Directory(directory))?,
-                operations.volume_geometry().cluster_size(),
-            )?;
+            let stream_metadata = CommittedNodeStreamMetadata::new(
+                NodeStreamMetadata::try_from_snapshot(
+                    mutation.load_node_metadata(NodeId::Directory(directory))?,
+                    operations.volume_geometry().cluster_size(),
+                )?,
+                operations.current_epoch_sequence(),
+            );
             let pending = open_target_directory(
                 &mut owner,
                 create_ea,
@@ -458,7 +462,7 @@ fn open_or_create(
                 directory,
                 location,
                 target,
-                stream_sizes,
+                stream_metadata,
             )?;
             Ok(select_existing_open_gate(
                 pending,
@@ -1165,7 +1169,7 @@ impl PendingExistingCreateOpen {
     fn prepare(
         request: &mut AuthorizedCreateCompletionOwner<'_>,
         target: ExistingNodeTarget,
-        stream_sizes: NodeStreamSizes,
+        stream_metadata: CommittedNodeStreamMetadata,
         policy: CreateHandlePolicy,
         pending_deletion: Option<PendingFileDeletion>,
         action: CreateAction,
@@ -1176,7 +1180,7 @@ impl PendingExistingCreateOpen {
             node_mode,
             location,
         } = target;
-        if stream_sizes.node() != node {
+        if stream_metadata.node() != node {
             return Err(DriverError::InternalInvariantViolation);
         }
         let validation_location = location.try_to_owned_location()?;
@@ -1194,7 +1198,7 @@ impl PendingExistingCreateOpen {
             request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
         let admission = VolumeControlBlock::open_existing_file_control_block(
             volume,
-            stream_sizes,
+            stream_metadata,
             file_object,
             policy.granted_access(),
             policy.existing_operation_access(),
@@ -1507,14 +1511,17 @@ fn open_existing_node(
         CreateDisposition::Open | CreateDisposition::OpenIf => {
             validate_existing_node_options(node, parameters.target_requirement())?;
             let pending = prepare_create_deletion(policy, node, &target.location, read)?;
-            let stream_sizes = NodeStreamSizes::try_from_storage(
-                read.load_node_storage(node)?,
-                operations.volume_geometry().cluster_size(),
-            )?;
+            let stream_metadata = CommittedNodeStreamMetadata::new(
+                NodeStreamMetadata::try_from_snapshot(
+                    read.load_node_metadata(node)?,
+                    operations.volume_geometry().cluster_size(),
+                )?,
+                operations.current_epoch_sequence(),
+            );
             let pending = PendingExistingCreateOpen::prepare(
                 request,
                 target,
-                stream_sizes,
+                stream_metadata,
                 policy,
                 pending,
                 CreateAction::Opened,
@@ -1619,7 +1626,7 @@ fn open_target_directory(
     directory: DirectoryNodeId,
     location: OpenedLocation,
     target: TargetDirectoryLeaf,
-    stream_sizes: NodeStreamSizes,
+    stream_metadata: CommittedNodeStreamMetadata,
 ) -> DriverResult<PendingExistingCreateOpen> {
     if !create_ea.is_empty() || request.parameters().disposition() != CreateDisposition::Open {
         return Err(DriverError::InvalidParameter);
@@ -1649,7 +1656,7 @@ fn open_target_directory(
             node_mode: OpenedNodeMode::Direct,
             location,
         },
-        stream_sizes,
+        stream_metadata,
         policy,
         None,
         action,
@@ -1731,15 +1738,15 @@ fn create_missing_node(
         )
     })?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
-    let stream_sizes = NodeStreamSizes::try_from_storage(
-        mutation.staged_node_storage(node)?,
+    let staged_stream = StagedNodeStreamMetadata::try_from_staged_snapshot(
+        mutation.staged_node_metadata(node)?,
         operations.volume_geometry().cluster_size(),
     )?;
     let file_object =
         request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
     Ok(PendingCreatePublication {
         creation,
-        stream_sizes,
+        staged_stream,
         file_object,
         desired_access: policy.granted_access(),
         share_access: policy.share_access(),
@@ -2095,8 +2102,8 @@ fn path_components(units: &[u16]) -> DriverResult<DriverVec<CreatePathComponent>
 pub(crate) struct PendingCreatePublication {
     /// Staged child identity and stable VCB/FCB-ledger capability.
     creation: PendingChildCreation,
-    /// Exact staged inode sizes after all create-time metadata and EA changes.
-    stream_sizes: NodeStreamSizes,
+    /// Exact staged stream dimensions after all create-time metadata and EA changes.
+    staged_stream: StagedNodeStreamMetadata,
     /// Create-owned FILE_OBJECT identity retained by the top-level IRP.
     file_object: KernelFileObject,
     /// Share-accounting access mask.
@@ -2127,7 +2134,7 @@ impl PendingCreatePublication {
     pub(crate) fn prepare(self) -> DriverResult<PreparedCreatePublication> {
         let Self {
             creation,
-            stream_sizes,
+            staged_stream,
             file_object,
             desired_access,
             share_access,
@@ -2141,7 +2148,7 @@ impl PendingCreatePublication {
             file_object,
             desired_access,
             share_access,
-            stream_sizes,
+            staged_stream,
         )?;
         let fcb = admission.file_control_block();
         Ok(PreparedCreatePublication {

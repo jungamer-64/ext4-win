@@ -356,6 +356,8 @@ impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
 pub struct ResolvedMutation {
     /// Resource set and versions observed by this resolve pass.
     observed: ObservedResourceVersionSet,
+    /// Complete final metadata for every live inode serialized by this mutation.
+    node_metadata_updates: Vec<NodeMetadataSnapshot>,
     /// Ordered data images that must be durable before journal metadata is written.
     data_writes: Vec<RangeWrite>,
     /// Complete metadata blocks supplied to JBD2 serialization.
@@ -407,6 +409,14 @@ pub struct ReservedMutation {
 }
 
 impl ReservedMutation {
+    /// Final metadata for each live inode changed by this version-revalidated mutation.
+    ///
+    /// These values are preparation inputs only; publication is permitted only after commit
+    /// durability. Deleted inodes are excluded because they have no live metadata snapshot.
+    #[must_use]
+    pub fn node_metadata_updates(&self) -> &[NodeMetadataSnapshot] {
+        &self.resolved.node_metadata_updates
+    }
 }
 
 /// All lower-write, epoch-publication, version, and checkpoint allocations prepared up front.
@@ -709,6 +719,18 @@ impl CleanJournalDurability {
 }
 
 impl MutationResolvePass<'_, '_, '_> {
+    /// Observes this pass's latest staged inode and Windows xattrs.
+    ///
+    /// This is distinct from `CommittedReadPass`: callers use it to prepare post-commit state,
+    /// never to acknowledge the uncommitted mutation to another observer.
+    /// # Errors
+    ///
+    /// Returns an error if the inode was deleted, storage cannot be read, or metadata is invalid.
+    pub fn staged_node_metadata(&mut self, node: NodeId) -> Result<NodeMetadataSnapshot> {
+        let record = self.mutation.raw_inode_for_policy(node.inode())?;
+        self.mutation.node_metadata_snapshot(&record)
+    }
+
     /// Selects any supported inode for POSIX metadata mutation.
     ///
     /// # Errors

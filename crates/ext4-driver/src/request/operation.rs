@@ -3237,9 +3237,9 @@ enum PendingDriverPublication {
 /// Post-commit driver publication whose durable path cannot allocate or fail.
 #[derive(Debug)]
 struct PreparedDriverPublication {
-    /// Every changed live inode's sizes, derived from the reserved core mutation.
-    stream_sizes: crate::state::PreparedStreamSizePublications,
-    /// Handle, cursor, notification, or volume state published after the sizes.
+    /// Every changed live inode's complete projection, derived from the reserved core mutation.
+    stream_metadata: crate::state::PreparedStreamMetadataPublications,
+    /// Handle, cursor, notification, or volume state published after stream metadata.
     effect: PreparedDriverEffect,
 }
 
@@ -3311,7 +3311,7 @@ impl PendingDriverPublication {
     /// state. No partially prepared value has publication authority on failure.
     fn prepare(
         self,
-        stream_sizes: crate::state::PreparedStreamSizePublications,
+        stream_metadata: crate::state::PreparedStreamMetadataPublications,
     ) -> DriverResult<PreparedDriverPublication> {
         let effect = match self {
             Self::Create(publication) => {
@@ -3325,7 +3325,7 @@ impl PendingDriverPublication {
             Self::Normal(completion) => PreparedDriverEffect::Normal(completion),
         };
         Ok(PreparedDriverPublication {
-            stream_sizes,
+            stream_metadata,
             effect,
         })
     }
@@ -5488,13 +5488,14 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         return self.complete_error(owned, DriverError::from(error));
                     }
                 };
-                let stream_sizes = match crate::state::PreparedStreamSizePublications::try_new(
-                    reserved.node_storage_updates(),
-                    access.volume_geometry().cluster_size(),
-                ) {
-                    Ok(stream_sizes) => stream_sizes,
-                    Err(error) => return self.complete_error(owned, error),
-                };
+                let stream_metadata =
+                    match crate::state::PreparedStreamMetadataPublications::try_new(
+                        reserved.node_metadata_updates(),
+                        access.volume_geometry().cluster_size(),
+                    ) {
+                        Ok(stream_metadata) => stream_metadata,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
                 if let (Some(prepared), Some(cleanup)) =
                     (deletion.as_ref(), self.cleanup_deletion.as_ref())
                     && prepared.node() != cleanup.node()
@@ -5511,7 +5512,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         Err(error) => return self.complete_error(owned, error),
                     };
                     if let Some(stream) = stream {
-                        drop(stream_sizes);
+                        drop(stream_metadata);
                         drop(publication);
                         drop(reserved);
                         self.state = MutationOperationState::PreparingDeletion {
@@ -5528,7 +5529,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 let size_changes = match size_changes {
                     Some(prepared) => {
                         let matches = match access.prepared_stream_size_changes_match(
-                            &stream_sizes,
+                            &stream_metadata,
                             &prepared,
                             deletion_node,
                         ) {
@@ -5546,12 +5547,12 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 };
                 if size_changes.is_none() {
                     let mut plan =
-                        match access.prepare_stream_size_changes(&stream_sizes, deletion_node) {
+                        match access.prepare_stream_size_changes(&stream_metadata, deletion_node) {
                             Ok(plan) => plan,
                             Err(error) => return self.complete_error(owned, error),
                         };
                     if let Some(stream) = plan.next() {
-                        drop(stream_sizes);
+                        drop(stream_metadata);
                         drop(publication);
                         drop(reserved);
                         self.state = MutationOperationState::PreparingSizeChange {
@@ -5572,7 +5573,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         return self.complete_error(owned, DriverError::InternalInvariantViolation);
                     }
                 }
-                let publication = match publication.prepare(stream_sizes) {
+                let publication = match publication.prepare(stream_metadata) {
                     Ok(publication) => publication,
                     Err(error) => return self.complete_error(owned, error),
                 };
@@ -5821,7 +5822,7 @@ impl InfalliblePublication for MutationRequestOperation {
                     deletion,
                 } = context;
                 let PreparedDriverPublication {
-                    stream_sizes,
+                    stream_metadata,
                     effect,
                 } = publication;
                 let publication = access.publish_durable(
@@ -5829,7 +5830,7 @@ impl InfalliblePublication for MutationRequestOperation {
                     visibility,
                     durable_slot,
                     checkpoint_slot,
-                    stream_sizes,
+                    stream_metadata,
                 );
                 let (pending, stream_projection) = publication.into_parts();
                 let completion = effect.publish(access);

@@ -666,7 +666,7 @@ pub(super) fn pack_directory_record(
     )?;
     LittleEndianOutput::new(buffer).write_u32(
         record_field_offset(start, DIRECTORY_FILE_ATTRIBUTES_OFFSET)?,
-        file_attributes(metadata),
+        metadata.file_attributes,
     )?;
     LittleEndianOutput::new(buffer).write_u32(
         record_field_offset(start, DIRECTORY_FILE_NAME_LENGTH_OFFSET)?,

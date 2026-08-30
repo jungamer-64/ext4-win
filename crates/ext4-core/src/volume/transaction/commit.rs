@@ -254,8 +254,20 @@ impl MetadataMutation<'_, '_> {
         let metadata_blocks = self.metadata_blocks()?;
         let _validated_next_state = self.committed_cluster_state()?;
         let mut observed = ObservedResourceVersionSet::new(ticket);
-        for inode in &self.inode_updates {
-            let resource = MutationResource::inode(inode.id());
+        let mut node_metadata_updates = Vec::new();
+        node_metadata_updates
+            .try_reserve_exact(self.inode_updates.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for index in 0..self.inode_updates.len() {
+            let (inode_id, live) = {
+                let inode = self.inode_updates.get(index).ok_or(Error::InvalidInode)?;
+                (inode.id(), matches!(inode, StagedInodeRecord::Live(_)))
+            };
+            if live {
+                let record = self.raw_inode_for_policy(inode_id)?;
+                node_metadata_updates.try_push(self.node_metadata_snapshot(&record)?)?;
+            }
+            let resource = MutationResource::inode(inode_id);
             observed.include(resource, coordinator.resource_version(resource))?;
         }
         for delta in &self.group_deltas {
@@ -274,6 +286,7 @@ impl MetadataMutation<'_, '_> {
         }
         Ok(ResolvedMutation {
             observed,
+            node_metadata_updates,
             data_writes: core::mem::take(&mut self.data_writes),
             metadata_blocks,
             cluster_deltas: core::mem::take(&mut self.cluster_deltas),

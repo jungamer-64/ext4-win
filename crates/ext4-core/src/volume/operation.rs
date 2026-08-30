@@ -33,6 +33,39 @@ pub enum WindowsNameMatch {
 /// implementation can survive suspension: all storage and continuation ownership remains in its
 /// enclosing operation.
 pub trait CommittedReadPass {
+    /// Reads complete stream metadata from one committed inode and its Windows xattrs.
+    /// # Errors
+    ///
+    /// Returns an error when the inode kind differs from `node`, storage cannot be read, or a
+    /// Windows metadata xattr is malformed.
+    fn load_node_metadata(&mut self, node: NodeId) -> Result<super::NodeMetadataSnapshot> {
+        let overlay = self.read_windows_overlay(node)?;
+        let has_reparse_xattr = match node {
+            NodeId::Symlink(_) => false,
+            NodeId::File(_) | NodeId::Directory(_) => {
+                self.read_windows_symlink_reparse_point(node)?.is_some()
+            }
+        };
+        let snapshot = match node {
+            NodeId::File(id) => super::NodeMetadataSnapshot::from_inode(
+                self.load_file(id)?.inode(),
+                overlay,
+                has_reparse_xattr,
+            ),
+            NodeId::Directory(id) => super::NodeMetadataSnapshot::from_inode(
+                self.load_directory(id)?.inode(),
+                overlay,
+                has_reparse_xattr,
+            ),
+            NodeId::Symlink(id) => super::NodeMetadataSnapshot::from_inode(
+                self.load_symlink(id)?.inode(),
+                overlay,
+                has_reparse_xattr,
+            ),
+        };
+        Ok(snapshot)
+    }
+
     /// Loads a regular file by validated identity.
     /// # Errors
     ///

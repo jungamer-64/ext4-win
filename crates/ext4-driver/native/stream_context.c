@@ -10,6 +10,35 @@
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
 
+typedef struct _EXT4WIN_STREAM_METADATA {
+    ULONGLONG Epoch;
+    ULONG CreationTimeSeconds;
+    ULONG LastAccessTimeSeconds;
+    ULONG LastWriteTimeSeconds;
+    ULONG ChangeTimeSeconds;
+    ULONG FileAttributes;
+    ULONG NumberOfLinks;
+    ULONG Directory;
+} EXT4WIN_STREAM_METADATA, *PEXT4WIN_STREAM_METADATA;
+
+typedef struct _EXT4WIN_PUBLISHED_STREAM_METADATA {
+    ULONGLONG Epoch;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    ULONG FileAttributes;
+    ULONG NumberOfLinks;
+    ULONG Directory;
+} EXT4WIN_PUBLISHED_STREAM_METADATA, *PEXT4WIN_PUBLISHED_STREAM_METADATA;
+
+typedef struct _EXT4WIN_FAST_IO_QUERY_SNAPSHOT {
+    EXT4WIN_PUBLISHED_STREAM_METADATA Metadata;
+    LARGE_INTEGER AllocationSize;
+    LARGE_INTEGER EndOfFile;
+    BOOLEAN DeletePending;
+} EXT4WIN_FAST_IO_QUERY_SNAPSHOT, *PEXT4WIN_FAST_IO_QUERY_SNAPSHOT;
+
 typedef struct _EXT4WIN_STREAM_CONTEXT {
     FSRTL_ADVANCED_FCB_HEADER Header;
     FAST_MUTEX HeaderMutex;
@@ -18,6 +47,7 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     SECTION_OBJECT_POINTERS SectionObjects;
     /* Physical storage charge is not the header's logical section bound. */
     LONGLONG AllocationCharge;
+    EXT4WIN_PUBLISHED_STREAM_METADATA PublishedMetadata;
     PVOID FileContextSupport;
     PVOID Owner;
     PFILE_LOCK ByteRangeLocks;
@@ -25,6 +55,8 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     REGHANDLE TraceRegistrationHandle;
     KEVENT SectionMutationReleased;
     volatile LONG SectionMutationState;
+    volatile LONG MetadataValid;
+    volatile LONG DeletePending;
     ULONG Signature;
     ULONG Kind;
     BOOLEAN MainResourceInitialized;
@@ -35,6 +67,35 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
 
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_CONTEXT, Header) == 0);
 C_ASSERT(sizeof(EXT4WIN_STREAM_CONTEXT) <= MAXSHORT);
+C_ASSERT(sizeof(EXT4WIN_STREAM_METADATA) == 40);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, Epoch) == 0);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, CreationTimeSeconds) == 8);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, FileAttributes) == 24);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, NumberOfLinks) == 28);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, Directory) == 32);
+
+static BOOLEAN
+ext4win_prepare_stream_metadata(
+    _In_ const EXT4WIN_STREAM_METADATA *input,
+    _Out_ PEXT4WIN_PUBLISHED_STREAM_METADATA output)
+{
+    if ((input == NULL) || (output == NULL) ||
+        (input->FileAttributes == 0) || (input->NumberOfLinks == 0) ||
+        (input->Directory > 1)) {
+        return FALSE;
+    }
+
+    RtlZeroMemory(output, sizeof(*output));
+    output->Epoch = input->Epoch;
+    RtlSecondsSince1970ToTime(input->CreationTimeSeconds, &output->CreationTime);
+    RtlSecondsSince1970ToTime(input->LastAccessTimeSeconds, &output->LastAccessTime);
+    RtlSecondsSince1970ToTime(input->LastWriteTimeSeconds, &output->LastWriteTime);
+    RtlSecondsSince1970ToTime(input->ChangeTimeSeconds, &output->ChangeTime);
+    output->FileAttributes = input->FileAttributes;
+    output->NumberOfLinks = input->NumberOfLinks;
+    output->Directory = input->Directory;
+    return TRUE;
+}
 
 static VOID
 ext4win_trace_selected(
@@ -450,17 +511,33 @@ ext4win_stream_create(
     _In_ LONGLONG file_size,
     _In_ LONGLONG valid_data_length,
     _In_ LONGLONG allocation_charge,
+    _In_opt_ const EXT4WIN_STREAM_METADATA *metadata,
     _In_ REGHANDLE trace_registration_handle,
     _Outptr_ PVOID *stream_header_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
+    EXT4WIN_PUBLISHED_STREAM_METADATA prepared_metadata;
+    BOOLEAN metadata_valid;
     NTSTATUS status;
 
     if (stream_header_out == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
     *stream_header_out = NULL;
-    if ((kind == 0) || (trace_registration_handle == (REGHANDLE)0) ||
+    RtlZeroMemory(&prepared_metadata, sizeof(prepared_metadata));
+    metadata_valid = FALSE;
+    if ((kind != 1) && (kind != 2)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if ((metadata != NULL) &&
+        !ext4win_prepare_stream_metadata(metadata, &prepared_metadata)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if ((kind == 2) && (metadata != NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    metadata_valid = metadata != NULL;
+    if ((trace_registration_handle == (REGHANDLE)0) ||
         (allocation_size < 0) || (file_size < 0) ||
         (allocation_charge < 0) || (allocation_charge > allocation_size) ||
         (valid_data_length != file_size) ||
@@ -513,6 +590,10 @@ ext4win_stream_create(
     stream->Header.FileSize.QuadPart = file_size;
     stream->Header.ValidDataLength.QuadPart = valid_data_length;
     stream->AllocationCharge = allocation_charge;
+    if (metadata_valid) {
+        stream->PublishedMetadata = prepared_metadata;
+        stream->MetadataValid = TRUE;
+    }
     stream->Header.IsFastIoPossible = FastIoIsQuestionable;
     FsRtlSetupAdvancedHeaderEx2(
         &stream->Header,
@@ -807,19 +888,23 @@ _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
-ext4win_stream_set_sizes(
+ext4win_stream_publish_metadata(
     _In_ PVOID stream_header,
     _In_ LONGLONG allocation_size,
     _In_ LONGLONG file_size,
     _In_ LONGLONG valid_data_length,
-    _In_ LONGLONG allocation_charge)
+    _In_ LONGLONG allocation_charge,
+    _In_ const EXT4WIN_STREAM_METADATA *metadata)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    EXT4WIN_PUBLISHED_STREAM_METADATA prepared_metadata;
     CC_FILE_SIZES sizes;
     PFILE_OBJECT file_object;
     NTSTATUS status;
 
-    if ((stream == NULL) || (allocation_size < 0) || (file_size < 0) ||
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        !ext4win_prepare_stream_metadata(metadata, &prepared_metadata) ||
+        (allocation_size < 0) || (file_size < 0) ||
         (allocation_charge < 0) || (allocation_charge > allocation_size) ||
         (valid_data_length != file_size) ||
         (file_size > allocation_size)) {
@@ -830,16 +915,24 @@ ext4win_stream_set_sizes(
     ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
     __try {
         ExAcquireFastMutex(&stream->HeaderMutex);
-        stream->Header.AllocationSize.QuadPart = allocation_size;
-        stream->Header.FileSize.QuadPart = file_size;
-        stream->Header.ValidDataLength.QuadPart = valid_data_length;
-        stream->AllocationCharge = allocation_charge;
-        sizes.AllocationSize = stream->Header.AllocationSize;
-        sizes.FileSize = stream->Header.FileSize;
-        sizes.ValidDataLength = stream->Header.ValidDataLength;
+        if ((stream->MetadataValid != FALSE) &&
+            (prepared_metadata.Epoch <= stream->PublishedMetadata.Epoch)) {
+            status = STATUS_INVALID_PARAMETER;
+        }
+        else {
+            stream->Header.AllocationSize.QuadPart = allocation_size;
+            stream->Header.FileSize.QuadPart = file_size;
+            stream->Header.ValidDataLength.QuadPart = valid_data_length;
+            stream->AllocationCharge = allocation_charge;
+            stream->PublishedMetadata = prepared_metadata;
+            stream->MetadataValid = TRUE;
+            sizes.AllocationSize = stream->Header.AllocationSize;
+            sizes.FileSize = stream->Header.FileSize;
+            sizes.ValidDataLength = stream->Header.ValidDataLength;
+        }
         ExReleaseFastMutex(&stream->HeaderMutex);
 
-        if (stream->SectionObjects.SharedCacheMap != NULL) {
+        if (NT_SUCCESS(status) && (stream->SectionObjects.SharedCacheMap != NULL)) {
             file_object = CcGetFileObjectFromSectionPtrsRef(&stream->SectionObjects);
             if (file_object == NULL) {
                 status = STATUS_INTERNAL_ERROR;
@@ -856,6 +949,24 @@ ext4win_stream_set_sizes(
     }
     ExReleaseResourceLite(&stream->MainResource);
     return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_set_delete_pending(
+    _In_ PVOID stream_header,
+    _In_ BOOLEAN pending)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        ((pending != FALSE) && (pending != TRUE))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    InterlockedExchange(&stream->DeletePending, pending != FALSE);
+    return STATUS_SUCCESS;
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -1408,6 +1519,199 @@ ext4win_stream_has_native_residency(
         (stream->SectionObjects.ImageSectionObject != NULL);
     ExReleaseResourceLite(&stream->MainResource);
     return STATUS_SUCCESS;
+}
+
+static BOOLEAN
+ext4win_acquire_fast_io_query_stream(
+    _In_ PFILE_OBJECT file_object,
+    _In_ BOOLEAN wait,
+    _Outptr_ PEXT4WIN_STREAM_CONTEXT *stream_out)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+
+    if (!ext4win_stream_fast_io_stream(file_object, &stream) ||
+        ((file_object->Flags & FO_NO_INTERMEDIATE_BUFFERING) != 0) ||
+        !file_object->ReadAccess ||
+        (stream->Header.IsFastIoPossible != FastIoIsPossible) ||
+        (InterlockedCompareExchange(
+            &stream->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_IDLE,
+            EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_IDLE) ||
+        !ExAcquireResourceSharedLite(&stream->MainResource, wait)) {
+        return FALSE;
+    }
+    if ((stream->Header.IsFastIoPossible != FastIoIsPossible) ||
+        (InterlockedCompareExchange(
+            &stream->SectionMutationState,
+            EXT4WIN_SECTION_MUTATION_IDLE,
+            EXT4WIN_SECTION_MUTATION_IDLE) != EXT4WIN_SECTION_MUTATION_IDLE)) {
+        ExReleaseResourceLite(&stream->MainResource);
+        return FALSE;
+    }
+    *stream_out = stream;
+    return TRUE;
+}
+
+static BOOLEAN
+ext4win_capture_fast_io_query_snapshot(
+    _In_ PEXT4WIN_STREAM_CONTEXT stream,
+    _Out_ PEXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot)
+{
+    BOOLEAN valid;
+
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    valid = stream->MetadataValid != FALSE;
+    if (valid) {
+        snapshot->Metadata = stream->PublishedMetadata;
+        snapshot->AllocationSize.QuadPart = stream->AllocationCharge;
+        snapshot->EndOfFile = stream->Header.FileSize;
+        snapshot->DeletePending = (BOOLEAN)(InterlockedCompareExchange(
+            &stream->DeletePending,
+            FALSE,
+            FALSE) != FALSE);
+    }
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    return valid;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_query_basic_info(
+    _In_ PFILE_OBJECT file_object,
+    _In_ BOOLEAN wait,
+    _Out_ PFILE_BASIC_INFORMATION buffer,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
+    BOOLEAN handled;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((buffer == NULL) || (io_status == NULL)) {
+        return FALSE;
+    }
+    io_status->Status = STATUS_NOT_SUPPORTED;
+    io_status->Information = 0;
+    if (!ext4win_acquire_fast_io_query_stream(file_object, wait, &stream)) {
+        return FALSE;
+    }
+    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
+        ExReleaseResourceLite(&stream->MainResource);
+        return FALSE;
+    }
+
+    handled = TRUE;
+    __try {
+        RtlZeroMemory(buffer, sizeof(*buffer));
+        buffer->CreationTime = snapshot.Metadata.CreationTime;
+        buffer->LastAccessTime = snapshot.Metadata.LastAccessTime;
+        buffer->LastWriteTime = snapshot.Metadata.LastWriteTime;
+        buffer->ChangeTime = snapshot.Metadata.ChangeTime;
+        buffer->FileAttributes = snapshot.Metadata.FileAttributes;
+        io_status->Status = STATUS_SUCCESS;
+        io_status->Information = sizeof(*buffer);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return handled;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_query_standard_info(
+    _In_ PFILE_OBJECT file_object,
+    _In_ BOOLEAN wait,
+    _Out_ PFILE_STANDARD_INFORMATION buffer,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
+    BOOLEAN handled;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((buffer == NULL) || (io_status == NULL)) {
+        return FALSE;
+    }
+    io_status->Status = STATUS_NOT_SUPPORTED;
+    io_status->Information = 0;
+    if (!ext4win_acquire_fast_io_query_stream(file_object, wait, &stream)) {
+        return FALSE;
+    }
+    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
+        ExReleaseResourceLite(&stream->MainResource);
+        return FALSE;
+    }
+
+    handled = TRUE;
+    __try {
+        RtlZeroMemory(buffer, sizeof(*buffer));
+        buffer->AllocationSize = snapshot.AllocationSize;
+        buffer->EndOfFile = snapshot.EndOfFile;
+        buffer->NumberOfLinks = snapshot.Metadata.NumberOfLinks;
+        buffer->DeletePending = snapshot.DeletePending;
+        buffer->Directory = (BOOLEAN)snapshot.Metadata.Directory;
+        io_status->Status = STATUS_SUCCESS;
+        io_status->Information = sizeof(*buffer);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return handled;
+}
+
+static BOOLEAN
+NTAPI
+ext4win_fast_io_query_network_open_info(
+    _In_ PFILE_OBJECT file_object,
+    _In_ BOOLEAN wait,
+    _Out_ PFILE_NETWORK_OPEN_INFORMATION buffer,
+    _Out_ PIO_STATUS_BLOCK io_status,
+    _In_ PDEVICE_OBJECT device_object)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
+    BOOLEAN handled;
+
+    UNREFERENCED_PARAMETER(device_object);
+    if ((buffer == NULL) || (io_status == NULL)) {
+        return FALSE;
+    }
+    io_status->Status = STATUS_NOT_SUPPORTED;
+    io_status->Information = 0;
+    if (!ext4win_acquire_fast_io_query_stream(file_object, wait, &stream)) {
+        return FALSE;
+    }
+    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
+        ExReleaseResourceLite(&stream->MainResource);
+        return FALSE;
+    }
+
+    handled = TRUE;
+    __try {
+        RtlZeroMemory(buffer, sizeof(*buffer));
+        buffer->CreationTime = snapshot.Metadata.CreationTime;
+        buffer->LastAccessTime = snapshot.Metadata.LastAccessTime;
+        buffer->LastWriteTime = snapshot.Metadata.LastWriteTime;
+        buffer->ChangeTime = snapshot.Metadata.ChangeTime;
+        buffer->AllocationSize = snapshot.AllocationSize;
+        buffer->EndOfFile = snapshot.EndOfFile;
+        buffer->FileAttributes = snapshot.Metadata.FileAttributes;
+        io_status->Status = STATUS_SUCCESS;
+        io_status->Information = sizeof(*buffer);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    return handled;
 }
 
 static BOOLEAN
@@ -2001,8 +2305,8 @@ static FAST_IO_DISPATCH ext4win_fast_io_dispatch_table = {
     ext4win_fast_io_check_if_possible,
     ext4win_fast_io_read,
     ext4win_fast_io_write,
-    NULL,
-    NULL,
+    ext4win_fast_io_query_basic_info,
+    ext4win_fast_io_query_standard_info,
     ext4win_fast_io_lock,
     ext4win_fast_io_unlock_single,
     ext4win_fast_io_unlock_all,
@@ -2011,7 +2315,7 @@ static FAST_IO_DISPATCH ext4win_fast_io_dispatch_table = {
     ext4win_acquire_file_for_section,
     ext4win_release_file_for_section,
     NULL,
-    NULL,
+    ext4win_fast_io_query_network_open_info,
     ext4win_acquire_for_mod_write,
     ext4win_mdl_read,
     ext4win_mdl_read_complete,

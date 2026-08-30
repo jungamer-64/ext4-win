@@ -189,14 +189,13 @@ fn reparse_metadata_controls_attribute_tag_and_file_attributes() {
         wdk_sys::IO_REPARSE_TAG_SYMLINK
     );
 
-    let metadata = test_metadata(super::FileMetadataKind::File);
+    let metadata = test_metadata(super::FileMetadataKind::Symlink);
     assert!(metadata.is_some());
-    let Some(mut metadata) = metadata else {
+    let Some(metadata) = metadata else {
         return;
     };
-    metadata.reparse_point = super::FileMetadataReparsePoint::SymbolicLink;
     assert_ne!(
-        super::file_attributes(metadata) & wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT,
+        metadata.file_attributes & wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT,
         0
     );
 }

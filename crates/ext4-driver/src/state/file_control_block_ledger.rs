@@ -475,16 +475,21 @@ impl Drop for PreparedStreamWriteOpen {
     reason = "the explicit lease retains the exact FCB pointer while publishing outside the ledger"
 )]
 impl StreamPublicationLease {
-    /// Publishes one complete stream-size tuple through the native Cc/MM boundary.
+    /// Publishes one complete epoch-tagged stream projection through the native Cc/MM boundary.
     /// # Errors
     ///
     /// Returns the exact Cache Manager publication failure.
-    fn publish(&self, sizes: StreamSizes) -> DriverResult<()> {
+    fn publish(
+        &self,
+        metadata: NodeStreamMetadata,
+        epoch: ext4_core::EpochSequence,
+    ) -> DriverResult<()> {
         let fcb = unsafe {
             // SAFETY: This lease keeps the FCB table entry alive until its own Drop completes.
             self.retained.fcb.as_ref()
         };
-        fcb.stream_context.set_sizes(sizes)
+        fcb.stream_context
+            .publish_node_metadata(metadata.sizes(), metadata.snapshot(), epoch)
     }
 }
 
@@ -829,7 +834,7 @@ struct ExistingFileControlBlockOpen {
     /// Write-only event capability inherited from the mounted volume owner.
     trace: OperationalTrace,
     /// Durable size snapshot used if construction creates the FCB.
-    stream: NodeStreamSizes,
+    stream: CommittedNodeStreamMetadata,
     /// FILE_OBJECT whose share claim is being published.
     file_object: KernelFileObject,
     /// Access already granted by the create security boundary.
@@ -848,7 +853,7 @@ struct FileControlBlockOpen {
     /// Mounted-volume identity that owns the stream.
     volume: NonNull<VolumeControlBlock>,
     /// Durable size snapshot used if construction creates the FCB.
-    stream: NodeStreamSizes,
+    stream: CommittedNodeStreamMetadata,
     /// Write-only event capability inherited from the mounted volume owner.
     trace: OperationalTrace,
     /// FILE_OBJECT whose share claim is being published.
@@ -965,14 +970,14 @@ impl FileControlBlockLedger {
     fn open_new(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        stream: NodeStreamSizes,
+        stream: StagedNodeStreamMetadata,
         trace: OperationalTrace,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<NewFileControlBlockAdmission> {
         let node = stream.node();
-        let candidate = self.file_control_block(volume, stream, trace)?;
+        let candidate = self.staged_file_control_block(volume, stream, trace)?;
         let fcb = NonNull::from(candidate.as_ref());
         let mut discarded = None;
         let mut removed = None;
@@ -1048,7 +1053,7 @@ impl FileControlBlockLedger {
             return result;
         }
 
-        let candidate = self.file_control_block(volume, stream, trace)?;
+        let candidate = self.committed_file_control_block(volume, stream, trace)?;
         let mut discarded = None;
         let mut removed = None;
         let result = {
@@ -1110,14 +1115,31 @@ impl FileControlBlockLedger {
     /// # Errors
     ///
     /// Returns an allocation or native-header initialization/binding error.
-    pub(super) fn file_control_block(
+    pub(super) fn staged_file_control_block(
         &self,
         volume: NonNull<VolumeControlBlock>,
-        stream: NodeStreamSizes,
+        stream: StagedNodeStreamMetadata,
         trace: OperationalTrace,
     ) -> DriverResult<Box<FileControlBlock>> {
         let candidate = memory::boxed_try_with(|| {
-            FileControlBlock::try_new(volume, NonNull::from(self), stream, trace)
+            FileControlBlock::try_new_staged(volume, NonNull::from(self), stream, trace)
+        })?;
+        candidate.bind_stream_owner()?;
+        Ok(candidate)
+    }
+
+    /// Creates an uninserted committed FCB candidate owned by this ledger.
+    /// # Errors
+    ///
+    /// Returns an allocation or native-header initialization/binding error.
+    fn committed_file_control_block(
+        &self,
+        volume: NonNull<VolumeControlBlock>,
+        stream: CommittedNodeStreamMetadata,
+        trace: OperationalTrace,
+    ) -> DriverResult<Box<FileControlBlock>> {
+        let candidate = memory::boxed_try_with(|| {
+            FileControlBlock::try_new_committed(volume, NonNull::from(self), stream, trace)
         })?;
         candidate.bind_stream_owner()?;
         Ok(candidate)
@@ -1201,11 +1223,22 @@ impl FileControlBlockLedger {
                 &*self.table.get()
             };
             let mut state = ledger_file_control_block_open_state(table, fcb);
-            unsafe {
+            let state = unsafe {
                 // SAFETY: The FCB was validated against the table while the resource is held.
                 state.as_mut()
+            };
+            let previous = state.set_delete_pending(pending);
+            if unsafe {
+                // SAFETY: The owning table retains this exact FCB while the resource is held.
+                fcb.as_ref()
             }
-            .set_delete_pending(pending)
+            .stream_context
+            .set_delete_pending(state.delete_pending())
+            .is_err()
+            {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+            }
+            previous
         };
         drop(previous);
     }
@@ -1223,11 +1256,22 @@ impl FileControlBlockLedger {
                 &*self.table.get()
             };
             let mut state = ledger_file_control_block_open_state(table, fcb);
-            unsafe {
+            let state = unsafe {
                 // SAFETY: The FCB was validated against the table while the resource is held.
                 state.as_mut()
+            };
+            let previous = state.clear_delete_pending();
+            if unsafe {
+                // SAFETY: The owning table retains this exact FCB while the resource is held.
+                fcb.as_ref()
             }
-            .clear_delete_pending()
+            .stream_context
+            .set_delete_pending(state.delete_pending())
+            .is_err()
+            {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+            }
+            previous
         };
         drop(previous);
     }
@@ -1268,11 +1312,22 @@ impl FileControlBlockLedger {
                 &*self.table.get()
             };
             let mut state = ledger_file_control_block_open_state(table, fcb);
-            unsafe {
+            let state = unsafe {
                 // SAFETY: The FCB was validated against the table while the resource is held.
                 state.as_mut()
+            };
+            let completed = state.complete_delete(target);
+            if unsafe {
+                // SAFETY: The owning table retains this exact FCB while the resource is held.
+                fcb.as_ref()
             }
-            .complete_delete(target)
+            .stream_context
+            .set_delete_pending(state.delete_pending())
+            .is_err()
+            {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+            }
+            completed
         };
         drop(completed);
     }
@@ -1294,11 +1349,22 @@ impl FileControlBlockLedger {
                 &*self.table.get()
             };
             let mut state = ledger_file_control_block_open_state(table, fcb);
-            unsafe {
+            let state = unsafe {
                 // SAFETY: The FCB was identity-checked against the owning table while locked.
                 state.as_mut()
+            };
+            let aborted = state.abort_cleanup_delete(target);
+            if unsafe {
+                // SAFETY: The owning table retains this exact FCB while the resource is held.
+                fcb.as_ref()
             }
-            .abort_cleanup_delete(target)
+            .stream_context
+            .set_delete_pending(state.delete_pending())
+            .is_err()
+            {
+                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+            }
+            aborted
         };
         drop(aborted);
     }
@@ -1587,7 +1653,7 @@ impl FileControlBlockLedger {
     )]
     pub(super) fn prepare_stream_size_changes(
         &self,
-        updates: &PreparedStreamSizePublications,
+        updates: &PreparedStreamMetadataPublications,
         deletion: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
         let capacity = updates.nodes.len();
@@ -1603,19 +1669,19 @@ impl FileControlBlockLedger {
             };
             let mut result = Ok(());
             for (index, update) in updates.nodes.iter().enumerate() {
-                if !matches!(update.node, NodeId::File(_)) || deletion == Some(update.node) {
+                if !matches!(update.node(), NodeId::File(_)) || deletion == Some(update.node()) {
                     continue;
                 }
                 if updates
                     .nodes
                     .iter()
                     .take(index)
-                    .any(|earlier| earlier.node == update.node)
+                    .any(|earlier| earlier.node() == update.node())
                 {
                     result = Err(DriverError::InternalInvariantViolation);
                     break;
                 }
-                let Some(fcb) = find_file_control_block_in_table(table, update.node) else {
+                let Some(fcb) = find_file_control_block_in_table(table, update.node()) else {
                     continue;
                 };
                 let fcb_ref = unsafe {
@@ -1629,7 +1695,7 @@ impl FileControlBlockLedger {
                         break;
                     }
                 };
-                if current.same_cache_dimensions(update.sizes) {
+                if current.same_cache_dimensions(update.sizes()) {
                     continue;
                 }
                 let mut state = ledger_file_control_block_open_state(table, fcb);
@@ -1649,8 +1715,8 @@ impl FileControlBlockLedger {
                             fcb,
                         },
                     },
-                    node: update.node,
-                    target_sizes: update.sizes,
+                    node: update.node(),
+                    target_sizes: update.sizes(),
                 };
                 if let Err(error) = remaining.push_reserved_owned(lease) {
                     let (error, lease) = error.into_parts();
@@ -1686,7 +1752,7 @@ impl FileControlBlockLedger {
     )]
     pub(super) fn prepared_stream_size_changes_match(
         &self,
-        updates: &PreparedStreamSizePublications,
+        updates: &PreparedStreamMetadataPublications,
         prepared: &PreparedStreamSizeChanges,
         deletion: Option<NodeId>,
     ) -> DriverResult<bool> {
@@ -1704,10 +1770,10 @@ impl FileControlBlockLedger {
         };
         let mut expected = 0_usize;
         for update in updates.nodes.iter() {
-            if !matches!(update.node, NodeId::File(_)) || deletion == Some(update.node) {
+            if !matches!(update.node(), NodeId::File(_)) || deletion == Some(update.node()) {
                 continue;
             }
-            let Some(fcb) = find_file_control_block_in_table(table, update.node) else {
+            let Some(fcb) = find_file_control_block_in_table(table, update.node()) else {
                 continue;
             };
             let current = unsafe {
@@ -1715,7 +1781,7 @@ impl FileControlBlockLedger {
                 fcb.as_ref()
             }
             .stream_sizes()?;
-            if current.same_cache_dimensions(update.sizes) {
+            if current.same_cache_dimensions(update.sizes()) {
                 continue;
             }
             expected = expected
@@ -1724,7 +1790,7 @@ impl FileControlBlockLedger {
             if !prepared
                 .prepared
                 .iter()
-                .any(|change| change.matches(update.node, update.sizes))
+                .any(|change| change.matches(update.node(), update.sizes()))
             {
                 return Ok(false);
             }
@@ -1822,13 +1888,14 @@ impl FileControlBlockLedger {
     /// # Errors
     ///
     /// Returns the exact stream-lease or Cc/MM publication failure.
-    pub(super) fn publish_stream_sizes(
+    pub(super) fn publish_stream_metadata(
         &self,
-        updates: PreparedStreamSizePublications,
+        updates: PreparedStreamMetadataPublications,
+        epoch: ext4_core::EpochSequence,
     ) -> DriverResult<()> {
         for update in updates.nodes.iter() {
             if let Some(lease) = self.acquire_stream_publication_lease(update.node())? {
-                lease.publish(update.sizes)?;
+                lease.publish(*update, epoch)?;
             }
         }
         Ok(())
@@ -2412,11 +2479,7 @@ impl VolumeControlBlock {
             file_control_blocks: FileControlBlockLedger::try_new()?,
             volume_control: VolumeControlPlane::mounted(),
             runtime: VolumeRuntime::try_new(mount, storage)?,
-            stream_context: StreamContext::try_new(
-                StreamOwnerKind::Volume,
-                StreamSizes::EMPTY,
-                trace,
-            )?,
+            stream_context: StreamContext::try_new_volume(StreamSizes::EMPTY, trace)?,
         })
     }
 
@@ -2472,7 +2535,7 @@ impl VolumeControlBlock {
     )]
     pub(crate) fn open_existing_file_control_block(
         volume: NonNull<Self>,
-        stream: NodeStreamSizes,
+        stream: CommittedNodeStreamMetadata,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         existing_operation_access: ExistingOperationAccess,
@@ -2544,9 +2607,9 @@ impl PendingChildCreation {
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
-        stream_sizes: NodeStreamSizes,
+        stream_metadata: StagedNodeStreamMetadata,
     ) -> DriverResult<NewFileControlBlockAdmission> {
-        if stream_sizes.node() != self.node {
+        if stream_metadata.node() != self.node {
             return Err(DriverError::InternalInvariantViolation);
         }
         unsafe {
@@ -2555,7 +2618,7 @@ impl PendingChildCreation {
         }
         .open_new(
             self.volume.as_non_null(),
-            stream_sizes,
+            stream_metadata,
             self.volume.trace(),
             file_object,
             desired_access,

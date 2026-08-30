@@ -673,7 +673,7 @@ pub(crate) fn validate_pending_deletion(
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }
     let metadata = metadata_from_node(read, node)?;
-    readonly.validate_attributes(file_attributes(metadata))?;
+    readonly.validate_attributes(metadata.file_attributes)?;
     if let NodeId::Directory(directory_id) = node {
         let directory = read.load_directory(directory_id)?;
         let mut cursor = DirectoryCursor::start();
@@ -952,7 +952,7 @@ fn prepare_hard_link_destination(
         operations.ensure_node_replaceable(target_node)?;
     }
     let target_metadata = metadata_from_node(read, target_node)?;
-    if file_attributes(target_metadata) & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
+    if target_metadata.file_attributes & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
         return Err(DriverError::CannotDelete);
     }
 

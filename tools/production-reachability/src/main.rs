@@ -58,7 +58,14 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "ext4win_stream_section_objects",
     ),
     ("native stream size observation", "ext4win_stream_get_sizes"),
-    ("native stream size publication", "ext4win_stream_set_sizes"),
+    (
+        "native stream metadata publication",
+        "ext4win_stream_publish_metadata",
+    ),
+    (
+        "native delete-pending projection",
+        "ext4win_stream_set_delete_pending",
+    ),
     ("native stream destruction", "ext4win_stream_destroy"),
     (
         "cache-map initialization",
@@ -86,6 +93,18 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("Fast I/O registration", "ext4win_fast_io_dispatch"),
     ("Fast I/O read callback", "ext4win_fast_io_read"),
     ("Fast I/O write callback", "ext4win_fast_io_write"),
+    (
+        "Fast I/O basic query callback",
+        "ext4win_fast_io_query_basic_info",
+    ),
+    (
+        "Fast I/O standard query callback",
+        "ext4win_fast_io_query_standard_info",
+    ),
+    (
+        "Fast I/O network query callback",
+        "ext4win_fast_io_query_network_open_info",
+    ),
     ("operational ETW registration", "ext4win_trace_register"),
     ("operational ETW event emission", "ext4win_trace_write"),
     ("operational ETW unregister", "ext4win_trace_unregister"),
@@ -2330,7 +2349,8 @@ mod tests {
              ext4win_stream_decode_owner\n\
              ext4win_stream_section_objects\n\
              ext4win_stream_get_sizes\n\
-             ext4win_stream_set_sizes\n\
+             ext4win_stream_publish_metadata\n\
+             ext4win_stream_set_delete_pending\n\
              ext4win_stream_destroy\n\
              ext4win_stream_cache_initialize\n\
              ext4win_stream_cache_read\n\
@@ -2346,6 +2366,9 @@ mod tests {
              ext4win_fast_io_dispatch\n\
              ext4win_fast_io_read\n\
              ext4win_fast_io_write\n\
+             ext4win_fast_io_query_basic_info\n\
+             ext4win_fast_io_query_standard_info\n\
+             ext4win_fast_io_query_network_open_info\n\
              ext4win_trace_register\n\
              ext4win_trace_write\n\
              ext4win_trace_unregister\n\
