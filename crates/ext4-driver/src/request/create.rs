@@ -13,8 +13,8 @@ use crate::{
         AtomicOplockReservation, CreateAction, CreateCompletion, CreateDeletion, CreateDisposition,
         CreateNameInterpretation, CreateParameters, CreateReparsePointMode,
         CreateSymlinkReparseBuffer, CreateSynchronizationMode, CreateTargetRequirement,
-        CreateTransferBuffering, ExistingOperationAccess, GrantedAccess, PendingIrpLease,
-        RegularFileWriteAccess, ShareAccess,
+        CreateTransferBuffering, ExistingOperationAccess, GrantedAccess, NamespaceOplockPlan,
+        NamespaceParentOplockEffect, PendingIrpLease, RegularFileWriteAccess, ShareAccess,
     },
     kernel::status::{DriverError, DriverResult, STATUS_RETRY},
     memory::{self, DriverVec},
@@ -49,6 +49,7 @@ pub(crate) fn execute(
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     pending_existing: &mut Option<PendingExistingCreateOpen>,
     prepared_write_open: Option<&PreparedStreamWriteOpen>,
+    namespace_oplocks: Option<NamespaceOplockPlan>,
 ) -> DriverResult<CreateResolution> {
     if pending_existing.is_some() {
         return resume_existing_open(
@@ -66,6 +67,7 @@ pub(crate) fn execute(
         operations,
         mutation,
         pending_existing,
+        namespace_oplocks,
     )
 }
 
@@ -95,6 +97,8 @@ pub(crate) enum CreateResolution {
         /// User-handle count atomically admitted with this create claim.
         open_count: NonZeroU32,
     },
+    /// A missing child requires parent-directory oplock authority before it can be staged.
+    CheckNamespaceOplocks(NamespaceOplockPlan),
     /// A missing child was staged and every driver publication value was preallocated.
     Mutation(Box<PendingCreatePublication>),
 }
@@ -368,6 +372,7 @@ fn open_or_create(
     operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     pending_existing: &mut Option<PendingExistingCreateOpen>,
+    namespace_oplocks: Option<NamespaceOplockPlan>,
 ) -> DriverResult<CreateResolution> {
     let PreparedCreateRequest {
         mut owner,
@@ -419,6 +424,10 @@ fn open_or_create(
         CreateTargetLookup::Missing { parent, name } => {
             let requirement = owner.parameters().target_requirement();
             let owner = owner.authorize_child_creation(parent, requirement, mutation)?;
+            let oplocks = NamespaceOplockPlan::single(parent, NamespaceParentOplockEffect::Change);
+            if namespace_oplocks != Some(oplocks) {
+                return Ok(CreateResolution::CheckNamespaceOplocks(oplocks));
+            }
             let publication = create_missing_node(
                 owner,
                 create_ea,

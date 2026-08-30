@@ -15,9 +15,10 @@ use wdk_sys::LARGE_INTEGER;
 use crate::irp::{
     ActiveFileObject, ActiveIrp, CreateDeletion, DataIoKind, DirectoryChangeFilter,
     DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
-    DirectoryWatchScope, FileAttributesWriteAccess, IrpBufferLength, IrpCompletion, OwnedIrp,
-    PendingIrpLease, PreparedDirectoryPattern, QueryFileInformationClass, ReadStartingPoint,
-    RegularFileWriteAccess, SetFileInformationClass, SetFileStack, WriteStartingPoint,
+    DirectoryWatchScope, FileAttributesWriteAccess, IrpBufferLength, IrpCompletion,
+    NamespaceOplockPlan, NamespaceParentOplockEffect, OwnedIrp, PendingIrpLease,
+    PreparedDirectoryPattern, QueryFileInformationClass, ReadStartingPoint, RegularFileWriteAccess,
+    SetFileInformationClass, SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{self, DriverVec};

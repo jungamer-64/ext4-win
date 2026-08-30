@@ -866,7 +866,7 @@ impl PreparedHardLinkMutation {
 
     /// Exact parent-directory authority required before this prepared write can be staged.
     fn oplock_plan(&self) -> NamespaceOplockPlan {
-        NamespaceOplockPlan::hard_link(self.target_parent, self.destination.oplock_effect())
+        NamespaceOplockPlan::single(self.target_parent, self.destination.oplock_effect())
     }
 
     /// Stages the already authorized hard-link mutation.

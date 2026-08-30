@@ -18,8 +18,8 @@ use crate::irp::reactor::{
     OperationTransition, PublicationAuthority, ReactorTarget, WaitCondition,
 };
 use crate::irp::{
-    AtomicOplockReservation, CreateCompletion, IrpCompletion, OplockCheck, OplockContinuation,
-    OwnedIrp,
+    AtomicOplockReservation, CreateCompletion, IrpCompletion, NamespaceOplockPlan,
+    NamespaceParentOplock, NamespaceParentOplockEffect, OplockCheck, OplockContinuation, OwnedIrp,
 };
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
@@ -3444,7 +3444,7 @@ enum OplockResume {
         /// Mutation reservations acquired before any corresponding FsRtl call.
         pending: PendingNamespaceOplocks,
         /// Optional second parent requirement of a cross-directory rename.
-        next: Option<crate::request::file_info::NamespaceParentOplock>,
+        next: Option<NamespaceParentOplock>,
     },
 }
 
@@ -3461,7 +3461,7 @@ struct CleanupParentOplockAuthority {
 #[derive(Debug)]
 struct PendingNamespaceOplocks {
     /// Exact preflight plan these node reservations cover.
-    plan: crate::request::file_info::NamespaceOplockPlan,
+    plan: NamespaceOplockPlan,
     /// First parent reservation acquired before its optional stream check.
     first: crate::state::OplockMutationLease,
     /// Second parent reservation acquired before its optional stream check.
@@ -3472,7 +3472,7 @@ struct PendingNamespaceOplocks {
 #[derive(Debug)]
 struct NamespaceOplockAuthority {
     /// Exact preflight plan revalidated immediately before staging ext4 writes.
-    plan: crate::request::file_info::NamespaceOplockPlan,
+    plan: NamespaceOplockPlan,
     /// First parent node reservation.
     _first: crate::state::OplockMutationLease,
     /// Optional second parent node reservation.
@@ -3492,7 +3492,7 @@ impl PendingNamespaceOplocks {
 
 impl NamespaceOplockAuthority {
     /// Reports whether this authority covers the exact current-epoch preflight plan.
-    fn authorizes(&self, plan: crate::request::file_info::NamespaceOplockPlan) -> bool {
+    fn authorizes(&self, plan: NamespaceOplockPlan) -> bool {
         self.plan == plan
     }
 }
@@ -3710,7 +3710,7 @@ struct MutationRequestOperation {
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Parent-directory removal authority retained for the current cleanup deletion target.
     cleanup_parent_oplock: Option<CleanupParentOplockAuthority>,
-    /// Parent-directory authority retained for a set-information namespace mutation.
+    /// Parent-directory authority retained for create or set-information namespace mutation.
     namespace_oplocks: Option<NamespaceOplockAuthority>,
     /// Fully allocated disposition state retained while its native preflight runs.
     disposition_deletion: Option<crate::request::file_info::PendingDispositionDeletion>,
@@ -3734,8 +3734,8 @@ struct DriverResolveState<'a> {
     cleanup_deletion: &'a mut Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Parent-directory removal authority already established for cleanup deletion.
     cleanup_parent_oplock: Option<&'a CleanupParentOplockAuthority>,
-    /// Exact authorized parent plan for a set-information namespace mutation.
-    namespace_oplocks: Option<crate::request::file_info::NamespaceOplockPlan>,
+    /// Exact authorized parent plan for create or set-information namespace mutation.
+    namespace_oplocks: Option<NamespaceOplockPlan>,
     /// Disposition deletion plan retained across its native preflight.
     disposition_deletion: &'a mut Option<crate::request::file_info::PendingDispositionDeletion>,
     /// Exact successful deletion gate retained for revalidation.
@@ -3765,7 +3765,7 @@ enum DriverResolveDisposition {
     /// A set-information namespace mutation must establish this exact parent oplock plan.
     CheckNamespaceOplocks {
         /// Current-epoch plan derived without staging an ext4 write.
-        plan: crate::request::file_info::NamespaceOplockPlan,
+        plan: NamespaceOplockPlan,
     },
     /// A resident regular-file create must flush its executable image outside the actor.
     PrepareWriteOpen {
@@ -4068,6 +4068,7 @@ impl MutationRequestOperation {
                     mutation,
                     state.pending_existing_create,
                     state.write_open,
+                    state.namespace_oplocks,
                 )? {
                     crate::request::create::CreateResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Create(completion)),
@@ -4080,6 +4081,9 @@ impl MutationRequestOperation {
                     }
                     crate::request::create::CreateResolution::ReserveOplock { fcb, open_count } => {
                         Ok(DriverResolveDisposition::ReserveOplock { fcb, open_count })
+                    }
+                    crate::request::create::CreateResolution::CheckNamespaceOplocks(plan) => {
+                        Ok(DriverResolveDisposition::CheckNamespaceOplocks { plan })
                     }
                     crate::request::create::CreateResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
@@ -4278,7 +4282,7 @@ impl MutationRequestOperation {
         mut self: Box<Self>,
         owned: OwnedIrp,
         mut pending: PendingNamespaceOplocks,
-        next: Option<crate::request::file_info::NamespaceParentOplock>,
+        next: Option<NamespaceParentOplock>,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         if let Some(requirement) = next {
@@ -4293,12 +4297,8 @@ impl MutationRequestOperation {
             pending.second = Some(mutation);
             if let Some(stream) = stream {
                 let check = match requirement.effect() {
-                    crate::request::file_info::NamespaceParentOplockEffect::Change => {
-                        OplockCheck::parent_change(stream)
-                    }
-                    crate::request::file_info::NamespaceParentOplockEffect::Removal => {
-                        OplockCheck::parent_removal(stream)
-                    }
+                    NamespaceParentOplockEffect::Change => OplockCheck::parent_change(stream),
+                    NamespaceParentOplockEffect::Removal => OplockCheck::parent_removal(stream),
                 };
                 self.state = MutationOperationState::OplockDelegated {
                     resume: OplockResume::ContinueNamespaceOplocks {
@@ -4411,8 +4411,10 @@ impl MutationRequestOperation {
                 }
                 Ok(DriverResolveDisposition::CheckNamespaceOplocks { plan }) => {
                     drop(pass);
-                    if self.request.kind() != MutationRequestKind::SetInformation
-                        || size_changes.is_some()
+                    if !matches!(
+                        self.request.kind(),
+                        MutationRequestKind::Create | MutationRequestKind::SetInformation
+                    ) || size_changes.is_some()
                         || deletion.is_some()
                         || self
                             .namespace_oplocks
@@ -4442,12 +4444,8 @@ impl MutationRequestOperation {
                         );
                     };
                     let check = match first.effect() {
-                        crate::request::file_info::NamespaceParentOplockEffect::Change => {
-                            OplockCheck::parent_change(stream)
-                        }
-                        crate::request::file_info::NamespaceParentOplockEffect::Removal => {
-                            OplockCheck::parent_removal(stream)
-                        }
+                        NamespaceParentOplockEffect::Change => OplockCheck::parent_change(stream),
+                        NamespaceParentOplockEffect::Removal => OplockCheck::parent_removal(stream),
                     };
                     self.state = MutationOperationState::OplockDelegated {
                         resume: OplockResume::ContinueNamespaceOplocks {
@@ -5304,8 +5302,10 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         if let Some(error) = oplock_error {
                             return self.complete_error(owned, error);
                         }
-                        if self.request.kind() != MutationRequestKind::SetInformation
-                            || self.namespace_oplocks.is_some()
+                        if !matches!(
+                            self.request.kind(),
+                            MutationRequestKind::Create | MutationRequestKind::SetInformation
+                        ) || self.namespace_oplocks.is_some()
                         {
                             return self
                                 .complete_error(owned, DriverError::InternalInvariantViolation);
