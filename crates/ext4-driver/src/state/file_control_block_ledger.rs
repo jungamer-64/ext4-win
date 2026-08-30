@@ -6,8 +6,19 @@ use super::*;
 pub(super) struct FileControlBlockLedger {
     /// Mutable ledger state reachable only while `lock` is held.
     pub(super) table: UnsafeCell<DriverVec<Box<FileControlBlock>>>,
+    /// Node-keyed mutation reservations that remain authoritative without a resident FCB.
+    oplock_mutations: UnsafeCell<DriverVec<OplockMutationEntry>>,
     /// Stable-address executive resource for every table/share/reference transition.
     lock: FileControlBlockLedgerLock,
+}
+
+/// One node-keyed oplock mutation reservation entry owned by the ledger resource.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OplockMutationEntry {
+    /// Namespace node whose new oplock grants are prohibited.
+    node: NodeId,
+    /// Number of active mutation authorities for the same node.
+    count: NonZeroU32,
 }
 
 /// Ledger-owned retention shared by the narrow stream authorities that may outlive its resource.
@@ -57,8 +68,10 @@ pub(crate) struct OplockStreamLease {
 /// One stream mutation authority that prevents new oplock grants until terminal release.
 #[derive(Debug)]
 pub(crate) struct OplockMutationLease {
-    /// Deferred FCB retention paired with the open-state mutation count.
-    retained: DeferredStreamLease,
+    /// Ledger that owns the node-keyed reservation.
+    owner: NonNull<FileControlBlockLedger>,
+    /// Exact node whose reservation must be released.
+    node: NodeId,
 }
 
 impl OplockStreamLease {
@@ -95,10 +108,10 @@ impl OplockStreamLease {
 impl Drop for OplockMutationLease {
     fn drop(&mut self) {
         let owner = unsafe {
-            // SAFETY: This mutation lease retains an entry owned by the exact ledger pointer.
-            self.retained.owner.as_ref()
+            // SAFETY: The mounted operation retains the VCB and its ledger through lease release.
+            self.owner.as_ref()
         };
-        owner.release_oplock_mutation(self.retained.fcb);
+        owner.release_oplock_mutation(self.node);
     }
 }
 
@@ -643,7 +656,7 @@ impl fmt::Debug for FileControlBlockLedger {
 
 impl Drop for FileControlBlockLedger {
     fn drop(&mut self) {
-        if !self.table.get_mut().is_empty() {
+        if !self.table.get_mut().is_empty() || !self.oplock_mutations.get_mut().is_empty() {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         }
     }
@@ -893,6 +906,7 @@ impl FileControlBlockLedger {
     pub(super) fn try_new() -> DriverResult<Self> {
         Ok(Self {
             table: UnsafeCell::new(DriverVec::new()),
+            oplock_mutations: UnsafeCell::new(DriverVec::new()),
             lock: FileControlBlockLedgerLock::try_new()?,
         })
     }
