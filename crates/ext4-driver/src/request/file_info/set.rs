@@ -779,64 +779,6 @@ impl HardLinkDirectoryChanges {
     }
 }
 
-/// Applies one owned FILE_LINK_INFORMATION mutation to the ext4 namespace.
-/// # Errors
-///
-/// Returns an error when target resolution, replacement policy, link limits, metadata staging, or
-/// the journal transaction fails.
-fn set_hard_link_information(
-    request: HardLinkMutation,
-    operations: &mut MountedVolumeAccess<'_>,
-    mutation: &mut DriverMutationPass<'_, '_, '_>,
-) -> DriverResult<HardLinkDirectoryChanges> {
-    let HardLinkMutation {
-        source,
-        target,
-        target_collision,
-    } = request;
-    let source_node = NodeId::from(source);
-    let (target_parent, target_name) = resolve_namespace_target(mutation, &target)?;
-    operations.ensure_node_openable(NodeId::Directory(target_parent))?;
-    let source_metadata = metadata_from_node(mutation, source_node)?;
-    let (destination, count_effect, changes) = prepare_hard_link_destination(
-        operations,
-        mutation,
-        source_node,
-        target_parent,
-        &target_name,
-        target.target_name(),
-        target_collision,
-    )?;
-    count_effect.validate(source_metadata.links_count)?;
-    let archive_overlay = hard_link_archive_overlay(source_metadata.overlay_attributes)?;
-
-    let source = mutation.hard_link_source(source)?;
-    let target_parent = mutation.directory(target_parent)?;
-    if let Some(overlay) = archive_overlay {
-        let node = mutation.node(source_node)?;
-        mutation.set_windows_overlay(node, overlay)?;
-    }
-    match &destination {
-        PreparedHardLinkDestination::Vacant => {
-            mutation.create_hard_link(
-                source,
-                target_parent,
-                &target_name,
-                HardLinkDestination::Vacant,
-            )?;
-        }
-        PreparedHardLinkDestination::Replace { existing_name } => {
-            mutation.create_hard_link(
-                source,
-                target_parent,
-                &target_name,
-                HardLinkDestination::Replace { existing_name },
-            )?;
-        }
-    }
-    Ok(changes)
-}
-
 /// Resolves collision policy into one exact hard-link destination and notification plan.
 /// # Errors
 ///
@@ -1004,63 +946,6 @@ enum PreparedRename {
         /// Namespace notifications derived before commit.
         notifications: Box<RenameDirectoryNameChanges>,
     },
-}
-
-/// Applies one owned FILE_RENAME_INFORMATION mutation to the ext4 namespace.
-/// # Errors
-///
-/// Returns an error when target resolution, notification preparation, or the rename transaction
-/// fails.
-fn set_rename_information(
-    request: RenameMutation,
-    operations: &mut MountedVolumeAccess<'_>,
-    mutation: &mut DriverMutationPass<'_, '_, '_>,
-) -> DriverResult<PreparedRename> {
-    let RenameMutation {
-        source_parent,
-        source_name,
-        source_node,
-        target,
-        target_collision,
-    } = request;
-    let (target_parent, target_name) = resolve_namespace_target(mutation, &target)?;
-    operations.ensure_node_openable(NodeId::Directory(source_parent))?;
-    operations.ensure_node_openable(NodeId::Directory(target_parent))?;
-    let notifications = RenameDirectoryNameChanges::prepare(
-        operations,
-        mutation,
-        RenameNotificationRequest {
-            source_parent,
-            source_name: &source_name,
-            source_node,
-            target_parent,
-            target_name: &target_name,
-            target_collision,
-        },
-    )?;
-    let notifications = notifications
-        .map(Box::try_new)
-        .transpose()
-        .map_err(|_| DriverError::InsufficientResources)?;
-    let source_parent = mutation.directory(source_parent)?;
-    let target_parent = mutation.directory(target_parent)?;
-    mutation.rename_child(
-        source_parent,
-        &source_name,
-        target_parent,
-        &target_name,
-        target_collision,
-    )?;
-    match notifications {
-        Some(notifications) => Ok(PreparedRename::Changed {
-            location: OpenedLocation::DirectoryEntry {
-                parent: target_parent.id(),
-                name: target_name,
-            },
-            notifications,
-        }),
-        None => Ok(PreparedRename::Unchanged),
-    }
 }
 
 /// Committed directory-name changes caused by one non-no-op rename operation.
