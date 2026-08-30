@@ -83,7 +83,7 @@ impl MountedVolumeDevice {
     )]
     pub(crate) fn initialize(
         device: KernelDevice,
-        vcb: Box<VolumeControlBlock>,
+        vcb: Pin<Box<VolumeControlBlock>>,
         vpb: NonNull<wdk_sys::VPB>,
         real_device: KernelDevice,
     ) -> DriverResult<()> {

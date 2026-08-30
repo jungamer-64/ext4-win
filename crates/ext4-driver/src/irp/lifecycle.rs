@@ -298,9 +298,17 @@ impl RequestorInput<'_> {
     /// Snapshots the complete input into equally sized driver-owned storage.
     /// # Errors
     ///
-    /// Returns an error when the destination length differs or the native copy rejects the range.
+    /// Returns an error when the destination length differs or the mapped range is invalid.
+    #[expect(
+        unsafe_code,
+        reason = "the lifetime-bound IRP view discharges the raw mapped-range copy contract"
+    )]
     pub(crate) fn copy_to(&self, destination: &mut [u8]) -> DriverResult<()> {
-        copy_requestor_input_window(self.buffer.address, self.buffer.length, 0, destination)
+        unsafe {
+            // SAFETY: `owner` retains the mapped input, and safe callers cannot construct
+            // `destination` as an alias of the opaque requestor range.
+            copy_requestor_input_window(self.buffer.address, self.buffer.length, 0, destination)
+        }
     }
 }
 
@@ -328,22 +336,33 @@ impl RequestorOutput<'_> {
     /// Copies driver-owned bytes to `offset` in the requestor output.
     /// # Errors
     ///
-    /// Returns an error when the selected range exceeds the output or native copy rejects it.
+    /// Returns an error when the selected range exceeds the mapped output.
+    #[expect(
+        unsafe_code,
+        reason = "the lifetime-bound IRP view discharges the raw mapped-range copy contract"
+    )]
     pub(crate) fn copy_from(&mut self, offset: usize, source: &[u8]) -> DriverResult<()> {
-        copy_requestor_output_window(self.buffer.address, self.buffer.length, offset, source)
+        unsafe {
+            // SAFETY: `owner` uniquely retains the mapped output, and safe callers cannot
+            // construct `source` as an alias of the opaque requestor range.
+            copy_requestor_output_window(self.buffer.address, self.buffer.length, offset, source)
+        }
     }
 }
 
 /// Copies one checked requestor-input window into driver-owned storage.
+/// # Safety
+///
+/// A nonempty `address` must remain readable for `total_length` bytes during the call, with valid
+/// provenance for one allocation. That range must not overlap `destination`.
 /// # Errors
 ///
-/// Returns an error when the range is invalid, unrepresentable by the native ABI, or rejected by
-/// the native copy boundary.
+/// Returns an error when the selected range is invalid or exceeds Rust's pointer-offset domain.
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-pub(super) fn copy_requestor_input_window(
+pub(super) unsafe fn copy_requestor_input_window(
     address: Option<NonNull<u8>>,
     total_length: usize,
     offset: usize,
@@ -359,39 +378,30 @@ pub(super) fn copy_requestor_input_window(
         return Ok(());
     }
     let address = address.ok_or(DriverError::InternalInvariantViolation)?;
-    let source_length = wdk_sys::ULONG::try_from(total_length)
-        .map_err(|_| DriverError::InternalInvariantViolation)?;
-    let source_offset =
-        wdk_sys::ULONG::try_from(offset).map_err(|_| DriverError::InternalInvariantViolation)?;
-    let destination_length = wdk_sys::ULONG::try_from(destination.len())
-        .map_err(|_| DriverError::InternalInvariantViolation)?;
-    let status = unsafe {
+    isize::try_from(total_length).map_err(|_| DriverError::InternalInvariantViolation)?;
+    let source = address.as_ptr().wrapping_add(offset);
+    unsafe {
         // SAFETY: The active or pending IRP owns `address` for `total_length`; checked arithmetic
-        // selects an in-range source window, and `destination` is driver-owned mutable storage.
-        ffi::ext4win_copy_requestor_input_window(
-            address.as_ptr().cast(),
-            source_length,
-            source_offset,
-            destination.as_mut_ptr().cast(),
-            destination_length,
-        )
-    };
-    if status < STATUS_SUCCESS {
-        return Err(DriverError::InternalInvariantViolation);
+        // selects an in-range source window, and the caller guarantees non-overlap with the
+        // initialized driver-owned destination.
+        core::ptr::copy_nonoverlapping(source, destination.as_mut_ptr(), destination.len());
     }
     Ok(())
 }
 
 /// Copies driver-owned bytes into one checked requestor-output window.
+/// # Safety
+///
+/// A nonempty `address` must remain writable for `total_length` bytes during the call, with valid
+/// provenance for one allocation. That range must not overlap `source`.
 /// # Errors
 ///
-/// Returns an error when the range is invalid, unrepresentable by the native ABI, or rejected by
-/// the native copy boundary.
+/// Returns an error when the selected range is invalid or exceeds Rust's pointer-offset domain.
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-pub(super) fn copy_requestor_output_window(
+pub(super) unsafe fn copy_requestor_output_window(
     address: Option<NonNull<u8>>,
     total_length: usize,
     offset: usize,
@@ -407,25 +417,13 @@ pub(super) fn copy_requestor_output_window(
         return Ok(());
     }
     let address = address.ok_or(DriverError::InternalInvariantViolation)?;
-    let destination_length = wdk_sys::ULONG::try_from(total_length)
-        .map_err(|_| DriverError::InternalInvariantViolation)?;
-    let destination_offset =
-        wdk_sys::ULONG::try_from(offset).map_err(|_| DriverError::InternalInvariantViolation)?;
-    let source_length = wdk_sys::ULONG::try_from(source.len())
-        .map_err(|_| DriverError::InternalInvariantViolation)?;
-    let status = unsafe {
+    isize::try_from(total_length).map_err(|_| DriverError::InternalInvariantViolation)?;
+    let destination = address.as_ptr().wrapping_add(offset);
+    unsafe {
         // SAFETY: The active or pending IRP owns `address` for `total_length`; checked arithmetic
-        // selects an in-range destination window, and `source` is initialized driver-owned bytes.
-        ffi::ext4win_copy_requestor_output_window(
-            address.as_ptr().cast(),
-            destination_length,
-            destination_offset,
-            source.as_ptr().cast(),
-            source_length,
-        )
-    };
-    if status < STATUS_SUCCESS {
-        return Err(DriverError::InternalInvariantViolation);
+        // selects an in-range destination window, and the caller guarantees non-overlap with the
+        // initialized driver-owned source.
+        core::ptr::copy_nonoverlapping(source.as_ptr(), destination, source.len());
     }
     Ok(())
 }

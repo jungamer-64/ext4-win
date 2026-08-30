@@ -7,6 +7,7 @@ use core::ptr::NonNull;
 use ext4_core::{FileOffset, WindowsNameMatch};
 use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING, STATUS_SUCCESS};
 
+#[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory;

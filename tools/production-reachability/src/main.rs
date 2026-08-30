@@ -50,6 +50,14 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("lower submission import", "IofCallDriver"),
     ("native advanced-header allocation", "ext4win_stream_create"),
     (
+        "native node stream lifetime binding",
+        "ext4win_stream_bind_node_owner",
+    ),
+    (
+        "native volume stream lifetime binding",
+        "ext4win_stream_bind_volume_owner",
+    ),
+    (
         "native stream owner decoding",
         "ext4win_stream_decode_owner",
     ),
@@ -2346,6 +2354,8 @@ mod tests {
              IoSetCompletionRoutineEx\n\
              IofCallDriver\n\
              ext4win_stream_create\n\
+             ext4win_stream_bind_node_owner\n\
+             ext4win_stream_bind_volume_owner\n\
              ext4win_stream_decode_owner\n\
              ext4win_stream_section_objects\n\
              ext4win_stream_get_sizes\n\

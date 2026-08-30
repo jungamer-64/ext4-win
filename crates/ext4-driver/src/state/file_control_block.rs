@@ -19,6 +19,8 @@ pub(crate) struct FileControlBlock {
     byte_range_locks: FileByteRangeLocks,
     /// Ledger-owned mutable state; accessed only under `owner`'s exclusive resource.
     pub(super) open_state: UnsafeCell<FileControlBlockOpenState>,
+    /// Prevents the native owner and FILE_LOCK addresses from being invalidated by a safe move.
+    _pin: PhantomPinned,
 }
 
 #[expect(
@@ -63,6 +65,7 @@ impl FileControlBlock {
             stream_context: StreamContext::try_new_staged_node(sizes, trace)?,
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
+            _pin: PhantomPinned,
         })
     }
 
@@ -88,18 +91,28 @@ impl FileControlBlock {
             )?,
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
+            _pin: PhantomPinned,
         })
     }
 
-    /// Binds the native header after the ledger candidate reaches its final heap address.
+    /// Binds the native header after the ledger candidate has been pinned at its final address.
     /// # Errors
     ///
     /// Returns an invariant error on repeated binding or malformed native ownership.
-    pub(super) fn bind_stream_owner(&self) -> DriverResult<()> {
-        self.stream_context
-            .bind_owner(NonNull::from(self).cast::<c_void>())?;
-        self.stream_context
-            .bind_byte_range_locks(self.byte_range_locks.native_pointer())
+    #[expect(
+        unsafe_code,
+        reason = "Pin and private construction establish the native FCB and FILE_LOCK lifetime"
+    )]
+    pub(super) fn bind_stream_owner(self: Pin<&Self>) -> DriverResult<()> {
+        let fcb = self.get_ref();
+        unsafe {
+            // SAFETY: `PhantomPinned` prevents safe relocation after this call. Field declaration
+            // order keeps the native stream alive until after its bound FILE_LOCK is withdrawn.
+            fcb.stream_context.bind_node_owner(
+                NonNull::from(fcb).cast::<c_void>(),
+                fcb.byte_range_locks.native_pointer(),
+            )
+        }
     }
 
     /// Returns the advanced-header pointer installed in every FILE_OBJECT for this inode.
@@ -405,18 +418,44 @@ impl PreparedStreamMetadataPublications {
     }
 }
 
-/// Result of durable ext4 visibility publication plus the independently fallible Windows stream
-/// projection.
+/// Machine-readable progress when Windows stream projection cannot finish after ext4 commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamProjectionFailure {
+    /// First exact failure in publication order.
+    pub(super) error: DriverError,
+    /// Number of live native stream headers that reached the new epoch.
+    pub(super) published_streams: usize,
+    /// Number of update records not yet examined after a pre-header-commit failure.
+    pub(super) unexamined_updates: usize,
+}
+
+impl StreamProjectionFailure {
+    /// Separates the exact failure from the progress needed for reconciliation.
+    pub(crate) const fn into_parts(self) -> (DriverError, usize, usize) {
+        (self.error, self.published_streams, self.unexamined_updates)
+    }
+}
+
+/// Result of projecting a durable ext4 epoch into every live Windows stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamProjectionOutcome {
+    /// Every live stream header and present Cache Manager map accepted the new epoch.
+    Complete,
+    /// Native publication made the explicitly recorded progress before terminal failure.
+    Incomplete(StreamProjectionFailure),
+}
+
+/// Result of durable ext4 visibility publication plus the Windows stream projection outcome.
 pub(crate) struct DurablePublicationOutcome {
     /// Checkpoint work remains mandatory because the ext4 commit is already visible.
     pub(super) checkpoint: PendingCheckpoint,
-    /// Exact Cc/MM projection result; failure cannot roll back the durable mutation.
-    pub(super) stream_projection: DriverResult<()>,
+    /// Exact post-commit progress; failure cannot roll back the durable mutation.
+    pub(super) stream_projection: StreamProjectionOutcome,
 }
 
 impl DurablePublicationOutcome {
     /// Separates mandatory checkpoint ownership from the post-commit projection result.
-    pub(crate) fn into_parts(self) -> (PendingCheckpoint, DriverResult<()>) {
+    pub(crate) fn into_parts(self) -> (PendingCheckpoint, StreamProjectionOutcome) {
         (self.checkpoint, self.stream_projection)
     }
 }
