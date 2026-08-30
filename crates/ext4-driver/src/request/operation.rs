@@ -2159,6 +2159,20 @@ pub(crate) enum FlushRequestKind {
 enum FlushOperationState {
     /// IRP target has not yet been validated on the reactor thread.
     Ready(OwnedIrp),
+    /// FsRtl owns the file-specific flush IRP during an oplock break wait.
+    OplockDelegated {
+        /// Validated durability scope retained without IRP completion authority.
+        scope: crate::state::VolumeFlushScope,
+    },
+    /// The reactor restored the file-specific flush IRP after FsRtl completion.
+    OplockReady {
+        /// Unique top-level completion authority returned by FsRtl.
+        owned: OwnedIrp,
+        /// Exact immediate or callback-published oplock status.
+        status: wdk_sys::NTSTATUS,
+        /// Validated durability scope retained across the oplock wait.
+        scope: crate::state::VolumeFlushScope,
+    },
     /// One file stream is flushing dirty Cache Manager pages outside the actor.
     CacheFlushing {
         /// Unique top-level completion authority.
@@ -2193,6 +2207,14 @@ enum FlushOperationState {
     },
     /// Terminal completion consumed the IRP.
     Terminal,
+}
+
+/// Validated flush target plus the stream check required before file-specific cache writeback.
+struct PreparedFlushTarget {
+    /// Journal or raw-device durability scope selected by the opened target.
+    scope: crate::state::VolumeFlushScope,
+    /// Node-stream oplock check; absent for shutdown, raw-volume, and device-level flushes.
+    oplock: Option<OplockCheck>,
 }
 
 /// One non-retrying-at-the-domain-level device flush operation.
@@ -2230,19 +2252,22 @@ impl FlushRequestOperation {
         }
     }
 
-    /// Validates the FILE_OBJECT or device-level flush target and its durability scope.
+    /// Validates the FILE_OBJECT or device-level flush target and captures any stream oplock.
     /// # Errors
     ///
     /// Returns an error when identity, lifecycle, raw access, or volume health rejects the flush.
-    fn validate_target(
+    fn prepare_target(
         &self,
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
-    ) -> DriverResult<crate::state::VolumeFlushScope> {
+    ) -> DriverResult<PreparedFlushTarget> {
         owned.request().with_active(|active| {
             if self.kind == FlushRequestKind::Shutdown {
                 access.authorize_durability()?;
-                return Ok(crate::state::VolumeFlushScope::Filesystem);
+                return Ok(PreparedFlushTarget {
+                    scope: crate::state::VolumeFlushScope::Filesystem,
+                    oplock: None,
+                });
             }
             let stack = active.current_stack()?;
             match stack.file_object() {
@@ -2253,15 +2278,27 @@ impl FlushRequestOperation {
                         }
                         access.authorize_handle(opened.file_object())?;
                         access.authorize_durability()?;
-                        Ok(crate::state::VolumeFlushScope::Filesystem)
+                        let oplock = access
+                            .acquire_oplock_stream_lease(file_object)
+                            .map(OplockCheck::ordinary)?;
+                        Ok(PreparedFlushTarget {
+                            scope: crate::state::VolumeFlushScope::Filesystem,
+                            oplock: Some(oplock),
+                        })
                     }
-                    crate::state::OpenedFileObject::Volume(opened) => {
-                        access.volume_flush_scope(opened.raw_target())
-                    }
+                    crate::state::OpenedFileObject::Volume(opened) => access
+                        .volume_flush_scope(opened.raw_target())
+                        .map(|scope| PreparedFlushTarget {
+                            scope,
+                            oplock: None,
+                        }),
                 },
                 Err(DriverError::InvalidParameter) => {
                     access.authorize_durability()?;
-                    Ok(crate::state::VolumeFlushScope::Filesystem)
+                    Ok(PreparedFlushTarget {
+                        scope: crate::state::VolumeFlushScope::Filesystem,
+                        oplock: None,
+                    })
                 }
                 Err(error) => Err(error),
             }
@@ -2301,6 +2338,28 @@ impl FlushRequestOperation {
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
         let _status = owned.complete_result(result);
         OperationTransition::Complete
+    }
+
+    /// Starts file-cache writeback after the file-specific oplock check has completed.
+    fn begin_cache_flush(
+        mut self: Box<Self>,
+        mut owned: OwnedIrp,
+        scope: crate::state::VolumeFlushScope,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let work = match self.prepare_cache_flush(&mut owned, access) {
+            Ok(work) => work,
+            Err(error) => return Self::complete(owned, Err(error)),
+        };
+        if let Some(work) = work {
+            self.state = FlushOperationState::CacheFlushing { owned, scope };
+            OperationTransition::SubmitCacheWork {
+                work,
+                suspended: self,
+            }
+        } else {
+            self.continue_after_cache_flush(owned, scope, access)
+        }
     }
 
     /// Continues the journal and lower-device durability sequence after cache writeback.
@@ -2386,6 +2445,26 @@ impl FlushRequestOperation {
     }
 }
 
+impl OplockContinuation for FlushRequestOperation {
+    fn resume_after_oplock(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        status: wdk_sys::NTSTATUS,
+    ) -> Box<dyn CompletionOperation> {
+        let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
+        let FlushOperationState::OplockDelegated { scope } = state else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        self.state = FlushOperationState::OplockReady {
+            owned,
+            status,
+            scope,
+        };
+        self
+    }
+}
+
 impl MountedVolumeOperation for FlushRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
@@ -2427,22 +2506,21 @@ impl MountedVolumeOperation for FlushRequestOperation {
         match state {
             FlushOperationState::Ready(mut owned) => match event {
                 OperationEvent::Admitted => {
-                    let scope = match self.validate_target(&mut owned, access) {
-                        Ok(scope) => scope,
+                    let target = match self.prepare_target(&mut owned, access) {
+                        Ok(target) => target,
                         Err(error) => return Self::complete(owned, Err(error)),
                     };
-                    let work = match self.prepare_cache_flush(&mut owned, access) {
-                        Ok(work) => work,
-                        Err(error) => return Self::complete(owned, Err(error)),
-                    };
-                    if let Some(work) = work {
-                        self.state = FlushOperationState::CacheFlushing { owned, scope };
-                        OperationTransition::SubmitCacheWork {
-                            work,
+                    if let Some(check) = target.oplock {
+                        self.state = FlushOperationState::OplockDelegated {
+                            scope: target.scope,
+                        };
+                        OperationTransition::CheckOplock {
+                            check,
+                            owned,
                             suspended: self,
                         }
                     } else {
-                        self.continue_after_cache_flush(owned, scope, access)
+                        self.begin_cache_flush(owned, target.scope, access)
                     }
                 }
                 OperationEvent::CancelRequested => {
@@ -2459,6 +2537,35 @@ impl MountedVolumeOperation for FlushRequestOperation {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
+            FlushOperationState::OplockReady {
+                owned,
+                status,
+                scope,
+            } => match event {
+                OperationEvent::Admitted if status >= STATUS_SUCCESS => {
+                    self.begin_cache_flush(owned, scope, access)
+                }
+                OperationEvent::Admitted => {
+                    Self::complete(owned, Err(DriverError::OplockFailure(status)))
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                }
+                OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_)
+                | OperationEvent::BarrierReleased(_) => {
+                    Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                }
+            },
+            FlushOperationState::OplockDelegated { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             FlushOperationState::CacheFlushing { .. } => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
