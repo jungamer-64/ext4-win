@@ -3078,8 +3078,8 @@ struct MutationRequestOperation {
     write_effect_observed: bool,
     /// CLEANUP alone must consume its per-handle terminal barrier before releasing handle state.
     cleanup_barrier_released: bool,
-    /// Cache-map teardown failure returned only after cleanup-owned releases have completed.
-    cleanup_cache_error: Option<DriverError>,
+    /// Pre-cleanup failure returned only after cleanup-owned releases have completed.
+    cleanup_deferred_error: Option<DriverError>,
     /// Current consuming state.
     state: MutationOperationState,
 }
@@ -3138,8 +3138,8 @@ impl MutationRequestOperation {
     /// Retains the current node stream when this request class can break an oplock.
     ///
     /// Position-only updates and paging writeback do not change stream or namespace state, so
-    /// they bypass this break protocol. CREATE and CLEANUP require request-specific protocols and
-    /// therefore remain outside this ordinary-mutation boundary.
+    /// they bypass this break protocol. CREATE has a separate admission protocol; CLEANUP derives
+    /// its FsRtl flags from the exact opened handle before releasing any handle-owned state.
     /// # Errors
     ///
     /// Returns request decoding, FILE_OBJECT identity, or finite stream-lease failures before any
@@ -3176,9 +3176,23 @@ impl MutationRequestOperation {
                 MutationRequestKind::Create
                 | MutationRequestKind::SetVolumeInformation
                 | MutationRequestKind::AddEncryptionKey
-                | MutationRequestKind::RemoveEncryptionKey
-                | MutationRequestKind::Cleanup,
+                | MutationRequestKind::RemoveEncryptionKey,
             ) => false,
+            PreparedMutationRequest::Other(MutationRequestKind::Cleanup) => {
+                return owned.request().with_active(|active| {
+                    let file_object = active.current_stack()?.file_object()?;
+                    match crate::state::OpenedFileObject::decode(file_object)? {
+                        crate::state::OpenedFileObject::Node(opened) => {
+                            let deletion = opened.create_deletion();
+                            access
+                                .acquire_oplock_stream_lease(file_object)
+                                .map(|stream| OplockCheck::cleanup(stream, deletion))
+                                .map(Some)
+                        }
+                        crate::state::OpenedFileObject::Volume(_) => Ok(None),
+                    }
+                });
+            }
             PreparedMutationRequest::Other(MutationRequestKind::Write) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
@@ -3265,7 +3279,7 @@ impl MutationRequestOperation {
                     write_open: None,
                     write_effect_observed: false,
                     cleanup_barrier_released: false,
-                    cleanup_cache_error: None,
+                    cleanup_deferred_error: None,
                     state,
                 }
             },
@@ -3293,7 +3307,7 @@ impl MutationRequestOperation {
         owned: OwnedIrp,
         completion: TopLevelCompletion,
     ) -> OperationTransition {
-        if let Some(error) = self.cleanup_cache_error {
+        if let Some(error) = self.cleanup_deferred_error {
             if self.request.is_paging() {
                 self.trace.record(
                     OperationalPath::PagingWrite,
@@ -4229,8 +4243,10 @@ impl MountedVolumeOperation for MutationRequestOperation {
                         },
                         crate::irp::CacheWorkCompletion::Uninitialize(result),
                     ) => {
-                        if let Err(error) = result {
-                            self.cleanup_cache_error = Some(error);
+                        if let Err(error) = result
+                            && self.cleanup_deferred_error.is_none()
+                        {
+                            self.cleanup_deferred_error = Some(error);
                         }
                         return self.advance_resolution(
                             owned,
@@ -4389,11 +4405,24 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 owned,
                 status,
                 resume,
-            } => match event {
-                OperationEvent::CancelRequested => {
-                    self.complete_error(owned, DriverError::from(Error::OperationCancelled))
+            } => {
+                let oplock_error = match event {
+                    OperationEvent::CancelRequested => {
+                        Some(DriverError::from(Error::OperationCancelled))
+                    }
+                    OperationEvent::Admitted if status >= STATUS_SUCCESS => None,
+                    OperationEvent::Admitted => Some(DriverError::OplockFailure(status)),
+                    _ => return self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                };
+                if let Some(error) = oplock_error {
+                    if self.request.kind() != MutationRequestKind::Cleanup {
+                        return self.complete_error(owned, error);
+                    }
+                    if self.cleanup_deferred_error.is_none() {
+                        self.cleanup_deferred_error = Some(error);
+                    }
                 }
-                OperationEvent::Admitted if status >= STATUS_SUCCESS => match resume {
+                match resume {
                     OplockResume::ContinueResolution { epoch, resolve } => self.advance_resolution(
                         owned,
                         ResolutionAttempt {
@@ -4416,12 +4445,8 @@ impl MountedVolumeOperation for MutationRequestOperation {
                             Err(error) => self.complete_error(owned, error),
                         }
                     }
-                },
-                OperationEvent::Admitted => {
-                    self.complete_error(owned, DriverError::OplockFailure(status))
                 }
-                _ => self.complete_error(owned, DriverError::InvalidDeviceRequest),
-            },
+            }
             MutationOperationState::OplockDelegated { .. } => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
