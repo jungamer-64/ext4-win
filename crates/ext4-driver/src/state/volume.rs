@@ -917,6 +917,20 @@ impl MountedVolumeAccess<'_> {
             .acquire_oplock_stream_lease(file_object, NonNull::from(&*self.volume))
     }
 
+    /// Retains an already resident parent directory while FsRtl checks a namespace oplock.
+    /// # Errors
+    ///
+    /// Returns a finite deferred-lease failure. `None` means no parent stream exists in this
+    /// mounted ledger and therefore no parent oplock can be present.
+    pub(crate) fn acquire_parent_oplock_stream_lease(
+        &self,
+        parent: ext4_core::DirectoryNodeId,
+    ) -> DriverResult<Option<OplockStreamLease>> {
+        self.volume
+            .file_control_blocks
+            .acquire_parent_oplock_stream_lease(parent)
+    }
+
     /// Retains the exact stream already owned by a provisional create claim.
     /// # Errors
     ///

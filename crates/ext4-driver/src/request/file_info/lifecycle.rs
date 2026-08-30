@@ -151,6 +151,19 @@ impl PendingCleanupDeletion {
         self.node
     }
 
+    /// Returns the exact parent directory from which final cleanup will remove the pending link.
+    #[expect(
+        unsafe_code,
+        reason = "the cleanup FILE_OBJECT retains the FCB-owned target allocation"
+    )]
+    pub(crate) fn parent(&self) -> DirectoryNodeId {
+        unsafe {
+            // SAFETY: This cleanup plan retains the stable target in Pending state until publish,
+            // abort, or drop consumes the plan.
+            self.target.as_ref().parent()
+        }
+    }
+
     /// Prevents rollback after a lower write or flush can have an uncertain external effect.
     pub(crate) fn preserve_pending_after_uncertain_effect(&mut self) {
         self.abort_on_drop = false;

@@ -1814,6 +1814,42 @@ impl FileControlBlockLedger {
         Ok(OplockStreamLease { retained })
     }
 
+    /// Retains an already resident parent-directory stream for a namespace oplock check.
+    /// # Errors
+    ///
+    /// Returns a finite deferred-lease failure. Absence is successful because a directory without
+    /// a resident FCB cannot own a stream oplock in this mounted ledger.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes node lookup and deferred-lease acquisition"
+    )]
+    pub(super) fn acquire_parent_oplock_stream_lease(
+        &self,
+        parent: DirectoryNodeId,
+    ) -> DriverResult<Option<OplockStreamLease>> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
+            &*self.table.get()
+        };
+        let Some(fcb) = find_file_control_block_in_table(table, NodeId::Directory(parent)) else {
+            return Ok(None);
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The ledger resource remains held and the exact table member was selected by
+            // node identity above.
+            state.as_mut()
+        }
+        .acquire_deferred_lease()?;
+        Ok(Some(OplockStreamLease {
+            retained: DeferredStreamLease {
+                owner: NonNull::from(self),
+                fcb,
+            },
+        }))
+    }
+
     /// Acquires one oplock lease for an exact provisional create claim.
     /// # Errors
     ///

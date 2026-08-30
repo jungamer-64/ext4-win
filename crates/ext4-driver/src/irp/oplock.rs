@@ -65,6 +65,14 @@ impl OplockCheck {
         }
     }
 
+    /// Builds the parent-directory break check required before removing a file or link.
+    pub(crate) const fn parent_removal(stream: OplockStreamLease) -> Self {
+        Self {
+            stream,
+            flags: parent_removal_oplock_flags(),
+        }
+    }
+
     /// Builds the break check selected by an existing-stream create request.
     /// # Errors
     ///
@@ -110,6 +118,11 @@ const fn cleanup_oplock_flags(deletion: CreateDeletion) -> u32 {
         CreateDeletion::Retain => 0,
         CreateDeletion::DeleteOnClose => wdk_sys::OPLOCK_FLAG_CLOSING_DELETE_ON_CLOSE,
     }
+}
+
+/// Projects final cleanup deletion into the mandatory parent-oplock flags.
+const fn parent_removal_oplock_flags() -> u32 {
+    wdk_sys::OPLOCK_FLAG_PARENT_OBJECT | wdk_sys::OPLOCK_FLAG_REMOVING_FILE_OR_LINK
 }
 
 /// Backout authority created only after FsRtl establishes a create-time atomic oplock.
@@ -715,7 +728,10 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
 
 #[cfg(test)]
 mod tests {
-    use super::{OplockCallbackProtocol, classify_atomic_oplock_status, cleanup_oplock_flags};
+    use super::{
+        OplockCallbackProtocol, classify_atomic_oplock_status, cleanup_oplock_flags,
+        parent_removal_oplock_flags,
+    };
     use crate::irp::CreateDeletion;
     use crate::kernel::status::DriverError;
 
@@ -751,6 +767,17 @@ mod tests {
         assert_eq!(
             cleanup_oplock_flags(CreateDeletion::DeleteOnClose),
             wdk_sys::OPLOCK_FLAG_CLOSING_DELETE_ON_CLOSE
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when link removal omits either mandatory parent-directory flag.
+    #[test]
+    fn parent_removal_oplock_flags_are_exact() {
+        assert_eq!(
+            parent_removal_oplock_flags(),
+            wdk_sys::OPLOCK_FLAG_PARENT_OBJECT | wdk_sys::OPLOCK_FLAG_REMOVING_FILE_OR_LINK
         );
     }
 
