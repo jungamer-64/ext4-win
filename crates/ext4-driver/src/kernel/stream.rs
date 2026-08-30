@@ -322,62 +322,6 @@ impl StreamContext {
         }
     }
 
-    /// Binds the native header to its final-address Rust owner exactly once.
-    /// # Errors
-    ///
-    /// Returns an invariant error if construction attempts to bind twice or with a null owner.
-    pub(crate) fn bind_owner(&self, owner: NonNull<c_void>) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live native header and `owner` has reached stable storage.
-                ext4win_stream_bind_owner(
-                    self.header.as_ptr(),
-                    self.kind.native_tag(),
-                    owner.as_ptr(),
-                )
-            };
-            native_status(status)
-        }
-        #[cfg(test)]
-        {
-            self.owner
-                .compare_exchange(
-                    core::ptr::null_mut(),
-                    owner.as_ptr(),
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .map(|_| ())
-                .map_err(|_| DriverError::InternalInvariantViolation)
-        }
-    }
-
-    /// Binds this node stream to the FCB-owned FsRtl byte-range lock state exactly once.
-    /// # Errors
-    ///
-    /// Returns an invariant error if a volume stream is supplied or construction binds twice.
-    pub(crate) fn bind_byte_range_locks(
-        &self,
-        _locks: NonNull<wdk_sys::FILE_LOCK>,
-    ) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The enclosing boxed FCB gives both objects one stable shared lifetime.
-                ext4win_stream_bind_byte_range_locks(self.header.as_ptr(), _locks.as_ptr())
-            };
-            native_status(status)
-        }
-        #[cfg(test)]
-        {
-            if self.kind != StreamOwnerKind::Node {
-                return Err(DriverError::InternalInvariantViolation);
-            }
-            Ok(())
-        }
-    }
-
     /// Transfers one live filesystem-control IRP to the stream-owned FsRtl oplock package.
     ///
     /// # Safety
@@ -563,63 +507,6 @@ impl StreamContext {
                 .lock()
                 .map(|sizes| *sizes)
                 .map_err(|_| DriverError::InternalInvariantViolation)
-        }
-    }
-
-    /// Publishes one epoch-tagged node metadata snapshot and its complete size tuple.
-    ///
-    /// The native boundary updates the advanced header, Fast I/O query records, and any live Cache
-    /// Manager map under one stream resource. Callers may invoke this only after ext4 durability
-    /// and visibility publication for `epoch`.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager status or an invariant error for a malformed stream or
-    /// non-monotonic epoch.
-    pub(crate) fn publish_node_metadata(
-        &self,
-        sizes: StreamSizes,
-        snapshot: NodeMetadataSnapshot,
-        epoch: EpochSequence,
-    ) -> DriverResult<()> {
-        if self.kind != StreamOwnerKind::Node {
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        let metadata = NativeStreamMetadata::from_snapshot(snapshot, epoch);
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live node header; native code borrows the complete fixed
-                // projection and contains every Cc exception before returning an NTSTATUS.
-                ext4win_stream_publish_metadata(
-                    self.header.as_ptr(),
-                    sizes.allocation_size,
-                    sizes.file_size,
-                    sizes.valid_data_length,
-                    sizes.allocation_charge,
-                    core::ptr::from_ref(&metadata),
-                )
-            };
-            native_status(status)
-        }
-        #[cfg(test)]
-        {
-            let mut current_metadata = self
-                .metadata
-                .lock()
-                .map_err(|_| DriverError::InternalInvariantViolation)?;
-            if current_metadata
-                .as_ref()
-                .is_some_and(|current| metadata.epoch <= current.epoch)
-            {
-                return Err(DriverError::InternalInvariantViolation);
-            }
-            let mut current_sizes = self
-                .sizes
-                .lock()
-                .map_err(|_| DriverError::InternalInvariantViolation)?;
-            *current_sizes = sizes;
-            *current_metadata = Some(metadata);
-            Ok(())
         }
     }
 
@@ -1120,15 +1007,6 @@ unsafe extern "system" {
         stream_header_out: *mut wdk_sys::PVOID,
     ) -> NTSTATUS;
 
-    fn ext4win_stream_bind_owner(
-        stream_header: wdk_sys::PVOID,
-        expected_kind: wdk_sys::ULONG,
-        owner: wdk_sys::PVOID,
-    ) -> NTSTATUS;
-    fn ext4win_stream_bind_byte_range_locks(
-        stream_header: wdk_sys::PVOID,
-        byte_range_locks: *mut wdk_sys::FILE_LOCK,
-    ) -> NTSTATUS;
     fn ext4win_stream_oplock_fsctrl(
         stream_header: wdk_sys::PVOID,
         irp: *mut wdk_sys::IRP,
@@ -1172,15 +1050,6 @@ unsafe extern "system" {
         file_size_out: *mut i64,
         valid_data_length_out: *mut i64,
         allocation_charge_out: *mut i64,
-    ) -> NTSTATUS;
-
-    fn ext4win_stream_publish_metadata(
-        stream_header: wdk_sys::PVOID,
-        allocation_size: i64,
-        file_size: i64,
-        valid_data_length: i64,
-        allocation_charge: i64,
-        metadata: *const NativeStreamMetadata,
     ) -> NTSTATUS;
 
     fn ext4win_stream_set_delete_pending(
