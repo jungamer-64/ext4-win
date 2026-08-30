@@ -3624,7 +3624,7 @@ mod tests {
         let Some(parsed) = parsed.ok() else {
             return;
         };
-        assert_eq!(parsed.e2fsprogs_version, "1.47.2");
+        assert_eq!(parsed.e2fsprogs_version, "9.8.7");
         assert_eq!(parsed.fake_time, 1_700_000_000);
         assert_eq!(parsed.fixtures.len(), 3);
 
@@ -3839,7 +3839,7 @@ mod tests {
     fn fixture_manifest(first_filesystem: &str) -> String {
         let digest = "0".repeat(64);
         format!(
-            "e2fsprogs 1.47.2\n\
+            "e2fsprogs 9.8.7\n\
              fake-time 1700000000\n\
              fixture external-1k-v2-32 1024 2 32 10000 11111111-1111-4111-8111-111111111111 {first_filesystem} {digest} aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa external-1k-v2-32.journal.img {digest}\n\
              fixture external-2k-v3-64 2048 3 64 27 22222222-2222-4222-8222-222222222222 external-2k-v3-64.filesystem.img {digest} bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb external-2k-v3-64.journal.img {digest}\n\
