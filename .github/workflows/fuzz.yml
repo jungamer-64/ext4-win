@@ -16,7 +16,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned Rust and cargo-fuzz
         run: |
-          rustup toolchain install --profile minimal
+          rustup toolchain install
           cargo_fuzz_version="$(tr -d '\r\n' < fuzz/cargo-fuzz.version)"
           cargo install --locked cargo-fuzz --version "${cargo_fuzz_version}"
       - name: Replay tracked corpora
@@ -29,7 +29,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned Rust and cargo-fuzz
         run: |
-          rustup toolchain install --profile minimal
+          rustup toolchain install
           cargo_fuzz_version="$(tr -d '\r\n' < fuzz/cargo-fuzz.version)"
           cargo install --locked cargo-fuzz --version "${cargo_fuzz_version}"
       - name: Run scheduled fuzz campaigns
