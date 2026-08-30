@@ -5,6 +5,12 @@ using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace Ext4Win {
+    public enum LiveVolumeMountState {
+        Absent,
+        Dismounted,
+        Mounted,
+    }
+
     // Read-only identity lookup. Discovery must already have registered a volume
     // with Mount Manager; this helper cannot register or retag a partition.
     public static class LiveVolume {
@@ -24,6 +30,11 @@ namespace Ext4Win {
         private static extern bool DeviceIoControl(SafeFileHandle handle, uint code,
             IntPtr input, uint inputLength, byte[] output, uint outputLength,
             out uint returned, IntPtr overlapped);
+        [DllImport("kernel32.dll", EntryPoint = "DeviceIoControl", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DeviceIoControlWithoutOutput(SafeFileHandle handle, uint code,
+            IntPtr input, uint inputLength, IntPtr output, uint outputLength,
+            out uint returned, IntPtr overlapped);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool GetVolumeNameForVolumeMountPoint(string path,
@@ -35,6 +46,42 @@ namespace Ext4Win {
                 throw new Win32Exception(Marshal.GetLastWin32Error());
             }
             return name.ToString();
+        }
+
+        // A dismount acknowledgement can be lost if the host process exits after the FSCTL.
+        // Recovery queries the recorded volume rather than treating a repeated failure as proof
+        // that the original request did not commit.
+        public static LiveVolumeMountState MountState(string volume) {
+            using (SafeFileHandle handle = CreateFile(volume.TrimEnd('\\'),
+                0x80000000, 7, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+                if (handle.IsInvalid) {
+                    return MountStateFromError(Marshal.GetLastWin32Error());
+                }
+                uint returned;
+                // FSCTL_IS_VOLUME_MOUNTED, with no input or output payload.
+                if (DeviceIoControlWithoutOutput(handle, 0x00090028,
+                    IntPtr.Zero, 0, IntPtr.Zero, 0, out returned, IntPtr.Zero)) {
+                    if (returned != 0) {
+                        throw new InvalidOperationException(
+                            "FSCTL_IS_VOLUME_MOUNTED returned an unexpected payload");
+                    }
+                    return LiveVolumeMountState.Mounted;
+                }
+                return MountStateFromError(Marshal.GetLastWin32Error());
+            }
+        }
+
+        private static LiveVolumeMountState MountStateFromError(int error) {
+            // The device path disappears after physical retirement. A logically dismounted
+            // volume remains identifiable but rejects mounted-only access with NOT_READY or
+            // UNRECOGNIZED_VOLUME.
+            if (error == 2 || error == 3) {
+                return LiveVolumeMountState.Absent;
+            }
+            if (error == 21 || error == 1005) {
+                return LiveVolumeMountState.Dismounted;
+            }
+            throw new Win32Exception(error);
         }
 
         // Match the independently recorded GPT partition ID as well as the disk
