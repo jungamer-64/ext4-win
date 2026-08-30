@@ -5,7 +5,7 @@ use super::*;
 /// VCB-owned FCB table and share accounting protected by one concrete executive resource.
 pub(super) struct FileControlBlockLedger {
     /// Mutable ledger state reachable only while `lock` is held.
-    pub(super) table: UnsafeCell<DriverVec<Box<FileControlBlock>>>,
+    pub(super) table: UnsafeCell<DriverVec<Pin<Box<FileControlBlock>>>>,
     /// Node-keyed mutation reservations that remain authoritative without a resident FCB.
     oplock_mutations: UnsafeCell<DriverVec<OplockMutationEntry>>,
     /// Stable-address executive resource for every table/share/reference transition.
@@ -478,12 +478,13 @@ impl StreamPublicationLease {
     /// Publishes one complete epoch-tagged stream projection through the native Cc/MM boundary.
     /// # Errors
     ///
-    /// Returns the exact Cache Manager publication failure.
+    /// Returns a pre-commit native-header failure separately from a committed native-header
+    /// publication whose Cache Manager projection failed.
     fn publish(
         &self,
         metadata: NodeStreamMetadata,
         epoch: ext4_core::EpochSequence,
-    ) -> DriverResult<()> {
+    ) -> DriverResult<StreamMetadataPublication> {
         let fcb = unsafe {
             // SAFETY: This lease keeps the FCB table entry alive until its own Drop completes.
             self.retained.fcb.as_ref()
@@ -978,7 +979,7 @@ impl FileControlBlockLedger {
     ) -> DriverResult<NewFileControlBlockAdmission> {
         let node = stream.node();
         let candidate = self.staged_file_control_block(volume, stream, trace)?;
-        let fcb = NonNull::from(candidate.as_ref());
+        let fcb = NonNull::from(candidate.as_ref().get_ref());
         let mut discarded = None;
         let mut removed = None;
         let result = {
@@ -1078,7 +1079,7 @@ impl FileControlBlockLedger {
                     open_count,
                 })
             } else {
-                let fcb = NonNull::from(candidate.as_ref());
+                let fcb = NonNull::from(candidate.as_ref().get_ref());
                 match table.try_push_owned(candidate) {
                     Ok(()) => match record_file_control_block_share(
                         table,
@@ -1120,11 +1121,12 @@ impl FileControlBlockLedger {
         volume: NonNull<VolumeControlBlock>,
         stream: StagedNodeStreamMetadata,
         trace: OperationalTrace,
-    ) -> DriverResult<Box<FileControlBlock>> {
+    ) -> DriverResult<Pin<Box<FileControlBlock>>> {
         let candidate = memory::boxed_try_with(|| {
             FileControlBlock::try_new_staged(volume, NonNull::from(self), stream, trace)
         })?;
-        candidate.bind_stream_owner()?;
+        let candidate = Box::into_pin(candidate);
+        candidate.as_ref().bind_stream_owner()?;
         Ok(candidate)
     }
 
@@ -1137,11 +1139,12 @@ impl FileControlBlockLedger {
         volume: NonNull<VolumeControlBlock>,
         stream: CommittedNodeStreamMetadata,
         trace: OperationalTrace,
-    ) -> DriverResult<Box<FileControlBlock>> {
+    ) -> DriverResult<Pin<Box<FileControlBlock>>> {
         let candidate = memory::boxed_try_with(|| {
             FileControlBlock::try_new_committed(volume, NonNull::from(self), stream, trace)
         })?;
-        candidate.bind_stream_owner()?;
+        let candidate = Box::into_pin(candidate);
+        candidate.as_ref().bind_stream_owner()?;
         Ok(candidate)
     }
 
@@ -1486,7 +1489,7 @@ impl FileControlBlockLedger {
                     let lease = StreamCacheLease {
                         retained: DeferredStreamLease {
                             owner: NonNull::from(self),
-                            fcb: NonNull::from(fcb.as_ref()),
+                            fcb: NonNull::from(fcb.as_ref().get_ref()),
                         },
                     };
                     if let Err(error) = remaining.push_reserved_owned(lease) {
@@ -1623,7 +1626,7 @@ impl FileControlBlockLedger {
             &*self.table.get()
         };
         for candidate in table.iter() {
-            let fcb = NonNull::from(candidate.as_ref());
+            let fcb = NonNull::from(candidate.as_ref().get_ref());
             let state = unsafe {
                 // SAFETY: The table owns this FCB and the resource remains held for mutation.
                 &mut *candidate.open_state.get()
@@ -1892,13 +1895,55 @@ impl FileControlBlockLedger {
         &self,
         updates: PreparedStreamMetadataPublications,
         epoch: ext4_core::EpochSequence,
-    ) -> DriverResult<()> {
-        for update in updates.nodes.iter() {
-            if let Some(lease) = self.acquire_stream_publication_lease(update.node())? {
-                lease.publish(*update, epoch)?;
+    ) -> StreamProjectionOutcome {
+        let mut published_streams = 0usize;
+        let mut first_failure = None;
+        let mut remaining_updates = updates.nodes.iter();
+        while let Some(update) = remaining_updates.next() {
+            let unexamined_updates = remaining_updates.len();
+            let lease = match self.acquire_stream_publication_lease(update.node()) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return StreamProjectionOutcome::Incomplete(StreamProjectionFailure {
+                        error: first_failure.unwrap_or(error),
+                        published_streams,
+                        unexamined_updates,
+                    });
+                }
+            };
+            let Some(lease) = lease else {
+                continue;
+            };
+            match lease.publish(*update, epoch) {
+                Ok(StreamMetadataPublication::Complete) => {
+                    published_streams = published_streams.checked_add(1).unwrap_or_else(|| {
+                        KernelWideInconsistency::file_control_block_ownership_corruption()
+                            .bugcheck()
+                    });
+                }
+                Ok(StreamMetadataPublication::CacheProjectionFailed { status }) => {
+                    published_streams = published_streams.checked_add(1).unwrap_or_else(|| {
+                        KernelWideInconsistency::file_control_block_ownership_corruption()
+                            .bugcheck()
+                    });
+                    first_failure.get_or_insert(DriverError::CacheManagerFailure(status));
+                }
+                Err(error) => {
+                    return StreamProjectionOutcome::Incomplete(StreamProjectionFailure {
+                        error: first_failure.unwrap_or(error),
+                        published_streams,
+                        unexamined_updates,
+                    });
+                }
             }
         }
-        Ok(())
+        first_failure.map_or(StreamProjectionOutcome::Complete, |error| {
+            StreamProjectionOutcome::Incomplete(StreamProjectionFailure {
+                error,
+                published_streams,
+                unexamined_updates: 0,
+            })
+        })
     }
 
     /// Acquires an explicit stream lease before releasing the ledger resource for a Cc/MM call.
@@ -2101,7 +2146,7 @@ impl FileControlBlockLedger {
         };
         if !table
             .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
         {
             return Err(DriverError::InternalInvariantViolation);
         }
@@ -2138,7 +2183,7 @@ impl FileControlBlockLedger {
         };
         if !table
             .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
         {
             return Err(DriverError::InternalInvariantViolation);
         }
@@ -2185,7 +2230,7 @@ impl FileControlBlockLedger {
         };
         if !table
             .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
         {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         }
@@ -2262,7 +2307,7 @@ impl FileControlBlockLedger {
     )]
     fn validate_deferred_stream(
         &self,
-        table: &DriverVec<Box<FileControlBlock>>,
+        table: &DriverVec<Pin<Box<FileControlBlock>>>,
         file_object: ActiveFileObject<'_>,
         volume: NonNull<VolumeControlBlock>,
         target: DeferredStreamTarget,
@@ -2281,7 +2326,7 @@ impl FileControlBlockLedger {
         .cast::<FileControlBlock>();
         if !table
             .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
         {
             return Err(DriverError::InvalidParameter);
         }
@@ -2330,7 +2375,7 @@ impl FileControlBlockLedger {
             };
             let Some(index) = table
                 .iter()
-                .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+                .position(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
             else {
                 KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
             };
@@ -2480,16 +2525,26 @@ impl VolumeControlBlock {
             volume_control: VolumeControlPlane::mounted(),
             runtime: VolumeRuntime::try_new(mount, storage)?,
             stream_context: StreamContext::try_new_volume(StreamSizes::EMPTY, trace)?,
+            _pin: PhantomPinned,
         })
     }
 
-    /// Binds the volume stream header after the VCB reaches its final heap address.
+    /// Binds the volume stream header after the VCB has been pinned at its final heap address.
     /// # Errors
     ///
     /// Returns an invariant error if mount publication attempts to bind this VCB more than once.
-    pub(crate) fn bind_stream_owner(&self) -> DriverResult<()> {
-        self.stream_context
-            .bind_owner(NonNull::from(self).cast::<c_void>())
+    #[expect(
+        unsafe_code,
+        reason = "Pin and private construction establish the native VCB owner lifetime"
+    )]
+    pub(crate) fn bind_stream_owner(self: Pin<&Self>) -> DriverResult<()> {
+        let vcb = self.get_ref();
+        unsafe {
+            // SAFETY: `PhantomPinned` prevents safe relocation and the stream is destroyed before
+            // the enclosing pinned VCB allocation is released.
+            vcb.stream_context
+                .bind_volume_owner(NonNull::from(vcb).cast::<c_void>())
+        }
     }
 
     /// Returns the advanced-header address published through direct volume FILE_OBJECTs.
@@ -2665,7 +2720,7 @@ impl PendingChildCreation {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 fn record_reused_file_control_block_open(
-    table: &DriverVec<Box<FileControlBlock>>,
+    table: &DriverVec<Pin<Box<FileControlBlock>>>,
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
     desired_access: GrantedAccess,
@@ -2693,7 +2748,7 @@ fn record_reused_file_control_block_open(
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 fn record_file_control_block_share(
-    table: &DriverVec<Box<FileControlBlock>>,
+    table: &DriverVec<Pin<Box<FileControlBlock>>>,
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
     desired_access: GrantedAccess,
@@ -2716,13 +2771,13 @@ fn record_file_control_block_share(
     reason = "the ledger resource uniquely owns stream-lifetime mutation and table removal"
 )]
 fn release_file_object_lease_in_table(
-    table: &mut DriverVec<Box<FileControlBlock>>,
+    table: &mut DriverVec<Pin<Box<FileControlBlock>>>,
     fcb: NonNull<FileControlBlock>,
     native_resident: bool,
-) -> Option<Box<FileControlBlock>> {
+) -> Option<Pin<Box<FileControlBlock>>> {
     let Some(index) = table
         .iter()
-        .position(|candidate| NonNull::from(candidate.as_ref()) == fcb)
+        .position(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
     else {
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
     };
@@ -2794,24 +2849,24 @@ fn oplock_grant_available(mutations: &DriverVec<OplockMutationEntry>, node: Node
 
 /// Finds a VCB-owned FCB by node identity.
 fn find_file_control_block_in_table(
-    table: &DriverVec<Box<FileControlBlock>>,
+    table: &DriverVec<Pin<Box<FileControlBlock>>>,
     node: NodeId,
 ) -> Option<NonNull<FileControlBlock>> {
     table
         .iter()
         .find(|fcb| fcb.node() == node)
-        .map(|fcb| NonNull::from(fcb.as_ref()))
+        .map(|fcb| NonNull::from(fcb.as_ref().get_ref()))
 }
 
 /// Returns one ledger-owned FCB's open-state address after validating table ownership.
 fn ledger_file_control_block_open_state(
-    table: &DriverVec<Box<FileControlBlock>>,
+    table: &DriverVec<Pin<Box<FileControlBlock>>>,
     fcb: NonNull<FileControlBlock>,
 ) -> NonNull<FileControlBlockOpenState> {
     let fcb = table
         .iter()
-        .find(|candidate| NonNull::from(candidate.as_ref()) == fcb)
-        .map(Box::as_ref)
+        .find(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
+        .map(|candidate| candidate.as_ref().get_ref())
         .unwrap_or_else(|| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
         });

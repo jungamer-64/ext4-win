@@ -7,6 +7,10 @@
 #define EXT4WIN_MAX_QUERY_OUTPUT_SIZE (128UL * 1024UL)
 #define EXT4WIN_MAX_EA_NAME_LIST_SIZE (64UL * 1024UL)
 #define EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE (64UL * 1024UL - sizeof(WCHAR))
+#define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS                                      \
+    (FsRtlIsNtstatusExpected((NTSTATUS)GetExceptionCode())                     \
+         ? EXCEPTION_EXECUTE_HANDLER                                           \
+         : EXCEPTION_CONTINUE_SEARCH)
 
 /*
  * This translation unit is the only boundary that touches neither-I/O security
@@ -102,7 +106,7 @@ ext4win_measure_relative_sid(
     _Inout_ PULONG measured_length)
 {
     const ULONG prefix_length = (ULONG)sizeof(EXT4WIN_SID_PREFIX);
-    EXT4WIN_SID_PREFIX prefix;
+    EXT4WIN_SID_PREFIX prefix = {0};
     PVOID prefix_address;
     PVOID sid_address;
     ULONG prefix_end;
@@ -121,10 +125,19 @@ ext4win_measure_relative_sid(
         return status;
     }
 
-    if (requestor_mode == UserMode) {
-        ProbeForRead(prefix_address, prefix_length, TYPE_ALIGNMENT(UCHAR));
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(prefix_address, prefix_length, TYPE_ALIGNMENT(UCHAR));
+        }
+        RtlCopyMemory(&prefix, prefix_address, prefix_length);
     }
-    RtlCopyMemory(&prefix, prefix_address, prefix_length);
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
     ext4win_extend_measured_length(measured_length, prefix_end);
 
     sid_length = prefix_length +
@@ -153,7 +166,7 @@ ext4win_measure_relative_acl(
     _Inout_ PULONG measured_length)
 {
     const ULONG header_length = (ULONG)sizeof(ACL);
-    ACL header;
+    ACL header = {0};
     PVOID header_address;
     PVOID acl_address;
     ULONG header_end;
@@ -172,10 +185,19 @@ ext4win_measure_relative_acl(
         return status;
     }
 
-    if (requestor_mode == UserMode) {
-        ProbeForRead(header_address, header_length, TYPE_ALIGNMENT(UCHAR));
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(header_address, header_length, TYPE_ALIGNMENT(UCHAR));
+        }
+        RtlCopyMemory(&header, header_address, header_length);
     }
-    RtlCopyMemory(&header, header_address, header_length);
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
     ext4win_extend_measured_length(measured_length, header_end);
 
     acl_length = (ULONG)header.AclSize;
@@ -207,7 +229,7 @@ ext4win_measure_relative_security_descriptor(
     _Out_ PULONG measured_length_out)
 {
     const ULONG header_length = (ULONG)sizeof(SECURITY_DESCRIPTOR_RELATIVE);
-    SECURITY_DESCRIPTOR_RELATIVE header;
+    SECURITY_DESCRIPTOR_RELATIVE header = {0};
     ULONG measured_length;
     NTSTATUS status;
 
@@ -220,10 +242,19 @@ ext4win_measure_relative_security_descriptor(
         return STATUS_BUFFER_OVERFLOW;
     }
 
-    if (requestor_mode == UserMode) {
-        ProbeForRead(source, header_length, TYPE_ALIGNMENT(UCHAR));
+    status = STATUS_SUCCESS;
+    __try {
+        if (requestor_mode == UserMode) {
+            ProbeForRead(source, header_length, TYPE_ALIGNMENT(UCHAR));
+        }
+        RtlCopyMemory(&header, source, header_length);
     }
-    RtlCopyMemory(&header, source, header_length);
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
+    }
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
 
     if ((header.Control & SE_SELF_RELATIVE) == 0) {
         return STATUS_INVALID_SECURITY_DESCR;
@@ -283,6 +314,8 @@ ext4win_release_query_security_output_internal(
         return;
     }
 
+    /* Only the successful capture handle can reach this private destructor. */
+#pragma warning(suppress: 6001)
     if (output->Mdl != NULL) {
         MmUnlockPages(output->Mdl);
         IoFreeMdl(output->Mdl);
@@ -362,6 +395,8 @@ ext4win_capture_query_security_output(
         return STATUS_INVALID_USER_BUFFER;
     }
 
+    /* Successful return transfers this allocation through output_out to the Rust owner. */
+#pragma warning(suppress: 6014)
     output = (PEXT4WIN_QUERY_SECURITY_OUTPUT)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(*output),
@@ -369,7 +404,10 @@ ext4win_capture_query_security_output(
     if (output == NULL) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    RtlZeroMemory(output, sizeof(*output));
 
+    /* IoAllocateMdl consumes the untrusted virtual address, not its uninitialized contents. */
+#pragma warning(suppress: 6001)
     output->Mdl = IoAllocateMdl(
         requestor_buffer,
         required_length,
@@ -385,7 +423,7 @@ ext4win_capture_query_security_output(
     __try {
         MmProbeAndLockPages(output->Mdl, requestor_mode, IoWriteAccess);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
@@ -443,6 +481,8 @@ VOID
 NTAPI
 ext4win_release_query_security_output(_Frees_ptr_opt_ PVOID output)
 {
+    /* Rust returns only the initialized opaque handle produced by the capture call. */
+#pragma warning(suppress: 6001)
     ext4win_release_query_security_output_internal(
         (PEXT4WIN_QUERY_SECURITY_OUTPUT)output);
 }
@@ -500,7 +540,7 @@ ext4win_capture_set_security_descriptor(
             maximum_length,
             &candidate_length);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
@@ -527,7 +567,7 @@ ext4win_capture_set_security_descriptor(
         }
         RtlCopyMemory(snapshot, source, candidate_length);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
@@ -593,22 +633,18 @@ ext4win_capture_bounded_input(
     _In_ ULONG maximum_length,
     _In_ ULONG alignment,
     _In_ KPROCESSOR_MODE access_mode,
-    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Outptr_result_bytebuffer_maybenull_(*length_out) PVOID *snapshot_out,
     _Out_ PULONG length_out)
 {
     PVOID snapshot;
     NTSTATUS status;
 
-    if (snapshot_out != NULL) {
-        *snapshot_out = NULL;
-    }
-    if (length_out != NULL) {
-        *length_out = 0;
-    }
     if ((snapshot_out == NULL) || (length_out == NULL) ||
         !ext4win_is_requestor_mode_valid(access_mode)) {
         return STATUS_INVALID_PARAMETER;
     }
+    *snapshot_out = NULL;
+    *length_out = 0;
     if (length > maximum_length) {
         return STATUS_INVALID_BUFFER_SIZE;
     }
@@ -634,7 +670,7 @@ ext4win_capture_bounded_input(
         }
         RtlCopyMemory(snapshot, source, length);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {
@@ -655,7 +691,7 @@ ext4win_capture_ea_name_list(
     _In_reads_bytes_(length) const VOID *source,
     _In_ ULONG length,
     _In_ KPROCESSOR_MODE requestor_mode,
-    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Outptr_result_bytebuffer_maybenull_(*length_out) PVOID *snapshot_out,
     _Out_ PULONG length_out)
 {
     return ext4win_capture_bounded_input(
@@ -674,7 +710,7 @@ NTSTATUS
 NTAPI
 ext4win_capture_io_manager_directory_pattern(
     _In_ PCUNICODE_STRING source,
-    _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
+    _Outptr_result_bytebuffer_maybenull_(*length_out) PVOID *snapshot_out,
     _Out_ PULONG length_out)
 {
     UNICODE_STRING header = {0};
@@ -698,7 +734,7 @@ ext4win_capture_io_manager_directory_pattern(
         /* NtQueryDirectoryFile has already captured this descriptor for the IRP. */
         RtlCopyMemory(&header, source, sizeof(header));
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
     }
     if (!NT_SUCCESS(status)) {

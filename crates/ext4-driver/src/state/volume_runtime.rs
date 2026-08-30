@@ -29,6 +29,10 @@ pub(crate) enum VolumeFailureState {
     CommittedButUnpublished {
         /// Exact Cc/MM status returned to the committing IRP and later operations.
         status: NTSTATUS,
+        /// Number of live native stream headers that reached the durable epoch.
+        published_streams: usize,
+        /// Number of prepared update records not examined after a pre-header-commit failure.
+        unexamined_updates: usize,
     },
     /// Cache Manager could not establish dirty-page writeback durability.
     CacheWritebackFailed {
@@ -50,7 +54,8 @@ impl VolumeFailureState {
             Self::DegradedReadOnly | Self::RecoveryRequired | Self::Failed => {
                 Err(DriverError::VolumeDismounted)
             }
-            Self::CommittedButUnpublished { status } | Self::CacheWritebackFailed { status } => {
+            Self::CommittedButUnpublished { status, .. }
+            | Self::CacheWritebackFailed { status } => {
                 Err(DriverError::CacheManagerFailure(status))
             }
         }
@@ -66,7 +71,7 @@ impl VolumeFailureState {
                 Ok(())
             }
             Self::RecoveryRequired | Self::Failed => Err(DriverError::VolumeDismounted),
-            Self::CommittedButUnpublished { status } => {
+            Self::CommittedButUnpublished { status, .. } => {
                 Err(DriverError::CacheManagerFailure(status))
             }
         }
@@ -101,14 +106,23 @@ impl VolumeFailureState {
     }
 
     /// Records the exact post-commit publication failure as a non-retryable terminal state.
-    const fn publication_failed(self, status: NTSTATUS) -> Self {
+    const fn publication_failed(
+        self,
+        status: NTSTATUS,
+        published_streams: usize,
+        unexamined_updates: usize,
+    ) -> Self {
         match self {
             Self::Failed => Self::Failed,
-            Self::CommittedButUnpublished { status } => Self::CommittedButUnpublished { status },
+            Self::CommittedButUnpublished { .. } => self,
             Self::Operational
             | Self::DegradedReadOnly
             | Self::RecoveryRequired
-            | Self::CacheWritebackFailed { .. } => Self::CommittedButUnpublished { status },
+            | Self::CacheWritebackFailed { .. } => Self::CommittedButUnpublished {
+                status,
+                published_streams,
+                unexamined_updates,
+            },
         }
     }
 
@@ -506,9 +520,16 @@ impl VolumeRuntime {
         self.failure = self.failure.read_unreliable();
     }
 
-    /// Records an exact post-commit Cc/MM publication failure.
-    pub(crate) fn record_publication_failure(&mut self, status: NTSTATUS) {
-        self.failure = self.failure.publication_failed(status);
+    /// Records an exact post-commit Cc/MM publication failure and stream progress.
+    pub(crate) fn record_publication_failure(
+        &mut self,
+        status: NTSTATUS,
+        published_streams: usize,
+        unexamined_updates: usize,
+    ) {
+        self.failure =
+            self.failure
+                .publication_failed(status, published_streams, unexamined_updates);
     }
 
     /// Records the exact dirty-page writeback failure returned by Cache Manager.
@@ -612,7 +633,8 @@ mod tests {
             VolumeFailureState::Operational.read_unreliable(),
             VolumeFailureState::Failed
         );
-        let publication = VolumeFailureState::Operational.publication_failed(publication_status);
+        let publication =
+            VolumeFailureState::Operational.publication_failed(publication_status, 2, 1);
         assert_eq!(
             publication.authorize_mutation(),
             Err(crate::kernel::status::DriverError::CacheManagerFailure(
@@ -622,7 +644,7 @@ mod tests {
         assert_eq!(publication.durable_abort(), publication);
         assert_eq!(publication.durability_unknown(), publication);
         assert_eq!(
-            publication.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
+            publication.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES, 0, 3),
             publication
         );
         let writeback = VolumeFailureState::Operational.cache_writeback_failed(publication_status);
@@ -639,9 +661,11 @@ mod tests {
         );
         assert_eq!(writeback.durability_unknown(), writeback);
         assert_eq!(
-            writeback.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
+            writeback.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES, 4, 2),
             VolumeFailureState::CommittedButUnpublished {
                 status: wdk_sys::STATUS_INSUFFICIENT_RESOURCES,
+                published_streams: 4,
+                unexamined_updates: 2,
             }
         );
     }
@@ -663,6 +687,8 @@ mod tests {
         ));
         let failed = VolumeFailureState::CommittedButUnpublished {
             status: wdk_sys::STATUS_IO_DEVICE_ERROR,
+            published_streams: 1,
+            unexamined_updates: 0,
         };
         let error = crate::kernel::status::DriverError::CacheManagerFailure(
             wdk_sys::STATUS_IO_DEVICE_ERROR,

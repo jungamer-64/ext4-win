@@ -13,8 +13,9 @@ use ext4_core::{
 #[cfg(test)]
 use std::sync::Mutex;
 
+use wdk_sys::NTSTATUS;
 #[cfg(not(test))]
-use wdk_sys::{NTSTATUS, STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
+use wdk_sys::{STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
 
 #[cfg(not(test))]
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -163,6 +164,25 @@ impl NativeStreamMetadata {
     }
 }
 
+/// Result after the native header has committed one epoch-tagged metadata projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StreamMetadataPublication {
+    /// Native header and any present Cache Manager map accepted the projection.
+    Complete,
+    /// Native header committed, but Cache Manager failed or raised after that commit point.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "host stream emulation has no Cache Manager failure source"
+        )
+    )]
+    CacheProjectionFailed {
+        /// Exact Cache Manager status or captured exception code.
+        status: NTSTATUS,
+    },
+}
+
 /// Rounds a Windows section bound to the mounted ext4 allocation cluster.
 /// # Errors
 ///
@@ -227,8 +247,8 @@ impl core::fmt::Debug for StreamContext {
 impl StreamContext {
     /// Allocates a node advanced header in an unbound construction state.
     ///
-    /// The enclosing Rust owner must reach stable storage and call [`Self::bind_owner`] before the
-    /// header can be published to a `FILE_OBJECT`.
+    /// The enclosing Rust owner must reach pinned storage and call [`Self::bind_node_owner`]
+    /// before the header can be published to a `FILE_OBJECT`.
     /// # Errors
     ///
     /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
@@ -241,8 +261,8 @@ impl StreamContext {
 
     /// Allocates a node advanced header with one coherent committed metadata projection.
     ///
-    /// The enclosing Rust owner must reach stable storage and call [`Self::bind_owner`] before the
-    /// header can be published to a `FILE_OBJECT`.
+    /// The enclosing Rust owner must reach pinned storage and call [`Self::bind_node_owner`]
+    /// before the header can be published to a `FILE_OBJECT`.
     /// # Errors
     ///
     /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
@@ -319,6 +339,82 @@ impl StreamContext {
                 metadata: Mutex::new(metadata),
                 delete_pending: AtomicBool::new(false),
             })
+        }
+    }
+
+    /// Atomically binds one pinned FCB and its embedded byte-range lock package.
+    ///
+    /// # Safety
+    ///
+    /// `owner` must identify the pinned enclosing `FileControlBlock`, and `locks` must identify
+    /// that owner's embedded `FILE_LOCK`. Both allocations must outlive this native stream and no
+    /// header may be published before this one-time call succeeds.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the native node stream is malformed or already bound.
+    pub(crate) unsafe fn bind_node_owner(
+        &self,
+        owner: NonNull<c_void>,
+        locks: NonNull<wdk_sys::FILE_LOCK>,
+    ) -> DriverResult<()> {
+        if self.kind != StreamOwnerKind::Node {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The caller establishes the pinned common lifetime documented above.
+                ext4win_stream_bind_node_owner(self.header.as_ptr(), owner.as_ptr(), locks.as_ptr())
+            };
+            native_status(status)
+        }
+        #[cfg(test)]
+        {
+            let _locks = locks;
+            self.owner
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    owner.as_ptr(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map(|_| ())
+                .map_err(|_| DriverError::InternalInvariantViolation)
+        }
+    }
+
+    /// Binds one pinned VCB as the sole direct-volume stream owner.
+    ///
+    /// # Safety
+    ///
+    /// `owner` must identify the pinned enclosing `VolumeControlBlock`, which must outlive this
+    /// native stream. No header may be published before this one-time call succeeds.
+    /// # Errors
+    ///
+    /// Returns an invariant error if the native volume stream is malformed or already bound.
+    pub(crate) unsafe fn bind_volume_owner(&self, owner: NonNull<c_void>) -> DriverResult<()> {
+        if self.kind != StreamOwnerKind::Volume {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The caller establishes the pinned enclosing lifetime documented above.
+                ext4win_stream_bind_volume_owner(self.header.as_ptr(), owner.as_ptr())
+            };
+            native_status(status)
+        }
+        #[cfg(test)]
+        {
+            self.owner
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    owner.as_ptr(),
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .map(|_| ())
+                .map_err(|_| DriverError::InternalInvariantViolation)
         }
     }
 
@@ -507,6 +603,72 @@ impl StreamContext {
                 .lock()
                 .map(|sizes| *sizes)
                 .map_err(|_| DriverError::InternalInvariantViolation)
+        }
+    }
+
+    /// Commits one epoch-tagged node projection and reports Cache Manager separately.
+    ///
+    /// The native header is the commit point. A Cache Manager failure occurs after that point and
+    /// is therefore returned as [`StreamMetadataPublication::CacheProjectionFailed`], not `Err`.
+    /// Callers may invoke this only after ext4 durability and visibility publication for `epoch`.
+    /// # Errors
+    ///
+    /// Returns an invariant error only when no native header commit occurred, such as a malformed
+    /// stream or non-monotonic epoch.
+    pub(crate) fn publish_node_metadata(
+        &self,
+        sizes: StreamSizes,
+        snapshot: NodeMetadataSnapshot,
+        epoch: EpochSequence,
+    ) -> DriverResult<StreamMetadataPublication> {
+        if self.kind != StreamOwnerKind::Node {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let metadata = NativeStreamMetadata::from_snapshot(snapshot, epoch);
+        #[cfg(not(test))]
+        {
+            let mut cache_status = STATUS_SUCCESS;
+            let publication_status = unsafe {
+                // SAFETY: `self` owns the live node header; native code borrows the complete fixed
+                // projection and writes one status describing only the post-commit Cc outcome.
+                ext4win_stream_publish_metadata(
+                    self.header.as_ptr(),
+                    sizes.allocation_size,
+                    sizes.file_size,
+                    sizes.valid_data_length,
+                    sizes.allocation_charge,
+                    core::ptr::from_ref(&metadata),
+                    core::ptr::addr_of_mut!(cache_status),
+                )
+            };
+            native_status(publication_status)?;
+            if cache_status >= STATUS_SUCCESS {
+                Ok(StreamMetadataPublication::Complete)
+            } else {
+                Ok(StreamMetadataPublication::CacheProjectionFailed {
+                    status: cache_status,
+                })
+            }
+        }
+        #[cfg(test)]
+        {
+            let mut current_metadata = self
+                .metadata
+                .lock()
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            if current_metadata
+                .as_ref()
+                .is_some_and(|current| metadata.epoch <= current.epoch)
+            {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            let mut current_sizes = self
+                .sizes
+                .lock()
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            *current_sizes = sizes;
+            *current_metadata = Some(metadata);
+            Ok(StreamMetadataPublication::Complete)
         }
     }
 
@@ -1007,6 +1169,16 @@ unsafe extern "system" {
         stream_header_out: *mut wdk_sys::PVOID,
     ) -> NTSTATUS;
 
+    fn ext4win_stream_bind_node_owner(
+        stream_header: wdk_sys::PVOID,
+        owner: wdk_sys::PVOID,
+        byte_range_locks: *mut wdk_sys::FILE_LOCK,
+    ) -> NTSTATUS;
+    fn ext4win_stream_bind_volume_owner(
+        stream_header: wdk_sys::PVOID,
+        owner: wdk_sys::PVOID,
+    ) -> NTSTATUS;
+
     fn ext4win_stream_oplock_fsctrl(
         stream_header: wdk_sys::PVOID,
         irp: *mut wdk_sys::IRP,
@@ -1050,6 +1222,16 @@ unsafe extern "system" {
         file_size_out: *mut i64,
         valid_data_length_out: *mut i64,
         allocation_charge_out: *mut i64,
+    ) -> NTSTATUS;
+
+    fn ext4win_stream_publish_metadata(
+        stream_header: wdk_sys::PVOID,
+        allocation_size: i64,
+        file_size: i64,
+        valid_data_length: i64,
+        allocation_charge: i64,
+        metadata: *const NativeStreamMetadata,
+        cache_status_out: *mut NTSTATUS,
     ) -> NTSTATUS;
 
     fn ext4win_stream_set_delete_pending(

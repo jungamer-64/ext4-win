@@ -212,16 +212,27 @@ impl CapturedReadOutput {
     /// Rust's aliasing model.
     /// # Errors
     ///
-    /// Returns an error when the selected range exceeds the prepared output or native copy fails.
+    /// Returns an error when the selected range exceeds the prepared output.
+    #[expect(
+        unsafe_code,
+        reason = "the pending IRP retains the opaque mapped output through this checked copy"
+    )]
     fn copy_window(&mut self, offset: usize, source: &[u8]) -> DriverResult<()> {
         match self {
-            Self::Empty => super::copy_requestor_output_window(None, 0, offset, source),
-            Self::Mapped(mapping) => super::copy_requestor_output_window(
-                Some(mapping.address()),
-                mapping.len(),
-                offset,
-                source,
-            ),
+            Self::Empty => unsafe {
+                // SAFETY: The empty representation permits only a zero-length checked copy.
+                super::copy_requestor_output_window(None, 0, offset, source)
+            },
+            Self::Mapped(mapping) => unsafe {
+                // SAFETY: The pending IRP keeps the system mapping writable, and safe callers
+                // cannot construct `source` as an alias of this opaque requestor range.
+                super::copy_requestor_output_window(
+                    Some(mapping.address()),
+                    mapping.len(),
+                    offset,
+                    source,
+                )
+            },
         }
     }
 }
@@ -316,7 +327,11 @@ impl CapturedWriteInput {
     /// # Errors
     ///
     /// Returns an invariant error when `offset..offset + destination.len()` exceeds the captured
-    /// input or the native copy boundary rejects the range.
+    /// input.
+    #[expect(
+        unsafe_code,
+        reason = "the pending IRP retains the opaque mapped input through this checked copy"
+    )]
     fn copy_window(&self, offset: usize, destination: &mut [u8]) -> DriverResult<()> {
         match self {
             Self::Empty if offset == 0 && destination.is_empty() => Ok(()),
@@ -331,12 +346,16 @@ impl CapturedWriteInput {
                 if destination.is_empty() {
                     return Ok(());
                 }
-                super::copy_requestor_input_window(
-                    Some(mapping.address()),
-                    mapping.len(),
-                    offset,
-                    destination,
-                )
+                unsafe {
+                    // SAFETY: The pending IRP keeps the system mapping readable, and safe callers
+                    // cannot construct `destination` as an alias of this opaque requestor range.
+                    super::copy_requestor_input_window(
+                        Some(mapping.address()),
+                        mapping.len(),
+                        offset,
+                        destination,
+                    )
+                }
             }
         }
     }

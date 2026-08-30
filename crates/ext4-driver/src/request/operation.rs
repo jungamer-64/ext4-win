@@ -35,7 +35,8 @@ use crate::request::file_system_control::MountAdmission;
 use crate::state::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeAccess,
     MountedVolumeDevice, MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
-    PreparedVolumeStateTransition, RawVolumeOperationKind, RawVolumeTarget, VolumeControlBlock,
+    PreparedVolumeStateTransition, RawVolumeOperationKind, RawVolumeTarget,
+    StreamProjectionOutcome, VolumeControlBlock,
 };
 
 /// Faults the mounted mutation authority only for real Cc/MM failures, not ordinary conflicts or
@@ -450,8 +451,9 @@ impl MountRequestOperation {
         let mut vcb = memory::boxed_try_with(move || {
             VolumeControlBlock::from_completed_mount(*completed, devices, trace)
         })?;
-        vcb.bind_stream_owner()?;
         vcb.initialize_directory_change_notifier()?;
+        let vcb = Box::into_pin(vcb);
+        vcb.as_ref().bind_stream_owner()?;
 
         let extension_size =
             wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>())
@@ -5834,26 +5836,31 @@ impl InfalliblePublication for MutationRequestOperation {
                 );
                 let (pending, stream_projection) = publication.into_parts();
                 let completion = effect.publish(access);
-                if let Err(error) = &stream_projection {
-                    access.record_publication_failure(error.ntstatus());
-                }
                 drop(size_changes);
                 drop(deletion);
                 drop(self.oplock_mutation.take());
                 drop(self.cleanup_parent_oplock.take());
                 drop(self.namespace_oplocks.take());
                 match stream_projection {
-                    Ok(()) => {
+                    StreamProjectionOutcome::Complete => {
                         let _complete = self.complete_success(owned, completion);
                     }
-                    Err(error) => match completion {
-                        TopLevelCompletion::Normal(completion) => {
-                            let _status = owned.complete(completion.committed_failure(error));
+                    StreamProjectionOutcome::Incomplete(failure) => {
+                        let (error, published_streams, unexamined_updates) = failure.into_parts();
+                        access.record_publication_failure(
+                            error.ntstatus(),
+                            published_streams,
+                            unexamined_updates,
+                        );
+                        match completion {
+                            TopLevelCompletion::Normal(completion) => {
+                                let _status = owned.complete(completion.committed_failure(error));
+                            }
+                            TopLevelCompletion::Create(_completion) => {
+                                let _status = owned.complete_create_result(Err(error));
+                            }
                         }
-                        TopLevelCompletion::Create(_completion) => {
-                            let _status = owned.complete_create_result(Err(error));
-                        }
-                    },
+                    }
                 }
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
             }

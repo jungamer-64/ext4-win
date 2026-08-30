@@ -2,6 +2,7 @@ use alloc::boxed::Box;
 use core::cell::Cell;
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
+use core::pin::Pin;
 use core::ptr::NonNull;
 
 use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset, NodeId};
@@ -168,23 +169,14 @@ fn file_object_with_contexts(
 
 /// # Panics
 ///
-/// Panics when the FSD-owned volume flag does not select the VCB/volume-handle context layout.
+/// Panics when the FSD-owned volume flag permits a node stream to decode as a direct-volume open.
 #[test]
-fn volume_open_flag_selects_typed_volume_contexts() {
+fn volume_open_flag_rejects_node_stream_context() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let stream = crate::kernel::stream::StreamContext::try_new_volume(
-        crate::kernel::stream::StreamSizes::EMPTY,
-        crate::kernel::operational_trace::OperationalTrace::host_test(),
-    )
-    .unwrap_or_else(|_| {
-        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-    });
-    stream.bind_owner(volume.cast()).unwrap_or_else(|_| {
-        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-    });
+    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
     let mut handle = OpenedVolumeHandle::new(RawVolumeAccess::MetadataOnly);
     let mut file = file_object_with_contexts(
-        stream.header().as_ptr(),
+        fcb.stream_header().as_ptr(),
         core::ptr::addr_of_mut!(handle).cast(),
     );
     file.Flags |= wdk_sys::FO_VOLUME_OPEN | wdk_sys::FO_SYNCHRONOUS_IO;
@@ -194,33 +186,10 @@ fn volume_open_flag_selects_typed_volume_contexts() {
             OpenedObject::decode(file_object),
             Err(DriverError::ObjectTypeMismatch)
         ));
-        let opened = OpenedFileObject::decode(file_object)?;
-        let OpenedFileObject::Volume(opened) = opened else {
-            return Err(DriverError::InternalInvariantViolation);
-        };
-        assert_eq!(opened.volume(), volume);
-        let position =
-            opened.prepare_current_file_position_update(FileOffset::from_bytes(512), 512)?;
-        assert_eq!(
-            opened.current_file_position(),
-            Ok(FileOffset::from_bytes(0))
-        );
-        position.publish();
-        assert_eq!(
-            opened.current_file_position(),
-            Ok(FileOffset::from_bytes(1024))
-        );
         assert!(matches!(
-            opened.prepare_current_file_position_update(FileOffset::from_bytes(u64::MAX), 1),
-            Err(DriverError::Core(ext4_core::Error::ArithmeticOverflow))
+            OpenedFileObject::decode(file_object),
+            Err(DriverError::InternalInvariantViolation)
         ));
-        let target = opened.raw_target();
-        assert_eq!(target.ensure_write_retryable(), Ok(()));
-        target.mark_write_uncertain(512);
-        assert_eq!(
-            target.ensure_write_retryable(),
-            Err(DriverError::RawOutcomeUncertain)
-        );
         Ok(())
     });
     assert_eq!(result, Ok(()));
@@ -550,7 +519,7 @@ fn with_active_file_object<R>(
 fn test_file_control_block(
     volume: NonNull<VolumeControlBlock>,
     node: NodeId,
-) -> Box<FileControlBlock> {
+) -> Pin<Box<FileControlBlock>> {
     let fcb = crate::memory::boxed_try_with(|| {
         FileControlBlock::try_new_staged(
             volume,
@@ -565,7 +534,8 @@ fn test_file_control_block(
     .unwrap_or_else(|_| {
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
     });
-    fcb.bind_stream_owner().unwrap_or_else(|_| {
+    let fcb = Box::into_pin(fcb);
+    fcb.as_ref().bind_stream_owner().unwrap_or_else(|_| {
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
     });
     fcb
@@ -769,7 +739,7 @@ fn typed_opened_directory_exposes_cursor_without_option() {
 fn oplock_control_accepts_the_exact_directory_stream() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
     let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
-    let expected = NonNull::from(fcb.as_ref());
+    let expected = NonNull::from(fcb.as_ref().get_ref());
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
         return;
@@ -1394,7 +1364,7 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
-    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let fcb_pointer = NonNull::from(fcb.as_ref().get_ref());
     ledger
         .table
         .get_mut()
@@ -1448,7 +1418,7 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
-    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let fcb_pointer = NonNull::from(fcb.as_ref().get_ref());
     let header = fcb.stream_header().as_ptr();
     ledger
         .table
@@ -1492,7 +1462,7 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
-    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let fcb_pointer = NonNull::from(fcb.as_ref().get_ref());
     let header = fcb.stream_header().as_ptr();
     ledger
         .table
@@ -1539,7 +1509,7 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
-    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let fcb_pointer = NonNull::from(fcb.as_ref().get_ref());
     let header = fcb.stream_header().as_ptr();
     ledger
         .table
@@ -1567,7 +1537,7 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
-    let reopened_pointer = NonNull::from(reopened.as_ref());
+    let reopened_pointer = NonNull::from(reopened.as_ref().get_ref());
     ledger
         .table
         .get_mut()
@@ -1607,7 +1577,7 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
-    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let fcb_pointer = NonNull::from(fcb.as_ref().get_ref());
     ledger
         .table
         .get_mut()

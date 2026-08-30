@@ -84,7 +84,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         .file(VOLUME_DISCOVERY_SOURCE);
 
     if is_msvc {
-        native.flag("/kernel").flag("/W4").flag("/WX");
+        native
+            .flag("/kernel")
+            .flag("/W4")
+            .flag("/WX")
+            .flag("/analyze")
+            // The WDK headers carry analyzer assumptions that this standalone C compilation
+            // cannot satisfy. Keep repository-owned diagnostics fatal while excluding only
+            // angle-bracket system headers from both compiler and code-analysis diagnostics.
+            .flag("/external:anglebrackets")
+            .flag("/external:W0")
+            .flag("/analyze:external-");
         let map_path = package_link_map_path()?;
         let map_parent = map_path
             .parent()
