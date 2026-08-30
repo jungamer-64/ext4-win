@@ -356,8 +356,6 @@ impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
 pub struct ResolvedMutation {
     /// Resource set and versions observed by this resolve pass.
     observed: ObservedResourceVersionSet,
-    /// Final live-inode sizes derived from the exact records serialized by this mutation.
-    node_storage_updates: Vec<NodeStorageSnapshot>,
     /// Ordered data images that must be durable before journal metadata is written.
     data_writes: Vec<RangeWrite>,
     /// Complete metadata blocks supplied to JBD2 serialization.
@@ -409,14 +407,6 @@ pub struct ReservedMutation {
 }
 
 impl ReservedMutation {
-    /// Final sizes for each live inode changed by this version-revalidated mutation.
-    ///
-    /// These values are preparation inputs only; publication is permitted only after commit
-    /// durability. Deleted inodes are excluded because they have no live storage snapshot.
-    #[must_use]
-    pub fn node_storage_updates(&self) -> &[NodeStorageSnapshot] {
-        &self.resolved.node_storage_updates
-    }
 }
 
 /// All lower-write, epoch-publication, version, and checkpoint allocations prepared up front.
@@ -719,18 +709,6 @@ impl CleanJournalDurability {
 }
 
 impl MutationResolvePass<'_, '_, '_> {
-    /// Observes this pass's latest staged inode, falling back to the selected committed epoch.
-    ///
-    /// This is distinct from `CommittedReadPass`: callers use it to prepare post-commit state,
-    /// never to acknowledge the uncommitted mutation to another observer.
-    /// # Errors
-    ///
-    /// Returns an error if the inode was deleted, its record is invalid, or storage cannot be read.
-    pub fn staged_node_storage(&mut self, node: NodeId) -> Result<NodeStorageSnapshot> {
-        let record = self.mutation.raw_inode_for_policy(node.inode())?;
-        Ok(NodeStorageSnapshot::from_inode(&record.parse()?))
-    }
-
     /// Selects any supported inode for POSIX metadata mutation.
     ///
     /// # Errors

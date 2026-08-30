@@ -460,36 +460,6 @@ impl StreamContext {
         }
     }
 
-    /// Publishes a prevalidated stream-size tuple after the corresponding ext4 commit.
-    /// # Errors
-    ///
-    /// Returns an invariant error when the native stream header is malformed.
-    pub(crate) fn set_sizes(&self, sizes: StreamSizes) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: Native code validates and serializes the complete header tuple.
-                ext4win_stream_set_sizes(
-                    self.header.as_ptr(),
-                    sizes.allocation_size,
-                    sizes.file_size,
-                    sizes.valid_data_length,
-                    sizes.allocation_charge,
-                )
-            };
-            native_status(status)
-        }
-        #[cfg(test)]
-        {
-            let mut current = self
-                .sizes
-                .lock()
-                .map_err(|_| DriverError::InternalInvariantViolation)?;
-            *current = sizes;
-            Ok(())
-        }
-    }
-
     /// Copies cached bytes into one system-addressable IRP buffer.
     /// # Errors
     ///
@@ -1015,14 +985,6 @@ unsafe extern "system" {
         file_size_out: *mut i64,
         valid_data_length_out: *mut i64,
         allocation_charge_out: *mut i64,
-    ) -> NTSTATUS;
-
-    fn ext4win_stream_set_sizes(
-        stream_header: wdk_sys::PVOID,
-        allocation_size: i64,
-        file_size: i64,
-        valid_data_length: i64,
-        allocation_charge: i64,
     ) -> NTSTATUS;
 
     fn ext4win_stream_cache_read(

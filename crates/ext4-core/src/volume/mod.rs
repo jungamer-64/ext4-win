@@ -29,7 +29,7 @@ pub use mount::{
 };
 pub use node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, NodeStorageSnapshot, SymlinkNode,
+    FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, SymlinkNode,
     SymlinkNodeId,
 };
 pub use operation::{

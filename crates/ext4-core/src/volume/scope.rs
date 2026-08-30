@@ -74,7 +74,7 @@ pub(super) use super::mount::{
 };
 pub(super) use super::node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, LoadedNode, NodeId, NodeStorageSnapshot,
+    FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, LoadedNode, NodeId,
     SymlinkNode, SymlinkNodeId,
 };
 
