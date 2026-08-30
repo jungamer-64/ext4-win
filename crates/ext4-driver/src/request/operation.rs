@@ -1760,6 +1760,174 @@ impl MountedVolumeOperation for NotificationOperation {
 // FsRtl notification package.
 unsafe impl Send for NotificationOperation {}
 
+/// Explicit ownership phase of one byte-range lock request.
+#[derive(Debug)]
+enum ByteRangeLockOperationState {
+    /// The driver owns the IRP and its prevalidated stream oplock check.
+    CheckingOplock {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Stream lifetime and normalized FsRtl check flags.
+        check: OplockCheck,
+    },
+    /// FsRtl owns the IRP until its oplock completion callback returns it.
+    OplockDelegated,
+    /// The reactor recovered the exact IRP and oplock result.
+    OplockReady {
+        /// Unique top-level completion authority returned by FsRtl.
+        owned: OwnedIrp,
+        /// Immediate or callback-published oplock status.
+        status: wdk_sys::NTSTATUS,
+    },
+    /// FsRtl file-lock ownership or terminal completion consumed the IRP.
+    Terminal,
+}
+
+/// One handle-serialized lock-control request delegated to FsRtl exactly once.
+#[derive(Debug)]
+struct ByteRangeLockOperation {
+    /// Current completion-ownership phase.
+    state: ByteRangeLockOperationState,
+}
+
+impl ByteRangeLockOperation {
+    /// Allocates a lock operation only after validating its regular-file stream and lease.
+    /// # Errors
+    ///
+    /// Returns the still-owned IRP when the target is malformed, stream retention fails, or
+    /// operation storage cannot be allocated.
+    fn try_new(
+        mut owned: OwnedIrp,
+        access: &MountedVolumeAccess<'_>,
+    ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+        let check = match owned.request().with_active(|active| {
+            let _file_control_block = crate::request::file_info::lock_control(active)?;
+            let file_object = active.current_stack()?.file_object()?;
+            access
+                .acquire_oplock_stream_lease(file_object)
+                .map(OplockCheck::ordinary)
+        }) {
+            Ok(check) => check,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
+        match memory::boxed_try_map((owned, check), |(owned, check)| Self {
+            state: ByteRangeLockOperationState::CheckingOplock { owned, check },
+        }) {
+            Ok(operation) => Ok(operation),
+            Err(error) => {
+                let (error, (owned, _check)) = error.into_parts();
+                Err(AdmitOperationError::new(error, owned))
+            }
+        }
+    }
+
+    /// Completes and consumes one lock-control IRP inside driver ownership.
+    fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
+        let _status = owned.complete_result(result);
+        OperationTransition::Complete
+    }
+
+    /// Revalidates the live FILE_OBJECT identity and transfers terminal ownership to FsRtl.
+    fn delegate(mut owned: OwnedIrp) -> OperationTransition {
+        let file_control_block = match owned
+            .request()
+            .with_active(crate::request::file_info::lock_control)
+        {
+            Ok(file_control_block) => file_control_block,
+            Err(error) => return Self::complete(owned, Err(error)),
+        };
+        let _status = owned.delegate_byte_range_lock(file_control_block);
+        OperationTransition::Complete
+    }
+}
+
+impl OplockContinuation for ByteRangeLockOperation {
+    fn resume_after_oplock(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        status: wdk_sys::NTSTATUS,
+    ) -> Box<dyn CompletionOperation> {
+        let state = core::mem::replace(&mut self.state, ByteRangeLockOperationState::Terminal);
+        let ByteRangeLockOperationState::OplockDelegated = state else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        self.state = ByteRangeLockOperationState::OplockReady { owned, status };
+        self
+    }
+}
+
+impl MountedVolumeOperation for ByteRangeLockOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: CompletionEvent,
+        _access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let event = event.into_core();
+        let state = core::mem::replace(&mut self.state, ByteRangeLockOperationState::Terminal);
+        match (state, event) {
+            (
+                ByteRangeLockOperationState::CheckingOplock { owned, check },
+                OperationEvent::Admitted,
+            ) => {
+                self.state = ByteRangeLockOperationState::OplockDelegated;
+                OperationTransition::CheckOplock {
+                    check,
+                    owned,
+                    suspended: self,
+                }
+            }
+            (
+                ByteRangeLockOperationState::OplockReady { owned, status },
+                OperationEvent::Admitted,
+            ) if status >= STATUS_SUCCESS => Self::delegate(owned),
+            (
+                ByteRangeLockOperationState::OplockReady { owned, status },
+                OperationEvent::Admitted,
+            ) => Self::complete(owned, Err(DriverError::OplockFailure(status))),
+            (
+                ByteRangeLockOperationState::CheckingOplock { owned, .. }
+                | ByteRangeLockOperationState::OplockReady { owned, .. },
+                OperationEvent::CancelRequested,
+            ) => Self::complete(owned, Err(DriverError::from(Error::OperationCancelled))),
+            (
+                ByteRangeLockOperationState::CheckingOplock { owned, .. }
+                | ByteRangeLockOperationState::OplockReady { owned, .. },
+                OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceLengthCompleted(_)
+                | OperationEvent::RetryElapsed(_)
+                | OperationEvent::IntentGranted(_)
+                | OperationEvent::CommitGranted(_)
+                | OperationEvent::VisibilityGranted(_)
+                | OperationEvent::CheckpointGranted(_)
+                | OperationEvent::BarrierReleased(_),
+            ) => Self::complete(owned, Err(DriverError::InternalInvariantViolation)),
+            (ByteRangeLockOperationState::OplockDelegated, _)
+            | (ByteRangeLockOperationState::Terminal, _) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        }
+    }
+
+    fn record_mounted_storage_failure(
+        &mut self,
+        _failure: StorageFailureClass,
+        _access: &mut MountedVolumeAccess<'_>,
+    ) {
+        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+            .bugcheck();
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the deferred stream lease and IRP move only through the reactor oplock envelope"
+)]
+// SAFETY: The stream lease retains its ledger-owned FCB through any FsRtl wait, the mounted VCB is
+// stable until reactor drain, and the operation is reclaimed before the sole reactor advances it.
+unsafe impl Send for ByteRangeLockOperation {}
+
 /// Volume lifecycle semantics selected from one payload-free standard FSCTL.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VolumeControlRequestKind {
@@ -5219,6 +5387,7 @@ impl_mounted_operation_adapter!(ReadRequestOperation);
 impl_mounted_operation_adapter!(RawVolumeOperation);
 impl_mounted_operation_adapter!(ImmediateRequestOperation);
 impl_mounted_operation_adapter!(NotificationOperation);
+impl_mounted_operation_adapter!(ByteRangeLockOperation);
 impl_mounted_operation_adapter!(VolumeControlOperation);
 impl_mounted_operation_adapter!(FlushRequestOperation);
 impl_mounted_operation_adapter!(MutationRequestOperation);
@@ -5243,6 +5412,17 @@ pub(crate) fn notification(
     owned: OwnedIrp,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
     NotificationOperation::try_new(owned)
+}
+
+/// Allocates one handle-serialized byte-range lock delegation.
+/// # Errors
+///
+/// Returns the still-owned IRP when target validation, stream retention, or allocation fails.
+pub(crate) fn byte_range_lock(
+    owned: OwnedIrp,
+    access: &MountedVolumeAccess<'_>,
+) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    ByteRangeLockOperation::try_new(owned, access)
 }
 
 /// Allocates one barrier-driven direct-volume lifecycle operation.

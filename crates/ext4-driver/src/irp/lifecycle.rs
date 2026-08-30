@@ -926,6 +926,36 @@ impl OwnedIrp {
         notifier.register(target, registration)
     }
 
+    /// Transfers this queued lock-control IRP's terminal completion authority to FsRtl.
+    ///
+    /// The caller has already serialized this request with the handle lane and completed its
+    /// stream oplock check. FsRtl then owns completion, conflict waiting, and cancellation for the
+    /// byte-range request.
+    #[expect(
+        unsafe_code,
+        reason = "the decoded FCB remains live through the consumed queued IRP and handle lane"
+    )]
+    pub(crate) fn delegate_byte_range_lock(
+        self,
+        file_control_block: NonNull<FileControlBlock>,
+    ) -> NTSTATUS {
+        let Self {
+            target,
+            context,
+            #[cfg(not(test))]
+            active_cancellation,
+        } = self;
+        #[cfg(not(test))]
+        drop(active_cancellation);
+        drop(context);
+        let file_control_block = unsafe {
+            // SAFETY: Reactor admission decoded this FCB from the same live FILE_OBJECT. The
+            // consumed IRP and its ordinary handle lane retain that object through delegation.
+            file_control_block.as_ref()
+        };
+        file_control_block.process_byte_range_lock(target)
+    }
+
     /// Completes the IRP as canceled.
     pub(super) fn complete_cancelled(self) -> NTSTATUS {
         self.complete(IrpCompletion::cancelled())
