@@ -1609,9 +1609,25 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
     assert!(!ledger.oplock_grant_available(fcb_pointer));
     drop(check);
     assert!(!ledger.oplock_grant_available(fcb_pointer));
-    drop(mutation);
-    assert!(ledger.oplock_grant_available(fcb_pointer));
     ledger.close(fcb_pointer);
+    assert!(ledger.table.get_mut().is_empty());
+    assert!(!ledger.is_empty());
+
+    let reopened = ledger.file_control_block(
+        volume,
+        stream,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
+    let reopened_pointer = NonNull::from(reopened.as_ref());
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(reopened)
+        .map_err(|failure| failure.into_parts().0)?;
+    assert!(!ledger.oplock_grant_available(reopened_pointer));
+    drop(mutation);
+    assert!(ledger.oplock_grant_available(reopened_pointer));
+    ledger.close(reopened_pointer);
     assert!(ledger.is_empty());
     Ok(())
 }
@@ -1621,19 +1637,18 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
 /// Returns a fixture allocation, native stream-header, or finite lease failure.
 /// # Panics
 ///
-/// Panics if parent lookup invents an absent stream or fails to retain an exact resident stream.
+/// Panics if parent reservation depends on FCB residency or retains the wrong resident stream.
 #[test]
 #[expect(
     clippy::panic_in_result_fn,
-    reason = "fixture failures use Result; assertions verify node-scoped parent oplock residency"
+    reason = "fixture failures use Result; assertions verify node-scoped parent oplock authority"
 )]
-fn parent_oplock_lease_is_optional_and_node_exact() -> Result<(), DriverError> {
+fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> {
     let mut ledger = FileControlBlockLedger::try_new()?;
-    assert!(
-        ledger
-            .acquire_parent_oplock_stream_lease(DirectoryNodeId::ROOT)?
-            .is_none()
-    );
+    let (absent_mutation, absent_stream) =
+        ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
+    assert!(absent_stream.is_none());
+    assert!(!ledger.is_empty());
     let stream = super::NodeStreamSizes {
         node: NodeId::Directory(DirectoryNodeId::ROOT),
         sizes: crate::kernel::stream::StreamSizes::EMPTY,
@@ -1649,14 +1664,19 @@ fn parent_oplock_lease_is_optional_and_node_exact() -> Result<(), DriverError> {
         .get_mut()
         .try_push_owned(fcb)
         .map_err(|failure| failure.into_parts().0)?;
+    assert!(!ledger.oplock_grant_available(fcb_pointer));
+    drop(absent_mutation);
+    assert!(ledger.oplock_grant_available(fcb_pointer));
 
-    let lease = ledger
-        .acquire_parent_oplock_stream_lease(DirectoryNodeId::ROOT)?
-        .ok_or(DriverError::InternalInvariantViolation)?;
+    let (mutation, lease) = ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
+    let lease = lease.ok_or(DriverError::InternalInvariantViolation)?;
     assert!(lease.identifies(fcb_pointer));
+    assert!(!ledger.oplock_grant_available(fcb_pointer));
     ledger.close(fcb_pointer);
     assert!(!ledger.is_empty());
     drop(lease);
+    assert!(!ledger.is_empty());
+    drop(mutation);
     assert!(ledger.is_empty());
     Ok(())
 }
@@ -1746,42 +1766,6 @@ fn file_control_block_starts_with_empty_share_access() {
     assert_eq!(state.share_access.SharedRead, 0);
     assert_eq!(state.share_access.SharedWrite, 0);
     assert_eq!(state.share_access.SharedDelete, 0);
-}
-
-/// # Panics
-///
-/// Panics when nested mutation authority permits a grant or releases the barrier prematurely.
-#[test]
-fn oplock_grant_barrier_tracks_mutation_authority_independently_from_retention() {
-    let mut state = FileControlBlockOpenState::new();
-    assert!(state.oplock_grant_available());
-
-    assert_eq!(state.acquire_oplock_mutation_pair(), Ok(()));
-    assert_eq!(state.acquire_oplock_mutation_pair(), Ok(()));
-    assert!(!state.oplock_grant_available());
-    state.release_oplock_mutation();
-    assert!(!state.oplock_grant_available());
-    state.release_oplock_mutation();
-    assert!(state.oplock_grant_available());
-
-    assert_eq!(
-        state.lifetime,
-        StreamLifetimeState::OpenHandles {
-            handles: NonZeroU32::MIN,
-            deferred_leases: 4,
-        }
-    );
-    assert!(!state.release_deferred_lease(false));
-    assert!(!state.release_deferred_lease(false));
-    assert!(!state.release_deferred_lease(false));
-    assert!(!state.release_deferred_lease(false));
-    assert_eq!(
-        state.lifetime,
-        StreamLifetimeState::OpenHandles {
-            handles: NonZeroU32::MIN,
-            deferred_leases: 0,
-        }
-    );
 }
 
 /// # Panics

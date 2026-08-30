@@ -3441,13 +3441,13 @@ enum OplockResume {
     },
 }
 
-/// Parent-directory oplock authority retained across cleanup deletion re-resolution.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CleanupParentOplockState {
-    /// No final cleanup deletion parent has been checked.
-    Unresolved,
-    /// The exact pending-delete parent completed its required removal break or had no resident FCB.
-    Authorized(ext4_core::DirectoryNodeId),
+/// Parent-directory mutation authority retained across cleanup deletion re-resolution.
+#[derive(Debug)]
+struct CleanupParentOplockAuthority {
+    /// Exact pending-delete parent covered by the removal check.
+    parent: ext4_core::DirectoryNodeId,
+    /// Node reservation retained until durable namespace publication.
+    _mutation: crate::state::OplockMutationLease,
 }
 
 /// Initial target-stream break check paired with the grant barrier retained by its mutation.
@@ -3459,10 +3459,10 @@ struct PreparedMutationOplock {
     mutation: crate::state::OplockMutationLease,
 }
 
-impl CleanupParentOplockState {
+impl CleanupParentOplockAuthority {
     /// Reports whether this authority covers the exact pending-delete parent.
-    fn authorizes(self, parent: ext4_core::DirectoryNodeId) -> bool {
-        matches!(self, Self::Authorized(authorized) if authorized == parent)
+    fn authorizes(&self, parent: ext4_core::DirectoryNodeId) -> bool {
+        self.parent == parent
     }
 }
 
@@ -3661,8 +3661,8 @@ struct MutationRequestOperation {
     oplock_mutation: Option<crate::state::OplockMutationLease>,
     /// Cleanup deletion plan retained across resolve suspension.
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
-    /// Parent-directory removal check completed for the current cleanup deletion target.
-    cleanup_parent_oplock: CleanupParentOplockState,
+    /// Parent-directory removal authority retained for the current cleanup deletion target.
+    cleanup_parent_oplock: Option<CleanupParentOplockAuthority>,
     /// Fully allocated disposition state retained while its native preflight runs.
     disposition_deletion: Option<crate::request::file_info::PendingDispositionDeletion>,
     /// Fully allocated existing-node create retained while its native write-open check runs.
@@ -3684,7 +3684,7 @@ struct DriverResolveState<'a> {
     /// Cleanup deletion plan retained across lower-read suspension.
     cleanup_deletion: &'a mut Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Parent-directory removal authority already established for cleanup deletion.
-    cleanup_parent_oplock: CleanupParentOplockState,
+    cleanup_parent_oplock: Option<&'a CleanupParentOplockAuthority>,
     /// Disposition deletion plan retained across its native preflight.
     disposition_deletion: &'a mut Option<crate::request::file_info::PendingDispositionDeletion>,
     /// Exact successful deletion gate retained for revalidation.
@@ -3891,7 +3891,7 @@ impl MutationRequestOperation {
                     crypto,
                     oplock_mutation,
                     cleanup_deletion: None,
-                    cleanup_parent_oplock: CleanupParentOplockState::Unresolved,
+                    cleanup_parent_oplock: None,
                     disposition_deletion: None,
                     pending_existing_create: None,
                     write_open: None,
@@ -4166,7 +4166,10 @@ impl MutationRequestOperation {
                     return Err(DriverError::InternalInvariantViolation);
                 };
                 let parent = deletion.parent();
-                if !state.cleanup_parent_oplock.authorizes(parent) {
+                if !state
+                    .cleanup_parent_oplock
+                    .is_some_and(|authority| authority.authorizes(parent))
+                {
                     return Ok(DriverResolveDisposition::CheckCleanupParentOplock { parent });
                 }
                 let publication =
@@ -4241,7 +4244,7 @@ impl MutationRequestOperation {
                 request,
                 DriverResolveState {
                     cleanup_deletion: &mut self.cleanup_deletion,
-                    cleanup_parent_oplock: self.cleanup_parent_oplock,
+                    cleanup_parent_oplock: self.cleanup_parent_oplock.as_ref(),
                     disposition_deletion: &mut self.disposition_deletion,
                     prepared_deletion: deletion.as_ref(),
                     pending_existing_create: &mut self.pending_existing_create,
@@ -4270,12 +4273,19 @@ impl MutationRequestOperation {
                     {
                         return self.complete_error(owned, DriverError::InternalInvariantViolation);
                     }
-                    let stream = match operations.acquire_parent_oplock_stream_lease(parent) {
-                        Ok(stream) => stream,
+                    if self.cleanup_parent_oplock.is_some() {
+                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
+                    let (mutation, stream) = match operations.acquire_parent_oplock_mutation(parent)
+                    {
+                        Ok(pair) => pair,
                         Err(error) => return self.complete_error(owned, error),
                     };
+                    self.cleanup_parent_oplock = Some(CleanupParentOplockAuthority {
+                        parent,
+                        _mutation: mutation,
+                    });
                     let Some(stream) = stream else {
-                        self.cleanup_parent_oplock = CleanupParentOplockState::Authorized(parent);
                         return self.restart_resolution(owned, None, None, operations);
                     };
                     self.state = MutationOperationState::OplockDelegated {
@@ -5116,7 +5126,14 @@ impl MountedVolumeOperation for MutationRequestOperation {
                             return self
                                 .complete_error(owned, DriverError::InternalInvariantViolation);
                         }
-                        self.cleanup_parent_oplock = CleanupParentOplockState::Authorized(parent);
+                        if !self
+                            .cleanup_parent_oplock
+                            .as_ref()
+                            .is_some_and(|authority| authority.authorizes(parent))
+                        {
+                            return self
+                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                        }
                         self.restart_resolution(owned, None, None, access)
                     }
                 }
@@ -5580,6 +5597,7 @@ impl InfalliblePublication for MutationRequestOperation {
                 drop(size_changes);
                 drop(deletion);
                 drop(self.oplock_mutation.take());
+                drop(self.cleanup_parent_oplock.take());
                 match stream_projection {
                     Ok(()) => {
                         let _complete = self.complete_success(owned, completion);
