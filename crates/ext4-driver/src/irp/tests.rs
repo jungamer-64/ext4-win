@@ -428,6 +428,47 @@ fn create_handle_completion_publishes_exact_action() {
 
 /// # Panics
 ///
+/// Panics when a successful complete-if-oplocked create loses its alternate success status or
+/// exact Windows create action.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+fn create_oplock_break_completion_preserves_status_and_action() {
+    let mut device_object = wdk_sys::DEVICE_OBJECT::default();
+    let device = kernel_device_fixture(&mut device_object);
+    assert!(device.is_some());
+    let Some(device) = device else {
+        return;
+    };
+    let mut irp = wdk_sys::IRP::default();
+    let owned = owned_irp_fixture(device, &mut irp);
+    assert!(owned.is_some());
+    let Some(owned) = owned else {
+        return;
+    };
+
+    assert_eq!(
+        owned.complete_create_result(Ok(CreateCompletion::OplockBreakInProgress(
+            CreateAction::Opened,
+        ))),
+        wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS
+    );
+    let auxiliary = unsafe {
+        // SAFETY: The test reads the active tail overlay after create completion.
+        irp.Tail.Overlay.AuxiliaryBuffer
+    };
+    assert!(auxiliary.is_null());
+    assert_eq!(irp_status(&irp), wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS);
+    assert_eq!(
+        irp.IoStatus.Information,
+        wdk_sys::ULONG_PTR::from(wdk_sys::FILE_OPENED)
+    );
+}
+
+/// # Panics
+///
 /// Panics when a failed create request publishes ownership into the IRP tail overlay.
 #[test]
 #[expect(

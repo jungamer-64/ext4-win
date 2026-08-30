@@ -917,6 +917,19 @@ impl MountedVolumeAccess<'_> {
             .acquire_oplock_stream_lease(file_object, NonNull::from(&*self.volume))
     }
 
+    /// Retains the exact stream already owned by a provisional create claim.
+    /// # Errors
+    ///
+    /// Returns an ownership invariant or finite deferred-lease failure before FsRtl delegation.
+    pub(crate) fn acquire_claimed_oplock_stream_lease(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+    ) -> DriverResult<OplockStreamLease> {
+        self.volume
+            .file_control_blocks
+            .acquire_claimed_oplock_stream_lease(fcb)
+    }
+
     /// Retains one node stream while a PASSIVE_LEVEL worker executes Cache Manager work.
     /// # Errors
     ///

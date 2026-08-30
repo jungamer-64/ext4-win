@@ -223,6 +223,8 @@ impl CreateSymlinkReparseBuffer {
 pub(crate) enum CreateCompletion {
     /// A handle was established with one exact Windows create action.
     Handle(CreateAction),
+    /// A handle was established while its requested nonblocking oplock break remains underway.
+    OplockBreakInProgress(CreateAction),
     /// Name resolution must continue through the Microsoft symbolic-link reparse handler.
     ReparseSymlink(CreateSymlinkReparseBuffer),
 }

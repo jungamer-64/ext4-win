@@ -13,6 +13,7 @@ use wdk_sys::{NTSTATUS, STATUS_PENDING};
 
 use crate::state::OplockStreamLease;
 
+use super::OplockCreatePolicy;
 #[cfg(not(test))]
 use super::lifecycle::DelegatedIrp;
 use super::lifecycle::OwnedIrp;
@@ -27,7 +28,6 @@ use super::scheduler::SlotId;
 use crate::kernel::fatal::KernelWideInconsistency;
 #[cfg(not(test))]
 use crate::kernel::ffi;
-#[cfg(not(test))]
 use crate::kernel::status::DriverError;
 #[cfg(not(test))]
 use crate::memory;
@@ -52,6 +52,24 @@ impl OplockCheck {
     /// Builds an ordinary break check for a handle mutation.
     pub(crate) const fn ordinary(stream: OplockStreamLease) -> Self {
         Self { stream, flags: 0 }
+    }
+
+    /// Builds the break check selected by an existing-stream create request.
+    /// # Errors
+    ///
+    /// Returns not-supported for policies that require the separate atomic reservation protocol.
+    pub(crate) fn create(
+        stream: OplockStreamLease,
+        policy: OplockCreatePolicy,
+    ) -> Result<Self, DriverError> {
+        let flags = match policy {
+            OplockCreatePolicy::Ordinary => 0,
+            OplockCreatePolicy::CompleteIfOplocked => wdk_sys::OPLOCK_FLAG_COMPLETE_IF_OPLOCKED,
+            OplockCreatePolicy::RequireUnbrokenOplock | OplockCreatePolicy::ReserveFilter => {
+                return Err(DriverError::NotSupported);
+            }
+        };
+        Ok(Self { stream, flags })
     }
 
     /// Invokes the native SEH boundary with a stable completion envelope.
