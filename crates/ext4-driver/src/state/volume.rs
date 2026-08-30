@@ -917,6 +917,19 @@ impl MountedVolumeAccess<'_> {
             .acquire_oplock_stream_lease(file_object, NonNull::from(&*self.volume))
     }
 
+    /// Acquires the mutation grant barrier and FsRtl check lease for one node FILE_OBJECT.
+    /// # Errors
+    ///
+    /// Returns an identity, retention, or finite-counter failure before the break check begins.
+    pub(crate) fn acquire_oplock_mutation(
+        &self,
+        file_object: ActiveFileObject<'_>,
+    ) -> DriverResult<(OplockMutationLease, OplockStreamLease)> {
+        self.volume
+            .file_control_blocks
+            .acquire_oplock_mutation(file_object, NonNull::from(&*self.volume))
+    }
+
     /// Retains an already resident parent directory while FsRtl checks a namespace oplock.
     /// # Errors
     ///
@@ -942,6 +955,24 @@ impl MountedVolumeAccess<'_> {
         self.volume
             .file_control_blocks
             .acquire_claimed_oplock_stream_lease(fcb)
+    }
+
+    /// Acquires the mutation grant barrier and check lease for a provisional create claim.
+    /// # Errors
+    ///
+    /// Returns an ownership or finite-counter failure before the break check begins.
+    pub(crate) fn acquire_claimed_oplock_mutation(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+    ) -> DriverResult<(OplockMutationLease, OplockStreamLease)> {
+        self.volume
+            .file_control_blocks
+            .acquire_claimed_oplock_mutation(fcb)
+    }
+
+    /// Reports whether the exact stream currently permits a new oplock grant.
+    pub(crate) fn oplock_grant_available(&self, fcb: NonNull<FileControlBlock>) -> bool {
+        self.volume.file_control_blocks.oplock_grant_available(fcb)
     }
 
     /// Retains one node stream while a PASSIVE_LEVEL worker executes Cache Manager work.

@@ -15,9 +15,10 @@ use super::{
     FILE_OPEN_DISPOSITION, FILE_OPEN_IF_DISPOSITION, FILE_OVERWRITE_DISPOSITION,
     FILE_OVERWRITE_IF_DISPOSITION, FILE_SHARE_ACCESS_MASK, FILE_SUPERSEDE_DISPOSITION,
     FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
-    IrpCompletion, KernelIrp, OplockCreatePolicy, OwnedIrp, QueryFileInformationClass,
-    QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp, RegularFileWriteAccess,
-    SetFileInformationClass, SetVolumeInformationClass, ShareAccess, WriteStartingPoint,
+    IrpCompletion, KernelIrp, OplockControlAction, OplockCreatePolicy, OwnedIrp,
+    QueryFileInformationClass, QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp,
+    RegularFileWriteAccess, SetFileInformationClass, SetVolumeInformationClass, ShareAccess,
+    WriteStartingPoint,
 };
 use crate::kernel::status::DriverError;
 use crate::security_descriptor::SecurityComponentSelection;
@@ -759,6 +760,46 @@ fn standard_volume_fsctl_codes_decode_to_domain_variants() {
     assert_eq!(
         FsControlCode::from_raw(0x0009_0083),
         Ok(FsControlCode::AllowExtendedDasdIo)
+    );
+}
+
+/// # Panics
+///
+/// Panics when request and break-continuation oplock controls can cross the wrong mutation lane.
+#[test]
+fn oplock_control_action_is_conservative_at_the_buffered_boundary() {
+    assert_eq!(
+        FsControlCode::RequestOplockLevel1.oplock_action(&[]),
+        Ok(OplockControlAction::Grant)
+    );
+    assert_eq!(
+        FsControlCode::OplockBreakNotify.oplock_action(&[]),
+        Ok(OplockControlAction::BreakContinuation)
+    );
+
+    let request = [0_u8, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0];
+    assert_eq!(
+        FsControlCode::RequestOplock.oplock_action(&request),
+        Ok(OplockControlAction::Grant)
+    );
+    let acknowledge = [0_u8, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0];
+    assert_eq!(
+        FsControlCode::RequestOplock.oplock_action(&acknowledge),
+        Ok(OplockControlAction::BreakContinuation)
+    );
+    let ambiguous = [0_u8, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0];
+    assert_eq!(
+        FsControlCode::RequestOplock.oplock_action(&ambiguous),
+        Ok(OplockControlAction::Grant)
+    );
+    let truncated = [0_u8; 8];
+    assert_eq!(
+        FsControlCode::RequestOplock.oplock_action(&truncated),
+        Ok(OplockControlAction::Grant)
+    );
+    assert_eq!(
+        FsControlCode::LockVolume.oplock_action(&[]),
+        Err(DriverError::InvalidDeviceRequest)
     );
 }
 

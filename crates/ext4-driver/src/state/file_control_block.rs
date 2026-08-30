@@ -315,6 +315,8 @@ pub(super) struct FileControlBlockOpenState {
     pub(super) lifetime: StreamLifetimeState,
     /// One namespace deletion truth shared by every handle for this inode.
     pub(super) deletion: FileDeletionState,
+    /// Active mutation authorities that prohibit a new oplock grant for this stream.
+    oplock_mutations: u32,
 }
 
 impl FileControlBlockOpenState {
@@ -335,7 +337,38 @@ impl FileControlBlockOpenState {
                 deferred_leases: 0,
             },
             deletion: FileDeletionState::Live,
+            oplock_mutations: 0,
         }
+    }
+
+    /// Adds one mutation barrier together with its FCB retention and FsRtl check leases.
+    /// # Errors
+    ///
+    /// Returns insufficient resources without changing either counter when one is exhausted.
+    pub(super) fn acquire_oplock_mutation_pair(&mut self) -> DriverResult<()> {
+        let lifetime = self
+            .lifetime
+            .with_additional_deferred_lease()?
+            .with_additional_deferred_lease()?;
+        let oplock_mutations = self
+            .oplock_mutations
+            .checked_add(1)
+            .ok_or(DriverError::InsufficientResources)?;
+        self.lifetime = lifetime;
+        self.oplock_mutations = oplock_mutations;
+        Ok(())
+    }
+
+    /// Ends one exact mutation barrier before its deferred FCB lease is released.
+    pub(super) fn release_oplock_mutation(&mut self) {
+        self.oplock_mutations = self.oplock_mutations.checked_sub(1).unwrap_or_else(|| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+    }
+
+    /// Reports whether a new oplock grant can be submitted for the current stream state.
+    pub(super) const fn oplock_grant_available(&self) -> bool {
+        self.oplock_mutations == 0
     }
 
     /// Checks any operation-implied access and records the FILE_OBJECT share claim.

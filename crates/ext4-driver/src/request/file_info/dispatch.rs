@@ -121,9 +121,7 @@ pub(crate) fn lock_control(target: &mut ActiveIrp<'_>) -> DriverResult<NonNull<F
 /// # Errors
 ///
 /// Returns an error when a user FSCTL stack or its opened namespace context is malformed.
-pub(crate) fn oplock_control(
-    target: &mut ActiveIrp<'_>,
-) -> DriverResult<NonNull<FileControlBlock>> {
+pub(crate) fn oplock_control(target: &mut ActiveIrp<'_>) -> DriverResult<OplockControlTarget> {
     let current = target.current_stack()?;
     if current.file_system_control_minor()
         != crate::irp::FileSystemControlMinorFunction::UserFsRequest
@@ -134,7 +132,29 @@ pub(crate) fn oplock_control(
     if !control.fs_control_code().is_oplock() {
         return Err(DriverError::InvalidDeviceRequest);
     }
+    let action = if control.fs_control_code() == crate::irp::FsControlCode::RequestOplock {
+        if control.input_buffer_length().is_empty() {
+            control.fs_control_code().oplock_action(&[])?
+        } else {
+            let input = target.buffered_input(control.input_buffer_length())?;
+            control.fs_control_code().oplock_action(input.as_slice())?
+        }
+    } else {
+        control.fs_control_code().oplock_action(&[])?
+    };
     let file_object = current.file_object()?;
     let opened = OpenedObject::decode(file_object)?;
-    Ok(NonNull::from(opened.file_control_block()))
+    Ok(OplockControlTarget {
+        file_control_block: NonNull::from(opened.file_control_block()),
+        action,
+    })
+}
+
+/// Exact namespace stream and semantic oplock action decoded from one live FSCTL.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OplockControlTarget {
+    /// Stable FCB retained by the queued FILE_OBJECT.
+    pub(crate) file_control_block: NonNull<FileControlBlock>,
+    /// Whether this request can grant a new oplock or only advances an existing break.
+    pub(crate) action: crate::irp::OplockControlAction,
 }

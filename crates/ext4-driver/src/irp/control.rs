@@ -76,6 +76,15 @@ pub(crate) enum FsControlCode {
     EnableVerity,
 }
 
+/// Oplock-control effect relevant to serialization with an admitted stream mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OplockControlAction {
+    /// Requests a new oplock grant and must not cross an active stream mutation.
+    Grant,
+    /// Advances or observes an already established break and must remain available to drain it.
+    BreakContinuation,
+}
+
 impl FsControlCode {
     /// Decodes the raw WDK control code at the IRP boundary.
     /// # Errors
@@ -122,6 +131,69 @@ impl FsControlCode {
                 | Self::RequestFilterOplock
                 | Self::RequestOplock
         )
+    }
+
+    /// Classifies an oplock FSCTL without duplicating FsRtl's complete payload validation.
+    ///
+    /// Malformed or truncated structured input is classified as a grant. FsRtl remains the
+    /// validation authority when no mutation barrier exists, while ambiguous input can never use
+    /// the break-continuation lane to bypass that barrier.
+    /// # Errors
+    ///
+    /// Returns invalid-device-request for a non-oplock control code.
+    pub(crate) fn oplock_action(
+        self,
+        structured_input: &[u8],
+    ) -> DriverResult<OplockControlAction> {
+        match self {
+            Self::RequestOplockLevel1
+            | Self::RequestOplockLevel2
+            | Self::RequestBatchOplock
+            | Self::RequestFilterOplock => Ok(OplockControlAction::Grant),
+            Self::OplockBreakAcknowledge
+            | Self::OplockBatchAckClosePending
+            | Self::OplockBreakNotify
+            | Self::OplockBreakAckNoLevel2 => Ok(OplockControlAction::BreakContinuation),
+            Self::RequestOplock => Ok(structured_oplock_action(structured_input)),
+            Self::LockVolume
+            | Self::UnlockVolume
+            | Self::DismountVolume
+            | Self::IsVolumeMounted
+            | Self::AllowExtendedDasdIo
+            | Self::GetReparsePoint
+            | Self::SetReparsePoint
+            | Self::DeleteReparsePoint
+            | Self::AddEncryptionKey
+            | Self::RemoveEncryptionKey
+            | Self::GetEncryptionKeyStatus
+            | Self::EnableVerity => Err(DriverError::InvalidDeviceRequest),
+        }
+    }
+}
+
+/// Byte offset of `REQUEST_OPLOCK_INPUT_BUFFER::Flags` in the documented buffered ABI.
+const REQUEST_OPLOCK_FLAGS_OFFSET: usize = 8;
+/// Complete prefix required to inspect `REQUEST_OPLOCK_INPUT_BUFFER::Flags`.
+const REQUEST_OPLOCK_FLAGS_END: usize = 12;
+/// WDK `REQUEST_OPLOCK_INPUT_FLAG_REQUEST`.
+const REQUEST_OPLOCK_INPUT_FLAG_REQUEST: u32 = 0x0000_0001;
+/// WDK `REQUEST_OPLOCK_INPUT_FLAG_ACK`.
+const REQUEST_OPLOCK_INPUT_FLAG_ACK: u32 = 0x0000_0002;
+
+/// Selects the break-continuation lane only for an unambiguous structured ACK.
+fn structured_oplock_action(input: &[u8]) -> OplockControlAction {
+    let Some(bytes) = input.get(REQUEST_OPLOCK_FLAGS_OFFSET..REQUEST_OPLOCK_FLAGS_END) else {
+        return OplockControlAction::Grant;
+    };
+    let Ok(flags) = <&[u8; 4]>::try_from(bytes) else {
+        return OplockControlAction::Grant;
+    };
+    let flags = u32::from_le_bytes(*flags);
+    if flags & REQUEST_OPLOCK_INPUT_FLAG_ACK != 0 && flags & REQUEST_OPLOCK_INPUT_FLAG_REQUEST == 0
+    {
+        OplockControlAction::BreakContinuation
+    } else {
+        OplockControlAction::Grant
     }
 }
 

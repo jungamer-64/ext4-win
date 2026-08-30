@@ -8,7 +8,7 @@ use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset,
 
 use crate::irp::{
     ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
-    ReceivedIrp, RegularFileWriteAccess,
+    OplockControlAction, ReceivedIrp, RegularFileWriteAccess,
 };
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::DriverError;
@@ -810,7 +810,10 @@ fn oplock_control_accepts_the_exact_directory_stream() {
     if let Ok(mut received) = received {
         assert_eq!(
             received.with_active(crate::request::file_info::oplock_control),
-            Ok(expected)
+            Ok(crate::request::file_info::OplockControlTarget {
+                file_control_block: expected,
+                action: OplockControlAction::Grant,
+            })
         );
     }
 }
@@ -1566,6 +1569,55 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
 
 /// # Errors
 ///
+/// Returns a fixture allocation, stream-header, or finite lease failure.
+/// # Panics
+///
+/// Panics if FsRtl check completion releases the separate mutation grant barrier.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture failures use Result; assertions verify atomic oplock mutation admission"
+)]
+fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), DriverError> {
+    let mut ledger = FileControlBlockLedger::try_new()?;
+    let volume = NonNull::<VolumeControlBlock>::dangling();
+    let stream = super::NodeStreamSizes {
+        node: NodeId::Directory(DirectoryNodeId::ROOT),
+        sizes: crate::kernel::stream::StreamSizes::EMPTY,
+    };
+    let fcb = ledger.file_control_block(
+        volume,
+        stream,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
+    let fcb_pointer = NonNull::from(fcb.as_ref());
+    let header = fcb.stream_header().as_ptr();
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(fcb)
+        .map_err(|failure| failure.into_parts().0)?;
+    let mut file_object = file_object_with_contexts(header, core::ptr::null_mut());
+    let Some(retained_fcb) = ledger.table.get_mut().iter().next() else {
+        return Err(DriverError::InternalInvariantViolation);
+    };
+    file_object.SectionObjectPointer = retained_fcb.stream_section_objects()?.as_ptr();
+
+    let (mutation, check) = with_active_file_object(&mut file_object, |active| {
+        ledger.acquire_oplock_mutation(active, volume)
+    })?;
+    assert!(!ledger.oplock_grant_available(fcb_pointer));
+    drop(check);
+    assert!(!ledger.oplock_grant_available(fcb_pointer));
+    drop(mutation);
+    assert!(ledger.oplock_grant_available(fcb_pointer));
+    ledger.close(fcb_pointer);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+///
 /// Returns a fixture allocation, native stream-header, or finite lease failure.
 /// # Panics
 ///
@@ -1694,6 +1746,42 @@ fn file_control_block_starts_with_empty_share_access() {
     assert_eq!(state.share_access.SharedRead, 0);
     assert_eq!(state.share_access.SharedWrite, 0);
     assert_eq!(state.share_access.SharedDelete, 0);
+}
+
+/// # Panics
+///
+/// Panics when nested mutation authority permits a grant or releases the barrier prematurely.
+#[test]
+fn oplock_grant_barrier_tracks_mutation_authority_independently_from_retention() {
+    let mut state = FileControlBlockOpenState::new();
+    assert!(state.oplock_grant_available());
+
+    assert_eq!(state.acquire_oplock_mutation_pair(), Ok(()));
+    assert_eq!(state.acquire_oplock_mutation_pair(), Ok(()));
+    assert!(!state.oplock_grant_available());
+    state.release_oplock_mutation();
+    assert!(!state.oplock_grant_available());
+    state.release_oplock_mutation();
+    assert!(state.oplock_grant_available());
+
+    assert_eq!(
+        state.lifetime,
+        StreamLifetimeState::OpenHandles {
+            handles: NonZeroU32::MIN,
+            deferred_leases: 4,
+        }
+    );
+    assert!(!state.release_deferred_lease(false));
+    assert!(!state.release_deferred_lease(false));
+    assert!(!state.release_deferred_lease(false));
+    assert!(!state.release_deferred_lease(false));
+    assert_eq!(
+        state.lifetime,
+        StreamLifetimeState::OpenHandles {
+            handles: NonZeroU32::MIN,
+            deferred_leases: 0,
+        }
+    );
 }
 
 /// # Panics
