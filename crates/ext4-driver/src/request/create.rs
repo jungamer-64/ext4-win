@@ -2046,42 +2046,6 @@ pub(crate) struct PendingCreatePublication {
     notification: DirectoryChange,
 }
 
-impl PendingCreatePublication {
-    /// Acquires every fallible driver-side resource required by post-commit publication.
-    ///
-    /// This is called after mutation resolution and before the first lower write. A returned value
-    /// contains no allocation or validation work for its durable publication path.
-    /// # Errors
-    ///
-    /// Returns an error when FCB allocation, reference accounting, or share validation fails.
-    pub(crate) fn prepare(self) -> DriverResult<PreparedCreatePublication> {
-        let Self {
-            creation,
-            stream_sizes,
-            file_object,
-            desired_access,
-            share_access,
-            handle,
-            flags,
-            pending_deletion,
-            notification,
-        } = self;
-        let fcb = creation.open_file_control_block(
-            file_object,
-            desired_access,
-            share_access,
-            stream_sizes,
-        )?;
-        Ok(PreparedCreatePublication {
-            claim: PendingFileControlBlockClaim { fcb, file_object },
-            handle,
-            flags,
-            pending_deletion,
-            notification,
-        })
-    }
-}
-
 /// Fully prepared post-commit create publication.
 #[derive(Debug)]
 pub(crate) struct PreparedCreatePublication {
