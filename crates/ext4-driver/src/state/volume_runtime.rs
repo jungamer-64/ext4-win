@@ -625,8 +625,7 @@ mod tests {
             publication.publication_failed(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
             publication
         );
-        let writeback =
-            VolumeFailureState::Operational.cache_writeback_failed(publication_status);
+        let writeback = VolumeFailureState::Operational.cache_writeback_failed(publication_status);
         assert_eq!(writeback.authorize_read(), Ok(()));
         assert_eq!(
             writeback.authorize_mutation(),
