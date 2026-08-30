@@ -78,6 +78,10 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("oplock FSCTL boundary", "ext4win_stream_oplock_fsctrl"),
     ("oplock package delegation", "FsRtlOplockFsctrlEx"),
     ("oplock conflict boundary", "ext4win_stream_check_oplock"),
+    (
+        "atomic oplock backout boundary",
+        "ext4win_stream_backout_atomic_oplock",
+    ),
     ("oplock conflict delegation", "FsRtlCheckOplockEx"),
     ("Fast I/O registration", "ext4win_fast_io_dispatch"),
     ("Fast I/O read callback", "ext4win_fast_io_read"),
@@ -2337,6 +2341,7 @@ mod tests {
              ext4win_stream_oplock_fsctrl\n\
              FsRtlOplockFsctrlEx\n\
              ext4win_stream_check_oplock\n\
+             ext4win_stream_backout_atomic_oplock\n\
              FsRtlCheckOplockEx\n\
              ext4win_fast_io_dispatch\n\
              ext4win_fast_io_read\n\

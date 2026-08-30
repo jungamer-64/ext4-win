@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 #[cfg(not(test))]
 use core::ffi::c_void;
 use core::fmt;
-#[cfg(not(test))]
+use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
 #[cfg(not(test))]
@@ -89,6 +89,124 @@ impl OplockCheck {
             self.stream
                 .stream_context()
                 .check_oplock(irp, self.flags, continuation)
+        }
+    }
+}
+
+/// Backout authority created only after FsRtl establishes a create-time atomic oplock.
+///
+/// The reservation must be consumed either by successful handle publication or by one synchronous
+/// backout using the same create IRP. Production drop treats any third outcome as ownership
+/// corruption rather than attempting a fallible native call from a finalizer.
+#[derive(Debug)]
+pub(crate) struct AtomicOplockReservation {
+    /// Retained stream and unconsumed backout authority.
+    stream: Option<OplockStreamLease>,
+}
+
+/// Validates the synchronous status contract shared by atomic establishment and backout.
+/// # Errors
+///
+/// Returns an invariant failure for asynchronous transfer or preserves any exact native rejection.
+fn classify_atomic_oplock_status(status: NTSTATUS) -> Result<(), DriverError> {
+    if status == wdk_sys::STATUS_SUCCESS {
+        Ok(())
+    } else if status == STATUS_PENDING {
+        Err(DriverError::InternalInvariantViolation)
+    } else {
+        Err(DriverError::OplockFailure(status))
+    }
+}
+
+impl AtomicOplockReservation {
+    /// Establishes the oplock encoded by the exact live create IRP.
+    /// # Errors
+    ///
+    /// Returns the exact FsRtl status when the atomic oplock cannot be granted, or an invariant
+    /// failure if a create-time request violates the documented synchronous contract.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the retained stream and borrowed live create IRP cross the audited FsRtl boundary"
+        )
+    )]
+    pub(crate) fn acquire(
+        stream: OplockStreamLease,
+        open_count: NonZeroU32,
+        owned: &OwnedIrp,
+    ) -> Result<Self, DriverError> {
+        #[cfg(not(test))]
+        let status = unsafe {
+            // SAFETY: `owned` is the unique live create IRP, and `stream` retains the FCB whose
+            // admitted share count is supplied for this synchronous request.
+            stream
+                .stream_context()
+                .reserve_create_oplock(owned.external_irp_identity(), open_count.get())
+        };
+        #[cfg(test)]
+        let status = {
+            let _: (NonZeroU32, &OwnedIrp) = (open_count, owned);
+            wdk_sys::STATUS_SUCCESS
+        };
+        classify_atomic_oplock_status(status)?;
+        Ok(Self {
+            stream: Some(stream),
+        })
+    }
+
+    /// Reports whether this backout authority belongs to the exact provisional FCB claim.
+    pub(crate) fn identifies(&self, fcb: NonNull<crate::state::FileControlBlock>) -> bool {
+        self.stream
+            .as_ref()
+            .is_some_and(|stream| stream.identifies(fcb))
+    }
+
+    /// Consumes backout authority after the matching handle has been published successfully.
+    pub(crate) fn publish(mut self) {
+        drop(self.stream.take());
+    }
+
+    /// Reverts the reservation before the matching create IRP is completed with failure.
+    /// # Errors
+    ///
+    /// Returns the exact native status and consumes the reservation even if FsRtl leaves the
+    /// outcome uncertain; callers must not retry with the same authority.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the one-shot reservation and live create IRP cross the audited FsRtl backout boundary"
+        )
+    )]
+    pub(crate) fn backout(mut self, owned: &OwnedIrp) -> Result<(), DriverError> {
+        let stream = self
+            .stream
+            .take()
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        #[cfg(not(test))]
+        let status = unsafe {
+            // SAFETY: This token retains the exact stream and is consumed with the same live create
+            // IRP before its provisional share claim or completion authority is released.
+            stream
+                .stream_context()
+                .backout_atomic_oplock(owned.external_irp_identity())
+        };
+        #[cfg(test)]
+        let status = {
+            let _: &OwnedIrp = owned;
+            wdk_sys::STATUS_SUCCESS
+        };
+        drop(stream);
+        classify_atomic_oplock_status(status)
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for AtomicOplockReservation {
+    fn drop(&mut self) {
+        if self.stream.is_some() {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
     }
 }
@@ -578,7 +696,30 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
 
 #[cfg(test)]
 mod tests {
-    use super::OplockCallbackProtocol;
+    use super::{OplockCallbackProtocol, classify_atomic_oplock_status};
+    use crate::kernel::status::DriverError;
+
+    /// # Panics
+    ///
+    /// Panics if atomic create oplocks accept asynchronous ownership transfer or erase an exact
+    /// native rejection status.
+    #[test]
+    fn atomic_oplock_statuses_are_synchronous_and_exact() {
+        assert_eq!(
+            classify_atomic_oplock_status(wdk_sys::STATUS_SUCCESS),
+            Ok(())
+        );
+        assert_eq!(
+            classify_atomic_oplock_status(wdk_sys::STATUS_PENDING),
+            Err(DriverError::InternalInvariantViolation)
+        );
+        assert_eq!(
+            classify_atomic_oplock_status(wdk_sys::STATUS_CANNOT_BREAK_OPLOCK),
+            Err(DriverError::OplockFailure(
+                wdk_sys::STATUS_CANNOT_BREAK_OPLOCK
+            ))
+        );
+    }
 
     /// # Panics
     ///

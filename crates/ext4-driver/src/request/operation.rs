@@ -17,7 +17,10 @@ use crate::irp::reactor::{
     ControlDeviceOperation, InfalliblePublication, IntentRequest, MountedVolumeOperation,
     OperationTransition, PublicationAuthority, ReactorTarget, WaitCondition,
 };
-use crate::irp::{CreateCompletion, IrpCompletion, OplockCheck, OplockContinuation, OwnedIrp};
+use crate::irp::{
+    AtomicOplockReservation, CreateCompletion, IrpCompletion, OplockCheck, OplockContinuation,
+    OwnedIrp,
+};
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
 use crate::kernel::ffi;
@@ -3120,6 +3123,13 @@ enum DriverResolveDisposition {
         /// Normalized create oplock behavior.
         policy: crate::irp::OplockCreatePolicy,
     },
+    /// An existing-node create must synchronously establish its encoded atomic oplock.
+    ReserveOplock {
+        /// Exact FCB retained by the provisional create claim.
+        fcb: core::ptr::NonNull<crate::state::FileControlBlock>,
+        /// User-handle count captured with the same provisional claim.
+        open_count: core::num::NonZeroU32,
+    },
     /// Core mutation and corresponding post-commit driver values were staged.
     Mutation(PendingDriverPublication),
 }
@@ -3323,7 +3333,7 @@ impl MutationRequestOperation {
     fn complete_error(
         mut self: Box<Self>,
         owned: OwnedIrp,
-        error: DriverError,
+        mut error: DriverError,
     ) -> OperationTransition {
         if self.request.is_paging() {
             self.trace.record(
@@ -3332,7 +3342,11 @@ impl MutationRequestOperation {
                 OperationalOutcome::Failed,
             );
         }
-        drop(self.pending_existing_create.take());
+        if let Some(pending) = self.pending_existing_create.take()
+            && let Err(backout_error) = pending.abort(&owned)
+        {
+            error = backout_error;
+        }
         drop(self.write_open.take());
         if let Some(deletion) = self.cleanup_deletion.as_mut() {
             deletion.abort_before_failure_completion();
@@ -3374,6 +3388,9 @@ impl MutationRequestOperation {
                     }
                     crate::request::create::CreateResolution::CheckOplock { fcb, policy } => {
                         Ok(DriverResolveDisposition::CheckOplock { fcb, policy })
+                    }
+                    crate::request::create::CreateResolution::ReserveOplock { fcb, open_count } => {
+                        Ok(DriverResolveDisposition::ReserveOplock { fcb, open_count })
                     }
                     crate::request::create::CreateResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
@@ -3671,6 +3688,33 @@ impl MutationRequestOperation {
                         suspended: self,
                     };
                 }
+                Ok(DriverResolveDisposition::ReserveOplock { fcb, open_count }) => {
+                    drop(pass);
+                    if size_changes.is_some()
+                        || deletion.is_some()
+                        || self.pending_existing_create.is_none()
+                        || self.write_open.is_some()
+                    {
+                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    }
+                    let stream = match operations.acquire_claimed_oplock_stream_lease(fcb) {
+                        Ok(stream) => stream,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    let reservation =
+                        match AtomicOplockReservation::acquire(stream, open_count, &owned) {
+                            Ok(reservation) => reservation,
+                            Err(error) => return self.complete_error(owned, error),
+                        };
+                    self.pending_existing_create
+                        .as_mut()
+                        .unwrap_or_else(|| {
+                            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        })
+                        .accept_oplock_reservation(reservation);
+                    return self.restart_resolution(owned, None, None, operations);
+                }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
                     if self.pending_existing_create.is_some() || self.write_open.is_some() {
                         return self.complete_error(owned, DriverError::InternalInvariantViolation);
@@ -3684,7 +3728,13 @@ impl MutationRequestOperation {
                         && self.pending_existing_create.is_some() =>
                 {
                     drop(pass);
-                    drop(self.pending_existing_create.take());
+                    let pending = self.pending_existing_create.take().unwrap_or_else(|| {
+                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                            .bugcheck()
+                    });
+                    if let Err(error) = pending.abort(&owned) {
+                        return self.complete_error(owned, error);
+                    }
                     drop(self.write_open.take());
                     return self.restart_resolution(owned, None, None, operations);
                 }
