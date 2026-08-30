@@ -51,7 +51,10 @@ pub(crate) use create::*;
 pub(crate) use dispatch::*;
 pub(crate) use lifecycle::*;
 use lifecycle::{KernelIrp, PendingIrp, copy_requestor_input_window, copy_requestor_output_window};
-pub(crate) use oplock::{AtomicOplockReservation, OplockCheck, OplockContinuation};
+pub(crate) use oplock::{
+    AtomicOplockReservation, NamespaceOplockPlan, NamespaceParentOplock,
+    NamespaceParentOplockEffect, OplockCheck, OplockContinuation,
+};
 pub(crate) use reactor::CompletionReactor;
 pub(crate) use stack::*;
 

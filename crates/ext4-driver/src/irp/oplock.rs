@@ -7,6 +7,7 @@ use core::fmt;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicI32, AtomicU8, Ordering};
+use ext4_core::DirectoryNodeId;
 #[cfg(not(test))]
 use wdk_sys::LIST_ENTRY;
 use wdk_sys::{NTSTATUS, STATUS_PENDING};
@@ -31,6 +32,93 @@ use crate::kernel::ffi;
 use crate::kernel::status::DriverError;
 #[cfg(not(test))]
 use crate::memory;
+
+/// Semantic effect a child-namespace mutation has on one parent directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NamespaceParentOplockEffect {
+    /// A vacant child name is created or an existing child name changes without removal semantics.
+    Change,
+    /// An existing child link is removed, renamed away, or replaced.
+    Removal,
+}
+
+/// One exact parent-directory oplock requirement derived before the first filesystem write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NamespaceParentOplock {
+    /// Directory node whose child namespace will change.
+    parent: DirectoryNodeId,
+    /// Strongest effect this mutation has on the parent.
+    effect: NamespaceParentOplockEffect,
+}
+
+impl NamespaceParentOplock {
+    /// Parent node covered by this requirement.
+    pub(crate) const fn parent(self) -> DirectoryNodeId {
+        self.parent
+    }
+
+    /// Child-namespace effect used to select the FsRtl check flags.
+    pub(crate) const fn effect(self) -> NamespaceParentOplockEffect {
+        self.effect
+    }
+}
+
+/// Allocation-free, exact parent oplock requirements for one namespace mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NamespaceOplockPlan {
+    /// First and always-present parent requirement.
+    first: NamespaceParentOplock,
+    /// Second parent requirement for a cross-directory rename.
+    second: Option<NamespaceParentOplock>,
+}
+
+impl NamespaceOplockPlan {
+    /// Creates one exact parent requirement for child creation, replacement, or removal.
+    pub(crate) const fn single(
+        parent: DirectoryNodeId,
+        effect: NamespaceParentOplockEffect,
+    ) -> Self {
+        Self {
+            first: NamespaceParentOplock { parent, effect },
+            second: None,
+        }
+    }
+
+    /// Creates a rename plan, coalescing a same-parent source and target to removal semantics.
+    pub(crate) fn rename(
+        source_parent: DirectoryNodeId,
+        target_parent: DirectoryNodeId,
+        target_effect: NamespaceParentOplockEffect,
+    ) -> Self {
+        let source = NamespaceParentOplock {
+            parent: source_parent,
+            effect: NamespaceParentOplockEffect::Removal,
+        };
+        if source_parent == target_parent {
+            return Self {
+                first: source,
+                second: None,
+            };
+        }
+        Self {
+            first: source,
+            second: Some(NamespaceParentOplock {
+                parent: target_parent,
+                effect: target_effect,
+            }),
+        }
+    }
+
+    /// First parent requirement in deterministic source-before-target order.
+    pub(crate) const fn first(self) -> NamespaceParentOplock {
+        self.first
+    }
+
+    /// Optional target-parent requirement for a cross-directory rename.
+    pub(crate) const fn second(self) -> Option<NamespaceParentOplock> {
+        self.second
+    }
+}
 
 /// One stream-retaining oplock check prepared before the IRP leaves driver ownership.
 #[derive(Debug)]
@@ -742,11 +830,13 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
 #[cfg(test)]
 mod tests {
     use super::{
-        OplockCallbackProtocol, classify_atomic_oplock_status, cleanup_oplock_flags,
-        parent_change_oplock_flags, parent_removal_oplock_flags,
+        NamespaceOplockPlan, NamespaceParentOplockEffect, OplockCallbackProtocol,
+        classify_atomic_oplock_status, cleanup_oplock_flags, parent_change_oplock_flags,
+        parent_removal_oplock_flags,
     };
     use crate::irp::CreateDeletion;
     use crate::kernel::status::DriverError;
+    use ext4_core::DirectoryNodeId;
 
     /// # Panics
     ///
@@ -803,6 +893,30 @@ mod tests {
             parent_change_oplock_flags(),
             wdk_sys::OPLOCK_FLAG_PARENT_OBJECT
         );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when one-parent plans or same-parent rename coalescing lose removal precedence.
+    #[test]
+    fn namespace_oplock_plans_are_effect_and_order_exact() {
+        let one =
+            NamespaceOplockPlan::single(DirectoryNodeId::ROOT, NamespaceParentOplockEffect::Change);
+        assert_eq!(one.first().parent(), DirectoryNodeId::ROOT);
+        assert_eq!(one.first().effect(), NamespaceParentOplockEffect::Change);
+        assert!(one.second().is_none());
+
+        let same_parent = NamespaceOplockPlan::rename(
+            DirectoryNodeId::ROOT,
+            DirectoryNodeId::ROOT,
+            NamespaceParentOplockEffect::Change,
+        );
+        assert_eq!(same_parent.first().parent(), DirectoryNodeId::ROOT);
+        assert_eq!(
+            same_parent.first().effect(),
+            NamespaceParentOplockEffect::Removal
+        );
+        assert!(same_parent.second().is_none());
     }
 
     /// # Panics
