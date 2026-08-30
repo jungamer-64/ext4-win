@@ -291,6 +291,30 @@ impl StreamContext {
         }
     }
 
+    /// Synchronously asks FsRtl to establish the atomic oplock encoded by one create IRP.
+    ///
+    /// # Safety
+    ///
+    /// `irp` must identify the unique live `IRP_MJ_CREATE` request whose provisional share claim
+    /// contributes to `open_count`. The caller retains completion authority because create-time
+    /// requests do not return `STATUS_PENDING` from this boundary.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the retained stream and borrowed live create IRP cross the audited FsRtl boundary"
+    )]
+    pub(crate) unsafe fn reserve_create_oplock(
+        &self,
+        irp: NonNull<wdk_sys::IRP>,
+        open_count: u32,
+    ) -> NTSTATUS {
+        unsafe {
+            // SAFETY: The caller retains the exact stream, IRP, and admitted handle-count
+            // authorities documented above for this synchronous call.
+            ext4win_stream_oplock_fsctrl(self.header.as_ptr(), irp.as_ptr(), open_count, 0)
+        }
+    }
+
     /// Delegates one break-causing IRP to the stream-owned FsRtl oplock package.
     ///
     /// # Safety
@@ -314,6 +338,26 @@ impl StreamContext {
                 flags,
                 continuation.as_ptr(),
             )
+        }
+    }
+
+    /// Reverts one create-time atomic oplock reservation before the create IRP fails.
+    ///
+    /// # Safety
+    ///
+    /// `irp` must be the unique live `IRP_MJ_CREATE` request that established the reservation,
+    /// and the caller must prevent the associated provisional handle claim from being released
+    /// until this synchronous call returns.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the live create IRP and retained stream cross the audited native FsRtl boundary"
+    )]
+    pub(crate) unsafe fn backout_atomic_oplock(&self, irp: NonNull<wdk_sys::IRP>) -> NTSTATUS {
+        unsafe {
+            // SAFETY: The caller supplies the exact live create IRP and retains this stream for
+            // the full synchronous backout described above.
+            ext4win_stream_backout_atomic_oplock(self.header.as_ptr(), irp.as_ptr())
         }
     }
 
@@ -939,6 +983,10 @@ unsafe extern "system" {
         irp: *mut wdk_sys::IRP,
         flags: wdk_sys::ULONG,
         continuation: wdk_sys::PVOID,
+    ) -> NTSTATUS;
+    fn ext4win_stream_backout_atomic_oplock(
+        stream_header: wdk_sys::PVOID,
+        irp: *mut wdk_sys::IRP,
     ) -> NTSTATUS;
     fn ext4win_stream_process_file_lock(
         stream_header: wdk_sys::PVOID,

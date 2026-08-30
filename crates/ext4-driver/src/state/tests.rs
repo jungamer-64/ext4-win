@@ -1500,6 +1500,7 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
     let lease = with_active_file_object(&mut file_object, |active| {
         ledger.acquire_oplock_stream_lease(active, volume)
     })?;
+    assert!(lease.identifies(fcb_pointer));
     ledger.close(fcb_pointer);
     assert!(!ledger.is_empty());
     drop(lease);

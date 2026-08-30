@@ -47,21 +47,19 @@ pub(crate) struct PagingStreamLease {
     file: FileNodeId,
 }
 
-/// One node stream retained while an IRP is delegated to the FsRtl oplock package.
+/// One node stream retained across an FsRtl oplock operation.
 #[derive(Debug)]
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "host tests validate lease residency but cannot enter the native FsRtl consumer"
-    )
-)]
 pub(crate) struct OplockStreamLease {
-    /// Sole retention authority spanning break notification, wait, and reactor resumption.
+    /// Sole retention authority spanning synchronous reservation/backout or an asynchronous break.
     retained: DeferredStreamLease,
 }
 
 impl OplockStreamLease {
+    /// Reports whether this lease retains the exact provisional create claim's FCB.
+    pub(crate) fn identifies(&self, fcb: NonNull<FileControlBlock>) -> bool {
+        self.retained.fcb == fcb
+    }
+
     /// Returns the retained stream boundary containing the FsRtl oplock package.
     #[cfg_attr(
         test,
@@ -845,6 +843,8 @@ pub(crate) struct ExistingFileControlBlockAdmission {
     fcb: NonNull<FileControlBlock>,
     /// Whether the stream existed before this claim was recorded.
     residency: ExistingStreamResidency,
+    /// User-handle count after this exact share claim was recorded.
+    open_count: NonZeroU32,
 }
 
 impl ExistingFileControlBlockAdmission {
@@ -856,6 +856,11 @@ impl ExistingFileControlBlockAdmission {
     /// Returns the pre-admission stream residency fact.
     pub(crate) const fn residency(self) -> ExistingStreamResidency {
         self.residency
+    }
+
+    /// Returns the nonzero handle count admitted with this share claim.
+    pub(crate) const fn open_count(self) -> NonZeroU32 {
+        self.open_count
     }
 }
 
@@ -965,9 +970,10 @@ impl FileControlBlockLedger {
                     share_access,
                     share_check,
                 )
-                .map(|()| ExistingFileControlBlockAdmission {
+                .map(|open_count| ExistingFileControlBlockAdmission {
                     fcb,
                     residency: ExistingStreamResidency::Resident,
+                    open_count,
                 })
             } else {
                 let fcb = NonNull::from(candidate.as_ref());
@@ -980,9 +986,10 @@ impl FileControlBlockLedger {
                         share_access,
                         share_check,
                     ) {
-                        Ok(()) => Ok(ExistingFileControlBlockAdmission {
+                        Ok(open_count) => Ok(ExistingFileControlBlockAdmission {
                             fcb,
                             residency: ExistingStreamResidency::FirstOpen,
+                            open_count,
                         }),
                         Err(error) => {
                             removed = release_file_object_lease_in_table(table, fcb, false);
@@ -1047,9 +1054,10 @@ impl FileControlBlockLedger {
                 share_access,
                 share_check,
             )
-            .map(|()| ExistingFileControlBlockAdmission {
+            .map(|open_count| ExistingFileControlBlockAdmission {
                 fcb,
                 residency: ExistingStreamResidency::Resident,
+                open_count,
             }),
         )
     }
@@ -2281,7 +2289,7 @@ fn record_reused_file_control_block_open(
     desired_access: GrantedAccess,
     share_access: ShareAccess,
     share_check: FileControlBlockShareCheck,
-) -> DriverResult<()> {
+) -> DriverResult<NonZeroU32> {
     let mut state = ledger_file_control_block_open_state(table, fcb);
     let state = unsafe {
         // SAFETY: The caller holds the ledger resource exclusively and the helper validated this
@@ -2291,7 +2299,7 @@ fn record_reused_file_control_block_open(
     let references = state.next_file_object_reference()?;
     state.record_share_access(file_object, desired_access, share_access, share_check)?;
     state.lifetime = references;
-    Ok(())
+    NonZeroU32::new(state.share_access.OpenCount).ok_or(DriverError::InternalInvariantViolation)
 }
 
 /// Records the first share claim on a newly inserted FCB.
@@ -2309,14 +2317,15 @@ fn record_file_control_block_share(
     desired_access: GrantedAccess,
     share_access: ShareAccess,
     share_check: FileControlBlockShareCheck,
-) -> DriverResult<()> {
+) -> DriverResult<NonZeroU32> {
     let mut state = ledger_file_control_block_open_state(table, fcb);
-    unsafe {
+    let state = unsafe {
         // SAFETY: The caller holds the ledger resource exclusively and the helper validated this
         // state pointer against the owning table.
         state.as_mut()
-    }
-    .record_share_access(file_object, desired_access, share_access, share_check)
+    };
+    state.record_share_access(file_object, desired_access, share_access, share_check)?;
+    NonZeroU32::new(state.share_access.OpenCount).ok_or(DriverError::InternalInvariantViolation)
 }
 
 /// Consumes one handle lease and removes the FCB only after the stream becomes reclaimable.

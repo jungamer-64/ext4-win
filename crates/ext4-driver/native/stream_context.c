@@ -647,6 +647,43 @@ _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
+ext4win_stream_backout_atomic_oplock(
+    _In_ PVOID stream_header,
+    _Inout_ PIRP irp)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+
+    if ((stream == NULL) || (stream->Kind != 1) ||
+        (stream->ByteRangeLocks == NULL) || (irp == NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
+    ExAcquireResourceSharedLite(&stream->MainResource, TRUE);
+    __try {
+        status = FsRtlCheckOplockEx(
+            &stream->Header.Oplock,
+            irp,
+            OPLOCK_FLAG_BACK_OUT_ATOMIC_OPLOCK,
+            NULL,
+            NULL,
+            NULL);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    ExReleaseResourceLite(&stream->MainResource);
+    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ExReleaseResourceLite(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK, status);
+    return status;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
 ext4win_stream_process_file_lock(
     _In_ PVOID stream_header,
     _Inout_ PIRP irp)
