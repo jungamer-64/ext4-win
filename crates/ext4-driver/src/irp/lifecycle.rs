@@ -551,19 +551,6 @@ impl ReceivedIrp {
         })
     }
 
-    /// Transfers this oplock FSCTL's terminal completion authority to FsRtl.
-    #[expect(
-        unsafe_code,
-        reason = "the validated FILE_OBJECT retains its FCB while FsRtl owns the consumed IRP"
-    )]
-    pub(crate) fn delegate_oplock(self, file_control_block: NonNull<FileControlBlock>) -> NTSTATUS {
-        let file_control_block = unsafe {
-            // SAFETY: FSCTL decode validated this FILE_OBJECT's bound inode stream owner.
-            file_control_block.as_ref()
-        };
-        file_control_block.process_oplock_fsctrl(self.target)
-    }
-
     /// Completes a raw IRP when dispatch-target decoding failed.
     /// # Safety
     ///

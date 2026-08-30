@@ -402,7 +402,7 @@ unsafe extern "C" fn shutdown(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> NTSTATUS {
-    let mut received = match unsafe {
+    let received = match unsafe {
         // SAFETY: The callback caller retains the WDK-provided device and IRP for this transition.
         ReceivedIrp::decode(device, irp)
     } {
@@ -419,15 +419,6 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
         Ok(device_kind) => device_kind,
         Err(error) => return received.complete_result(Err(error)),
     };
-    if device_kind == DriverDeviceKind::MountedVolume && major == DispatchMajor::FileSystemControl {
-        match received.with_active(super::file_info::oplock_control) {
-            Ok(Some(file_control_block)) => {
-                return received.delegate_oplock(file_control_block);
-            }
-            Ok(None) => {}
-            Err(error) => return received.complete_result(Err(error)),
-        }
-    }
     match dispatch_policy(device_kind, major) {
         DispatchPolicy::Immediate(request) => execute_immediate(received, request),
         DispatchPolicy::Queued => crate::state::queue_device_request(received, major),
@@ -588,6 +579,7 @@ pub(crate) fn admit_owned(
         Immediate(ImmediateRequestKind),
         Notification,
         ByteRangeLock,
+        OplockControl,
         VolumeControl(super::operation::VolumeControlRequestKind),
         FsControl(crate::irp::FileSystemControlMinorFunction),
         Unsupported,
@@ -667,7 +659,7 @@ pub(crate) fn admit_owned(
                     | crate::irp::FsControlCode::OplockBreakNotify
                     | crate::irp::FsControlCode::OplockBreakAckNoLevel2
                     | crate::irp::FsControlCode::RequestFilterOplock
-                    | crate::irp::FsControlCode::RequestOplock => Admission::Unsupported,
+                    | crate::irp::FsControlCode::RequestOplock => Admission::OplockControl,
                     crate::irp::FsControlCode::GetReparsePoint => {
                         Admission::Read(ReadRequestKind::GetReparsePoint)
                     }
@@ -753,6 +745,7 @@ pub(crate) fn admit_owned(
         Admission::Immediate(_)
         | Admission::Notification
         | Admission::ByteRangeLock
+        | Admission::OplockControl
         | Admission::VolumeControl(_) => HandleRequestClass::Ordinary,
         Admission::FsControl(_) | Admission::Unsupported => HandleRequestClass::Device,
     };
@@ -860,6 +853,9 @@ pub(crate) fn admit_owned(
             }
             Admission::ByteRangeLock => target
                 .with_mounted_access(|access| super::operation::byte_range_lock(owned, access)),
+            Admission::OplockControl => {
+                target.with_mounted_access(|access| super::operation::oplock_control(owned, access))
+            }
             Admission::VolumeControl(kind) => {
                 target.with_mounted_access(|_| super::operation::volume_control(owned, kind))
             }
