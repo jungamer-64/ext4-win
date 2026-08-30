@@ -827,6 +827,8 @@ pub(crate) enum PreparedRequest {
     DirectoryControl(PreparedDirectoryControl),
     /// File-system control with a sealed minor-function classification.
     FileSystemControl(FileSystemControlMinorFunction),
+    /// Byte-range lock or unlock request whose live lock parameters remain IRP-owned.
+    LockControl,
     /// Flush request.
     FlushBuffers,
     /// Extended-attribute query with an owned selection list.
@@ -927,6 +929,7 @@ impl PreparedRequest {
                 };
                 Ok((Self::FileSystemControl(minor), key))
             }
+            DispatchMajor::LockControl => Ok((Self::LockControl, generic_key())),
             DispatchMajor::FlushBuffers => Ok((Self::FlushBuffers, generic_key())),
             DispatchMajor::QueryEa => {
                 let query = stack.query_ea().map_err(IrpCompletion::from_error)?;
@@ -1485,6 +1488,37 @@ mod tests {
                         Ok(QueueContextOwnership::Close),
                         QueueContextOwnership::Close
                     )
+                ));
+            }
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when lock-control loses its sealed major classification or handle cancellation key.
+    #[test]
+    fn lock_control_capture_is_file_scoped() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+        let mut other_file = wdk_sys::FILE_OBJECT::default();
+        let mut irp = wdk_sys::IRP::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MajorFunction: u8::try_from(wdk_sys::IRP_MJ_LOCK_CONTROL).unwrap_or_default(),
+            FileObject: core::ptr::addr_of_mut!(file_object),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let target = build_target(&mut device, &mut irp, &mut stack);
+        assert!(target.is_some());
+        if let Some(mut target) = target {
+            let context = capture_context(&mut target, DispatchMajor::LockControl);
+            assert!(context.is_ok());
+            if let Ok(QueueContextOwnership::Captured(context)) = context {
+                assert!(matches!(context.prepared(), PreparedRequest::LockControl));
+                assert!(context.matches_cancellation_context(
+                    core::ptr::addr_of_mut!(file_object).cast::<c_void>()
+                ));
+                assert!(!context.matches_cancellation_context(
+                    core::ptr::addr_of_mut!(other_file).cast::<c_void>()
                 ));
             }
         }
