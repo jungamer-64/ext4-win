@@ -229,51 +229,6 @@ impl FileControlBlock {
     }
 }
 
-/// Identity-bound Windows sizes derived together from one validated core inode snapshot.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct NodeStreamSizes {
-    /// Inode whose stream receives these sizes.
-    pub(super) node: NodeId,
-    /// Complete native size tuple, validated before publication can become irreversible.
-    pub(super) sizes: StreamSizes,
-}
-
-impl NodeStreamSizes {
-    /// Converts the core observation to Windows units without granting publication authority.
-    /// # Errors
-    ///
-    /// Returns an error when the observed sizes exceed Windows' signed size domain.
-    pub(crate) fn try_from_storage(
-        snapshot: NodeStorageSnapshot,
-        cluster_size: ClusterSize,
-    ) -> DriverResult<Self> {
-        Ok(Self {
-            node: snapshot.node(),
-            sizes: StreamSizes::try_from_ext4(
-                snapshot.size(),
-                snapshot.allocation_size(),
-                cluster_size,
-            )?,
-        })
-    }
-
-    /// Identity bound to the size observation.
-    pub(crate) const fn node(self) -> NodeId {
-        self.node
-    }
-}
-
-/// Prevalidated sizes retained with the exact mutation's commit continuation.
-///
-/// Preparation does not snapshot FCB addresses: a stream may close or first open during commit
-/// I/O. Publication resolves inode identities under the ledger guard after epoch visibility and
-/// before IRP completion/notifications. Future opens initialize from that now-current epoch.
-#[derive(Debug)]
-pub(crate) struct PreparedStreamSizePublications {
-    /// One final size tuple per live inode changed by the reserved mutation.
-    pub(super) nodes: DriverVec<NodeStreamSizes>,
-}
-
 /// Result of durable ext4 visibility publication plus the independently fallible Windows stream
 /// projection.
 pub(crate) struct DurablePublicationOutcome {
@@ -287,23 +242,6 @@ impl DurablePublicationOutcome {
     /// Separates mandatory checkpoint ownership from the post-commit projection result.
     pub(crate) fn into_parts(self) -> (PendingCheckpoint, DriverResult<()>) {
         (self.checkpoint, self.stream_projection)
-    }
-}
-
-impl PreparedStreamSizePublications {
-    /// Prepares all conversions and storage before the first lower write.
-    /// # Errors
-    ///
-    /// Returns an error on allocation failure or a size outside the Windows domain.
-    pub(crate) fn try_new(
-        snapshots: &[NodeStorageSnapshot],
-        cluster_size: ClusterSize,
-    ) -> DriverResult<Self> {
-        let mut nodes = DriverVec::try_with_capacity(snapshots.len())?;
-        for snapshot in snapshots {
-            nodes.try_push(NodeStreamSizes::try_from_storage(*snapshot, cluster_size)?)?;
-        }
-        Ok(Self { nodes })
     }
 }
 

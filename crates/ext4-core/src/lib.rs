@@ -59,7 +59,7 @@ pub use volume::{
     HomeBlockDurability, JournalPayloadDurability, MAX_DIRECTORY_SCAN_ENTRIES, MountOperation,
     MountTransition, MountedProfile, MutationCoordinatorState, MutationLease,
     MutationResolveOperation, MutationResolvePass, MutationResolveReady, MutationResolveTransition,
-    MutationResource, NodeId, NodeStorageSnapshot, ObservedResourceVersionSet, OperationEvent,
+    MutationResource, NodeId, ObservedResourceVersionSet, OperationEvent,
     OperationId, OrderedDataDurability, PublishedMutation, ReadTransition, RenameTargetCollision,
     ReservedMutation, ResolvedMutation, ResourceVersion, RetryPermit, ScannedDirectoryEntry,
     StorageRequestSequence, StorageRequestSequenceStep, SymlinkNode, SymlinkNodeId,
