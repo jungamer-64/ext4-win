@@ -997,7 +997,7 @@ impl MountedVolumeAccess<'_> {
     /// first Cache Manager or Memory Manager call is submitted.
     pub(crate) fn prepare_stream_size_changes(
         &self,
-        updates: &PreparedStreamSizePublications,
+        updates: &PreparedStreamMetadataPublications,
         deletion: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
         self.volume
@@ -1011,7 +1011,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns a native size snapshot failure or a cross-volume gate invariant error.
     pub(crate) fn prepared_stream_size_changes_match(
         &self,
-        updates: &PreparedStreamSizePublications,
+        updates: &PreparedStreamMetadataPublications,
         prepared: &PreparedStreamSizeChanges,
         deletion: Option<NodeId>,
     ) -> DriverResult<bool> {
@@ -1295,10 +1295,10 @@ impl MountedVolumeAccess<'_> {
         self.volume.runtime.journal_is_clean()
     }
 
-    /// Publishes the durable epoch and its prevalidated stream sizes in one reactor turn.
+    /// Publishes the durable epoch and its prevalidated stream metadata in one reactor turn.
     ///
     /// The core durability/visibility capabilities are required here, so a caller cannot install
-    /// prepared stream sizes through the mounted-volume boundary before the commit is durable.
+    /// prepared stream metadata through the mounted-volume boundary before the commit is durable.
     #[inline(never)]
     pub(crate) fn publish_durable(
         &mut self,
@@ -1306,7 +1306,7 @@ impl MountedVolumeAccess<'_> {
         visibility: VisibilityLease,
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
-        stream_sizes: PreparedStreamSizePublications,
+        stream_metadata: PreparedStreamMetadataPublications,
     ) -> DurablePublicationOutcome {
         let checkpoint = self.volume.runtime.publish_durable(
             mutation,
@@ -1314,10 +1314,11 @@ impl MountedVolumeAccess<'_> {
             durable_slot,
             checkpoint_slot,
         );
+        let epoch = checkpoint.epoch();
         let stream_projection = self
             .volume
             .file_control_blocks
-            .publish_stream_sizes(stream_sizes);
+            .publish_stream_metadata(stream_metadata, epoch);
         DurablePublicationOutcome {
             checkpoint,
             stream_projection,
@@ -1369,6 +1370,11 @@ impl MountedVolumeAccess<'_> {
     /// Current committed allocation geometry.
     pub(crate) fn volume_geometry(&self) -> VolumeGeometry {
         self.volume.runtime.current_epoch().geometry()
+    }
+
+    /// Returns the committed epoch that owns non-suspending metadata observations.
+    pub(crate) fn current_epoch_sequence(&self) -> ext4_core::EpochSequence {
+        self.volume.runtime.current_epoch().sequence()
     }
 
     /// Checks whether resolve still observes the epoch paired with the current coordinator.

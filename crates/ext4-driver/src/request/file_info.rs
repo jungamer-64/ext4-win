@@ -7,8 +7,8 @@ use ext4_core::{
     ChildLookup, CommittedReadPass, DirectoryNode, DirectoryNodeId, DirectoryScanLimit,
     Ext4LinkCount, Ext4Name, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
     Ext4WindowsAttributes, FileAllocationSize, FileNodeId, FileOffset, FileSize,
-    HardLinkDestination, HardLinkNodeId, HardLinks, NodeId, RenameTargetCollision, StorageRequest,
-    StorageTarget, WindowsName, WindowsOverlay,
+    HardLinkDestination, HardLinkNodeId, HardLinks, NodeId, NodeMetadataSnapshot, NodeReparsePoint,
+    RenameTargetCollision, StorageRequest, StorageTarget, WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -39,7 +39,7 @@ use directory::{
     windows_time_quad, wire_offset, wire_range, write_utf16,
 };
 use query::{
-    FileMetadata, FileMetadataKind, FileMetadataReparsePoint, file_attributes, metadata_from_node,
+    FileMetadata, FileMetadataKind, FileMetadataReparsePoint, metadata_from_node,
     query_file_information, reparse_tag, windows_time,
 };
 use set::{UTF16_BACKSLASH, regular_file_size, set_file_information};

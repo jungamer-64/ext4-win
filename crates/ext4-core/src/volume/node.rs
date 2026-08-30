@@ -9,6 +9,7 @@ use crate::disk_format::inode::{
 };
 use crate::error::{Error, Result};
 use crate::platform::name::Ext4Name;
+use crate::platform::windows::{Ext4WindowsAttributes, WindowsOverlay};
 
 /// Typed regular-file inode identity.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -101,6 +102,141 @@ impl NodeId {
     #[must_use]
     pub const fn file_index(self) -> u32 {
         self.inode().as_u32()
+    }
+}
+
+/// Windows-visible reparse classification derived from one ext4 inode and its private xattrs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeReparsePoint {
+    /// The inode has no reparse interpretation.
+    None,
+    /// The inode is a native symbolic link or carries the validated symbolic-link reparse xattr.
+    SymbolicLink,
+}
+
+/// Complete live-inode metadata snapshot prepared from one coherent ext4 view.
+///
+/// Logical EOF and physical allocation remain distinct. POSIX metadata and the two Windows xattr
+/// projections travel with those sizes so a durable publication cannot mix values from different
+/// inode states. This observation grants neither mutation nor publication authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NodeMetadataSnapshot {
+    /// Identity and kind validated from the same inode as every remaining field.
+    node: NodeId,
+    /// Logical payload length, including holes and unwritten ranges.
+    size: FileSize,
+    /// Allocation charge including inode-owned metadata blocks.
+    allocation_size: FileAllocationSize,
+    /// POSIX owner and permission state.
+    security: Ext4Security,
+    /// Complete ext4 timestamp set.
+    times: Ext4Times,
+    /// Nonzero live namespace link count.
+    links_count: Ext4LinkCount,
+    /// Windows-only attribute bits parsed from the private overlay xattr.
+    windows_attributes: Ext4WindowsAttributes,
+    /// Windows reparse interpretation validated from inode kind and private xattr state.
+    reparse_point: NodeReparsePoint,
+}
+
+impl NodeMetadataSnapshot {
+    /// Projects one validated inode and its already parsed Windows xattr state.
+    pub(super) fn from_inode(
+        inode: &Inode,
+        overlay: Option<WindowsOverlay>,
+        has_windows_symlink_reparse: bool,
+    ) -> Self {
+        let node = match inode.kind() {
+            InodeKind::File => NodeId::File(FileNodeId::new(inode.id())),
+            InodeKind::Directory => NodeId::Directory(DirectoryNodeId::new(inode.id())),
+            InodeKind::Symlink => NodeId::Symlink(SymlinkNodeId::new(inode.id())),
+        };
+        let reparse_point = if inode.kind() == InodeKind::Symlink || has_windows_symlink_reparse {
+            NodeReparsePoint::SymbolicLink
+        } else {
+            NodeReparsePoint::None
+        };
+        Self {
+            node,
+            size: inode.size(),
+            allocation_size: inode.allocation_size(),
+            security: inode.security(),
+            times: inode.times(),
+            links_count: inode.links_count(),
+            windows_attributes: overlay
+                .map(WindowsOverlay::attributes)
+                .unwrap_or(Ext4WindowsAttributes::NONE),
+            reparse_point,
+        }
+    }
+
+    /// Identity of the inode represented by this snapshot.
+    #[must_use]
+    pub const fn node(self) -> NodeId {
+        self.node
+    }
+
+    /// Logical payload length in the observed inode.
+    #[must_use]
+    pub const fn size(self) -> FileSize {
+        self.size
+    }
+
+    /// Physical allocation charged to the observed inode.
+    #[must_use]
+    pub const fn allocation_size(self) -> FileAllocationSize {
+        self.allocation_size
+    }
+
+    /// POSIX security metadata from the observed inode.
+    #[must_use]
+    pub const fn security(self) -> Ext4Security {
+        self.security
+    }
+
+    /// Complete timestamp set from the observed inode.
+    #[must_use]
+    pub const fn times(self) -> Ext4Times {
+        self.times
+    }
+
+    /// Live link count from the observed inode.
+    #[must_use]
+    pub const fn links_count(self) -> Ext4LinkCount {
+        self.links_count
+    }
+
+    /// Validated Windows-only attribute bits.
+    #[must_use]
+    pub const fn windows_attributes(self) -> Ext4WindowsAttributes {
+        self.windows_attributes
+    }
+
+    /// Validated Windows reparse classification.
+    #[must_use]
+    pub const fn reparse_point(self) -> NodeReparsePoint {
+        self.reparse_point
+    }
+
+    /// Complete Windows file-attribute projection derived from this one coherent snapshot.
+    #[must_use]
+    pub fn windows_file_attributes(self) -> u32 {
+        const READONLY: u32 = 0x0000_0001;
+        const DIRECTORY: u32 = 0x0000_0010;
+        const NORMAL: u32 = 0x0000_0080;
+        const REPARSE_POINT: u32 = 0x0000_0400;
+
+        let mut attributes = self.windows_attributes.bits();
+        if self.security.permissions().as_u16() & 0o222 == 0 {
+            attributes |= READONLY;
+        }
+        if matches!(self.node, NodeId::Directory(_)) {
+            attributes |= DIRECTORY;
+        }
+        if self.reparse_point == NodeReparsePoint::SymbolicLink {
+            attributes |= REPARSE_POINT;
+        }
+        if attributes == 0 { NORMAL } else { attributes }
     }
 }
 

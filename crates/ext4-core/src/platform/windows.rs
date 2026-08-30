@@ -10,6 +10,8 @@ use crate::memory;
 pub struct Ext4WindowsAttributes(u32);
 
 impl Ext4WindowsAttributes {
+    /// No Windows-only attributes are attached to the inode.
+    pub const NONE: Self = Self(0);
     /// Windows hidden attribute.
     pub const HIDDEN: u32 = 0x0000_0002;
     /// Windows system attribute.

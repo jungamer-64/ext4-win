@@ -440,14 +440,16 @@ pub(super) struct FileMetadata {
     pub(super) size: FileSize,
     /// ext4 allocation charge in bytes.
     pub(super) allocation_size: FileAllocationSize,
-    /// POSIX security metadata.
+    /// POSIX security metadata retained for metadata mutations.
     pub(super) security: Ext4Security,
     /// ext4 inode timestamps.
     pub(super) times: Ext4Times,
     /// ext4 inode link count.
     pub(super) links_count: Ext4LinkCount,
-    /// Windows-specific overlay attributes.
+    /// Windows-specific overlay bits retained for metadata mutations.
     pub(super) overlay_attributes: u32,
+    /// Complete Windows file attributes derived by the coherent core snapshot.
+    pub(super) file_attributes: u32,
     /// Windows reparse metadata projected from a native symlink or private xattr.
     pub(super) reparse_point: FileMetadataReparsePoint,
 }
@@ -512,6 +514,33 @@ pub(super) enum FileMetadataReparsePoint {
     SymbolicLink,
 }
 
+impl From<NodeMetadataSnapshot> for FileMetadata {
+    /// Projects the coherent core observation to the Windows packing boundary.
+    fn from(snapshot: NodeMetadataSnapshot) -> Self {
+        let kind = match snapshot.node() {
+            NodeId::File(_) => FileMetadataKind::File,
+            NodeId::Directory(_) => FileMetadataKind::Directory,
+            NodeId::Symlink(_) => FileMetadataKind::Symlink,
+        };
+        let reparse_point = match snapshot.reparse_point() {
+            NodeReparsePoint::None => FileMetadataReparsePoint::None,
+            NodeReparsePoint::SymbolicLink => FileMetadataReparsePoint::SymbolicLink,
+        };
+        Self {
+            file_index: snapshot.node().file_index(),
+            kind,
+            size: snapshot.size(),
+            allocation_size: snapshot.allocation_size(),
+            security: snapshot.security(),
+            times: snapshot.times(),
+            links_count: snapshot.links_count(),
+            overlay_attributes: snapshot.windows_attributes().bits(),
+            file_attributes: snapshot.windows_file_attributes(),
+            reparse_point,
+        }
+    }
+}
+
 /// Builds Windows-facing metadata from a loaded ext4 node.
 /// # Errors
 ///
@@ -521,66 +550,7 @@ pub(super) fn metadata_from_node(
     read: &mut impl CommittedReadPass,
     node_id: NodeId,
 ) -> DriverResult<FileMetadata> {
-    let overlay_attributes = read
-        .read_windows_overlay(node_id)?
-        .map(|overlay| overlay.attributes().bits())
-        .unwrap_or(0);
-    let reparse_point = match node_id {
-        NodeId::Symlink(_) => FileMetadataReparsePoint::SymbolicLink,
-        NodeId::File(_) | NodeId::Directory(_) => {
-            if read.read_windows_symlink_reparse_point(node_id)?.is_some() {
-                FileMetadataReparsePoint::SymbolicLink
-            } else {
-                FileMetadataReparsePoint::None
-            }
-        }
-    };
-
-    let file_index = node_id.file_index();
-    match node_id {
-        NodeId::File(file_id) => {
-            let file = read.load_file(file_id)?;
-            Ok(FileMetadata {
-                file_index,
-                kind: FileMetadataKind::File,
-                size: file.size(),
-                allocation_size: file.allocation_size(),
-                security: file.security(),
-                times: file.times(),
-                links_count: file.links_count(),
-                overlay_attributes,
-                reparse_point,
-            })
-        }
-        NodeId::Directory(directory_id) => {
-            let directory = read.load_directory(directory_id)?;
-            Ok(FileMetadata {
-                file_index,
-                kind: FileMetadataKind::Directory,
-                size: directory.size(),
-                allocation_size: directory.allocation_size(),
-                security: directory.security(),
-                times: directory.times(),
-                links_count: directory.links_count(),
-                overlay_attributes,
-                reparse_point,
-            })
-        }
-        NodeId::Symlink(symlink_id) => {
-            let symlink = read.load_symlink(symlink_id)?;
-            Ok(FileMetadata {
-                file_index,
-                kind: FileMetadataKind::Symlink,
-                size: symlink.size(),
-                allocation_size: symlink.allocation_size(),
-                security: symlink.security(),
-                times: symlink.times(),
-                links_count: symlink.links_count(),
-                overlay_attributes,
-                reparse_point,
-            })
-        }
-    }
+    Ok(read.load_node_metadata(node_id)?.into())
 }
 
 /// Packs FILE_BASIC_INFORMATION.
@@ -626,7 +596,7 @@ fn pack_basic_information(
             wdk_sys::FILE_BASIC_INFORMATION,
             FileAttributes
         )),
-        file_attributes(metadata),
+        metadata.file_attributes,
     )?;
     IrpCompletion::from_usize(size)
 }
@@ -826,7 +796,7 @@ fn pack_network_open_information(
             wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
             FileAttributes
         )),
-        file_attributes(metadata),
+        metadata.file_attributes,
     )?;
     IrpCompletion::from_usize(size)
 }
@@ -872,7 +842,7 @@ fn pack_attribute_tag_information(
             wdk_sys::FILE_ATTRIBUTE_TAG_INFORMATION,
             FileAttributes
         )),
-        file_attributes(metadata),
+        metadata.file_attributes,
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -938,27 +908,6 @@ pub(super) fn windows_time(timestamp: Ext4Timestamp) -> LARGE_INTEGER {
         );
     }
     time
-}
-
-/// Returns Windows file attribute bits for an ext4 node.
-pub(super) fn file_attributes(metadata: FileMetadata) -> wdk_sys::ULONG {
-    let mut attributes = metadata.overlay_attributes;
-    if metadata.security.permissions().as_u16() & 0o222 == 0 {
-        attributes |= wdk_sys::FILE_ATTRIBUTE_READONLY;
-    }
-    match metadata.kind {
-        FileMetadataKind::File => {}
-        FileMetadataKind::Directory => attributes |= wdk_sys::FILE_ATTRIBUTE_DIRECTORY,
-        FileMetadataKind::Symlink => {}
-    }
-    if metadata.reparse_point == FileMetadataReparsePoint::SymbolicLink {
-        attributes |= wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT;
-    }
-    if attributes == 0 {
-        wdk_sys::FILE_ATTRIBUTE_NORMAL
-    } else {
-        attributes
-    }
 }
 
 /// Converts a Rust boolean to WDK BOOLEAN.

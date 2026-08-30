@@ -48,17 +48,44 @@ impl FileControlBlock {
     /// # Errors
     ///
     /// Returns an error if the native header or its synchronization resources cannot be allocated.
-    pub(super) fn try_new(
+    pub(super) fn try_new_staged(
         volume: NonNull<VolumeControlBlock>,
         owner: NonNull<FileControlBlockLedger>,
-        stream: NodeStreamSizes,
+        stream: StagedNodeStreamMetadata,
+        trace: OperationalTrace,
+    ) -> DriverResult<Self> {
+        let node = stream.node();
+        let sizes = stream.sizes();
+        Ok(Self {
+            volume,
+            owner,
+            node,
+            stream_context: StreamContext::try_new_staged_node(sizes, trace)?,
+            byte_range_locks: FileByteRangeLocks::new(),
+            open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
+        })
+    }
+
+    /// Creates an FCB with one epoch-tagged committed metadata projection.
+    /// # Errors
+    ///
+    /// Returns an error if the native header or its synchronization resources cannot be allocated.
+    pub(super) fn try_new_committed(
+        volume: NonNull<VolumeControlBlock>,
+        owner: NonNull<FileControlBlockLedger>,
+        stream: CommittedNodeStreamMetadata,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
         Ok(Self {
             volume,
             owner,
             node: stream.node(),
-            stream_context: StreamContext::try_new(StreamOwnerKind::Node, stream.sizes, trace)?,
+            stream_context: StreamContext::try_new_committed_node(
+                stream.sizes(),
+                stream.snapshot(),
+                stream.epoch(),
+                trace,
+            )?,
             byte_range_locks: FileByteRangeLocks::new(),
             open_state: UnsafeCell::new(FileControlBlockOpenState::new()),
         })
@@ -226,6 +253,155 @@ impl FileControlBlock {
         {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         }
+    }
+}
+
+/// Complete identity-bound Windows stream projection derived from one coherent core snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NodeStreamMetadata {
+    /// Inode metadata that owns every projected Windows field.
+    snapshot: NodeMetadataSnapshot,
+    /// Native section and allocation sizes derived from `snapshot`.
+    sizes: StreamSizes,
+}
+
+impl NodeStreamMetadata {
+    /// Converts one coherent core observation without granting publication authority.
+    /// # Errors
+    ///
+    /// Returns an error when the observed sizes exceed Windows' signed size domain.
+    pub(crate) fn try_from_snapshot(
+        snapshot: NodeMetadataSnapshot,
+        cluster_size: ClusterSize,
+    ) -> DriverResult<Self> {
+        Ok(Self {
+            snapshot,
+            sizes: StreamSizes::try_from_ext4(
+                snapshot.size(),
+                snapshot.allocation_size(),
+                cluster_size,
+            )?,
+        })
+    }
+
+    /// Identity bound to this coherent projection.
+    pub(crate) const fn node(self) -> NodeId {
+        self.snapshot.node()
+    }
+
+    /// Complete coherent core metadata represented by this projection.
+    pub(crate) const fn snapshot(self) -> NodeMetadataSnapshot {
+        self.snapshot
+    }
+
+    /// Complete native size tuple for this stream state.
+    pub(crate) const fn sizes(self) -> StreamSizes {
+        self.sizes
+    }
+}
+
+/// One complete node metadata observation bound to its exact committed epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CommittedNodeStreamMetadata {
+    /// Complete coherent inode and Windows projection.
+    metadata: NodeStreamMetadata,
+    /// Committed epoch from which `metadata` was observed.
+    epoch: ext4_core::EpochSequence,
+}
+
+impl CommittedNodeStreamMetadata {
+    /// Binds one complete observation to the immutable epoch that supplied it.
+    pub(crate) const fn new(metadata: NodeStreamMetadata, epoch: ext4_core::EpochSequence) -> Self {
+        Self { metadata, epoch }
+    }
+
+    /// Identity bound to this committed observation.
+    pub(crate) const fn node(self) -> NodeId {
+        self.metadata.node()
+    }
+
+    /// Complete coherent core metadata represented by this observation.
+    pub(crate) const fn snapshot(self) -> NodeMetadataSnapshot {
+        self.metadata.snapshot()
+    }
+
+    /// Complete native size tuple for this observation.
+    pub(crate) const fn sizes(self) -> StreamSizes {
+        self.metadata.sizes()
+    }
+
+    /// Immutable committed epoch that owns this observation.
+    pub(crate) const fn epoch(self) -> ext4_core::EpochSequence {
+        self.epoch
+    }
+}
+
+/// Transaction-local stream identity whose query metadata remains hidden until commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StagedNodeStreamMetadata {
+    /// Inode identity allocated by the transaction.
+    pub(super) node: NodeId,
+    /// Native sizes used for cache and mapped-section admission before commit.
+    pub(super) sizes: StreamSizes,
+}
+
+impl StagedNodeStreamMetadata {
+    /// Converts transaction-local metadata while keeping it unqueryable until commit.
+    /// # Errors
+    ///
+    /// Returns an error when the observed sizes exceed Windows' signed size domain.
+    pub(crate) fn try_from_staged_snapshot(
+        snapshot: NodeMetadataSnapshot,
+        cluster_size: ClusterSize,
+    ) -> DriverResult<Self> {
+        Ok(Self {
+            node: snapshot.node(),
+            sizes: StreamSizes::try_from_ext4(
+                snapshot.size(),
+                snapshot.allocation_size(),
+                cluster_size,
+            )?,
+        })
+    }
+
+    /// Identity bound to this coherent projection.
+    pub(crate) const fn node(self) -> NodeId {
+        self.node
+    }
+
+    /// Complete native size tuple for this stream state.
+    pub(crate) const fn sizes(self) -> StreamSizes {
+        self.sizes
+    }
+}
+
+/// Prevalidated metadata retained with the exact mutation's commit continuation.
+///
+/// Preparation does not snapshot FCB addresses: publication resolves inode identities under the
+/// ledger guard after epoch visibility. Future opens initialize from that current epoch.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamMetadataPublications {
+    /// One final metadata projection per live inode changed by the reserved mutation.
+    pub(super) nodes: DriverVec<NodeStreamMetadata>,
+}
+
+impl PreparedStreamMetadataPublications {
+    /// Prepares all conversions and storage before the first lower write.
+    /// # Errors
+    ///
+    /// Returns an error on allocation failure or a size outside the Windows domain.
+    pub(crate) fn try_new(
+        snapshots: &[NodeMetadataSnapshot],
+        cluster_size: ClusterSize,
+    ) -> DriverResult<Self> {
+        let mut nodes = DriverVec::try_with_capacity(snapshots.len())?;
+        for snapshot in snapshots {
+            nodes.try_push(NodeStreamMetadata::try_from_snapshot(
+                *snapshot,
+                cluster_size,
+            )?)?;
+        }
+        Ok(Self { nodes })
     }
 }
 

@@ -99,6 +99,41 @@ impl MutationResolvePass<'_, '_, '_> {
 }
 
 impl MetadataMutation<'_, '_> {
+    /// Builds the exact post-mutation metadata projection for one staged live inode.
+    /// # Errors
+    ///
+    /// Returns an error when the inode, xattr storage, or either Windows xattr payload is invalid.
+    pub(super) fn node_metadata_snapshot(
+        &mut self,
+        raw_inode: &LiveInodeRecord,
+    ) -> Result<NodeMetadataSnapshot> {
+        let inode = raw_inode.parse()?;
+        let xattrs = self.xattr_set_for_raw_inode(raw_inode)?;
+        let overlay_name = WindowsOverlay::attributes_xattr_name()?;
+        let overlay = xattrs
+            .public()
+            .get(&overlay_name)
+            .map(WindowsOverlay::parse)
+            .transpose()?;
+        let has_reparse_xattr = match inode.kind() {
+            InodeKind::Symlink => false,
+            InodeKind::File | InodeKind::Directory => {
+                let reparse_name = WindowsSymlinkReparsePoint::xattr_name()?;
+                xattrs
+                    .public()
+                    .get(&reparse_name)
+                    .map(WindowsSymlinkReparsePoint::parse)
+                    .transpose()?
+                    .is_some()
+            }
+        };
+        Ok(NodeMetadataSnapshot::from_inode(
+            &inode,
+            overlay,
+            has_reparse_xattr,
+        ))
+    }
+
     /// Stages the latest image for a mutated external xattr block.
     /// # Errors
     ///

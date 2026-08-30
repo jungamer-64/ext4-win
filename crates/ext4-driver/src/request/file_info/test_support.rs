@@ -13,6 +13,19 @@ pub(super) fn test_metadata_with_permissions(
     overlay_attributes: u32,
 ) -> Option<super::FileMetadata> {
     let timestamp = Ext4Timestamp::from_unix_seconds(1);
+    let mut file_attributes = overlay_attributes;
+    if permissions & 0o222 == 0 {
+        file_attributes |= wdk_sys::FILE_ATTRIBUTE_READONLY;
+    }
+    if kind == super::FileMetadataKind::Directory {
+        file_attributes |= wdk_sys::FILE_ATTRIBUTE_DIRECTORY;
+    }
+    if kind == super::FileMetadataKind::Symlink {
+        file_attributes |= wdk_sys::FILE_ATTRIBUTE_REPARSE_POINT;
+    }
+    if file_attributes == 0 {
+        file_attributes = wdk_sys::FILE_ATTRIBUTE_NORMAL;
+    }
     Some(super::FileMetadata {
         file_index: 1,
         kind,
@@ -25,6 +38,7 @@ pub(super) fn test_metadata_with_permissions(
         times: Ext4Times::new(timestamp, timestamp, timestamp, timestamp),
         links_count: Ext4LinkCount::ONE,
         overlay_attributes,
+        file_attributes,
         reparse_point: match kind {
             super::FileMetadataKind::File | super::FileMetadataKind::Directory => {
                 super::FileMetadataReparsePoint::None
