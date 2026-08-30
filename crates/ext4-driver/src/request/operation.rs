@@ -724,6 +724,29 @@ impl PreparedReadRequest {
 /// Explicit ownership phase of one top-level read operation.
 #[derive(Debug)]
 enum ReadOperationState {
+    /// A non-paging data read is ready to transfer its IRP to the stream oplock package.
+    CheckingOplock {
+        /// Unique top-level completion authority before FsRtl delegation.
+        owned: OwnedIrp,
+        /// Operation-owned storage transcript that has not observed an epoch.
+        read: EpochReadOperation,
+        /// Stream lease and normalized check flags.
+        check: OplockCheck,
+    },
+    /// FsRtl owns the data-read IRP during an oplock break wait.
+    OplockDelegated {
+        /// Operation-owned storage transcript retained without IRP completion authority.
+        read: EpochReadOperation,
+    },
+    /// The reactor restored the data-read IRP after FsRtl completion.
+    OplockReady {
+        /// Unique top-level completion authority returned by FsRtl.
+        owned: OwnedIrp,
+        /// Operation-owned storage transcript that has not observed an epoch.
+        read: EpochReadOperation,
+        /// Exact immediate or callback-published oplock status.
+        status: wdk_sys::NTSTATUS,
+    },
     /// IRP and transcript are available for one concrete event.
     Running {
         /// Unique top-level completion authority.
@@ -767,6 +790,31 @@ struct ReadRequestOperation {
 }
 
 impl ReadRequestOperation {
+    /// Captures the stream check required by a non-paging data read.
+    /// # Errors
+    ///
+    /// Returns a FILE_OBJECT identity or finite stream-lease failure before the oplock package is
+    /// invoked. Paging reads already own a cleanup-independent stream lease and do not break
+    /// handle oplocks.
+    fn prepare_oplock_check(
+        request: &PreparedReadRequest,
+        owned: &mut OwnedIrp,
+        access: &MountedVolumeAccess<'_>,
+    ) -> DriverResult<Option<OplockCheck>> {
+        match request {
+            PreparedReadRequest::Data(authority) if !authority.is_paging() => {
+                owned.request().with_active(|active| {
+                    let file_object = active.current_stack()?.file_object()?;
+                    access
+                        .acquire_oplock_stream_lease(file_object)
+                        .map(OplockCheck::ordinary)
+                        .map(Some)
+                })
+            }
+            PreparedReadRequest::Data(_) | PreparedReadRequest::Other(_) => Ok(None),
+        }
+    }
+
     /// Allocates and initializes one read operation while preserving IRP ownership on failure.
     /// # Errors
     ///
@@ -779,6 +827,10 @@ impl ReadRequestOperation {
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
         let request = match PreparedReadRequest::prepare(kind, &mut owned, access) {
             Ok(request) => request,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
+        let oplock = match Self::prepare_oplock_check(&request, &mut owned, access) {
+            Ok(oplock) => oplock,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         let paging = request.is_paging();
@@ -794,13 +846,19 @@ impl ReadRequestOperation {
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         match memory::boxed_try_map(
-            (owned, epoch, crypto, request),
-            |(owned, epoch, crypto, request)| Self {
-                epoch,
-                devices,
-                request,
-                crypto,
-                state: ReadOperationState::Running { owned, read },
+            (owned, epoch, crypto, request, oplock),
+            |(owned, epoch, crypto, request, oplock)| {
+                let state = match oplock {
+                    Some(check) => ReadOperationState::CheckingOplock { owned, read, check },
+                    None => ReadOperationState::Running { owned, read },
+                };
+                Self {
+                    epoch,
+                    devices,
+                    request,
+                    crypto,
+                    state,
+                }
             },
         ) {
             Ok(operation) => {
@@ -814,7 +872,7 @@ impl ReadRequestOperation {
                 Ok(operation)
             }
             Err(error) => {
-                let (error, (owned, _epoch, _crypto, _request)) = error.into_parts();
+                let (error, (owned, _epoch, _crypto, _request, _oplock)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
@@ -884,6 +942,26 @@ impl ReadRequestOperation {
     }
 }
 
+impl OplockContinuation for ReadRequestOperation {
+    fn resume_after_oplock(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        status: wdk_sys::NTSTATUS,
+    ) -> Box<dyn CompletionOperation> {
+        let state = core::mem::replace(&mut self.state, ReadOperationState::Terminal);
+        let ReadOperationState::OplockDelegated { read } = state else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        self.state = ReadOperationState::OplockReady {
+            owned,
+            read,
+            status,
+        };
+        self
+    }
+}
+
 impl MountedVolumeOperation for ReadRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
@@ -891,6 +969,74 @@ impl MountedVolumeOperation for ReadRequestOperation {
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, ReadOperationState::Terminal);
+        let state = match state {
+            ReadOperationState::CheckingOplock { owned, read, check } => {
+                return match event.into_core() {
+                    OperationEvent::Admitted => {
+                        self.state = ReadOperationState::OplockDelegated { read };
+                        OperationTransition::CheckOplock {
+                            check,
+                            owned,
+                            suspended: self,
+                        }
+                    }
+                    OperationEvent::CancelRequested => {
+                        Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                    }
+                    OperationEvent::StorageCompleted(_)
+                    | OperationEvent::DeviceLengthCompleted(_)
+                    | OperationEvent::RetryElapsed(_)
+                    | OperationEvent::IntentGranted(_)
+                    | OperationEvent::CommitGranted(_)
+                    | OperationEvent::VisibilityGranted(_)
+                    | OperationEvent::CheckpointGranted(_)
+                    | OperationEvent::BarrierReleased(_) => {
+                        Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                    }
+                };
+            }
+            ReadOperationState::OplockReady {
+                owned,
+                read,
+                status,
+            } => {
+                return match event.into_core() {
+                    OperationEvent::Admitted if status >= STATUS_SUCCESS => {
+                        let epoch = match access.acquire_epoch() {
+                            Ok(epoch) => epoch,
+                            Err(error) => return Self::complete(owned, Err(error)),
+                        };
+                        self.epoch = epoch;
+                        self.state = ReadOperationState::Running { owned, read };
+                        self.advance_mounted(
+                            CompletionEvent::Core(OperationEvent::Admitted),
+                            access,
+                        )
+                    }
+                    OperationEvent::Admitted => {
+                        Self::complete(owned, Err(DriverError::OplockFailure(status)))
+                    }
+                    OperationEvent::CancelRequested => {
+                        Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                    }
+                    OperationEvent::StorageCompleted(_)
+                    | OperationEvent::DeviceLengthCompleted(_)
+                    | OperationEvent::RetryElapsed(_)
+                    | OperationEvent::IntentGranted(_)
+                    | OperationEvent::CommitGranted(_)
+                    | OperationEvent::VisibilityGranted(_)
+                    | OperationEvent::CheckpointGranted(_)
+                    | OperationEvent::BarrierReleased(_) => {
+                        Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                    }
+                };
+            }
+            ReadOperationState::OplockDelegated { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+            state => state,
+        };
         let (mut owned, read, event, cache_prepared) = match (state, event) {
             (
                 ReadOperationState::Cached {
