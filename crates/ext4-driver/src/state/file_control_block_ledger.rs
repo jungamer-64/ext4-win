@@ -898,6 +898,27 @@ impl ExistingFileControlBlockAdmission {
     }
 }
 
+/// Exact first-open FCB/share claim for one transaction-local node.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NewFileControlBlockAdmission {
+    /// Newly inserted FCB retained by the recorded FILE_OBJECT claim.
+    fcb: NonNull<FileControlBlock>,
+    /// User-handle count proven to be one when the staged node entered the ledger.
+    open_count: NonZeroU32,
+}
+
+impl NewFileControlBlockAdmission {
+    /// Returns the exact newly inserted FCB whose share claim is rollback-owned by create.
+    pub(crate) const fn file_control_block(self) -> NonNull<FileControlBlock> {
+        self.fcb
+    }
+
+    /// Returns the first and only user-handle count admitted for this staged node.
+    pub(crate) const fn open_count(self) -> NonZeroU32 {
+        self.open_count
+    }
+}
+
 impl FileControlBlockLedger {
     /// Creates an empty synchronized FCB ledger and its native resource.
     /// # Errors
@@ -937,6 +958,10 @@ impl FileControlBlockLedger {
     /// # Errors
     ///
     /// Returns an error when FCB allocation/reference growth or Windows share validation fails.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes unique staged-node FCB insertion"
+    )]
     fn open_new(
         &self,
         volume: NonNull<VolumeControlBlock>,
@@ -945,17 +970,54 @@ impl FileControlBlockLedger {
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
-    ) -> DriverResult<NonNull<FileControlBlock>> {
-        self.open(FileControlBlockOpen {
-            volume,
-            stream,
-            trace,
-            file_object,
-            desired_access,
-            share_access,
-            share_check: FileControlBlockShareCheck::NewNode,
-        })
-        .map(ExistingFileControlBlockAdmission::file_control_block)
+    ) -> DriverResult<NewFileControlBlockAdmission> {
+        let node = stream.node();
+        let candidate = self.file_control_block(volume, stream, trace)?;
+        let fcb = NonNull::from(candidate.as_ref());
+        let mut discarded = None;
+        let mut removed = None;
+        let result = {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The executive resource uniquely owns table mutation for this scope.
+                &mut *self.table.get()
+            };
+            if find_file_control_block_in_table(table, node).is_some() {
+                discarded = Some(candidate);
+                Err(DriverError::InternalInvariantViolation)
+            } else {
+                match table.try_push_owned(candidate) {
+                    Ok(()) => match record_file_control_block_share(
+                        table,
+                        fcb,
+                        file_object,
+                        desired_access,
+                        share_access,
+                        FileControlBlockShareCheck::NewNode,
+                    ) {
+                        Ok(open_count) => {
+                            if open_count != NonZeroU32::MIN {
+                                KernelWideInconsistency::file_control_block_ownership_corruption()
+                                    .bugcheck();
+                            }
+                            Ok(NewFileControlBlockAdmission { fcb, open_count })
+                        }
+                        Err(error) => {
+                            removed = release_file_object_lease_in_table(table, fcb, false);
+                            Err(error)
+                        }
+                    },
+                    Err(error) => {
+                        let (error, candidate) = error.into_parts();
+                        discarded = Some(candidate);
+                        Err(error)
+                    }
+                }
+            }
+        };
+        drop(removed);
+        drop(discarded);
+        result
     }
 
     /// Opens or creates one ledger entry and records the FILE_OBJECT share claim atomically.
@@ -2483,7 +2545,7 @@ impl PendingChildCreation {
         desired_access: GrantedAccess,
         share_access: ShareAccess,
         stream_sizes: NodeStreamSizes,
-    ) -> DriverResult<NonNull<FileControlBlock>> {
+    ) -> DriverResult<NewFileControlBlockAdmission> {
         if stream_sizes.node() != self.node {
             return Err(DriverError::InternalInvariantViolation);
         }
