@@ -983,10 +983,7 @@ impl PreparedRequest {
                 ))
             }
             DispatchMajor::Shutdown => Ok((Self::Shutdown, QueueCancellationKey::Device)),
-            DispatchMajor::Close
-            | DispatchMajor::Cleanup
-            | DispatchMajor::DeviceControl
-            | DispatchMajor::LockControl => {
+            DispatchMajor::Close | DispatchMajor::Cleanup | DispatchMajor::DeviceControl => {
                 Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
             }
         }

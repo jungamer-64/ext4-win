@@ -551,27 +551,6 @@ impl ReceivedIrp {
         })
     }
 
-    /// Transfers this lock-control IRP's terminal completion authority to FsRtl.
-    ///
-    /// FsRtl completes lock requests itself, including requests that wait for a conflicting range.
-    /// This consuming transition prevents the normal driver completion path from completing the
-    /// same IRP again.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn delegate_byte_range_lock(
-        self,
-        file_control_block: NonNull<FileControlBlock>,
-    ) -> NTSTATUS {
-        let file_control_block = unsafe {
-            // SAFETY: Lock-control decode validated the active FILE_OBJECT's native header and
-            // bound inode owner. The consumed IRP retains both through delegation.
-            file_control_block.as_ref()
-        };
-        file_control_block.process_byte_range_lock(self.target)
-    }
-
     /// Transfers this oplock FSCTL's terminal completion authority to FsRtl.
     #[expect(
         unsafe_code,
