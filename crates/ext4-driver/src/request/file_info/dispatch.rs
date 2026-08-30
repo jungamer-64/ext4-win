@@ -23,6 +23,7 @@ pub(crate) fn set(
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     pending_disposition: &mut Option<PendingDispositionDeletion>,
     prepared_deletion: Option<&PreparedStreamDeletion>,
+    namespace_oplocks: Option<NamespaceOplockPlan>,
 ) -> DriverResult<SetFileResolution> {
     set_file_information(
         request,
@@ -30,6 +31,7 @@ pub(crate) fn set(
         mutation,
         pending_disposition,
         prepared_deletion,
+        namespace_oplocks,
     )
 }
 
