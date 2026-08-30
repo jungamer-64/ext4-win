@@ -164,27 +164,3 @@ unsafe extern "C" {
         routine: wdk_sys::PDRIVER_CANCEL,
     ) -> wdk_sys::PDRIVER_CANCEL;
 }
-
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-unsafe extern "system" {
-    /// Copies one checked requestor-input window into driver-owned storage.
-    pub(crate) fn ext4win_copy_requestor_input_window(
-        source: *const core::ffi::c_void,
-        source_length: wdk_sys::ULONG,
-        source_offset: wdk_sys::ULONG,
-        destination: wdk_sys::PVOID,
-        destination_length: wdk_sys::ULONG,
-    ) -> wdk_sys::NTSTATUS;
-
-    /// Copies driver-owned bytes into one checked requestor-output window.
-    pub(crate) fn ext4win_copy_requestor_output_window(
-        destination: wdk_sys::PVOID,
-        destination_length: wdk_sys::ULONG,
-        destination_offset: wdk_sys::ULONG,
-        source: *const core::ffi::c_void,
-        source_length: wdk_sys::ULONG,
-    ) -> wdk_sys::NTSTATUS;
-}

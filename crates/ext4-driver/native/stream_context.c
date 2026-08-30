@@ -613,44 +613,6 @@ _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
-ext4win_stream_bind_owner(
-    _In_ PVOID stream_header,
-    _In_ ULONG expected_kind,
-    _In_ PVOID owner)
-{
-    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-
-    if ((stream == NULL) || (owner == NULL) ||
-        (stream->Kind != expected_kind) || (stream->Owner != NULL)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    stream->Owner = owner;
-    return STATUS_SUCCESS;
-}
-
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-NTAPI
-ext4win_stream_bind_byte_range_locks(
-    _In_ PVOID stream_header,
-    _Inout_ PFILE_LOCK byte_range_locks)
-{
-    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-
-    if ((stream == NULL) || (stream->Kind != 1) ||
-        (byte_range_locks == NULL) || (stream->ByteRangeLocks != NULL)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    stream->ByteRangeLocks = byte_range_locks;
-    ext4win_stream_refresh_fast_io_projection(stream);
-    return STATUS_SUCCESS;
-}
-
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-NTAPI
 ext4win_stream_oplock_fsctrl(
     _In_ PVOID stream_header,
     _Inout_ PIRP irp,
@@ -882,73 +844,6 @@ ext4win_stream_get_sizes(
     *allocation_charge_out = stream->AllocationCharge;
     ExReleaseFastMutex(&stream->HeaderMutex);
     return STATUS_SUCCESS;
-}
-
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-NTAPI
-ext4win_stream_publish_metadata(
-    _In_ PVOID stream_header,
-    _In_ LONGLONG allocation_size,
-    _In_ LONGLONG file_size,
-    _In_ LONGLONG valid_data_length,
-    _In_ LONGLONG allocation_charge,
-    _In_ const EXT4WIN_STREAM_METADATA *metadata)
-{
-    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-    EXT4WIN_PUBLISHED_STREAM_METADATA prepared_metadata;
-    CC_FILE_SIZES sizes;
-    PFILE_OBJECT file_object;
-    NTSTATUS status;
-
-    if ((stream == NULL) || (stream->Kind != 1) ||
-        !ext4win_prepare_stream_metadata(metadata, &prepared_metadata) ||
-        (allocation_size < 0) || (file_size < 0) ||
-        (allocation_charge < 0) || (allocation_charge > allocation_size) ||
-        (valid_data_length != file_size) ||
-        (file_size > allocation_size)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    status = STATUS_SUCCESS;
-    file_object = NULL;
-    ExAcquireResourceExclusiveLite(&stream->MainResource, TRUE);
-    __try {
-        ExAcquireFastMutex(&stream->HeaderMutex);
-        if ((stream->MetadataValid != FALSE) &&
-            (prepared_metadata.Epoch <= stream->PublishedMetadata.Epoch)) {
-            status = STATUS_INVALID_PARAMETER;
-        }
-        else {
-            stream->Header.AllocationSize.QuadPart = allocation_size;
-            stream->Header.FileSize.QuadPart = file_size;
-            stream->Header.ValidDataLength.QuadPart = valid_data_length;
-            stream->AllocationCharge = allocation_charge;
-            stream->PublishedMetadata = prepared_metadata;
-            stream->MetadataValid = TRUE;
-            sizes.AllocationSize = stream->Header.AllocationSize;
-            sizes.FileSize = stream->Header.FileSize;
-            sizes.ValidDataLength = stream->Header.ValidDataLength;
-        }
-        ExReleaseFastMutex(&stream->HeaderMutex);
-
-        if (NT_SUCCESS(status) && (stream->SectionObjects.SharedCacheMap != NULL)) {
-            file_object = CcGetFileObjectFromSectionPtrsRef(&stream->SectionObjects);
-            if (file_object == NULL) {
-                status = STATUS_INTERNAL_ERROR;
-            } else {
-                status = CcSetFileSizesEx(file_object, &sizes);
-            }
-        }
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        status = GetExceptionCode();
-    }
-    if (file_object != NULL) {
-        ObDereferenceObject(file_object);
-    }
-    ExReleaseResourceLite(&stream->MainResource);
-    return status;
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -2044,31 +1939,6 @@ ext4win_fast_io_unlock_all_by_key(
     return TRUE;
 }
 
-static VOID
-NTAPI
-ext4win_acquire_file_for_section(_In_ PFILE_OBJECT file_object)
-{
-    PEXT4WIN_STREAM_CONTEXT stream;
-
-    if (ext4win_stream_fast_io_stream(file_object, &stream)) {
-        ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION);
-        (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
-        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION, STATUS_SUCCESS);
-    }
-}
-
-static VOID
-NTAPI
-ext4win_release_file_for_section(_In_ PFILE_OBJECT file_object)
-{
-    PEXT4WIN_STREAM_CONTEXT stream;
-
-    if ((file_object != NULL) &&
-        ((stream = ext4win_stream_from_header(file_object->FsContext)) != NULL)) {
-        ExReleaseResourceLite(&stream->MainResource);
-    }
-}
-
 static BOOLEAN
 NTAPI
 ext4win_mdl_read(
@@ -2312,8 +2182,8 @@ static FAST_IO_DISPATCH ext4win_fast_io_dispatch_table = {
     ext4win_fast_io_unlock_all,
     ext4win_fast_io_unlock_all_by_key,
     NULL,
-    ext4win_acquire_file_for_section,
-    ext4win_release_file_for_section,
+    NULL,
+    NULL,
     NULL,
     ext4win_fast_io_query_network_open_info,
     ext4win_acquire_for_mod_write,
