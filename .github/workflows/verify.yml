@@ -36,11 +36,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: >
-          rustup toolchain install
-          --profile minimal
-          --component rustfmt
-          --component clippy
+        run: rustup toolchain install
 
       - name: Verify portable workspace
         run: cargo xtask verify-portable
@@ -57,11 +53,7 @@ jobs:
           persist-credentials: false
 
       - name: Install pinned Rust toolchain
-        run: >
-          rustup toolchain install
-          --profile minimal
-          --component rustfmt
-          --component clippy
+        run: rustup toolchain install
 
       - name: Install e2fsprogs oracle
         run: |
@@ -100,10 +92,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          rustup toolchain install `
-            --profile minimal `
-            --component rustfmt `
-            --component clippy
+          rustup toolchain install
 
           rustup toolchain list
 
