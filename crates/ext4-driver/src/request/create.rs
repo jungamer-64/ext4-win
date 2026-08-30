@@ -1046,6 +1046,72 @@ impl ExistingCreateOplockState {
     }
 }
 
+/// Oplock reservation authority for one transaction-local first-open stream.
+#[derive(Debug)]
+enum NewCreateOplockState {
+    /// The create flags require no atomic oplock establishment.
+    Ready,
+    /// The live create IRP must establish its requested oplock with this proven handle count.
+    Reserve(NonZeroU32),
+    /// FsRtl established the oplock and this state owns success-or-backout authority.
+    Reserved(AtomicOplockReservation),
+}
+
+impl NewCreateOplockState {
+    /// Derives the only legal first-open state from normalized create policy.
+    const fn from_policy(policy: crate::irp::OplockCreatePolicy, open_count: NonZeroU32) -> Self {
+        match policy {
+            crate::irp::OplockCreatePolicy::Ordinary
+            | crate::irp::OplockCreatePolicy::CompleteIfOplocked => Self::Ready,
+            crate::irp::OplockCreatePolicy::RequireUnbrokenOplock
+            | crate::irp::OplockCreatePolicy::ReserveFilter => Self::Reserve(open_count),
+        }
+    }
+
+    /// Returns the proven handle count when FsRtl establishment remains outstanding.
+    const fn reservation_target(&self) -> Option<NonZeroU32> {
+        match self {
+            Self::Reserve(open_count) => Some(*open_count),
+            Self::Ready | Self::Reserved(_) => None,
+        }
+    }
+
+    /// Seals a reservation belonging to the matching first-open FCB.
+    fn accept(&mut self, reservation: AtomicOplockReservation, fcb: NonNull<FileControlBlock>) {
+        if !matches!(self, Self::Reserve(_)) || !reservation.identifies(fcb) {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        }
+        *self = Self::Reserved(reservation);
+    }
+
+    /// Consumes one-shot backout authority before a failed create completion.
+    /// # Errors
+    ///
+    /// Returns the exact native backout failure after consuming the reservation.
+    fn abort(&mut self, owned: &crate::irp::OwnedIrp) -> DriverResult<()> {
+        let oplock = core::mem::replace(self, Self::Ready);
+        match oplock {
+            Self::Reserved(reservation) => reservation.backout(owned),
+            Self::Ready | Self::Reserve(_) => Ok(()),
+        }
+    }
+
+    /// Consumes the reservation after the committed handle becomes publishable.
+    fn publish(&mut self) {
+        let oplock = core::mem::replace(self, Self::Ready);
+        match oplock {
+            Self::Ready => {}
+            Self::Reserved(reservation) => reservation.publish(),
+            Self::Reserve(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
+                )
+                .bugcheck();
+            }
+        }
+    }
+}
+
 impl ExistingWriteOpenRequirement {
     /// Selects the native gate for an already classified regular-file admission.
     const fn for_regular_file(
@@ -1677,6 +1743,7 @@ fn create_missing_node(
         file_object,
         desired_access: policy.granted_access(),
         share_access: policy.share_access(),
+        oplock_policy: policy.oplock_policy(),
         handle,
         flags: policy.file_object_flags(),
         pending_deletion,
@@ -2036,6 +2103,8 @@ pub(crate) struct PendingCreatePublication {
     desired_access: GrantedAccess,
     /// Share-accounting share mask.
     share_access: ShareAccess,
+    /// Create-time oplock behavior retained until the new stream is reserved or published.
+    oplock_policy: crate::irp::OplockCreatePolicy,
     /// Fully allocated per-handle context.
     handle: Box<OpenedHandle>,
     /// FILE_OBJECT flags fixed by create options.
@@ -2046,11 +2115,53 @@ pub(crate) struct PendingCreatePublication {
     notification: DirectoryChange,
 }
 
+impl PendingCreatePublication {
+    /// Acquires the unique first-open FCB/share claim for this staged child.
+    ///
+    /// This boundary runs after mutation intent is reserved and before commit admission. Atomic
+    /// create policies remain explicitly unsealed until the live create IRP visits FsRtl.
+    /// # Errors
+    ///
+    /// Returns an error when FCB allocation, first-open admission, reference accounting, or share
+    /// recording fails.
+    pub(crate) fn prepare(self) -> DriverResult<PreparedCreatePublication> {
+        let Self {
+            creation,
+            stream_sizes,
+            file_object,
+            desired_access,
+            share_access,
+            oplock_policy,
+            handle,
+            flags,
+            pending_deletion,
+            notification,
+        } = self;
+        let admission = creation.open_file_control_block(
+            file_object,
+            desired_access,
+            share_access,
+            stream_sizes,
+        )?;
+        let fcb = admission.file_control_block();
+        Ok(PreparedCreatePublication {
+            claim: PendingFileControlBlockClaim { fcb, file_object },
+            oplock: NewCreateOplockState::from_policy(oplock_policy, admission.open_count()),
+            handle,
+            flags,
+            pending_deletion,
+            notification,
+        })
+    }
+}
+
 /// Fully prepared post-commit create publication.
 #[derive(Debug)]
 pub(crate) struct PreparedCreatePublication {
     /// Rollback-owning FCB/share claim consumed only by durable attachment.
     claim: PendingFileControlBlockClaim,
+    /// Atomic create reservation state retained through commit durability.
+    oplock: NewCreateOplockState,
     /// Fully allocated per-handle context.
     handle: Box<OpenedHandle>,
     /// Prevalidated FILE_OBJECT flags.
@@ -2062,10 +2173,35 @@ pub(crate) struct PreparedCreatePublication {
 }
 
 impl PreparedCreatePublication {
+    /// Returns the exact first-open stream that must establish an atomic create oplock.
+    pub(crate) fn oplock_reservation_target(
+        &self,
+    ) -> Option<(NonNull<FileControlBlock>, NonZeroU32)> {
+        self.oplock
+            .reservation_target()
+            .map(|open_count| (self.claim.file_control_block(), open_count))
+    }
+
+    /// Seals the synchronous reservation for this exact first-open claim.
+    pub(crate) fn accept_oplock_reservation(&mut self, reservation: AtomicOplockReservation) {
+        self.oplock
+            .accept(reservation, self.claim.file_control_block());
+    }
+
+    /// Backs out a sealed atomic oplock before failure completion and drops the unpublished claim.
+    /// # Errors
+    ///
+    /// Returns the exact one-shot native backout failure after consuming the reservation.
+    pub(crate) fn abort(mut self, owned: &crate::irp::OwnedIrp) -> DriverResult<()> {
+        self.oplock.abort(owned)
+    }
+
     /// Publishes a committed child using pointer writes and prepared-value moves only.
-    pub(crate) fn publish(self, operations: &mut MountedVolumeAccess<'_>) -> CreateCompletion {
+    pub(crate) fn publish(mut self, operations: &mut MountedVolumeAccess<'_>) -> CreateCompletion {
+        self.oplock.publish();
         let Self {
             claim,
+            oplock: _,
             handle,
             flags,
             pending_deletion,
@@ -2246,6 +2382,42 @@ mod tests {
                 NonZeroU32::MIN,
             ),
             ExistingCreateOplockState::Reserve(NonZeroU32::MIN)
+        ));
+    }
+
+    /// # Panics
+    ///
+    /// Panics if a first-open create can enter an existing-stream check state or loses the exact
+    /// handle count required by synchronous FsRtl establishment.
+    #[test]
+    fn new_create_oplock_state_has_only_ready_or_atomic_reservation() {
+        assert!(matches!(
+            NewCreateOplockState::from_policy(
+                crate::irp::OplockCreatePolicy::Ordinary,
+                NonZeroU32::MIN,
+            ),
+            NewCreateOplockState::Ready
+        ));
+        assert!(matches!(
+            NewCreateOplockState::from_policy(
+                crate::irp::OplockCreatePolicy::CompleteIfOplocked,
+                NonZeroU32::MIN,
+            ),
+            NewCreateOplockState::Ready
+        ));
+        assert!(matches!(
+            NewCreateOplockState::from_policy(
+                crate::irp::OplockCreatePolicy::RequireUnbrokenOplock,
+                NonZeroU32::MIN,
+            ),
+            NewCreateOplockState::Reserve(NonZeroU32::MIN)
+        ));
+        assert!(matches!(
+            NewCreateOplockState::from_policy(
+                crate::irp::OplockCreatePolicy::ReserveFilter,
+                NonZeroU32::MIN,
+            ),
+            NewCreateOplockState::Reserve(NonZeroU32::MIN)
         ));
     }
 

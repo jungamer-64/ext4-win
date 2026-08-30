@@ -3243,6 +3243,49 @@ struct PreparedDriverPublication {
     effect: PreparedDriverEffect,
 }
 
+impl PreparedDriverPublication {
+    /// Returns the exact staged-new stream whose create IRP must establish an atomic oplock.
+    fn oplock_reservation_target(
+        &self,
+    ) -> Option<(
+        core::ptr::NonNull<crate::state::FileControlBlock>,
+        core::num::NonZeroU32,
+    )> {
+        match &self.effect {
+            PreparedDriverEffect::Create(publication) => publication.oplock_reservation_target(),
+            PreparedDriverEffect::Write(_)
+            | PreparedDriverEffect::SetFile(_)
+            | PreparedDriverEffect::Cleanup(_)
+            | PreparedDriverEffect::VolumeLabel(_)
+            | PreparedDriverEffect::Normal(_) => None,
+        }
+    }
+
+    /// Seals one atomic oplock reservation for the matching staged-new create publication.
+    fn accept_oplock_reservation(&mut self, reservation: AtomicOplockReservation) {
+        let PreparedDriverEffect::Create(publication) = &mut self.effect else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        publication.accept_oplock_reservation(reservation);
+    }
+
+    /// Consumes any atomic create backout authority before a failed top-level completion.
+    /// # Errors
+    ///
+    /// Returns the exact native backout failure after all publication state is consumed.
+    fn abort(self, owned: &OwnedIrp) -> DriverResult<()> {
+        match self.effect {
+            PreparedDriverEffect::Create(publication) => (*publication).abort(owned),
+            PreparedDriverEffect::Write(_)
+            | PreparedDriverEffect::SetFile(_)
+            | PreparedDriverEffect::Cleanup(_)
+            | PreparedDriverEffect::VolumeLabel(_)
+            | PreparedDriverEffect::Normal(_) => Ok(()),
+        }
+    }
+}
+
 /// Operation-specific state prepared before any irreversible lower write.
 #[derive(Debug)]
 enum PreparedDriverEffect {
@@ -4745,7 +4788,14 @@ impl MutationRequestOperation {
         if self.write_effect_observed {
             access.record_durability_unknown();
         }
-        self.complete_error(context.owned, DriverError::from(error))
+        let CommitContext {
+            owned, publication, ..
+        } = context;
+        let mut error = DriverError::from(error);
+        if let Err(backout_error) = publication.abort(&owned) {
+            error = backout_error;
+        }
+        self.complete_error(owned, error)
     }
 
     /// Records one successfully completed pre-visibility write.
@@ -5568,6 +5618,22 @@ impl MountedVolumeOperation for MutationRequestOperation {
                     Ok(ready) => ready,
                     Err(error) => return self.complete_error(owned, DriverError::from(error)),
                 };
+                let mut publication = publication;
+                if let Some((fcb, open_count)) = publication.oplock_reservation_target() {
+                    if !access.oplock_grant_available(fcb) {
+                        return self.complete_error(owned, DriverError::OplockNotGranted);
+                    }
+                    let stream = match access.acquire_claimed_oplock_stream_lease(fcb) {
+                        Ok(stream) => stream,
+                        Err(error) => return self.complete_error(owned, error),
+                    };
+                    let reservation =
+                        match AtomicOplockReservation::acquire(stream, open_count, &owned) {
+                            Ok(reservation) => reservation,
+                            Err(error) => return self.complete_error(owned, error),
+                        };
+                    publication.accept_oplock_reservation(reservation);
+                }
                 let (durable_slot, checkpoint_slot) = slots.into_parts();
                 let context = CommitContext {
                     owned,
