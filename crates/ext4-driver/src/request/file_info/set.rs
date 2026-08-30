@@ -86,8 +86,95 @@ pub(crate) enum SetFileResolution {
         /// Exact regular-file inode bound to that FCB.
         node: NodeId,
     },
+    /// A fully resolved namespace mutation must establish parent-directory oplock authority before
+    /// it can stage any ext4 write.
+    CheckNamespaceOplocks(NamespaceOplockPlan),
     /// Ext4 mutation requires commit and the driver publication is fully prepared.
     Mutation(SetFilePublication),
+}
+
+/// Semantic effect a child-namespace mutation has on one parent directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NamespaceParentOplockEffect {
+    /// A vacant child name is created or an existing child name changes without removal semantics.
+    Change,
+    /// An existing child link is removed, renamed away, or replaced.
+    Removal,
+}
+
+/// One exact parent-directory oplock requirement derived before the first ext4 write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NamespaceParentOplock {
+    /// Directory node whose child namespace will change.
+    parent: DirectoryNodeId,
+    /// Strongest effect this mutation has on the parent.
+    effect: NamespaceParentOplockEffect,
+}
+
+impl NamespaceParentOplock {
+    /// Parent node covered by this requirement.
+    pub(crate) const fn parent(self) -> DirectoryNodeId {
+        self.parent
+    }
+
+    /// Child-namespace effect used to select the FsRtl check flags.
+    pub(crate) const fn effect(self) -> NamespaceParentOplockEffect {
+        self.effect
+    }
+}
+
+/// Allocation-free, exact parent oplock requirements for one namespace mutation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NamespaceOplockPlan {
+    /// First and always-present parent requirement.
+    first: NamespaceParentOplock,
+    /// Second parent requirement for a cross-directory rename.
+    second: Option<NamespaceParentOplock>,
+}
+
+impl NamespaceOplockPlan {
+    /// Creates the one-parent plan used by hard-link creation and replacement.
+    const fn hard_link(parent: DirectoryNodeId, effect: NamespaceParentOplockEffect) -> Self {
+        Self {
+            first: NamespaceParentOplock { parent, effect },
+            second: None,
+        }
+    }
+
+    /// Creates a rename plan, coalescing a same-parent source and target to removal semantics.
+    fn rename(
+        source_parent: DirectoryNodeId,
+        target_parent: DirectoryNodeId,
+        target_effect: NamespaceParentOplockEffect,
+    ) -> Self {
+        let source = NamespaceParentOplock {
+            parent: source_parent,
+            effect: NamespaceParentOplockEffect::Removal,
+        };
+        if source_parent == target_parent {
+            return Self {
+                first: source,
+                second: None,
+            };
+        }
+        Self {
+            first: source,
+            second: Some(NamespaceParentOplock {
+                parent: target_parent,
+                effect: target_effect,
+            }),
+        }
+    }
+
+    /// First parent requirement in deterministic source-before-target order.
+    pub(crate) const fn first(self) -> NamespaceParentOplock {
+        self.first
+    }
+
+    /// Optional target-parent requirement for a cross-directory rename.
+    pub(crate) const fn second(self) -> Option<NamespaceParentOplock> {
+        self.second
+    }
 }
 
 /// Allocation-free driver publication paired with a set-information mutation.
@@ -190,6 +277,7 @@ pub(super) fn set_file_information(
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     pending_disposition: &mut Option<PendingDispositionDeletion>,
     prepared_deletion: Option<&PreparedStreamDeletion>,
+    namespace_oplocks: Option<NamespaceOplockPlan>,
 ) -> DriverResult<SetFileResolution> {
     if let Some(pending) = pending_disposition.as_ref() {
         pending.validate_request(&mut request)?;
@@ -320,7 +408,12 @@ pub(super) fn set_file_information(
             return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
         }
         SetFilePlan::Link { mutation: request } => {
-            let changes = set_hard_link_information(request, operations, mutation)?;
+            let prepared = PreparedHardLinkMutation::prepare(request, operations, mutation)?;
+            let oplocks = prepared.oplock_plan();
+            if namespace_oplocks != Some(oplocks) {
+                return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
+            }
+            let changes = prepared.apply(mutation)?;
             let changes = memory::boxed_try_with(move || Ok(changes))?;
             return Ok(SetFileResolution::Mutation(SetFilePublication::HardLink(
                 changes,
@@ -330,7 +423,13 @@ pub(super) fn set_file_information(
             mutation: rename,
             file_object,
         } => {
-            let publication = set_rename_information(rename, operations, mutation)?;
+            let prepared = PreparedRenameMutation::prepare(rename, operations, mutation)?;
+            if let Some(oplocks) = prepared.oplock_plan()
+                && namespace_oplocks != Some(oplocks)
+            {
+                return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
+            }
+            let publication = prepared.apply(mutation)?;
             return Ok(SetFileResolution::Mutation(match publication {
                 PreparedRename::Unchanged => SetFilePublication::None,
                 PreparedRename::Changed {
@@ -736,6 +835,16 @@ enum PreparedHardLinkDestination {
     },
 }
 
+impl PreparedHardLinkDestination {
+    /// Parent-directory effect required by this exact destination state.
+    const fn oplock_effect(&self) -> NamespaceParentOplockEffect {
+        match self {
+            Self::Vacant => NamespaceParentOplockEffect::Change,
+            Self::Replace { .. } => NamespaceParentOplockEffect::Removal,
+        }
+    }
+}
+
 /// Source link-count transition implied by the prepared destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HardLinkCountEffect {
@@ -776,6 +885,103 @@ impl HardLinkDirectoryChanges {
         if let Some(second) = self.second {
             operations.report_directory_change(*second);
         }
+    }
+}
+
+/// Fully resolved hard-link write staged only after its exact parent oplock plan is authorized.
+#[derive(Debug)]
+struct PreparedHardLinkMutation {
+    /// Existing inode that receives the additional name.
+    source: HardLinkNodeId,
+    /// Source identity used for metadata and notification publication.
+    source_node: NodeId,
+    /// Exact resolved destination directory.
+    target_parent: DirectoryNodeId,
+    /// Exact ext4 target spelling used by the transaction.
+    target_name: Ext4Name,
+    /// Validated target state and replacement spelling.
+    destination: PreparedHardLinkDestination,
+    /// Optional archive-bit projection prepared before writes begin.
+    archive_overlay: Option<WindowsOverlay>,
+    /// Fully allocated post-commit notification sequence.
+    changes: HardLinkDirectoryChanges,
+}
+
+impl PreparedHardLinkMutation {
+    /// Resolves and validates every fallible hard-link input without staging an ext4 write.
+    /// # Errors
+    ///
+    /// Returns a target-resolution, replacement-policy, link-limit, metadata, or allocation error.
+    fn prepare(
+        request: HardLinkMutation,
+        operations: &mut MountedVolumeAccess<'_>,
+        read: &mut impl CommittedReadPass,
+    ) -> DriverResult<Self> {
+        let HardLinkMutation {
+            source,
+            target,
+            target_collision,
+        } = request;
+        let source_node = NodeId::from(source);
+        let (target_parent, target_name) = resolve_namespace_target(read, &target)?;
+        operations.ensure_node_openable(NodeId::Directory(target_parent))?;
+        let source_metadata = metadata_from_node(read, source_node)?;
+        let (destination, count_effect, changes) = prepare_hard_link_destination(
+            operations,
+            read,
+            source_node,
+            target_parent,
+            &target_name,
+            target.target_name(),
+            target_collision,
+        )?;
+        count_effect.validate(source_metadata.links_count)?;
+        let archive_overlay = hard_link_archive_overlay(source_metadata.overlay_attributes)?;
+        Ok(Self {
+            source,
+            source_node,
+            target_parent,
+            target_name,
+            destination,
+            archive_overlay,
+            changes,
+        })
+    }
+
+    /// Exact parent-directory authority required before this prepared write can be staged.
+    fn oplock_plan(&self) -> NamespaceOplockPlan {
+        NamespaceOplockPlan::hard_link(self.target_parent, self.destination.oplock_effect())
+    }
+
+    /// Stages the already authorized hard-link mutation.
+    /// # Errors
+    ///
+    /// Returns an error when the epoch state changed or the ext4 transaction cannot stage writes.
+    fn apply(
+        self,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+    ) -> DriverResult<HardLinkDirectoryChanges> {
+        let source = mutation.hard_link_source(self.source)?;
+        let target_parent = mutation.directory(self.target_parent)?;
+        if let Some(overlay) = self.archive_overlay {
+            let node = mutation.node(self.source_node)?;
+            mutation.set_windows_overlay(node, overlay)?;
+        }
+        match &self.destination {
+            PreparedHardLinkDestination::Vacant => mutation.create_hard_link(
+                source,
+                target_parent,
+                &self.target_name,
+                HardLinkDestination::Vacant,
+            )?,
+            PreparedHardLinkDestination::Replace { existing_name } => mutation.create_hard_link(
+                source,
+                target_parent,
+                &self.target_name,
+                HardLinkDestination::Replace { existing_name },
+            )?,
+        }
+        Ok(self.changes)
     }
 }
 
@@ -946,6 +1152,131 @@ enum PreparedRename {
         /// Namespace notifications derived before commit.
         notifications: Box<RenameDirectoryNameChanges>,
     },
+}
+
+/// Fully resolved rename staged only after its exact parent oplock plan is authorized.
+enum PreparedRenameMutation {
+    /// Source and target identify the same effective namespace entry.
+    Unchanged,
+    /// Exact source, target, and publication state for a non-no-op rename.
+    Changed {
+        /// Source directory before the rename.
+        source_parent: DirectoryNodeId,
+        /// Exact source spelling retained by the opened handle.
+        source_name: Ext4Name,
+        /// Destination directory resolved in the current epoch.
+        target_parent: DirectoryNodeId,
+        /// Exact destination spelling.
+        target_name: Ext4Name,
+        /// Validated collision policy passed to the ext4 transaction.
+        target_collision: RenameTargetCollision,
+        /// Parent-directory oplock effects derived from the resolved target state.
+        oplocks: NamespaceOplockPlan,
+        /// New handle location published only after durable commit.
+        location: OpenedLocation,
+        /// Fully allocated post-commit notification sequence.
+        notifications: Box<RenameDirectoryNameChanges>,
+    },
+}
+
+impl PreparedRenameMutation {
+    /// Resolves and allocates a rename transcript without staging an ext4 write.
+    /// # Errors
+    ///
+    /// Returns a namespace-resolution, replacement-policy, notification, or allocation error.
+    fn prepare(
+        request: RenameMutation,
+        operations: &mut MountedVolumeAccess<'_>,
+        read: &mut impl CommittedReadPass,
+    ) -> DriverResult<Self> {
+        let RenameMutation {
+            source_parent,
+            source_name,
+            source_node,
+            target,
+            target_collision,
+        } = request;
+        let (target_parent, target_name) = resolve_namespace_target(read, &target)?;
+        operations.ensure_node_openable(NodeId::Directory(source_parent))?;
+        operations.ensure_node_openable(NodeId::Directory(target_parent))?;
+        let notifications = RenameDirectoryNameChanges::prepare(
+            operations,
+            read,
+            RenameNotificationRequest {
+                source_parent,
+                source_name: &source_name,
+                source_node,
+                target_parent,
+                target_name: &target_name,
+                target_collision,
+            },
+        )?;
+        let Some(notifications) = notifications else {
+            return Ok(Self::Unchanged);
+        };
+        let target_effect = if notifications.replaced_target.is_some() {
+            NamespaceParentOplockEffect::Removal
+        } else {
+            NamespaceParentOplockEffect::Change
+        };
+        let oplocks = NamespaceOplockPlan::rename(source_parent, target_parent, target_effect);
+        let notifications =
+            Box::try_new(notifications).map_err(|_| DriverError::InsufficientResources)?;
+        Ok(Self::Changed {
+            source_parent,
+            source_name,
+            target_parent,
+            target_name: target_name.try_to_owned_name()?,
+            target_collision,
+            oplocks,
+            location: OpenedLocation::DirectoryEntry {
+                parent: target_parent,
+                name: target_name,
+            },
+            notifications,
+        })
+    }
+
+    /// Exact parent-directory authority needed by a non-no-op rename.
+    const fn oplock_plan(&self) -> Option<NamespaceOplockPlan> {
+        match self {
+            Self::Unchanged => None,
+            Self::Changed { oplocks, .. } => Some(*oplocks),
+        }
+    }
+
+    /// Stages the authorized rename and returns its allocation-free publication state.
+    /// # Errors
+    ///
+    /// Returns an error when the epoch state changed or the ext4 transaction cannot stage writes.
+    fn apply(self, mutation: &mut DriverMutationPass<'_, '_, '_>) -> DriverResult<PreparedRename> {
+        let Self::Changed {
+            source_parent,
+            source_name,
+            target_parent,
+            target_name,
+            target_collision,
+            location,
+            notifications,
+            ..
+        } = self
+        else {
+            return Ok(PreparedRename::Unchanged);
+        };
+        let source_parent = mutation.directory(source_parent)?;
+        let target_parent = mutation.directory(target_parent)?;
+        mutation.rename_child(
+            source_parent,
+            &source_name,
+            target_parent,
+            &target_name,
+            target_collision,
+        )?;
+        Ok(PreparedRename::Changed {
+            location,
+            notifications,
+        })
+    }
 }
 
 /// Committed directory-name changes caused by one non-no-op rename operation.

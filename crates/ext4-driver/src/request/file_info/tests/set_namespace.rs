@@ -150,6 +150,52 @@ fn hard_link_count_and_archive_boundaries_are_explicit() {
 
 /// # Panics
 ///
+/// Panics when vacant/replacement effects or same-parent rename coalescing drift.
+#[test]
+fn namespace_oplock_plans_preserve_parent_effects() {
+    let vacant = super::PreparedHardLinkDestination::Vacant;
+    assert_eq!(
+        vacant.oplock_effect(),
+        super::NamespaceParentOplockEffect::Change
+    );
+    let name = Ext4Name::new(b"target");
+    assert!(name.is_ok());
+    if let Ok(name) = name {
+        let replaced = super::PreparedHardLinkDestination::Replace {
+            existing_name: name,
+        };
+        assert_eq!(
+            replaced.oplock_effect(),
+            super::NamespaceParentOplockEffect::Removal
+        );
+    }
+
+    let hard_link = super::NamespaceOplockPlan::hard_link(
+        DirectoryNodeId::ROOT,
+        super::NamespaceParentOplockEffect::Change,
+    );
+    assert_eq!(hard_link.first().parent(), DirectoryNodeId::ROOT);
+    assert_eq!(
+        hard_link.first().effect(),
+        super::NamespaceParentOplockEffect::Change
+    );
+    assert!(hard_link.second().is_none());
+
+    let same_parent = super::NamespaceOplockPlan::rename(
+        DirectoryNodeId::ROOT,
+        DirectoryNodeId::ROOT,
+        super::NamespaceParentOplockEffect::Change,
+    );
+    assert_eq!(same_parent.first().parent(), DirectoryNodeId::ROOT);
+    assert_eq!(
+        same_parent.first().effect(),
+        super::NamespaceParentOplockEffect::Removal
+    );
+    assert!(same_parent.second().is_none());
+}
+
+/// # Panics
+///
 /// Panics when namespace path bases or relative-path rejection drift.
 #[test]
 fn namespace_target_distinguishes_opened_parent_from_volume_root() {

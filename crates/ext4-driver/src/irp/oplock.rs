@@ -73,6 +73,14 @@ impl OplockCheck {
         }
     }
 
+    /// Builds the parent-directory check required before changing a child namespace entry.
+    pub(crate) const fn parent_change(stream: OplockStreamLease) -> Self {
+        Self {
+            stream,
+            flags: parent_change_oplock_flags(),
+        }
+    }
+
     /// Builds the break check selected by an existing-stream create request.
     /// # Errors
     ///
@@ -123,6 +131,11 @@ const fn cleanup_oplock_flags(deletion: CreateDeletion) -> u32 {
 /// Projects final cleanup deletion into the mandatory parent-oplock flags.
 const fn parent_removal_oplock_flags() -> u32 {
     wdk_sys::OPLOCK_FLAG_PARENT_OBJECT | wdk_sys::OPLOCK_FLAG_REMOVING_FILE_OR_LINK
+}
+
+/// Projects child creation/change into the parent-object FsRtl contract.
+const fn parent_change_oplock_flags() -> u32 {
+    wdk_sys::OPLOCK_FLAG_PARENT_OBJECT
 }
 
 /// Backout authority created only after FsRtl establishes a create-time atomic oplock.
@@ -730,7 +743,7 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
 mod tests {
     use super::{
         OplockCallbackProtocol, classify_atomic_oplock_status, cleanup_oplock_flags,
-        parent_removal_oplock_flags,
+        parent_change_oplock_flags, parent_removal_oplock_flags,
     };
     use crate::irp::CreateDeletion;
     use crate::kernel::status::DriverError;
@@ -778,6 +791,17 @@ mod tests {
         assert_eq!(
             parent_removal_oplock_flags(),
             wdk_sys::OPLOCK_FLAG_PARENT_OBJECT | wdk_sys::OPLOCK_FLAG_REMOVING_FILE_OR_LINK
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a non-removing child change incorrectly claims link-removal semantics.
+    #[test]
+    fn parent_change_oplock_flags_are_exact() {
+        assert_eq!(
+            parent_change_oplock_flags(),
+            wdk_sys::OPLOCK_FLAG_PARENT_OBJECT
         );
     }
 
