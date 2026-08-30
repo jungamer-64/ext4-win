@@ -8,13 +8,6 @@ on:
 permissions:
   contents: read
 
-env:
-  E2FSPROGS_RELEASE: 1.47.2
-
-  # Keep cargo-wdk aligned with the exact windows-drivers-rs revision
-  # used by this repository.
-  WINDOWS_DRIVERS_RS_REV: 7d3000c6e60041c6ea1ab75abebe411e6482fca6
-
 jobs:
   portable:
     name: portable (${{ matrix.os }})
@@ -60,9 +53,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes e2fsprogs
 
+          manifest="tools/xtask/fixtures/journal/provenance.manifest"
+          mapfile -t release_records < <(
+            sed -n 's/^e2fsprogs \([^[:space:]]\+\)$/\1/p' "${manifest}"
+          )
+          if [ "${#release_records[@]}" -ne 1 ]; then
+            echo "${manifest} must contain exactly one e2fsprogs release record" >&2
+            exit 1
+          fi
+
+          expected_release="${release_records[0]}"
           actual_release="$(mke2fs -V 2>&1 | sed -n 's/^mke2fs \([0-9.]*\).*/\1/p')"
-          if [ "$actual_release" != "${{ env.E2FSPROGS_RELEASE }}" ]; then
-            echo "e2fsprogs release must be ${{ env.E2FSPROGS_RELEASE }}, found $actual_release" >&2
+          if [ "$actual_release" != "$expected_release" ]; then
+            echo "e2fsprogs release must be $expected_release, found $actual_release" >&2
             exit 1
           fi
 
@@ -283,13 +286,39 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          #
-          # Use exactly the same windows-drivers-rs revision
-          # as the repository's WDK crates.
-          #
+          $metadataJson = cargo metadata `
+            --locked `
+            --format-version 1 | Out-String
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to resolve the locked Cargo dependency graph"
+          }
+
+          $metadata = $metadataJson | ConvertFrom-Json
+          $wdkPackages = @($metadata.packages | Where-Object {
+            $_.source -match `
+              '^git\+https://github\.com/microsoft/windows-drivers-rs(?:\?|#)'
+          })
+          if ($wdkPackages.Count -eq 0) {
+            throw "Locked Cargo graph omits windows-drivers-rs packages"
+          }
+
+          $wdkSources = @($wdkPackages.source | Sort-Object -Unique)
+          if ($wdkSources.Count -ne 1) {
+            throw "Locked windows-drivers-rs packages resolve from different sources: $($wdkSources -join ', ')"
+          }
+
+          $source = $wdkSources[0]
+          if ($source -notmatch '^git\+https://github\.com/microsoft/windows-drivers-rs(?:\?[^#]*)?#(?<revision>[0-9a-f]{40})$') {
+            throw "Unexpected locked windows-drivers-rs source: $source"
+          }
+
+          $revision = $Matches.revision
+          Write-Host "Locked windows-drivers-rs revision: $revision"
+
           cargo install cargo-wdk `
             --git https://github.com/microsoft/windows-drivers-rs `
-            --rev "${{ env.WINDOWS_DRIVERS_RS_REV }}" `
+            --rev $revision `
             --locked
 
           cargo wdk --version
@@ -521,7 +550,20 @@ jobs:
           # live below /usr/sbin on Ubuntu.
           #
           $linuxPath = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-          $e2fsprogsRelease = "${{ env.E2FSPROGS_RELEASE }}"
+          $provenanceManifest = `
+            "tools/xtask/fixtures/journal/provenance.manifest"
+          $releaseRecords = @(Get-Content `
+            -LiteralPath $provenanceManifest | ForEach-Object {
+              if ($_ -match '^e2fsprogs ([^\s]+)$') {
+                $Matches[1]
+              }
+            })
+
+          if ($releaseRecords.Count -ne 1) {
+            throw "$provenanceManifest must contain exactly one e2fsprogs release record"
+          }
+
+          $e2fsprogsRelease = $releaseRecords[0]
 
           wsl.exe `
             --distribution Ubuntu-26.04 `
