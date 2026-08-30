@@ -431,7 +431,6 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
     match dispatch_policy(device_kind, major) {
         DispatchPolicy::Immediate(request) => execute_immediate(received, request),
         DispatchPolicy::Queued => crate::state::queue_device_request(received, major),
-        DispatchPolicy::FsRtlFileLock => dispatch_file_lock(received),
     }
 }
 
@@ -457,8 +456,6 @@ enum DispatchPolicy {
     Immediate(ImmediateDispatch),
     /// Mark pending and execute on the dedicated device actor.
     Queued,
-    /// Transfer terminal completion to the FsRtl byte-range lock package.
-    FsRtlFileLock,
 }
 
 /// Returns the queue policy for a major function.
@@ -489,7 +486,6 @@ const fn dispatch_policy(device_kind: DriverDeviceKind, major: DispatchMajor) ->
         },
         DriverDeviceKind::MountedVolume => match major {
             DispatchMajor::DeviceControl => DispatchPolicy::Immediate(ImmediateDispatch::Reject),
-            DispatchMajor::LockControl => DispatchPolicy::FsRtlFileLock,
             DispatchMajor::Create
             | DispatchMajor::Cleanup
             | DispatchMajor::Close
@@ -504,18 +500,11 @@ const fn dispatch_policy(device_kind: DriverDeviceKind, major: DispatchMajor) ->
             | DispatchMajor::FlushBuffers
             | DispatchMajor::QueryEa
             | DispatchMajor::SetEa
+            | DispatchMajor::LockControl
             | DispatchMajor::QuerySecurity
             | DispatchMajor::SetSecurity
             | DispatchMajor::Shutdown => DispatchPolicy::Queued,
         },
-    }
-}
-
-/// Decodes a lock target, then lets FsRtl own and complete the lock-control IRP.
-fn dispatch_file_lock(mut received: ReceivedIrp) -> NTSTATUS {
-    match received.with_active(crate::request::file_info::lock_control) {
-        Ok(file_control_block) => received.delegate_byte_range_lock(file_control_block),
-        Err(error) => received.complete_result(Err(error)),
     }
 }
 
@@ -924,12 +913,12 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when lock-control IRPs stop being completed by FsRtl.
+    /// Panics when lock-control IRPs bypass the actor that sequences oplock and byte-lock state.
     #[test]
-    fn lock_control_is_delegated_to_fsrtl() {
+    fn lock_control_is_queued_for_stream_synchronization() {
         assert_eq!(
             dispatch_policy(DriverDeviceKind::MountedVolume, DispatchMajor::LockControl),
-            DispatchPolicy::FsRtlFileLock
+            DispatchPolicy::Queued
         );
     }
 
