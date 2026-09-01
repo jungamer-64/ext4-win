@@ -38,13 +38,11 @@ const ARTIFACT_ID_MARKER: &str = "EXT4WIN_ARTIFACT_ID=";
 
 fn main() -> Result<(), Box<dyn Error>> {
     const SECURITY_CAPTURE_SOURCE: &str = "native/security_capture.c";
-    const CANCEL_SOURCE: &str = "native/cancel.c";
     const STREAM_CONTEXT_SOURCE: &str = "native/stream_context.c";
     const OPERATIONAL_TRACE_SOURCE: &str = "native/operational_trace.c";
     const VOLUME_DISCOVERY_SOURCE: &str = "native/volume_discovery.c";
 
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");
-    println!("cargo:rerun-if-changed={CANCEL_SOURCE}");
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");
     println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_SOURCE}");
     println!("cargo:rerun-if-changed=native/operational_trace.h");
@@ -78,7 +76,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .includes(config.include_paths()?)
         .include(&out_directory)
         .file(SECURITY_CAPTURE_SOURCE)
-        .file(CANCEL_SOURCE)
         .file(STREAM_CONTEXT_SOURCE)
         .file(OPERATIONAL_TRACE_SOURCE)
         .file(VOLUME_DISCOVERY_SOURCE);

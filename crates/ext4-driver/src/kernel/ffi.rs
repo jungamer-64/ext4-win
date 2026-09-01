@@ -151,16 +151,3 @@ unsafe extern "system" {
     /// Releases one purpose-specific requestor-input capture.
     pub(crate) fn ext4win_release_captured_requestor_input(snapshot: wdk_sys::PVOID);
 }
-
-#[cfg(not(test))]
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-unsafe extern "C" {
-    /// Atomically replaces `IRP.CancelRoutine` under the caller-held cancel spin lock.
-    pub(crate) fn ext4win_set_cancel_routine(
-        irp: wdk_sys::PIRP,
-        routine: wdk_sys::PDRIVER_CANCEL,
-    ) -> wdk_sys::PDRIVER_CANCEL;
-}
