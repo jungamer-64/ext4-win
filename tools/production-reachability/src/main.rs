@@ -48,6 +48,12 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("durable publication boundary", "publish_durable"),
     ("completion registration import", "IoSetCompletionRoutineEx"),
     ("lower submission import", "IofCallDriver"),
+    ("cancel routine exchange", "wdk_sys_IoSetCancelRoutine"),
+    ("IRP completion boundary", "wdk_sys_IoCompleteRequest"),
+    (
+        "private IRP stack selection",
+        "wdk_sys_IoGetNextIrpStackLocation",
+    ),
     ("native advanced-header allocation", "ext4win_stream_create"),
     (
         "native node stream lifetime binding",
@@ -2353,6 +2359,9 @@ mod tests {
              publish_durable\n\
              IoSetCompletionRoutineEx\n\
              IofCallDriver\n\
+             wdk_sys_IoSetCancelRoutine\n\
+             wdk_sys_IoCompleteRequest\n\
+             wdk_sys_IoGetNextIrpStackLocation\n\
              ext4win_stream_create\n\
              ext4win_stream_bind_node_owner\n\
              ext4win_stream_bind_volume_owner\n\

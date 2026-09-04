@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering}
 use ext4_core::{ByteOffset, Error};
 use wdk_sys::{IRP_MJ_DEVICE_CONTROL, IRP_MJ_FLUSH_BUFFERS, IRP_MJ_READ, IRP_MJ_WRITE, NTSTATUS};
 #[cfg(not(test))]
-use wdk_sys::{LARGE_INTEGER, PIO_STACK_LOCATION, PIRP};
+use wdk_sys::{LARGE_INTEGER, PIRP};
 
 use crate::kernel::fatal::KernelWideInconsistency;
 #[cfg(not(test))]
@@ -1280,7 +1280,7 @@ fn prepare_private_irp(
     irp_ref.IoStatus.Information = 0;
     let stack = unsafe {
         // SAFETY: Positive target stack depth provides one unused private stack location.
-        next_irp_stack_location(authority.as_ptr())
+        ffi::IoGetNextIrpStackLocation(authority.as_ptr())
     };
     unsafe {
         // SAFETY: The unused stack slot is exclusively owned before submission.
@@ -1357,34 +1357,6 @@ fn prepare_private_irp(
         }
     }
     Ok(authority)
-}
-
-#[cfg(not(test))]
-/// Returns the next private-IRP stack slot using the WDK macro contract.
-/// # Safety
-///
-/// `irp` must be freshly allocated with a positive unused stack depth.
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-unsafe fn next_irp_stack_location(irp: PIRP) -> PIO_STACK_LOCATION {
-    let irp = unsafe {
-        // SAFETY: The caller guarantees one valid live private IRP.
-        &*irp
-    };
-    let tail = unsafe {
-        // SAFETY: Live IRP stack traversal selects the Tail.Overlay representation.
-        &irp.Tail.Overlay
-    };
-    let current = unsafe {
-        // SAFETY: The stack-traversal union arm is active for this allocated IRP.
-        tail.__bindgen_anon_2.__bindgen_anon_1.CurrentStackLocation
-    };
-    unsafe {
-        // SAFETY: Positive stack depth guarantees one initialized slot before `current`.
-        current.sub(1)
-    }
 }
 
 #[cfg(not(test))]

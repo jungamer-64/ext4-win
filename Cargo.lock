@@ -807,7 +807,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "wdk-alloc"
 version = "0.4.1"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09#573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=1492a114b89aad9487ada273de0ef18b003ab42f#1492a114b89aad9487ada273de0ef18b003ab42f"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -818,7 +818,7 @@ dependencies = [
 [[package]]
 name = "wdk-build"
 version = "0.5.1"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09#573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=1492a114b89aad9487ada273de0ef18b003ab42f#1492a114b89aad9487ada273de0ef18b003ab42f"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -841,7 +841,7 @@ dependencies = [
 [[package]]
 name = "wdk-macros"
 version = "0.5.1"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09#573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=1492a114b89aad9487ada273de0ef18b003ab42f#1492a114b89aad9487ada273de0ef18b003ab42f"
 dependencies = [
  "cfg-if",
  "fs4",
@@ -857,7 +857,7 @@ dependencies = [
 [[package]]
 name = "wdk-sys"
 version = "0.5.1"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09#573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=1492a114b89aad9487ada273de0ef18b003ab42f#1492a114b89aad9487ada273de0ef18b003ab42f"
 dependencies = [
  "anyhow",
  "bindgen",
