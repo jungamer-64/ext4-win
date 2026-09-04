@@ -20,9 +20,9 @@ license = "MIT OR Apache-2.0"
 cc = "1"
 hkdf = { version = "0.13", default-features = false }
 sha2 = { version = "0.11", default-features = false }
-wdk-build = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09" }
-wdk-sys = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09" }
-wdk-alloc = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "573c5ac07581dcd7f2fb1c9d6ce6b9f700a35c09" }
+wdk-build = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "1492a114b89aad9487ada273de0ef18b003ab42f" }
+wdk-sys = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "1492a114b89aad9487ada273de0ef18b003ab42f" }
+wdk-alloc = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "1492a114b89aad9487ada273de0ef18b003ab42f" }
 
 [profile.dev]
 panic = "abort"

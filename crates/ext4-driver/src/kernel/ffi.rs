@@ -2,7 +2,7 @@
 
 pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 #[cfg(not(test))]
-pub(crate) use wdk_sys::ntddk::IofCompleteRequest;
+pub(crate) use wdk_sys::ntddk::IoCompleteRequest;
 pub(crate) use wdk_sys::ntddk::{
     IoCheckShareAccess, IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink,
     IoRegisterFileSystem, IoRemoveShareAccess, IoUnregisterFileSystem, KeQuerySystemTimePrecise,
@@ -73,12 +73,13 @@ pub(crate) use wdk_sys::ntddk::{
     FsRtlNotifyFullReportChange, FsRtlNotifyInitializeSync, FsRtlNotifyUninitializeSync,
     FsRtlUninitializeFileLock, IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl,
     IoAllocateWorkItem, IoCancelIrp, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp,
-    IoFreeIrp, IoFreeMdl, IoFreeWorkItem, IoGetRequestorProcess, IoQueueWorkItem,
-    IoRegisterShutdownNotification, IoReleaseVpbSpinLock, IoSetCompletionRoutineEx,
-    IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeCancelTimer,
-    KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer,
-    KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool,
-    MmUnlockPages, ObfDereferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
+    IoFreeIrp, IoFreeMdl, IoFreeWorkItem, IoGetNextIrpStackLocation, IoGetRequestorProcess,
+    IoQueueWorkItem, IoRegisterShutdownNotification, IoReleaseVpbSpinLock,
+    IoSetCompletionRoutineEx, IoUnregisterShutdownNotification, IofCallDriver,
+    KeAcquireSpinLockRaiseToDpc, KeCancelTimer, KeFlushQueuedDpcs, KeInitializeDpc,
+    KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer, KeReleaseSpinLock, KeSetEvent,
+    KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages,
+    ObfDereferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
     ZwWaitForSingleObject,
 };
 
@@ -91,7 +92,9 @@ pub(crate) use wdk_sys::ntddk::{
 };
 
 #[cfg(not(test))]
-pub(crate) use wdk_sys::ntddk::{IoAcquireCancelSpinLock, IoReleaseCancelSpinLock};
+pub(crate) use wdk_sys::ntddk::{
+    IoAcquireCancelSpinLock, IoReleaseCancelSpinLock, IoSetCancelRoutine,
+};
 
 #[cfg(not(test))]
 #[expect(

@@ -143,7 +143,7 @@ impl ActiveCancellation {
         if !cancelled {
             let previous = unsafe {
                 // SAFETY: The cancel spin lock is held and no earlier active routine exists.
-                ffi::ext4win_set_cancel_routine(irp, Some(active_irp_cancelled))
+                ffi::IoSetCancelRoutine(irp, Some(active_irp_cancelled))
             };
             if previous.is_some() {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -181,7 +181,7 @@ impl Drop for ActiveCancellation {
         }
         let _previous = unsafe {
             // SAFETY: The cancel spin lock excludes routine selection while authority is removed.
-            ffi::ext4win_set_cancel_routine(self.irp.as_ptr(), None)
+            ffi::IoSetCancelRoutine(self.irp.as_ptr(), None)
         };
         let irp = unsafe {
             // SAFETY: Terminal ownership and the cancel spin lock permit context removal.

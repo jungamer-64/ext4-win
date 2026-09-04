@@ -1196,7 +1196,7 @@ impl KernelIrp {
         unsafe {
             // SAFETY: The IRP pointer belongs to the unique completion owner
             // and the calling completion path wrote every terminal field first.
-            ffi::IofCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
+            ffi::IoCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
         }
         status
     }
