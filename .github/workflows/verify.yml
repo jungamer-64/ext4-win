@@ -295,13 +295,16 @@ jobs:
           }
 
           $metadata = $metadataJson | ConvertFrom-Json
-          $wdkPackages = @($metadata.packages | Where-Object {
-            $_.source -match `
-              '^git\+https://github\.com/microsoft/windows-drivers-rs(?:\?|#)'
+          $wdkPackages = @(foreach ($name in @("wdk-build", "wdk-sys", "wdk-alloc")) {
+            $packages = @($metadata.packages | Where-Object { $_.name -eq $name })
+            if ($packages.Count -ne 1) {
+              throw "Locked Cargo graph must contain exactly one $name package"
+            }
+            if ($packages[0].source -notmatch '^git\+') {
+              throw "Locked $name must resolve from a Git source"
+            }
+            $packages[0]
           })
-          if ($wdkPackages.Count -eq 0) {
-            throw "Locked Cargo graph omits windows-drivers-rs packages"
-          }
 
           $wdkSources = @($wdkPackages.source | Sort-Object -Unique)
           if ($wdkSources.Count -ne 1) {
@@ -309,19 +312,29 @@ jobs:
           }
 
           $source = $wdkSources[0]
-          if ($source -notmatch '^git\+https://github\.com/microsoft/windows-drivers-rs(?:\?[^#]*)?#(?<revision>[0-9a-f]{40})$') {
+          if ($source -notmatch '^git\+(?<repository>https://[^?#\s]+)(?:\?[^#]*)?#(?<revision>[0-9a-f]{40})$') {
             throw "Unexpected locked windows-drivers-rs source: $source"
           }
 
+          $repository = $Matches.repository
           $revision = $Matches.revision
+          Write-Host "Locked windows-drivers-rs repository: $repository"
           Write-Host "Locked windows-drivers-rs revision: $revision"
 
           cargo install cargo-wdk `
-            --git https://github.com/microsoft/windows-drivers-rs `
+            --git $repository `
             --rev $revision `
             --locked
 
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo-wdk installation failed with exit code $LASTEXITCODE"
+          }
+
           cargo wdk --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to query the installed cargo-wdk version"
+          }
 
       - name: Set up Ubuntu 26.04 WSL oracle
         shell: pwsh
