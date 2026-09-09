@@ -226,18 +226,35 @@ impl DeviceExtensionHeader {
         target: ReactorTarget,
         trace: OperationalTrace,
     ) -> DriverResult<()> {
+        let destination = NonNull::new(header).ok_or(DriverError::InvalidParameter)?;
+        let kind_slot = unsafe {
+            // SAFETY: Project a scalar field without forming a reference to uninitialized storage.
+            core::ptr::addr_of_mut!((*header).kind)
+        };
+        unsafe {
+            // SAFETY: The caller exclusively owns this uninitialized field.
+            kind_slot.write(kind);
+        }
+        let dispatch = unsafe {
+            // SAFETY: This disjoint field belongs to the same exclusive storage.
+            core::ptr::addr_of_mut!((*header).dispatch)
+        };
+        unsafe {
+            // SAFETY: Rundown has no observers until initialization and device publication.
+            dispatch.write(DeviceDispatchRundown::new());
+        }
         let mut initialization = unsafe {
-            // SAFETY: The caller exclusively owns final-address uninitialized extension storage.
-            InPlaceInitialization::write(
-                header,
-                Self {
-                    kind,
-                    dispatch: DeviceDispatchRundown::new(),
-                    reactor: UnsafeCell::new(MaybeUninit::uninit()),
-                },
-            )?
+            // SAFETY: kind and dispatch are initialized. UnsafeCell<MaybeUninit<CompletionReactor>>
+            // accepts uninitialized bytes, so its large storage needs no by-value write.
+            InPlaceInitialization::assume_init(destination)
         };
         let header = initialization.get_mut();
+        // New fields must be included in the initialization proof before borrowing Self.
+        let Self {
+            kind: _,
+            dispatch: _,
+            reactor: _,
+        } = header;
         header.dispatch.initialize();
         unsafe {
             // SAFETY: The actor slot is uninitialized, aligned, and already at its final address.
