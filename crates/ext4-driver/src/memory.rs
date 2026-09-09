@@ -64,30 +64,6 @@ pub(crate) struct InPlaceInitialization<T> {
 }
 
 impl<T> InPlaceInitialization<T> {
-    /// Initializes `value` at its final address and takes rollback ownership.
-    /// # Safety
-    ///
-    /// `destination` must be aligned, writable storage for one `T`, must not currently hold an
-    /// initialized value, and must remain uniquely owned through [`Self::publish`] or guard drop.
-    /// # Errors
-    ///
-    /// Returns invalid parameter when `destination` is null; `value` remains ordinarily dropped.
-    #[expect(
-        unsafe_code,
-        reason = "this boundary uniquely owns final-address initialization until explicit publication"
-    )]
-    pub(crate) unsafe fn write(destination: *mut T, value: T) -> DriverResult<Self> {
-        let destination = NonNull::new(destination).ok_or(DriverError::InvalidParameter)?;
-        unsafe {
-            // SAFETY: The caller supplies exclusive writable uninitialized storage for one T.
-            destination.as_ptr().write(value);
-        }
-        Ok(Self {
-            destination,
-            rollback: true,
-        })
-    }
-
     /// Returns exclusive access before the value is published to another observer.
     #[expect(
         unsafe_code,

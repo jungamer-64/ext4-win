@@ -301,14 +301,6 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
-    /// Creates an empty running scheduler.
-    pub(crate) fn new() -> Self {
-        Self {
-            slots: core::array::from_fn(|_| Slot::vacant()),
-            draining: false,
-        }
-    }
-
     /// Closes model admission while allowing active slots to drain.
     pub(crate) fn begin_drain(&mut self) {
         self.draining = true;
