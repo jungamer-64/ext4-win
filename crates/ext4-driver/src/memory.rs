@@ -64,6 +64,23 @@ pub(crate) struct InPlaceInitialization<T> {
 }
 
 impl<T> InPlaceInitialization<T> {
+    /// Takes rollback ownership after field-by-field initialization at the final address.
+    /// # Safety
+    ///
+    /// Every field at `destination` must be initialized as a valid `T`. The storage must remain
+    /// writable, address-stable and uniquely owned until publication or guard drop. The caller
+    /// transfers sole destruction responsibility; this guard does not allocate or move `T`.
+    #[expect(
+        unsafe_code,
+        reason = "the constructor accepts the caller's proof of complete final-address initialization"
+    )]
+    pub(crate) unsafe fn assume_init(destination: NonNull<T>) -> Self {
+        Self {
+            destination,
+            rollback: true,
+        }
+    }
+
     /// Returns exclusive access before the value is published to another observer.
     #[expect(
         unsafe_code,
@@ -846,29 +863,21 @@ mod tests {
         let drops = AtomicUsize::new(0);
         let mut rollback_storage = core::mem::MaybeUninit::<DropProbe<'_>>::uninit();
         {
-            let guard = unsafe {
-                // SAFETY: The MaybeUninit slot is aligned, writable, uninitialized, and uniquely
-                // retained until guard drop.
-                InPlaceInitialization::write(
-                    rollback_storage.as_mut_ptr(),
-                    DropProbe { drops: &drops },
-                )
+            let destination =
+                core::ptr::NonNull::from(rollback_storage.write(DropProbe { drops: &drops }));
+            let _guard = unsafe {
+                // SAFETY: The initialized slot remains exclusively owned until guard drop.
+                InPlaceInitialization::assume_init(destination)
             };
-            assert!(guard.is_ok());
         }
         assert_eq!(drops.load(Ordering::Acquire), 1);
 
         let mut published_storage = core::mem::MaybeUninit::<DropProbe<'_>>::uninit();
+        let destination =
+            core::ptr::NonNull::from(published_storage.write(DropProbe { drops: &drops }));
         let guard = unsafe {
-            // SAFETY: The second MaybeUninit slot is uniquely retained through publication.
-            InPlaceInitialization::write(
-                published_storage.as_mut_ptr(),
-                DropProbe { drops: &drops },
-            )
-        };
-        assert!(guard.is_ok());
-        let Ok(guard) = guard else {
-            return;
+            // SAFETY: The initialized second slot is uniquely retained through publication.
+            InPlaceInitialization::assume_init(destination)
         };
         let published = published_storage.as_mut_ptr();
         guard.publish();

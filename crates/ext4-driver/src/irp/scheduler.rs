@@ -301,6 +301,44 @@ pub(crate) struct Scheduler {
 }
 
 impl Scheduler {
+    /// Initializes an empty scheduler without materializing its slot registry on the stack.
+    #[expect(
+        unsafe_code,
+        reason = "uninitialized storage is projected and initialized one field and slot at a time"
+    )]
+    pub(crate) fn initialize(storage: &mut core::mem::MaybeUninit<Self>) -> &mut Self {
+        let scheduler = storage.as_mut_ptr();
+        let slots = unsafe {
+            // SAFETY: Raw projection into exclusively borrowed, aligned uninitialized storage.
+            core::ptr::addr_of_mut!((*scheduler).slots)
+        };
+        let slots = unsafe {
+            // SAFETY: MaybeUninit preserves each Slot's layout and accepts uninitialized bytes.
+            &mut *slots.cast::<[core::mem::MaybeUninit<Slot>; MAX_OPERATIONS]>()
+        };
+        for slot in slots {
+            slot.write(Slot::vacant());
+        }
+        let draining = unsafe {
+            // SAFETY: This disjoint scalar field also belongs to the borrowed storage.
+            core::ptr::addr_of_mut!((*scheduler).draining)
+        };
+        unsafe {
+            // SAFETY: The scalar has not yet been initialized; no other observer exists.
+            draining.write(false);
+        }
+        let initialized = unsafe {
+            // SAFETY: Both fields, including every array element, were initialized above.
+            storage.assume_init_mut()
+        };
+        // Exhaustive destructuring makes adding a field require revisiting initialization.
+        let Self {
+            slots: _,
+            draining: _,
+        } = initialized;
+        initialized
+    }
+
     /// Closes model admission while allowing active slots to drain.
     pub(crate) fn begin_drain(&mut self) {
         self.draining = true;
@@ -947,7 +985,17 @@ mod tests {
     /// Panics when the scheduler violates its bounded slot identity contract.
     #[test]
     fn slot_bound_and_generation_reuse_are_exact() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let mut slots = [None; MAX_OPERATIONS];
         for slot in &mut slots {
             *slot = scheduler.reserve();
@@ -967,7 +1015,17 @@ mod tests {
     /// Panics when intent arbitration violates overlap or ticket ordering.
     #[test]
     fn conflicting_intents_are_fifo_while_disjoint_intents_progress() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let first = require_some!(scheduler.reserve());
         let second = require_some!(scheduler.reserve());
         let disjoint = require_some!(scheduler.reserve());
@@ -998,7 +1056,17 @@ mod tests {
     /// releases its grant, or if that grant can be consumed twice.
     #[test]
     fn reentrant_preparation_releases_exactly_one_held_intent() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let preparation = require_some!(scheduler.reserve());
         let paging = require_some!(scheduler.reserve());
         let preparation_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
@@ -1024,7 +1092,17 @@ mod tests {
     /// Panics when commit selection or held-commit accounting is inconsistent.
     #[test]
     fn commit_queue_is_serialized_by_ticket() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let later = require_some!(scheduler.reserve());
         let earlier = require_some!(scheduler.reserve());
         assert!(scheduler.request_commit(later, 20));
@@ -1061,7 +1139,17 @@ mod tests {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn cancellation_covers_wait_retry_registering_and_lower_phases() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         for (phase, expected) in [
             (Phase::Ready, CancelDisposition::ResumeOperation),
             (Phase::HandleTurn, CancelDisposition::ResumeOperation),
@@ -1139,7 +1227,17 @@ mod tests {
     /// wait.
     #[test]
     fn oplock_wait_retains_future_cancellation_after_empty_poll() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let slot = require_some!(scheduler.reserve());
         assert!(!scheduler.cancellation_is_pending(slot.index(), false));
         assert!(scheduler.set_phase(slot, Phase::Oplock));
@@ -1154,7 +1252,17 @@ mod tests {
     /// Panics if one-way closing retains or later recovers top-level cancellation authority.
     #[test]
     fn closing_wait_revokes_cancellation_before_durability_drain() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let slot = require_some!(scheduler.reserve());
         assert_eq!(
             scheduler.install(slot, Admission::Device, false),
@@ -1181,7 +1289,17 @@ mod tests {
     /// Panics when intent/commit waiting cancellation retains authority or enters a lower phase.
     #[test]
     fn precommit_cancellation_releases_scheduler_authority() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
 
         let intent_waiter = require_some!(scheduler.reserve());
         let intent_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
@@ -1226,7 +1344,17 @@ mod tests {
     /// Panics when drain admits new work, repeats cancellation, or cancels a terminal barrier.
     #[test]
     fn drain_rejects_admission_and_selects_interruptible_work() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let slot = require_some!(scheduler.reserve());
         let lower = require_some!(scheduler.reserve());
         assert!(scheduler.set_phase(lower, Phase::Lower));
@@ -1287,7 +1415,17 @@ mod tests {
     /// Panics when operations on one handle escape their ordered lane.
     #[test]
     fn handle_fifo_barrier_and_ordinary_cancel_mask_are_model_owned() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let handle = HandleId::from_address(17);
         let other = HandleId::from_address(23);
         let first = require_some!(scheduler.reserve());
@@ -1359,7 +1497,17 @@ mod tests {
     /// Panics when retry or cancellation authority survives slot reuse.
     #[test]
     fn retry_generation_and_effect_cancellation_are_stale_safe() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let first = require_some!(scheduler.reserve());
         assert!(!scheduler.consume_cancel_before_effect(first.index(), false));
         assert!(scheduler.set_phase(first, Phase::Retry));
@@ -1379,7 +1527,17 @@ mod tests {
     /// Panics when a race leaves stale cancellation or slot ownership behind.
     #[test]
     fn cancel_and_lower_completion_orders_converge_without_stale_reuse() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let cancel_first = require_some!(scheduler.reserve());
         assert!(scheduler.set_phase(cancel_first, Phase::Lower));
         assert_eq!(
@@ -1409,7 +1567,17 @@ mod tests {
     /// Panics when publication authority can be duplicated, mismatched, or retained.
     #[test]
     fn durable_publication_consumes_exact_intent_and_commit_authority() {
-        let mut scheduler = Scheduler::new();
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; moving this pointer-free model gives the fixture
+            // ordinary drop ownership, including any resource sets retained when an assertion fails.
+            storage.assume_init()
+        };
         let mutation = require_some!(scheduler.reserve());
         let mutation_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(

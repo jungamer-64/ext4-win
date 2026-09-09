@@ -1025,40 +1025,245 @@ impl CompletionReactor {
         target: ReactorTarget,
         trace: OperationalTrace,
     ) -> DriverResult<()> {
+        let reactor_storage = NonNull::new(reactor).ok_or(DriverError::InvalidParameter)?;
         let completion_rundown = CompletionRundown::try_new()?;
+        // Complete fallible preparation before moving resource owners into raw fields. Every
+        // remaining field constructor is infallible; native setup below is guarded as one value.
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).csq)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(wdk_sys::IO_CSQ::default());
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).lock)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(0);
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).pending_head)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(LIST_ENTRY::default()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).completion_head)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(LIST_ENTRY::default()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).length_completion_head)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(LIST_ENTRY::default()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).cache_completion_head)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(LIST_ENTRY::default()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).oplock_completion_head)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(LIST_ENTRY::default()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).admitted)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicUsize::new(0));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).wake_event)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(wdk_sys::KEVENT::default());
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).retry_ready)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicU64::new(0));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).delayed_close_ready)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicU8::new(0));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).cancel_ready)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicU64::new(0));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).lifecycle)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicU8::new(ReactorState::Running.as_raw()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).completion_rundown)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(completion_rundown);
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).thread_handle)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicPtr::new(core::ptr::null_mut()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).delayed_close_timer)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(DelayedCloseTimerEnvelope::inert());
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).delayed_close_timer_state)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(DelayedCloseTimerState::Idle));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).device)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(device);
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).trace)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(trace);
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).target)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(target));
+        }
+        let destination = unsafe {
+            // SAFETY: Project the uninitialized array without borrowing the complete reactor.
+            core::ptr::addr_of_mut!((*reactor).payloads)
+        };
+        let slots = unsafe {
+            // SAFETY: UnsafeCell and MaybeUninit preserve layout; every slot is exclusively owned.
+            &mut *destination.cast::<[core::mem::MaybeUninit<ShellSlot>; MAX_OPERATIONS]>()
+        };
+        for slot in slots {
+            slot.write(ShellSlot::vacant());
+        }
+        let destination = unsafe {
+            // SAFETY: Project the uninitialized array without borrowing the complete reactor.
+            core::ptr::addr_of_mut!((*reactor).retry_timers)
+        };
+        let slots = unsafe {
+            // SAFETY: MaybeUninit preserve layout; every slot is exclusively owned.
+            &mut *destination.cast::<[core::mem::MaybeUninit<RetryTimerEnvelope>; MAX_OPERATIONS]>()
+        };
+        for (index, slot) in slots.iter_mut().enumerate() {
+            slot.write(RetryTimerEnvelope::inert(index));
+        }
+        let destination = unsafe {
+            // SAFETY: Project the uninitialized array without borrowing the complete reactor.
+            core::ptr::addr_of_mut!((*reactor).cancel_envelopes)
+        };
+        let slots = unsafe {
+            // SAFETY: MaybeUninit preserve layout; every slot is exclusively owned.
+            &mut *destination
+                .cast::<[core::mem::MaybeUninit<ActiveCancelEnvelope>; MAX_OPERATIONS]>()
+        };
+        for (index, slot) in slots.iter_mut().enumerate() {
+            slot.write(ActiveCancelEnvelope::inert(index));
+        }
+        let scheduler = unsafe {
+            // SAFETY: The scheduler field is still uninitialized and exclusively owned.
+            core::ptr::addr_of_mut!((*reactor).scheduler)
+        };
+        let scheduler = unsafe {
+            // SAFETY: UnsafeCell and MaybeUninit preserve Scheduler layout and alignment.
+            &mut *scheduler.cast::<core::mem::MaybeUninit<Scheduler>>()
+        };
+        Scheduler::initialize(scheduler);
         let mut initialization = unsafe {
-            // SAFETY: The caller owns writable, uninitialized final-address extension storage.
-            InPlaceInitialization::write(
-                reactor,
-                Self {
-                    csq: wdk_sys::IO_CSQ::default(),
-                    lock: 0,
-                    pending_head: UnsafeCell::new(LIST_ENTRY::default()),
-                    completion_head: UnsafeCell::new(LIST_ENTRY::default()),
-                    length_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
-                    cache_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
-                    oplock_completion_head: UnsafeCell::new(LIST_ENTRY::default()),
-                    admitted: AtomicUsize::new(0),
-                    wake_event: wdk_sys::KEVENT::default(),
-                    retry_ready: AtomicU64::new(0),
-                    delayed_close_ready: AtomicU8::new(0),
-                    cancel_ready: AtomicU64::new(0),
-                    lifecycle: AtomicU8::new(ReactorState::Running.as_raw()),
-                    completion_rundown,
-                    thread_handle: AtomicPtr::new(core::ptr::null_mut()),
-                    scheduler: UnsafeCell::new(Scheduler::new()),
-                    payloads: UnsafeCell::new(core::array::from_fn(|_| ShellSlot::vacant())),
-                    retry_timers: core::array::from_fn(RetryTimerEnvelope::inert),
-                    delayed_close_timer: DelayedCloseTimerEnvelope::inert(),
-                    delayed_close_timer_state: UnsafeCell::new(DelayedCloseTimerState::Idle),
-                    cancel_envelopes: core::array::from_fn(ActiveCancelEnvelope::inert),
-                    device,
-                    trace,
-                    target: UnsafeCell::new(target),
-                },
-            )?
+            // SAFETY: Every field and array element now holds a valid value at its final address.
+            InPlaceInitialization::assume_init(reactor_storage)
         };
         let reactor = initialization.get_mut();
+        // Keep this check exhaustive: new fields need an explicit initialization proof above.
+        let Self {
+            csq: _,
+            lock: _,
+            pending_head: _,
+            completion_head: _,
+            length_completion_head: _,
+            cache_completion_head: _,
+            oplock_completion_head: _,
+            admitted: _,
+            wake_event: _,
+            retry_ready: _,
+            delayed_close_ready: _,
+            cancel_ready: _,
+            lifecycle: _,
+            completion_rundown: _,
+            thread_handle: _,
+            delayed_close_timer: _,
+            delayed_close_timer_state: _,
+            device: _,
+            trace: _,
+            target: _,
+            scheduler: _,
+            payloads: _,
+            retry_timers: _,
+            cancel_envelopes: _,
+        } = reactor;
         #[cfg(not(test))]
         let reactor_address = NonNull::from(&mut *reactor);
         unsafe {
