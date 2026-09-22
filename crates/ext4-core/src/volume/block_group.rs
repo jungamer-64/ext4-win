@@ -10,48 +10,6 @@ struct MountedAllocationSnapshot {
 }
 
 impl MountedAllocationSnapshot {
-    /// Reads every descriptor and materializes its semantic allocation bitmap state.
-    /// # Errors
-    ///
-    /// Returns an error when group geometry is invalid or any descriptor or bitmap cannot be read.
-    fn load(reader: &mut OperationDevice<'_>, superblock: &Superblock) -> Result<Self> {
-        let group_count = superblock.block_group_count()?;
-        let mut descriptors = Vec::new();
-        let mut layouts = Vec::new();
-        for group in 0..group_count.as_u32() {
-            let group = BlockGroupId::from_u32(group);
-            let descriptor = BlockGroupDescriptor::read_from(reader, superblock, group)?;
-            layouts.try_push(GroupMetadataLayout::from_descriptor(group, &descriptor))?;
-            descriptors.try_push((group, descriptor))?;
-        }
-        let mut groups = Vec::new();
-        for (group, descriptor) in descriptors {
-            let block_bitmap = match descriptor.block_bitmap_initialization() {
-                AllocationBitmapInitialization::Initialized => {
-                    read_allocation_bitmap(reader, superblock, descriptor.block_bitmap())?
-                }
-                AllocationBitmapInitialization::Uninitialized => {
-                    materialize_uninitialized_block_bitmap(superblock, group, &layouts)?
-                }
-            };
-            let inode_bitmap = match descriptor.inode_bitmap_initialization() {
-                AllocationBitmapInitialization::Initialized => {
-                    read_allocation_bitmap(reader, superblock, descriptor.inode_bitmap())?
-                }
-                AllocationBitmapInitialization::Uninitialized => {
-                    materialize_uninitialized_inode_bitmap(superblock, group)?
-                }
-            };
-            groups.try_push(GroupAllocationSnapshot {
-                group,
-                descriptor,
-                block_bitmap,
-                inode_bitmap,
-            })?;
-        }
-        Ok(Self { groups })
-    }
-
     /// Returns group allocation state by its geometry-derived vector position.
     /// # Errors
     ///
@@ -123,10 +81,6 @@ impl GroupMetadataLayout {
 pub(super) struct ClusterReferenceIndex {
     /// Reference count per allocation cluster with at least one known owner, sorted by cluster.
     refs: Vec<ClusterReference>,
-    /// Physical blocks that must have exclusive ownership, sorted by block address.
-    exclusive_blocks: Vec<BlockAddress>,
-    /// External xattr blocks that may be shared by ext4 xattr refcount, sorted by block address.
-    xattr_blocks: Vec<BlockAddress>,
 }
 
 impl ClusterReferenceIndex {
@@ -137,29 +91,7 @@ impl ClusterReferenceIndex {
     pub(super) fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             refs: memory::copied_slice(&self.refs)?,
-            exclusive_blocks: memory::copied_slice(&self.exclusive_blocks)?,
-            xattr_blocks: memory::copied_slice(&self.xattr_blocks)?,
         })
-    }
-
-    /// Builds the mounted reference index from static metadata and live inodes.
-    /// # Errors
-    ///
-    /// Returns an error when static metadata or live inode block references cannot be validated
-    /// against allocation bitmaps.
-    pub(super) fn load(
-        volume: &mut EpochReadView<'_, '_>,
-        orphans: &super::orphan::ValidatedOrphanInventory,
-    ) -> Result<Self> {
-        let allocation = MountedAllocationSnapshot::load(&mut volume.device, &volume.superblock)?;
-        let mut index = Self {
-            refs: Vec::new(),
-            exclusive_blocks: Vec::new(),
-            xattr_blocks: Vec::new(),
-        };
-        index.add_static_metadata(&volume.superblock, &allocation)?;
-        index.add_live_inodes(volume, &allocation, orphans)?;
-        Ok(index)
     }
 
     /// Returns the known mounted reference count for one cluster.
@@ -182,243 +114,6 @@ impl ClusterReferenceIndex {
             if updated < 0 {
                 return Err(Error::ClusterReferenceConflict);
             }
-        }
-        Ok(())
-    }
-
-    /// Adds one exclusive mounted reference after validating bitmap allocation.
-    /// # Errors
-    ///
-    /// Returns an error when `block` is already known through another owner or is not marked
-    /// allocated in the mounted cluster bitmap.
-    fn add_exclusive_reference(
-        &mut self,
-        superblock: &Superblock,
-        allocation: &MountedAllocationSnapshot,
-        block: BlockAddress,
-    ) -> Result<()> {
-        if self.exclusive_blocks.binary_search(&block).is_ok()
-            || self.xattr_blocks.binary_search(&block).is_ok()
-        {
-            return Err(Error::ClusterReferenceConflict);
-        }
-        let insertion = self
-            .exclusive_blocks
-            .binary_search(&block)
-            .unwrap_or_else(core::convert::identity);
-        self.exclusive_blocks.try_insert(insertion, block)?;
-        self.add_cluster_reference(superblock, allocation, block)
-    }
-
-    /// Adds one external-xattr mounted reference after validating bitmap allocation.
-    /// # Errors
-    ///
-    /// Returns an error when `block` conflicts with an exclusive owner or is not allocated in the
-    /// mounted cluster bitmap.
-    fn add_xattr_reference(
-        &mut self,
-        superblock: &Superblock,
-        allocation: &MountedAllocationSnapshot,
-        block: BlockAddress,
-    ) -> Result<()> {
-        if self.exclusive_blocks.binary_search(&block).is_ok() {
-            return Err(Error::ClusterReferenceConflict);
-        }
-        if let Err(insertion) = self.xattr_blocks.binary_search(&block) {
-            self.xattr_blocks.try_insert(insertion, block)?;
-        }
-        self.add_cluster_reference(superblock, allocation, block)
-    }
-
-    /// Adds one mounted cluster reference after validating bitmap allocation.
-    /// # Errors
-    ///
-    /// Returns an error when `block` cannot be translated to a mounted cluster, the bitmap cannot
-    /// be read, or the cluster is marked free.
-    fn add_cluster_reference(
-        &mut self,
-        superblock: &Superblock,
-        allocation: &MountedAllocationSnapshot,
-        block: BlockAddress,
-    ) -> Result<()> {
-        let cluster = superblock.cluster_of_block(block)?;
-        if allocation.cluster_state(superblock, cluster)? != BitmapBitState::Used {
-            return Err(Error::ClusterReferenceConflict);
-        }
-        self.apply_delta(cluster, 1)?;
-        Ok(())
-    }
-
-    /// Adds all static metadata ranges that must keep their clusters allocated.
-    /// # Errors
-    ///
-    /// Returns an error when descriptor-table, bitmap, or inode-table blocks cannot be enumerated
-    /// or are not exclusively allocated.
-    fn add_static_metadata(
-        &mut self,
-        superblock: &Superblock,
-        allocation: &MountedAllocationSnapshot,
-    ) -> Result<()> {
-        let groups = superblock.block_group_count()?;
-        let descriptor_blocks = descriptor_table_blocks(superblock)?;
-        for group in 0..groups.as_u32() {
-            let group = BlockGroupId::from_u32(group);
-            if group_has_superblock(superblock, group) {
-                let superblock_block = group_start_block(superblock, group)?;
-                self.add_exclusive_reference(superblock, allocation, superblock_block)?;
-                for offset in 0..descriptor_blocks {
-                    self.add_exclusive_reference(
-                        superblock,
-                        allocation,
-                        BlockAddress::new(
-                            superblock_block
-                                .get()
-                                .checked_add(1)
-                                .and_then(|value| value.checked_add(offset))
-                                .ok_or(Error::ArithmeticOverflow)?,
-                        ),
-                    )?;
-                }
-            }
-
-            let descriptor = &allocation.group(group)?.descriptor;
-            self.add_exclusive_reference(superblock, allocation, descriptor.block_bitmap())?;
-            self.add_exclusive_reference(superblock, allocation, descriptor.inode_bitmap())?;
-            let inode_table_blocks = inode_table_blocks(superblock, group)?;
-            for offset in 0..inode_table_blocks {
-                self.add_exclusive_reference(
-                    superblock,
-                    allocation,
-                    BlockAddress::new(
-                        descriptor
-                            .inode_table()
-                            .get()
-                            .checked_add(offset)
-                            .ok_or(Error::ArithmeticOverflow)?,
-                    ),
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Adds data and dynamic metadata references from allocated inode records.
-    /// # Errors
-    ///
-    /// Returns an error when inode bitmaps, raw inode records, external xattr blocks, or extent tree
-    /// blocks cannot be read or validated as allocated.
-    fn add_live_inodes(
-        &mut self,
-        volume: &mut EpochReadView<'_, '_>,
-        allocation: &MountedAllocationSnapshot,
-        orphans: &super::orphan::ValidatedOrphanInventory,
-    ) -> Result<()> {
-        for group in &allocation.groups {
-            let inode_count = inode_count_in_group(&volume.superblock, group.group)?;
-            for bit in 0..inode_count {
-                let position = InodeBitmapPosition::new(group.group, bit);
-                if inode_bitmap_bit_state(&group.inode_bitmap, position)? != BitmapBitState::Used {
-                    continue;
-                }
-                let inode_id = position.inode_id(&volume.superblock)?;
-                let raw_inode = read_group_inode_record(volume, group, position)?;
-                if raw_inode.mode()? == 0 {
-                    continue;
-                }
-                if volume.superblock.is_resize_inode(inode_id) {
-                    self.add_resize_inode_references(
-                        volume,
-                        allocation,
-                        raw_inode.resize_inode_block_map()?,
-                    )?;
-                    continue;
-                }
-                if let Some(block) = raw_inode.xattr_block()? {
-                    self.add_xattr_reference(&volume.superblock, allocation, block)?;
-                }
-                if !orphans.contains(inode_id) && raw_inode.parse().is_err() {
-                    if raw_inode.has_extent_tree()? {
-                        return Err(Error::UnsupportedBlockMap);
-                    }
-                    continue;
-                }
-                let data = crate::disk_format::inode::InodeData::parse(
-                    raw_inode.id,
-                    &raw_inode.bytes,
-                    raw_inode.encoding,
-                )?;
-                let root = match data.storage() {
-                    InodeStorage::Extents(root) => root,
-                    InodeStorage::InlineBytes(_) => continue,
-                    InodeStorage::UnsupportedBlockMap => return Err(Error::UnsupportedBlockMap),
-                };
-                let superblock = volume.superblock;
-                crate::disk_format::extent::visit_allocations(
-                    root,
-                    superblock.block_size(),
-                    &mut volume.device,
-                    super::orphan::extent_context(superblock, &data),
-                    |item| match item {
-                        crate::disk_format::extent::ExtentAllocation::Data(extent) => {
-                            self.add_extent_references(&superblock, allocation, extent)
-                        }
-                        crate::disk_format::extent::ExtentAllocation::Metadata(block) => {
-                            self.add_exclusive_reference(&superblock, allocation, block)
-                        }
-                    },
-                )?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Adds the fixed double-indirect metadata ownership of ext4's reserved resize inode.
-    /// # Errors
-    ///
-    /// Returns an error when pointer blocks cannot be read, contain invalid block addresses, or
-    /// reference blocks that are not allocated exclusively.
-    fn add_resize_inode_references(
-        &mut self,
-        volume: &mut EpochReadView<'_, '_>,
-        allocation: &MountedAllocationSnapshot,
-        block_map: ResizeInodeBlockMap,
-    ) -> Result<()> {
-        let double_indirect = block_map.double_indirect();
-        self.add_exclusive_reference(&volume.superblock, allocation, double_indirect)?;
-        let indirect_blocks = read_resize_pointer_block(volume, double_indirect)?;
-        for indirect in indirect_blocks {
-            self.add_exclusive_reference(&volume.superblock, allocation, indirect)?;
-            let reserved_blocks = read_resize_pointer_block(volume, indirect)?;
-            for reserved in reserved_blocks {
-                self.add_exclusive_reference(&volume.superblock, allocation, reserved)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Adds references for every physical block represented by an extent.
-    /// # Errors
-    ///
-    /// Returns an error when the extent block range overflows or any represented block is not an
-    /// exclusively allocated cluster.
-    fn add_extent_references(
-        &mut self,
-        superblock: &Superblock,
-        allocation: &MountedAllocationSnapshot,
-        extent: Extent,
-    ) -> Result<()> {
-        for offset in 0..extent.len().as_u64() {
-            self.add_exclusive_reference(
-                superblock,
-                allocation,
-                BlockAddress::new(
-                    extent
-                        .physical_start()
-                        .get()
-                        .checked_add(offset)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                ),
-            )?;
         }
         Ok(())
     }
@@ -766,8 +461,6 @@ mod tests {
     fn cluster_reference_index_preserves_sorted_lookup_after_out_of_order_inserts() {
         let mut index = ClusterReferenceIndex {
             refs: Vec::new(),
-            exclusive_blocks: Vec::new(),
-            xattr_blocks: Vec::new(),
         };
         assert_eq!(index.apply_delta(ClusterAddress::new(9), 1), Ok(1));
         assert_eq!(index.apply_delta(ClusterAddress::new(2), 1), Ok(1));
