@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
 
 mod tail;
-pub(crate) use tail::{ExtentAllocation, ExtentTail, visit_allocations};
+pub(crate) use tail::{ExtentAllocation, ExtentAllocationCursor, ExtentTail, visit_allocations};
 
 /// Magic value stored at the start of every ext4 extent header.
 const EXTENT_MAGIC: u16 = 0xF30A;
