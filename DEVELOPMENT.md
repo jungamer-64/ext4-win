@@ -90,7 +90,7 @@ IR, MAP, SYS, CAT, and INF hashes to the exact source snapshot, target, profile,
 rustflags, and rustc, LLVM, Cargo, `cargo-wdk`, and WDK versions. The production
 command neither reuses portable artifacts nor accepts stale release output.
 
-`verify-hosted-driver-load` is the higher CI umbrella. It performs the hosted
+`verify-hosted-driver-load` is the kernel-load-only umbrella. It performs the hosted
 preflight, invokes `verify-production-driver`'s bundle construction exactly
 once, shuts down the production gate's WSL oracle so its ext4 virtual disk is
 not an incidental mount target, and passes the resulting verified bundle value
@@ -102,10 +102,14 @@ the intended boundary without a live kernel-load claim.
 
 CI runs `verify-portable` on Windows, Ubuntu, and macOS, replays every tracked fuzz corpus on
 pull requests, runs time-bounded fuzz campaigns on schedule, and runs ext4 interoperability on
-Ubuntu. The blocking driver job runs on the `windows-2025-vs2026` GitHub-hosted
+Ubuntu. The blocking live read-write job runs on the `windows-2025-vs2026` GitHub-hosted
 image. It imports the single cargo-wdk certificate identity into LocalMachine
 Root and Trusted Publishers, confirms both thumbprints, and then runs
-`verify-hosted-driver-load`.
+`verify-live-vhdx`. Pull requests, pushes to `main`, and manual dispatches run
+the same gate. The job enables the immediately applicable Driver Verifier DIF
+checks before loading the driver; it does not rely on next-boot settings or
+reboot the runner. The workflow owns the selected rule classes and stops those
+checks after session cleanup.
 
 A green production bundle proves signed artifact identity and release
 reachability. The hosted load gate additionally proves that structured PnPUtil
@@ -132,11 +136,25 @@ The hosted gate does not claim a byte hash of kernel memory, VHDX or filesystem
 I/O behavior, or Driver Verifier coverage. Those are distinct live-validation
 boundaries and a hosted smoke result does not substitute for them.
 
+The live CI result additionally requires byte-for-byte readback through Windows,
+rename and hard-link enumeration, flush/dismount, and persisted readback after
+VHDX reattachment with the same loaded driver. Runtime `verifier /query` reports
+must identify active flags and a currently loaded `ext4win.sys` before and after
+the filesystem scenario. The report parser accepts the English Windows runtime
+format and fails closed on unknown formats. Registry settings alone cannot pass.
+The job retains the transcript, live-session phase manifests, runtime Verifier
+report, driver-load identity evidence, and signed production bundle, including
+available evidence after failure. It attempts identity-checked session recovery
+even after a failed test step; cleanup success does not turn failed I/O into a
+passing result. A VM crash or job-level timeout can prevent cleanup and artifact
+upload; the hosted VM is discarded, and that run is not acceptance evidence.
+
 `verify-live-vhdx` composes the common driver-load preflight with its additional
 Hyper-V, WSL/e2fsprogs, and Driver Verifier requirements. It does not accept a disk path or disk number. It creates one
 fixed-size VHDX below `target/live-vhdx-sessions/<session-id>/`, bounds WSL
 device discovery to the device introduced by that VHDX, and unmounts the device
-from WSL before Windows-driver access. Driver installation, start, stop, package
+from WSL before Windows-driver access. It also shuts down WSL so the oracle's
+own ext4 disk cannot become an incidental discovery target. Driver installation, start, stop, package
 selection, hash verification, and cleanup are delegated to the same durable
 driver-load session used by the hosted gate.
 

@@ -1,6 +1,7 @@
 name: verify
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [main]
@@ -33,6 +34,11 @@ jobs:
 
       - name: Verify portable workspace
         run: cargo xtask verify-portable
+
+      - name: Verify live harness contracts
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: ./tools/xtask/live-vhdx.tests.ps1
 
 
   ext4-interop:
@@ -80,7 +86,7 @@ jobs:
 
 
   production-driver:
-    name: hosted kernel-load smoke (WDK 28000)
+    name: live ext4 read-write (WDK 28000)
     runs-on: windows-2025-vs2026
     timeout-minutes: 180
 
@@ -743,27 +749,84 @@ jobs:
             Write-Host "Trusted LocalMachine\$store thumbprint: $($trusted.Thumbprint)"
           }
 
-      - name: Check hosted driver environment
+      - name: Enable live Driver Verifier checks
+        id: verifier
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module Hyper-V -ErrorAction Stop
+          # DIF activates these checks now; /standard alone requires a reboot.
+          # The hosted VM is disposable and verifies only this job's driver.
+          verifier.exe /dif 1 2 4 5 9 12 18 /now /driver ext4win.sys
+          if ($LASTEXITCODE -ne 0) {
+            throw "Immediate Driver Verifier activation failed: $LASTEXITCODE"
+          }
+
+      - name: Check live driver environment
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          cargo xtask check-hosted-driver-host
+          cargo xtask check-live-driver-host
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Hosted driver preflight failed with exit code $LASTEXITCODE"
+            throw "Live driver preflight failed with exit code $LASTEXITCODE"
           }
 
-      - name: Verify hosted driver load
+      - name: Verify loaded driver ext4 read-write and remount
+        timeout-minutes: 150
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          cargo xtask verify-hosted-driver-load
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Hosted driver-load verification failed with exit code $LASTEXITCODE"
+          New-Item -ItemType Directory -Path target -Force | Out-Null
+          Start-Transcript -Path target/live-vhdx-ci.log
+          try {
+            cargo xtask verify-live-vhdx
+            if ($LASTEXITCODE -ne 0) {
+              throw "Live ext4 read-write verification failed with exit code $LASTEXITCODE"
+            }
           }
+          finally {
+            Stop-Transcript
+          }
+
+      - name: Reconcile interrupted live sessions
+        if: always()
+        timeout-minutes: 10
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sessionRoot = "target/live-vhdx-sessions"
+          if (Test-Path -LiteralPath $sessionRoot) {
+            foreach ($session in Get-ChildItem -LiteralPath $sessionRoot -Directory) {
+              # The session owner validates every persisted identity before cleanup.
+              & ./tools/xtask/live-vhdx.ps1 -Mode Cleanup `
+                -RepositoryRoot $env:GITHUB_WORKSPACE -SessionId $session.Name
+            }
+          }
+
+      - name: Stop job-owned Driver Verifier checks
+        if: always() && steps.verifier.outcome == 'success'
+        shell: powershell
+        run: |
+          verifier.exe /stop
+          if ($LASTEXITCODE -ne 0) {
+            throw "Driver Verifier stop failed: $LASTEXITCODE"
+          }
+
+      - name: Upload live filesystem evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ext4-win-live-vhdx-evidence
+          path: |
+            target/live-vhdx-ci.log
+            target/live-vhdx-sessions/**/*.manifest
+            target/live-vhdx-sessions/**/verifier-runtime.txt
+            target/driver-load-sessions/**
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: List verified production bundle
         shell: pwsh
@@ -785,6 +848,7 @@ jobs:
             Select-Object FullName, Length
 
       - name: Upload verified production bundle
+        if: always()
         uses: actions/upload-artifact@v7
         with:
           name: ext4-win-verified-production-wdk-${{ env.EXT4WIN_WDK_VERSION }}
