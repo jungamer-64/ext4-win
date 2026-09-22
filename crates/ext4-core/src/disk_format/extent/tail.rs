@@ -107,9 +107,195 @@ fn load_child(
     Ok(node)
 }
 
+#[cfg(test)]
+mod cursor_tests {
+    use super::*;
+    use crate::disk::block::DeviceLength;
+    use crate::disk::storage::{
+        CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
+        StorageTranscript,
+    };
+
+    /// Wire fixture with two independently supplied leaf blocks.
+    /// # Errors
+    /// Returns a field-encoding or root-validation error.
+    fn two_leaf_cursor() -> Result<ExtentAllocationCursor> {
+        let mut root = [0_u8; 60];
+        for (offset, value) in [(0, 0xf30a), (2, 2), (4, 4), (6, 1)] {
+            put_le_u16(&mut root, disk_offset(offset), value)?;
+        }
+        for (offset, value) in [(12, 0), (16, 10), (24, 8), (28, 11)] {
+            put_le_u32(&mut root, disk_offset(offset), value)?;
+        }
+        ExtentAllocationCursor::new(
+            &InodeExtentRoot::from_bytes(root),
+            BlockSize::from_superblock_log(0)?,
+            ExtentTreeContext::none(),
+        )
+    }
+
+    /// Completes the exact requested block with one hand-encoded leaf extent.
+    /// # Errors
+    /// Returns request-shape, wire-encoding, or completion errors.
+    fn complete_leaf(transcript: &mut StorageTranscript, logical: u32) -> Result<()> {
+        let mut request = transcript.take_pending_request()?;
+        let StorageRequest::Read { buffer, .. } = &mut request else {
+            return Err(Error::DeviceIo);
+        };
+        for (offset, value) in [(0, 0xf30a), (2, 1), (4, 84), (6, 0), (16, 4)] {
+            put_le_u16(buffer, disk_offset(offset), value)?;
+        }
+        put_le_u32(buffer, disk_offset(12), logical)?;
+        put_le_u32(buffer, disk_offset(20), 100)?;
+        let count = request.byte_count();
+        transcript.complete(StorageCompletion::success(
+            CompletedStorageTransfer::from_request(request),
+            count,
+        ))
+    }
+
+    /// # Errors
+    /// Returns fixture construction or traversal errors.
+    /// # Panics
+    /// Fails if suspension loses a child, repeats an item, or loses cross-leaf ordering.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "test assertions report contract failures while fixture setup propagates errors"
+    )]
+    fn allocation_walk_resumes_each_child_once_and_checks_cross_leaf_order() -> Result<()> {
+        for second_logical in [8, 2] {
+            let mut cursor = two_leaf_cursor()?;
+            let mut transcript = StorageTranscript::new(
+                StorageTarget::Filesystem,
+                DeviceLength::from_bytes(32 * 1024),
+            );
+            assert!(matches!(
+                cursor.next(&mut OperationDevice::new(&mut transcript)),
+                Err(Error::OperationSuspended)
+            ));
+            complete_leaf(&mut transcript, 0)?;
+            assert!(
+                matches!(cursor.next(&mut OperationDevice::new(&mut transcript))?, Some(ExtentAllocation::Metadata(block)) if block == BlockAddress::new(10))
+            );
+            assert!(
+                matches!(cursor.next(&mut OperationDevice::new(&mut transcript))?, Some(ExtentAllocation::Data(extent)) if extent.logical_start().as_u32() == 0)
+            );
+            // Decoded path nodes, not a retained read cache, own traversal progress.
+            transcript = StorageTranscript::new(StorageTarget::Filesystem, transcript.len());
+            assert!(matches!(
+                cursor.next(&mut OperationDevice::new(&mut transcript)),
+                Err(Error::OperationSuspended)
+            ));
+            complete_leaf(&mut transcript, second_logical)?;
+            assert!(
+                matches!(cursor.next(&mut OperationDevice::new(&mut transcript))?, Some(ExtentAllocation::Metadata(block)) if block == BlockAddress::new(11))
+            );
+            let result = cursor.next(&mut OperationDevice::new(&mut transcript));
+            if second_logical == 8 {
+                assert!(
+                    matches!(result?, Some(ExtentAllocation::Data(extent)) if extent.logical_start().as_u32() == 8)
+                );
+                assert!(
+                    cursor
+                        .next(&mut OperationDevice::new(&mut transcript))?
+                        .is_none()
+                );
+            } else {
+                assert!(matches!(result, Err(Error::InvalidExtentTree)));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resumable depth-first allocation walk over one immutable inode tree.
+/// A suspended read leaves the parent entry unconsumed; successful items are yielded once.
+#[derive(Debug)]
+pub(crate) struct ExtentAllocationCursor {
+    /// Validated root-to-current-node path, bounded by the format's maximum depth.
+    path: Vec<PathNode>,
+    /// End of the preceding data extent, including across leaf boundaries.
+    previous_end: u64,
+    /// Geometry and checksum identity cannot change while the walk is suspended.
+    block_size: BlockSize,
+    /// Checksum identity of this inode's external nodes.
+    context: ExtentTreeContext,
+}
+
+impl ExtentAllocationCursor {
+    /// Retains the validated inode root before any external-node I/O.
+    /// # Errors
+    /// Returns malformed-root or allocation errors.
+    pub(crate) fn new(
+        root: &InodeExtentRoot,
+        block_size: BlockSize,
+        context: ExtentTreeContext,
+    ) -> Result<Self> {
+        let root = PathNode {
+            block: None,
+            bytes: memory::copied_slice(root.bytes())?,
+            next: 0,
+        };
+        root.validate(None)?;
+        let mut path = Vec::new();
+        path.try_push(root)?;
+        Ok(Self {
+            path,
+            previous_end: 0,
+            block_size,
+            context,
+        })
+    }
+
+    /// Consumes one allocation item, retaining progress across a suspended child read.
+    /// Only `OperationSuspended` permits retry; any other error terminates the walk.
+    /// # Errors
+    /// Returns invalid ordering, child geometry/checksum, allocation, or read errors.
+    pub(crate) fn next(
+        &mut self,
+        reader: &mut impl ExtentNodeReader,
+    ) -> Result<Option<ExtentAllocation>> {
+        loop {
+            let Some(node) = self.path.last() else {
+                return Ok(None);
+            };
+            if node.next == header_entries(&node.bytes)? {
+                self.path.pop();
+                continue;
+            }
+            let next = node.next.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            let depth = le_u16(&node.bytes, disk_offset(6))?;
+            if depth == 0 {
+                let extent = parse_extent(&node.bytes, entry_offset(node.next)?)?;
+                if extent.logical_start().as_u64() < self.previous_end
+                    || extent.end_logical() > u64::from(u32::MAX).saturating_add(1)
+                {
+                    return Err(Error::InvalidExtentTree);
+                }
+                self.previous_end = extent.end_logical();
+                self.path.last_mut().ok_or(Error::InvalidExtentTree)?.next = next;
+                return Ok(Some(ExtentAllocation::Data(extent)));
+            }
+            let block = node.child(node.next)?;
+            let child = load_child(
+                &self.path,
+                block,
+                depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?,
+                self.block_size,
+                reader,
+                self.context,
+            )?;
+            self.path.last_mut().ok_or(Error::InvalidExtentTree)?.next = next;
+            self.path.try_push(child)?;
+            return Ok(Some(ExtentAllocation::Metadata(block)));
+        }
+    }
+}
+
 /// Visits all allocation without retaining the complete extent tree.
 /// # Errors
-/// Returns an error for malformed or overlapping extents, failed reads/checksums, or visitor failure.
+/// Returns malformed-tree, read/checksum, allocation, or visitor errors.
 pub(crate) fn visit_allocations(
     root: &InodeExtentRoot,
     block_size: BlockSize,
@@ -117,45 +303,9 @@ pub(crate) fn visit_allocations(
     context: ExtentTreeContext,
     mut visit: impl FnMut(ExtentAllocation) -> Result<()>,
 ) -> Result<()> {
-    let root = PathNode {
-        block: None,
-        bytes: memory::copied_slice(root.bytes())?,
-        next: 0,
-    };
-    root.validate(None)?;
-    let mut path = Vec::new();
-    path.try_push(root)?;
-    let mut previous_end = 0;
-    while let Some(node) = path.last_mut() {
-        if node.next == header_entries(&node.bytes)? {
-            path.pop();
-            continue;
-        }
-        let index = node.next;
-        node.next = node.next.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-        let depth = le_u16(&node.bytes, disk_offset(6))?;
-        if depth == 0 {
-            let extent = parse_extent(&node.bytes, entry_offset(index)?)?;
-            if extent.logical_start().as_u64() < previous_end
-                || extent.end_logical() > u64::from(u32::MAX).saturating_add(1)
-            {
-                return Err(Error::InvalidExtentTree);
-            }
-            previous_end = extent.end_logical();
-            visit(ExtentAllocation::Data(extent))?;
-        } else {
-            let block = node.child(index)?;
-            let child = load_child(
-                &path,
-                block,
-                depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?,
-                block_size,
-                reader,
-                context,
-            )?;
-            visit(ExtentAllocation::Metadata(block))?;
-            path.try_push(child)?;
-        }
+    let mut cursor = ExtentAllocationCursor::new(root, block_size, context)?;
+    while let Some(item) = cursor.next(reader)? {
+        visit(item)?;
     }
     Ok(())
 }

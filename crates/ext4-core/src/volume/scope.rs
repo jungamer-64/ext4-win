@@ -65,7 +65,7 @@ pub(super) use super::directory::{
 };
 pub(super) use super::inode_record::{
     AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord,
-    RecoverableOrphanInode, ResizeInodeBlockMap, StagedInodeIndex, StagedInodeRecord,
+    RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
 pub(super) use super::mount::{
     CommittedEpoch, EpochReadView, JournalCoordinatorState, MountedProfile,

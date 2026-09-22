@@ -2,54 +2,8 @@
 
 use super::scope::*;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Allocation bitmaps captured once after journal recovery for mount validation.
-struct MountedAllocationSnapshot {
-    /// Per-group descriptors and allocation bitmap images, ordered by group id.
-    groups: Vec<GroupAllocationSnapshot>,
-}
-
-impl MountedAllocationSnapshot {
-    /// Returns group allocation state by its geometry-derived vector position.
-    /// # Errors
-    ///
-    /// Returns an error when `group` is outside the captured filesystem geometry.
-    fn group(&self, group: BlockGroupId) -> Result<&GroupAllocationSnapshot> {
-        let index = usize::try_from(group.as_u32()).map_err(|_| Error::ArithmeticOverflow)?;
-        let snapshot = self.groups.get(index).ok_or(Error::InvalidSuperblock)?;
-        if snapshot.group == group {
-            Ok(snapshot)
-        } else {
-            Err(Error::InvalidSuperblock)
-        }
-    }
-
-    /// Returns whether an allocation cluster was marked used in the recovered image.
-    /// # Errors
-    ///
-    /// Returns an error when `cluster` cannot be mapped into the captured group bitmaps.
-    fn cluster_state(
-        &self,
-        superblock: &Superblock,
-        cluster: ClusterAddress,
-    ) -> Result<BitmapBitState> {
-        let position = ClusterBitmapPosition::from_cluster(superblock, cluster)?;
-        cluster_bitmap_bit_state(&self.group(position.group())?.block_bitmap, position)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// One block group's validated descriptor and allocation bitmap images.
-struct GroupAllocationSnapshot {
-    /// Group represented by this snapshot.
-    group: BlockGroupId,
-    /// Descriptor selecting the bitmap and inode-table locations.
-    descriptor: BlockGroupDescriptor,
-    /// Allocation-cluster bitmap block.
-    block_bitmap: Vec<u8>,
-    /// Inode allocation bitmap block.
-    inode_bitmap: Vec<u8>,
-}
+mod index;
+pub(super) use index::AllocationIndexBuild;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Static metadata locations selected by one block-group descriptor.
@@ -210,38 +164,26 @@ pub(super) fn materialize_uninitialized_block_bitmap(
             .checked_add(descriptor_table_blocks(superblock)?)
             .and_then(|count| count.checked_add(superblock.reserved_gdt_blocks().as_u64()))
             .ok_or(Error::ArithmeticOverflow)?;
-        for offset in 0..metadata_blocks {
-            mark_metadata_block(
-                &mut bytes,
-                superblock,
-                group,
-                BlockAddress::new(
-                    superblock_block
-                        .get()
-                        .checked_add(offset)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                ),
-            )?;
-        }
+        mark_metadata_range(
+            &mut bytes,
+            superblock,
+            group,
+            superblock_block,
+            metadata_blocks,
+        )?;
     }
 
     for layout in layouts {
-        mark_metadata_block(&mut bytes, superblock, group, layout.block_bitmap)?;
-        mark_metadata_block(&mut bytes, superblock, group, layout.inode_bitmap)?;
-        for offset in 0..inode_table_blocks(superblock, layout.group)? {
-            mark_metadata_block(
-                &mut bytes,
-                superblock,
-                group,
-                BlockAddress::new(
-                    layout
-                        .inode_table
-                        .get()
-                        .checked_add(offset)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                ),
-            )?;
+        for block in [layout.block_bitmap, layout.inode_bitmap] {
+            mark_metadata_range(&mut bytes, superblock, group, block, 1)?;
         }
+        mark_metadata_range(
+            &mut bytes,
+            superblock,
+            group,
+            layout.inode_table,
+            inode_table_blocks(superblock, layout.group)?,
+        )?;
     }
     Ok(bytes)
 }
@@ -274,22 +216,43 @@ pub(super) fn materialize_uninitialized_inode_bitmap(
     Ok(bytes)
 }
 
-/// Marks one metadata block in the bitmap when its allocation cluster belongs to `bitmap_group`.
+/// Marks only the intersection of a physical metadata range and one allocation bitmap.
+/// Other groups' inode tables are rejected by range arithmetic, without visiting their blocks.
 /// # Errors
-///
-/// Returns an error when the metadata block or its bitmap position is outside mounted geometry.
-fn mark_metadata_block(
+/// Returns an error for out-of-volume metadata, arithmetic, or invalid bitmap geometry.
+fn mark_metadata_range(
     bytes: &mut [u8],
     superblock: &Superblock,
     bitmap_group: BlockGroupId,
-    block: BlockAddress,
+    first: BlockAddress,
+    blocks: u64,
 ) -> Result<()> {
-    let cluster = superblock.cluster_of_block(block)?;
-    if superblock.cluster_group_of(cluster)? != bitmap_group {
-        return Ok(());
+    let last = first
+        .get()
+        .checked_add(blocks.checked_sub(1).ok_or(Error::InvalidSuperblock)?)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let start = superblock.cluster_of_block(first)?.get();
+    let end = superblock
+        .cluster_of_block(BlockAddress::new(last))?
+        .get()
+        .checked_add(1)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let group_start = u64::from(bitmap_group.as_u32())
+        .checked_mul(u64::from(superblock.clusters_per_group().as_u32()))
+        .ok_or(Error::ArithmeticOverflow)?;
+    let group_end = group_start
+        .checked_add(u64::from(superblock.clusters_in_group(bitmap_group)?))
+        .ok_or(Error::ArithmeticOverflow)?;
+    for cluster in core::cmp::max(start, group_start)..core::cmp::min(end, group_end) {
+        let bit = u32::try_from(
+            cluster
+                .checked_sub(group_start)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .map_err(|_| Error::ArithmeticOverflow)?;
+        set_bitmap_bit(bytes, bit, BitmapBitState::Used)?;
     }
-    let position = ClusterBitmapPosition::from_cluster(superblock, cluster)?;
-    set_cluster_bitmap_bit(bytes, position, BitmapBitState::Used)
+    Ok(())
 }
 
 /// Marks bitmap bits outside the populated tail of a partial group as unavailable.
@@ -329,63 +292,6 @@ pub(super) fn read_allocation_bitmap(
     let mut bytes = empty_allocation_bitmap(superblock)?;
     reader.read_exact_at(superblock.block_size().offset_of(block)?, &mut bytes)?;
     Ok(bytes)
-}
-
-/// Reads one allocated inode record using its already loaded group descriptor.
-/// # Errors
-///
-/// Returns an error when the group-local inode position is inconsistent, offset arithmetic
-/// overflows, allocation fails, or the record cannot be read.
-fn read_group_inode_record(
-    volume: &mut EpochReadView<'_, '_>,
-    group: &GroupAllocationSnapshot,
-    position: InodeBitmapPosition,
-) -> Result<RawInodeRecord> {
-    if position.group() != group.group {
-        return Err(Error::InvalidInode);
-    }
-    let inode_id = position.inode_id(&volume.superblock)?;
-    let inode_size = u64::from(volume.superblock.inode_size().as_u16());
-    let offset = volume
-        .superblock
-        .block_size()
-        .offset_of(group.descriptor.inode_table())?
-        .get()
-        .checked_add(
-            u64::from(position.bit())
-                .checked_mul(inode_size)
-                .ok_or(Error::ArithmeticOverflow)?,
-        )
-        .ok_or(Error::ArithmeticOverflow)?;
-    let offset = ByteOffset::new(offset);
-    let mut bytes =
-        memory::repeated_vec(0_u8, usize::from(volume.superblock.inode_size().as_u16()))?;
-    volume.device.read_exact_at(offset, &mut bytes)?;
-    Ok(RawInodeRecord {
-        id: inode_id,
-        offset,
-        bytes,
-        encoding: volume.superblock.inode_data_encoding(),
-    })
-}
-
-/// Reads the nonzero block addresses stored in one resize-inode pointer block.
-/// # Errors
-///
-/// Returns an error when the block cannot be read or its length is not a whole number of pointers.
-fn read_resize_pointer_block(
-    volume: &mut EpochReadView<'_, '_>,
-    block: BlockAddress,
-) -> Result<Vec<BlockAddress>> {
-    let block_size = volume.superblock.block_size();
-    let mut bytes = memory::repeated_vec(
-        0_u8,
-        usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-    )?;
-    volume
-        .device
-        .read_exact_at(block_size.offset_of(block)?, bytes.as_mut_slice())?;
-    parse_resize_pointer_block(bytes.as_slice())
 }
 
 /// Converts a resize-inode pointer block into its nonzero physical block addresses.
@@ -459,9 +365,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn cluster_reference_index_preserves_sorted_lookup_after_out_of_order_inserts() {
-        let mut index = ClusterReferenceIndex {
-            refs: Vec::new(),
-        };
+        let mut index = ClusterReferenceIndex { refs: Vec::new() };
         assert_eq!(index.apply_delta(ClusterAddress::new(9), 1), Ok(1));
         assert_eq!(index.apply_delta(ClusterAddress::new(2), 1), Ok(1));
         assert_eq!(index.apply_delta(ClusterAddress::new(5), 1), Ok(1));

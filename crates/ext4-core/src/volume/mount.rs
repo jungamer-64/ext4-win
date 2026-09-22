@@ -3,6 +3,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use super::block_group::AllocationIndexBuild;
 use super::orphan::{OrphanRecoveryQueue, ValidatedOrphanInventory};
 use super::scope::*;
 use super::transaction::{
@@ -1202,13 +1203,15 @@ struct MountPublicationSeed {
     journal_target: StorageTarget,
 }
 
-/// Allocation-indexed mount values awaiting durable write-session marking.
+/// Validated orphan membership and resumable allocation ownership awaiting indexing.
 #[derive(Debug)]
 struct ValidatedMountSeed {
     /// Replayed primary and clean journal.
     publication: MountPublicationSeed,
     /// Immutable membership, consumed only after allocation indexing completes.
     orphans: ValidatedOrphanInventory,
+    /// Resumable mount-private ownership validation, retained across lower completions.
+    index: Box<AllocationIndexBuild>,
 }
 
 /// Allocation-indexed mount values awaiting durable write-session marking.
@@ -1654,9 +1657,14 @@ impl MountOperation {
                             {
                                 return MountTransition::Complete(Err(error));
                             }
+                            let index = match memory::try_box(AllocationIndexBuild::new()) {
+                                Ok(index) => index,
+                                Err(error) => return MountTransition::Complete(Err(error)),
+                            };
                             self.state = MountState::Indexing(ValidatedMountSeed {
                                 publication,
                                 orphans,
+                                index,
                             });
                         }
                         Err(Error::OperationSuspended) => {
@@ -1666,16 +1674,12 @@ impl MountOperation {
                         Err(error) => return MountTransition::Complete(Err(error)),
                     }
                 }
-                MountState::Indexing(validated) => {
-                    let clusters = {
-                        let device = OperationDevice::new(&mut self.filesystem);
-                        let Some(keys) = self.fscrypt_keys.as_ref() else {
-                            return MountTransition::Complete(Err(Error::DeviceIo));
-                        };
-                        let mut volume =
-                            EpochReadView::mounting(device, validated.publication.superblock, keys);
-                        ClusterReferenceIndex::load(&mut volume, &validated.orphans)
-                    };
+                MountState::Indexing(mut validated) => {
+                    let clusters = validated.index.advance(
+                        &mut self.filesystem,
+                        &validated.publication.superblock,
+                        &validated.orphans,
+                    );
                     match clusters {
                         Ok(clusters) => {
                             self.state = MountState::PreparingMarker(IndexedMountSeed {
