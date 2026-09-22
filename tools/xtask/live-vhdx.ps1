@@ -49,6 +49,11 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments, [string]$Descrip
 }
 
 function Invoke-Wsl([string[]]$Arguments, [string]$Description) {
+    # --exec does not use a login shell; formatting requires root and /usr/sbin.
+    if ($Arguments[0] -eq '--exec') {
+        $Arguments = @('--user', 'root', '--exec', '/usr/bin/env',
+            'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin') + $Arguments[1..($Arguments.Length - 1)]
+    }
     $output = @(& wsl.exe @Arguments)
     if ($LASTEXITCODE -ne 0) {
         throw "$Description failed with exit code $LASTEXITCODE"
@@ -81,14 +86,39 @@ function Invoke-DriverLoadSession([string]$RequestedMode, [string]$RequestedSess
     Invoke-Checked 'powershell.exe' $arguments "delegated driver-load $RequestedMode session"
 }
 
-function Assert-VerifierConfiguration {
-    $settingsPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
-    $settings = Get-ItemProperty -LiteralPath $settingsPath -ErrorAction Stop
-    $level = [uint32]$settings.VerifyDriverLevel
-    $drivers = @(([string]$settings.VerifyDrivers) -split '[,;\s]+' | Where-Object { $_ })
-    if ($level -eq 0 -or -not ($drivers -contains 'ext4win.sys')) {
-        throw 'Driver Verifier must have nonzero flags and explicitly include ext4win.sys'
+function Read-VerifierActivity([string]$Report) {
+    # /query describes this boot, including /dif /now. Registry values and
+    # /querysettings can describe only the next boot and are not live evidence.
+    # Unknown/localized formats fail closed instead of accepting a driver-name substring.
+    $flags = [regex]::Matches($Report, '(?im)^\s*(?:Verifier Flags:|Verify Flags Level)\s*(0x[0-9a-f]+)\s*$')
+    $drivers = [regex]::Matches($Report, '(?im)^\s*MODULE:\s+ext4win\.sys\s+\(load:\s*(\d+)\s*/\s*unload:\s*(\d+)\)\s*$')
+    if ($flags.Count -ne 1 -or $drivers.Count -ne 1) {
+        throw 'Driver Verifier runtime report must identify flags and exactly one ext4win.sys module'
     }
+    $level = [Convert]::ToUInt32($flags[0].Groups[1].Value.Substring(2), 16)
+    if ($level -eq 0) {
+        throw 'Driver Verifier has no active flags'
+    }
+    return [PSCustomObject]@{
+        Flags = $level
+        Loads = [uint64]$drivers[0].Groups[1].Value
+        Unloads = [uint64]$drivers[0].Groups[2].Value
+    }
+}
+
+function Assert-VerifierConfiguration {
+    $report = Invoke-Checked 'verifier.exe' @('/query') 'Driver Verifier runtime query' | Out-String
+    Read-VerifierActivity $report | Out-Null
+}
+
+function Assert-LoadedDriverVerifier {
+    $report = Invoke-Checked 'verifier.exe' @('/query') 'loaded Driver Verifier runtime query' | Out-String
+    $report | Set-Content -LiteralPath (Join-Path $script:SessionDirectory 'verifier-runtime.txt')
+    $activity = Read-VerifierActivity $report
+    if ($activity.Loads -le $activity.Unloads) {
+        throw 'Driver Verifier does not report ext4win.sys currently loaded'
+    }
+    Write-Phase 'LoadedDriverVerifierConfirmed'
 }
 
 function Assert-HostContract {
@@ -98,7 +128,7 @@ function Assert-HostContract {
             throw "Hyper-V PowerShell command is unavailable: $command"
         }
     }
-    foreach ($program in @('wsl.exe', 'fsutil.exe', 'mountvol.exe')) {
+    foreach ($program in @('wsl.exe', 'fsutil.exe', 'mountvol.exe', 'verifier.exe')) {
         if (-not (Get-Command $program -ErrorAction SilentlyContinue)) {
             throw "required Windows command is unavailable: $program"
         }
@@ -247,12 +277,16 @@ function Format-SessionVhdx {
     }
     Set-StateValue 'wsl_partition' ([string]$partitions[0])
     Write-Phase 'WslFormatRequested'
-    Invoke-Wsl @('--user', 'root', '--exec', 'mke2fs', '-t', 'ext4', '-F', '-b', '4096', '-O', 'metadata_csum,64bit', "/dev/$($partitions[0])") 'WSL ext4 format' | Out-Null
+    Invoke-Wsl @('--exec', 'mke2fs', '-t', 'ext4', '-F', '-b', '4096', '-O', 'metadata_csum,64bit', "/dev/$($partitions[0])") 'WSL ext4 format' | Out-Null
     Write-Phase 'WslFormatted'
     Write-Phase 'WslUnmountRequested'
     Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'WSL VHDX unmount' | Out-Null
     Set-StateValue 'wsl_attached' 'false'
     Write-Phase 'WslUnmounted'
+    # Detach the oracle's own ext4 disk before Windows hidden-volume discovery.
+    Write-Phase 'WslShutdownRequested'
+    Invoke-Wsl @('--shutdown') 'WSL oracle shutdown before driver load' | Out-Null
+    Write-Phase 'WslShutdownCompleted'
 }
 
 function Get-SessionPartition {
@@ -383,6 +417,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     Invoke-DriverLoadSession 'Start' $script:State.driver_session_id $BundleArguments
     Set-StateValue 'driver_session_started' 'true'
     Write-Phase 'DriverLoadSessionStarted'
+    Assert-LoadedDriverVerifier
     $root = Mount-SessionNamespace
     $alpha = Join-Path $root 'alpha.bin'
     $beta = Join-Path $root 'beta.bin'
@@ -430,6 +465,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     }
     Get-SessionPartition | Out-Null
     Write-Phase 'HotAttachVerified'
+    Assert-LoadedDriverVerifier
     Invoke-Checked 'fsutil.exe' @('volume', 'dismount', $script:State.volume_name) 'hot-attached session volume dismount'
     Remove-SessionNamespace
     Dismount-VHD -Path $script:State.vhdx_path
