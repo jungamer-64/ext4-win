@@ -7,13 +7,35 @@ $errors = $null
 $source = Join-Path $PSScriptRoot 'live-vhdx.ps1'
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
-foreach ($name in @('Read-VerifierActivity', 'Assert-LoadedDriverVerifier', 'Start-VerifiedDriverSession', 'Invoke-Wsl', 'Dismount-SessionFilesystemForCleanup')) {
+foreach ($name in @('Read-VerifierActivity', 'Assert-LoadedDriverVerifier', 'Start-VerifiedDriverSession', 'Invoke-Wsl', 'Dismount-SessionFilesystemForCleanup', 'Resolve-WslSessionPartition')) {
     $definition = $ast.Find({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
     }, $true)
     if (-not $definition) { throw "Missing function: $name" }
     . ([scriptblock]::Create($definition.Extent.Text))
+}
+
+$partitionId = [Guid]'2ca3ad84-858a-49ba-be4a-430713ddf498'
+$partitionType = [Guid]'0fc63daf-8483-4772-8e79-3d69d8477de4'
+$layout = @(
+    'sde disk',
+    'sde1 part 98740d78-04a2-4e2d-8ac4-4cf186293890 e3c9e316-0b5c-4db8-817d-f92df00215ae',
+    'sde2 part 2ca3ad84-858a-49ba-be4a-430713ddf498 0fc63daf-8483-4772-8e79-3d69d8477de4'
+)
+if ((Resolve-WslSessionPartition $layout $partitionId $partitionType) -cne 'sde2') {
+    throw 'WSL partition selection ignored the recorded GPT identity'
+}
+foreach ($invalid in @(
+    @($layout[0], $layout[1]),
+    @($layout[0], $layout[1], $layout[2].Replace('2ca3ad84', '2ca3ad85')),
+    @($layout[0], $layout[1], $layout[2].Replace('0fc63daf', '0fc63dae')),
+    @($layout[0], $layout[1], $layout[2], $layout[2].Replace('sde2', 'sde3'))
+)) {
+    $rejected = $false
+    try { Resolve-WslSessionPartition $invalid $partitionId $partitionType | Out-Null }
+    catch { $rejected = $true }
+    if (-not $rejected) { throw 'WSL partition selection accepted an absent or ambiguous GPT identity' }
 }
 
 $active = "Verifier Flags: 0x001209bb`nMODULE: ext4win.sys (load: 1 / unload: 0)"
