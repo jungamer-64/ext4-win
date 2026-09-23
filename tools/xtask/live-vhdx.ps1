@@ -96,19 +96,17 @@ function Read-VerifierActivity([string]$Report) {
         throw 'Driver Verifier runtime report must identify flags and exactly one ext4win.sys module'
     }
     $level = [Convert]::ToUInt32($flags[0].Groups[1].Value.Substring(2), 16)
-    if ($level -eq 0) {
-        throw 'Driver Verifier has no active flags'
+    # The selected DIF classes must be active for this exact driver; a report
+    # with unrelated Verifier options is not filesystem I/O coverage evidence.
+    $requiredFlags = [uint32]0x0002091b
+    if (($level -band $requiredFlags) -ne $requiredFlags) {
+        throw 'Driver Verifier is missing required live filesystem checks'
     }
     return [PSCustomObject]@{
         Flags = $level
         Loads = [uint64]$drivers[0].Groups[1].Value
         Unloads = [uint64]$drivers[0].Groups[2].Value
     }
-}
-
-function Assert-VerifierConfiguration {
-    $report = Invoke-Checked 'verifier.exe' @('/query') 'Driver Verifier runtime query' | Out-String
-    Read-VerifierActivity $report | Out-Null
 }
 
 function Assert-LoadedDriverVerifier {
@@ -119,6 +117,18 @@ function Assert-LoadedDriverVerifier {
         throw 'Driver Verifier does not report ext4win.sys currently loaded'
     }
     Write-Phase 'LoadedDriverVerifierConfirmed'
+}
+
+function Start-VerifiedDriverSession([string[]]$BundleArguments) {
+    Write-Phase 'DriverLoadSessionStartRequested'
+    Invoke-DriverLoadSession 'Start' $script:State.driver_session_id $BundleArguments
+    Set-StateValue 'driver_session_started' 'true'
+    Write-Phase 'DriverLoadSessionStarted'
+    # DIF /now requires the selected driver to be running. Record the attempted
+    # activation before the external effect so interrupted runs still stop it.
+    Write-Phase 'DriverVerifierActivationRequested'
+    Invoke-Checked 'verifier.exe' @('/dif', '1', '2', '4', '5', '9', '12', '18', '/now', '/driver', 'ext4win.sys') 'live Driver Verifier activation'
+    Assert-LoadedDriverVerifier
 }
 
 function Assert-HostContract {
@@ -135,7 +145,6 @@ function Assert-HostContract {
     }
     Invoke-Wsl @('--status') 'WSL status query' | Out-Null
     Invoke-Wsl @('--exec', 'mke2fs', '-V') 'WSL e2fsprogs query' | Out-Null
-    Assert-VerifierConfiguration
 }
 
 function Read-KeyValueFile([string]$Path) {
@@ -413,11 +422,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
         throw 'Windows reattach selected a disk outside the session identity'
     }
     Write-Phase 'WindowsAttached'
-    Write-Phase 'DriverLoadSessionStartRequested'
-    Invoke-DriverLoadSession 'Start' $script:State.driver_session_id $BundleArguments
-    Set-StateValue 'driver_session_started' 'true'
-    Write-Phase 'DriverLoadSessionStarted'
-    Assert-LoadedDriverVerifier
+    Start-VerifiedDriverSession $BundleArguments
     $root = Mount-SessionNamespace
     $alpha = Join-Path $root 'alpha.bin'
     $beta = Join-Path $root 'beta.bin'

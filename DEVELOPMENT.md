@@ -19,7 +19,7 @@ below instead of substituting generic Cargo commands for a canonical gate.
 | `cargo xtask check-hosted-driver-host` | Elevated Windows host with `TESTSIGNING`, PnPUtil, SCM, and no existing ext4win package/service | Performs the read-only preflight for a kernel-load smoke session. |
 | `cargo xtask verify-hosted-driver-load` | A host that passes the hosted preflight and trusts the production signer in LocalMachine Root and Trusted Publishers | Builds one verified production bundle, installs that exact package, completes demand-start driver initialization, and requires service/package cleanup. |
 | `cargo xtask cleanup-driver-load-session <session-id>` | Elevated Windows host | Reconciles an interrupted service/package session only after its durable bundle, signer, and package identities match. |
-| `cargo xtask check-live-driver-host` | Dedicated host that passes the hosted preflight and also provides Hyper-V PowerShell, WSL/e2fsprogs, and configured Driver Verifier | Performs the read-only preflight for disposable live VHDX validation. |
+| `cargo xtask check-live-driver-host` | Dedicated host that passes the hosted preflight and also provides Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier | Performs the read-only preflight for disposable live VHDX validation. |
 | `cargo xtask verify-live-vhdx` | A host that passes the live preflight | Builds a verified bundle and exercises it only against a newly created disposable VHDX. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
 
@@ -106,10 +106,10 @@ Ubuntu. The blocking live read-write job runs on the `windows-2025-vs2026` GitHu
 image. It imports the single cargo-wdk certificate identity into LocalMachine
 Root and Trusted Publishers, confirms both thumbprints, and then runs
 `verify-live-vhdx`. Pull requests, pushes to `main`, and manual dispatches run
-the same gate. The job enables the immediately applicable Driver Verifier DIF
-checks before loading the driver; it does not rely on next-boot settings or
-reboot the runner. The workflow owns the selected rule classes and stops those
-checks after session cleanup.
+the same gate. The live session enables the immediately applicable Driver Verifier DIF
+checks after the driver starts and before filesystem I/O; it does not rely on next-boot
+settings or reboot the runner. The workflow stops the selected rule classes after
+session cleanup.
 
 A green production bundle proves signed artifact identity and release
 reachability. The hosted load gate additionally proves that structured PnPUtil

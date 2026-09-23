@@ -7,7 +7,7 @@ $errors = $null
 $source = Join-Path $PSScriptRoot 'live-vhdx.ps1'
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
-foreach ($name in @('Read-VerifierActivity', 'Assert-LoadedDriverVerifier', 'Invoke-Wsl')) {
+foreach ($name in @('Read-VerifierActivity', 'Assert-LoadedDriverVerifier', 'Start-VerifiedDriverSession', 'Invoke-Wsl')) {
     $definition = $ast.Find({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -28,6 +28,7 @@ foreach ($invalid in @(
     '',
     'VerifyDrivers=ext4win.sys',
     $active.Replace('0x001209bb', '0x00000000'),
+    $active.Replace('0x001209bb', '0x00000001'),
     $active.Replace('ext4win.sys', 'other.sys'),
     $active.Replace('ext4win.sys', 'ext4win.sys.bak'),
     "$active`nMODULE: ext4win.sys (load: 1 / unload: 0)",
@@ -88,4 +89,51 @@ try { Invoke-Wsl @('--shutdown') 'shutdown' | Out-Null }
 catch { $rejected = $true }
 if (-not $rejected) { throw 'WSL failure was ignored' }
 $global:LASTEXITCODE = 0
+
+# The running driver must exist before immediate DIF activation, and the
+# runtime report must be accepted before the filesystem scenario can proceed.
+$script:State = @{ driver_session_id = '0123456789abcdef0123456789abcdef' }
+$script:StartEvents = [Collections.Generic.List[string]]::new()
+$script:ActivationFails = $false
+function Write-Phase([string]$Phase) { $script:StartEvents.Add("phase:$Phase") }
+function Set-StateValue([string]$Name, [string]$Value) { $script:State[$Name] = $Value }
+function Invoke-DriverLoadSession([string]$Mode, [string]$SessionId, [string[]]$BundleArguments) {
+    if ($Mode -cne 'Start' -or $SessionId -cne $script:State.driver_session_id -or
+        ($BundleArguments -join '|') -cne 'bundle') {
+        throw 'Driver-load identity was not forwarded intact'
+    }
+    $script:StartEvents.Add('driver-started')
+}
+function Invoke-Checked([string]$Program, [string[]]$Arguments, [string]$Description) {
+    if ($Program -cne 'verifier.exe' -or
+        ($Arguments -join '|') -cne '/dif|1|2|4|5|9|12|18|/now|/driver|ext4win.sys') {
+        throw 'Immediate Driver Verifier command was not scoped to ext4win.sys'
+    }
+    $script:StartEvents.Add('verifier-activation')
+    if ($script:ActivationFails) { throw 'activation failed' }
+}
+function Assert-LoadedDriverVerifier { $script:StartEvents.Add('runtime-confirmed') }
+
+Start-VerifiedDriverSession @('bundle')
+$expectedStart = @(
+    'phase:DriverLoadSessionStartRequested',
+    'driver-started',
+    'phase:DriverLoadSessionStarted',
+    'phase:DriverVerifierActivationRequested',
+    'verifier-activation',
+    'runtime-confirmed'
+)
+if (($script:StartEvents -join '|') -cne ($expectedStart -join '|') -or
+    $script:State.driver_session_started -cne 'true') {
+    throw 'Driver startup, immediate Verifier activation, and runtime confirmation were not ordered'
+}
+$script:StartEvents.Clear()
+$script:ActivationFails = $true
+$rejected = $false
+try { Start-VerifiedDriverSession @('bundle') }
+catch { $rejected = $true }
+if (-not $rejected -or $script:StartEvents.Contains('runtime-confirmed')) {
+    throw 'Failed Verifier activation proceeded to filesystem acceptance'
+}
+
 Write-Output 'live VHDX harness contracts: PASS'

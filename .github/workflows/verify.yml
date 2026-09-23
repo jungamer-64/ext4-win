@@ -749,19 +749,6 @@ jobs:
             Write-Host "Trusted LocalMachine\$store thumbprint: $($trusted.Thumbprint)"
           }
 
-      - name: Enable live Driver Verifier checks
-        id: verifier
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          Import-Module Hyper-V -ErrorAction Stop
-          # DIF activates these checks now; /standard alone requires a reboot.
-          # The hosted VM is disposable and verifies only this job's driver.
-          verifier.exe /dif 1 2 4 5 9 12 18 /now /driver ext4win.sys
-          if ($LASTEXITCODE -ne 0) {
-            throw "Immediate Driver Verifier activation failed: $LASTEXITCODE"
-          }
-
       - name: Check live driver environment
         shell: pwsh
         run: |
@@ -774,6 +761,7 @@ jobs:
           }
 
       - name: Verify loaded driver ext4 read-write and remount
+        id: live_io
         timeout-minutes: 150
         shell: pwsh
         run: |
@@ -807,7 +795,7 @@ jobs:
           }
 
       - name: Stop job-owned Driver Verifier checks
-        if: always() && steps.verifier.outcome == 'success'
+        if: always() && steps.live_io.outcome != 'skipped'
         shell: powershell
         run: |
           verifier.exe /stop
