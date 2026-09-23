@@ -262,6 +262,26 @@ function Get-SessionDisk {
     return $disk[0]
 }
 
+function Resolve-WslSessionPartition([string[]]$Layout, [Guid]$PartitionId, [Guid]$PartitionType) {
+    $matches = @($Layout | ForEach-Object {
+        $fields = $_ -split '\s+'
+        if ($fields.Count -ne 4 -or $fields[1] -ne 'part' -or $fields[0] -notmatch '^[A-Za-z0-9]+$') {
+            return
+        }
+        $id = [Guid]::Empty
+        $type = [Guid]::Empty
+        if ([Guid]::TryParse($fields[2], [ref]$id) -and
+            [Guid]::TryParse($fields[3], [ref]$type) -and
+            $id -eq $PartitionId -and $type -eq $PartitionType) {
+            $fields[0]
+        }
+    })
+    if ($matches.Count -ne 1) {
+        throw 'session VHDX did not expose exactly one identity-matched WSL partition'
+    }
+    return [string]$matches[0]
+}
+
 function Format-SessionVhdx {
     $before = @(Invoke-Wsl @('--exec', 'lsblk', '-dn', '-o', 'NAME') 'WSL device inventory before VHDX attach')
     Set-StateValue 'wsl_attached' 'true'
@@ -274,19 +294,11 @@ function Format-SessionVhdx {
         throw 'WSL attach did not expose exactly one safely named block device'
     }
     Set-StateValue 'wsl_device' ([string]$newDevices[0])
-    $layout = @(Invoke-Wsl @('--exec', 'lsblk', '-ln', '-o', 'NAME,TYPE', "/dev/$($newDevices[0])") 'WSL partition inventory')
-    $partitions = @($layout | ForEach-Object {
-        $fields = $_ -split '\s+'
-        if ($fields.Count -eq 2 -and $fields[1] -eq 'part' -and $fields[0] -match '^[A-Za-z0-9]+$') {
-            $fields[0]
-        }
-    })
-    if ($partitions.Count -ne 1) {
-        throw 'session VHDX did not expose exactly one WSL partition'
-    }
-    Set-StateValue 'wsl_partition' ([string]$partitions[0])
+    $layout = @(Invoke-Wsl @('--exec', 'lsblk', '-nr', '-o', 'NAME,TYPE,PARTUUID,PARTTYPE', "/dev/$($newDevices[0])") 'WSL partition inventory')
+    $partitionName = Resolve-WslSessionPartition $layout ([Guid]$script:State.partition_id) ([Guid]$script:State.partition_type)
+    Set-StateValue 'wsl_partition' $partitionName
     Write-Phase 'WslFormatRequested'
-    Invoke-Wsl @('--exec', 'mke2fs', '-t', 'ext4', '-F', '-b', '4096', '-O', 'metadata_csum,64bit', "/dev/$($partitions[0])") 'WSL ext4 format' | Out-Null
+    Invoke-Wsl @('--exec', 'mke2fs', '-t', 'ext4', '-F', '-b', '4096', '-O', 'metadata_csum,64bit', "/dev/$partitionName") 'WSL ext4 format' | Out-Null
     Write-Phase 'WslFormatted'
     Write-Phase 'WslUnmountRequested'
     Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'WSL VHDX unmount' | Out-Null
