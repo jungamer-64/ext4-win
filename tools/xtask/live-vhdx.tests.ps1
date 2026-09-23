@@ -7,7 +7,7 @@ $errors = $null
 $source = Join-Path $PSScriptRoot 'live-vhdx.ps1'
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
-foreach ($name in @('Read-VerifierActivity', 'Assert-LoadedDriverVerifier', 'Start-VerifiedDriverSession', 'Invoke-Wsl')) {
+foreach ($name in @('Read-VerifierActivity', 'Assert-LoadedDriverVerifier', 'Start-VerifiedDriverSession', 'Invoke-Wsl', 'Dismount-SessionFilesystemForCleanup')) {
     $definition = $ast.Find({
         param($node)
         $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name
@@ -134,6 +134,24 @@ try { Start-VerifiedDriverSession @('bundle') }
 catch { $rejected = $true }
 if (-not $rejected -or $script:StartEvents.Contains('runtime-confirmed')) {
     throw 'Failed Verifier activation proceeded to filesystem acceptance'
+}
+
+# A failed partition creation may leave a session VHDX attached, but there is
+# no filesystem to dismount until its identity has been published durably.
+$script:State = @{ driver_session_id = '0123456789abcdef0123456789abcdef'; driver_session_started = 'false' }
+$driverSessionParent = Join-Path ([IO.Path]::GetTempPath()) ([Guid]::NewGuid().ToString('N'))
+$script:StartEvents.Clear()
+function Get-SessionPartition { throw 'partition lookup must not run before identity publication' }
+Dismount-SessionFilesystemForCleanup
+if (($script:StartEvents -join '|') -cne 'phase:CleanupPartitionUnrecorded') {
+    throw 'Unrecorded partition cleanup did not preserve the early lifecycle boundary'
+}
+$script:State.driver_session_started = 'true'
+$rejected = $false
+try { Dismount-SessionFilesystemForCleanup }
+catch { $rejected = $true }
+if (-not $rejected) {
+    throw 'Cleanup accepted an unrecorded partition after driver startup'
 }
 
 Write-Output 'live VHDX harness contracts: PASS'
