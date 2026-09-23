@@ -299,6 +299,15 @@ function Format-SessionVhdx {
     Set-StateValue 'wsl_partition' $partitionName
     Write-Phase 'WslFormatRequested'
     Invoke-Wsl @('--exec', 'mke2fs', '-t', 'ext4', '-F', '-b', '4096', '-O', 'metadata_csum,64bit', "/dev/$partitionName") 'WSL ext4 format' | Out-Null
+    # The ext4 root remains 0755. The Windows CI account has no Linux root SID,
+    # so give this disposable test directory explicit POSIX write permission.
+    Invoke-Wsl @('--exec', 'debugfs', '-w', '-R', 'mkdir /live-ci', "/dev/$partitionName") 'WSL test directory creation' | Out-Null
+    Invoke-Wsl @('--exec', 'debugfs', '-w', '-R', 'set_inode_field /live-ci mode 040777', "/dev/$partitionName") 'WSL test directory permissions' | Out-Null
+    $fixture = Invoke-Wsl @('--exec', 'debugfs', '-R', 'stat /live-ci', "/dev/$partitionName") 'WSL test directory verification' | Out-String
+    if ($fixture -notmatch '(?m)\bMode:\s+0777\b') {
+        throw 'WSL test directory does not have the required POSIX write permission'
+    }
+    Invoke-Wsl @('--exec', 'e2fsck', '-fn', "/dev/$partitionName") 'WSL formatted fixture integrity check' | Out-Null
     Write-Phase 'WslFormatted'
     Write-Phase 'WslUnmountRequested'
     Invoke-Wsl @('--unmount', $script:State.vhdx_path) 'WSL VHDX unmount' | Out-Null
@@ -448,6 +457,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     Write-Phase 'WindowsAttached'
     Start-VerifiedDriverSession $BundleArguments
     $root = Mount-SessionNamespace
+    $root = Join-Path $root 'live-ci'
     $alpha = Join-Path $root 'alpha.bin'
     $beta = Join-Path $root 'beta.bin'
     $hardlink = Join-Path $root 'beta-link.bin'
@@ -488,6 +498,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     Write-Phase 'HotAttachRequested'
     Mount-VHD -Path $script:State.vhdx_path | Out-Null
     $root = Mount-SessionNamespace
+    $root = Join-Path $root 'live-ci'
     $readback = [IO.File]::ReadAllBytes((Join-Path $root 'beta-link.bin'))
     if ([Convert]::ToBase64String($payload) -ne [Convert]::ToBase64String($readback)) {
         throw 'hot-attached Linux data GUID volume lost the durable content'
