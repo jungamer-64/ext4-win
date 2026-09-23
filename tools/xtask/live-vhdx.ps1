@@ -358,6 +358,18 @@ function Remove-SessionNamespace {
 }
 
 function Dismount-SessionFilesystemForCleanup {
+    if (-not $script:State.Contains('partition_number')) {
+        $driverSessionDirectory = Join-Path $driverSessionParent $script:State.driver_session_id
+        if ($script:State.Contains('volume_name') -or
+            $script:State.driver_session_started -eq 'true' -or
+            (Test-Path -LiteralPath $driverSessionDirectory -PathType Container)) {
+            throw 'session reached driver or volume publication without a recorded partition identity'
+        }
+        # Formatting and driver startup follow durable partition publication.
+        # An interrupted partition creation has no mounted filesystem to flush.
+        Write-Phase 'CleanupPartitionUnrecorded'
+        return
+    }
     $partition = Get-SessionPartition
     Import-LiveVolumeBoundary
     $volume = [Ext4Win.LiveVolume]::Find(
@@ -560,7 +572,8 @@ function Start-LiveSession([string[]]$BundleArguments, [string]$RequestedSession
         Write-Phase 'PartitioningAttached'
         Set-StateValue 'partition_type' '{0FC63DAF-8483-4772-8E79-3D69D8477DE4}'
         Write-Phase 'PartitionCreateRequested'
-        Set-Disk -Number $disk[0].Number -IsOffline $false -IsReadOnly $false
+        Set-Disk -Number $disk[0].Number -IsOffline $false
+        Set-Disk -Number $disk[0].Number -IsReadOnly $false
         Initialize-Disk -Number $disk[0].Number -PartitionStyle GPT
         $partition = New-Partition -DiskNumber $disk[0].Number -UseMaximumSize -GptType $script:State.partition_type
         if ([Guid]$partition.GptType -ne [Guid]$script:State.partition_type) {
