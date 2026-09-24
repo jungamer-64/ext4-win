@@ -3837,6 +3837,27 @@ enum DriverResolveDisposition {
     Mutation(PendingDriverPublication),
 }
 
+/// Work selected by one mutation phase after it has released its stack temporaries.
+///
+/// Resolution resumes in the same reactor turn and reuses the admitted operation allocation.
+/// Returning a step prevents commit/checkpoint dispatch frames and repeated epoch retries from
+/// accumulating beneath filesystem traversal or native completion calls.
+enum MutationStep {
+    /// One externally scheduled action or terminal completion.
+    Transition(OperationTransition),
+    /// One read-only attempt against an exact retained epoch.
+    Resolve {
+        /// Admitted operation retaining request and publication ownership.
+        operation: Box<MutationRequestOperation>,
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Epoch and native coherency gates for this attempt.
+        attempt: ResolutionAttempt,
+        /// Concrete event consumed by the core resolver.
+        event: OperationEvent,
+    },
+}
+
 impl MutationRequestOperation {
     /// Retains the current node stream when this request class can break an oplock.
     ///
@@ -4303,7 +4324,7 @@ impl MutationRequestOperation {
         size_changes: Option<crate::state::PreparedStreamSizeChanges>,
         deletion: Option<crate::state::PreparedStreamDeletion>,
         access: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
+    ) -> MutationStep {
         let epoch = match access.acquire_epoch() {
             Ok(epoch) => epoch,
             Err(error) => return self.complete_error(owned, error),
@@ -4329,7 +4350,7 @@ impl MutationRequestOperation {
         mut pending: PendingNamespaceOplocks,
         next: Option<NamespaceParentOplock>,
         access: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
+    ) -> MutationStep {
         if let Some(requirement) = next {
             if pending.second.is_some() {
                 return self.complete_error(owned, DriverError::InternalInvariantViolation);
@@ -4375,7 +4396,7 @@ impl MutationRequestOperation {
         attempt: ResolutionAttempt,
         event: OperationEvent,
         operations: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
+    ) -> MutationStep {
         let ResolutionAttempt {
             epoch,
             resolve,
@@ -5054,12 +5075,17 @@ impl OplockContinuation for MutationRequestOperation {
     }
 }
 
-impl MountedVolumeOperation for MutationRequestOperation {
-    fn advance_mounted(
+impl MutationRequestOperation {
+    /// Integrates one event, returning resolution work only after this phase's temporaries die.
+    ///
+    /// The independent frame is required by the bounded kernel stack. Commit and checkpoint
+    /// state transitions must not remain on the stack while namespace traversal calls the OS.
+    #[inline(never)]
+    fn advance_event(
         mut self: Box<Self>,
         event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
+    ) -> MutationStep {
         let event = match event {
             CompletionEvent::Core(event) => event,
             CompletionEvent::CacheCompleted(completion) => {
@@ -5707,6 +5733,25 @@ impl MountedVolumeOperation for MutationRequestOperation {
                     access,
                 ),
             MutationOperationState::Terminal => OperationTransition::Complete,
+        }
+    }
+
+}
+
+impl MountedVolumeOperation for MutationRequestOperation {
+    fn advance_mounted(
+        self: Box<Self>,
+        event: CompletionEvent,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let mut step = self.advance_event(event, access);
+        loop {
+            match step {
+                MutationStep::Transition(transition) => return transition,
+                MutationStep::Resolve { operation, owned, attempt, event } => {
+                    step = operation.advance_resolution(owned, attempt, event, access);
+                }
+            }
         }
     }
 
