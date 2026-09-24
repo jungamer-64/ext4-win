@@ -524,31 +524,30 @@ impl StreamContext {
     /// Releases cleanup-owned byte locks and refreshes the derived Fast I/O projection.
     /// # Errors
     ///
-    /// Returns an invariant error if the native stream, FILE_OBJECT, or requestor identity does
-    /// not belong to one live regular-file stream.
+    /// Returns an invariant error if the native stream, FILE_OBJECT, or requestor identity is
+    /// malformed. No remaining byte locks already satisfies cleanup, including a handle that
+    /// never acquired a lock or whose locks were explicitly released before cleanup.
     pub(crate) fn unlock_all(
         &self,
         file_object: NonNull<wdk_sys::FILE_OBJECT>,
         process: NonNull<c_void>,
     ) -> DriverResult<()> {
         #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: Cleanup retains the FCB, FILE_OBJECT, and captured requestor process.
-                ext4win_stream_unlock_all(
-                    self.header.as_ptr(),
-                    file_object.as_ptr(),
-                    process.as_ptr().cast(),
-                )
-            };
-            native_status(status)
-        }
+        let status = unsafe {
+            // SAFETY: Cleanup retains the FCB, FILE_OBJECT, and captured requestor process.
+            ext4win_stream_unlock_all(
+                self.header.as_ptr(),
+                file_object.as_ptr(),
+                process.as_ptr().cast(),
+            )
+        };
         #[cfg(test)]
-        {
+        let status = {
             let _file_object = file_object;
             let _process = process;
-            Ok(())
-        }
+            wdk_sys::STATUS_RANGE_NOT_LOCKED
+        };
+        cleanup_unlock_status(status)
     }
 
     /// Returns the `FSRTL_ADVANCED_FCB_HEADER` address stored in `FILE_OBJECT::FsContext`.
@@ -1123,6 +1122,18 @@ impl Drop for StreamContext {
     }
 }
 
+/// Interprets the cleanup postcondition, which does not require any lock to have existed.
+/// # Errors
+///
+/// Preserves rejection of malformed native ownership. This interpretation belongs only to cleanup;
+/// explicit unlock requests still expose their original native status to their caller.
+fn cleanup_unlock_status(status: NTSTATUS) -> DriverResult<()> {
+    match status {
+        wdk_sys::STATUS_SUCCESS | wdk_sys::STATUS_RANGE_NOT_LOCKED => Ok(()),
+        _ => Err(DriverError::InternalInvariantViolation),
+    }
+}
+
 #[cfg(not(test))]
 /// Maps this boundary's construction failure or malformed ownership to driver errors.
 /// # Errors
@@ -1297,6 +1308,28 @@ mod tests {
 
     use super::{NativeStreamMetadata, OperationalTrace, Ordering, StreamContext, StreamSizes};
     use crate::kernel::status::{DriverError, DriverResult};
+
+    /// # Panics
+    ///
+    /// Panics if a lock-free cleanup is treated as ownership corruption or an actual native
+    /// rejection is silently accepted.
+    #[test]
+    fn cleanup_accepts_absent_locks_but_rejects_native_ownership_errors() {
+        assert_eq!(
+            super::cleanup_unlock_status(wdk_sys::STATUS_SUCCESS),
+            Ok(())
+        );
+        assert_eq!(
+            super::cleanup_unlock_status(wdk_sys::STATUS_RANGE_NOT_LOCKED),
+            Ok(())
+        );
+        for status in [wdk_sys::STATUS_INVALID_PARAMETER, wdk_sys::STATUS_PENDING] {
+            assert_eq!(
+                super::cleanup_unlock_status(status),
+                Err(DriverError::InternalInvariantViolation)
+            );
+        }
+    }
 
     /// # Errors
     ///
