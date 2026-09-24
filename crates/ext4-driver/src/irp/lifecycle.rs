@@ -1193,10 +1193,32 @@ impl KernelIrp {
     )]
     fn finish_completion(self, status: NTSTATUS) -> NTSTATUS {
         #[cfg(not(test))]
-        unsafe {
-            // SAFETY: The IRP pointer belongs to the unique completion owner
-            // and the calling completion path wrote every terminal field first.
-            ffi::IoCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
+        {
+            // Completion invokes upper filters synchronously. A posted request runs on the
+            // volume's sole reactor thread, so a filter must not mistake this for a fresh
+            // top-level entry and synchronously query that same reactor (for example, to
+            // normalize a filename). Preserve any existing filesystem/Cc recursion context.
+            let previous = unsafe {
+                // SAFETY: This only observes the current thread's opaque filesystem context.
+                ffi::IoGetTopLevelIrp()
+            };
+            if previous.is_null() {
+                unsafe {
+                    // SAFETY: This filesystem owns the live IRP through native completion. The
+                    // thread-local marker is restored below before returning to any caller.
+                    ffi::IoSetTopLevelIrp(self.as_mut_ptr());
+                }
+            }
+            unsafe {
+                // SAFETY: The unique completion owner wrote all terminal fields and released its
+                // mappings and cancellation state before invoking the I/O Manager.
+                ffi::IoCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
+            }
+            // The IRP may now be freed. Restore only the saved thread value; never inspect it.
+            unsafe {
+                // SAFETY: `previous` is the unchanged opaque value belonging to this same thread.
+                ffi::IoSetTopLevelIrp(previous);
+            }
         }
         status
     }
