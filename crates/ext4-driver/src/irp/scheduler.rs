@@ -478,6 +478,21 @@ impl Scheduler {
         })
     }
 
+    /// Returns an FsRtl-owned slot to the actor after synchronous return or callback completion.
+    ///
+    /// The exact generation must still be waiting for this oplock. Cancellation remains pending
+    /// until the returned IRP receives its next event; a stale completion cannot modify a reused slot.
+    pub(crate) fn reclaim_oplock(&mut self, identity: SlotId) -> bool {
+        let Some(slot) = self.slot_mut(identity) else {
+            return false;
+        };
+        if !matches!(slot.phase, Phase::Oplock) {
+            return false;
+        }
+        slot.phase = Phase::Actor;
+        true
+    }
+
     /// Completes and vacates one actor-owned slot.
     pub(crate) fn complete(&mut self, identity: SlotId) -> bool {
         let Some(slot) = self.slot_mut(identity) else {
@@ -1127,6 +1142,49 @@ mod tests {
         assert!(!scheduler.reject_commit(earlier, 10));
         assert_eq!(scheduler.abandon_commit(earlier), Some(10));
         assert!(!scheduler.has_commit_work());
+    }
+
+    /// # Panics
+    ///
+    /// Panics if oplock return cannot resume exactly once, loses cancellation, or accepts an old
+    /// completion after slot reuse. Both immediate return and callback completion use this boundary.
+    #[test]
+    fn oplock_return_restores_actor_ownership_before_ready_delivery() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the host fixture takes ownership of the fully initialized scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed and the pointer-free scheduler can be moved.
+            storage.assume_init()
+        };
+        let mut previous = None;
+        for cancelled in [false, true] {
+            let identity = require_some!(scheduler.reserve());
+            assert!(!scheduler.cancellation_is_pending(identity.index(), false));
+            assert!(scheduler.set_phase(identity, Phase::Oplock));
+            if let Some(stale) = previous {
+                assert!(!scheduler.reclaim_oplock(stale));
+            }
+            if cancelled {
+                assert_eq!(
+                    scheduler.request_cancel(identity.index()),
+                    CancelDisposition::CancelOplock
+                );
+            }
+            assert!(scheduler.reclaim_oplock(identity));
+            assert!(!scheduler.reclaim_oplock(identity));
+            assert_eq!(
+                scheduler.cancellation_is_pending(identity.index(), false),
+                cancelled
+            );
+            assert!(scheduler.set_phase(identity, Phase::Ready));
+            assert_eq!(scheduler.take_ready(), Some(identity));
+            assert!(scheduler.complete(identity));
+            previous = Some(identity);
+        }
     }
 
     /// Verifies cancellation behavior at every suspending scheduler phase.
