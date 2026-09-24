@@ -1239,10 +1239,7 @@ fn verify_external_extent_block_checksum(context: ExtentTreeContext, raw: &[u8])
     let Some(checksum) = context.checksum else {
         return Ok(());
     };
-    let offset = raw
-        .len()
-        .checked_sub(EXTENT_TAIL_SIZE)
-        .ok_or(Error::InvalidExtentTree)?;
+    let offset = extent_checksum_offset(raw)?;
     let expected = le_u32(raw, disk_offset(offset))?;
     if extent_block_checksum(checksum, raw, offset)? == expected {
         Ok(())
@@ -1254,8 +1251,7 @@ fn verify_external_extent_block_checksum(context: ExtentTreeContext, raw: &[u8])
 /// Refreshes an external extent block checksum when metadata checksums are enabled.
 /// # Errors
 ///
-/// Returns an error when the block is too small for a checksum tail or the checksum field cannot be
-/// zeroed and rewritten.
+/// Returns an error when the header's entry capacity places the checksum outside the block.
 fn refresh_external_extent_block_checksum(
     context: ExtentTreeContext,
     raw: &mut [u8],
@@ -1263,52 +1259,135 @@ fn refresh_external_extent_block_checksum(
     let Some(checksum) = context.checksum else {
         return Ok(());
     };
-    let offset = raw
-        .len()
-        .checked_sub(EXTENT_TAIL_SIZE)
-        .ok_or(Error::InvalidExtentTree)?;
-    put_le_u32(raw, disk_offset(offset), 0)?;
+    let offset = extent_checksum_offset(raw)?;
     let checksum = extent_block_checksum(checksum, raw, offset)?;
     put_le_u32(raw, disk_offset(offset), checksum)
 }
 
-/// Computes the crc32c checksum for one external extent block.
+/// Locates the tail after all `eh_max` entry slots, including unused slots. Any remaining block
+/// padding follows the tail and is not covered by the extent checksum.
 /// # Errors
 ///
-/// Returns an error when the pre-tail or post-tail ranges cannot be sliced from `raw`, or the tail
-/// offset arithmetic overflows.
+/// Returns an error when the header is truncated or its capacity leaves no room for the tail.
+fn extent_checksum_offset(raw: &[u8]) -> Result<usize> {
+    let capacity = usize::from(le_u16(raw, disk_offset(4))?);
+    let offset = entry_offset(capacity)?;
+    let end = offset
+        .checked_add(EXTENT_TAIL_SIZE)
+        .ok_or(Error::ArithmeticOverflow)?;
+    if capacity == 0 || end > raw.len() {
+        return Err(Error::InvalidExtentTree);
+    }
+    Ok(offset)
+}
+
+/// Covers the inode identity and the extent block prefix ending immediately before the tail.
+/// Unlike inode checksums, the extent checksum does not include a zeroed checksum field.
+/// # Errors
+///
+/// Returns an error when the checksum offset is outside `raw`.
 fn extent_block_checksum(
     checksum: ExtentBlockChecksum,
     raw: &[u8],
     checksum_offset: usize,
 ) -> Result<u32> {
-    let zero_checksum = [0_u8; EXTENT_TAIL_SIZE];
     let mut seed = ext4_crc32c(checksum.seed, &checksum.inode_id.as_u32().to_le_bytes());
     seed = ext4_crc32c(seed, &checksum.generation.to_le_bytes());
-    let mut value = ext4_crc32c(
+    Ok(ext4_crc32c(
         seed,
         raw.get(..checksum_offset)
             .ok_or(Error::TruncatedStructure)?,
-    );
-    value = ext4_crc32c(value, &zero_checksum);
-    let checksum_end = checksum_offset
-        .checked_add(EXTENT_TAIL_SIZE)
-        .ok_or(Error::ArithmeticOverflow)?;
-    if checksum_end < raw.len() {
-        value = ext4_crc32c(
-            value,
-            raw.get(checksum_end..).ok_or(Error::TruncatedStructure)?,
-        );
-    }
-    Ok(value)
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        EXTENT_LEN_INITIALIZED_MAX, ExtentInitialization, ExtentLength, parse_extent_length,
+        EXTENT_LEN_INITIALIZED_MAX, ExtentInitialization, ExtentLength, ExtentTreeContext,
+        parse_extent_length, refresh_external_extent_block_checksum,
+        verify_external_extent_block_checksum,
     };
+    use crate::disk_format::inode::InodeId;
     use crate::error::Error;
+
+    /// # Panics
+    ///
+    /// Panics when external extent checksum coverage differs from the on-disk contract.
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::disallowed_methods,
+        reason = "fixed on-disk vectors use known nonzero inode IDs and explicit in-bounds byte ranges"
+    )]
+    fn external_extent_checksum_matches_independent_crc32c_vectors() {
+        // Known answers from bitwise CRC32C (reflected polynomial 0x82f63b78), with no final xor.
+        // The 2 KiB block and reduced capacity distinguish the tail from end-of-block padding.
+        let context = ExtentTreeContext::metadata_csum(
+            0x1234_5678,
+            InodeId::try_from(0x1234).expect("nonzero fixture inode"),
+            0x0102_0304,
+        );
+        for (size, capacity, tail, expected) in [
+            (1024, 84_u16, 1020, 0x992a_6622_u32),
+            (2048, 169, 2040, 0x0de5_c751),
+            (4096, 340, 4092, 0x7a50_ae35),
+            (4096, 1, 24, 0xb6cf_3f8e),
+        ] {
+            let mut storage = [0_u8; 4096];
+            let raw = &mut storage[..size];
+            raw[..4].copy_from_slice(&[0x0a, 0xf3, 1, 0]);
+            raw[4..6].copy_from_slice(&capacity.to_le_bytes());
+            raw[16..24].copy_from_slice(&[3, 0, 0, 0, 3, 2, 1, 0]);
+            raw[tail..tail + 4].copy_from_slice(&expected.to_le_bytes());
+            raw[tail + 4..].fill(0xa5);
+            assert_eq!(verify_external_extent_block_checksum(context, raw), Ok(()));
+            raw[tail..tail + 4].fill(0xff);
+            assert_eq!(refresh_external_extent_block_checksum(context, raw), Ok(()));
+            assert_eq!(&raw[tail..tail + 4], &expected.to_le_bytes());
+            assert!(raw[tail + 4..].iter().all(|byte| *byte == 0xa5));
+            raw[20] ^= 1;
+            assert_eq!(
+                verify_external_extent_block_checksum(context, raw),
+                Err(Error::ChecksumMismatch)
+            );
+        }
+    }
+
+    /// # Panics
+    ///
+    /// Panics when a truncated or out-of-block extent tail is accepted or rewritten.
+    #[test]
+    #[expect(
+        clippy::expect_used,
+        clippy::disallowed_methods,
+        reason = "fixed nonzero inode and equal-length field copies construct malformed tail fixtures"
+    )]
+    fn external_extent_checksum_rejects_invalid_tail_bounds() {
+        let context = ExtentTreeContext::metadata_csum(
+            0,
+            InodeId::try_from(8).expect("nonzero fixture inode"),
+            0,
+        );
+        for capacity in [0_u16, 1, u16::MAX] {
+            let mut raw = [0_u8; 24];
+            raw[4..6].copy_from_slice(&capacity.to_le_bytes());
+            let original = raw;
+            assert_eq!(
+                verify_external_extent_block_checksum(context, &raw),
+                Err(Error::InvalidExtentTree)
+            );
+            assert_eq!(
+                refresh_external_extent_block_checksum(context, &mut raw),
+                Err(Error::InvalidExtentTree)
+            );
+            assert_eq!(raw, original);
+        }
+        assert_eq!(
+            verify_external_extent_block_checksum(context, &[0; 5]),
+            Err(Error::TruncatedStructure)
+        );
+    }
 
     /// # Panics
     ///

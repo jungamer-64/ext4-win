@@ -2700,8 +2700,6 @@ impl CompletionReactor {
                 return;
             }
         };
-        // An empty poll cannot revoke cancellation: unlike a lower write, delegation to FsRtl
-        // starts a cancellable wait whose cancel routine remains externally owned until callback.
         if self.cancellation_is_pending(index) {
             let (_work, suspended) = CacheWorkEnvelope::cancel_before_queue(prepared);
             self.set_ready_operation_event(
@@ -2772,7 +2770,9 @@ impl CompletionReactor {
                 return;
             }
         };
-        if self.consume_cancellation_before_effect(index) {
+        // FsRtl delegation starts a cancellable wait, not an effect-bearing write. Observing no
+        // cancellation now must leave later cancellation enabled until the IRP is returned.
+        if self.cancellation_is_pending(index) {
             let (_check, owned, suspended) = OplockEnvelope::cancel_before_submit(prepared);
             let operation = suspended.resume_after_oplock(owned, STATUS_SUCCESS);
             self.set_ready_operation_event(
@@ -2789,7 +2789,7 @@ impl CompletionReactor {
         self.install_payload(index, SlotPayload::Oplock(publication));
         match OplockEnvelope::submit(prepared) {
             OplockSubmission::Immediate { envelope, status } => {
-                self.take_oplock_slot(index, NonNull::from(envelope.as_ref()));
+                self.take_oplock_slot(identity, NonNull::from(envelope.as_ref()));
                 let (owned, suspended, status) =
                     OplockEnvelope::reclaim_immediate(envelope, status);
                 self.restore_oplock_operation(index, owned, suspended, status);
@@ -3360,9 +3360,14 @@ impl CompletionReactor {
         })
     }
 
-    /// Detaches the exact FsRtl cancellation publication before its envelope can be reclaimed.
+    /// Restores actor ownership and detaches the exact FsRtl publication before envelope reclaim.
+    /// Immediate returns and queued completions must cross this same boundary before resumption.
     #[cfg(not(test))]
-    fn take_oplock_slot(&self, index: usize, envelope: NonNull<OplockEnvelope>) {
+    fn take_oplock_slot(&self, identity: SlotId, envelope: NonNull<OplockEnvelope>) {
+        if !self.with_scheduler(|scheduler| scheduler.reclaim_oplock(identity)) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let index = identity.index();
         self.with_payloads(|payloads| {
             let Some(slot) = payloads.get_mut(index) else {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -3393,13 +3398,7 @@ impl CompletionReactor {
                 envelope.as_ref().identity()
             };
             let index = identity.index();
-            let entered = self.with_scheduler(|scheduler| {
-                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Oplock))
-            });
-            if entered != Some(identity) {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            }
-            self.take_oplock_slot(index, envelope);
+            self.take_oplock_slot(identity, envelope);
             let envelope = unsafe {
                 // SAFETY: Inbox removal and generation validation grant unique box ownership.
                 Box::from_raw(envelope.as_ptr())

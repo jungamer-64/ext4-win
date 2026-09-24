@@ -20,6 +20,11 @@ ext4-core = { path = "../ext4-core" }
 wdk-alloc.workspace = true
 wdk-sys.workspace = true
 
+[dev-dependencies]
+# Host tests supply the driver boundary doubles; kernel import libraries must not resolve
+# std's Nt/Rtl calls to ntoskrnl instead of the user-mode system libraries.
+wdk-sys = { workspace = true, features = ["suppress-wdk-linking"] }
+
 [features]
 default = []
 nightly = ["wdk-sys/nightly"]

@@ -6,8 +6,35 @@ pub(crate) use wdk_sys::ntddk::IoCompleteRequest;
 pub(crate) use wdk_sys::ntddk::{
     IoCheckShareAccess, IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink,
     IoRegisterFileSystem, IoRemoveShareAccess, IoUnregisterFileSystem, KeQuerySystemTimePrecise,
-    MmMapLockedPagesSpecifyCache, RtlSecondsSince1970ToTime, RtlTimeToSecondsSince1970,
+    RtlSecondsSince1970ToTime, RtlTimeToSecondsSince1970,
 };
+
+#[cfg(not(test))]
+pub(crate) use wdk_sys::ntddk::MmMapLockedPagesSpecifyCache;
+
+/// Host fixtures can describe already mapped buffers but cannot map physical kernel pages.
+/// # Safety
+/// Retains the production argument contract; reaching this kernel-only branch fails the host test.
+/// # Panics
+/// Always fails if a host test reaches the physical-page mapping boundary.
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::panic,
+    clippy::disallowed_macros,
+    reason = "fail closed if a host fixture attempts a kernel-only physical-page mapping"
+)]
+pub(crate) unsafe fn MmMapLockedPagesSpecifyCache(
+    _mdl: wdk_sys::PMDL,
+    _mode: wdk_sys::KPROCESSOR_MODE,
+    _cache_type: wdk_sys::MEMORY_CACHING_TYPE,
+    _address: wdk_sys::PVOID,
+    _bugcheck_on_failure: wdk_sys::ULONG,
+    _priority: wdk_sys::ULONG,
+) -> wdk_sys::PVOID {
+    panic!("host MDL fixtures must supply an already mapped buffer")
+}
 
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{

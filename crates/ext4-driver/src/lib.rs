@@ -60,7 +60,7 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
     unsafe_code,
     reason = "DriverEntry is the audited Windows loader ABI and initial device-ownership boundary"
 )]
-#[unsafe(export_name = "DriverEntry")]
+#[cfg_attr(not(test), unsafe(export_name = "DriverEntry"))]
 pub unsafe extern "system" fn driver_entry(
     driver: PDRIVER_OBJECT,
     _registry_path: PCUNICODE_STRING,

@@ -60,38 +60,61 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = wdk_build::Config::from_env_auto()?;
     config.configure_binary_build()?;
 
-    let is_msvc = std::env::var_os("CARGO_CFG_TARGET_ENV").is_some_and(|target| target == "msvc");
+    let is_msvc_target =
+        std::env::var_os("CARGO_CFG_TARGET_ENV").is_some_and(|target| target == "msvc");
     let mut native = cc::Build::new();
+    let compiler = native.get_compiler();
+    let is_msvc_frontend = compiler.is_like_msvc();
+    let is_clang_cl = compiler.is_like_clang_cl();
+    let wdk_include_paths = config.include_paths()?.collect::<Vec<_>>();
+
     for (name, value) in config.preprocessor_definitions() {
-        // MSVC's /kernel switch defines this reserved implementation macro itself.
-        if !(is_msvc && name == "_KERNEL_MODE") {
+        // Both cl.exe and clang-cl accept /kernel, which defines this reserved
+        // implementation macro itself. Do not provide a duplicate definition.
+        if !(is_msvc_frontend && name == "_KERNEL_MODE") {
             native.define(&name, value.as_deref());
         }
     }
+
     let out_directory =
         PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")
         })?);
+
+    // clang-cl currently diagnoses /external:anglebrackets as an unused driver
+    // argument, which becomes fatal under /WX. Mark WDK/SDK directories as Clang
+    // system include paths instead. Repository-generated headers remain ordinary
+    // includes so their diagnostics stay visible and fatal.
+    if is_clang_cl {
+        for include_path in &wdk_include_paths {
+            native.flag(format!("-imsvc{}", include_path.display()));
+        }
+    } else {
+        native.includes(&wdk_include_paths);
+    }
+
     native
-        .includes(config.include_paths()?)
         .include(&out_directory)
         .file(SECURITY_CAPTURE_SOURCE)
         .file(STREAM_CONTEXT_SOURCE)
         .file(OPERATIONAL_TRACE_SOURCE)
         .file(VOLUME_DISCOVERY_SOURCE);
 
-    if is_msvc {
-        native
-            .flag("/kernel")
-            .flag("/W4")
-            .flag("/WX")
-            .flag("/analyze")
-            // The WDK headers carry analyzer assumptions that this standalone C compilation
-            // cannot satisfy. Keep repository-owned diagnostics fatal while excluding only
-            // angle-bracket system headers from both compiler and code-analysis diagnostics.
-            .flag("/external:anglebrackets")
-            .flag("/external:W0")
-            .flag("/analyze:external-");
+    if is_msvc_frontend {
+        native.flag("/kernel").flag("/W4").flag("/WX");
+
+        if !is_clang_cl {
+            // MSVC can suppress diagnostics originating in angle-bracket WDK/system
+            // headers while preserving /W4 /WX for repository-owned native sources.
+            native
+                .flag("/external:anglebrackets")
+                .flag("/external:W0")
+                .flag("/analyze")
+                .flag("/analyze:external-");
+        }
+    }
+
+    if is_msvc_target {
         let map_path = package_link_map_path()?;
         let map_parent = map_path
             .parent()

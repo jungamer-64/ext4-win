@@ -47,6 +47,8 @@ enum IndexPhase {
         bit: u32,
         /// Active inode traversal, or permission to select the next bitmap bit.
         scan: InodeAllocationScan,
+        /// One bounded read-ahead window from the immutable recovered inode tables.
+        table: Option<InodeTableWindow>,
     },
     /// The validated index has been consumed; this builder cannot be resumed.
     Finished,
@@ -59,6 +61,24 @@ enum BitmapRead {
     Block,
     /// Owns the block bitmap while its paired inode bitmap is read.
     Inode(Vec<u8>),
+}
+
+/// A completed read retained only during mount allocation validation. The recovered device is
+/// immutable for this phase; the window is discarded before mount publication or recovery writes.
+#[derive(Debug)]
+struct InodeTableWindow {
+    /// Absolute device offset of the first buffered byte.
+    offset: ByteOffset,
+    /// At most 64 KiB, bounded by the current group's inode table.
+    bytes: Vec<u8>,
+}
+
+impl InodeTableWindow {
+    /// Borrows a complete inode only when its full byte range belongs to this completed read.
+    fn record(&self, offset: ByteOffset, size: usize) -> Option<&[u8]> {
+        let start = usize::try_from(offset.get().checked_sub(self.offset.get())?).ok()?;
+        self.bytes.get(start..start.checked_add(size)?)
+    }
 }
 
 /// Allocation traversal retained across inode and external-node reads.
@@ -218,6 +238,7 @@ impl AllocationIndexBuild {
                         group: 0,
                         bit: 0,
                         scan: InodeAllocationScan::Next,
+                        table: None,
                     };
                 } else {
                     let (group, descriptor) = descriptors
@@ -265,6 +286,7 @@ impl AllocationIndexBuild {
                 group,
                 bit,
                 scan,
+                table,
             } => {
                 if matches!(scan, InodeAllocationScan::Next) {
                     let Some(snapshot) = allocation.groups.get(*group) else {
@@ -282,8 +304,9 @@ impl AllocationIndexBuild {
                         if inode_bitmap_bit_state(&snapshot.inode_bitmap, position)?
                             == BitmapBitState::Used
                         {
-                            let raw =
-                                read_group_inode_record(reader, superblock, snapshot, position)?;
+                            let raw = read_group_inode_record(
+                                reader, superblock, snapshot, position, table,
+                            )?;
                             *scan = begin_inode_scan(raw, superblock, orphans, &mut self.ranges)?;
                             *bit = bit.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                             return Ok(None);
@@ -521,7 +544,8 @@ struct GroupAllocationSnapshot {
     inode_bitmap: Vec<u8>,
 }
 
-/// Reads one allocated inode record using its already loaded group descriptor.
+/// Reads an allocated inode, retaining adjacent records in one bounded table window. A suspended
+/// or failed read cannot publish a window; retry resumes the identical request and cursor position.
 /// # Errors
 ///
 /// Returns an error when the group-local inode position is inconsistent, offset arithmetic
@@ -531,25 +555,60 @@ fn read_group_inode_record(
     superblock: &Superblock,
     group: &GroupAllocationSnapshot,
     position: InodeBitmapPosition,
+    table: &mut Option<InodeTableWindow>,
 ) -> Result<RawInodeRecord> {
-    if position.group() != group.group {
+    let count = inode_count_in_group(superblock, group.group)?;
+    if position.group() != group.group || position.bit() >= count {
         return Err(Error::InvalidInode);
     }
     let inode_id = position.inode_id(superblock)?;
     let inode_size = u64::from(superblock.inode_size().as_u16());
-    let offset = superblock
+    let table_offset = superblock
         .block_size()
         .offset_of(group.descriptor.inode_table())?
-        .get()
-        .checked_add(
-            u64::from(position.bit())
-                .checked_mul(inode_size)
-                .ok_or(Error::ArithmeticOverflow)?,
-        )
+        .get();
+    let relative = u64::from(position.bit())
+        .checked_mul(inode_size)
         .ok_or(Error::ArithmeticOverflow)?;
-    let offset = ByteOffset::new(offset);
-    let mut bytes = memory::repeated_vec(0_u8, usize::from(superblock.inode_size().as_u16()))?;
-    reader.read_exact_at(offset, &mut bytes)?;
+    let offset = ByteOffset::new(
+        table_offset
+            .checked_add(relative)
+            .ok_or(Error::ArithmeticOverflow)?,
+    );
+    let size = usize::from(superblock.inode_size().as_u16());
+    if table
+        .as_ref()
+        .and_then(|window| window.record(offset, size))
+        .is_none()
+    {
+        const WINDOW_BYTES: u64 = 64 * 1024;
+        let start = relative
+            .checked_sub(relative % WINDOW_BYTES)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let remaining = u64::from(count)
+            .checked_mul(inode_size)
+            .and_then(|length| length.checked_sub(start))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let length =
+            usize::try_from(remaining.min(WINDOW_BYTES)).map_err(|_| Error::ArithmeticOverflow)?;
+        let window_offset = ByteOffset::new(
+            table_offset
+                .checked_add(start)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        let mut bytes = memory::repeated_vec(0_u8, length)?;
+        reader.read_exact_at(window_offset, &mut bytes)?;
+        *table = Some(InodeTableWindow {
+            offset: window_offset,
+            bytes,
+        });
+    }
+    let bytes = memory::copied_slice(
+        table
+            .as_ref()
+            .and_then(|window| window.record(offset, size))
+            .ok_or(Error::InvalidInode)?,
+    )?;
     Ok(RawInodeRecord {
         id: inode_id,
         offset,
@@ -842,7 +901,7 @@ mod tests {
                 3072 => buffer.fill(0xff),
                 4096 => *buffer.first_mut().ok_or(Error::DeviceIo)? = 3,
                 // Reserved, uninitialized inode records have no data allocation to traverse.
-                5120 | 5376 => {}
+                5120 => assert_eq!(buffer.len(), 128 * 256),
                 _ => return Err(Error::DeviceIo),
             }
             let count = request.byte_count();
@@ -851,12 +910,85 @@ mod tests {
                 count,
             ))?;
         };
-        assert_eq!(observed, [2048, 3072, 4096, 5120, 5376]);
+        assert_eq!(observed, [2048, 3072, 4096, 5120]);
         // Superblock, descriptor, two bitmaps and 32 inode-table blocks occupy blocks 1..37.
         for cluster in 0..36 {
             assert_eq!(index.count(ClusterAddress::new(cluster)), 1);
         }
         assert_eq!(index.count(ClusterAddress::new(36)), 0);
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture construction or read-completion errors.
+    /// # Panics
+    /// Fails if an incomplete table read is cached, record offsets drift, or a read exceeds its group.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "test assertions report contract failures while fixture setup propagates errors"
+    )]
+    fn inode_table_window_retains_only_completed_group_bounded_reads() -> Result<()> {
+        let (superblock, allocation) = allocation_fixture(0, 4096)?;
+        let group = allocation.groups.first().ok_or(Error::InvalidSuperblock)?;
+        let mut transcript = StorageTranscript::new(
+            StorageTarget::Filesystem,
+            DeviceLength::from_bytes(4096 * 1024),
+        );
+        let mut table = None;
+        assert!(matches!(
+            read_group_inode_record(
+                &mut OperationDevice::new(&mut transcript),
+                &superblock,
+                group,
+                InodeBitmapPosition::new(group.group, 0),
+                &mut table,
+            ),
+            Err(Error::OperationSuspended)
+        ));
+        assert!(table.is_none());
+        let mut request = transcript.take_pending_request()?;
+        let StorageRequest::Read { offset, buffer, .. } = &mut request else {
+            return Err(Error::DeviceIo);
+        };
+        assert_eq!(offset.get(), 5120);
+        assert_eq!(buffer.len(), 128 * 256);
+        for (number, record) in buffer.as_chunks_mut::<256>().0.iter_mut().enumerate() {
+            put_le_u32(
+                record,
+                disk_offset(0),
+                u32::try_from(number).map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+        }
+        let count = request.byte_count();
+        transcript.complete(StorageCompletion::success(
+            CompletedStorageTransfer::from_request(request),
+            count,
+        ))?;
+        for bit in [0, 1, 127] {
+            let raw = read_group_inode_record(
+                &mut OperationDevice::new(&mut transcript),
+                &superblock,
+                group,
+                InodeBitmapPosition::new(group.group, bit),
+                &mut table,
+            )?;
+            assert_eq!(raw.id.as_u32(), bit + 1);
+            assert_eq!(raw.offset.get(), 5120 + u64::from(bit) * 256);
+            assert_eq!(le_u32(&raw.bytes, disk_offset(0))?, bit);
+            // A cached record must survive release of the preceding storage transcript.
+            transcript = StorageTranscript::new(StorageTarget::Filesystem, transcript.len());
+        }
+        assert!(matches!(
+            read_group_inode_record(
+                &mut OperationDevice::new(&mut transcript),
+                &superblock,
+                group,
+                InodeBitmapPosition::new(group.group, 128),
+                &mut table,
+            ),
+            Err(Error::InvalidInode)
+        ));
         Ok(())
     }
 }
