@@ -4327,20 +4327,20 @@ impl MutationRequestOperation {
     ) -> MutationStep {
         let epoch = match access.acquire_epoch() {
             Ok(epoch) => epoch,
-            Err(error) => return self.complete_error(owned, error),
+            Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
         };
         let resolve = MutationResolveOperation::new(access.mounted_profile());
-        self.advance_resolution(
+        MutationStep::Resolve {
+            operation: self,
             owned,
-            ResolutionAttempt {
+            attempt: ResolutionAttempt {
                 epoch,
                 resolve,
                 size_changes,
                 deletion,
             },
-            OperationEvent::Admitted,
-            access,
-        )
+            event: OperationEvent::Admitted,
+        }
     }
 
     /// Advances the second parent check or seals a fully checked namespace oplock authority.
@@ -4353,13 +4353,16 @@ impl MutationRequestOperation {
     ) -> MutationStep {
         if let Some(requirement) = next {
             if pending.second.is_some() {
-                return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                return MutationStep::Transition(
+                    self.complete_error(owned, DriverError::InternalInvariantViolation),
+                );
             }
-            let (mutation, stream) =
-                match access.acquire_parent_oplock_mutation(requirement.parent()) {
-                    Ok(pair) => pair,
-                    Err(error) => return self.complete_error(owned, error),
-                };
+            let (mutation, stream) = match access
+                .acquire_parent_oplock_mutation(requirement.parent())
+            {
+                Ok(pair) => pair,
+                Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
+            };
             pending.second = Some(mutation);
             if let Some(stream) = stream {
                 let check = match requirement.effect() {
@@ -4372,11 +4375,11 @@ impl MutationRequestOperation {
                         next: None,
                     },
                 };
-                return OperationTransition::CheckOplock {
+                return MutationStep::Transition(OperationTransition::CheckOplock {
                     check,
                     owned,
                     suspended: self,
-                };
+                });
             }
         }
         if self
@@ -4384,7 +4387,9 @@ impl MutationRequestOperation {
             .replace(pending.authorize())
             .is_some()
         {
-            return self.complete_error(owned, DriverError::InternalInvariantViolation);
+            return MutationStep::Transition(
+                self.complete_error(owned, DriverError::InternalInvariantViolation),
+            );
         }
         self.restart_resolution(owned, None, None, access)
     }
@@ -4405,7 +4410,11 @@ impl MutationRequestOperation {
         } = attempt;
         let mut ready = match resolve.accept(event) {
             Ok(ready) => ready,
-            Err(error) => return self.complete_error(owned, DriverError::from(error)),
+            Err(error) => {
+                return MutationStep::Transition(
+                    self.complete_error(owned, DriverError::from(error)),
+                );
+            }
         };
         // The version set sealed below must describe the same inode/allocation snapshot as this
         // pass. A completed lower read from an older epoch cannot be relabeled with new versions.
@@ -4435,12 +4444,13 @@ impl MutationRequestOperation {
                 Ok(DriverResolveDisposition::Complete(completion)) => {
                     if self.request.kind() == MutationRequestKind::Create {
                         if self.pending_existing_create.is_some() {
-                            return self
-                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                            return MutationStep::Transition(
+                                self.complete_error(owned, DriverError::InternalInvariantViolation),
+                            );
                         }
                         drop(self.write_open.take());
                     }
-                    return self.complete_success(owned, completion);
+                    return MutationStep::Transition(self.complete_success(owned, completion));
                 }
                 Ok(DriverResolveDisposition::CheckCleanupParentOplock { parent }) => {
                     drop(pass);
@@ -4449,15 +4459,21 @@ impl MutationRequestOperation {
                         || size_changes.is_some()
                         || deletion.is_some()
                     {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     if self.cleanup_parent_oplock.is_some() {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     let (mutation, stream) = match operations.acquire_parent_oplock_mutation(parent)
                     {
                         Ok(pair) => pair,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     self.cleanup_parent_oplock = Some(CleanupParentOplockAuthority {
                         parent,
@@ -4469,11 +4485,11 @@ impl MutationRequestOperation {
                     self.state = MutationOperationState::OplockDelegated {
                         resume: OplockResume::RestartCleanupDeletion { parent },
                     };
-                    return OperationTransition::CheckOplock {
+                    return MutationStep::Transition(OperationTransition::CheckOplock {
                         check: OplockCheck::parent_removal(stream),
                         owned,
                         suspended: self,
-                    };
+                    });
                 }
                 Ok(DriverResolveDisposition::CheckNamespaceOplocks { plan }) => {
                     drop(pass);
@@ -4487,14 +4503,18 @@ impl MutationRequestOperation {
                             .as_ref()
                             .is_some_and(|held| held.authorizes(plan))
                     {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     drop(self.namespace_oplocks.take());
                     let first = plan.first();
                     let (mutation, stream) =
                         match operations.acquire_parent_oplock_mutation(first.parent()) {
                             Ok(pair) => pair,
-                            Err(error) => return self.complete_error(owned, error),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
                         };
                     let pending = PendingNamespaceOplocks {
                         plan,
@@ -4519,30 +4539,33 @@ impl MutationRequestOperation {
                             next: plan.second(),
                         },
                     };
-                    return OperationTransition::CheckOplock {
+                    return MutationStep::Transition(OperationTransition::CheckOplock {
                         check,
                         owned,
                         suspended: self,
-                    };
+                    });
                 }
                 Ok(DriverResolveDisposition::PrepareDispositionDeletion { fcb, node }) => {
                     drop(pass);
                     let stream = match operations.prepare_stream_deletion(fcb, node) {
                         Ok(Some(stream)) => stream,
                         Ok(None) => {
-                            return self
-                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                            return MutationStep::Transition(
+                                self.complete_error(owned, DriverError::InternalInvariantViolation),
+                            );
                         }
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     self.state = MutationOperationState::PreparingDeletion {
                         owned,
                         size_changes,
                     };
-                    return OperationTransition::SubmitCacheWork {
+                    return MutationStep::Transition(OperationTransition::SubmitCacheWork {
                         work: crate::irp::CacheWork::prepare_deletion(stream),
                         suspended: self,
-                    };
+                    });
                 }
                 Ok(DriverResolveDisposition::PrepareWriteOpen { fcb, node }) => {
                     drop(pass);
@@ -4551,17 +4574,21 @@ impl MutationRequestOperation {
                         || self.pending_existing_create.is_none()
                         || self.write_open.is_some()
                     {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     let stream = match operations.prepare_stream_write_open(fcb, node) {
                         Ok(stream) => stream,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     self.state = MutationOperationState::PreparingWriteOpen { owned };
-                    return OperationTransition::SubmitCacheWork {
+                    return MutationStep::Transition(OperationTransition::SubmitCacheWork {
                         work: crate::irp::CacheWork::prepare_write_open(stream),
                         suspended: self,
-                    };
+                    });
                 }
                 Ok(DriverResolveDisposition::CheckOplock { fcb, policy }) => {
                     drop(pass);
@@ -4570,28 +4597,36 @@ impl MutationRequestOperation {
                         || self.pending_existing_create.is_none()
                         || self.write_open.is_some()
                     {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     if self.oplock_mutation.is_some() {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     let (mutation, stream) = match operations.acquire_claimed_oplock_mutation(fcb) {
                         Ok(admission) => admission,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     let check = match OplockCheck::create(stream, policy) {
                         Ok(check) => check,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     self.oplock_mutation = Some(mutation);
                     self.state = MutationOperationState::OplockDelegated {
                         resume: OplockResume::RestartExistingCreate,
                     };
-                    return OperationTransition::CheckOplock {
+                    return MutationStep::Transition(OperationTransition::CheckOplock {
                         check,
                         owned,
                         suspended: self,
-                    };
+                    });
                 }
                 Ok(DriverResolveDisposition::ReserveOplock { fcb, open_count }) => {
                     drop(pass);
@@ -4600,19 +4635,27 @@ impl MutationRequestOperation {
                         || self.pending_existing_create.is_none()
                         || self.write_open.is_some()
                     {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     if !operations.oplock_grant_available(fcb) {
-                        return self.complete_error(owned, DriverError::OplockNotGranted);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::OplockNotGranted),
+                        );
                     }
                     let stream = match operations.acquire_claimed_oplock_stream_lease(fcb) {
                         Ok(stream) => stream,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     let reservation =
                         match AtomicOplockReservation::acquire(stream, open_count, &owned) {
                             Ok(reservation) => reservation,
-                            Err(error) => return self.complete_error(owned, error),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
                         };
                     self.pending_existing_create
                         .as_mut()
@@ -4625,7 +4668,9 @@ impl MutationRequestOperation {
                 }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
                     if self.pending_existing_create.is_some() || self.write_open.is_some() {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                     publication = Some(prepared);
                     operations.resolve_mutation(pass, self.ticket)
@@ -4641,12 +4686,12 @@ impl MutationRequestOperation {
                             .bugcheck()
                     });
                     if let Err(error) = pending.abort(&owned) {
-                        return self.complete_error(owned, error);
+                        return MutationStep::Transition(self.complete_error(owned, error));
                     }
                     drop(self.write_open.take());
                     return self.restart_resolution(owned, None, None, operations);
                 }
-                Err(error) => return self.complete_error(owned, error),
+                Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
             }
         };
         match ready.finish(resolved) {
@@ -4658,24 +4703,28 @@ impl MutationRequestOperation {
                     size_changes,
                     deletion,
                 };
-                OperationTransition::SubmitLower {
+                MutationStep::Transition(OperationTransition::SubmitLower {
                     devices: self.devices,
                     request,
                     suspended: self,
-                }
+                })
             }
             MutationResolveTransition::Complete(Ok(resolved)) => {
                 let Some(publication) = publication else {
-                    return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    return MutationStep::Transition(
+                        self.complete_error(owned, DriverError::InternalInvariantViolation),
+                    );
                 };
                 let resources = resolved.observed_resources().resources();
                 let mut requested = match memory::DriverVec::try_with_capacity(resources.len()) {
                     Ok(requested) => requested,
-                    Err(error) => return self.complete_error(owned, error),
+                    Err(error) => {
+                        return MutationStep::Transition(self.complete_error(owned, error));
+                    }
                 };
                 for resource in resources {
                     if let Err(error) = requested.try_push(resource) {
-                        return self.complete_error(owned, error);
+                        return MutationStep::Transition(self.complete_error(owned, error));
                     }
                 }
                 self.state = MutationOperationState::AwaitingIntent {
@@ -4685,13 +4734,13 @@ impl MutationRequestOperation {
                     size_changes,
                     deletion,
                 };
-                OperationTransition::RequestIntent {
+                MutationStep::Transition(OperationTransition::RequestIntent {
                     request: IntentRequest::new(self.ticket, requested),
                     suspended: self,
-                }
+                })
             }
             MutationResolveTransition::Complete(Err(error)) => {
-                self.complete_error(owned, DriverError::from(error))
+                MutationStep::Transition(self.complete_error(owned, DriverError::from(error)))
             }
         }
     }
@@ -5102,13 +5151,13 @@ impl MutationRequestOperation {
                             publication,
                             result,
                         ) {
-                            Ok(completion) => self.complete_success(
+                            Ok(completion) => MutationStep::Transition(self.complete_success(
                                 owned,
                                 TopLevelCompletion::Normal(completion),
-                            ),
+                            )),
                             Err(error) => {
                                 record_cache_coherency_failure(error, access);
-                                self.complete_error(owned, error)
+                                MutationStep::Transition(self.complete_error(owned, error))
                             }
                         };
                     }
@@ -5121,23 +5170,18 @@ impl MutationRequestOperation {
                         crate::irp::CacheWorkCompletion::Purge(result),
                     ) => {
                         return match result {
-                            Ok(()) => self.advance_resolution(
-                                owned,
-                                ResolutionAttempt {
+                            Ok(()) => MutationStep::Resolve { operation: self, owned, attempt: ResolutionAttempt {
                                     epoch,
                                     resolve,
                                     size_changes: None,
                                     deletion: None,
-                                },
-                                OperationEvent::Admitted,
-                                access,
-                            ),
+                                }, event: OperationEvent::Admitted },
                             Err(DriverError::CacheManagerFailure(STATUS_RETRY)) => {
                                 self.restart_resolution(owned, None, None, access)
                             }
                             Err(error) => {
                                 record_cache_coherency_failure(error, access);
-                                self.complete_error(owned, error)
+                                MutationStep::Transition(self.complete_error(owned, error))
                             }
                         };
                     }
@@ -5154,17 +5198,12 @@ impl MutationRequestOperation {
                         {
                             self.cleanup_deferred_error = Some(error);
                         }
-                        return self.advance_resolution(
-                            owned,
-                            ResolutionAttempt {
+                        return MutationStep::Resolve { operation: self, owned, attempt: ResolutionAttempt {
                                 epoch,
                                 resolve,
                                 size_changes: None,
                                 deletion: None,
-                            },
-                            OperationEvent::Admitted,
-                            access,
-                        );
+                            }, event: OperationEvent::Admitted };
                     }
                     (
                         MutationOperationState::PreparingSizeChange {
@@ -5177,7 +5216,7 @@ impl MutationRequestOperation {
                         return match result {
                             Ok(size_change) => {
                                 if let Err(error) = plan.record_completion(size_change) {
-                                    return self.complete_error(owned, error);
+                                    return MutationStep::Transition(self.complete_error(owned, error));
                                 }
                                 if let Some(stream) = plan.next() {
                                     self.state = MutationOperationState::PreparingSizeChange {
@@ -5185,14 +5224,14 @@ impl MutationRequestOperation {
                                         plan,
                                         deletion,
                                     };
-                                    OperationTransition::SubmitCacheWork {
+                                    MutationStep::Transition(OperationTransition::SubmitCacheWork {
                                         work: crate::irp::CacheWork::prepare_size_change(stream),
                                         suspended: self,
-                                    }
+                                    })
                                 } else {
                                     let size_changes = match plan.into_prepared() {
                                         Ok(size_changes) => size_changes,
-                                        Err(error) => return self.complete_error(owned, error),
+                                        Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
                                     };
                                     self.restart_resolution(
                                         owned,
@@ -5204,7 +5243,7 @@ impl MutationRequestOperation {
                             }
                             Err(error) => {
                                 record_cache_coherency_failure(error, access);
-                                self.complete_error(owned, error)
+                                MutationStep::Transition(self.complete_error(owned, error))
                             }
                         };
                     }
@@ -5221,7 +5260,7 @@ impl MutationRequestOperation {
                             }
                             Err(error) => {
                                 record_cache_coherency_failure(error, access);
-                                self.complete_error(owned, error)
+                                MutationStep::Transition(self.complete_error(owned, error))
                             }
                         };
                     }
@@ -5232,16 +5271,16 @@ impl MutationRequestOperation {
                         return match result {
                             Ok(write_open) => {
                                 if self.write_open.replace(write_open).is_some() {
-                                    return self.complete_error(
+                                    return MutationStep::Transition(self.complete_error(
                                         owned,
                                         DriverError::InternalInvariantViolation,
-                                    );
+                                    ));
                                 }
                                 self.restart_resolution(owned, None, None, access)
                             }
                             Err(error) => {
                                 record_cache_coherency_failure(error, access);
-                                self.complete_error(owned, error)
+                                MutationStep::Transition(self.complete_error(owned, error))
                             }
                         };
                     }
@@ -5256,7 +5295,7 @@ impl MutationRequestOperation {
                 let MutationOperationState::AwaitingCommit { owned, .. } = state else {
                     crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 };
-                return self.complete_error(owned, error);
+                return MutationStep::Transition(self.complete_error(owned, error));
             }
         };
         let event = if self.request.kind() == MutationRequestKind::Cleanup
@@ -5264,12 +5303,12 @@ impl MutationRequestOperation {
         {
             match event {
                 OperationEvent::Admitted => {
-                    return OperationTransition::Wait {
+                    return MutationStep::Transition(OperationTransition::Wait {
                         condition: WaitCondition::Barrier {
                             identity: CLEANUP_HANDLE_BARRIER,
                         },
                         suspended: self,
-                    };
+                    });
                 }
                 OperationEvent::BarrierReleased(permit) => {
                     if permit.into_identity() != CLEANUP_HANDLE_BARRIER {
@@ -5296,16 +5335,18 @@ impl MutationRequestOperation {
             } => match event {
                 OperationEvent::Admitted => {
                     self.state = MutationOperationState::OplockDelegated { resume };
-                    OperationTransition::CheckOplock {
+                    MutationStep::Transition(OperationTransition::CheckOplock {
                         check,
                         owned,
                         suspended: self,
-                    }
+                    })
                 }
-                OperationEvent::CancelRequested => {
-                    self.complete_error(owned, DriverError::from(Error::OperationCancelled))
-                }
-                _ => self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                OperationEvent::CancelRequested => MutationStep::Transition(
+                    self.complete_error(owned, DriverError::from(Error::OperationCancelled)),
+                ),
+                _ => MutationStep::Transition(
+                    self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                ),
             },
             MutationOperationState::OplockReady {
                 owned,
@@ -5318,33 +5359,37 @@ impl MutationRequestOperation {
                     }
                     OperationEvent::Admitted if status >= STATUS_SUCCESS => None,
                     OperationEvent::Admitted => Some(DriverError::OplockFailure(status)),
-                    _ => return self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                    _ => {
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                        );
+                    }
                 };
                 match resume {
                     OplockResume::ContinueResolution { epoch, resolve } => {
                         if let Some(error) = oplock_error {
                             if self.request.kind() != MutationRequestKind::Cleanup {
-                                return self.complete_error(owned, error);
+                                return MutationStep::Transition(self.complete_error(owned, error));
                             }
                             if self.cleanup_deferred_error.is_none() {
                                 self.cleanup_deferred_error = Some(error);
                             }
                         }
-                        self.advance_resolution(
+                        MutationStep::Resolve {
+                            operation: self,
                             owned,
-                            ResolutionAttempt {
+                            attempt: ResolutionAttempt {
                                 epoch,
                                 resolve,
                                 size_changes: None,
                                 deletion: None,
                             },
-                            OperationEvent::Admitted,
-                            access,
-                        )
+                            event: OperationEvent::Admitted,
+                        }
                     }
                     OplockResume::RestartExistingCreate => {
                         if let Some(error) = oplock_error {
-                            return self.complete_error(owned, error);
+                            return MutationStep::Transition(self.complete_error(owned, error));
                         }
                         let result = self
                             .pending_existing_create
@@ -5353,40 +5398,45 @@ impl MutationRequestOperation {
                             .and_then(|pending| pending.accept_oplock_status(status));
                         match result {
                             Ok(()) => self.restart_resolution(owned, None, None, access),
-                            Err(error) => self.complete_error(owned, error),
+                            Err(error) => {
+                                MutationStep::Transition(self.complete_error(owned, error))
+                            }
                         }
                     }
                     OplockResume::RestartCleanupDeletion { parent } => {
                         if let Some(error) = oplock_error {
-                            return self.complete_error(owned, error);
+                            return MutationStep::Transition(self.complete_error(owned, error));
                         }
                         if self.request.kind() != MutationRequestKind::Cleanup
                             || self.cleanup_deletion.is_none()
                         {
-                            return self
-                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                            return MutationStep::Transition(
+                                self.complete_error(owned, DriverError::InternalInvariantViolation),
+                            );
                         }
                         if !self
                             .cleanup_parent_oplock
                             .as_ref()
                             .is_some_and(|authority| authority.authorizes(parent))
                         {
-                            return self
-                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                            return MutationStep::Transition(
+                                self.complete_error(owned, DriverError::InternalInvariantViolation),
+                            );
                         }
                         self.restart_resolution(owned, None, None, access)
                     }
                     OplockResume::ContinueNamespaceOplocks { pending, next } => {
                         if let Some(error) = oplock_error {
-                            return self.complete_error(owned, error);
+                            return MutationStep::Transition(self.complete_error(owned, error));
                         }
                         if !matches!(
                             self.request.kind(),
                             MutationRequestKind::Create | MutationRequestKind::SetInformation
                         ) || self.namespace_oplocks.is_some()
                         {
-                            return self
-                                .complete_error(owned, DriverError::InternalInvariantViolation);
+                            return MutationStep::Transition(
+                                self.complete_error(owned, DriverError::InternalInvariantViolation),
+                            );
                         }
                         self.continue_namespace_oplocks(owned, pending, next, access)
                     }
@@ -5413,7 +5463,9 @@ impl MutationRequestOperation {
                             access,
                         ) {
                             Ok(work) => work,
-                            Err(error) => return self.complete_error(owned, error),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
                         };
                         if let Some(work) = work {
                             self.state = MutationOperationState::CacheUninitializing {
@@ -5421,10 +5473,12 @@ impl MutationRequestOperation {
                                 epoch,
                                 resolve,
                             };
-                            return OperationTransition::SubmitCacheWork {
-                                work,
-                                suspended: self,
-                            };
+                            return MutationStep::Transition(
+                                OperationTransition::SubmitCacheWork {
+                                    work,
+                                    suspended: self,
+                                },
+                            );
                         }
                     }
                     if let PreparedMutationRequest::DataWrite(authority) = &self.request {
@@ -5434,7 +5488,9 @@ impl MutationRequestOperation {
                             access,
                         ) {
                             Ok(plan) => plan,
-                            Err(error) => return self.complete_error(owned, error),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
                         };
                         match plan {
                             crate::request::file_info::WriteCachePlan::Cached {
@@ -5443,10 +5499,12 @@ impl MutationRequestOperation {
                             } => {
                                 self.state =
                                     MutationOperationState::CacheWriting { owned, publication };
-                                return OperationTransition::SubmitCacheWork {
-                                    work,
-                                    suspended: self,
-                                };
+                                return MutationStep::Transition(
+                                    OperationTransition::SubmitCacheWork {
+                                        work,
+                                        suspended: self,
+                                    },
+                                );
                             }
                             crate::request::file_info::WriteCachePlan::PurgeBeforeDirect(work) => {
                                 self.state = MutationOperationState::CachePurging {
@@ -5454,26 +5512,28 @@ impl MutationRequestOperation {
                                     epoch,
                                     resolve,
                                 };
-                                return OperationTransition::SubmitCacheWork {
-                                    work,
-                                    suspended: self,
-                                };
+                                return MutationStep::Transition(
+                                    OperationTransition::SubmitCacheWork {
+                                        work,
+                                        suspended: self,
+                                    },
+                                );
                             }
                             crate::request::file_info::WriteCachePlan::Direct => {}
                         }
                     }
                 }
-                self.advance_resolution(
+                MutationStep::Resolve {
+                    operation: self,
                     owned,
-                    ResolutionAttempt {
+                    attempt: ResolutionAttempt {
                         epoch,
                         resolve,
                         size_changes,
                         deletion,
                     },
                     event,
-                    access,
-                )
+                }
             }
             MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CachePurging { .. }
@@ -5484,10 +5544,12 @@ impl MutationRequestOperation {
             MutationOperationState::PreparingSizeChange { owned, .. }
             | MutationOperationState::PreparingDeletion { owned, .. }
             | MutationOperationState::PreparingWriteOpen { owned } => match event {
-                OperationEvent::CancelRequested => {
-                    self.complete_error(owned, DriverError::from(Error::OperationCancelled))
-                }
-                _ => self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                OperationEvent::CancelRequested => MutationStep::Transition(
+                    self.complete_error(owned, DriverError::from(Error::OperationCancelled)),
+                ),
+                _ => MutationStep::Transition(
+                    self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                ),
             },
             MutationOperationState::AwaitingIntent {
                 owned,
@@ -5496,14 +5558,21 @@ impl MutationRequestOperation {
                 size_changes,
                 deletion,
             } => {
-                let intent = match event {
-                    OperationEvent::IntentGranted(intent) => intent,
-                    OperationEvent::CancelRequested => {
-                        return self
-                            .complete_error(owned, DriverError::from(Error::OperationCancelled));
-                    }
-                    _ => return self.complete_error(owned, DriverError::InvalidDeviceRequest),
-                };
+                let intent =
+                    match event {
+                        OperationEvent::IntentGranted(intent) => intent,
+                        OperationEvent::CancelRequested => {
+                            return MutationStep::Transition(self.complete_error(
+                                owned,
+                                DriverError::from(Error::OperationCancelled),
+                            ));
+                        }
+                        _ => {
+                            return MutationStep::Transition(
+                                self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                            );
+                        }
+                    };
                 let reserved = access.reserve_mutation(resolved, intent);
                 let reserved = match reserved {
                     Ok(reserved) => reserved,
@@ -5513,7 +5582,9 @@ impl MutationRequestOperation {
                     }
                     Err(error) => {
                         drop(publication);
-                        return self.complete_error(owned, DriverError::from(error));
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::from(error)),
+                        );
                     }
                 };
                 let stream_metadata =
@@ -5522,13 +5593,17 @@ impl MutationRequestOperation {
                         access.volume_geometry().cluster_size(),
                     ) {
                         Ok(stream_metadata) => stream_metadata,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                 if let (Some(prepared), Some(cleanup)) =
                     (deletion.as_ref(), self.cleanup_deletion.as_ref())
                     && prepared.node() != cleanup.node()
                 {
-                    return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                    return MutationStep::Transition(
+                        self.complete_error(owned, DriverError::InternalInvariantViolation),
+                    );
                 }
                 if deletion.is_none()
                     && let Some(cleanup) = self.cleanup_deletion.as_ref()
@@ -5537,7 +5612,9 @@ impl MutationRequestOperation {
                         .prepare_stream_deletion(cleanup.file_control_block(), cleanup.node())
                     {
                         Ok(stream) => stream,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     if let Some(stream) = stream {
                         drop(stream_metadata);
@@ -5547,10 +5624,12 @@ impl MutationRequestOperation {
                             owned,
                             size_changes,
                         };
-                        return OperationTransition::SubmitCacheWorkAfterIntentRelease {
-                            work: crate::irp::CacheWork::prepare_deletion(stream),
-                            suspended: self,
-                        };
+                        return MutationStep::Transition(
+                            OperationTransition::SubmitCacheWorkAfterIntentRelease {
+                                work: crate::irp::CacheWork::prepare_deletion(stream),
+                                suspended: self,
+                            },
+                        );
                     }
                 }
                 let deletion_node = deletion.as_ref().map(|prepared| prepared.node());
@@ -5562,7 +5641,9 @@ impl MutationRequestOperation {
                             deletion_node,
                         ) {
                             Ok(matches) => matches,
-                            Err(error) => return self.complete_error(owned, error),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
                         };
                         if matches {
                             Some(prepared)
@@ -5577,7 +5658,9 @@ impl MutationRequestOperation {
                     let mut plan =
                         match access.prepare_stream_size_changes(&stream_metadata, deletion_node) {
                             Ok(plan) => plan,
-                            Err(error) => return self.complete_error(owned, error),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
                         };
                     if let Some(stream) = plan.next() {
                         drop(stream_metadata);
@@ -5588,28 +5671,38 @@ impl MutationRequestOperation {
                             plan,
                             deletion,
                         };
-                        return OperationTransition::SubmitCacheWorkAfterIntentRelease {
-                            work: crate::irp::CacheWork::prepare_size_change(stream),
-                            suspended: self,
-                        };
+                        return MutationStep::Transition(
+                            OperationTransition::SubmitCacheWorkAfterIntentRelease {
+                                work: crate::irp::CacheWork::prepare_size_change(stream),
+                                suspended: self,
+                            },
+                        );
                     }
                     let empty = match plan.into_prepared() {
                         Ok(empty) => empty,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     if empty.is_some() {
-                        return self.complete_error(owned, DriverError::InternalInvariantViolation);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     }
                 }
                 let publication = match publication.prepare(stream_metadata) {
                     Ok(publication) => publication,
-                    Err(error) => return self.complete_error(owned, error),
+                    Err(error) => {
+                        return MutationStep::Transition(self.complete_error(owned, error));
+                    }
                 };
                 let slots = {
                     let reservations = access.reserve_epoch_publication();
                     match reservations {
                         Ok(slots) => slots,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     }
                 };
                 self.state = MutationOperationState::AwaitingCommit {
@@ -5620,10 +5713,10 @@ impl MutationRequestOperation {
                     size_changes,
                     deletion,
                 };
-                OperationTransition::RequestCommit {
+                MutationStep::Transition(OperationTransition::RequestCommit {
                     ticket: self.ticket,
                     suspended: self,
-                }
+                })
             }
             MutationOperationState::AwaitingCommit {
                 owned,
@@ -5633,33 +5726,50 @@ impl MutationRequestOperation {
                 size_changes,
                 deletion,
             } => {
-                let commit = match event {
-                    OperationEvent::CommitGranted(commit) => commit,
-                    OperationEvent::CancelRequested => {
-                        return self
-                            .complete_error(owned, DriverError::from(Error::OperationCancelled));
-                    }
-                    _ => return self.complete_error(owned, DriverError::InvalidDeviceRequest),
-                };
+                let commit =
+                    match event {
+                        OperationEvent::CommitGranted(commit) => commit,
+                        OperationEvent::CancelRequested => {
+                            return MutationStep::Transition(self.complete_error(
+                                owned,
+                                DriverError::from(Error::OperationCancelled),
+                            ));
+                        }
+                        _ => {
+                            return MutationStep::Transition(
+                                self.complete_error(owned, DriverError::InvalidDeviceRequest),
+                            );
+                        }
+                    };
                 let ready: Result<CommitReadyMutation, Error> =
                     access.prepare_mutation_commit(reserved, commit);
                 let ready = match ready {
                     Ok(ready) => ready,
-                    Err(error) => return self.complete_error(owned, DriverError::from(error)),
+                    Err(error) => {
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::from(error)),
+                        );
+                    }
                 };
                 let mut publication = publication;
                 if let Some((fcb, open_count)) = publication.oplock_reservation_target() {
                     if !access.oplock_grant_available(fcb) {
-                        return self.complete_error(owned, DriverError::OplockNotGranted);
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::OplockNotGranted),
+                        );
                     }
                     let stream = match access.acquire_claimed_oplock_stream_lease(fcb) {
                         Ok(stream) => stream,
-                        Err(error) => return self.complete_error(owned, error),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     let reservation =
                         match AtomicOplockReservation::acquire(stream, open_count, &owned) {
                             Ok(reservation) => reservation,
-                            Err(error) => return self.complete_error(owned, error),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
                         };
                     publication.accept_oplock_reservation(reservation);
                 }
@@ -5672,27 +5782,31 @@ impl MutationRequestOperation {
                     size_changes,
                     deletion,
                 };
-                self.drive_ordered(context, ready.start())
+                MutationStep::Transition(self.drive_ordered(context, ready.start()))
             }
             MutationOperationState::CommitIo { context, phase } => {
-                self.advance_commit_io(context, phase, event, access)
+                MutationStep::Transition(self.advance_commit_io(context, phase, event, access))
             }
             MutationOperationState::AwaitingVisibility { context, durable } => {
                 let OperationEvent::VisibilityGranted(visibility) = event else {
-                    return self.fail_commit_path(context, Error::DeviceIo, access);
+                    return MutationStep::Transition(self.fail_commit_path(
+                        context,
+                        Error::DeviceIo,
+                        access,
+                    ));
                 };
                 self.state = MutationOperationState::PublishingDurable {
                     context,
                     durable,
                     visibility,
                 };
-                OperationTransition::Publish { publication: self }
+                MutationStep::Transition(OperationTransition::Publish { publication: self })
             }
             MutationOperationState::PublishingDurable { context, .. } => {
-                self.fail_commit_path(context, Error::DeviceIo, access)
+                MutationStep::Transition(self.fail_commit_path(context, Error::DeviceIo, access))
             }
             MutationOperationState::AwaitingCheckpoint(pending) => match event {
-                OperationEvent::Admitted => OperationTransition::Wait {
+                OperationEvent::Admitted => MutationStep::Transition(OperationTransition::Wait {
                     condition: WaitCondition::Checkpoint {
                         epoch: pending.epoch(),
                     },
@@ -5700,10 +5814,14 @@ impl MutationRequestOperation {
                         self.state = MutationOperationState::AwaitingCheckpoint(pending);
                         self
                     },
-                },
+                }),
                 OperationEvent::CheckpointGranted(checkpoint) => {
                     let (operation, publication, epoch) = pending.into_parts();
-                    self.drive_checkpoint_home(operation.start(checkpoint), publication, epoch)
+                    MutationStep::Transition(self.drive_checkpoint_home(
+                        operation.start(checkpoint),
+                        publication,
+                        epoch,
+                    ))
                 }
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
@@ -5714,28 +5832,36 @@ impl MutationRequestOperation {
                 | OperationEvent::VisibilityGranted(_)
                 | OperationEvent::BarrierReleased(_) => {
                     let (_, publication, _) = pending.into_parts();
-                    self.fail_checkpoint(
+                    MutationStep::Transition(self.fail_checkpoint(
                         publication,
                         StorageFailureClass::DurabilityUnknown { completed: 0 },
                         access,
-                    )
+                    ))
                 }
             },
             MutationOperationState::CheckpointIo {
                 phase,
                 publication,
                 epoch,
-            } => self.advance_checkpoint_io(phase, publication, epoch, event, access),
-            MutationOperationState::PublishingCheckpoint { publication, .. } => self
-                .fail_checkpoint(
+            } => MutationStep::Transition(self.advance_checkpoint_io(
+                phase,
+                publication,
+                epoch,
+                event,
+                access,
+            )),
+            MutationOperationState::PublishingCheckpoint { publication, .. } => {
+                MutationStep::Transition(self.fail_checkpoint(
                     publication,
                     StorageFailureClass::DurabilityUnknown { completed: 0 },
                     access,
-                ),
-            MutationOperationState::Terminal => OperationTransition::Complete,
+                ))
+            }
+            MutationOperationState::Terminal => {
+                MutationStep::Transition(OperationTransition::Complete)
+            }
         }
     }
-
 }
 
 impl MountedVolumeOperation for MutationRequestOperation {
@@ -5748,7 +5874,12 @@ impl MountedVolumeOperation for MutationRequestOperation {
         loop {
             match step {
                 MutationStep::Transition(transition) => return transition,
-                MutationStep::Resolve { operation, owned, attempt, event } => {
+                MutationStep::Resolve {
+                    operation,
+                    owned,
+                    attempt,
+                    event,
+                } => {
                     step = operation.advance_resolution(owned, attempt, event, access);
                 }
             }
