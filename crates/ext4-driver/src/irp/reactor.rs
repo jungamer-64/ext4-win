@@ -515,8 +515,10 @@ pub(crate) enum OperationTransition {
         /// Publication values and continuation prepared before durable I/O.
         publication: Box<dyn InfalliblePublication>,
     },
-    /// Operation has consumed every terminal authority it owned.
-    Complete,
+    /// Release operation authority before notifying upper drivers of the prepared result.
+    Complete(super::lifecycle::PreparedIrpCompletion),
+    /// Operation has no remaining IRP authority (delegated or already acknowledged).
+    Retired,
 }
 
 /// Device reactor lifecycle.

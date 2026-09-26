@@ -833,8 +833,8 @@ impl OwnedIrp {
         }
     }
 
-    /// Completes the IRP through the I/O Manager.
-    pub(crate) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
+    /// Releases request capture and cancellation, retaining only terminal notification authority.
+    pub(crate) fn prepare_completion(self, completion: IrpCompletion) -> PreparedIrpCompletion {
         let Self {
             target,
             context,
@@ -844,12 +844,13 @@ impl OwnedIrp {
         #[cfg(not(test))]
         drop(active_cancellation);
         drop(context);
-        target.irp.complete(completion)
+        target.irp.write_status_block(completion);
+        PreparedIrpCompletion { irp: target.irp, status: completion.status() }
     }
 
     /// Completes the IRP from a fallible request result.
-    pub(crate) fn complete_result(self, result: DriverResult<IrpCompletion>) -> NTSTATUS {
-        self.complete(match result {
+    pub(crate) fn prepare_result(self, result: DriverResult<IrpCompletion>) -> PreparedIrpCompletion {
+        self.prepare_completion(match result {
             Ok(completion) => completion,
             Err(error) => IrpCompletion::from_error(error),
         })
@@ -859,7 +860,7 @@ impl OwnedIrp {
     ///
     /// A successful reparse transfers the auxiliary buffer to the I/O Manager immediately before
     /// completing with `STATUS_REPARSE`. Failed results never transfer an allocation.
-    pub(crate) fn complete_create_result(self, result: DriverResult<CreateCompletion>) -> NTSTATUS {
+    pub(crate) fn prepare_create_result(self, result: DriverResult<CreateCompletion>) -> PreparedIrpCompletion {
         let Self {
             target,
             context,
@@ -869,16 +870,19 @@ impl OwnedIrp {
         #[cfg(not(test))]
         drop(active_cancellation);
         drop(context);
-        match result {
-            Ok(CreateCompletion::Handle(action)) => target.irp.complete_create_action(action),
+        let (status, information) = match result {
+            Ok(CreateCompletion::Handle(action)) => (wdk_sys::STATUS_SUCCESS, wdk_sys::ULONG_PTR::from(action.as_ulong())),
             Ok(CreateCompletion::OplockBreakInProgress(action)) => {
-                target.irp.complete_create_oplock_break(action)
+                (wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS, wdk_sys::ULONG_PTR::from(action.as_ulong()))
             }
             Ok(CreateCompletion::ReparseSymlink(buffer)) => {
-                target.irp.complete_create_symlink_reparse(buffer)
+                target.irp.install_create_symlink_reparse_buffer(buffer);
+                (wdk_sys::STATUS_REPARSE, wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK))
             }
-            Err(error) => target.irp.complete(IrpCompletion::from_error(error)),
-        }
+            Err(error) => (error.ntstatus(), 0),
+        };
+        target.irp.write_status_and_information(status, information);
+        PreparedIrpCompletion { irp: target.irp, status }
     }
 
     /// Transfers this queued directory-change IRP's terminal completion authority to FsRtl.
@@ -971,8 +975,8 @@ impl OwnedIrp {
     }
 
     /// Completes the IRP as canceled.
-    pub(super) fn complete_cancelled(self) -> NTSTATUS {
-        self.complete(IrpCompletion::cancelled())
+    pub(super) fn prepare_cancelled(self) -> PreparedIrpCompletion {
+        self.prepare_completion(IrpCompletion::cancelled())
     }
 }
 
@@ -984,6 +988,19 @@ impl OwnedIrp {
 // thread and an ext4win-owned lower completion envelope. No requestor-context access occurs while
 // the lower stack owns that envelope.
 unsafe impl Send for OwnedIrp {}
+
+/// Unique terminal IRP notification after all request-owned resources have been released.
+///
+/// The reactor must relinquish scheduling and actor authority before consuming this value.
+/// Preparation cannot allocate or fail after a durable publication has committed.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct PreparedIrpCompletion {
+    /// Live IRP whose status and auxiliary buffer have already been published.
+    irp: KernelIrp,
+    /// Saved status; notification may free the IRP before returning.
+    status: NTSTATUS,
+}
 
 /// Non-null IRP pointer kept private to the typed dispatch boundary.
 #[derive(Clone, Copy, Debug)]
