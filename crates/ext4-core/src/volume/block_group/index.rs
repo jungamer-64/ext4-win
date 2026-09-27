@@ -1,7 +1,7 @@
 //! Mount-private resumable allocation validation.
 
 use super::*;
-use crate::disk::storage::{StorageTarget, StorageTranscript};
+use crate::disk::storage::StorageTranscript;
 use crate::disk_format::extent::{ExtentAllocation, ExtentAllocationCursor};
 use crate::disk_format::inode::InodeData;
 use crate::volume::orphan::ValidatedOrphanInventory;
@@ -69,7 +69,7 @@ enum BitmapRead {
 struct InodeTableWindow {
     /// Absolute device offset of the first buffered byte.
     offset: ByteOffset,
-    /// At most 64 KiB, bounded by the current group's inode table.
+    /// At most 1 MiB, bounded by the current group's inode table.
     bytes: Vec<u8>,
 }
 
@@ -174,7 +174,9 @@ impl AllocationIndexBuild {
         loop {
             let result = self.step(&mut OperationDevice::new(transcript), superblock, orphans)?;
             // A successful step never retains a pending request or borrows transcript bytes.
-            *transcript = StorageTranscript::new(StorageTarget::Filesystem, transcript.len());
+            // The recovered filesystem is immutable throughout this builder. Keep only the
+            // latest completed block so adjacent descriptors share one lower transfer.
+            transcript.retire_decoded_stage(1)?;
             if let Some(index) = result {
                 return Ok(index);
             }
@@ -581,7 +583,7 @@ fn read_group_inode_record(
         .and_then(|window| window.record(offset, size))
         .is_none()
     {
-        const WINDOW_BYTES: u64 = 64 * 1024;
+        const WINDOW_BYTES: u64 = 1024 * 1024;
         let start = relative
             .checked_sub(relative % WINDOW_BYTES)
             .ok_or(Error::ArithmeticOverflow)?;
@@ -638,7 +640,9 @@ fn read_resize_pointer_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk::storage::{CompletedStorageTransfer, StorageCompletion, StorageRequest};
+    use crate::disk::storage::{
+        CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
+    };
 
     /// Hand-encoded geometry and descriptor, independent of the range accumulator.
     /// # Errors
@@ -646,13 +650,14 @@ mod tests {
     fn allocation_fixture(
         cluster_log: u32,
         blocks: u32,
+        inodes_per_group: u32,
     ) -> Result<(Superblock, MountedAllocationSnapshot)> {
         let mut primary = [0_u8; 1024];
         let inodes = blocks
             .checked_sub(1)
             .ok_or(Error::InvalidSuperblock)?
             .div_ceil(8192)
-            .checked_mul(128)
+            .checked_mul(inodes_per_group)
             .ok_or(Error::ArithmeticOverflow)?;
         for (offset, value) in [
             (0, inodes),
@@ -666,7 +671,7 @@ mod tests {
                     .checked_shr(cluster_log)
                     .ok_or(Error::ArithmeticOverflow)?,
             ),
-            (40, 128),
+            (40, inodes_per_group),
             (84, 11),
             (92, 4),
             (96, 0x42),
@@ -722,6 +727,115 @@ mod tests {
     }
 
     /// # Errors
+    /// Returns fixture, storage completion or descriptor validation failures.
+    /// # Panics
+    /// Fails if adjacent descriptors require repeated storage or lose their writable offsets.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify the storage contract while fixture failures propagate"
+    )]
+    fn adjacent_descriptors_share_a_completed_filesystem_block() -> Result<()> {
+        let (superblock, _) = allocation_fixture(0, 16385, 128)?;
+        let mut transcript = StorageTranscript::new(
+            StorageTarget::Filesystem,
+            DeviceLength::from_bytes(16385 * 1024),
+        );
+        assert!(matches!(
+            BlockGroupDescriptor::read_from(
+                &mut OperationDevice::new(&mut transcript),
+                &superblock,
+                BlockGroupId::from_u32(0)
+            ),
+            Err(Error::OperationSuspended)
+        ));
+        let mut request = transcript.take_pending_request()?;
+        let StorageRequest::Read { offset, buffer, .. } = &mut request else {
+            return Err(Error::DeviceIo);
+        };
+        assert_eq!(offset.get(), 2048);
+        assert_eq!(buffer.len(), 1024);
+        for (offset, value) in [(0, 3), (4, 4), (8, 5), (32, 8195), (36, 8196), (40, 8197)] {
+            put_le_u32(buffer, disk_offset(offset), value)?;
+        }
+        let count = request.byte_count();
+        transcript.complete(StorageCompletion::success(
+            CompletedStorageTransfer::from_request(request),
+            count,
+        ))?;
+        for (group, offset, bitmap) in [(0, 2048, 3), (1, 2080, 8195)] {
+            let descriptor = BlockGroupDescriptor::read_from(
+                &mut OperationDevice::new(&mut transcript),
+                &superblock,
+                BlockGroupId::from_u32(group),
+            )?;
+            assert_eq!(descriptor.offset().get(), offset);
+            assert_eq!(descriptor.block_bitmap().get(), bitmap);
+            assert_eq!(descriptor.bytes().len(), 32);
+            transcript.retire_decoded_stage(1)?;
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture, storage or inode decoding failures.
+    /// # Panics
+    /// Fails if a large table rereads a completed window or crosses its fixed read-ahead bound.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify bounded I/O while fixture failures propagate"
+    )]
+    fn large_inode_table_reads_use_bounded_contiguous_windows() -> Result<()> {
+        let (superblock, allocation) = allocation_fixture(0, 4096, 8192)?;
+        let group = allocation.groups.first().ok_or(Error::InvalidSuperblock)?;
+        let mut transcript = StorageTranscript::new(
+            StorageTarget::Filesystem,
+            DeviceLength::from_bytes(4096 * 1024),
+        );
+        let mut table = None;
+        let mut reads = 0;
+        for bit in [0, 4095, 4096, 8191] {
+            let position = InodeBitmapPosition::new(group.group, bit);
+            let result = read_group_inode_record(
+                &mut OperationDevice::new(&mut transcript),
+                &superblock,
+                group,
+                position,
+                &mut table,
+            );
+            if matches!(result, Err(Error::OperationSuspended)) {
+                let request = transcript.take_pending_request()?;
+                assert_eq!(request.byte_count(), 1024 * 1024);
+                assert_eq!(
+                    request.offset(),
+                    Some(ByteOffset::new(5120 + u64::from(bit / 4096) * 1024 * 1024))
+                );
+                let count = request.byte_count();
+                transcript.complete(StorageCompletion::success(
+                    CompletedStorageTransfer::from_request(request),
+                    count,
+                ))?;
+                reads += 1;
+            } else {
+                result?;
+            }
+            let inode = read_group_inode_record(
+                &mut OperationDevice::new(&mut transcript),
+                &superblock,
+                group,
+                position,
+                &mut table,
+            )?;
+            assert_eq!(inode.id.as_u32(), bit + 1);
+            assert_eq!(inode.offset.get(), 5120 + u64::from(bit) * 256);
+            transcript = StorageTranscript::new(StorageTarget::Filesystem, transcript.len());
+        }
+        assert_eq!(reads, 2);
+        Ok(())
+    }
+
+    /// # Errors
     /// Returns fixture or range-validation errors.
     /// # Panics
     /// Fails if distinct blocks in a shared BIGALLOC cluster lose their separate counts.
@@ -731,7 +845,7 @@ mod tests {
         reason = "test assertions report contract failures while fixture setup propagates errors"
     )]
     fn range_counts_preserve_cluster_boundaries_and_shared_xattr_owners() -> Result<()> {
-        let (superblock, allocation) = allocation_fixture(2, 4096)?;
+        let (superblock, allocation) = allocation_fixture(2, 4096, 128)?;
         let mut ranges = Vec::new();
         for (start, blocks, ownership) in [
             (9, 1, BlockOwnership::SharedXattr),
@@ -763,7 +877,7 @@ mod tests {
         reason = "test assertions report contract failures while fixture setup propagates errors"
     )]
     fn allocation_publication_rejects_conflicts_and_unallocated_blocks() -> Result<()> {
-        let (superblock, mut allocation) = allocation_fixture(0, 4096)?;
+        let (superblock, mut allocation) = allocation_fixture(0, 4096, 128)?;
         for ownership in [BlockOwnership::Exclusive, BlockOwnership::SharedXattr] {
             for reverse in [false, true] {
                 let mut ranges = Vec::new();
@@ -821,7 +935,7 @@ mod tests {
         reason = "test assertions report contract failures while fixture setup propagates errors"
     )]
     fn metadata_ranges_mark_only_intersecting_allocation_clusters() -> Result<()> {
-        let (superblock, _) = allocation_fixture(2, 4096)?;
+        let (superblock, _) = allocation_fixture(2, 4096, 128)?;
         let mut bitmap = memory::repeated_vec(0, 1024)?;
         mark_metadata_range(
             &mut bitmap,
@@ -832,7 +946,7 @@ mod tests {
         )?;
         assert_eq!(bitmap.first().copied(), Some(0b111));
 
-        let (superblock, _) = allocation_fixture(2, 16385)?;
+        let (superblock, _) = allocation_fixture(2, 16385, 128)?;
         for (group, byte, mask) in [(0, 255, 0x80), (1, 0, 1)] {
             bitmap.fill(0);
             mark_metadata_range(
@@ -867,7 +981,7 @@ mod tests {
         reason = "test assertions report contract failures while fixture setup propagates errors"
     )]
     fn index_build_consumes_metadata_once_across_individual_read_completions() -> Result<()> {
-        let (superblock, _) = allocation_fixture(0, 4096)?;
+        let (superblock, _) = allocation_fixture(0, 4096, 128)?;
         let mut transcript = StorageTranscript::new(
             StorageTarget::Filesystem,
             DeviceLength::from_bytes(4096 * 1024),
@@ -929,7 +1043,7 @@ mod tests {
         reason = "test assertions report contract failures while fixture setup propagates errors"
     )]
     fn inode_table_window_retains_only_completed_group_bounded_reads() -> Result<()> {
-        let (superblock, allocation) = allocation_fixture(0, 4096)?;
+        let (superblock, allocation) = allocation_fixture(0, 4096, 128)?;
         let group = allocation.groups.first().ok_or(Error::InvalidSuperblock)?;
         let mut transcript = StorageTranscript::new(
             StorageTarget::Filesystem,

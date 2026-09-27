@@ -127,9 +127,29 @@ impl BlockGroupDescriptor {
         }
         let offset =
             descriptor_offset(superblock.block_size(), superblock.descriptor_size(), group)?;
-        let mut bytes =
-            memory::repeated_vec(0_u8, usize::from(superblock.descriptor_size().as_u16()))?;
-        reader.read_exact_at(offset, &mut bytes)?;
+        // A filesystem block contains multiple descriptors. Retaining that completed read in
+        // the operation transcript lets sequential scans reuse it without changing checksum scope.
+        let block_bytes = u64::from(superblock.block_size().bytes());
+        let within_block = offset
+            .get()
+            .checked_rem(block_bytes)
+            .ok_or(Error::InvalidSuperblock)?;
+        let block_offset = ByteOffset::new(
+            offset
+                .get()
+                .checked_sub(within_block)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        let mut block = memory::repeated_vec(
+            0_u8,
+            usize::try_from(block_bytes).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        reader.read_exact_at(block_offset, &mut block)?;
+        let start = usize::try_from(within_block).map_err(|_| Error::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(usize::from(superblock.descriptor_size().as_u16()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let bytes = memory::copied_slice(block.get(start..end).ok_or(Error::InvalidSuperblock)?)?;
         verify_block_group_descriptor_checksum(superblock, group, &bytes)?;
         let block_bitmap = descriptor_block_address(
             &bytes,
