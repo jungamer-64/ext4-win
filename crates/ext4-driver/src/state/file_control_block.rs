@@ -462,8 +462,8 @@ impl DurablePublicationOutcome {
 
 /// Mutable FCB lifecycle state owned exclusively by `FileControlBlockLedger`.
 pub(super) struct FileControlBlockOpenState {
-    /// I/O manager share-access accounting for this inode identity.
-    pub(super) share_access: SHARE_ACCESS,
+    /// Active FILE_OBJECT opens and their separate native sharing constraints.
+    pub(super) shares: FileObjectShares,
     /// Explicit stream lifetime across handle and cache/mapping residency domains.
     pub(super) lifetime: StreamLifetimeState,
     /// One namespace deletion truth shared by every handle for this inode.
@@ -474,15 +474,7 @@ impl FileControlBlockOpenState {
     /// Creates empty share accounting for the first FILE_OBJECT reference.
     pub(super) const fn new() -> Self {
         Self {
-            share_access: SHARE_ACCESS {
-                OpenCount: 0,
-                Readers: 0,
-                Writers: 0,
-                Deleters: 0,
-                SharedRead: 0,
-                SharedWrite: 0,
-                SharedDelete: 0,
-            },
+            shares: FileObjectShares::new(),
             lifetime: StreamLifetimeState::OpenHandles {
                 handles: NonZeroU32::MIN,
                 deferred_leases: 0,

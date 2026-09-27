@@ -29,7 +29,7 @@ pub(super) struct VolumeControlPlane {
     /// Current mount/lock state.
     pub(super) state: MountedVolumeState,
     /// Share claims for direct user volume opens.
-    handles: VolumeHandleLedger,
+    handles: FileObjectShares,
     /// Direct-volume FILE_OBJECT allocations retained until Close.
     volume_file_objects: u32,
 }
@@ -39,7 +39,7 @@ impl VolumeControlPlane {
     pub(super) const fn mounted() -> Self {
         Self {
             state: MountedVolumeState::Mounted,
-            handles: VolumeHandleLedger::new(),
+            handles: FileObjectShares::new(),
             volume_file_objects: 0,
         }
     }
