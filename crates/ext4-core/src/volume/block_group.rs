@@ -30,95 +30,8 @@ impl GroupMetadataLayout {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-/// Mounted allocation-cluster ownership index used by write transactions.
-pub(super) struct ClusterReferenceIndex {
-    /// Reference count per allocation cluster with at least one known owner, sorted by cluster.
-    refs: Vec<ClusterReference>,
-}
-
-impl ClusterReferenceIndex {
-    /// Copies the mounted cluster-reference index without infallible allocation.
-    /// # Errors
-    ///
-    /// Returns an error when copying any reference-index vector cannot allocate.
-    pub(super) fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            refs: memory::copied_slice(&self.refs)?,
-        })
-    }
-
-    /// Returns the known mounted reference count for one cluster.
-    pub(super) fn count(&self, cluster: ClusterAddress) -> u32 {
-        self.refs
-            .binary_search_by_key(&cluster, |reference| reference.cluster)
-            .ok()
-            .and_then(|index| self.refs.get(index))
-            .map_or(0, |reference| reference.count)
-    }
-
-    /// Applies committed staged reference deltas.
-    /// # Errors
-    ///
-    /// Returns an error when a staged delta would drive a mounted cluster reference count below
-    /// zero or overflow its signed representation.
-    pub(super) fn apply_deltas(&mut self, deltas: &[ClusterReferenceDelta]) -> Result<()> {
-        for delta in deltas {
-            let updated = self.apply_delta(delta.cluster, delta.delta)?;
-            if updated < 0 {
-                return Err(Error::ClusterReferenceConflict);
-            }
-        }
-        Ok(())
-    }
-
-    /// Applies one signed delta and returns the resulting signed count.
-    /// # Errors
-    ///
-    /// Returns an error when reference-count arithmetic overflows or an existing reference slot
-    /// cannot be found after lookup.
-    pub(super) fn apply_delta(&mut self, cluster: ClusterAddress, delta: i32) -> Result<i32> {
-        if let Ok(index) = self
-            .refs
-            .binary_search_by_key(&cluster, |reference| reference.cluster)
-        {
-            let current = i32::try_from(
-                self.refs
-                    .get(index)
-                    .ok_or(Error::ClusterReferenceConflict)?
-                    .count,
-            )
-            .map_err(|_| Error::ArithmeticOverflow)?;
-            let updated = current
-                .checked_add(delta)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if updated <= 0 {
-                let _removed = self.refs.try_remove_at(index)?;
-            } else {
-                self.refs
-                    .get_mut(index)
-                    .ok_or(Error::ClusterReferenceConflict)?
-                    .count = u32::try_from(updated).map_err(|_| Error::ArithmeticOverflow)?;
-            }
-            Ok(updated)
-        } else if delta > 0 {
-            let insertion = self
-                .refs
-                .binary_search_by_key(&cluster, |reference| reference.cluster)
-                .unwrap_or_else(core::convert::identity);
-            self.refs.try_insert(
-                insertion,
-                ClusterReference {
-                    cluster,
-                    count: u32::try_from(delta).map_err(|_| Error::ArithmeticOverflow)?,
-                },
-            )?;
-            Ok(delta)
-        } else {
-            Ok(delta)
-        }
-    }
-}
+mod references;
+pub(super) use references::ClusterReferenceIndex;
 
 /// Reads all static group layouts without treating bitmap contents as authoritative.
 /// # Errors
@@ -374,15 +287,6 @@ mod tests {
         assert_eq!(index.count(ClusterAddress::new(5)), 1);
         assert_eq!(index.count(ClusterAddress::new(9)), 1);
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-/// Mounted reference count for one allocation cluster.
-struct ClusterReference {
-    /// Allocation cluster.
-    cluster: ClusterAddress,
-    /// Number of known owners in the mounted image.
-    count: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
