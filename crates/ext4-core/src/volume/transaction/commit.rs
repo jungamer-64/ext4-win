@@ -323,8 +323,9 @@ impl ReservedMutation {
         let version_publication =
             coordinator.prepare_version_publication(&self.resolved.observed)?;
 
-        let mut durable_clusters = current_epoch.clusters.try_clone()?;
-        durable_clusters.apply_deltas(&self.resolved.cluster_deltas)?;
+        let durable_clusters = current_epoch
+            .clusters
+            .with_deltas(&self.resolved.cluster_deltas)?;
         let checkpoint_clusters = durable_clusters.try_clone()?;
         let durable_keys = match self.resolved.fscrypt_keys_update {
             Some(keys) => keys,

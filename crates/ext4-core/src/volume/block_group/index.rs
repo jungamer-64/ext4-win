@@ -454,7 +454,7 @@ fn finish_ranges(
 ) -> Result<ClusterReferenceIndex> {
     memory::heap_sort_by(&mut ranges, |left, right| left.start.cmp(&right.start))?;
     let mut previous = None;
-    let mut refs: Vec<ClusterReference> = Vec::new();
+    let mut index = ClusterReferenceIndex::new();
     for range in ranges {
         if previous.is_some_and(|previous| !range.can_follow(previous)) {
             return Err(Error::ClusterReferenceConflict);
@@ -465,36 +465,69 @@ fn finish_ranges(
             .get()
             .checked_sub(1)
             .ok_or(Error::ArithmeticOverflow)?;
-        let _last_cluster = superblock.cluster_of_block(BlockAddress::new(last))?;
-        let mut block = range.start;
-        while block < range.end {
-            let cluster = superblock.cluster_of_block(block)?;
-            if allocation.cluster_state(superblock, cluster)? != BitmapBitState::Used {
-                return Err(Error::ClusterReferenceConflict);
-            }
-            let cluster_end = superblock
-                .first_block_of_cluster(cluster)?
+        let first_cluster = superblock.cluster_of_block(range.start)?;
+        let last_cluster = superblock.cluster_of_block(BlockAddress::new(last))?;
+        let end_cluster = ClusterAddress::new(
+            last_cluster
                 .get()
-                .checked_add(u64::from(superblock.blocks_in_cluster(cluster)?))
-                .ok_or(Error::ArithmeticOverflow)?;
-            let end = core::cmp::min(cluster_end, range.end.get());
-            let count = u32::try_from(
-                end.checked_sub(block.get())
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .map_err(|_| Error::ArithmeticOverflow)?;
-            if let Some(last) = refs.last_mut().filter(|last| last.cluster == cluster) {
-                last.count = last
-                    .count
-                    .checked_add(count)
-                    .ok_or(Error::ArithmeticOverflow)?;
-            } else {
-                refs.try_push(ClusterReference { cluster, count })?;
-            }
-            block = BlockAddress::new(end);
-        }
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        allocation.require_allocated_clusters(superblock, first_cluster, end_cluster)?;
+        append_range_counts(&mut index, superblock, range, first_cluster, last_cluster)?;
     }
-    Ok(ClusterReferenceIndex { refs })
+    Ok(index)
+}
+
+/// A physical range contributes at most two partial clusters and one uniform interior.
+/// # Errors
+/// Returns invalid geometry, count/address overflow or index allocation failures.
+fn append_range_counts(
+    index: &mut ClusterReferenceIndex,
+    superblock: &Superblock,
+    range: AllocationRange,
+    first: ClusterAddress,
+    last: ClusterAddress,
+) -> Result<()> {
+    let after_first = ClusterAddress::new(
+        first
+            .get()
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?,
+    );
+    if first == last {
+        let blocks = range
+            .end
+            .get()
+            .checked_sub(range.start.get())
+            .ok_or(Error::ArithmeticOverflow)?;
+        return index.append_owned_range(
+            first,
+            after_first,
+            u32::try_from(blocks).map_err(|_| Error::ArithmeticOverflow)?,
+        );
+    }
+    let first_end = superblock.first_block_of_cluster(after_first)?.get();
+    let first_count = u32::try_from(
+        first_end
+            .checked_sub(range.start.get())
+            .ok_or(Error::ArithmeticOverflow)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    index.append_owned_range(first, after_first, first_count)?;
+    if after_first < last {
+        index.append_owned_range(after_first, last, superblock.blocks_per_cluster().as_u32())?;
+    }
+    let last_count = u32::try_from(
+        range
+            .end
+            .get()
+            .checked_sub(superblock.first_block_of_cluster(last)?.get())
+            .ok_or(Error::ArithmeticOverflow)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    let end = ClusterAddress::new(last.get().checked_add(1).ok_or(Error::ArithmeticOverflow)?);
+    index.append_owned_range(last, end, last_count)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -519,18 +552,84 @@ impl MountedAllocationSnapshot {
         }
     }
 
-    /// Returns whether an allocation cluster was marked used in the recovered image.
+    /// Checks recovered allocation in group-bounded bitmap slices, without expanding
+    /// the physical range into one geometry lookup and index entry per cluster.
     /// # Errors
     ///
-    /// Returns an error when `cluster` cannot be mapped into the captured group bitmaps.
-    fn cluster_state(
+    /// Rejects out-of-volume ranges, free bits, invalid bitmap lengths and arithmetic.
+    fn require_allocated_clusters(
         &self,
         superblock: &Superblock,
-        cluster: ClusterAddress,
-    ) -> Result<BitmapBitState> {
-        let position = ClusterBitmapPosition::from_cluster(superblock, cluster)?;
-        cluster_bitmap_bit_state(&self.group(position.group())?.block_bitmap, position)
+        mut start: ClusterAddress,
+        end: ClusterAddress,
+    ) -> Result<()> {
+        if start >= end || end.get() > superblock.cluster_count().as_u64() {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        while start < end {
+            let position = ClusterBitmapPosition::from_cluster(superblock, start)?;
+            let available = superblock
+                .clusters_in_group(position.group())?
+                .checked_sub(position.bit())
+                .ok_or(Error::InvalidClusterGeometry)?;
+            let count = end
+                .get()
+                .checked_sub(start.get())
+                .ok_or(Error::ArithmeticOverflow)?
+                .min(u64::from(available));
+            let bit_end = position
+                .bit()
+                .checked_add(u32::try_from(count).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            require_used_bitmap_range(
+                &self.group(position.group())?.block_bitmap,
+                position.bit(),
+                bit_end,
+            )?;
+            start = ClusterAddress::new(
+                start
+                    .get()
+                    .checked_add(count)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
+        }
+        Ok(())
     }
+}
+
+/// Validates exactly the requested half-open bit interval, including partial edge bytes.
+/// # Errors
+/// Rejects empty/reversed ranges, truncated bitmaps, and any free covered bit.
+fn require_used_bitmap_range(bytes: &[u8], first: u32, end: u32) -> Result<()> {
+    if first >= end {
+        return Err(Error::InvalidClusterGeometry);
+    }
+    let first_byte = usize::try_from(first / 8).map_err(|_| Error::ArithmeticOverflow)?;
+    let end_byte = usize::try_from(end.div_ceil(8)).map_err(|_| Error::ArithmeticOverflow)?;
+    let selected = bytes
+        .get(first_byte..end_byte)
+        .ok_or(Error::InvalidClusterGeometry)?;
+    for (offset, byte) in selected.iter().copied().enumerate() {
+        let mut mask = u8::MAX;
+        if offset == 0 {
+            mask &= u8::MAX
+                .checked_shl(first % 8)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        if offset.checked_add(1) == Some(selected.len()) && !end.is_multiple_of(8) {
+            mask &= u8::MAX
+                .checked_shr(
+                    8_u32
+                        .checked_sub(end % 8)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
+        if byte & mask != mask {
+            return Err(Error::ClusterReferenceConflict);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -643,6 +742,39 @@ mod tests {
     use crate::disk::storage::{
         CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
     };
+
+    /// # Errors
+    /// Returns an invalid fixture bit position.
+    /// # Panics
+    /// Fails if a covered free bit is missed or an uncovered edge bit is required.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare the range validator with individual bit membership"
+    )]
+    fn allocation_bitmap_ranges_match_individual_bits_at_every_edge() -> Result<()> {
+        for first in 0_u32..24 {
+            for end in first + 1..=24 {
+                for free in 0_u32..24 {
+                    let mut bytes = [0xff_u8; 3];
+                    let byte = usize::try_from(free / 8).map_err(|_| Error::ArithmeticOverflow)?;
+                    *bytes.get_mut(byte).ok_or(Error::InvalidClusterGeometry)? &=
+                        !(1 << (free % 8));
+                    let expected = if (first..end).contains(&free) {
+                        Err(Error::ClusterReferenceConflict)
+                    } else {
+                        Ok(())
+                    };
+                    assert_eq!(require_used_bitmap_range(&bytes, first, end), expected);
+                }
+            }
+        }
+        assert_eq!(
+            require_used_bitmap_range(&[0xff], 0, 9),
+            Err(Error::InvalidClusterGeometry)
+        );
+        Ok(())
+    }
 
     /// Hand-encoded geometry and descriptor, independent of the range accumulator.
     /// # Errors

@@ -1132,8 +1132,10 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when staged cluster deltas conflict or the superblock free-cluster delta
     /// cannot be applied.
     fn committed_cluster_state(&self) -> Result<(ClusterReferenceIndex, Superblock)> {
-        let mut clusters = self.volume.committed_clusters()?.try_clone()?;
-        clusters.apply_deltas(self.cluster_deltas.as_slice())?;
+        let clusters = self
+            .volume
+            .committed_clusters()?
+            .with_deltas(&self.cluster_deltas)?;
         let mut superblock = self.volume.superblock;
         superblock.apply_free_cluster_delta(self.free_clusters_delta)?;
         superblock.apply_free_inode_delta(self.free_inodes_delta)?;

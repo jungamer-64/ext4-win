@@ -240,12 +240,11 @@ fn parse_resize_pointer_block(bytes: &[u8]) -> Result<Vec<BlockAddress>> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::vec;
 
-    use super::{ClusterReferenceIndex, parse_resize_pointer_block};
+    use super::parse_resize_pointer_block;
     use crate::disk::block::BlockAddress;
     use crate::disk::endian::{DiskOffset, put_le_u32};
-    use crate::disk_format::superblock::ClusterAddress;
     use crate::error::Error;
 
     /// # Panics
@@ -271,21 +270,6 @@ mod tests {
             parse_resize_pointer_block(&[0_u8; 5]),
             Err(Error::UnsupportedBlockMap)
         );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn cluster_reference_index_preserves_sorted_lookup_after_out_of_order_inserts() {
-        let mut index = ClusterReferenceIndex { refs: Vec::new() };
-        assert_eq!(index.apply_delta(ClusterAddress::new(9), 1), Ok(1));
-        assert_eq!(index.apply_delta(ClusterAddress::new(2), 1), Ok(1));
-        assert_eq!(index.apply_delta(ClusterAddress::new(5), 1), Ok(1));
-
-        assert_eq!(index.count(ClusterAddress::new(2)), 1);
-        assert_eq!(index.count(ClusterAddress::new(5)), 1);
-        assert_eq!(index.count(ClusterAddress::new(9)), 1);
     }
 }
 
