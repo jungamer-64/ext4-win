@@ -6,7 +6,7 @@ impl MetadataMutation<'_, '_> {
     /// Releases terminal inode ownership after all data and extent-node references are staged away.
     /// # Errors
     /// Returns an error for invalid xattr ownership, allocation bitmaps, or directory accounting.
-    pub(super) fn reclaim_inode(&mut self, raw: &RawInodeRecord) -> Result<()> {
+    pub(super) fn reclaim_inode(&mut self, raw: &RawInodeRecord<Vec<u8>>) -> Result<()> {
         if let Some(block) = raw.xattr_block()? {
             self.release_xattr_block_ref(block)?;
         }

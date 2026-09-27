@@ -317,7 +317,7 @@ fn validate_recovery_identity(
 pub(super) fn read_allocated_inode(
     volume: &mut EpochReadView<'_, '_>,
     inode: InodeId,
-) -> Result<RawInodeRecord> {
+) -> Result<RawInodeRecord<Vec<u8>>> {
     let position = InodeBitmapPosition::from_inode(&volume.superblock, inode)?;
     let descriptor =
         BlockGroupDescriptor::read_from(&mut volume.device, &volume.superblock, position.group())?;

@@ -1389,7 +1389,10 @@ impl EpochReadView<'_, '_> {
     ///
     /// Returns an error when `inode_id` is outside the filesystem inode range, its table offset
     /// cannot be computed, or the record cannot be read.
-    pub(super) fn read_raw_inode_record(&mut self, inode_id: InodeId) -> Result<RawInodeRecord> {
+    pub(super) fn read_raw_inode_record(
+        &mut self,
+        inode_id: InodeId,
+    ) -> Result<RawInodeRecord<Vec<u8>>> {
         if inode_id.as_u32() > self.superblock.inode_count().as_u32() {
             return Err(Error::InvalidInode);
         }

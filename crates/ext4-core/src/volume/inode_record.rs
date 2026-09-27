@@ -35,21 +35,21 @@ impl ResizeInodeBlockMap {
 /// Newly allocated zeroed inode record before an inode kind has been written.
 pub(super) struct AllocatedInodeRecord {
     /// Raw inode image owned by this typestate.
-    raw: RawInodeRecord,
+    raw: RawInodeRecord<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Allocated inode record with a nonzero link count and supported inode kind.
 pub(super) struct LiveInodeRecord {
     /// Raw inode image owned by this typestate.
-    raw: RawInodeRecord,
+    raw: RawInodeRecord<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Inode record staged after final unlink and deletion serialization.
 pub(super) struct DeletedInodeRecord {
     /// Raw inode image owned by this typestate.
-    raw: RawInodeRecord,
+    raw: RawInodeRecord<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,7 +91,7 @@ impl From<DeletedInodeRecord> for StagedInodeRecord {
     }
 }
 
-impl RawInodeRecord {
+impl RawInodeRecord<Vec<u8>> {
     /// Copies this raw inode image without infallible allocation.
     /// # Errors
     ///
@@ -221,7 +221,7 @@ impl AllocatedInodeRecord {
 
 impl LiveInodeRecord {
     /// Storage facts passed to the final allocation release boundary without copying the record.
-    pub(super) const fn raw(&self) -> &RawInodeRecord {
+    pub(super) const fn raw(&self) -> &RawInodeRecord<Vec<u8>> {
         &self.raw
     }
 
@@ -548,69 +548,7 @@ impl StagedInodeRecord {
     }
 }
 
-impl RawInodeRecord {
-    /// Returns the raw inode mode field without imposing a supported kind.
-    /// # Errors
-    ///
-    /// Returns an error when the inode mode field is not fully present.
-    pub(super) fn mode(&self) -> Result<u16> {
-        le_u16(&self.bytes, disk_offset(INODE_MODE_OFFSET))
-    }
-
-    /// Returns whether the raw inode advertises an extent tree.
-    /// # Errors
-    ///
-    /// Returns an error when `i_flags` is truncated before the extent-tree bit can be read.
-    pub(super) fn has_extent_tree(&self) -> Result<bool> {
-        Ok(self.flags()?.has_extent_tree())
-    }
-
-    /// Parses the fixed legacy block-map shape used by ext4's reserved resize inode.
-    /// # Errors
-    ///
-    /// Returns an error when any direct, single-indirect, or triple-indirect slot is nonzero, or the
-    /// required double-indirect slot is zero or truncated.
-    pub(super) fn resize_inode_block_map(&self) -> Result<ResizeInodeBlockMap> {
-        const DOUBLE_INDIRECT_INDEX: usize = 13;
-        const TRIPLE_INDIRECT_INDEX: usize = 14;
-        for index in 0..DOUBLE_INDIRECT_INDEX {
-            if self.legacy_block_pointer(index)?.get() != 0 {
-                return Err(Error::UnsupportedBlockMap);
-            }
-        }
-        let double_indirect = self.legacy_block_pointer(DOUBLE_INDIRECT_INDEX)?;
-        if double_indirect.get() == 0
-            || self.legacy_block_pointer(TRIPLE_INDIRECT_INDEX)?.get() != 0
-        {
-            return Err(Error::UnsupportedBlockMap);
-        }
-        Ok(ResizeInodeBlockMap { double_indirect })
-    }
-
-    /// Reads one legacy `i_block` pointer by slot index.
-    /// # Errors
-    ///
-    /// Returns an error when slot offset arithmetic overflows or the inode block field is truncated.
-    fn legacy_block_pointer(&self, index: usize) -> Result<BlockAddress> {
-        let offset = index
-            .checked_mul(core::mem::size_of::<u32>())
-            .and_then(|value| value.checked_add(INODE_BLOCK_OFFSET))
-            .ok_or(Error::ArithmeticOverflow)?;
-        Ok(BlockAddress::new(u64::from(le_u32(
-            &self.bytes,
-            disk_offset(offset),
-        )?)))
-    }
-
-    /// Parses the raw bytes as a validated inode.
-    /// # Errors
-    ///
-    /// Returns an error when required inode fields are truncated or encode an unsupported inode
-    /// layout.
-    pub(super) fn parse(&self) -> Result<Inode> {
-        Inode::parse(self.id, &self.bytes, self.encoding)
-    }
-
+impl RawInodeRecord<Vec<u8>> {
     /// Initializes a zeroed inode record as an empty extent-backed file.
     /// # Errors
     ///
@@ -842,17 +780,6 @@ impl RawInodeRecord {
         )
     }
 
-    /// Reads the inode flags field.
-    /// # Errors
-    ///
-    /// Returns an error when `i_flags` is truncated.
-    pub(super) fn flags(&self) -> Result<InodeFlags> {
-        Ok(InodeFlags::from_u32(le_u32(
-            &self.bytes,
-            disk_offset(INODE_FLAGS_OFFSET),
-        )?))
-    }
-
     /// Writes a validated low/high inode size pair.
     /// # Errors
     ///
@@ -1022,28 +949,6 @@ impl RawInodeRecord {
             }
         }
         self.set_creation_time(times.created(), timestamp_encoding)
-    }
-
-    /// Returns the external xattr block referenced by `i_file_acl`.
-    /// # Errors
-    ///
-    /// Returns an error when the present low or high `i_file_acl` field is truncated.
-    pub(super) fn xattr_block(&self) -> Result<Option<BlockAddress>> {
-        if self.bytes.len() <= INODE_FILE_ACL_LO_OFFSET {
-            return Ok(None);
-        }
-        let low = u64::from(le_u32(&self.bytes, disk_offset(INODE_FILE_ACL_LO_OFFSET))?);
-        let high = if self.bytes.len() > INODE_FILE_ACL_HI_OFFSET {
-            u64::from(le_u16(&self.bytes, disk_offset(INODE_FILE_ACL_HI_OFFSET))?)
-        } else {
-            0
-        };
-        let block = low | (high << 32);
-        if block == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(BlockAddress::new(block)))
-        }
     }
 
     /// Writes the external xattr block reference into `i_file_acl`.
@@ -1267,7 +1172,7 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error when `value` is outside the inode-id domain.
-    fn raw_record(value: u32) -> Result<RawInodeRecord> {
+    fn raw_record(value: u32) -> Result<RawInodeRecord<Vec<u8>>> {
         Ok(RawInodeRecord {
             id: InodeId::try_from(value)?,
             offset: ByteOffset::new(0),
@@ -1309,7 +1214,7 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error when the mode field is truncated.
-    fn mode(record: &RawInodeRecord) -> Result<u16> {
+    fn mode(record: &RawInodeRecord<Vec<u8>>) -> Result<u16> {
         le_u16(record.bytes(), disk_offset(INODE_MODE_OFFSET))
     }
 
@@ -1317,7 +1222,7 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error when the link-count field is truncated.
-    fn links(record: &RawInodeRecord) -> Result<u16> {
+    fn links(record: &RawInodeRecord<Vec<u8>>) -> Result<u16> {
         le_u16(record.bytes(), disk_offset(INODE_LINKS_COUNT_OFFSET))
     }
 
@@ -1325,7 +1230,7 @@ mod tests {
     /// # Errors
     ///
     /// Returns an error when the flags field is truncated.
-    fn flags(record: &RawInodeRecord) -> Result<u32> {
+    fn flags(record: &RawInodeRecord<Vec<u8>>) -> Result<u32> {
         le_u32(record.bytes(), disk_offset(INODE_FLAGS_OFFSET))
     }
 
@@ -1574,7 +1479,7 @@ mod tests {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum RecoverableOrphanInode {
     /// All storage must be released before the inode bitmap can be cleared.
-    Unlinked(RawInodeRecord),
+    Unlinked(RawInodeRecord<Vec<u8>>),
     /// Namespace links remain; only allocation beyond persisted EOF may be removed.
     Truncating(LiveInodeRecord),
 }
@@ -1583,7 +1488,7 @@ impl RecoverableOrphanInode {
     /// Validates the inode storage and chooses the recovery operation from its persistent links.
     /// # Errors
     /// Returns an error for unsupported mappings, invalid linked kinds, or malformed records.
-    pub(super) fn parse(raw: RawInodeRecord) -> Result<Self> {
+    pub(super) fn parse(raw: RawInodeRecord<Vec<u8>>) -> Result<Self> {
         let data = InodeData::parse(raw.id, &raw.bytes, raw.encoding)?;
         if matches!(data.storage(), InodeStorage::UnsupportedBlockMap) {
             return Err(Error::UnsupportedBlockMap);
@@ -1606,7 +1511,7 @@ impl RecoverableOrphanInode {
     }
 
     /// Current raw image, including the legacy next pointer while cleanup is incomplete.
-    pub(super) const fn raw(&self) -> &RawInodeRecord {
+    pub(super) const fn raw(&self) -> &RawInodeRecord<Vec<u8>> {
         match self {
             Self::Unlinked(raw) => raw,
             Self::Truncating(live) => &live.raw,
@@ -1614,7 +1519,7 @@ impl RecoverableOrphanInode {
     }
 
     /// Mutation is confined to the owning recovery pass.
-    pub(super) fn raw_mut(&mut self) -> &mut RawInodeRecord {
+    pub(super) fn raw_mut(&mut self) -> &mut RawInodeRecord<Vec<u8>> {
         match self {
             Self::Unlinked(raw) => raw,
             Self::Truncating(live) => &mut live.raw,
@@ -1658,6 +1563,109 @@ impl RecoverableOrphanInode {
                 raw.set_xattr_block(None)?;
                 Ok(StagedInodeRecord::Deleted(DeletedInodeRecord { raw }))
             }
+        }
+    }
+}
+
+impl<Bytes: AsRef<[u8]>> RawInodeRecord<Bytes> {
+    /// Returns the raw inode mode field without imposing a supported kind.
+    /// # Errors
+    ///
+    /// Returns an error when the inode mode field is not fully present.
+    pub(super) fn mode(&self) -> Result<u16> {
+        le_u16(self.bytes.as_ref(), disk_offset(INODE_MODE_OFFSET))
+    }
+
+    /// Returns whether the raw inode advertises an extent tree.
+    /// # Errors
+    ///
+    /// Returns an error when `i_flags` is truncated before the extent-tree bit can be read.
+    pub(super) fn has_extent_tree(&self) -> Result<bool> {
+        Ok(self.flags()?.has_extent_tree())
+    }
+
+    /// Parses the fixed legacy block-map shape used by ext4's reserved resize inode.
+    /// # Errors
+    ///
+    /// Returns an error when any direct, single-indirect, or triple-indirect slot is nonzero, or the
+    /// required double-indirect slot is zero or truncated.
+    pub(super) fn resize_inode_block_map(&self) -> Result<ResizeInodeBlockMap> {
+        const DOUBLE_INDIRECT_INDEX: usize = 13;
+        const TRIPLE_INDIRECT_INDEX: usize = 14;
+        for index in 0..DOUBLE_INDIRECT_INDEX {
+            if self.legacy_block_pointer(index)?.get() != 0 {
+                return Err(Error::UnsupportedBlockMap);
+            }
+        }
+        let double_indirect = self.legacy_block_pointer(DOUBLE_INDIRECT_INDEX)?;
+        if double_indirect.get() == 0
+            || self.legacy_block_pointer(TRIPLE_INDIRECT_INDEX)?.get() != 0
+        {
+            return Err(Error::UnsupportedBlockMap);
+        }
+        Ok(ResizeInodeBlockMap { double_indirect })
+    }
+
+    /// Reads one legacy `i_block` pointer by slot index.
+    /// # Errors
+    ///
+    /// Returns an error when slot offset arithmetic overflows or the inode block field is truncated.
+    fn legacy_block_pointer(&self, index: usize) -> Result<BlockAddress> {
+        let offset = index
+            .checked_mul(core::mem::size_of::<u32>())
+            .and_then(|value| value.checked_add(INODE_BLOCK_OFFSET))
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(BlockAddress::new(u64::from(le_u32(
+            self.bytes.as_ref(),
+            disk_offset(offset),
+        )?)))
+    }
+
+    /// Parses the raw bytes as a validated inode.
+    /// # Errors
+    ///
+    /// Returns an error when required inode fields are truncated or encode an unsupported inode
+    /// layout.
+    pub(super) fn parse(&self) -> Result<Inode> {
+        Inode::parse(self.id, self.bytes.as_ref(), self.encoding)
+    }
+
+    /// Reads the inode flags field.
+    /// # Errors
+    ///
+    /// Returns an error when `i_flags` is truncated.
+    pub(super) fn flags(&self) -> Result<InodeFlags> {
+        Ok(InodeFlags::from_u32(le_u32(
+            self.bytes.as_ref(),
+            disk_offset(INODE_FLAGS_OFFSET),
+        )?))
+    }
+
+    /// Returns the external xattr block referenced by `i_file_acl`.
+    /// # Errors
+    ///
+    /// Returns an error when the present low or high `i_file_acl` field is truncated.
+    pub(super) fn xattr_block(&self) -> Result<Option<BlockAddress>> {
+        if self.bytes.as_ref().len() <= INODE_FILE_ACL_LO_OFFSET {
+            return Ok(None);
+        }
+        let low = u64::from(le_u32(
+            self.bytes.as_ref(),
+            disk_offset(INODE_FILE_ACL_LO_OFFSET),
+        )?);
+        let high = if self.bytes.as_ref().len() > INODE_FILE_ACL_HI_OFFSET {
+            u64::from(le_u16(
+                self.bytes.as_ref(),
+                disk_offset(INODE_FILE_ACL_HI_OFFSET),
+            )?)
+        } else {
+            0
+        };
+        let block = low | (high << 32);
+        if block == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(BlockAddress::new(block)))
         }
     }
 }

@@ -331,7 +331,7 @@ impl AllocationIndexBuild {
 /// # Errors
 /// Returns invalid/unsupported inode storage, extent root, or allocation errors.
 fn begin_inode_scan(
-    raw: RawInodeRecord,
+    raw: RawInodeRecord<&[u8]>,
     superblock: &Superblock,
     orphans: &ValidatedOrphanInventory,
     ranges: &mut Vec<AllocationRange>,
@@ -353,7 +353,7 @@ fn begin_inode_scan(
         }
         return Ok(InodeAllocationScan::Next);
     }
-    let data = InodeData::parse(raw.id, &raw.bytes, raw.encoding)?;
+    let data = InodeData::parse(raw.id, raw.bytes, raw.encoding)?;
     match data.storage() {
         InodeStorage::InlineBytes(_) => Ok(InodeAllocationScan::Next),
         InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
@@ -647,17 +647,18 @@ struct GroupAllocationSnapshot {
 
 /// Reads an allocated inode, retaining adjacent records in one bounded table window. A suspended
 /// or failed read cannot publish a window; retry resumes the identical request and cursor position.
+/// The returned image borrows the window, so its interpretation finishes before replacement.
 /// # Errors
 ///
 /// Returns an error when the group-local inode position is inconsistent, offset arithmetic
 /// overflows, allocation fails, or the record cannot be read.
-fn read_group_inode_record(
+fn read_group_inode_record<'table>(
     reader: &mut OperationDevice<'_>,
     superblock: &Superblock,
     group: &GroupAllocationSnapshot,
     position: InodeBitmapPosition,
-    table: &mut Option<InodeTableWindow>,
-) -> Result<RawInodeRecord> {
+    table: &'table mut Option<InodeTableWindow>,
+) -> Result<RawInodeRecord<&'table [u8]>> {
     let count = inode_count_in_group(superblock, group.group)?;
     if position.group() != group.group || position.bit() >= count {
         return Err(Error::InvalidInode);
@@ -704,12 +705,10 @@ fn read_group_inode_record(
             bytes,
         });
     }
-    let bytes = memory::copied_slice(
-        table
-            .as_ref()
-            .and_then(|window| window.record(offset, size))
-            .ok_or(Error::InvalidInode)?,
-    )?;
+    let bytes = table
+        .as_ref()
+        .and_then(|window| window.record(offset, size))
+        .ok_or(Error::InvalidInode)?;
     Ok(RawInodeRecord {
         id: inode_id,
         offset,
@@ -1221,7 +1220,7 @@ mod tests {
             )?;
             assert_eq!(raw.id.as_u32(), bit + 1);
             assert_eq!(raw.offset.get(), 5120 + u64::from(bit) * 256);
-            assert_eq!(le_u32(&raw.bytes, disk_offset(0))?, bit);
+            assert_eq!(le_u32(raw.bytes, disk_offset(0))?, bit);
             // A cached record must survive release of the preceding storage transcript.
             transcript = StorageTranscript::new(StorageTarget::Filesystem, transcript.len());
         }
