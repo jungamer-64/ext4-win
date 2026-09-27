@@ -4,14 +4,15 @@ use super::scope::*;
 use crate::disk_format::inode::InodeData;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Raw inode record paired with its inode number and device offset.
-pub(super) struct RawInodeRecord {
+/// Raw inode image paired with its identity and device offset. Read-only consumers may borrow
+/// immutable table storage; mutation typestates own their independently writable bytes.
+pub(super) struct RawInodeRecord<Bytes> {
     /// Inode number represented by this raw record.
     pub(super) id: InodeId,
     /// Absolute device offset of the inode record.
     pub(super) offset: ByteOffset,
-    /// Writable inode record bytes.
-    pub(super) bytes: Vec<u8>,
+    /// Storage ownership determines whether this record can enter a mutation typestate.
+    pub(super) bytes: Bytes,
     /// Mounted encoding required to parse and rewrite inode data fields.
     pub(super) encoding: InodeDataEncoding,
 }
