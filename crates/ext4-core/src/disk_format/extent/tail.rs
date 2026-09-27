@@ -213,8 +213,12 @@ mod cursor_tests {
 /// A suspended read leaves the parent entry unconsumed; successful items are yielded once.
 #[derive(Debug)]
 pub(crate) struct ExtentAllocationCursor {
-    /// Validated root-to-current-node path, bounded by the format's maximum depth.
-    path: Vec<PathNode>,
+    /// Inode-resident image retained inline; its fixed format never requires heap storage.
+    root: InodeExtentRoot,
+    /// First root entry not yet consumed by traversal.
+    root_next: usize,
+    /// Only external nodes need variable-sized images, bounded by the format's depth.
+    external_path: Vec<PathNode>,
     /// End of the preceding data extent, including across leaf boundaries.
     previous_end: u64,
     /// Geometry and checksum identity cannot change while the walk is suspended.
