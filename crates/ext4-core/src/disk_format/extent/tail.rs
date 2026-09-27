@@ -26,54 +26,66 @@ impl PathNode {
     /// # Errors
     /// Returns an error for malformed node geometry, entries, or child pointers.
     fn validate(&self, expected: Option<u16>) -> Result<u16> {
-        let mut extents = Vec::new();
-        let depth = parse_node(&self.bytes, expected, &mut extents)?;
-        let capacity = usize::from(le_u16(&self.bytes, disk_offset(4))?);
-        let available = self
-            .bytes
-            .len()
-            .checked_sub(EXTENT_HEADER_SIZE)
-            .ok_or(Error::InvalidExtentTree)?;
-        if capacity == 0 || capacity > available / EXTENT_ENTRY_SIZE {
-            return Err(Error::InvalidExtentTree);
-        }
-        let entries = header_entries(&self.bytes)?;
-        if depth > 0 && entries == 0 {
-            return Err(Error::InvalidExtentTree);
-        }
-        let mut previous = None;
-        for index in 0..entries {
-            let key = le_u32(&self.bytes, disk_offset(entry_offset(index)?))?;
-            if previous.is_some_and(|previous| key <= previous) {
-                return Err(Error::InvalidExtentTree);
-            }
-            previous = Some(key);
-        }
-        Ok(depth)
+        validate_path_node(&self.bytes, expected)
     }
 
     /// Reads a validated index entry's external block address.
     /// # Errors
     /// Returns an error for an absent entry or zero pointer.
     fn child(&self, index: usize) -> Result<BlockAddress> {
-        if index >= header_entries(&self.bytes)? {
-            return Err(Error::InvalidExtentTree);
-        }
-        let offset = entry_offset(index)?;
-        let low = u64::from(le_u32(
-            &self.bytes,
-            disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
-        )?);
-        let high = u64::from(le_u16(
-            &self.bytes,
-            disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
-        )?);
-        let block = BlockAddress::new(low | high << 32);
-        if block.get() == 0 {
-            return Err(Error::InvalidExtentTree);
-        }
-        Ok(block)
+        path_node_child(&self.bytes, index)
     }
+}
+
+/// Checks fixed and external node images without allocating a throwaway extent list.
+/// # Errors
+/// Rejects malformed capacity, depth, ordering or encoded leaf entries.
+fn validate_path_node(bytes: &[u8], expected: Option<u16>) -> Result<u16> {
+    let depth = parse_node(bytes, expected, |_extent| Ok(()))?;
+    let capacity = usize::from(le_u16(bytes, disk_offset(4))?);
+    let available = bytes
+        .len()
+        .checked_sub(EXTENT_HEADER_SIZE)
+        .ok_or(Error::InvalidExtentTree)?;
+    if capacity == 0 || capacity > available / EXTENT_ENTRY_SIZE {
+        return Err(Error::InvalidExtentTree);
+    }
+    let entries = header_entries(bytes)?;
+    if depth > 0 && entries == 0 {
+        return Err(Error::InvalidExtentTree);
+    }
+    let mut previous = None;
+    for index in 0..entries {
+        let key = le_u32(bytes, disk_offset(entry_offset(index)?))?;
+        if previous.is_some_and(|previous| key <= previous) {
+            return Err(Error::InvalidExtentTree);
+        }
+        previous = Some(key);
+    }
+    Ok(depth)
+}
+
+/// Reads a validated index entry from either inode or external-node storage.
+/// # Errors
+/// Rejects missing entries, truncated addresses and zero child pointers.
+fn path_node_child(bytes: &[u8], index: usize) -> Result<BlockAddress> {
+    if index >= header_entries(bytes)? {
+        return Err(Error::InvalidExtentTree);
+    }
+    let offset = entry_offset(index)?;
+    let low = u64::from(le_u32(
+        bytes,
+        disk_offset(offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?),
+    )?);
+    let high = u64::from(le_u16(
+        bytes,
+        disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
+    )?);
+    let block = BlockAddress::new(low | high << 32);
+    if block.get() == 0 {
+        return Err(Error::InvalidExtentTree);
+    }
+    Ok(block)
 }
 
 /// Loads one child while retaining at most one node per tree depth.
@@ -115,6 +127,62 @@ mod cursor_tests {
         CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
         StorageTranscript,
     };
+
+    /// # Errors
+    /// Returns fixture encoding or traversal failures.
+    /// # Panics
+    /// Fails if an inode-resident leaf requests external I/O or loses entry validation.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture errors propagate while assertions verify extent semantics"
+    )]
+    fn inode_resident_allocation_walk_checks_entries_without_external_reads() -> Result<()> {
+        let mut root = [0_u8; 60];
+        for (offset, value) in [(0, 0xf30a), (2, 2), (4, 4), (16, 3), (28, 0x8002)] {
+            put_le_u16(&mut root, disk_offset(offset), value)?;
+        }
+        for (offset, value) in [(12, 2), (20, 100), (24, 8), (32, 200)] {
+            put_le_u32(&mut root, disk_offset(offset), value)?;
+        }
+        let mut cursor = ExtentAllocationCursor::new(
+            &InodeExtentRoot::from_bytes(root),
+            BlockSize::from_superblock_log(0)?,
+            ExtentTreeContext::none(),
+        )?;
+        let mut transcript =
+            StorageTranscript::new(StorageTarget::Filesystem, DeviceLength::from_bytes(1024));
+        for (logical, physical, length) in [(2, 100, 3), (8, 200, 2)] {
+            let Some(ExtentAllocation::Data(extent)) =
+                cursor.next(&mut OperationDevice::new(&mut transcript))?
+            else {
+                return Err(Error::InvalidExtentTree);
+            };
+            assert_eq!(extent.logical_start().as_u32(), logical);
+            assert_eq!(extent.physical_start().get(), physical);
+            assert_eq!(extent.len().as_u64(), length);
+        }
+        assert!(
+            cursor
+                .next(&mut OperationDevice::new(&mut transcript))?
+                .is_none()
+        );
+        assert!(
+            cursor
+                .next(&mut OperationDevice::new(&mut transcript))?
+                .is_none()
+        );
+        put_le_u16(&mut root, disk_offset(16), 0)?;
+        assert!(
+            ExtentAllocationCursor::new(
+                &InodeExtentRoot::from_bytes(root),
+                BlockSize::from_superblock_log(0)?,
+                ExtentTreeContext::none()
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     /// Wire fixture with two independently supplied leaf blocks.
     /// # Errors
@@ -236,16 +304,11 @@ impl ExtentAllocationCursor {
         block_size: BlockSize,
         context: ExtentTreeContext,
     ) -> Result<Self> {
-        let root = PathNode {
-            block: None,
-            bytes: memory::copied_slice(root.bytes())?,
-            next: 0,
-        };
-        root.validate(None)?;
-        let mut path = Vec::new();
-        path.try_push(root)?;
+        validate_path_node(root.bytes(), None)?;
         Ok(Self {
-            path,
+            root: root.clone(),
+            root_next: 0,
+            external_path: Vec::new(),
             previous_end: 0,
             block_size,
             context,
@@ -261,38 +324,52 @@ impl ExtentAllocationCursor {
         reader: &mut impl ExtentNodeReader,
     ) -> Result<Option<ExtentAllocation>> {
         loop {
-            let Some(node) = self.path.last() else {
+            let (bytes, index) = self
+                .external_path
+                .last()
+                .map_or((self.root.bytes().as_slice(), self.root_next), |node| {
+                    (node.bytes.as_slice(), node.next)
+                });
+            if index == header_entries(bytes)? {
+                if self.external_path.pop().is_some() {
+                    continue;
+                }
                 return Ok(None);
-            };
-            if node.next == header_entries(&node.bytes)? {
-                self.path.pop();
-                continue;
             }
-            let next = node.next.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-            let depth = le_u16(&node.bytes, disk_offset(6))?;
+            let next = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            let depth = le_u16(bytes, disk_offset(6))?;
             if depth == 0 {
-                let extent = parse_extent(&node.bytes, entry_offset(node.next)?)?;
+                let extent = parse_extent(bytes, entry_offset(index)?)?;
                 if extent.logical_start().as_u64() < self.previous_end
                     || extent.end_logical() > u64::from(u32::MAX).saturating_add(1)
                 {
                     return Err(Error::InvalidExtentTree);
                 }
                 self.previous_end = extent.end_logical();
-                self.path.last_mut().ok_or(Error::InvalidExtentTree)?.next = next;
+                self.advance_entry(next);
                 return Ok(Some(ExtentAllocation::Data(extent)));
             }
-            let block = node.child(node.next)?;
+            let block = path_node_child(bytes, index)?;
             let child = load_child(
-                &self.path,
+                &self.external_path,
                 block,
                 depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?,
                 self.block_size,
                 reader,
                 self.context,
             )?;
-            self.path.last_mut().ok_or(Error::InvalidExtentTree)?.next = next;
-            self.path.try_push(child)?;
+            self.advance_entry(next);
+            self.external_path.try_push(child)?;
             return Ok(Some(ExtentAllocation::Metadata(block)));
+        }
+    }
+
+    /// Advances only the currently selected node after an item has been decoded.
+    fn advance_entry(&mut self, next: usize) {
+        if let Some(node) = self.external_path.last_mut() {
+            node.next = next;
+        } else {
+            self.root_next = next;
         }
     }
 }

@@ -708,7 +708,7 @@ fn load_external_extent_nodes(
     extents: &mut Vec<Extent>,
     metadata_blocks: &mut Vec<BlockAddress>,
 ) -> Result<()> {
-    let depth = parse_node(raw, None, extents)?;
+    let depth = parse_node(raw, None, |extent| extents.try_push(extent))?;
     if depth == 0 {
         return Ok(());
     }
@@ -725,7 +725,9 @@ fn load_external_extent_nodes(
         )?;
         reader.read_extent_bytes(block_size.offset_of(child.block)?, &mut bytes)?;
         verify_external_extent_block_checksum(context, bytes.as_slice())?;
-        let child_depth = parse_node(bytes.as_slice(), Some(child.expected_depth), extents)?;
+        let child_depth = parse_node(bytes.as_slice(), Some(child.expected_depth), |extent| {
+            extents.try_push(extent)
+        })?;
         if child_depth > 0 {
             push_index_children(bytes.as_slice(), child_depth, &mut pending)?;
         }
@@ -765,12 +767,16 @@ fn push_index_children(raw: &[u8], depth: u16, pending: &mut Vec<PendingExtentNo
     Ok(())
 }
 
-/// Parses one extent tree node and appends leaf extents when the node is a leaf.
+/// Parses one extent tree node, delivering leaf entries directly to their consumer.
 /// # Errors
 ///
 /// Returns an error when the header magic is wrong, the depth or entry count is unsupported, the
 /// expected depth does not match, or a leaf entry is truncated or invalid.
-fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>) -> Result<u16> {
+fn parse_node(
+    raw: &[u8],
+    expected_depth: Option<u16>,
+    mut visit: impl FnMut(Extent) -> Result<()>,
+) -> Result<u16> {
     if le_u16(raw, disk_offset(0))? != EXTENT_MAGIC {
         return Err(Error::InvalidExtentTree);
     }
@@ -799,7 +805,7 @@ fn parse_node(raw: &[u8], expected_depth: Option<u16>, extents: &mut Vec<Extent>
         if end > raw.len() {
             return Err(Error::InvalidExtentTree);
         }
-        extents.try_push(parse_extent(raw, offset)?)?;
+        visit(parse_extent(raw, offset)?)?;
     }
     Ok(depth)
 }
