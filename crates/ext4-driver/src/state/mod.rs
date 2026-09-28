@@ -50,6 +50,8 @@ use crate::memory::{self, DriverVec, InPlaceInitialization};
 
 mod control_device;
 mod directory_notification;
+mod directory_search;
+pub(crate) use directory_search::{DirectoryPattern, DirectorySearch};
 mod file_control_block;
 mod file_control_block_ledger;
 mod kernel_object;

@@ -610,6 +610,8 @@ pub(super) struct EpochReadView<'storage, 'epoch> {
     pub(super) superblock: Superblock,
     /// Immutable key snapshot selected by the epoch lease.
     pub(super) fscrypt_keys: &'epoch FscryptKeySet,
+    /// Identity of the immutable snapshot; absent before mount has committed.
+    pub(super) epoch: Option<(FilesystemUuid, EpochSequence)>,
     /// Allocation ownership snapshot used only by mutation resolution.
     pub(super) clusters: Option<&'epoch ClusterReferenceIndex>,
 }
@@ -625,6 +627,7 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
             superblock: epoch.superblock,
             fscrypt_keys: &epoch.fscrypt_keys,
             clusters: Some(&epoch.clusters),
+            epoch: Some((epoch.identity().uuid(), epoch.sequence())),
         }
     }
 
@@ -639,6 +642,7 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
             superblock,
             fscrypt_keys,
             clusters: None,
+            epoch: None,
         }
     }
 

@@ -2,75 +2,6 @@
 
 use super::*;
 
-/// Packs directory entries into the caller's query-directory buffer.
-/// # Errors
-///
-/// Returns an error when the directory query stack, pattern, output buffer, opened directory, or
-/// emitted directory record layout is invalid.
-pub(crate) fn query_directory(
-    mut request: PendingIrpLease<'_>,
-    read: &mut impl CommittedReadPass,
-) -> DriverResult<IrpCompletion> {
-    let (prepared_stack, pattern) = {
-        let prepared = request.prepared_query_directory()?;
-        (
-            prepared.stack(),
-            DirectoryPattern::from_prepared(prepared.pattern())?,
-        )
-    };
-    let (class, pattern, length, entry_emission, directory_id, mut cursor) = {
-        request.with_active(|active| {
-            let file_object = active.current_stack()?.file_object()?;
-            let mut opened_file = OpenedDirectory::decode(file_object)?;
-            let class = prepared_stack.information_class();
-            let length = prepared_stack.length();
-            let entry_emission = prepared_stack.entry_emission();
-            let directory_id = opened_file.id();
-            let mut cursor = *opened_file.cursor_mut();
-            initialize_directory_cursor(&mut cursor, prepared_stack.cursor_position());
-            Ok::<_, DriverError>((class, pattern, length, entry_emission, directory_id, cursor))
-        })?
-    };
-    let (cursor, packed, result) = {
-        let directory = read.load_directory(directory_id)?;
-        let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
-        let result = emit_directory_entries(
-            read,
-            &directory,
-            &mut cursor,
-            entry_emission,
-            class,
-            &pattern,
-            packed.as_mut_slice(),
-        );
-        (cursor, packed, result)
-    };
-
-    let publish_cursor = matches!(
-        result,
-        Ok(_)
-            | Err(DriverError::BufferOverflow | DriverError::NoMoreFiles | DriverError::NoSuchFile)
-    );
-    let information = result.unwrap_or(0);
-    request.with_active(|active| {
-        if result.is_ok() {
-            let source = packed
-                .as_slice()
-                .get(..information)
-                .ok_or(DriverError::InternalInvariantViolation)?;
-            active.requestor_output(length)?.copy_from(0, source)?;
-        }
-        if publish_cursor {
-            let file_object = active.current_stack()?.file_object()?;
-            let mut opened_file = OpenedDirectory::decode(file_object)?;
-            *opened_file.cursor_mut() = cursor;
-        }
-        Ok::<_, DriverError>(())
-    })?;
-    result?;
-    IrpCompletion::from_usize(information)
-}
-
 #[cfg(test)]
 #[path = "tests/directory.rs"]
 mod tests;
@@ -173,198 +104,6 @@ enum DirectoryFileIdLayout {
     U128(usize),
 }
 
-/// Caller-supplied directory filename pattern.
-#[derive(Debug, Eq, PartialEq)]
-enum DirectoryPattern {
-    /// Enumerate every Windows-representable ext4 entry.
-    All,
-    /// Return the entry with this exact Windows name.
-    Exact(WindowsName),
-    /// Return entries matched by a caller-supplied wildcard expression.
-    Wildcard(DirectoryWildcardPattern),
-}
-
-impl DirectoryPattern {
-    /// Decodes the captured QueryDirectory filename pattern.
-    /// # Errors
-    ///
-    /// Returns an error when the pattern UNICODE_STRING is malformed, contains unsupported
-    /// wildcards, or is not a valid Windows name.
-    fn from_prepared(pattern: &PreparedDirectoryPattern) -> DriverResult<Self> {
-        let PreparedDirectoryPattern::Name(units) = pattern else {
-            return Ok(Self::All);
-        };
-        let units = units.as_slice();
-        if is_all_directory_pattern(units) {
-            return Ok(Self::All);
-        }
-        if units
-            .iter()
-            .any(|unit| matches!(*unit, UTF16_ASTERISK | UTF16_QUESTION_MARK))
-        {
-            return DirectoryWildcardPattern::from_utf16(units).map(Self::Wildcard);
-        }
-        WindowsName::from_utf16(units)
-            .map(Self::Exact)
-            .map_err(DriverError::from)
-    }
-
-    /// Returns true when the projected Windows name matches this pattern.
-    fn matches(&self, name: &WindowsName) -> bool {
-        match self {
-            Self::All => true,
-            Self::Exact(requested) => name.equals(requested),
-            Self::Wildcard(pattern) => pattern.matches(name),
-        }
-    }
-
-    /// Returns the no-entry status for this pattern.
-    const fn exhausted_error(&self) -> DriverError {
-        match self {
-            Self::All => DriverError::NoMoreFiles,
-            Self::Exact(_) | Self::Wildcard(_) => DriverError::NoSuchFile,
-        }
-    }
-}
-
-/// Caller-supplied wildcard pattern for Windows-visible long names.
-#[derive(Debug, Eq, PartialEq)]
-struct DirectoryWildcardPattern {
-    /// Parsed pattern tokens.
-    tokens: DriverVec<DirectoryWildcardToken>,
-}
-
-impl DirectoryWildcardPattern {
-    /// Decodes a wildcard pattern for directory enumeration.
-    /// # Errors
-    ///
-    /// Returns an error when the pattern contains a non-wildcard character outside the Windows name
-    /// component domain or malformed UTF-16.
-    fn from_utf16(units: &[u16]) -> DriverResult<Self> {
-        validate_directory_pattern_units(units)?;
-        let mut tokens = DriverVec::new();
-        for unit in units {
-            let token = match *unit {
-                UTF16_ASTERISK => DirectoryWildcardToken::AnySequence,
-                UTF16_QUESTION_MARK => DirectoryWildcardToken::AnyOne,
-                unit => DirectoryWildcardToken::Literal(unit),
-            };
-            tokens
-                .try_push_owned(token)
-                .map_err(|error| error.into_parts().0)?;
-        }
-        Ok(Self { tokens })
-    }
-
-    /// Returns true when this pattern matches a Windows-visible long name.
-    fn matches(&self, name: &WindowsName) -> bool {
-        wildcard_tokens_match(self.tokens.as_slice(), name.utf16())
-    }
-}
-
-/// One token in a directory wildcard expression.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectoryWildcardToken {
-    /// Exact UTF-16 code unit match.
-    Literal(u16),
-    /// Match exactly one UTF-16 code unit.
-    AnyOne,
-    /// Match zero or more UTF-16 code units.
-    AnySequence,
-}
-
-/// Validates wildcard pattern units while keeping wildcard syntax out of `WindowsName`.
-/// # Errors
-///
-/// Returns an error when a non-wildcard unit is not valid inside a Windows component or the pattern
-/// is malformed UTF-16.
-fn validate_directory_pattern_units(units: &[u16]) -> DriverResult<()> {
-    if units.iter().any(|unit| {
-        matches!(
-            *unit,
-            0x0000 | 0x0022 | 0x002F | 0x003A | 0x003C | 0x003E | 0x005C | 0x007C
-        )
-    }) {
-        return Err(DriverError::from(ext4_core::Error::InvalidName));
-    }
-    if core::char::decode_utf16(units.iter().copied()).any(|item| item.is_err()) {
-        return Err(DriverError::from(ext4_core::Error::InvalidName));
-    }
-    Ok(())
-}
-
-/// Matches `*` and `?` wildcard tokens against UTF-16 name units.
-fn wildcard_tokens_match(pattern: &[DirectoryWildcardToken], name: &[u16]) -> bool {
-    let mut pattern_index = 0_usize;
-    let mut name_index = 0_usize;
-    let mut sequence_restart = None;
-
-    while name_index < name.len() {
-        if let Some(token) = pattern.get(pattern_index) {
-            match token {
-                DirectoryWildcardToken::Literal(unit)
-                    if name.get(name_index).copied() == Some(*unit) =>
-                {
-                    let Some(next_pattern) = pattern_index.checked_add(1) else {
-                        return false;
-                    };
-                    let Some(next_name) = name_index.checked_add(1) else {
-                        return false;
-                    };
-                    pattern_index = next_pattern;
-                    name_index = next_name;
-                    continue;
-                }
-                DirectoryWildcardToken::AnyOne => {
-                    let Some(next_pattern) = pattern_index.checked_add(1) else {
-                        return false;
-                    };
-                    let Some(next_name) = name_index.checked_add(1) else {
-                        return false;
-                    };
-                    pattern_index = next_pattern;
-                    name_index = next_name;
-                    continue;
-                }
-                DirectoryWildcardToken::AnySequence => {
-                    let Some(next_pattern) = pattern_index.checked_add(1) else {
-                        return false;
-                    };
-                    sequence_restart = Some((pattern_index, name_index));
-                    pattern_index = next_pattern;
-                    continue;
-                }
-                DirectoryWildcardToken::Literal(_) => {}
-            }
-        }
-
-        let Some((sequence_index, restart_name)) = sequence_restart else {
-            return false;
-        };
-        let Some(next_restart_name) = restart_name.checked_add(1) else {
-            return false;
-        };
-        let Some(next_pattern) = sequence_index.checked_add(1) else {
-            return false;
-        };
-        sequence_restart = Some((sequence_index, next_restart_name));
-        pattern_index = next_pattern;
-        name_index = next_restart_name;
-    }
-
-    while matches!(
-        pattern.get(pattern_index),
-        Some(DirectoryWildcardToken::AnySequence)
-    ) {
-        let Some(next_pattern) = pattern_index.checked_add(1) else {
-            return false;
-        };
-        pattern_index = next_pattern;
-    }
-
-    pattern_index == pattern.len()
-}
-
 /// Variable directory record layout for one emitted entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct DirectoryRecordLayout {
@@ -392,6 +131,42 @@ impl DirectoryRecordLayout {
             unpadded_size,
             padded_size: align_to_eight(unpadded_size)?,
         })
+    }
+}
+
+/// Capacity admission distinguishes a complete record from the first-call prefix contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryRecordExtent {
+    /// All required fields and name bytes fit.
+    Complete,
+    /// Only this first-call prefix may be copied; its cursor remains unconsumed.
+    Prefix(usize),
+}
+impl DirectoryRecordLayout {
+    /// Reserves space before the caller requests additional inode metadata.
+    /// # Errors
+    /// Returns overflow or a first-call buffer smaller than the fixed fields.
+    fn admit(
+        self,
+        start: usize,
+        capacity: usize,
+        first_record: bool,
+        initial: bool,
+    ) -> DriverResult<Option<DirectoryRecordExtent>> {
+        if start
+            .checked_add(self.unpadded_size)
+            .ok_or(DriverError::InvalidParameter)?
+            <= capacity
+        {
+            return Ok(Some(DirectoryRecordExtent::Complete));
+        }
+        if !first_record || !initial {
+            return Ok(None);
+        }
+        if capacity < self.name_offset {
+            return Err(DriverError::BufferTooSmall);
+        }
+        Ok(Some(DirectoryRecordExtent::Prefix(capacity)))
     }
 }
 
@@ -485,121 +260,12 @@ const ID_64_EXTD_BOTH_DIRECTORY_FILE_ID_OFFSET: usize =
     core::mem::offset_of!(wdk_sys::FILE_ID_64_EXTD_BOTH_DIR_INFORMATION, FileId);
 /// Windows directory query entry alignment.
 const DIRECTORY_ENTRY_ALIGNMENT: usize = 8;
-/// UTF-16 `*`.
-const UTF16_ASTERISK: u16 = 0x002A;
-/// UTF-16 `.`.
-const UTF16_DOT: u16 = 0x002E;
-/// UTF-16 `?`.
-const UTF16_QUESTION_MARK: u16 = 0x003F;
-
-/// Returns true for the all-entries patterns accepted without wildcard matching.
-fn is_all_directory_pattern(units: &[u16]) -> bool {
-    units.is_empty()
-        || units == [UTF16_ASTERISK]
-        || units == [UTF16_ASTERISK, UTF16_DOT, UTF16_ASTERISK]
-}
-
 /// Applies QueryDirectory cursor reset/index flags.
 fn initialize_directory_cursor(cursor: &mut DirectoryCursor, position: DirectoryCursorPosition) {
     match position {
         DirectoryCursorPosition::Current => {}
         DirectoryCursorPosition::Restart => cursor.restart(),
         DirectoryCursorPosition::Index(index) => cursor.seek_ordinal(u64::from(index.as_u32())),
-    }
-}
-
-/// Emits directory entries into a caller buffer.
-/// # Errors
-///
-/// Returns an error when cursor arithmetic overflows, a matching entry cannot fit in an empty
-/// output buffer, metadata loading fails, or a directory record cannot be packed.
-fn emit_directory_entries(
-    read: &mut impl CommittedReadPass,
-    directory: &DirectoryNode,
-    cursor: &mut DirectoryCursor,
-    entry_emission: DirectoryEntryEmission,
-    class: DirectoryInformationClass,
-    pattern: &DirectoryPattern,
-    buffer: &mut [u8],
-) -> DriverResult<usize> {
-    let mut emitted = 0_usize;
-    let mut written = 0_usize;
-    let mut information = 0_usize;
-    let mut previous_start = None;
-
-    loop {
-        let batch = match read.scan_directory(directory, cursor, DirectoryScanLimit::MAX) {
-            Ok(batch) => batch,
-            Err(_) if emitted != 0 => return Ok(information),
-            Err(error) => return Err(DriverError::from(error)),
-        };
-        let exhausted = batch.is_exhausted();
-        let entries = batch.into_entries();
-        if entries.is_empty() && !exhausted {
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        for scanned in entries {
-            let entry = scanned.entry();
-            let next_cursor = *scanned.next_cursor();
-            let Ok(name) = WindowsName::from_ext4(entry.name()) else {
-                *cursor = next_cursor;
-                continue;
-            };
-            if !pattern.matches(&name) {
-                *cursor = next_cursor;
-                continue;
-            }
-
-            let metadata = match metadata_from_node(read, *entry.node()) {
-                Ok(metadata) => metadata,
-                Err(_) if emitted != 0 => return Ok(information),
-                Err(error) => return Err(error),
-            };
-            let layout = DirectoryRecordLayout::new(class, &name)?;
-            let required = written
-                .checked_add(layout.unpadded_size)
-                .ok_or(DriverError::InvalidParameter)?;
-            if required > buffer.len() {
-                if emitted == 0 {
-                    return Err(DriverError::BufferOverflow);
-                }
-                return Ok(information);
-            }
-
-            if let Some(previous_start) = previous_start {
-                let next_offset = written
-                    .checked_sub(previous_start)
-                    .ok_or(DriverError::InvalidParameter)?;
-                LittleEndianOutput::new(buffer).write_u32(
-                    record_field_offset(previous_start, DIRECTORY_NEXT_ENTRY_OFFSET)?,
-                    u32::try_from(next_offset).map_err(|_| DriverError::InvalidParameter)?,
-                )?;
-            }
-
-            let file_index = directory_file_index(scanned.ordinal());
-            pack_directory_record(buffer, written, class, file_index, &name, metadata, layout)?;
-            previous_start = Some(written);
-            information = required;
-            emitted = emitted
-                .checked_add(1)
-                .ok_or(DriverError::InvalidParameter)?;
-            written = written
-                .checked_add(layout.padded_size)
-                .ok_or(DriverError::InvalidParameter)?;
-            *cursor = next_cursor;
-
-            if matches!(entry_emission, DirectoryEntryEmission::Single) {
-                return Ok(information);
-            }
-        }
-
-        if exhausted {
-            return if emitted == 0 {
-                Err(pattern.exhausted_error())
-            } else {
-                Ok(information)
-            };
-        }
     }
 }
 
@@ -628,18 +294,6 @@ pub(super) fn pack_directory_record(
         record_field_offset(start, DIRECTORY_FILE_INDEX_OFFSET)?,
         file_index,
     )?;
-    if matches!(class, DirectoryInformationClass::Names) {
-        LittleEndianOutput::new(buffer).write_u32(
-            record_field_offset(start, NAMES_INFORMATION_FILE_NAME_LENGTH_OFFSET)?,
-            u32::try_from(utf16_byte_len(name.utf16())?)
-                .map_err(|_| DriverError::InvalidParameter)?,
-        )?;
-        return write_utf16(
-            buffer,
-            field_offset(start, layout.name_offset)?,
-            name.utf16(),
-        );
-    }
     LittleEndianOutput::new(buffer).write_bytes(
         record_field_offset(start, DIRECTORY_CREATION_TIME_OFFSET)?,
         &windows_time_quad(metadata.times.created()).to_le_bytes(),
@@ -827,5 +481,302 @@ pub(super) fn windows_time_quad(timestamp: Ext4Timestamp) -> i64 {
         // SAFETY: `QuadPart` is the active LARGE_INTEGER representation used
         // by this driver for Windows time values.
         time.QuadPart
+    }
+}
+/// Packs names without requesting any Windows metadata.
+/// # Errors
+/// Returns a name-length or output-range error.
+fn pack_name_record(
+    buffer: &mut [u8],
+    start: usize,
+    file_index: u32,
+    name: &WindowsName,
+) -> DriverResult<()> {
+    let layout = DirectoryRecordLayout::new(DirectoryInformationClass::Names, name)?;
+    clear_record(buffer, start, layout.unpadded_size)?;
+    LittleEndianOutput::new(buffer).write_u32(
+        record_field_offset(start, DIRECTORY_FILE_INDEX_OFFSET)?,
+        file_index,
+    )?;
+    LittleEndianOutput::new(buffer).write_u32(
+        record_field_offset(start, NAMES_INFORMATION_FILE_NAME_LENGTH_OFFSET)?,
+        u32::try_from(utf16_byte_len(name.utf16())?).map_err(|_| DriverError::InvalidParameter)?,
+    )?;
+    write_utf16(
+        buffer,
+        field_offset(start, layout.name_offset)?,
+        name.utf16(),
+    )
+}
+
+/// Packing progress belongs to the admitted request, including across metadata I/O.
+#[derive(Debug)]
+pub(crate) struct DirectoryQuery {
+    /// Retains the handle-selected expression independently of later IRP captures.
+    pattern: crate::memory::DriverSharedLease<DirectoryPattern>,
+    /// Requested Windows wire layout.
+    class: DirectoryInformationClass,
+    /// Caller capacity retained through deferred copy.
+    length: IrpBufferLength,
+    /// Stops packing immediately after the first match for a single-entry request.
+    emission: DirectoryEntryEmission,
+    /// No previous enumeration outcome has been published on this handle.
+    initial: bool,
+    /// Private progress; publishing it requires successful output copy.
+    cursor: DirectoryCursor,
+    /// One request-sized output allocation retained across lower reads.
+    packed: DriverVec<u8>,
+    /// Aligned start of the next complete record.
+    written: usize,
+    /// Valid output prefix, excluding final alignment padding.
+    information: usize,
+    /// Last complete record whose forward link may be updated.
+    previous: Option<usize>,
+}
+
+/// A matching record whose output space has been reserved before metadata is read.
+#[derive(Debug)]
+pub(crate) struct DirectoryRecord {
+    /// Validated identity and opaque continuation for this reserved record.
+    entry: ext4_core::ScannedDirectoryEntry,
+    /// Windows-visible name retained while metadata is loaded.
+    name: WindowsName,
+    /// Capacity-checked layout selected before metadata I/O.
+    layout: DirectoryRecordLayout,
+    /// Partial first record reports overflow and does not consume the entry.
+    extent: DirectoryRecordExtent,
+}
+impl DirectoryRecord {
+    /// Identity already validated by the directory engine, used only for additional metadata.
+    pub(crate) fn node(&self) -> NodeId {
+        *self.entry.entry().node()
+    }
+}
+
+/// Filtering either consumes a skipped name, reserves one record, or leaves it for the next call.
+#[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the reserved record carries an inline cursor without allocating on each name match"
+)]
+pub(crate) enum DirectorySelection {
+    /// The name does not match or cannot be represented on Windows.
+    Skip,
+    /// Output space exists; metadata may now be requested.
+    Record(DirectoryRecord),
+    /// No further complete record fits; the entry remains unpublished.
+    Full,
+}
+
+impl DirectoryQuery {
+    /// Captures the initial expression at admission; output and cursor remain private until copy.
+    /// # Errors
+    /// Returns invalid handle/pattern, allocation, or shared-lease exhaustion errors.
+    pub(crate) fn prepare(
+        mut request: PendingIrpLease<'_>,
+    ) -> DriverResult<(Self, DirectoryNodeId)> {
+        let existing = request.with_active(|active| {
+            let mut opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
+            opened.search_mut().expression()
+        })?;
+        let prepared = request.prepared_query_directory()?;
+        let stack = prepared.stack();
+        let pattern = if existing.is_none() {
+            Some(DirectoryPattern::from_prepared(prepared.pattern())?)
+        } else {
+            None
+        };
+        let (pattern, directory, cursor, initial) = request.with_active(|active| {
+            let mut opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
+            let directory = opened.id();
+            let search = opened.search_mut();
+            let initial = !search.completed;
+            let pattern = match existing {
+                Some(pattern) => pattern,
+                None => search
+                    .capture_pattern(pattern.ok_or(DriverError::InternalInvariantViolation)?)?,
+            };
+            let mut cursor = search.cursor;
+            if initial {
+                cursor.restart();
+            } else {
+                initialize_directory_cursor(&mut cursor, stack.cursor_position());
+            }
+            Ok::<_, DriverError>((pattern, directory, cursor, initial))
+        })?;
+        Ok((
+            Self {
+                pattern,
+                class: stack.information_class(),
+                length: stack.length(),
+                emission: stack.entry_emission(),
+                initial,
+                cursor,
+                packed: DriverVec::try_repeated_copy(0, stack.length().as_usize())?,
+                written: 0,
+                information: 0,
+                previous: None,
+            },
+            directory,
+        ))
+    }
+
+    /// Starts a fresh core walk in this request's epoch.
+    pub(crate) const fn cursor(&self) -> DirectoryCursor {
+        self.cursor
+    }
+    /// Names-only wire records require no timestamps, attributes, or reparse metadata.
+    pub(crate) const fn needs_metadata(&self) -> bool {
+        !matches!(self.class, DirectoryInformationClass::Names)
+    }
+
+    /// Name filtering and capacity decisions precede any metadata request.
+    /// # Errors
+    /// Returns record-size overflow or an output buffer smaller than the fixed header.
+    pub(crate) fn select(
+        &mut self,
+        entry: ext4_core::ScannedDirectoryEntry,
+    ) -> DriverResult<DirectorySelection> {
+        let Ok(name) = WindowsName::from_ext4(entry.entry().name()) else {
+            self.cursor = *entry.next_cursor();
+            return Ok(DirectorySelection::Skip);
+        };
+        if !self.pattern.get().matches(&name) {
+            self.cursor = *entry.next_cursor();
+            return Ok(DirectorySelection::Skip);
+        }
+        let layout = DirectoryRecordLayout::new(self.class, &name)?;
+        let Some(extent) = layout.admit(
+            self.written,
+            self.packed.len(),
+            self.previous.is_none(),
+            self.initial,
+        )?
+        else {
+            return Ok(DirectorySelection::Full);
+        };
+        Ok(DirectorySelection::Record(DirectoryRecord {
+            entry,
+            name,
+            layout,
+            extent,
+        }))
+    }
+
+    /// Serializes a reserved name without reading Windows metadata.
+    /// # Errors
+    /// Returns record layout or output range failures.
+    pub(crate) fn append_name(&mut self, record: DirectoryRecord) -> DriverResult<bool> {
+        self.append(record, None)
+    }
+    /// Serializes a reserved record using metadata from the retained request epoch.
+    /// # Errors
+    /// Returns record layout or metadata serialization failures.
+    pub(crate) fn append_metadata(
+        &mut self,
+        record: DirectoryRecord,
+        metadata: NodeMetadataSnapshot,
+    ) -> DriverResult<bool> {
+        self.append(record, Some(metadata.into()))
+    }
+
+    /// Commits one packed record locally. A partial first record preserves its original cursor.
+    /// # Errors
+    /// Returns allocation, arithmetic, or output serialization errors before publication.
+    fn append(
+        &mut self,
+        record: DirectoryRecord,
+        metadata: Option<FileMetadata>,
+    ) -> DriverResult<bool> {
+        let file_index = directory_file_index(record.entry.ordinal());
+        let pack = |buffer: &mut [u8], start| match metadata {
+            Some(metadata) => pack_directory_record(
+                buffer,
+                start,
+                self.class,
+                file_index,
+                &record.name,
+                metadata,
+                record.layout,
+            ),
+            None => pack_name_record(buffer, start, file_index, &record.name),
+        };
+        if let DirectoryRecordExtent::Prefix(length) = record.extent {
+            let mut buffer = DriverVec::try_repeated_copy(0, record.layout.unpadded_size)?;
+            pack(buffer.as_mut_slice(), 0)?;
+            memory::copy_exact(
+                self.packed.as_mut_slice(),
+                buffer
+                    .as_slice()
+                    .get(..length)
+                    .ok_or(DriverError::InternalInvariantViolation)?,
+            )?;
+            self.information = length;
+            return Ok(true);
+        }
+        pack(self.packed.as_mut_slice(), self.written)?;
+        if let Some(previous) = self.previous {
+            let offset = self
+                .written
+                .checked_sub(previous)
+                .ok_or(DriverError::InvalidParameter)?;
+            LittleEndianOutput::new(self.packed.as_mut_slice()).write_u32(
+                record_field_offset(previous, DIRECTORY_NEXT_ENTRY_OFFSET)?,
+                u32::try_from(offset).map_err(|_| DriverError::InvalidParameter)?,
+            )?;
+        }
+        self.previous = Some(self.written);
+        self.information = self
+            .written
+            .checked_add(record.layout.unpadded_size)
+            .ok_or(DriverError::InvalidParameter)?;
+        self.written = self
+            .written
+            .checked_add(record.layout.padded_size)
+            .ok_or(DriverError::InvalidParameter)?;
+        self.cursor = *record.entry.next_cursor();
+        Ok(matches!(self.emission, DirectoryEntryEmission::Single))
+    }
+
+    /// Copies first, then publishes the opaque cursor while the handle lane remains exclusive.
+    /// # Errors
+    /// Returns copy failure without publishing progress, or invalid handle/output errors.
+    pub(crate) fn finish(
+        self,
+        mut request: PendingIrpLease<'_>,
+        exhausted: Option<DirectoryCursor>,
+    ) -> DriverResult<IrpCompletion> {
+        let partial = self.information != 0 && self.previous.is_none();
+        let completion = if partial {
+            IrpCompletion::buffer_overflow(self.information)?
+        } else if self.information != 0 || exhausted.is_none() {
+            IrpCompletion::from_usize(self.information)?
+        } else {
+            IrpCompletion::from_error(if self.initial {
+                DriverError::NoSuchFile
+            } else {
+                DriverError::NoMoreFiles
+            })
+        };
+        request.with_active(|active| {
+            let cursor = exhausted.unwrap_or(self.cursor);
+            if self.information == 0 {
+                let mut opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
+                return opened.search_mut().publish_after_copy(cursor, || Ok(()));
+            }
+            let (mut output, file_object) =
+                active.requestor_output_with_file_object(self.length)?;
+            let mut opened = OpenedDirectory::decode(file_object)?;
+            opened.search_mut().publish_after_copy(cursor, || {
+                output.copy_from(
+                    0,
+                    self.packed
+                        .as_slice()
+                        .get(..self.information)
+                        .ok_or(DriverError::InternalInvariantViolation)?,
+                )
+            })
+        })?;
+        Ok(completion)
     }
 }

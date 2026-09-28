@@ -1,49 +1,10 @@
 //! Bounded directory enumeration domain types.
 
-use alloc::vec::Vec;
-use core::num::NonZeroU8;
-
 use crate::error::{Error, Result};
 use crate::memory;
 use crate::platform::name::Ext4Name;
 
 use super::node::DirectoryEntry;
-
-/// Maximum number of raw live dirents returned by one core scan operation.
-pub const MAX_DIRECTORY_SCAN_ENTRIES: usize = 128;
-/// Raw-entry bound in the cursor limit's compact representation.
-const MAX_DIRECTORY_SCAN_ENTRIES_U8: u8 = 128;
-
-/// Validated raw-entry budget for one bounded directory scan.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DirectoryScanLimit(NonZeroU8);
-
-impl DirectoryScanLimit {
-    /// Largest supported raw-entry budget.
-    pub const MAX: Self = Self(match NonZeroU8::new(MAX_DIRECTORY_SCAN_ENTRIES_U8) {
-        Some(value) => value,
-        None => NonZeroU8::MIN,
-    });
-
-    /// Validates a caller-selected raw-entry budget.
-    /// # Errors
-    ///
-    /// Returns an error when `entries` is zero or exceeds the core bound.
-    pub fn new(entries: usize) -> Result<Self> {
-        if entries == 0 || entries > MAX_DIRECTORY_SCAN_ENTRIES {
-            return Err(Error::InvalidDirectoryScanLimit);
-        }
-        Ok(Self(
-            NonZeroU8::new(u8::try_from(entries).map_err(|_| Error::ArithmeticOverflow)?)
-                .ok_or(Error::InvalidDirectoryScanLimit)?,
-        ))
-    }
-
-    /// Returns the validated raw-entry budget.
-    pub fn entries(self) -> usize {
-        usize::from(self.0.get())
-    }
-}
 
 /// Inline HTree name retained by a cursor without allocating in driver handle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,78 +214,9 @@ impl ScannedDirectoryEntry {
     }
 }
 
-/// One bounded live-directory scan result.
-#[derive(Debug, Eq, PartialEq)]
-pub struct DirectoryScanBatch {
-    /// Bounded projected entries returned by this call.
-    entries: Vec<ScannedDirectoryEntry>,
-    /// Cursor after all entries in `entries`.
-    continuation: DirectoryScanCursor,
-    /// Whether this call observed the end of the live directory.
-    exhausted: bool,
-}
-
-impl DirectoryScanBatch {
-    /// Constructs one internally validated bounded scan result.
-    pub(crate) const fn new(
-        entries: Vec<ScannedDirectoryEntry>,
-        continuation: DirectoryScanCursor,
-        exhausted: bool,
-    ) -> Self {
-        Self {
-            entries,
-            continuation,
-            exhausted,
-        }
-    }
-
-    /// Returns the raw live entries produced by this bounded scan.
-    #[must_use]
-    pub fn entries(&self) -> &[ScannedDirectoryEntry] {
-        &self.entries
-    }
-
-    /// Consumes the batch into its bounded scan records.
-    #[must_use]
-    pub fn into_entries(self) -> Vec<ScannedDirectoryEntry> {
-        self.entries
-    }
-
-    /// Returns the cursor after every entry in this batch.
-    #[must_use]
-    pub const fn continuation(&self) -> &DirectoryScanCursor {
-        &self.continuation
-    }
-
-    /// Returns whether this call observed end of directory.
-    #[must_use]
-    pub const fn is_exhausted(&self) -> bool {
-        self.exhausted
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// # Panics
-    ///
-    /// Panics when the raw-entry batch bound accepts zero or an oversized request.
-    #[test]
-    fn scan_limit_enforces_the_single_batch_raw_entry_budget() {
-        assert_eq!(
-            DirectoryScanLimit::new(0),
-            Err(Error::InvalidDirectoryScanLimit)
-        );
-        assert_eq!(
-            DirectoryScanLimit::new(MAX_DIRECTORY_SCAN_ENTRIES + 1),
-            Err(Error::InvalidDirectoryScanLimit)
-        );
-        assert_eq!(
-            DirectoryScanLimit::new(MAX_DIRECTORY_SCAN_ENTRIES),
-            Ok(DirectoryScanLimit::MAX)
-        );
-    }
 
     /// # Panics
     ///

@@ -1038,10 +1038,10 @@ pub(super) enum OpenedHandleKind {
         /// Data-write authority fixed when this handle was created.
         write_access: RegularFileWriteAccess,
     },
-    /// Directory handle with enumeration cursor.
+    /// Directory handle retaining its search expression and published continuation.
     Directory {
-        /// Stable, separately allocated directory enumeration cursor.
-        cursor: Box<UnsafeCell<DirectoryCursor>>,
+        /// Stable, separately allocated directory search state.
+        search: Box<UnsafeCell<DirectorySearch>>,
     },
     /// Symlink handle.
     Symlink,
@@ -1088,7 +1088,7 @@ impl OpenedHandle {
                 write_access: regular_file_write_access,
             },
             NodeId::Directory(_) => OpenedHandleKind::Directory {
-                cursor: memory::boxed_try_with(|| Ok(UnsafeCell::new(DirectoryCursor::start())))?,
+                search: memory::boxed_try_with(|| Ok(UnsafeCell::new(DirectorySearch::new())))?,
             },
             NodeId::Symlink(_) => OpenedHandleKind::Symlink,
         };
@@ -1196,10 +1196,10 @@ impl OpenedHandle {
         }
     }
 
-    /// Returns the stable interior cursor address for directory handles.
-    fn directory_cursor(&self) -> Option<NonNull<DirectoryCursor>> {
+    /// Returns the stable interior search-state address for directory handles.
+    fn directory_search(&self) -> Option<NonNull<DirectorySearch>> {
         match &self.kind {
-            OpenedHandleKind::Directory { cursor } => NonNull::new(cursor.as_ref().get()),
+            OpenedHandleKind::Directory { search } => NonNull::new(search.as_ref().get()),
             OpenedHandleKind::File { .. } | OpenedHandleKind::Symlink => None,
         }
     }
@@ -2087,8 +2087,8 @@ pub(crate) struct OpenedDirectory<'owner> {
     opened: OpenedObject<'owner>,
     /// Typed directory node identity.
     id: DirectoryNodeId,
-    /// Directory cursor stored in the directory handle variant.
-    cursor: NonNull<DirectoryCursor>,
+    /// Search expression and published position stored in the directory handle variant.
+    search: NonNull<DirectorySearch>,
 }
 
 impl<'owner> OpenedDirectory<'owner> {
@@ -2105,10 +2105,10 @@ impl<'owner> OpenedDirectory<'owner> {
         if opened.node_mode() == OpenedNodeMode::ReparsePoint {
             return Err(DriverError::NotSupported);
         }
-        let Some(cursor) = opened.handle().directory_cursor() else {
+        let Some(search) = opened.handle().directory_search() else {
             return Err(DriverError::InvalidParameter);
         };
-        Ok(Self { opened, id, cursor })
+        Ok(Self { opened, id, search })
     }
 
     /// Returns the typed directory identity.
@@ -2134,17 +2134,17 @@ impl<'owner> OpenedDirectory<'owner> {
         self.opened.notification_context()
     }
 
-    /// Returns the mutable directory enumeration cursor.
+    /// Borrows the search state while the owning request retains the exclusive handle lane.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) fn cursor_mut(&mut self) -> &mut DirectoryCursor {
+    pub(crate) fn search_mut(&mut self) -> &mut DirectorySearch {
         unsafe {
-            // SAFETY: `cursor` points into the live directory handle variant
+            // SAFETY: `search` points into the live directory handle variant
             // validated during decode. This type exposes no variant-changing
             // operation.
-            self.cursor.as_mut()
+            self.search.as_mut()
         }
     }
 }

@@ -675,21 +675,11 @@ pub(crate) fn validate_pending_deletion(
     let metadata = metadata_from_node(read, node)?;
     readonly.validate_attributes(metadata.file_attributes)?;
     if let NodeId::Directory(directory_id) = node {
-        let directory = read.load_directory(directory_id)?;
-        let mut cursor = DirectoryCursor::start();
-        loop {
-            let batch = read.scan_directory(&directory, &cursor, DirectoryScanLimit::MAX)?;
-            if batch
-                .entries()
-                .iter()
-                .any(|entry| !matches!(entry.entry().name().bytes(), b"." | b".."))
-            {
+        let mut reader = ext4_core::DirectoryReader::new(directory_id, DirectoryCursor::start());
+        while let Some(entry) = read.next_directory_entry(&mut reader)? {
+            if !matches!(entry.entry().name().bytes(), b"." | b"..") {
                 return Err(DriverError::from(ext4_core::Error::DirectoryNotEmpty));
             }
-            if batch.is_exhausted() {
-                break;
-            }
-            cursor = *batch.continuation();
         }
     }
     Ok(())

@@ -1050,15 +1050,13 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
         self.mutation.volume.read_symlink(symlink)
     }
 
-    fn scan_directory(
+    fn next_directory_entry(
         &mut self,
-        directory: &DirectoryNode,
-        cursor: &DirectoryScanCursor,
-        limit: DirectoryScanLimit,
-    ) -> Result<DirectoryScanBatch> {
+        reader: &mut DirectoryReader,
+    ) -> Result<Option<ScannedDirectoryEntry>> {
         self.mutation
             .volume
-            .scan_directory(directory, cursor, limit, self.crypto)
+            .next_directory_entry(reader, self.crypto)
     }
 
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {

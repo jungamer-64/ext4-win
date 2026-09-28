@@ -334,6 +334,8 @@ pub(crate) fn verify_htree_interop(repository_root: &Path) -> TaskResult<()> {
     let temporary_root = create_task_directory(repository_root, "htree-interop")?;
     let verification = (|| -> TaskResult<()> {
         verify_large_directory_depth_two(linux, &temporary_root)?;
+        verify_directory_enumeration_scaling(linux, &temporary_root)?;
+        verify_locked_directory_enumeration(linux, &temporary_root)?;
         for block_size in [1_024_u32, 4_096] {
             for metadata_checksum in [false, true] {
                 for large_directory in [false, true] {
@@ -604,38 +606,45 @@ fn verify_htree_mutation_profile(
         })?;
     }
 
+    if block_size == 4096 && metadata_checksum && !large_directory {
+        verify_directory_read_faults(&image, ext4_core::DirectoryNodeId::ROOT)?;
+    }
+    let (mut published_names, mut published_cursor) = read_directory_request(
+        &image,
+        ext4_core::DirectoryNodeId::ROOT,
+        ext4_core::DirectoryScanCursor::start(),
+        5,
+    )?;
     let source =
         htree_profile_name(block_size, "entry", ENTRY_COUNT - 1).map_err(core_task_error)?;
+    if published_names
+        .last()
+        .is_some_and(|name| name == source.bytes())
+    {
+        (published_names, published_cursor) = read_directory_request(
+            &image,
+            ext4_core::DirectoryNodeId::ROOT,
+            ext4_core::DirectoryScanCursor::start(),
+            6,
+        )?;
+    }
     let renamed =
         htree_profile_name(block_size, "renamed", ENTRY_COUNT - 1).map_err(core_task_error)?;
     drive_internal_core_mutation(&image, |pass| {
         let root =
             ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
-        let mut cursor = ext4_core::DirectoryScanCursor::start();
+        let mut reader =
+            ext4_core::DirectoryReader::new(root.id(), ext4_core::DirectoryScanCursor::start());
         let mut count = 0_usize;
         let mut saw_source = false;
-        loop {
-            let batch = ext4_core::CommittedReadPass::scan_directory(
-                pass,
-                &root,
-                &cursor,
-                ext4_core::DirectoryScanLimit::MAX,
-            )?;
-            if batch.entries().len() > ext4_core::MAX_DIRECTORY_SCAN_ENTRIES {
-                return Err(ext4_core::Error::InvalidDirectoryScanLimit);
-            }
-            let exhausted = batch.is_exhausted();
-            cursor = *batch.continuation();
-            for scanned in batch.into_entries() {
-                count = count
-                    .checked_add(1)
-                    .ok_or(ext4_core::Error::ArithmeticOverflow)?;
-                if scanned.entry().name() == &source {
-                    saw_source = true;
-                }
-            }
-            if exhausted {
-                break;
+        while let Some(scanned) =
+            ext4_core::CommittedReadPass::next_directory_entry(pass, &mut reader)?
+        {
+            count = count
+                .checked_add(1)
+                .ok_or(ext4_core::Error::ArithmeticOverflow)?;
+            if scanned.entry().name() == &source {
+                saw_source = true;
             }
         }
         if count != ENTRY_COUNT + 3 || !saw_source {
@@ -677,6 +686,38 @@ fn verify_htree_mutation_profile(
             ext4_core::RenameTargetCollision::Reject,
         )
     })?;
+
+    let (current_names, _) = read_directory_request(
+        &image,
+        ext4_core::DirectoryNodeId::ROOT,
+        ext4_core::DirectoryScanCursor::start(),
+        usize::MAX,
+    )?;
+    let anchor = published_names
+        .last()
+        .ok_or_else(|| io::Error::other("empty directory prefix"))?;
+    if anchor != source.bytes() {
+        let boundary = current_names
+            .iter()
+            .position(|name| name == anchor)
+            .and_then(|index| index.checked_add(1))
+            .ok_or_else(|| io::Error::other("published anchor missing"))?;
+        let (resumed, _) = read_directory_request(
+            &image,
+            ext4_core::DirectoryNodeId::ROOT,
+            published_cursor,
+            usize::MAX,
+        )?;
+        if current_names.get(boundary..) != Some(resumed.as_slice()) {
+            return Err(
+                io::Error::other("directory continuation did not use the updated epoch").into(),
+            );
+        }
+    } else {
+        return Err(
+            io::Error::other("fixture selected the renamed entry as continuation anchor").into(),
+        );
+    }
 
     let dump = debugfs_request_output(linux, &image, "htree_dump /")?;
     if !dump.contains("Root node dump") {
@@ -771,7 +812,7 @@ fn verify_large_directory_depth_two(
     let image = case_root.join("filesystem.img");
     format_htree_image(linux, &image, 64 * 1024 * 1024, BLOCK_SIZE, true, true, 8)?;
     let image_path = linux.tool_path(&image)?;
-    populate_depth_two_mounted_image(linux, &image_path, ENTRY_COUNT)?;
+    populate_directory_image(linux, &image_path, ENTRY_COUNT, 255)?;
 
     let blocks = debugfs_block_sequence(linux, &image_path, "blocks /depth2")?;
     let directory_bytes = blocks
@@ -839,7 +880,7 @@ fn verify_large_directory_depth_two(
         .into());
     }
 
-    drive_internal_core_read(&image, |pass| {
+    let directory_id = drive_internal_core_read(&image, |pass| {
         let root =
             ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
         let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, &directory_name)?;
@@ -854,28 +895,15 @@ fn verify_large_directory_depth_two(
                 return Err(ext4_core::Error::DirectoryEntryNotFound);
             }
         };
-        let directory = ext4_core::CommittedReadPass::load_directory(pass, directory_id)?;
-        let first = ext4_core::CommittedReadPass::scan_directory(
-            pass,
-            &directory,
-            &ext4_core::DirectoryScanCursor::start(),
-            ext4_core::DirectoryScanLimit::MAX,
-        )?;
-        if first.entries().len() != ext4_core::MAX_DIRECTORY_SCAN_ENTRIES || first.is_exhausted() {
-            return Err(ext4_core::Error::InvalidDirectoryEntry);
-        }
-        let second = ext4_core::CommittedReadPass::scan_directory(
-            pass,
-            &directory,
-            first.continuation(),
-            ext4_core::DirectoryScanLimit::MAX,
-        )?;
-        if second.entries().len() != ext4_core::MAX_DIRECTORY_SCAN_ENTRIES || second.is_exhausted()
-        {
-            return Err(ext4_core::Error::InvalidDirectoryEntry);
-        }
-        Ok(())
+        Ok(directory_id)
     })?;
+    let mut expected = alloc::collections::BTreeSet::new();
+    expected.insert(b".".to_vec());
+    expected.insert(b"..".to_vec());
+    for index in 0..ENTRY_COUNT {
+        expected.insert(depth_two_profile_name(index)?.into_bytes());
+    }
+    drive_directory_enumeration(&image, directory_id, &mut expected)?;
     println!(
         "depth-two >16 MiB lookup/paging: PASS ({exact_lower_reads} exact lower reads, {} directory blocks)",
         blocks.len()
@@ -889,10 +917,11 @@ fn verify_large_directory_depth_two(
 ///
 /// Returns an error when mount-directory creation, loop mounting, hard-link population, sync,
 /// unmount, or mandatory mount-directory cleanup fails.
-fn populate_depth_two_mounted_image(
+fn populate_directory_image(
     linux: LinuxEnvironment,
     image_path: &str,
     entry_count: usize,
+    name_bytes: usize,
 ) -> TaskResult<()> {
     const PREFIX: &str = "/tmp/ext4win-htree-mount.";
 
@@ -920,16 +949,23 @@ root = sys.argv[1]
 count = int(sys.argv[2])
 depth = os.path.join(root, "depth2")
 os.mkdir(depth)
-target = os.path.join(root, "depth2-target")
-open(target, "wb").close()
 for index in range(count):
+    if index % 50000 == 0:
+        target = os.path.join(root, f"target-{index}")
+        open(target, "wb").close()
     name = f"depth-{index:05d}-"
-    name += "x" * (255 - len(name))
+    name += "x" * max(0, int(sys.argv[3]) - len(name))
     os.link(target, os.path.join(depth, name))
 "#;
         let mut populate = linux.command("python3");
         populate
-            .args(["-c", script, &mount_directory, &entry_count.to_string()])
+            .args([
+                "-c",
+                script,
+                &mount_directory,
+                &entry_count.to_string(),
+                &name_bytes.to_string(),
+            ])
             .stdout(Stdio::null());
         run_checked(populate, "depth-two mounted directory population")?;
         let mut sync = linux.command("sync");
@@ -3595,6 +3631,131 @@ fn run_internal_htree_mutation_until_boundary(
         },
     )?;
     run_prepared_mutation_until_boundary(&mut storage, &mut coordinator, ticket, prepared, cut)
+}
+
+/// Full-set oracle and read-count scaling for ordinary names, separate from the maximum-name fixture.
+/// # Errors
+/// Returns fixture, enumeration, or external filesystem consistency failures.
+fn verify_directory_enumeration_scaling(
+    linux: LinuxEnvironment,
+    temporary_root: &Path,
+) -> TaskResult<()> {
+    for count in [10_000, 100_000] {
+        let label = format!("directory-{count}");
+        let case_root = temporary_root.join(&label);
+        fs::create_dir(&case_root)?;
+        let image = case_root.join("filesystem.img");
+        format_htree_image(linux, &image, 64 * 1024 * 1024, 4096, true, true, 8)?;
+        let image_path = linux.tool_path(&image)?;
+        populate_directory_image(linux, &image_path, count, 0)?;
+        let directory = drive_internal_core_read(&image, |pass| {
+            let root = ext4_core::CommittedReadPass::load_directory(
+                pass,
+                ext4_core::DirectoryNodeId::ROOT,
+            )?;
+            match ext4_core::CommittedReadPass::lookup_child(
+                pass,
+                &root,
+                &ext4_core::Ext4Name::new(b"depth2")?,
+            )? {
+                ext4_core::ChildLookup::Found(child) => match *child.node() {
+                    ext4_core::NodeId::Directory(directory) => Ok(directory),
+                    _ => Err(ext4_core::Error::WrongInodeKind),
+                },
+                _ => Err(ext4_core::Error::DirectoryEntryNotFound),
+            }
+        })?;
+        let mut expected = alloc::collections::BTreeSet::new();
+        expected.insert(b".".to_vec());
+        expected.insert(b"..".to_vec());
+        for index in 0..count {
+            expected.insert(format!("depth-{index:05}-").into_bytes());
+        }
+        drive_directory_enumeration(&image, directory, &mut expected)?;
+        verify_internal_e2fsck_clean(linux, &image, &label)?;
+    }
+    Ok(())
+}
+
+/// Verifies raw encrypted-name ordering, no-key projection, and I/O retry against a disk fixture.
+/// # Errors
+/// Returns external fixture, directory enumeration, or integrity-check failures.
+fn verify_locked_directory_enumeration(
+    linux: LinuxEnvironment,
+    temporary_root: &Path,
+) -> TaskResult<()> {
+    let case_root = temporary_root.join("locked-directory");
+    fs::create_dir(&case_root)?;
+    let image = case_root.join("filesystem.img");
+    format_htree_image(linux, &image, 32 * 1024 * 1024, 4096, false, false, 4)?;
+    let context = case_root.join("context.bin");
+    let mut context_bytes = [1_u8; 40];
+    for (target, value) in context_bytes.iter_mut().zip([2, 1, 4, 0, 0, 0, 0, 0]) {
+        *target = value;
+    }
+    fs::write(&context, context_bytes)?;
+    let context_path = linux.tool_path(&context)?;
+    let image_path = linux.tool_path(&image)?;
+    let commands = case_root.join("populate.debugfs");
+    let mut script = String::from("feature encrypt\nmkdir /locked\n");
+    for name in ["abcdefghijklmnop", "ponmlkjihgfedcba"] {
+        script.push_str(&format!("write /dev/null /locked/{name}\nea_set -f {context_path} /locked/{name} c\nset_inode_field /locked/{name} flags 0x80800\n"));
+    }
+    script.push_str(&format!(
+        "ea_set -f {context_path} /locked c\nset_inode_field /locked flags 0x80800\n"
+    ));
+    fs::write(&commands, script)?;
+    let mut populate = linux.command("debugfs");
+    populate.args(["-w", "-f", &linux.tool_path(&commands)?, &image_path]);
+    run_checked(populate, "encrypted directory fixture")?;
+    // The oracle CLI has no encryption-namespace spelling. Encode only the on-disk namespace
+    // byte in its otherwise generated inline attribute; this fixture has no metadata checksum.
+    let namespace_script = r#"import re, struct, subprocess, sys
+image = sys.argv[1]
+for name in ["/locked", "/locked/abcdefghijklmnop", "/locked/ponmlkjihgfedcba"]:
+    output = subprocess.check_output(["/usr/sbin/debugfs", "-R", "imap " + name, image], text=True)
+    block, offset = re.search(r"located at block (\d+), offset (0x[0-9a-fA-F]+)", output).groups()
+    base = int(block) * 4096 + int(offset, 16)
+    with open(image, "r+b") as disk:
+        disk.seek(base + 128)
+        extra = struct.unpack("<H", disk.read(2))[0]
+        disk.seek(base + 128 + extra)
+        header = disk.read(24)
+        assert header[:6] == bytes([0, 0, 2, 234, 1, 0]) and header[20:21] == b"c"
+        disk.seek(base + 128 + extra + 5)
+        disk.write(bytes([9]))
+"#;
+    let mut namespace = linux.command("python3");
+    namespace.args(["-c", namespace_script, &image_path]);
+    run_checked(namespace, "encryption context namespace encoding")?;
+    verify_internal_e2fsck_clean(linux, &image, "encrypted directory fixture")?;
+    let directory = drive_internal_core_read_observed(&image, |pass| {
+        let root =
+            ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
+        match ext4_core::CommittedReadPass::lookup_child(
+            pass,
+            &root,
+            &ext4_core::Ext4Name::new(b"locked")?,
+        )? {
+            ext4_core::ChildLookup::Found(child) => match *child.node() {
+                ext4_core::NodeId::Directory(id) => Ok(id),
+                _ => Err(ext4_core::Error::WrongInodeKind),
+            },
+            _ => Err(ext4_core::Error::DirectoryEntryNotFound),
+        }
+    })?
+    .0;
+    let mut expected = [
+        b".".to_vec(),
+        b"..".to_vec(),
+        b"_fscrypt_YWJjZGVmZ2hpamtsbW5vcA".to_vec(),
+        b"_fscrypt_cG9ubWxramloZ2ZlZGNiYQ".to_vec(),
+    ]
+    .into_iter()
+    .collect();
+    drive_directory_enumeration(&image, directory, &mut expected)?;
+    verify_directory_read_faults(&image, directory)?;
+    Ok(())
 }
 
 #[cfg(test)]

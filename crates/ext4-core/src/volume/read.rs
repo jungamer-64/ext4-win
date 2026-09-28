@@ -21,20 +21,20 @@ struct VerityReadPlan {
 
 /// One resident routing table in an on-demand HTree path.
 #[derive(Debug, Eq, PartialEq)]
-struct HtreePathLevel {
+pub(super) struct HtreePathLevel {
     /// Logical block containing this table (`0` for the root).
-    logical: u32,
+    pub(super) logical: u32,
     /// Validated root or interior-node routing table.
-    index: DxIndex,
+    pub(super) index: DxIndex,
     /// Child selected inside `index`.
-    selected: usize,
+    pub(super) selected: usize,
 }
 
 /// Root-to-leaf route. Its length is bounded by the mounted HTree depth profile.
 #[derive(Debug, Eq, PartialEq)]
-struct HtreePath {
+pub(super) struct HtreePath {
     /// Resident root-to-leaf index levels.
-    levels: Vec<HtreePathLevel>,
+    pub(super) levels: Vec<HtreePathLevel>,
 }
 
 impl HtreePath {
@@ -42,7 +42,7 @@ impl HtreePath {
     /// # Errors
     ///
     /// Returns an error when allocating either the level vector or a copied index fails.
-    fn try_clone(&self) -> Result<Self> {
+    pub(super) fn try_clone(&self) -> Result<Self> {
         let mut levels = Vec::new();
         levels
             .try_reserve_exact(self.levels.len())
@@ -62,7 +62,7 @@ impl HtreePath {
     ///
     /// Returns an error when the path is empty, its selected route is absent, or it points back to
     /// a resident index level.
-    fn leaf(&self) -> Result<u32> {
+    pub(super) fn leaf(&self) -> Result<u32> {
         let leaf = self
             .levels
             .last()
@@ -79,7 +79,7 @@ impl HtreePath {
     /// # Errors
     ///
     /// Returns an error when the path is empty or its selected route is absent.
-    fn boundary(&self) -> Result<u32> {
+    pub(super) fn boundary(&self) -> Result<u32> {
         if self.levels.is_empty() {
             return Err(Error::InvalidDirectoryEntry);
         }
@@ -94,7 +94,7 @@ impl HtreePath {
     /// # Errors
     ///
     /// Returns an error when any selected route is absent or violates its parent interval.
-    fn hash_range(&self) -> Result<HtreeHashRange> {
+    pub(super) fn hash_range(&self) -> Result<HtreeHashRange> {
         let mut range = HtreeHashRange::root();
         for level in &self.levels {
             range = range.descend(&level.index, level.selected)?;
@@ -400,38 +400,21 @@ impl EpochReadView<'_, '_> {
     /// # Errors
     ///
     /// Returns an error when encrypted-name projection or referenced-inode validation fails.
-    fn project_scanned_directory_entry(
+    pub(super) fn project_directory_name(
         &mut self,
         directory: &DirectoryNode,
         raw: RawDirectoryEntry,
         crypto: &mut dyn CryptographicOperation,
-    ) -> Result<DirectoryEntry> {
-        let visible = if directory.protection().is_encrypted() {
+    ) -> Result<Ext4Name> {
+        if directory.protection().is_encrypted() {
             match self.decrypt_directory_child_name(directory.inode(), raw.name(), crypto) {
-                Ok(name) => name,
-                Err(Error::MissingEncryptionKey) => {
-                    Self::project_locked_directory_name(raw.name())?
-                }
-                Err(error) => return Err(error),
+                Ok(name) => Ok(name),
+                Err(Error::MissingEncryptionKey) => Self::project_locked_directory_name(raw.name()),
+                Err(error) => Err(error),
             }
         } else {
-            raw.name().try_to_owned_name()?
-        };
-        self.validate_directory_entry(raw, &visible)
-    }
-
-    /// Loads the directory's extent mapping once for one lookup or scan call.
-    /// # Errors
-    ///
-    /// Returns an error when the directory extent root or an external extent node is invalid.
-    fn directory_extent_tree(&mut self, inode: &Inode) -> Result<MutableExtentTree> {
-        let context = self.extent_tree_context(inode);
-        MutableExtentTree::load_inode_tree(
-            inode.extent_root()?,
-            self.superblock.block_size(),
-            &mut self.device,
-            context,
-        )
+            raw.name().try_to_owned_name()
+        }
     }
 
     /// Reads one mapped logical directory block.
@@ -439,10 +422,10 @@ impl EpochReadView<'_, '_> {
     ///
     /// Returns an error when the logical block is outside the semantic directory size, unmapped,
     /// unreadable, or cannot be allocated.
-    fn read_directory_logical_block(
+    pub(super) fn read_directory_logical_block(
         &mut self,
         inode: &Inode,
-        tree: &MutableExtentTree,
+        tree: &mut ExtentMappingCursor,
         logical: LogicalBlock,
     ) -> Result<DirectoryBlock> {
         let block_count = round_up_div(
@@ -452,7 +435,7 @@ impl EpochReadView<'_, '_> {
         if logical.as_u64() >= block_count {
             return Err(Error::InvalidDirectoryEntry);
         }
-        let physical = match tree.map_logical(logical) {
+        let physical = match tree.map(logical, &mut self.device)? {
             BlockMapping::Physical(physical) => physical,
             BlockMapping::Uninitialized | BlockMapping::Hole => {
                 return Err(Error::InvalidDirectoryEntry);
@@ -476,7 +459,7 @@ impl EpochReadView<'_, '_> {
     fn htree_path_for_hash(
         &mut self,
         inode: &Inode,
-        tree: &MutableExtentTree,
+        tree: &mut ExtentMappingCursor,
         root: DxIndex,
         indirect_levels: u8,
         major: u32,
@@ -522,7 +505,7 @@ impl EpochReadView<'_, '_> {
     fn advance_htree_path(
         &mut self,
         inode: &Inode,
-        tree: &MutableExtentTree,
+        tree: &mut ExtentMappingCursor,
         path: &mut HtreePath,
         indirect_levels: u8,
         checksum: DirectoryChecksum,
@@ -585,7 +568,11 @@ impl EpochReadView<'_, '_> {
         inode: &Inode,
         name: &Ext4Name,
     ) -> Result<Option<RawDirectoryEntry>> {
-        let tree = self.directory_extent_tree(inode)?;
+        let mut tree = ExtentMappingCursor::new(
+            inode.extent_root()?,
+            self.superblock.block_size(),
+            self.extent_tree_context(inode),
+        )?;
         let block_size = self.superblock.block_size();
         match inode.directory_storage_kind()? {
             DirectoryStorageKind::Linear => {
@@ -594,7 +581,7 @@ impl EpochReadView<'_, '_> {
                 for logical in 0..block_count {
                     let block = self.read_directory_logical_block(
                         inode,
-                        &tree,
+                        &mut tree,
                         LogicalBlock::try_from(logical)?,
                     )?;
                     if let Some(entry) = block.find(name)? {
@@ -607,7 +594,7 @@ impl EpochReadView<'_, '_> {
                 let checksum = self.directory_checksum(inode);
                 let root_block = self.read_directory_logical_block(
                     inode,
-                    &tree,
+                    &mut tree,
                     LogicalBlock::try_from(0_u64)?,
                 )?;
                 let root = HtreeRoot::parse(
@@ -623,7 +610,7 @@ impl EpochReadView<'_, '_> {
                 let hash = root.hash_scheme().hash(name);
                 let mut path = self.htree_path_for_hash(
                     inode,
-                    &tree,
+                    &mut tree,
                     root.index().try_clone()?,
                     root.indirect_levels(),
                     hash.major,
@@ -632,7 +619,7 @@ impl EpochReadView<'_, '_> {
                 loop {
                     let leaf = self.read_directory_logical_block(
                         inode,
-                        &tree,
+                        &mut tree,
                         LogicalBlock::try_from(u64::from(path.leaf()?))?,
                     )?;
                     let entries = leaf.entries()?;
@@ -643,7 +630,7 @@ impl EpochReadView<'_, '_> {
                     }
                     if !self.advance_htree_path(
                         inode,
-                        &tree,
+                        &mut tree,
                         &mut path,
                         root.indirect_levels(),
                         checksum,
@@ -933,33 +920,23 @@ impl EpochReadView<'_, '_> {
                 return Err(Error::InvalidDirectoryEntry);
             }
             visited.try_push(directory_id)?;
-            let directory = self.load_directory(directory_id)?;
-            let mut cursor = DirectoryScanCursor::start();
-            loop {
-                let batch =
-                    self.scan_directory(&directory, &cursor, DirectoryScanLimit::MAX, crypto)?;
-                let exhausted = batch.is_exhausted();
-                cursor = *batch.continuation();
-                for scanned in batch.into_entries() {
-                    let entry = scanned.into_entry();
-                    if matches!(entry.name().bytes(), b"." | b"..") {
-                        continue;
-                    }
-                    match *entry.node() {
-                        NodeId::Directory(child) => {
-                            if visited.contains(&child) || pending.contains(&child) {
-                                return Err(Error::InvalidDirectoryEntry);
-                            }
-                            pending.try_push(child)?;
-                        }
-                        node if node == target_node => {
-                            links.try_push(HardLinkEntry::try_new(directory_id, entry.name())?)?;
-                        }
-                        NodeId::File(_) | NodeId::Symlink(_) => {}
-                    }
+            let mut reader = DirectoryReader::new(directory_id, DirectoryScanCursor::start());
+            while let Some(scanned) = self.next_directory_entry(&mut reader, crypto)? {
+                let entry = scanned.into_entry();
+                if matches!(entry.name().bytes(), b"." | b"..") {
+                    continue;
                 }
-                if exhausted {
-                    break;
+                match *entry.node() {
+                    NodeId::Directory(child) => {
+                        if visited.contains(&child) || pending.contains(&child) {
+                            return Err(Error::InvalidDirectoryEntry);
+                        }
+                        pending.try_push(child)?;
+                    }
+                    node if node == target_node => {
+                        links.try_push(HardLinkEntry::try_new(directory_id, entry.name())?)?;
+                    }
+                    NodeId::File(_) | NodeId::Symlink(_) => {}
                 }
             }
         }
@@ -1066,27 +1043,20 @@ impl EpochReadView<'_, '_> {
             return Ok(None);
         }
         let mut folded = None;
-        let mut cursor = DirectoryScanCursor::start();
-        loop {
-            let batch = self.scan_directory(parent, &cursor, DirectoryScanLimit::MAX, crypto)?;
-            let exhausted = batch.is_exhausted();
-            cursor = *batch.continuation();
-            for scanned in batch.into_entries() {
-                let entry = scanned.into_entry();
-                let Ok(name) = WindowsName::from_ext4(entry.name()) else {
-                    continue;
-                };
-                if name.equals_ascii_case_insensitive(requested) {
-                    if folded.is_some() {
-                        return Err(Error::AmbiguousWindowsName);
-                    }
-                    folded = Some(entry);
+        let mut reader = DirectoryReader::new(parent.id(), DirectoryScanCursor::start());
+        while let Some(scanned) = self.next_directory_entry(&mut reader, crypto)? {
+            let entry = scanned.into_entry();
+            let Ok(name) = WindowsName::from_ext4(entry.name()) else {
+                continue;
+            };
+            if name.equals_ascii_case_insensitive(requested) {
+                if folded.is_some() {
+                    return Err(Error::AmbiguousWindowsName);
                 }
-            }
-            if exhausted {
-                return Ok(folded);
+                folded = Some(entry);
             }
         }
+        Ok(folded)
     }
 
     /// Converts a directory entry into a child whose inode kind is validated.
@@ -1494,70 +1464,4 @@ fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> 
     end_blocks
         .checked_mul(u64::from(block_size.bytes()))
         .ok_or(Error::ArithmeticOverflow)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Builds one synthetic collision candidate without coupling the test to a hash algorithm.
-    fn collision_candidate(name_byte: u8, minor: u32, inode: u32) -> Option<HtreeScanCandidate> {
-        let name_bytes = [name_byte];
-        let Ok(name) = Ext4Name::new(&name_bytes) else {
-            return None;
-        };
-        let Ok(inode) = InodeId::try_from(inode) else {
-            return None;
-        };
-        let Ok(entry) = RawDirectoryEntry::new(inode, &name, DirectoryEntryKind::File) else {
-            return None;
-        };
-        Some(HtreeScanCandidate {
-            entry,
-            hash: DirectoryHash {
-                major: 0x1234_5600,
-                minor,
-            },
-        })
-    }
-
-    /// # Panics
-    ///
-    /// Panics when a bounded collision merge loses, duplicates, or reorders entries while resuming
-    /// by the complete `(major, minor, raw name)` key.
-    #[test]
-    fn bounded_collision_merge_resumes_by_complete_semantic_key() {
-        let specifications = [(b'z', 1), (b'm', 2), (b'a', 1), (b'c', 3), (b'b', 2)];
-        let mut consumed = None;
-        let mut observed = Vec::new();
-        for page in 0..3_u32 {
-            let mut retained = Vec::new();
-            for (index, (name, minor)) in specifications.iter().copied().enumerate() {
-                let Some(candidate) = collision_candidate(
-                    name,
-                    minor,
-                    u32::try_from(index).unwrap_or(0).saturating_add(12),
-                ) else {
-                    return;
-                };
-                if candidate.is_after(consumed)
-                    && retain_bounded_htree_candidate(&mut retained, candidate, 2).is_err()
-                {
-                    return;
-                }
-            }
-            assert_eq!(retained.len(), if page < 2 { 2 } else { 1 });
-            for candidate in retained {
-                let Some(name_byte) = candidate.entry.name().bytes().first().copied() else {
-                    return;
-                };
-                let Ok(name) = DirectoryCursorName::from_name(candidate.entry.name()) else {
-                    return;
-                };
-                consumed = Some((candidate.hash.major, candidate.hash.minor, name));
-                observed.push(name_byte);
-            }
-        }
-        assert_eq!(observed, vec![b'a', b'z', b'b', b'm', b'c']);
-    }
 }

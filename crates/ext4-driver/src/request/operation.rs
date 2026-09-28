@@ -76,6 +76,10 @@ macro_rules! impl_mounted_operation_adapter {
     };
 }
 
+#[path = "operation/directory.rs"]
+mod directory;
+pub(crate) use directory::query_directory;
+
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]
 pub(crate) struct AdmitOperationError {
@@ -680,8 +684,6 @@ pub(crate) enum ReadRequestKind {
     Read,
     /// File information query.
     QueryInformation,
-    /// Directory enumeration query.
-    QueryDirectory,
     /// Extended-attribute query.
     QueryEa,
     /// Security descriptor query.
@@ -897,9 +899,6 @@ impl ReadRequestOperation {
             }
             PreparedReadRequest::Other(ReadRequestKind::QueryInformation) => {
                 crate::request::file_info::query(owned.request(), read)
-            }
-            PreparedReadRequest::Other(ReadRequestKind::QueryDirectory) => {
-                crate::request::file_info::query_directory(owned.request(), read)
             }
             PreparedReadRequest::Other(ReadRequestKind::QueryEa) => {
                 crate::request::ea::query(owned.request(), read)

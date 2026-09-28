@@ -1656,3 +1656,271 @@ fn verify_volume_label(image: &Path, expected: &[u8]) -> TaskResult<()> {
         Err(io::Error::other("e2fsck did not replay the core-generated metadata label").into())
     }
 }
+
+/// Executes the production consuming walk, checking an independently populated name set.
+/// The expectation belongs to the oracle; it is not storage retained by the walk.
+/// # Errors
+/// Returns I/O, unexpected name/ordinal, missing name, or clean-close failures.
+fn drive_directory_enumeration(
+    image: &Path,
+    directory: ext4_core::DirectoryNodeId,
+    expected: &mut alloc::collections::BTreeSet<Vec<u8>>,
+) -> TaskResult<()> {
+    let mut storage = FileStorageAdapter::open_internal(image)?;
+    let length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let (profile, epoch, _coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let mut operation = ext4_core::DirectoryReadOperation::new(
+        &profile,
+        directory,
+        ext4_core::DirectoryScanCursor::start(),
+    );
+    let mut event = ext4_core::OperationEvent::Admitted;
+    let mut reads = 0_usize;
+    let mut count = 0_usize;
+    let started = std::time::Instant::now();
+    let mut first = None;
+    let cursor = loop {
+        match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+            ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
+                reads = reads
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("enumeration count overflow"))?;
+                event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(
+                    &mut storage,
+                    request,
+                )?);
+                operation = suspended;
+            }
+            ext4_core::DirectoryReadTransition::Entry {
+                entry,
+                continuation,
+            } => {
+                first.get_or_insert_with(|| started.elapsed());
+                if !expected.remove(entry.entry().name().bytes()) {
+                    return Err(io::Error::other("unexpected or duplicate directory name").into());
+                }
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("enumeration count overflow"))?;
+                if entry.ordinal()
+                    != u64::try_from(
+                        count
+                            .checked_sub(1)
+                            .ok_or_else(|| io::Error::other("enumeration ordinal underflow"))?,
+                    )?
+                {
+                    return Err(io::Error::other("directory ordinal discontinuity").into());
+                }
+                operation = continuation;
+                event = ext4_core::OperationEvent::Admitted;
+            }
+            ext4_core::DirectoryReadTransition::Complete(result) => {
+                break result.map_err(core_task_error)?;
+            }
+        }
+    };
+    if !expected.is_empty() {
+        return Err(io::Error::other(format!("{} directory names missing", expected.len())).into());
+    }
+    match ext4_core::DirectoryReadOperation::new(&profile, directory, cursor).advance(
+        ext4_core::OperationEvent::Admitted,
+        &epoch,
+        &mut RejectingCryptographicOperation,
+    ) {
+        ext4_core::DirectoryReadTransition::Complete(Ok(end)) if end == cursor => {}
+        _ => return Err(io::Error::other("directory end cursor did not remain exhausted").into()),
+    }
+    println!(
+        "directory enumeration: {count} entries, first {:?}, total {:?}, {reads} lower reads",
+        first,
+        started.elapsed()
+    );
+    complete_core_clean_close(&mut storage, length, profile.journal_target())?;
+    Ok(())
+}
+
+/// Injects cancellation and failed completions at every lower read of a small real directory.
+/// # Errors
+/// Returns I/O, unexpected continuation, failure masking, or clean-close errors.
+fn verify_directory_read_faults(
+    image: &Path,
+    directory: ext4_core::DirectoryNodeId,
+) -> TaskResult<()> {
+    let mut storage = FileStorageAdapter::open_internal(image)?;
+    let length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let (profile, epoch, _coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let mut baseline = Vec::new();
+    let mut read_count = 0_usize;
+    let mut operation = ext4_core::DirectoryReadOperation::new(
+        &profile,
+        directory,
+        ext4_core::DirectoryScanCursor::start(),
+    );
+    let mut event = ext4_core::OperationEvent::Admitted;
+    loop {
+        match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+            ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
+                read_count = read_count
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("enumeration count overflow"))?;
+                operation = suspended;
+                event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(
+                    &mut storage,
+                    request,
+                )?);
+            }
+            ext4_core::DirectoryReadTransition::Entry {
+                entry,
+                continuation,
+            } => {
+                baseline.push(entry.entry().name().bytes().to_vec());
+                operation = continuation;
+                event = ext4_core::OperationEvent::Admitted;
+            }
+            ext4_core::DirectoryReadTransition::Complete(result) => {
+                result.map_err(core_task_error)?;
+                break;
+            }
+        }
+    }
+    for failure in [
+        ext4_core::Error::OperationCancelled,
+        ext4_core::Error::DeviceIo,
+    ] {
+        for fault in 0..read_count {
+            let mut published = ext4_core::DirectoryScanCursor::start();
+            let mut operation =
+                ext4_core::DirectoryReadOperation::new(&profile, directory, published);
+            let mut event = ext4_core::OperationEvent::Admitted;
+            let mut reads = 0_usize;
+            let mut emitted = 0_usize;
+            let mut injected = false;
+            loop {
+                match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+                    ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
+                        if !injected && reads == fault {
+                            event = if failure == ext4_core::Error::OperationCancelled {
+                                drop(request);
+                                ext4_core::OperationEvent::CancelRequested
+                            } else {
+                                ext4_core::OperationEvent::StorageCompleted(
+                                    ext4_core::StorageCompletion::failure(
+                                        ext4_core::CompletedStorageTransfer::from_request(request),
+                                        failure,
+                                    ),
+                                )
+                            };
+                            match suspended.advance(
+                                event,
+                                &epoch,
+                                &mut RejectingCryptographicOperation,
+                            ) {
+                                ext4_core::DirectoryReadTransition::Complete(Err(error))
+                                    if error == failure => {}
+                                _ => {
+                                    return Err(io::Error::other(
+                                        "directory failure was masked or consumed an entry",
+                                    )
+                                    .into());
+                                }
+                            }
+                            injected = true;
+                            operation = ext4_core::DirectoryReadOperation::new(
+                                &profile, directory, published,
+                            );
+                            event = ext4_core::OperationEvent::Admitted;
+                        } else {
+                            event = ext4_core::OperationEvent::StorageCompleted(
+                                complete_file_request(&mut storage, request)?,
+                            );
+                            operation = suspended;
+                        }
+                        reads = reads
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::other("enumeration count overflow"))?;
+                    }
+                    ext4_core::DirectoryReadTransition::Entry {
+                        entry,
+                        continuation,
+                    } => {
+                        if baseline.get(emitted).map(Vec::as_slice)
+                            != Some(entry.entry().name().bytes())
+                        {
+                            return Err(io::Error::other(
+                                "directory resume duplicated or skipped a name",
+                            )
+                            .into());
+                        }
+                        emitted = emitted
+                            .checked_add(1)
+                            .ok_or_else(|| io::Error::other("enumeration count overflow"))?;
+                        published = *entry.next_cursor();
+                        operation = continuation;
+                        event = ext4_core::OperationEvent::Admitted;
+                    }
+                    ext4_core::DirectoryReadTransition::Complete(result) => {
+                        result.map_err(core_task_error)?;
+                        if !injected || emitted != baseline.len() {
+                            return Err(io::Error::other(
+                                "directory fault matrix failed to reach the complete name set",
+                            )
+                            .into());
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "directory cancellation/read failure boundaries: PASS ({read_count} lower reads each)"
+    );
+    complete_core_clean_close(&mut storage, length, profile.journal_target())
+}
+
+/// Captures one request's names and publishable cursor, then releases its mounted epoch.
+/// # Errors
+/// Returns lower I/O, directory validation, or clean-close errors.
+fn read_directory_request(
+    image: &Path,
+    directory: ext4_core::DirectoryNodeId,
+    cursor: ext4_core::DirectoryScanCursor,
+    limit: usize,
+) -> TaskResult<(Vec<Vec<u8>>, ext4_core::DirectoryScanCursor)> {
+    let mut storage = FileStorageAdapter::open_internal(image)?;
+    let length =
+        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
+    let (profile, epoch, _coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let mut operation = ext4_core::DirectoryReadOperation::new(&profile, directory, cursor);
+    let mut event = ext4_core::OperationEvent::Admitted;
+    let mut names = Vec::new();
+    let cursor = loop {
+        match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+            ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
+                event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(
+                    &mut storage,
+                    request,
+                )?);
+                operation = suspended;
+            }
+            ext4_core::DirectoryReadTransition::Entry {
+                entry,
+                continuation,
+            } => {
+                names.push(entry.entry().name().bytes().to_vec());
+                if names.len() == limit {
+                    break *entry.next_cursor();
+                }
+                operation = continuation;
+                event = ext4_core::OperationEvent::Admitted;
+            }
+            ext4_core::DirectoryReadTransition::Complete(result) => {
+                break result.map_err(core_task_error)?;
+            }
+        }
+    };
+    complete_core_clean_close(&mut storage, length, profile.journal_target())?;
+    Ok((names, cursor))
+}

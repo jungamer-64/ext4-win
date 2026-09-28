@@ -275,6 +275,69 @@ mod cursor_tests {
         }
         Ok(())
     }
+    /// # Errors
+    /// Returns malformed fixture, mapping, or lower-completion failures.
+    /// # Panics
+    /// Fails if mapping reads an unrelated leaf, loses a gap, or accepts a child outside its parent.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture construction is separate from mapping assertions"
+    )]
+    fn mapping_retains_selected_path_across_suspension_and_gaps() -> Result<()> {
+        for second_start in [8, 7] {
+            let allocation = two_leaf_cursor()?;
+            let mut bytes = [0; 60];
+            memory::copy_exact(&mut bytes, allocation.root.bytes())?;
+            let mut mapping = ExtentMappingCursor::new(
+                &InodeExtentRoot::from_bytes(bytes),
+                BlockSize::from_superblock_log(0)?,
+                ExtentTreeContext::none(),
+            )?;
+            let mut transcript = StorageTranscript::new(
+                StorageTarget::Filesystem,
+                DeviceLength::from_bytes(32 * 1024),
+            );
+            let first = LogicalBlock::try_from(2_u64)?;
+            assert_eq!(
+                mapping.map(first, &mut OperationDevice::new(&mut transcript)),
+                Err(Error::OperationSuspended)
+            );
+            complete_leaf(&mut transcript, 0)?;
+            assert_eq!(
+                mapping.map(first, &mut OperationDevice::new(&mut transcript))?,
+                BlockMapping::Physical(BlockAddress::new(102))
+            );
+            transcript.retire_decoded_stage(0)?;
+            assert_eq!(
+                mapping.map(
+                    LogicalBlock::try_from(3_u64)?,
+                    &mut OperationDevice::new(&mut transcript)
+                )?,
+                BlockMapping::Physical(BlockAddress::new(103))
+            );
+            assert_eq!(
+                mapping.map(
+                    LogicalBlock::try_from(6_u64)?,
+                    &mut OperationDevice::new(&mut transcript)
+                )?,
+                BlockMapping::Hole
+            );
+            let second = LogicalBlock::try_from(9_u64)?;
+            assert_eq!(
+                mapping.map(second, &mut OperationDevice::new(&mut transcript)),
+                Err(Error::OperationSuspended)
+            );
+            complete_leaf(&mut transcript, second_start)?;
+            let result = mapping.map(second, &mut OperationDevice::new(&mut transcript));
+            if second_start == 8 {
+                assert_eq!(result?, BlockMapping::Physical(BlockAddress::new(101)));
+            } else {
+                assert_eq!(result, Err(Error::InvalidExtentTree));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Resumable depth-first allocation walk over one immutable inode tree.
@@ -617,5 +680,168 @@ mod tests {
             Ok(())
         })();
         assert_eq!(result, Ok(()));
+    }
+}
+
+/// One decoded node whose local ordering and ancestor interval have been validated.
+#[derive(Debug)]
+struct MappingNode {
+    /// None denotes the inode root; external identities reject path cycles.
+    block: Option<BlockAddress>,
+    /// Remaining on-disk tree depth, checked against the parent.
+    depth: u16,
+    /// Exclusive ancestor bound in logical-block coordinates.
+    upper: u64,
+    /// Entries have already passed local and ancestor interval validation.
+    entries: MappingEntries,
+}
+#[derive(Debug)]
+/// Leaf and routing payloads cannot be interpreted interchangeably.
+enum MappingEntries {
+    /// Ordered logical lower bounds and corresponding physical child blocks.
+    Branch(Vec<(u32, BlockAddress)>),
+    /// Ordered non-overlapping extents for direct binary selection.
+    Leaf(Vec<Extent>),
+}
+impl MappingNode {
+    /// Establishes interval validity before discarding the raw image.
+    /// # Errors
+    /// Returns malformed-node, parent-range, or allocation failures.
+    fn decode(node: PathNode, depth: Option<u16>, lower: u64, upper: u64) -> Result<Self> {
+        let depth = node.validate(depth)?;
+        let mut branches = Vec::new();
+        let mut leaves = Vec::new();
+        for index in 0..header_entries(&node.bytes)? {
+            let key = le_u32(&node.bytes, disk_offset(entry_offset(index)?))?;
+            if u64::from(key) < lower || u64::from(key) >= upper {
+                return Err(Error::InvalidExtentTree);
+            }
+            if depth == 0 {
+                let extent = parse_extent(&node.bytes, entry_offset(index)?)?;
+                if extent.end_logical() > upper {
+                    return Err(Error::InvalidExtentTree);
+                }
+                leaves.try_push(extent)?;
+            } else {
+                branches.try_push((key, node.child(index)?))?;
+            }
+        }
+        Ok(Self {
+            block: node.block,
+            depth,
+            upper,
+            entries: if depth == 0 {
+                MappingEntries::Leaf(leaves)
+            } else {
+                MappingEntries::Branch(branches)
+            },
+        })
+    }
+}
+
+/// Decoded root-to-leaf mapping retained across storage suspension.
+/// Raw buffers are released as soon as each node is validated and decoded.
+#[derive(Debug)]
+pub(crate) struct ExtentMappingCursor {
+    /// Only the active route is retained; a sibling selection retires descendants.
+    path: Vec<MappingNode>,
+    /// Volume geometry for external node reads.
+    block_size: BlockSize,
+    /// Inode identity and checksum seed for external blocks.
+    context: ExtentTreeContext,
+}
+impl ExtentMappingCursor {
+    /// Validates and retains the inode root, without loading external extent nodes.
+    /// # Errors
+    /// Returns invalid-root or allocation failures.
+    pub(crate) fn new(
+        root: &InodeExtentRoot,
+        block_size: BlockSize,
+        context: ExtentTreeContext,
+    ) -> Result<Self> {
+        let root = MappingNode::decode(
+            PathNode {
+                block: None,
+                bytes: memory::copied_slice(root.bytes())?,
+                next: 0,
+            },
+            None,
+            0,
+            1_u64 << 32,
+        )?;
+        let mut path = Vec::new();
+        path.try_push(root)?;
+        Ok(Self {
+            path,
+            block_size,
+            context,
+        })
+    }
+    /// Reads only the missing descendants of the selected coordinate.
+    /// # Errors
+    /// Returns suspended I/O, checksum, malformed routing, or allocation failures.
+    pub(crate) fn map(
+        &mut self,
+        logical: LogicalBlock,
+        reader: &mut impl ExtentNodeReader,
+    ) -> Result<BlockMapping> {
+        let mut level = 0_usize;
+        loop {
+            let node = self.path.get(level).ok_or(Error::InvalidExtentTree)?;
+            let branches = match &node.entries {
+                MappingEntries::Leaf(extents) => {
+                    let index = extents.partition_point(|extent| {
+                        extent.logical_start().as_u32() <= logical.as_u32()
+                    });
+                    return Ok(index
+                        .checked_sub(1)
+                        .and_then(|index| extents.get(index))
+                        .map_or(BlockMapping::Hole, |extent| extent.map_logical(logical)));
+                }
+                MappingEntries::Branch(branches) => branches,
+            };
+            let index = branches.partition_point(|(key, _)| *key <= logical.as_u32());
+            let Some(selected) = index.checked_sub(1) else {
+                return Ok(BlockMapping::Hole);
+            };
+            let (lower, block) = branches
+                .get(selected)
+                .copied()
+                .ok_or(Error::InvalidExtentTree)?;
+            let upper = branches
+                .get(index)
+                .map_or(node.upper, |(key, _)| u64::from(*key));
+            let depth = node.depth.checked_sub(1).ok_or(Error::InvalidExtentTree)?;
+            let child_level = level.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            if self
+                .path
+                .get(child_level)
+                .is_none_or(|child| child.block != Some(block))
+            {
+                self.path.truncate(child_level);
+                if self.path.iter().any(|node| node.block == Some(block)) {
+                    return Err(Error::InvalidExtentTree);
+                }
+                let mut bytes = memory::repeated_vec(
+                    0,
+                    usize::try_from(self.block_size.bytes())
+                        .map_err(|_| Error::ArithmeticOverflow)?,
+                )?;
+                reader.read_extent_bytes(self.block_size.offset_of(block)?, &mut bytes)?;
+                verify_external_extent_block_checksum(self.context, &bytes)?;
+                let child = MappingNode::decode(
+                    PathNode {
+                        block: Some(block),
+                        bytes,
+                        next: 0,
+                    },
+                    Some(depth),
+                    u64::from(lower),
+                    upper,
+                )?;
+                self.path.try_push(child)?;
+            }
+            level = child_level;
+        }
     }
 }

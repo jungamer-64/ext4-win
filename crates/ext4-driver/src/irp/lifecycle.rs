@@ -119,19 +119,6 @@ impl ActiveIrp<'_> {
         RequestorInput::from_active(self.requestor_buffer(length)?)
     }
 
-    /// Returns an opaque requestor-output range tied to this active owner borrow.
-    ///
-    /// The range can only receive bytes from driver-owned storage; it never becomes a Rust slice.
-    /// # Errors
-    ///
-    /// Returns an error when neither a system buffer nor a mapped MDL covers `length`.
-    pub(crate) fn requestor_output(
-        &mut self,
-        length: IrpBufferLength,
-    ) -> Result<RequestorOutput<'_>, DriverError> {
-        RequestorOutput::from_active(self.requestor_buffer(length)?)
-    }
-
     /// Borrows disjoint output and FILE_OBJECT views for one output-and-cursor publication.
     /// # Errors
     ///

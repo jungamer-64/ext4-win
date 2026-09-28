@@ -720,9 +720,9 @@ fn typed_opened_directory_exposes_cursor_without_option() {
     let result = with_active_file_object(&mut file, |file_object| {
         let mut directory = OpenedDirectory::decode(file_object)?;
         assert_eq!(directory.id(), DirectoryNodeId::ROOT);
-        assert_eq!(directory.cursor_mut().ordinal(), 0);
-        directory.cursor_mut().seek_ordinal(7);
-        assert_eq!(directory.cursor_mut().ordinal(), 7);
+        assert_eq!(directory.search_mut().cursor.ordinal(), 0);
+        directory.search_mut().cursor.seek_ordinal(7);
+        assert_eq!(directory.search_mut().cursor.ordinal(), 7);
         Ok(())
     });
     assert_eq!(result, Ok(()));

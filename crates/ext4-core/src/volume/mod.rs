@@ -2,6 +2,8 @@
 
 mod block_group;
 mod directory;
+mod directory_read;
+pub use directory_read::{DirectoryReadOperation, DirectoryReadTransition, DirectoryReader};
 mod event;
 mod inode_record;
 mod mount;
@@ -12,10 +14,7 @@ mod read;
 mod scope;
 mod transaction;
 
-pub use directory::{
-    DirectoryScanBatch, DirectoryScanCursor, DirectoryScanLimit, MAX_DIRECTORY_SCAN_ENTRIES,
-    ScannedDirectoryEntry,
-};
+pub use directory::{DirectoryScanCursor, ScannedDirectoryEntry};
 pub use event::{
     BarrierPermit, CheckpointLease, CommitLease, MutationLease, OperationEvent, OperationId,
     RetryPermit, VisibilityLease,

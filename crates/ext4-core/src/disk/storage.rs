@@ -310,6 +310,25 @@ impl StorageTranscript {
         }
     }
 
+    /// Retires an already decoded stage while retaining a fixed recent-read working set.
+    /// Call only after the consumer has retained its semantic progress. Eviction during a
+    /// restartable stage could discard reads that the unfinished stage needs to replay.
+    /// # Errors
+    /// Rejects retirement while lower I/O still owns a request.
+    pub(crate) fn retire_decoded_stage(&mut self, retained: usize) -> Result<()> {
+        if self.pending_request.is_some() || self.in_flight.is_some() {
+            return Err(Error::OperationSuspended);
+        }
+        let discard = self.completed_reads.len().saturating_sub(retained);
+        self.completed_reads.get(..discard).ok_or(Error::DeviceIo)?;
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the exact drain range is checked immediately before mutation; bulk retirement preserves the bounded suffix without repeated shifts"
+        )]
+        drop(self.completed_reads.drain(..discard));
+        Ok(())
+    }
+
     /// Returns the validated device length.
     pub(crate) const fn len(&self) -> DeviceLength {
         self.length

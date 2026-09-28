@@ -573,6 +573,7 @@ pub(crate) fn admit_owned(
     enum Admission {
         Mount(super::file_system_control::MountAdmission),
         Read(ReadRequestKind),
+        Directory,
         Raw(crate::state::RawVolumeOperationKind),
         Mutation(MutationRequestKind),
         Flush(FlushRequestKind),
@@ -592,7 +593,7 @@ pub(crate) fn admit_owned(
         }
         ActorRequest::Captured(PreparedRequest::DirectoryControl(
             PreparedDirectoryControl::QueryDirectory(_),
-        )) => Admission::Read(ReadRequestKind::QueryDirectory),
+        )) => Admission::Directory,
         ActorRequest::Captured(PreparedRequest::QueryEa(_)) => {
             Admission::Read(ReadRequestKind::QueryEa)
         }
@@ -730,7 +731,9 @@ pub(crate) fn admit_owned(
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
             HandleRequestClass::Paging
         }
-        Admission::Read(_) | Admission::Raw(_) => HandleRequestClass::Ordinary,
+        Admission::Directory | Admission::Read(_) | Admission::Raw(_) => {
+            HandleRequestClass::Ordinary
+        }
         Admission::Mutation(MutationRequestKind::Create) => HandleRequestClass::Device,
         Admission::Mutation(MutationRequestKind::Write)
             if data_io_kind == Some(DataIoKind::Paging) =>
@@ -834,6 +837,8 @@ pub(crate) fn admit_owned(
                 target.require_control_device();
                 super::operation::mount(owned, admission, trace)
             }
+            Admission::Directory => target
+                .with_mounted_access(|access| super::operation::query_directory(owned, access)),
             Admission::Read(kind) => {
                 target.with_mounted_access(|access| super::operation::read(owned, kind, access))
             }

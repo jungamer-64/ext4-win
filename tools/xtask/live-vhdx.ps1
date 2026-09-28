@@ -307,6 +307,29 @@ function Format-SessionVhdx {
     if ($fixture -notmatch '(?m)\bMode:\s+0777\b') {
         throw 'WSL test directory does not have the required POSIX write permission'
     }
+    # Populate before driver load so the measured work is enumeration, not namespace mutation.
+    $populate = @'
+import subprocess, sys, tempfile
+with tempfile.NamedTemporaryFile(mode="w", encoding="ascii") as commands:
+    commands.write("mkdir /live-ci/large-directory\n")
+    for group in range(2):
+        target = f"/live-ci/large-target-{group}"
+        commands.write(f"write /dev/null {target}\n")
+        for index in range(group * 50000, (group + 1) * 50000):
+            if index != 0 and index % 200 == 0:
+                commands.write("expand_dir /live-ci/large-directory\n")
+            commands.write(f"ln {target} /live-ci/large-directory/entry-{index:06d}\n")
+        commands.write(f"set_inode_field {target} links_count 50001\n")
+    commands.flush()
+    result = subprocess.run(["debugfs", "-w", "-f", commands.name, sys.argv[1]], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    diagnostics = [line for line in result.stderr.splitlines() if line and not line.startswith("debugfs ")]
+    if diagnostics:
+        raise SystemExit("\n".join(diagnostics))
+result = subprocess.run(["e2fsck", "-fyD", sys.argv[1]], check=False)
+if result.returncode not in (0, 1):
+    raise SystemExit(result.returncode)
+'@
+    Invoke-Wsl @('--exec', 'python3', '-c', $populate, "/dev/$partitionName") 'WSL large directory population' | Out-Null
     Invoke-Wsl @('--exec', 'e2fsck', '-fn', "/dev/$partitionName") 'WSL formatted fixture integrity check' | Out-Null
     Write-Phase 'WslFormatted'
     Write-Phase 'WslUnmountRequested'
@@ -484,6 +507,26 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     finally {
         $stream.Dispose()
     }
+    [Ext4Win.LiveDirectory]::Verify((Join-Path $root 'large-directory'))
+    $enumerationClock = [Diagnostics.Stopwatch]::StartNew()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $enumerator = [IO.Directory]::EnumerateFiles((Join-Path $root 'large-directory')).GetEnumerator()
+    $firstMilliseconds = $null
+    try {
+        while ($enumerator.MoveNext()) {
+            if ($null -eq $firstMilliseconds) { $firstMilliseconds = $enumerationClock.Elapsed.TotalMilliseconds }
+            $name = [IO.Path]::GetFileName($enumerator.Current)
+            if (-not $seen.Add($name)) { throw 'large directory returned a duplicate name' }
+        }
+    }
+    finally { $enumerator.Dispose() }
+    $enumerationClock.Stop()
+    if ($seen.Count -ne 100000) { throw 'large directory enumeration count differs from the independent fixture' }
+    for ($index = 0; $index -lt 100000; $index++) {
+        if (-not $seen.Contains(('entry-{0:D6}' -f $index))) { throw 'large directory omitted an expected name' }
+    }
+    [ordered]@{ entries = $seen.Count; first_ms = $firstMilliseconds; total_ms = $enumerationClock.Elapsed.TotalMilliseconds } |
+        ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:SessionDirectory 'directory-enumeration.json')
     Write-Phase 'FilesystemOperationsCompleted'
     Write-Phase 'VolumeDismountRequested'
     Get-SessionPartition | Out-Null

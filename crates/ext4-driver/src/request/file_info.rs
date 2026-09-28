@@ -4,11 +4,11 @@ use alloc::boxed::Box;
 use core::{num::NonZeroUsize, ptr::NonNull};
 
 use ext4_core::{
-    ChildLookup, CommittedReadPass, DirectoryNode, DirectoryNodeId, DirectoryScanLimit,
-    Ext4LinkCount, Ext4Name, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
-    Ext4WindowsAttributes, FileAllocationSize, FileNodeId, FileOffset, FileSize,
-    HardLinkDestination, HardLinkNodeId, HardLinks, NodeId, NodeMetadataSnapshot, NodeReparsePoint,
-    RenameTargetCollision, StorageRequest, StorageTarget, WindowsName, WindowsOverlay,
+    ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
+    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileAllocationSize, FileNodeId,
+    FileOffset, FileSize, HardLinkDestination, HardLinkNodeId, HardLinks, NodeId,
+    NodeMetadataSnapshot, NodeReparsePoint, RenameTargetCollision, StorageRequest, StorageTarget,
+    WindowsName, WindowsOverlay,
 };
 use wdk_sys::LARGE_INTEGER;
 
@@ -17,16 +17,16 @@ use crate::irp::{
     DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
     DirectoryWatchScope, FileAttributesWriteAccess, IrpBufferLength, IrpCompletion,
     NamespaceOplockPlan, NamespaceParentOplockEffect, OwnedIrp, PendingIrpLease,
-    PreparedDirectoryPattern, QueryFileInformationClass, ReadStartingPoint, RegularFileWriteAccess,
-    SetFileInformationClass, SetFileStack, WriteStartingPoint,
+    QueryFileInformationClass, ReadStartingPoint, RegularFileWriteAccess, SetFileInformationClass,
+    SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{self, DriverVec};
 use crate::state::{
     CleanupStart, CloseReleasePlan, DirectoryChange, DirectoryChangeAction, DirectoryCursor,
-    DirectoryNotificationRegistration, FileCleanupDisposition, FileControlBlock, FileDeleteTarget,
-    MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation,
-    OpenedObject, OpenedRegularFile, PagingStreamLease, PendingFileDeletion,
+    DirectoryNotificationRegistration, DirectoryPattern, FileCleanupDisposition, FileControlBlock,
+    FileDeleteTarget, MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject,
+    OpenedLocation, OpenedObject, OpenedRegularFile, PagingStreamLease, PendingFileDeletion,
     PreparedFilePositionPublication, PreparedHandleAdmission, PreparedOpenedLocationPublication,
     PreparedStreamDeletion, RawVolumeOperationKind, RawVolumeTarget, VolumeHandleCleanup,
     VolumeRetirement, release_cancelled_file_control_block, release_file_control_block,

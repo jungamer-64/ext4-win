@@ -15,8 +15,8 @@ pub(super) use crate::disk_format::dir::{
 };
 pub(super) use crate::disk_format::directory_hash::{DirectoryHash, DirectoryHashScheme};
 pub(super) use crate::disk_format::extent::{
-    BlockMapping, Extent, ExtentBlockRun, ExtentLength, ExtentTree, ExtentTreeContext,
-    LogicalBlock, MutableExtentTree, SerializedExtentTree,
+    BlockMapping, Extent, ExtentBlockRun, ExtentLength, ExtentMappingCursor, ExtentTree,
+    ExtentTreeContext, LogicalBlock, MutableExtentTree, SerializedExtentTree,
 };
 pub(super) use crate::disk_format::group::{AllocationBitmapInitialization, BlockGroupDescriptor};
 pub(super) use crate::disk_format::inode::{
@@ -60,9 +60,9 @@ pub(super) use super::block_group::{
     set_inode_bitmap_bit,
 };
 pub(super) use super::directory::{
-    DirectoryCursorName, DirectoryScanBatch, DirectoryScanCursor, DirectoryScanLimit,
-    DirectoryScanPosition, MAX_DIRECTORY_SCAN_ENTRIES, ScannedDirectoryEntry,
+    DirectoryCursorName, DirectoryScanCursor, DirectoryScanPosition, ScannedDirectoryEntry,
 };
+pub(super) use super::directory_read::DirectoryReader;
 pub(super) use super::inode_record::{
     AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord,
     RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,

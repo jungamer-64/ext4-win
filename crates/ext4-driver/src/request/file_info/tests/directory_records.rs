@@ -12,27 +12,8 @@ fn file_names_information_record_uses_name_only_layout() {
     let Ok(name) = name else {
         return;
     };
-    let layout = super::DirectoryRecordLayout::new(DirectoryInformationClass::Names, &name);
-    assert!(layout.is_ok());
-    let Ok(layout) = layout else {
-        return;
-    };
     let mut buffer = [0_u8; 24];
-    let metadata = test_metadata(super::FileMetadataKind::File);
-    assert!(metadata.is_some());
-    let Some(metadata) = metadata else {
-        return;
-    };
-
-    let packed = super::pack_directory_record(
-        &mut buffer,
-        0,
-        DirectoryInformationClass::Names,
-        7,
-        &name,
-        metadata,
-        layout,
-    );
+    let packed = super::pack_name_record(&mut buffer, 0, 7, &name);
     assert!(packed.is_ok());
 
     assert_eq!(le_u32(&buffer, super::DIRECTORY_NEXT_ENTRY_OFFSET), Some(0));

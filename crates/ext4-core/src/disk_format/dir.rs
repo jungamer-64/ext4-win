@@ -989,13 +989,20 @@ impl HtreeHashRange {
                 return Err(Error::InvalidDirectoryEntry);
             }
             let major = hash.hash(entry.name()).major;
-            if major < self.lower
-                || self
-                    .upper
-                    .is_some_and(|(end, inclusive)| major > end || (major == end && !inclusive))
-            {
-                return Err(Error::InvalidDirectoryEntry);
-            }
+            self.validate_hash(major)?;
+        }
+        Ok(())
+    }
+    /// Checks an already computed primary hash against this routing interval.
+    /// # Errors
+    /// Returns an error if the hash is outside the selected interval.
+    pub(crate) fn validate_hash(self, major: u32) -> Result<()> {
+        if major < self.lower
+            || self
+                .upper
+                .is_some_and(|(end, inclusive)| major > end || (major == end && !inclusive))
+        {
+            return Err(Error::InvalidDirectoryEntry);
         }
         Ok(())
     }

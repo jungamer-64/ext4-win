@@ -48,8 +48,6 @@ pub enum Error {
     InvalidExtentTree,
     /// A directory entry record is malformed.
     InvalidDirectoryEntry,
-    /// A requested bounded scan has an invalid raw-entry budget.
-    InvalidDirectoryScanLimit,
     /// A directory cannot grow beyond the active standard-size profile.
     DirectorySizeLimit,
     /// An HTree cannot receive another routing entry at the active maximum depth.
@@ -140,7 +138,6 @@ impl fmt::Display for Error {
             Self::UnsupportedExtentDepth => "unsupported extent tree depth",
             Self::InvalidExtentTree => "invalid extent tree",
             Self::InvalidDirectoryEntry => "invalid directory entry",
-            Self::InvalidDirectoryScanLimit => "invalid directory scan limit",
             Self::DirectorySizeLimit => "directory exceeds the mounted size profile",
             Self::DirectoryIndexFull => "directory index reached its maximum depth and fan-out",
             Self::InvalidName => "invalid name at domain boundary",

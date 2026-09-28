@@ -125,17 +125,15 @@ pub trait CommittedReadPass {
     ///
     /// Returns an error when the target is malformed, cannot be read, or cannot be allocated.
     fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>>;
-    /// Reads at most `limit` raw live entries from a live directory continuation.
+    /// Advances one entry in an owned directory reader; suspension retains its progress.
     /// # Errors
     ///
     /// Returns an error when the directory/index/dirent representation is invalid, entry names
     /// cannot be projected, referenced inodes are invalid, or bounded result allocation fails.
-    fn scan_directory(
+    fn next_directory_entry(
         &mut self,
-        directory: &DirectoryNode,
-        cursor: &DirectoryScanCursor,
-        limit: DirectoryScanLimit,
-    ) -> Result<DirectoryScanBatch>;
+        reader: &mut DirectoryReader,
+    ) -> Result<Option<ScannedDirectoryEntry>>;
     /// Enumerates every reachable hard link to a non-directory inode.
     /// # Errors
     ///
@@ -273,14 +271,11 @@ impl EpochReadPass<'_, '_, '_> {
     /// # Errors
     ///
     /// Returns an error when storage is incomplete or directory traversal/projection fails.
-    pub fn scan_directory(
+    pub fn next_directory_entry(
         &mut self,
-        directory: &DirectoryNode,
-        cursor: &DirectoryScanCursor,
-        limit: DirectoryScanLimit,
-    ) -> Result<DirectoryScanBatch> {
-        self.view
-            .scan_directory(directory, cursor, limit, self.crypto)
+        reader: &mut DirectoryReader,
+    ) -> Result<Option<ScannedDirectoryEntry>> {
+        self.view.next_directory_entry(reader, self.crypto)
     }
 
     /// Enumerates every reachable hard link to a non-directory inode.
@@ -364,13 +359,11 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
         self.read_symlink(symlink)
     }
 
-    fn scan_directory(
+    fn next_directory_entry(
         &mut self,
-        directory: &DirectoryNode,
-        cursor: &DirectoryScanCursor,
-        limit: DirectoryScanLimit,
-    ) -> Result<DirectoryScanBatch> {
-        self.scan_directory(directory, cursor, limit)
+        reader: &mut DirectoryReader,
+    ) -> Result<Option<ScannedDirectoryEntry>> {
+        self.next_directory_entry(reader)
     }
 
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
