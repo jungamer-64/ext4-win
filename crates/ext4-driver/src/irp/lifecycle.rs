@@ -560,6 +560,9 @@ impl ReceivedIrp {
 #[derive(Debug)]
 #[must_use]
 pub(super) struct PendingIrp {
+    /// Pre-admitted PASSIVE_LEVEL terminal work reservation.
+    #[cfg(not(test))]
+    notification: super::notification::NotificationPermit,
     /// Dispatch target whose completion authority transfers with queue insertion.
     pub(super) target: DispatchTarget,
     /// Requestor-context capture transferred through `DriverContext[0]` before insertion.
@@ -568,9 +571,15 @@ pub(super) struct PendingIrp {
 
 impl PendingIrp {
     /// Joins the received completion authority with its fully captured queue context.
-    pub(super) fn from_received(received: ReceivedIrp, context: QueueContextOwnership) -> Self {
+    pub(super) fn from_received(
+        received: ReceivedIrp,
+        context: QueueContextOwnership,
+        #[cfg(not(test))] notification: super::notification::NotificationPermit,
+    ) -> Self {
         Self {
             target: received.target,
+            #[cfg(not(test))]
+            notification,
             context,
         }
     }
@@ -578,6 +587,8 @@ impl PendingIrp {
     /// Publishes the context into `DriverContext[0]` and transfers queue ownership.
     pub(super) fn publish(self) -> PIRP {
         self.target.irp.publish_queue_context(self.context);
+        #[cfg(not(test))]
+        self.notification.publish(self.target.irp);
         self.target.irp.as_ptr()
     }
 
@@ -591,6 +602,9 @@ impl PendingIrp {
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct OwnedIrp {
+    /// Pre-admitted PASSIVE_LEVEL terminal work reservation.
+    #[cfg(not(test))]
+    notification: super::notification::NotificationPermit,
     /// Target whose IRP can be completed exactly once by this owner.
     target: DispatchTarget,
     /// Request capture removed exactly once from `DriverContext[0]` with queue ownership.
@@ -607,6 +621,9 @@ pub(crate) struct OwnedIrp {
 #[cfg(not(test))]
 #[derive(Debug)]
 pub(super) struct DelegatedIrp {
+    /// Pre-admitted PASSIVE_LEVEL terminal work reservation.
+    #[cfg(not(test))]
+    notification: super::notification::NotificationPermit,
     /// Dispatch target whose raw IRP was transferred to FsRtl.
     target: DispatchTarget,
     /// Request capture retained independently from the IRP's temporary external owner.
@@ -624,6 +641,7 @@ impl DelegatedIrp {
     pub(super) fn reclaim(self) -> OwnedIrp {
         OwnedIrp {
             target: self.target,
+            notification: self.notification,
             context: self.context,
             active_cancellation: None,
         }
@@ -735,9 +753,16 @@ impl OwnedIrp {
                 .bugcheck();
         };
         let context = irp.take_queue_context();
+        #[cfg(not(test))]
+        let notification = unsafe {
+            // SAFETY: Exclusive CSQ removal recovers the permit published with this pending IRP.
+            super::notification::NotificationPermit::take(irp)
+        };
         Self {
             target: DispatchTarget { device, irp },
             context,
+            #[cfg(not(test))]
+            notification,
             #[cfg(not(test))]
             active_cancellation: None,
         }
@@ -805,10 +830,16 @@ impl OwnedIrp {
         let Self {
             target,
             context,
+            #[cfg(not(test))]
+            notification,
             active_cancellation,
         } = self;
         drop(active_cancellation);
-        DelegatedIrp { target, context }
+        DelegatedIrp {
+            target,
+            context,
+            notification,
+        }
     }
 
     /// Returns the exhaustive actor-local request classification.
@@ -826,31 +857,46 @@ impl OwnedIrp {
             target,
             context,
             #[cfg(not(test))]
+            notification,
+            #[cfg(not(test))]
             active_cancellation,
         } = self;
         #[cfg(not(test))]
         drop(active_cancellation);
         drop(context);
         target.irp.write_status_block(completion);
-        PreparedIrpCompletion { irp: target.irp, status: completion.status() }
+        PreparedIrpCompletion {
+            #[cfg(not(test))]
+            notification,
+            irp: target.irp,
+            status: completion.status(),
+        }
     }
 
-    /// Completes the IRP from a fallible request result.
-    pub(crate) fn prepare_result(self, result: DriverResult<IrpCompletion>) -> PreparedIrpCompletion {
+    /// Prepares terminal status without calling upper drivers.
+    pub(crate) fn prepare_result(
+        self,
+        result: DriverResult<IrpCompletion>,
+    ) -> PreparedIrpCompletion {
         self.prepare_completion(match result {
             Ok(completion) => completion,
             Err(error) => IrpCompletion::from_error(error),
         })
     }
 
-    /// Completes a create IRP from its ownership-bearing, mutually exclusive result.
+    /// Prepares a create result, consuming its mutually exclusive completion ownership.
     ///
-    /// A successful reparse transfers the auxiliary buffer to the I/O Manager immediately before
-    /// completing with `STATUS_REPARSE`. Failed results never transfer an allocation.
-    pub(crate) fn prepare_create_result(self, result: DriverResult<CreateCompletion>) -> PreparedIrpCompletion {
+    /// A successful reparse installs its auxiliary buffer into the retained IRP. Notification
+    /// transfers that buffer to the I/O Manager. Failed results never install an allocation.
+    pub(crate) fn prepare_create_result(
+        self,
+        result: DriverResult<CreateCompletion>,
+    ) -> PreparedIrpCompletion {
         let Self {
             target,
             context,
+            #[cfg(not(test))]
+            notification,
             #[cfg(not(test))]
             active_cancellation,
         } = self;
@@ -858,21 +904,36 @@ impl OwnedIrp {
         drop(active_cancellation);
         drop(context);
         let (status, information) = match result {
-            Ok(CreateCompletion::Handle(action)) => (wdk_sys::STATUS_SUCCESS, wdk_sys::ULONG_PTR::from(action.as_ulong())),
-            Ok(CreateCompletion::OplockBreakInProgress(action)) => {
-                (wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS, wdk_sys::ULONG_PTR::from(action.as_ulong()))
-            }
+            Ok(CreateCompletion::Handle(action)) => (
+                wdk_sys::STATUS_SUCCESS,
+                wdk_sys::ULONG_PTR::from(action.as_ulong()),
+            ),
+            Ok(CreateCompletion::OplockBreakInProgress(action)) => (
+                wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS,
+                wdk_sys::ULONG_PTR::from(action.as_ulong()),
+            ),
             Ok(CreateCompletion::ReparseSymlink(buffer)) => {
                 target.irp.install_create_symlink_reparse_buffer(buffer);
-                (wdk_sys::STATUS_REPARSE, wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK))
+                (
+                    wdk_sys::STATUS_REPARSE,
+                    wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK),
+                )
             }
             Err(error) => (error.ntstatus(), 0),
         };
         target.irp.write_status_and_information(status, information);
-        PreparedIrpCompletion { irp: target.irp, status }
+        PreparedIrpCompletion {
+            #[cfg(not(test))]
+            notification,
+            irp: target.irp,
+            status,
+        }
     }
 
     /// Transfers this queued directory-change IRP's terminal completion authority to FsRtl.
+    /// # Errors
+    ///
+    /// Returns the retained terminal notification if registration preparation fails.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -881,10 +942,12 @@ impl OwnedIrp {
         self,
         notifier: NonNull<DirectoryChangeNotifier>,
         registration: DirectoryNotificationRegistration,
-    ) -> NTSTATUS {
+    ) -> Result<NTSTATUS, PreparedIrpCompletion> {
         let Self {
             target,
             context,
+            #[cfg(not(test))]
+            notification,
             #[cfg(not(test))]
             active_cancellation,
         } = self;
@@ -897,9 +960,18 @@ impl OwnedIrp {
             notifier.as_ref()
         };
         if let Err(error) = notifier.ensure_registration_ready() {
-            return target.irp.complete(IrpCompletion::from_error(error));
+            let completion = IrpCompletion::from_error(error);
+            target.irp.write_status_block(completion);
+            return Err(PreparedIrpCompletion {
+                #[cfg(not(test))]
+                notification,
+                irp: target.irp,
+                status: completion.status(),
+            });
         }
-        notifier.register(target, registration)
+        #[cfg(not(test))]
+        drop(notification);
+        Ok(notifier.register(target, registration))
     }
 
     /// Transfers this queued lock-control IRP's terminal completion authority to FsRtl.
@@ -919,6 +991,8 @@ impl OwnedIrp {
             target,
             context,
             #[cfg(not(test))]
+            notification,
+            #[cfg(not(test))]
             active_cancellation,
         } = self;
         #[cfg(not(test))]
@@ -929,6 +1003,8 @@ impl OwnedIrp {
             // consumed IRP and its ordinary handle lane retain that object through delegation.
             file_control_block.as_ref()
         };
+        #[cfg(not(test))]
+        drop(notification);
         file_control_block.process_byte_range_lock(target)
     }
 
@@ -948,6 +1024,8 @@ impl OwnedIrp {
             target,
             context,
             #[cfg(not(test))]
+            notification,
+            #[cfg(not(test))]
             active_cancellation,
         } = self;
         #[cfg(not(test))]
@@ -958,10 +1036,12 @@ impl OwnedIrp {
             // consumed IRP and its ordinary handle lane retain that object through delegation.
             file_control_block.as_ref()
         };
+        #[cfg(not(test))]
+        drop(notification);
         file_control_block.process_oplock_fsctrl(target)
     }
 
-    /// Completes the IRP as canceled.
+    /// Prepares cancellation after detaching driver-owned request resources.
     pub(super) fn prepare_cancelled(self) -> PreparedIrpCompletion {
         self.prepare_completion(IrpCompletion::cancelled())
     }
@@ -983,10 +1063,29 @@ unsafe impl Send for OwnedIrp {}
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct PreparedIrpCompletion {
+    /// Pre-admitted worker slot retained through upper completion callbacks.
+    #[cfg(not(test))]
+    notification: super::notification::NotificationPermit,
     /// Live IRP whose status and auxiliary buffer have already been published.
     irp: KernelIrp,
     /// Saved status; notification may free the IRP before returning.
     status: NTSTATUS,
+}
+
+impl PreparedIrpCompletion {
+    /// Transfers terminal notification to the preallocated PASSIVE_LEVEL worker.
+    ///
+    /// The reactor has already released actor borrows and the top-level handle lane. Upper
+    /// completion callbacks may now query the filesystem without preventing actor progress.
+    /// Queueing cannot allocate or fail after durable publication. The returned status is the
+    /// prepared request result; notification and callback rundown can finish asynchronously.
+    pub(super) fn notify(self) -> NTSTATUS {
+        #[cfg(not(test))]
+        self.notification.queue(self.irp, self.status);
+        #[cfg(test)]
+        let _status = self.irp.finish_completion(self.status);
+        self.status
+    }
 }
 
 /// Non-null IRP pointer kept private to the typed dispatch boundary.
@@ -1195,13 +1294,10 @@ impl KernelIrp {
             reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
         )
     )]
-    fn finish_completion(self, status: NTSTATUS) -> NTSTATUS {
+    pub(super) fn finish_completion(self, status: NTSTATUS) -> NTSTATUS {
         #[cfg(not(test))]
         {
-            // Completion invokes upper filters synchronously. A posted request runs on the
-            // volume's sole reactor thread, so a filter must not mistake this for a fresh
-            // top-level entry and synchronously query that same reactor (for example, to
-            // normalize a filename). Preserve any existing filesystem/Cc recursion context.
+            // Preserve the filesystem recursion context across synchronous upper callbacks.
             let previous = unsafe {
                 // SAFETY: This only observes the current thread's opaque filesystem context.
                 ffi::IoGetTopLevelIrp()
@@ -1225,34 +1321,6 @@ impl KernelIrp {
             }
         }
         status
-    }
-
-    /// Transfers a create reparse buffer to the I/O Manager and completes exactly once.
-    fn complete_create_symlink_reparse(self, buffer: CreateSymlinkReparseBuffer) -> NTSTATUS {
-        // A name-surrogate buffer is identified by its reparse tag. `IO_REPARSE` is reserved for
-        // the separate contract where the filesystem has already replaced FILE_OBJECT::FileName.
-        let information = wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK);
-        self.install_create_symlink_reparse_buffer(buffer);
-        self.write_status_and_information(wdk_sys::STATUS_REPARSE, information);
-        self.finish_completion(wdk_sys::STATUS_REPARSE)
-    }
-
-    /// Completes a successful create with its exact `FILE_*` action result.
-    fn complete_create_action(self, action: CreateAction) -> NTSTATUS {
-        self.write_status_and_information(
-            wdk_sys::STATUS_SUCCESS,
-            wdk_sys::ULONG_PTR::from(action.as_ulong()),
-        );
-        self.finish_completion(wdk_sys::STATUS_SUCCESS)
-    }
-
-    /// Completes a successful create while preserving its nonblocking oplock-break status.
-    fn complete_create_oplock_break(self, action: CreateAction) -> NTSTATUS {
-        self.write_status_and_information(
-            wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS,
-            wdk_sys::ULONG_PTR::from(action.as_ulong()),
-        );
-        self.finish_completion(wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS)
     }
 
     /// Completes the IRP through the I/O Manager.

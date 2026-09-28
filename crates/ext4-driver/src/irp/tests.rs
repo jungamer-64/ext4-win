@@ -351,8 +351,11 @@ fn create_reparse_completion_transfers_exact_auxiliary_buffer() {
     assert!(buffer.is_ok());
     let mut completion_status = None;
     if let Ok(buffer) = buffer {
-        completion_status =
-            Some(owned.complete_create_result(Ok(CreateCompletion::ReparseSymlink(buffer))));
+        completion_status = Some(
+            owned
+                .prepare_create_result(Ok(CreateCompletion::ReparseSymlink(buffer)))
+                .notify(),
+        );
     }
 
     let auxiliary = unsafe {
@@ -364,7 +367,7 @@ fn create_reparse_completion_transfers_exact_auxiliary_buffer() {
         let allocation =
             core::ptr::slice_from_raw_parts_mut(auxiliary.as_ptr().cast::<u8>(), EXPECTED.len());
         unsafe {
-            // SAFETY: `complete_create_result` obtained this pointer from one
+            // SAFETY: `prepare_create_result` obtained this pointer from one
             // `Box<[u8]>` of exactly `EXPECTED.len()` bytes. Unit tests do not
             // invoke the I/O Manager, so this reconstruction is its sole owner.
             Box::from_raw(allocation)
@@ -413,7 +416,9 @@ fn create_handle_completion_publishes_exact_action() {
         };
 
         assert_eq!(
-            owned.complete_create_result(Ok(CreateCompletion::Handle(action))),
+            owned
+                .prepare_create_result(Ok(CreateCompletion::Handle(action)))
+                .notify(),
             wdk_sys::STATUS_SUCCESS
         );
 
@@ -451,9 +456,11 @@ fn create_oplock_break_completion_preserves_status_and_action() {
     };
 
     assert_eq!(
-        owned.complete_create_result(Ok(CreateCompletion::OplockBreakInProgress(
-            CreateAction::Opened,
-        ))),
+        owned
+            .prepare_create_result(Ok(CreateCompletion::OplockBreakInProgress(
+                CreateAction::Opened,
+            )))
+            .notify(),
         wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS
     );
     let auxiliary = unsafe {
@@ -488,7 +495,9 @@ fn failed_create_completion_never_publishes_auxiliary_buffer() {
     assert!(owned.is_some());
     if let Some(owned) = owned {
         assert_eq!(
-            owned.complete_create_result(Err(crate::kernel::status::DriverError::InvalidParameter)),
+            owned
+                .prepare_create_result(Err(crate::kernel::status::DriverError::InvalidParameter))
+                .notify(),
             wdk_sys::STATUS_INVALID_PARAMETER
         );
     }

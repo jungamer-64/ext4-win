@@ -483,86 +483,42 @@ impl FileControlBlockOpenState {
         }
     }
 
-    /// Checks any operation-implied access and records the FILE_OBJECT share claim.
+    /// Validates operation access and admits the returned FILE_OBJECT atomically.
     /// # Errors
-    ///
-    /// Returns an error when existing handles do not share the effective operation access or when
-    /// the requested handle claim cannot be recorded.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
+    /// Returns deletion, oplock, sharing or capacity failures before admitting the open.
     pub(super) fn record_share_access(
         &mut self,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
-    ) -> DriverResult<()> {
+    ) -> DriverResult<NonZeroU32> {
         self.deletion.ensure_openable()?;
         if let FileControlBlockShareCheck::ExistingNode {
-            operation_access: existing_operation_access,
+            operation_access,
             oplock_policy,
         } = share_check
         {
             if matches!(oplock_policy, OplockCreatePolicy::ReserveFilter)
-                && self.share_access.OpenCount != 0
+                && self.shares.active_handle_count() != 0
             {
                 return Err(DriverError::OplockNotGranted);
             }
-            let operation_status = unsafe {
-                // SAFETY: The ledger exclusively owns this SHARE_ACCESS record. Update is false,
-                // so operation-implied access is checked without recording it as returned-handle
-                // authority.
-                ffi::IoCheckShareAccess(
-                    existing_operation_access.as_raw(),
-                    share_access.as_ulong(),
-                    file_object.as_ptr(),
-                    core::ptr::addr_of_mut!(self.share_access),
-                    0,
-                )
-            };
-            if operation_status < STATUS_SUCCESS {
-                return Err(DriverError::ShareAccessConflict);
-            }
+            self.shares
+                .check_operation(file_object, operation_access, share_access)?;
         }
-        let status = unsafe {
-            // SAFETY: The ledger exclusively owns this SHARE_ACCESS record. This call records only
-            // the access explicitly requested for the returned FILE_OBJECT.
-            ffi::IoCheckShareAccess(
-                desired_access.as_raw(),
-                share_access.as_ulong(),
-                file_object.as_ptr(),
-                core::ptr::addr_of_mut!(self.share_access),
-                1,
-            )
-        };
-        if status < STATUS_SUCCESS {
-            return Err(DriverError::ShareAccessConflict);
-        }
-        Ok(())
+        self.shares.open(file_object, desired_access, share_access)
     }
 
-    /// Removes one FILE_OBJECT's recorded share-access claim.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
+    /// Consumes one FILE_OBJECT's unique active-open cleanup obligation.
     pub(super) fn remove_share_access(&mut self, file_object: KernelFileObject) {
-        unsafe {
-            // SAFETY: Successful create recorded this FILE_OBJECT against this ledger-owned
-            // SHARE_ACCESS, and the lifecycle transition selects one unique removal point.
-            ffi::IoRemoveShareAccess(
-                file_object.as_ptr(),
-                core::ptr::addr_of_mut!(self.share_access),
-            );
-        }
+        self.shares.cleanup(file_object);
     }
 
     /// Selects deferred deletion after one share claim has been removed.
     pub(super) fn cleanup_disposition(&self) -> FileCleanupDisposition {
         self.deletion
-            .cleanup_target(self.share_access.OpenCount)
+            .cleanup_target(self.shares.active_handle_count())
             .map_or(
                 FileCleanupDisposition::Retained,
                 FileCleanupDisposition::Delete,
@@ -575,7 +531,7 @@ impl FileControlBlockOpenState {
     /// Returns delete-pending or sharing-violation when the current open state rejects replacement.
     pub(super) fn ensure_namespace_replaceable(&self) -> DriverResult<()> {
         self.deletion.ensure_openable()?;
-        if self.share_access.OpenCount == 0 {
+        if self.shares.active_handle_count() == 0 {
             Ok(())
         } else {
             Err(DriverError::ShareAccessConflict)
@@ -584,7 +540,7 @@ impl FileControlBlockOpenState {
 
     /// Returns whether one active handle still owns share-access authority for this stream.
     pub(super) const fn has_active_handle(&self) -> bool {
-        self.share_access.OpenCount != 0
+        self.shares.active_handle_count() != 0
     }
 
     /// Returns whether lock-time cache draining has removed every non-handle resident.
@@ -671,7 +627,7 @@ impl FileControlBlockOpenState {
         &mut self,
         target: NonNull<FileDeleteTarget>,
     ) -> Option<PendingFileDeletion> {
-        if self.share_access.OpenCount != 0 {
+        if self.shares.active_handle_count() != 0 {
             KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
         }
         match core::mem::replace(&mut self.deletion, FileDeletionState::Live) {

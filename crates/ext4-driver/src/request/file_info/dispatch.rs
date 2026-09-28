@@ -40,7 +40,9 @@ pub(crate) fn set(
     unsafe_code,
     reason = "the active notification IRP retains the mounted VCB borrowed for FsRtl registration"
 )]
-pub(crate) fn notify_change_directory(mut owned: OwnedIrp) -> wdk_sys::NTSTATUS {
+pub(crate) fn notify_change_directory(
+    mut owned: OwnedIrp,
+) -> crate::irp::reactor::OperationTransition {
     let registration = owned.request().with_active(|active| {
         DirectoryNotificationRequest::decode(active).and_then(|mut request| {
             let registration = request.registration()?;
@@ -54,9 +56,14 @@ pub(crate) fn notify_change_directory(mut owned: OwnedIrp) -> wdk_sys::NTSTATUS 
     });
     match registration {
         Ok((notifier, registration)) => {
-            owned.delegate_directory_notification(notifier, registration)
+            match owned.delegate_directory_notification(notifier, registration) {
+                Ok(_status) => crate::irp::reactor::OperationTransition::Retired,
+                Err(completion) => crate::irp::reactor::OperationTransition::Complete(completion),
+            }
         }
-        Err(error) => owned.complete_result(Err(error)),
+        Err(error) => {
+            crate::irp::reactor::OperationTransition::Complete(owned.prepare_result(Err(error)))
+        }
     }
 }
 

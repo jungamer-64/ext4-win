@@ -54,6 +54,7 @@ mod directory_search;
 pub(crate) use directory_search::{DirectoryPattern, DirectorySearch};
 mod file_control_block;
 mod file_control_block_ledger;
+mod file_object_shares;
 mod kernel_object;
 mod mounted_volume_device;
 mod open_object;
@@ -73,6 +74,7 @@ use file_control_block::NativeFileByteRange;
 pub(crate) use file_control_block::*;
 pub(crate) use file_control_block_ledger::*;
 use file_control_block_ledger::{FileControlBlockLedger, FileControlBlockShareCheck};
+use file_object_shares::FileObjectShares;
 pub(crate) use kernel_object::*;
 #[cfg(test)]
 use mounted_volume_device::shutdown_registration_status;

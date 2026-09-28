@@ -2423,7 +2423,7 @@ impl FileControlBlockLedger {
         let state = ledger_file_control_block_open_state(table, fcb);
         unsafe {
             // SAFETY: The FCB is table-owned for this retained FILE_OBJECT and the guard is held.
-            state.as_ref().share_access.OpenCount
+            state.as_ref().shares.active_handle_count()
         }
     }
 
@@ -2734,9 +2734,10 @@ fn record_reused_file_control_block_open(
         state.as_mut()
     };
     let references = state.next_file_object_reference()?;
-    state.record_share_access(file_object, desired_access, share_access, share_check)?;
+    let open_count =
+        state.record_share_access(file_object, desired_access, share_access, share_check)?;
     state.lifetime = references;
-    NonZeroU32::new(state.share_access.OpenCount).ok_or(DriverError::InternalInvariantViolation)
+    Ok(open_count)
 }
 
 /// Records the first share claim on a newly inserted FCB.
@@ -2761,8 +2762,7 @@ fn record_file_control_block_share(
         // state pointer against the owning table.
         state.as_mut()
     };
-    state.record_share_access(file_object, desired_access, share_access, share_check)?;
-    NonZeroU32::new(state.share_access.OpenCount).ok_or(DriverError::InternalInvariantViolation)
+    state.record_share_access(file_object, desired_access, share_access, share_check)
 }
 
 /// Consumes one handle lease and removes the FCB only after the stream becomes reclaimable.

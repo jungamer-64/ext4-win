@@ -27,6 +27,9 @@ mod control;
 mod create;
 mod dispatch;
 mod lifecycle;
+#[cfg(not(test))]
+mod notification;
+pub(crate) use lifecycle::PreparedIrpCompletion;
 pub(crate) mod lower;
 mod oplock;
 pub(crate) mod reactor;

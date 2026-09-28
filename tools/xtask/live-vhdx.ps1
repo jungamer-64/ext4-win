@@ -490,6 +490,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     }
     Write-Phase 'FilesystemOperationsRequested'
     [IO.File]::WriteAllBytes($alpha, $payload)
+    [Ext4Win.LiveMetadata]::Verify($alpha)
     $readback = [IO.File]::ReadAllBytes($alpha)
     if ([Convert]::ToBase64String($payload) -ne [Convert]::ToBase64String($readback)) {
         throw 'live VHDX readback differed from the written payload'

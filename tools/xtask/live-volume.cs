@@ -5,6 +5,42 @@ using System.Text;
 using Microsoft.Win32.SafeHandles;
 
 namespace Ext4Win {
+    // Metadata-only opens participate in handle lifetime even when native share counters stay zero.
+    public static class LiveMetadata {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(string name, uint access, uint share,
+            IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetVolumeInformationByHandleW(SafeFileHandle handle,
+            StringBuilder label, uint labelLength, out uint serial, out uint maximum,
+            out uint flags, StringBuilder filesystem, uint filesystemLength);
+
+        public static void Verify(string file) {
+            // Attribute-only and zero-access handles must survive independent cleanup while a
+            // subsequent data open remains valid. No handle requests mutation authority.
+            using (var first = CreateFile(file, 0x80, 7, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+                if (first.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                using (var second = CreateFile(file, 0, 7, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+                    if (second.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                    var label = new StringBuilder(261);
+                    var filesystem = new StringBuilder(261);
+                    uint serial, maximum, flags;
+                    if (!GetVolumeInformationByHandleW(second, label, 261, out serial,
+                        out maximum, out flags, filesystem, 261)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                    if (filesystem.ToString() != "EXT4WIN" || maximum != 255) {
+                        throw new InvalidOperationException("volume identity from metadata handle differs");
+                    }
+                }
+                using (var data = CreateFile(file, 0x80000000, 7, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+                    if (data.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                }
+            }
+        }
+    }
+
     public enum LiveVolumeMountState {
         Absent,
         Dismounted,

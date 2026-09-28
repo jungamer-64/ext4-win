@@ -417,10 +417,17 @@ pub(crate) trait InfalliblePublication: fmt::Debug + Send + 'static {
     fn authority(&self) -> PublicationAuthority;
 
     /// Publishes prepared values and returns the same box in its next operation phase.
+    ///
+    /// A durable publication also transfers its prepared top-level acknowledgment; checkpoint
+    /// publication has none. The caller must end the mounted-volume borrow and release the
+    /// top-level handle lane before notifying upper drivers, while retaining checkpoint work.
     fn publish(
         self: Box<Self>,
         access: &mut MountedVolumeAccess<'_>,
-    ) -> Box<dyn CompletionOperation>;
+    ) -> (
+        Box<dyn CompletionOperation>,
+        Option<super::PreparedIrpCompletion>,
+    );
 }
 
 /// One consuming action emitted by an event-driven operation.
@@ -952,6 +959,9 @@ pub(crate) struct CompletionReactor {
     lifecycle: AtomicU8,
     /// Lifetime gate retained by every lower completion envelope.
     completion_rundown: CompletionRundown,
+    /// Fixed terminal work items retained until notification rundown completes.
+    #[cfg(not(test))]
+    notifications: super::notification::NotificationPool,
     /// System-thread handle joined during teardown.
     thread_handle: AtomicPtr<c_void>,
     /// Pure pointer-free scheduling authority owned by the sole actor.
@@ -1029,6 +1039,8 @@ impl CompletionReactor {
     ) -> DriverResult<()> {
         let reactor_storage = NonNull::new(reactor).ok_or(DriverError::InvalidParameter)?;
         let completion_rundown = CompletionRundown::try_new()?;
+        #[cfg(not(test))]
+        let notifications = super::notification::NotificationPool::try_new(device, MAX_OPERATIONS)?;
         // Complete fallible preparation before moving resource owners into raw fields. Every
         // remaining field constructor is infallible; native setup below is guarded as one value.
         let destination = unsafe {
@@ -1234,6 +1246,17 @@ impl CompletionReactor {
             &mut *scheduler.cast::<core::mem::MaybeUninit<Scheduler>>()
         };
         Scheduler::initialize(scheduler);
+        #[cfg(not(test))]
+        let notification_destination = unsafe {
+            // SAFETY: This final-address field is uninitialized and uniquely owned; the pool
+            // finished all fallible construction before other fields moved into this storage.
+            core::ptr::addr_of_mut!((*reactor).notifications)
+        };
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The projected field has not been initialized and remains exclusively owned.
+            notification_destination.write(notifications);
+        }
         let mut initialization = unsafe {
             // SAFETY: Every field and array element now holds a valid value at its final address.
             InPlaceInitialization::assume_init(reactor_storage)
@@ -1255,6 +1278,8 @@ impl CompletionReactor {
             cancel_ready: _,
             lifecycle: _,
             completion_rundown: _,
+            #[cfg(not(test))]
+                notifications: _,
             thread_handle: _,
             delayed_close_timer: _,
             delayed_close_timer_state: _,
@@ -1394,11 +1419,21 @@ impl CompletionReactor {
             Ok(reservation) => reservation,
             Err(error) => return received.complete_result(Err(error)),
         };
+        #[cfg(not(test))]
+        let notification = match self.notifications.reserve(&self.completion_rundown) {
+            Ok(permit) => permit,
+            Err(error) => return received.complete_result(Err(error)),
+        };
         let context = match received.with_active(|active| QueueContext::capture(active, major)) {
             Ok(context) => context,
             Err(completion) => return received.complete(completion),
         };
-        let pending = PendingIrp::from_received(received, context);
+        let pending = PendingIrp::from_received(
+            received,
+            context,
+            #[cfg(not(test))]
+            notification,
+        );
         let status = pending.dispatch_status();
         self.enqueue(pending, reservation);
         status
@@ -1421,7 +1456,7 @@ impl CompletionReactor {
                 OwnedIrp::from_queued_raw(self.device, irp)
             };
             release_operation_reservation(&self.admitted);
-            let _status = owned.complete_cancelled();
+            let _status = owned.prepare_cancelled().notify();
         }
     }
 
@@ -1929,7 +1964,7 @@ impl CompletionReactor {
                 OwnedIrp::from_queued_raw(reactor.device, irp)
             };
             release_operation_reservation(&reactor.admitted);
-            let _status = owned.complete_cancelled();
+            let _status = owned.prepare_cancelled().notify();
         }
         reactor.wake();
 
@@ -2282,8 +2317,9 @@ impl CompletionReactor {
                 Err(error) => {
                     let (error, owned) = error.into_parts();
                     release_operation_reservation(&self.admitted);
-                    let _status = owned.complete_result(Err(error));
+                    let completion = owned.prepare_result(Err(error));
                     self.retire_cancel_slot(index);
+                    let _status = completion.notify();
                 }
             }
         }
@@ -2488,7 +2524,8 @@ impl CompletionReactor {
             OperationTransition::Publish { publication } => {
                 let authority = publication.authority();
                 self.consume_publication_authority(index, authority);
-                let operation = self.with_mounted_access(|access| publication.publish(access));
+                let (operation, completion) =
+                    self.with_mounted_access(|access| publication.publish(access));
                 if matches!(authority, PublicationAuthority::Durable { .. }) {
                     self.retire_cancel_slot(index);
                     self.release_handle_lane(index);
@@ -2502,26 +2539,36 @@ impl CompletionReactor {
                 self.grant_available_commit();
                 self.grant_all_available_waits();
                 self.grant_all_handle_turns();
-            }
-            OperationTransition::Complete => {
-                self.release_intent(index);
-                self.abandon_commit(index);
-                self.release_handle_lane(index);
-                self.retire_cancel_slot(index);
-                let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
-                else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                if !self.with_scheduler(|scheduler| scheduler.complete(identity)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                if let Some(completion) = completion {
+                    let _status = completion.notify();
                 }
-                release_operation_reservation(&self.admitted);
-                self.grant_available_intents();
-                self.grant_available_commit();
-                self.grant_all_available_waits();
-                self.grant_all_handle_turns();
             }
+            OperationTransition::Complete(completion) => {
+                self.retire_operation(index);
+                let _status = completion.notify();
+            }
+            OperationTransition::Retired => self.retire_operation(index),
         }
+    }
+
+    /// Relinquishes the request's actor scheduling authority before invoking upper drivers.
+    #[cfg(not(test))]
+    fn retire_operation(&self, index: usize) {
+        self.release_intent(index);
+        self.abandon_commit(index);
+        self.release_handle_lane(index);
+        self.retire_cancel_slot(index);
+        let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        if !self.with_scheduler(|scheduler| scheduler.complete(identity)) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        release_operation_reservation(&self.admitted);
+        self.grant_available_intents();
+        self.grant_available_commit();
+        self.grant_all_available_waits();
+        self.grant_all_handle_turns();
     }
 
     /// Enters the non-interruptible lower-registration phase with no shell payload retained.
@@ -3994,7 +4041,7 @@ unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
         OwnedIrp::from_queued_raw(reactor.device, irp)
     };
     release_operation_reservation(&reactor.admitted);
-    let _status = owned.complete_cancelled();
+    let _status = owned.prepare_cancelled().notify();
 }
 
 /// Recovers a reactor from its first-field CSQ pointer.
@@ -4298,7 +4345,7 @@ mod tests {
             _event: CompletionEvent,
             _target: &mut super::ReactorTarget,
         ) -> OperationTransition {
-            OperationTransition::Complete
+            OperationTransition::Retired
         }
 
         fn record_storage_failure(
@@ -4336,7 +4383,11 @@ mod tests {
         access: &mut crate::state::MountedVolumeAccess<'_>,
     ) -> (PublicationAuthority, SuspendedOperation) {
         let authority = publication.authority();
-        (authority, publication.publish(access))
+        let (operation, completion) = publication.publish(access);
+        if let Some(completion) = completion {
+            let _status = completion.notify();
+        }
+        (authority, operation)
     }
 
     fn consume_transition(transition: OperationTransition) {
@@ -4449,7 +4500,10 @@ mod tests {
                 drop(suspended);
             }
             OperationTransition::Publish { publication } => drop(publication),
-            OperationTransition::Complete => {}
+            OperationTransition::Complete(completion) => {
+                let _status = completion.notify();
+            }
+            OperationTransition::Retired => {}
         }
     }
 
@@ -4510,7 +4564,7 @@ mod tests {
         let mut target = super::ReactorTarget::ControlDevice;
         assert!(matches!(
             operation.advance(CompletionEvent::Core(OperationEvent::Admitted), &mut target),
-            OperationTransition::Complete
+            OperationTransition::Retired
         ));
     }
 

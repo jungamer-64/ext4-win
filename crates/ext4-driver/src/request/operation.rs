@@ -233,8 +233,7 @@ impl MountRequestOperation {
 
     /// Completes and consumes the top-level mount IRP.
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
-        let _status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     /// Converts a core mount transition into its matching reactor action.
@@ -646,7 +645,7 @@ impl ControlDeviceOperation for MountRequestOperation {
                 let transition = probe.advance(event);
                 self.drive_exclusive_external_probe(context, transition)
             }
-            MountRequestState::Terminal => OperationTransition::Complete,
+            MountRequestState::Terminal => OperationTransition::Retired,
         }
     }
 
@@ -920,8 +919,7 @@ impl ReadRequestOperation {
 
     /// Completes and consumes one terminal top-level IRP.
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
-        let _status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     /// Reacquires the current durable epoch after a native size gate invalidated a cache plan.
@@ -1294,8 +1292,7 @@ impl RawVolumeOperation {
             },
             &result,
         );
-        let _status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     /// Completes an IRP whose committed-progress wrapper does not expose its terminal status.
@@ -1312,8 +1309,7 @@ impl RawVolumeOperation {
             },
             status,
         );
-        let _completion_status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     /// Completes a failed transfer while preserving lower-reported partial write progress.
@@ -1494,7 +1490,7 @@ impl MountedVolumeOperation for RawVolumeOperation {
                     }
                 }
             }
-            RawVolumeOperationState::Terminal => OperationTransition::Complete,
+            RawVolumeOperationState::Terminal => OperationTransition::Retired,
         }
     }
 
@@ -1654,8 +1650,7 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
             | OperationEvent::CheckpointGranted(_)
             | OperationEvent::BarrierReleased(_) => Err(DriverError::InternalInvariantViolation),
         };
-        let _status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     fn record_mounted_storage_failure(
@@ -1722,13 +1717,10 @@ impl MountedVolumeOperation for NotificationOperation {
                 .bugcheck();
         };
         match event {
-            OperationEvent::Admitted => {
-                let _status = crate::request::file_info::notify_change_directory(owned);
-            }
-            OperationEvent::CancelRequested => {
-                let _status =
-                    owned.complete_result(Err(DriverError::from(Error::OperationCancelled)));
-            }
+            OperationEvent::Admitted => crate::request::file_info::notify_change_directory(owned),
+            OperationEvent::CancelRequested => OperationTransition::Complete(
+                owned.prepare_result(Err(DriverError::from(Error::OperationCancelled))),
+            ),
             OperationEvent::StorageCompleted(_)
             | OperationEvent::DeviceLengthCompleted(_)
             | OperationEvent::RetryElapsed(_)
@@ -1736,11 +1728,10 @@ impl MountedVolumeOperation for NotificationOperation {
             | OperationEvent::CommitGranted(_)
             | OperationEvent::VisibilityGranted(_)
             | OperationEvent::CheckpointGranted(_)
-            | OperationEvent::BarrierReleased(_) => {
-                let _status = owned.complete_result(Err(DriverError::InternalInvariantViolation));
-            }
+            | OperationEvent::BarrierReleased(_) => OperationTransition::Complete(
+                owned.prepare_result(Err(DriverError::InternalInvariantViolation)),
+            ),
         }
-        OperationTransition::Complete
     }
 
     fn record_mounted_storage_failure(
@@ -1824,8 +1815,7 @@ impl ByteRangeLockOperation {
 
     /// Completes and consumes one lock-control IRP inside driver ownership.
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
-        let _status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     /// Revalidates the live FILE_OBJECT identity and transfers terminal ownership to FsRtl.
@@ -1838,7 +1828,7 @@ impl ByteRangeLockOperation {
             Err(error) => return Self::complete(owned, Err(error)),
         };
         let _status = owned.delegate_byte_range_lock(file_control_block);
-        OperationTransition::Complete
+        OperationTransition::Retired
     }
 }
 
@@ -1982,8 +1972,7 @@ impl OplockControlOperation {
 
     /// Completes one request still owned by the reactor.
     fn complete(owned: OwnedIrp, error: DriverError) -> OperationTransition {
-        let _status = owned.complete_result(Err(error));
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(Err(error)))
     }
 
     /// Revalidates the live stream identity and consumes the IRP into FsRtl.
@@ -2009,7 +1998,7 @@ impl OplockControlOperation {
             return Self::complete(owned, DriverError::OplockNotGranted);
         }
         let _status = owned.delegate_oplock_control(expected);
-        OperationTransition::Complete
+        OperationTransition::Retired
     }
 }
 
@@ -2171,8 +2160,7 @@ impl VolumeControlOperation {
 
     /// Completes and consumes the lifecycle IRP.
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
-        let _status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     /// Publishes the prevalidated lock or dismount transition after successful lower flush.
@@ -2568,7 +2556,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     access,
                 ),
             },
-            VolumeControlOperationState::Terminal => OperationTransition::Complete,
+            VolumeControlOperationState::Terminal => OperationTransition::Retired,
         }
     }
 
@@ -2791,8 +2779,7 @@ impl FlushRequestOperation {
 
     /// Completes and consumes the top-level flush IRP.
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
-        let _status = owned.complete_result(result);
-        OperationTransition::Complete
+        OperationTransition::Complete(owned.prepare_result(result))
     }
 
     /// Starts file-cache writeback after the file-specific oplock check has completed.
@@ -3115,7 +3102,7 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 let result = close.advance(event);
                 self.drive_clean_close(owned, transition, result, access)
             }
-            FlushOperationState::Terminal => OperationTransition::Complete,
+            FlushOperationState::Terminal => OperationTransition::Retired,
         }
     }
 
@@ -4041,12 +4028,12 @@ impl MutationRequestOperation {
         }
     }
 
-    /// Completes one top-level success with its major-function-specific ownership protocol.
-    fn complete_success(
+    /// Prepares one top-level acknowledgment, preserving deferred cleanup failures.
+    fn prepare_success(
         &self,
         owned: OwnedIrp,
         completion: TopLevelCompletion,
-    ) -> OperationTransition {
+    ) -> crate::irp::PreparedIrpCompletion {
         if let Some(error) = self.cleanup_deferred_error {
             if self.request.is_paging() {
                 self.trace.record(
@@ -4055,15 +4042,10 @@ impl MutationRequestOperation {
                     OperationalOutcome::Failed,
                 );
             }
-            match completion {
-                TopLevelCompletion::Normal(_) => {
-                    let _status = owned.complete_result(Err(error));
-                }
-                TopLevelCompletion::Create(_) => {
-                    let _status = owned.complete_create_result(Err(error));
-                }
-            }
-            return OperationTransition::Complete;
+            return match completion {
+                TopLevelCompletion::Normal(_) => owned.prepare_result(Err(error)),
+                TopLevelCompletion::Create(_) => owned.prepare_create_result(Err(error)),
+            };
         }
         if self.request.is_paging() {
             self.trace.record(
@@ -4073,14 +4055,9 @@ impl MutationRequestOperation {
             );
         }
         match completion {
-            TopLevelCompletion::Normal(completion) => {
-                let _status = owned.complete(completion);
-            }
-            TopLevelCompletion::Create(completion) => {
-                let _status = owned.complete_create_result(Ok(completion));
-            }
+            TopLevelCompletion::Normal(completion) => owned.prepare_completion(completion),
+            TopLevelCompletion::Create(completion) => owned.prepare_create_result(Ok(completion)),
         }
-        OperationTransition::Complete
     }
 
     /// Completes one top-level failure while respecting create auxiliary-buffer ownership.
@@ -4106,11 +4083,10 @@ impl MutationRequestOperation {
             deletion.abort_before_failure_completion();
         }
         if self.request.kind() == MutationRequestKind::Create {
-            let _status = owned.complete_create_result(Err(error));
+            OperationTransition::Complete(owned.prepare_create_result(Err(error)))
         } else {
-            let _status = owned.complete_result(Err(error));
+            OperationTransition::Complete(owned.prepare_result(Err(error)))
         }
-        OperationTransition::Complete
     }
 
     /// Runs the concrete driver mutation surface inside one restart-local core pass.
@@ -4449,7 +4425,9 @@ impl MutationRequestOperation {
                         }
                         drop(self.write_open.take());
                     }
-                    return MutationStep::Transition(self.complete_success(owned, completion));
+                    return MutationStep::Transition(OperationTransition::Complete(
+                        self.prepare_success(owned, completion),
+                    ));
                 }
                 Ok(DriverResolveDisposition::CheckCleanupParentOplock { parent }) => {
                     drop(pass);
@@ -5036,7 +5014,7 @@ impl MutationRequestOperation {
                 access.record_durability_unknown();
             }
         }
-        OperationTransition::Complete
+        OperationTransition::Retired
     }
 
     /// Integrates one matching detached-checkpoint completion.
@@ -5150,10 +5128,10 @@ impl MutationRequestOperation {
                             publication,
                             result,
                         ) {
-                            Ok(completion) => MutationStep::Transition(self.complete_success(
+                            Ok(completion) => MutationStep::Transition(OperationTransition::Complete(self.prepare_success(
                                 owned,
                                 TopLevelCompletion::Normal(completion),
-                            )),
+                            ))),
                             Err(error) => {
                                 record_cache_coherency_failure(error, access);
                                 MutationStep::Transition(self.complete_error(owned, error))
@@ -5857,7 +5835,7 @@ impl MutationRequestOperation {
                 ))
             }
             MutationOperationState::Terminal => {
-                MutationStep::Transition(OperationTransition::Complete)
+                MutationStep::Transition(OperationTransition::Retired)
             }
         }
     }
@@ -5982,9 +5960,12 @@ impl InfalliblePublication for MutationRequestOperation {
     fn publish(
         mut self: Box<Self>,
         access: &mut MountedVolumeAccess<'_>,
-    ) -> Box<dyn CompletionOperation> {
+    ) -> (
+        Box<dyn CompletionOperation>,
+        Option<crate::irp::PreparedIrpCompletion>,
+    ) {
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
-        match state {
+        let completion = match state {
             MutationOperationState::PublishingDurable {
                 context,
                 durable,
@@ -6016,10 +5997,8 @@ impl InfalliblePublication for MutationRequestOperation {
                 drop(self.oplock_mutation.take());
                 drop(self.cleanup_parent_oplock.take());
                 drop(self.namespace_oplocks.take());
-                match stream_projection {
-                    StreamProjectionOutcome::Complete => {
-                        let _complete = self.complete_success(owned, completion);
-                    }
+                let completion = match stream_projection {
+                    StreamProjectionOutcome::Complete => self.prepare_success(owned, completion),
                     StreamProjectionOutcome::Incomplete(failure) => {
                         let (error, published_streams, unexamined_updates) = failure.into_parts();
                         access.record_publication_failure(
@@ -6029,15 +6008,16 @@ impl InfalliblePublication for MutationRequestOperation {
                         );
                         match completion {
                             TopLevelCompletion::Normal(completion) => {
-                                let _status = owned.complete(completion.committed_failure(error));
+                                owned.prepare_completion(completion.committed_failure(error))
                             }
                             TopLevelCompletion::Create(_completion) => {
-                                let _status = owned.complete_create_result(Err(error));
+                                owned.prepare_create_result(Err(error))
                             }
                         }
                     }
-                }
+                };
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
+                Some(completion)
             }
             MutationOperationState::PublishingCheckpoint {
                 durability,
@@ -6046,6 +6026,7 @@ impl InfalliblePublication for MutationRequestOperation {
             } => {
                 access.publish_checkpoint(durability, publication, epoch);
                 self.state = MutationOperationState::Terminal;
+                None
             }
             MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CheckingOplock { .. }
@@ -6067,8 +6048,8 @@ impl InfalliblePublication for MutationRequestOperation {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
-        }
-        self
+        };
+        (self, completion)
     }
 }
 
