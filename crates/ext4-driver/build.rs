@@ -194,7 +194,7 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
 /// Returns an input or I/O error when the checked-in schema is incomplete, duplicated, malformed,
 /// or cannot be written to Cargo's output directory.
 fn write_operational_trace_contract() -> Result<(), io::Error> {
-    const EVENT_RECORDS: [(&str, &str); 17] = [
+    const EVENT_RECORDS: [(&str, &str); 29] = [
         ("event_cached_read", "CACHED_READ"),
         ("event_cached_write", "CACHED_WRITE"),
         ("event_cache_flush", "CACHE_FLUSH"),
@@ -212,6 +212,18 @@ fn write_operational_trace_contract() -> Result<(), io::Error> {
         ("event_raw_write", "RAW_WRITE"),
         ("event_raw_flush", "RAW_FLUSH"),
         ("event_oplock_check", "OPLOCK_CHECK"),
+        ("event_driver_initialization", "DRIVER_INITIALIZATION"),
+        ("event_control_device_creation", "CONTROL_DEVICE_CREATION"),
+        ("event_reactor_initialization", "REACTOR_INITIALIZATION"),
+        ("event_discovery_subscription", "DISCOVERY_SUBSCRIPTION"),
+        ("event_discovery_worker", "DISCOVERY_WORKER"),
+        ("event_filesystem_registration", "FILESYSTEM_REGISTRATION"),
+        ("event_discovery_scan", "DISCOVERY_SCAN"),
+        ("event_discovery_open", "DISCOVERY_OPEN"),
+        ("event_discovery_partition", "DISCOVERY_PARTITION"),
+        ("event_discovery_geometry", "DISCOVERY_GEOMETRY"),
+        ("event_discovery_read", "DISCOVERY_READ"),
+        ("event_discovery_announcement", "DISCOVERY_ANNOUNCEMENT"),
     ];
     const OUTCOME_RECORDS: [(&str, &str); 5] = [
         ("outcome_selected", "SELECTED"),
@@ -252,10 +264,20 @@ fn write_operational_trace_contract() -> Result<(), io::Error> {
             ));
         }
         event_values.push(value);
-        if matches!(
-            symbol,
-            "PAGING_READ" | "PAGING_WRITE" | "RAW_READ" | "RAW_WRITE" | "RAW_FLUSH"
-        ) {
+        if record.starts_with("event_discovery_")
+            || matches!(
+                symbol,
+                "PAGING_READ"
+                    | "PAGING_WRITE"
+                    | "RAW_READ"
+                    | "RAW_WRITE"
+                    | "RAW_FLUSH"
+                    | "DRIVER_INITIALIZATION"
+                    | "CONTROL_DEVICE_CREATION"
+                    | "REACTOR_INITIALIZATION"
+                    | "FILESYSTEM_REGISTRATION"
+            )
+        {
             rust_projection.push_str(&format!(
                 "/// Stable event identifier generated from the operational trace contract.\n\
                  pub(crate) const TRACE_EVENT_{symbol}: u16 = {value};\n"

@@ -188,7 +188,7 @@ function Assert-HostContract([bool]$RequireCleanState) {
             throw "required Windows command is unavailable: $program"
         }
     }
-    foreach ($command in @('Get-Service', 'Start-Service', 'Start-Job', 'Wait-Job', 'Stop-Job', 'Remove-Job')) {
+    foreach ($command in @('Get-Service', 'Start-Job', 'Wait-Job', 'Stop-Job', 'Remove-Job')) {
         if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
             throw "required SCM PowerShell command is unavailable: $command"
         }
@@ -556,6 +556,8 @@ function Write-Phase([string]$Phase) {
         $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw [ComponentModel.Win32Exception]::new($errorCode, 'durable phase publication failed')
     }
+    Write-Host ("[{0:o}] driver-load session={1} phase={2}" -f [DateTime]::UtcNow, $script:State.session_id, $Phase)
+    [Console]::Out.Flush()
 }
 
 function Load-Session([string]$RequestedSessionId) {
@@ -756,28 +758,45 @@ function Assert-ServiceConfiguration([string]$ExpectedHash, [string]$ExpectedDri
     Write-Host "service ImagePath matches selected OEM package SYS: $ExpectedDriverStorePath"
 }
 
-function Request-BoundedServiceStop {
+function Request-BoundedServiceCommand(
+    [ValidateSet('start', 'stop')][string]$Operation,
+    [int]$TimeoutMilliseconds = 30000
+) {
     $start = [Diagnostics.ProcessStartInfo]::new()
     $start.FileName = 'sc.exe'
-    $start.Arguments = "stop $serviceName"
+    $start.Arguments = "$Operation $serviceName"
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
+    Invoke-BoundedScmProcess $start $TimeoutMilliseconds
+}
+
+# Terminating the user-mode requester does not cancel an accepted SCM operation.
+# Timeout is therefore an uncertain outcome, distinct from a returned SCM error.
+function Invoke-BoundedScmProcess(
+    [Diagnostics.ProcessStartInfo]$Start,
+    [ValidateRange(1, 2147483647)][int]$TimeoutMilliseconds
+) {
     $process = [Diagnostics.Process]::new()
-    $process.StartInfo = $start
+    $process.StartInfo = $Start
     try {
         if (-not $process.Start()) {
-            throw 'SCM stop request process did not start'
+            throw 'SCM request process did not start'
         }
-        if (-not $process.WaitForExit(30000)) {
+        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
             $terminationError = $null
             try {
                 $process.Kill()
-                $process.WaitForExit()
+                if (-not $process.WaitForExit(5000)) {
+                    throw 'SCM helper did not terminate within 5 seconds'
+                }
             }
             catch {
                 $terminationError = $_
+            }
+            if ($terminationError) {
+                throw [TimeoutException]::new("SCM request exceeded $TimeoutMilliseconds ms and its helper could not be terminated; driver outcome is uncertain: $terminationError")
             }
             $standardOutput = $process.StandardOutput.ReadToEnd()
             $standardError = $process.StandardError.ReadToEnd()
@@ -787,10 +806,7 @@ function Request-BoundedServiceStop {
             if ($standardError) {
                 Write-Host $standardError.TrimEnd()
             }
-            if ($terminationError) {
-                throw "SCM stop request exceeded 30 seconds and its helper could not be terminated: $terminationError"
-            }
-            throw 'SCM stop request exceeded 30 seconds; driver unload outcome is uncertain'
+            throw [TimeoutException]::new("SCM request exceeded $TimeoutMilliseconds ms; driver outcome is uncertain")
         }
         $standardOutput = $process.StandardOutput.ReadToEnd()
         $standardError = $process.StandardError.ReadToEnd()
@@ -801,7 +817,7 @@ function Request-BoundedServiceStop {
             Write-Host $standardError.TrimEnd()
         }
         if ($process.ExitCode -ne 0) {
-            throw "SCM stop request failed with exit code $($process.ExitCode)"
+            throw [ComponentModel.Win32Exception]::new($process.ExitCode, 'SCM request failed')
         }
     }
     finally {
@@ -901,7 +917,7 @@ function Start-DriverLoadSession(
     Assert-DiscoveryVolumeScope $RequestedSessionId
     $serviceStartAttempt = Get-Date
     try {
-        Start-Service -Name $serviceName -ErrorAction Stop
+        Request-BoundedServiceCommand 'start' 60000
     }
     catch {
         $startFailure = $_
@@ -947,6 +963,12 @@ function Cleanup-DriverLoadSession {
         }
         Assert-ServiceConfiguration $script:State.sys_hash $expectedDriverStorePath ([bool]$package)
         $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($service -and $service.Status -eq [System.ServiceProcess.ServiceControllerStatus]::StartPending) {
+            # A timed-out start is not evidence of rollback. Retain the image/package while
+            # DriverEntry may still execute; recovery must observe a terminal SCM state first.
+            Write-Phase 'CleanupServiceStartPending'
+            throw 'driver initialization remains StartPending; retaining its service and package for reconciliation'
+        }
         if ($service -and $service.Status -ne [System.ServiceProcess.ServiceControllerStatus]::Stopped) {
             $serviceStopAttempt = Get-Date
             try {
@@ -959,7 +981,7 @@ function Cleanup-DriverLoadSession {
                         default { throw 'unknown control retirement outcome' }
                     }
                     Write-Phase 'CleanupServiceStopRequested'
-                    Request-BoundedServiceStop
+                    Request-BoundedServiceCommand 'stop'
                 }
                 $service = Get-Service -Name $serviceName -ErrorAction Stop
                 # SCM can remain StopPending while filesystem-registration notifications and

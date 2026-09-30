@@ -9,6 +9,7 @@ use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
 use crate::irp::lower::AlignedTransferBuffer;
 use crate::kernel::device_interface::{VolumeInterfaceClass, VolumeInterfaces, unicode_string};
+use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace};
 use crate::kernel::{fatal::KernelWideInconsistency, ffi};
 use crate::memory;
 use crate::state::KernelDevice;
@@ -54,6 +55,8 @@ struct DiscoveryContext {
     thread: AtomicPtr<c_void>,
     /// Control device lifetime encloses this owner, including error-log submissions.
     owner: KernelDevice,
+    /// Write-only provider capability retained until discovery unregisters and joins.
+    trace: OperationalTrace,
     /// The native dispatcher event and callback context must never move.
     _pin: PhantomPinned,
 }
@@ -66,7 +69,7 @@ impl VolumeDiscovery {
         unsafe_code,
         reason = "pinned context publication is paired with unregister and join"
     )]
-    pub(crate) fn start(owner: KernelDevice) -> Result<Self, NTSTATUS> {
+    pub(crate) fn start(owner: KernelDevice, trace: OperationalTrace) -> Result<Self, NTSTATUS> {
         let context = memory::boxed_try_with(|| {
             Ok(DiscoveryContext {
                 phase: AtomicU8::new(DiscoveryPhase::Dormant.raw()),
@@ -74,6 +77,7 @@ impl VolumeDiscovery {
                 notification: AtomicPtr::new(core::ptr::null_mut()),
                 thread: AtomicPtr::new(core::ptr::null_mut()),
                 owner,
+                trace,
                 _pin: PhantomPinned,
             })
         })
@@ -97,6 +101,11 @@ impl VolumeDiscovery {
         .ok_or(wdk_sys::STATUS_INVALID_PARAMETER)?;
         let address = core::ptr::from_ref(context).cast_mut().cast::<c_void>();
         let mut registration = core::ptr::null_mut();
+        trace.record(
+            OperationalPath::DiscoverySubscription,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let status = unsafe {
             // SAFETY: Callback storage is initialized and pinned. The callback only signals;
             // INCLUDE_EXISTING may invoke it synchronously before this call returns.
@@ -112,6 +121,7 @@ impl VolumeDiscovery {
                 &raw mut registration,
             )
         };
+        trace.record_status(OperationalPath::DiscoverySubscription, status);
         native_success(status)?;
         if registration.is_null() {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
@@ -124,6 +134,11 @@ impl VolumeDiscovery {
             ..wdk_sys::OBJECT_ATTRIBUTES::default()
         };
         let mut thread = core::ptr::null_mut();
+        trace.record(
+            OperationalPath::DiscoveryWorker,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let status = unsafe {
             // SAFETY: Drop unregisters callbacks and joins any created thread before context drop.
             ffi::PsCreateSystemThread(
@@ -136,6 +151,7 @@ impl VolumeDiscovery {
                 address,
             )
         };
+        trace.record_status(OperationalPath::DiscoveryWorker, status);
         native_success(status)?;
         if thread.is_null() {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
@@ -246,7 +262,17 @@ impl DiscoveryContext {
             if phase == DiscoveryPhase::Dormant.raw() {
                 continue;
             }
-            if let Err(status) = self.scan() {
+            self.trace.record(
+                OperationalPath::DiscoveryScan,
+                STATUS_SUCCESS,
+                OperationalOutcome::Selected,
+            );
+            let scanned = self.scan();
+            self.trace.record_status(
+                OperationalPath::DiscoveryScan,
+                scanned.as_ref().err().copied().unwrap_or(STATUS_SUCCESS),
+            );
+            if let Err(status) = scanned {
                 self.report(status);
             }
         }
@@ -278,9 +304,24 @@ impl DiscoveryContext {
         reason = "referenced volume and owned buffers outlive each synchronous call"
     )]
     fn probe(&self, path: &[u16]) -> Result<(), NTSTATUS> {
-        let volume = ReferencedVolume::open(path)?;
+        self.trace.record(
+            OperationalPath::DiscoveryOpen,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
+        let opened = ReferencedVolume::open(path);
+        self.trace.record_status(
+            OperationalPath::DiscoveryOpen,
+            opened.as_ref().err().copied().unwrap_or(STATUS_SUCCESS),
+        );
+        let volume = opened?;
         let mut kind = wdk_sys::GUID::default();
         let mut attributes = 0_u64;
+        self.trace.record(
+            OperationalPath::DiscoveryPartition,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let status = unsafe {
             // SAFETY: The file reference keeps the lower device live; outputs are writable.
             ext4win_query_volume_partition(
@@ -289,6 +330,8 @@ impl DiscoveryContext {
                 &raw mut attributes,
             )
         };
+        self.trace
+            .record_status(OperationalPath::DiscoveryPartition, status);
         if status == wdk_sys::STATUS_NOT_SUPPORTED {
             return Ok(());
         }
@@ -297,10 +340,17 @@ impl DiscoveryContext {
             return Ok(());
         }
         let mut sector = 0_u32;
+        self.trace.record(
+            OperationalPath::DiscoveryGeometry,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let status = unsafe {
             // SAFETY: Live referenced storage device with a synchronous output slot.
             ext4win_query_volume_sector_size(volume.device.as_ptr(), &raw mut sector)
         };
+        self.trace
+            .record_status(OperationalPath::DiscoveryGeometry, status);
         native_success(status)?;
         if sector < 512 || !sector.is_power_of_two() || sector > 65_536 {
             return Err(wdk_sys::STATUS_NOT_SUPPORTED);
@@ -327,6 +377,11 @@ impl DiscoveryContext {
             usize::try_from(alignment).map_err(|_| wdk_sys::STATUS_INVALID_BUFFER_SIZE)?,
         )
         .map_err(|error| error.ntstatus())?;
+        self.trace.record(
+            OperationalPath::DiscoveryRead,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let status = unsafe {
             // SAFETY: Buffer is nonpaged and aligned, exclusively borrowed until I/O completes.
             ext4win_read_volume_prefix(
@@ -335,6 +390,8 @@ impl DiscoveryContext {
                 length,
             )
         };
+        self.trace
+            .record_status(OperationalPath::DiscoveryRead, status);
         native_success(status)?;
         let offset = usize::try_from(ExtVolumeSignature::BYTE_OFFSET)
             .map_err(|_| wdk_sys::STATUS_INVALID_BUFFER_SIZE)?;
@@ -349,11 +406,18 @@ impl DiscoveryContext {
         {
             return Ok(());
         }
+        self.trace.record(
+            OperationalPath::DiscoveryAnnouncement,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let status = unsafe {
             // SAFETY: The same referenced volume supplied GPT and signature evidence. Acceptance
             // is reconciled by native queries; shutdown joins this call before retiring the FSD.
             ext4win_announce_volume(volume.device.as_ptr())
         };
+        self.trace
+            .record_status(OperationalPath::DiscoveryAnnouncement, status);
         native_success(status)
     }
 

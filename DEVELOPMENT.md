@@ -90,6 +90,15 @@ IR, MAP, SYS, CAT, and INF hashes to the exact source snapshot, target, profile,
 rustflags, and rustc, LLVM, Cargo, `cargo-wdk`, and WDK versions. The production
 command neither reuses portable artifacts nor accepts stale release output.
 
+Each bundle also carries verbatim license and copyright documents for the
+driver's target-resolved normal dependency closure and the Rust standard
+library. The package index identifies each source and its declared license;
+the production manifest binds every copied document by SHA-256. Missing source
+notices prevent publication. `LICENSE-MIT` and `LICENSE-APACHE` at the repository
+root are the authoritative project texts. The core and driver crates are internal
+workspace components and are not published separately. Production bundles carry
+the project's original license texts from the repository root.
+
 `verify-hosted-driver-load` is the kernel-load-only umbrella. It performs the hosted
 preflight, invokes `verify-production-driver`'s bundle construction exactly
 once, shuts down the production gate's WSL oracle so its ext4 virtual disk is
@@ -148,6 +157,15 @@ available evidence after failure. It attempts identity-checked session recovery
 even after a failed test step; cleanup success does not turn failed I/O into a
 passing result. A VM crash or job-level timeout can prevent cleanup and artifact
 upload; the hosted VM is discarded, and that run is not acceptance evidence.
+
+The live CI step starts an ETW consumer before the driver registers its provider.
+It streams fixed initialization and discovery stages, status and outcome to the
+job console and retains a bounded ETL alongside session evidence. This makes
+the last delivered kernel stage observable when the runner cannot upload files.
+Delivery remains buffered; a stopped host can lose its final events, and absence
+of an event does not prove that its operation never started. SCM start and stop
+requests have bounded helper waits. A start timeout does not cancel DriverEntry;
+cleanup retains the service and package while SCM still reports `StartPending`.
 
 `verify-live-vhdx` composes the common driver-load preflight with its additional
 Hyper-V, WSL/e2fsprogs, and Driver Verifier requirements. It does not accept a disk path or disk number. It creates one

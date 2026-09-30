@@ -142,48 +142,6 @@ struct SealedProductionArtifacts {
     licenses: Vec<SealedLicenseDocument>,
 }
 
-/// Atomically published production bundle whose manifest and artifacts passed the release gate.
-#[derive(Debug)]
-pub(crate) struct VerifiedProductionBundle {
-    /// Exact atomically published bundle directory.
-    directory: PathBuf,
-    /// Build-generated identity embedded in the signed driver and directory name.
-    artifact_id: String,
-    /// Hash of the exact signed SYS admitted by the production gate.
-    driver_hash: String,
-    /// Hash of the exact signed catalog admitted by the production gate.
-    catalog_hash: String,
-    /// Hash of the exact installation metadata admitted by the production gate.
-    inf_hash: String,
-}
-
-impl VerifiedProductionBundle {
-    /// Returns the exact published directory passed to downstream artifact consumers.
-    pub(crate) fn as_path(&self) -> &Path {
-        &self.directory
-    }
-
-    /// Returns the exact embedded artifact identity established during production verification.
-    pub(crate) fn artifact_id(&self) -> &str {
-        &self.artifact_id
-    }
-
-    /// Returns the admitted signed-driver digest without reparsing the published manifest.
-    pub(crate) fn driver_hash(&self) -> &str {
-        &self.driver_hash
-    }
-
-    /// Returns the admitted signed-catalog digest without reparsing the published manifest.
-    pub(crate) fn catalog_hash(&self) -> &str {
-        &self.catalog_hash
-    }
-
-    /// Returns the admitted installation-metadata digest without reparsing the published manifest.
-    pub(crate) fn inf_hash(&self) -> &str {
-        &self.inf_hash
-    }
-}
-
 /// One source license document with its bundle-relative name and admitted digest.
 #[derive(Debug)]
 struct SealedLicenseDocument {
@@ -253,6 +211,48 @@ struct LicenseDependency {
 struct LicenseDependencyKind {
     /// Named build/development kind or absent normal kind.
     kind: Option<String>,
+}
+
+/// Atomically published production bundle whose manifest and artifacts passed the release gate.
+#[derive(Debug)]
+pub(crate) struct VerifiedProductionBundle {
+    /// Exact atomically published bundle directory.
+    directory: PathBuf,
+    /// Build-generated identity embedded in the signed driver and directory name.
+    artifact_id: String,
+    /// Hash of the exact signed SYS admitted by the production gate.
+    driver_hash: String,
+    /// Hash of the exact signed catalog admitted by the production gate.
+    catalog_hash: String,
+    /// Hash of the exact installation metadata admitted by the production gate.
+    inf_hash: String,
+}
+
+impl VerifiedProductionBundle {
+    /// Returns the exact published directory passed to downstream artifact consumers.
+    pub(crate) fn as_path(&self) -> &Path {
+        &self.directory
+    }
+
+    /// Returns the exact embedded artifact identity established during production verification.
+    pub(crate) fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    /// Returns the admitted signed-driver digest without reparsing the published manifest.
+    pub(crate) fn driver_hash(&self) -> &str {
+        &self.driver_hash
+    }
+
+    /// Returns the admitted signed-catalog digest without reparsing the published manifest.
+    pub(crate) fn catalog_hash(&self) -> &str {
+        &self.catalog_hash
+    }
+
+    /// Returns the admitted installation-metadata digest without reparsing the published manifest.
+    pub(crate) fn inf_hash(&self) -> &str {
+        &self.inf_hash
+    }
 }
 
 impl SealedProductionArtifacts {
@@ -613,6 +613,51 @@ fn locate_signtool() -> TaskResult<PathBuf> {
     })
 }
 
+/// Copies every analyzer input only after proving the source file remained one exact byte sequence.
+///
+/// # Errors
+///
+/// Returns an error for source mutation, I/O failure, a duplicate snapshot destination, or a
+/// signed-driver digest that differs from the cryptographically verified final SYS.
+fn seal_production_artifacts(
+    repository_root: &Path,
+    source: &ProductionArtifacts,
+    directory: &Path,
+    signed_driver_hash: &str,
+) -> TaskResult<SealedProductionArtifacts> {
+    let ir = directory.join("ext4win.ll");
+    let link_map = directory.join("ext4win.map");
+    let driver = directory.join("ext4win.sys");
+    let catalog = directory.join("ext4win.cat");
+    let inf = directory.join("ext4win.inf");
+    let ir_hash = copy_stable_artifact(&source.ir, &ir, "release LLVM IR")?;
+    let map_hash = copy_stable_artifact(&source.link_map, &link_map, "release link map")?;
+    let driver_hash = copy_stable_artifact(&source.driver, &driver, "signed driver")?;
+    let catalog_hash = copy_stable_artifact(&source.catalog, &catalog, "signed catalog")?;
+    let inf_hash = copy_stable_artifact(&source.inf, &inf, "driver installation metadata")?;
+    if driver_hash != signed_driver_hash {
+        return Err(io::Error::other(
+            "signed driver changed after final Authenticode verification and before analyzer sealing",
+        )
+        .into());
+    }
+    Ok(SealedProductionArtifacts {
+        artifacts: ProductionArtifacts {
+            ir,
+            link_map,
+            driver,
+            catalog,
+            inf,
+        },
+        ir_hash,
+        map_hash,
+        driver_hash,
+        catalog_hash,
+        inf_hash,
+        licenses: seal_license_documents(repository_root, directory)?,
+    })
+}
+
 /// Copies source notices for the target-resolved driver dependencies and Rust library.
 ///
 /// The package index records each source's own license expression; collecting a dependency's
@@ -822,51 +867,6 @@ fn package_license_documents(package: &LicensePackage) -> TaskResult<BTreeSet<Pa
     Ok(documents)
 }
 
-/// Copies every analyzer input only after proving the source file remained one exact byte sequence.
-///
-/// # Errors
-///
-/// Returns an error for source mutation, I/O failure, a duplicate snapshot destination, or a
-/// signed-driver digest that differs from the cryptographically verified final SYS.
-fn seal_production_artifacts(
-    repository_root: &Path,
-    source: &ProductionArtifacts,
-    directory: &Path,
-    signed_driver_hash: &str,
-) -> TaskResult<SealedProductionArtifacts> {
-    let ir = directory.join("ext4win.ll");
-    let link_map = directory.join("ext4win.map");
-    let driver = directory.join("ext4win.sys");
-    let catalog = directory.join("ext4win.cat");
-    let inf = directory.join("ext4win.inf");
-    let ir_hash = copy_stable_artifact(&source.ir, &ir, "release LLVM IR")?;
-    let map_hash = copy_stable_artifact(&source.link_map, &link_map, "release link map")?;
-    let driver_hash = copy_stable_artifact(&source.driver, &driver, "signed driver")?;
-    let catalog_hash = copy_stable_artifact(&source.catalog, &catalog, "signed catalog")?;
-    let inf_hash = copy_stable_artifact(&source.inf, &inf, "driver installation metadata")?;
-    if driver_hash != signed_driver_hash {
-        return Err(io::Error::other(
-            "signed driver changed after final Authenticode verification and before analyzer sealing",
-        )
-        .into());
-    }
-    Ok(SealedProductionArtifacts {
-        artifacts: ProductionArtifacts {
-            ir,
-            link_map,
-            driver,
-            catalog,
-            inf,
-        },
-        ir_hash,
-        map_hash,
-        driver_hash,
-        catalog_hash,
-        inf_hash,
-        licenses: seal_license_documents(repository_root, directory)?,
-    })
-}
-
 /// Writes the versioned evidence manifest into an unpublished verified bundle.
 ///
 /// # Errors
@@ -923,7 +923,6 @@ fn write_production_manifest(
     write_manifest_artifact(&mut manifest, "sys", "ext4win.sys", &sealed.driver_hash)?;
     write_manifest_artifact(&mut manifest, "cat", "ext4win.cat", &sealed.catalog_hash)?;
     write_manifest_artifact(&mut manifest, "inf", "ext4win.inf", &sealed.inf_hash)?;
-
     for (index, document) in sealed.licenses.iter().enumerate() {
         write_manifest_artifact(
             &mut manifest,
@@ -1201,6 +1200,9 @@ fn hash_source_record(hasher: &mut Sha256, relative_path: &str, contents: Option
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::path::Path;
+
     /// License closure selection excludes build/development edges and rejects incomplete evidence.
     ///
     /// # Errors
@@ -1283,9 +1285,6 @@ mod tests {
         let cleanup = remove_task_directory(&repository_root, &directory, "license-notice-test");
         combine_verification_and_cleanup(verification, cleanup)
     }
-
-    use super::*;
-    use std::path::Path;
 
     /// The process boundary keeps the path, artifact ID, and all three hashes paired.
     ///

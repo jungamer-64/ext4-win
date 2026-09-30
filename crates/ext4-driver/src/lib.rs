@@ -26,7 +26,9 @@ mod wire;
 use wdk_alloc::WdkAllocator;
 use wdk_sys::{NTSTATUS, PCUNICODE_STRING, PDRIVER_OBJECT, STATUS_SUCCESS};
 
-use crate::kernel::operational_trace::OperationalTraceRegistration;
+use crate::kernel::operational_trace::{
+    OperationalOutcome, OperationalPath, OperationalTraceRegistration,
+};
 
 /// Length of the fixed build identity record emitted by the build script.
 const EXT4WIN_PRODUCTION_ARTIFACT_RECORD_LENGTH: usize =
@@ -81,11 +83,21 @@ pub unsafe extern "system" fn driver_entry(
         Ok(registration) => registration,
         Err(status) => return status,
     };
-    let _control_device = match state::ControlDevice::create(driver, trace_registration.trace()) {
+    let trace = trace_registration.trace();
+    trace.record(
+        OperationalPath::DriverInitialization,
+        STATUS_SUCCESS,
+        OperationalOutcome::Selected,
+    );
+    let _control_device = match state::ControlDevice::create(driver, trace) {
         Ok(control_device) => control_device,
-        Err(status) => return status,
+        Err(status) => {
+            trace.record_status(OperationalPath::DriverInitialization, status);
+            return status;
+        }
     };
     trace_registration.publish();
+    trace.record_status(OperationalPath::DriverInitialization, STATUS_SUCCESS);
 
     STATUS_SUCCESS
 }

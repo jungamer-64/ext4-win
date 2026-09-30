@@ -218,6 +218,8 @@ namespace Ext4Win {
         $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
         throw [ComponentModel.Win32Exception]::new($errorCode, 'durable live phase publication failed')
     }
+    Write-Host ("[{0:o}] live-vhdx session={1} phase={2}" -f [DateTime]::UtcNow, $script:State.session_id, $Phase)
+    [Console]::Out.Flush()
 }
 
 function Load-Session([string]$RequestedSessionId) {

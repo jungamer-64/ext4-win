@@ -1,6 +1,7 @@
 //! Filesystem and control-device extension lifecycle, dispatch rundown, and retirement.
 
 use super::*;
+use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath};
 
 /// Driver-owned device extension kind retained independently of reactor lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -505,7 +506,12 @@ impl ControlDeviceExtension {
             // SAFETY: This extension was allocated with ControlDeviceExtension size and alignment.
             core::ptr::addr_of_mut!((*extension.as_ptr()).header)
         };
-        unsafe {
+        trace.record(
+            OperationalPath::ReactorInitialization,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
+        let initialized = unsafe {
             // SAFETY: The extension is stable device-owned storage.
             DeviceExtensionHeader::initialize_at(
                 header,
@@ -514,28 +520,30 @@ impl ControlDeviceExtension {
                 ReactorTarget::ControlDevice,
                 trace,
             )
-        }
-        .map_err(|error| error.ntstatus())?;
+        };
+        trace.record_result(OperationalPath::ReactorInitialization, &initialized);
+        initialized.map_err(|error| error.ntstatus())?;
         #[cfg(not(test))]
         {
-            let discovery = match crate::kernel::volume_discovery::VolumeDiscovery::start(device) {
-                Ok(discovery) => discovery,
-                Err(status) => {
-                    let header = unsafe {
-                        // SAFETY: Successful header initialization established this live value.
-                        &*header
-                    };
-                    unsafe {
-                        // SAFETY: No publication occurred; discovery rollback joined its observers.
-                        let target = header.retire();
-                        if !matches!(target, ReactorTarget::ControlDevice) {
-                            KernelWideInconsistency::completion_reactor_state_corruption()
-                                .bugcheck();
+            let discovery =
+                match crate::kernel::volume_discovery::VolumeDiscovery::start(device, trace) {
+                    Ok(discovery) => discovery,
+                    Err(status) => {
+                        let header = unsafe {
+                            // SAFETY: Successful header initialization established this live value.
+                            &*header
+                        };
+                        unsafe {
+                            // SAFETY: No publication occurred; discovery rollback joined its observers.
+                            let target = header.retire();
+                            if !matches!(target, ReactorTarget::ControlDevice) {
+                                KernelWideInconsistency::completion_reactor_state_corruption()
+                                    .bugcheck();
+                            }
                         }
+                        return Err(status);
                     }
-                    return Err(status);
-                }
-            };
+                };
             let destination = unsafe {
                 // SAFETY: Project only the uninitialized discovery field; the running reactor is
                 // a different field and is never aliased by a whole-extension mutable reference.
@@ -649,6 +657,11 @@ impl ControlDevice {
             crate::lifecycle_control::CONTROL_DEVICE_SDDL_MAXIMUM_BYTE_LENGTH,
         );
         let mut device = core::ptr::null_mut();
+        trace.record(
+            OperationalPath::ControlDeviceCreation,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let status = unsafe {
             // SAFETY: Generated strings are stable, terminated contract values; `device` is
             // writable out storage and the custom GUID is unique to this control device.
@@ -664,6 +677,7 @@ impl ControlDevice {
                 core::ptr::addr_of_mut!(device),
             )
         };
+        trace.record_status(OperationalPath::ControlDeviceCreation, status);
         if status < STATUS_SUCCESS {
             return Err(status);
         }
@@ -706,11 +720,17 @@ impl ControlDevice {
             return Err(link_status);
         }
 
+        trace.record(
+            OperationalPath::FilesystemRegistration,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         unsafe {
             // SAFETY: The named, initialized disk-filesystem control device is ready to acquire
             // its registration reference while DO_DEVICE_INITIALIZING still excludes opens.
             ffi::IoRegisterFileSystem(device.as_ptr());
         }
+        trace.record_status(OperationalPath::FilesystemRegistration, STATUS_SUCCESS);
         let extension = unsafe {
             // SAFETY: This exact device was initialized as the filesystem control device above.
             ControlDeviceExtension::from_device(device)

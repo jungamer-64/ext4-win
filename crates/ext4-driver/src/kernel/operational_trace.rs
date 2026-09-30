@@ -15,6 +15,30 @@ mod contract {
 /// Driver-owned path identity recorded without file names, offsets, lengths, or payload bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationalPath {
+    /// DriverEntry after provider registration through successful device publication.
+    DriverInitialization,
+    /// Secure control device allocation before extension initialization.
+    ControlDeviceCreation,
+    /// Final-address reactor initialization, including its joined worker.
+    ReactorInitialization,
+    /// PnP subscription, including synchronous existing-interface callbacks.
+    DiscoverySubscription,
+    /// Dormant discovery system-thread creation.
+    DiscoveryWorker,
+    /// Filesystem registration and its synchronous filter notifications.
+    FilesystemRegistration,
+    /// One hidden-volume enumeration and probe pass.
+    DiscoveryScan,
+    /// Referenced lower-volume open before recognition.
+    DiscoveryOpen,
+    /// Read-only GPT identity and attribute query.
+    DiscoveryPartition,
+    /// Logical sector geometry query.
+    DiscoveryGeometry,
+    /// Aligned ext superblock prefix read.
+    DiscoveryRead,
+    /// Mount Manager arrival and registration reconciliation.
+    DiscoveryAnnouncement,
     /// Paging read admitted independently from handle cleanup.
     PagingRead,
     /// Paging write or lazy writeback.
@@ -31,6 +55,18 @@ impl OperationalPath {
     /// Returns the stable event identifier generated from the repository-owned trace contract.
     const fn event_id(self) -> u16 {
         match self {
+            Self::DriverInitialization => contract::TRACE_EVENT_DRIVER_INITIALIZATION,
+            Self::ControlDeviceCreation => contract::TRACE_EVENT_CONTROL_DEVICE_CREATION,
+            Self::ReactorInitialization => contract::TRACE_EVENT_REACTOR_INITIALIZATION,
+            Self::DiscoverySubscription => contract::TRACE_EVENT_DISCOVERY_SUBSCRIPTION,
+            Self::DiscoveryWorker => contract::TRACE_EVENT_DISCOVERY_WORKER,
+            Self::FilesystemRegistration => contract::TRACE_EVENT_FILESYSTEM_REGISTRATION,
+            Self::DiscoveryScan => contract::TRACE_EVENT_DISCOVERY_SCAN,
+            Self::DiscoveryOpen => contract::TRACE_EVENT_DISCOVERY_OPEN,
+            Self::DiscoveryPartition => contract::TRACE_EVENT_DISCOVERY_PARTITION,
+            Self::DiscoveryGeometry => contract::TRACE_EVENT_DISCOVERY_GEOMETRY,
+            Self::DiscoveryRead => contract::TRACE_EVENT_DISCOVERY_READ,
+            Self::DiscoveryAnnouncement => contract::TRACE_EVENT_DISCOVERY_ANNOUNCEMENT,
             Self::PagingRead => contract::TRACE_EVENT_PAGING_READ,
             Self::PagingWrite => contract::TRACE_EVENT_PAGING_WRITE,
             Self::RawRead => contract::TRACE_EVENT_RAW_READ,
@@ -269,6 +305,18 @@ mod tests {
     #[test]
     fn event_schema_has_unique_nonzero_domains() {
         let events = [
+            OperationalPath::DriverInitialization,
+            OperationalPath::ControlDeviceCreation,
+            OperationalPath::ReactorInitialization,
+            OperationalPath::DiscoverySubscription,
+            OperationalPath::DiscoveryWorker,
+            OperationalPath::FilesystemRegistration,
+            OperationalPath::DiscoveryScan,
+            OperationalPath::DiscoveryOpen,
+            OperationalPath::DiscoveryPartition,
+            OperationalPath::DiscoveryGeometry,
+            OperationalPath::DiscoveryRead,
+            OperationalPath::DiscoveryAnnouncement,
             OperationalPath::PagingRead,
             OperationalPath::PagingWrite,
             OperationalPath::RawRead,
