@@ -41,6 +41,17 @@ pub(crate) fn verify_portable(repository_root: &Path) -> TaskResult<()> {
 ///
 /// Returns an error when any driver Cargo gate cannot start or exits unsuccessfully.
 pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
+    #[cfg(windows)]
+    {
+        let mut command = Command::new("powershell.exe");
+        command.current_dir(repository_root).args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            "tools/xtask/executive-resource.tests.ps1",
+        ]);
+        run_checked(command, "native executive resource APC contract")?;
+    }
     run_checked(
         cargo_command(repository_root, &["check", "-p", "ext4win", "--locked"]),
         "driver check gate",

@@ -475,26 +475,57 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
         $payload[$index] = [byte]($index % 251)
     }
     Write-Phase 'FilesystemOperationsRequested'
-    [IO.File]::WriteAllBytes($alpha, $payload)
+    Write-Phase 'FileCreateRequested'
+    $stream = [IO.FileStream]::new($alpha, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::Read, 1)
+    try {
+        Write-Phase 'FileCreated'
+        Write-Phase 'FileWriteRequested'
+        $stream.Write($payload, 0, $payload.Length)
+        Write-Phase 'FileWritten'
+    }
+    finally {
+        try { Write-Phase 'FileCloseRequested' }
+        finally { $stream.Dispose() }
+        Write-Phase 'FileClosed'
+    }
+    Write-Phase 'MetadataVerificationRequested'
     [Ext4Win.LiveMetadata]::Verify($alpha)
+    Write-Phase 'MetadataVerified'
+    Write-Phase 'FileReadRequested'
     $readback = [IO.File]::ReadAllBytes($alpha)
     if ([Convert]::ToBase64String($payload) -ne [Convert]::ToBase64String($readback)) {
         throw 'live VHDX readback differed from the written payload'
     }
+    Write-Phase 'FileReadVerified'
+    Write-Phase 'RenameRequested'
     Move-Item -LiteralPath $alpha -Destination $beta
+    Write-Phase 'Renamed'
+    Write-Phase 'HardLinkRequested'
     New-Item -ItemType HardLink -Path $hardlink -Target $beta | Out-Null
+    Write-Phase 'HardLinkCreated'
+    Write-Phase 'HardLinkEnumerationRequested'
     $matches = @([IO.Directory]::EnumerateFiles($root, 'beta*'))
     if ($matches.Count -ne 2) {
         throw 'patterned directory enumeration did not return both hard-link names'
     }
+    Write-Phase 'HardLinkEnumerationVerified'
+    Write-Phase 'WriteThroughOpenRequested'
     $stream = [IO.FileStream]::new($beta, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read, 4096, [IO.FileOptions]::WriteThrough)
     try {
+        Write-Phase 'WriteThroughOpened'
+        Write-Phase 'FileFlushRequested'
         $stream.Flush($true)
+        Write-Phase 'FileFlushed'
     }
     finally {
-        $stream.Dispose()
+        try { Write-Phase 'WriteThroughCloseRequested' }
+        finally { $stream.Dispose() }
+        Write-Phase 'WriteThroughClosed'
     }
+    Write-Phase 'DirectoryVerificationRequested'
     [Ext4Win.LiveDirectory]::Verify((Join-Path $root 'large-directory'))
+    Write-Phase 'DirectoryVerified'
+    Write-Phase 'LargeDirectoryEnumerationRequested'
     $enumerationClock = [Diagnostics.Stopwatch]::StartNew()
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $enumerator = [IO.Directory]::EnumerateFiles((Join-Path $root 'large-directory')).GetEnumerator()
@@ -514,6 +545,7 @@ function Exercise-SessionVolume([string[]]$BundleArguments) {
     }
     [ordered]@{ entries = $seen.Count; first_ms = $firstMilliseconds; total_ms = $enumerationClock.Elapsed.TotalMilliseconds } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $script:SessionDirectory 'directory-enumeration.json')
+    Write-Phase 'LargeDirectoryEnumerationVerified'
     Write-Phase 'FilesystemOperationsCompleted'
     Write-Phase 'VolumeDismountRequested'
     Get-SessionPartition | Out-Null
