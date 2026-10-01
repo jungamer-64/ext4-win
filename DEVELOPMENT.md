@@ -27,6 +27,53 @@ below instead of substituting generic Cargo commands for a canonical gate.
 The scheduled fuzz campaign remains a separate, time-bounded search rather than part of the
 signed production umbrella.
 
+## Developer diagnostics
+
+`tools/diagnostics/diagnose.py` provides read-only diagnostics using Python 3.9+
+and its standard library. Run it with `--help` or a subcommand's `--help` for explicit
+inputs. Results are JSON on stdout; failures return a nonzero exit status.
+Use `python3` in place of `python` on hosts where that names the interpreter.
+
+```console
+python -B tools/diagnostics/diagnose.py host
+python -B tools/diagnostics/diagnose.py service --name ext4win
+python -B tools/diagnostics/diagnose.py volume C:/
+python -B tools/diagnostics/diagnose.py stack target/verified-production/<artifact-id> --limit 20 --rva 0x1234
+python -B tools/diagnostics/diagnose.py completion target/verified-production/<artifact-id>
+python -B tools/diagnostics/diagnose.py extent --superblock superblock.bin --block extent.bin --inode 8 --generation 0
+python -B tools/diagnostics/diagnose.py waits kernel.log --match ext4win! --encoding utf-8
+```
+
+Artifact diagnostics validate the requested bundle's manifest hashes and analyze
+the bytes read into that snapshot. They do not establish that the bundle matches
+the current checkout, is trusted, or is loaded. Rebuild with
+`verify-production-driver` when current-source evidence is required. Stack
+inspection reports fixed AMD64 prolog frames, not a complete call-chain or live
+stack bound. Completion inspection rejects unmodeled IR forms and checks context
+capture, marker installation and immediate restoration around direct native
+completion calls, rejecting paths that can reenter completion without capture.
+Aliases, indirect calls and runtime Filter Manager behavior
+are outside that analysis.
+
+`service` and `volume` require Windows. Service hashing requires an explicit
+driver `ImagePath` and identifies that configured image on disk. Volume queries
+can block inside the filesystem driver; the tool does not claim to cancel a
+pending kernel operation. Neither command changes
+driver lifecycle or storage. Extent input files must be a complete superblock
+and external extent block; the checksum result does not validate the rest of
+the filesystem. Wait-log extraction reports its match count and any truncation.
+
+The diagnostic contract gate, also run by portable CI, is:
+
+```console
+python -B -m unittest discover -s tools/diagnostics -p "test_*.py"
+```
+
+The Windows harness contract gate runs `tools/xtask/live-vhdx.tests.ps1`,
+`tools/xtask/driver-load.tests.ps1`, and `tools/xtask/operational-trace.tests.ps1`.
+It includes parsing the live workflow and compiling its native C# boundary;
+no disposable volume or driver installation is needed for these host tests.
+
 ## Ext4 durability and interoperability
 
 `verify-journal-interop` treats e2fsprogs as an independent oracle rather than

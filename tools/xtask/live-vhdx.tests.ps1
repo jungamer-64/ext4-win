@@ -7,6 +7,9 @@ $errors = $null
 $source = Join-Path $PSScriptRoot 'live-vhdx.ps1'
 $ast = [Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$errors)
 if ($errors.Count -ne 0) { throw ($errors | Out-String) }
+# Compile the current native boundary used by the live scenario; no filesystem
+# queries are issued by this compilation check.
+Add-Type -Path (Join-Path $PSScriptRoot 'live-volume.cs')
 foreach ($name in @('Read-VerifierActivity', 'Assert-LoadedDriverVerifier', 'Start-VerifiedDriverSession', 'Invoke-Wsl', 'Dismount-SessionFilesystemForCleanup', 'Resolve-WslSessionPartition')) {
     $definition = $ast.Find({
         param($node)

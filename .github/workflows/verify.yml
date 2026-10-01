@@ -35,6 +35,15 @@ jobs:
       - name: Verify portable workspace
         run: cargo xtask verify-portable
 
+      - name: Verify diagnostic tools
+        shell: bash
+        run: |
+          diagnostic_python=python3
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            diagnostic_python=python
+          fi
+          "$diagnostic_python" -B -m unittest discover -s tools/diagnostics -p 'test_*.py'
+
       - name: Verify live harness contracts
         if: runner.os == 'Windows'
         shell: powershell
