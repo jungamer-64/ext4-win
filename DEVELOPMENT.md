@@ -1,15 +1,16 @@
 # Development
 
 The workspace separates the portable ext4 domain from the Windows kernel
-boundary. Default Cargo commands select the host-independent members:
-`ext4-core`, `production-reachability`, and `xtask`. Use the repository tasks
+boundary. Default Cargo commands select the host-independent members recorded
+in `Cargo.toml`. Use the repository tasks
 below instead of substituting generic Cargo commands for a canonical gate.
 
 ## Verification commands
 
 | Command | Host requirements | What it establishes |
 | --- | --- | --- |
-| `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, then runs the portable tests and Clippy. |
+| `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, runs the portable tests and Clippy, and documents the host boundary. |
+| `cargo xtask verify-windows-host` | Elevated Windows host | Exercises native ETW enable-before-registration, scalar delivery, trace persistence and joined shutdown without installing a driver. |
 | `cargo xtask verify-driver` | Windows with MSVC, WDK, and Clang configured | Checks native resource/APC ownership, checks, tests, lints, and builds rustdoc for the `ext4win` kernel-driver crate. It does not build a signed release package. |
 | `cargo xtask verify-fuzz-replay` | Host with the repository-pinned cargo-fuzz installed | Discovers every declared fuzz target and replays its tracked corpus once under the bounded fuzz harness. |
 | `cargo xtask verify-journal-interop` | Native Linux or Windows with WSL; e2fsprogs | Exercises ext4 mutation and recovery against independently generated `debugfs` and `e2fsck` evidence. |
@@ -29,19 +30,17 @@ signed production umbrella.
 
 ## Developer diagnostics
 
-`tools/diagnostics/diagnose.py` provides read-only diagnostics using Python 3.9+
-and its standard library. Run it with `--help` or a subcommand's `--help` for explicit
-inputs. Results are JSON on stdout; failures return a nonzero exit status.
-Use `python3` in place of `python` on hosts where that names the interpreter.
+`cargo diagnose` runs the Rust diagnostic executable. Inputs are explicit;
+results are JSON on stdout and failures return a nonzero exit status.
 
 ```console
-python -B tools/diagnostics/diagnose.py host
-python -B tools/diagnostics/diagnose.py service --name ext4win
-python -B tools/diagnostics/diagnose.py volume C:/
-python -B tools/diagnostics/diagnose.py stack target/verified-production/<artifact-id> --limit 20 --rva 0x1234
-python -B tools/diagnostics/diagnose.py completion target/verified-production/<artifact-id>
-python -B tools/diagnostics/diagnose.py extent --superblock superblock.bin --block extent.bin --inode 8 --generation 0
-python -B tools/diagnostics/diagnose.py waits kernel.log --match ext4win! --encoding utf-8
+cargo diagnose host
+cargo diagnose service --name ext4win
+cargo diagnose volume C:/
+cargo diagnose stack target/verified-production/<artifact-id> --limit 20 --rva 0x1234
+cargo diagnose completion target/verified-production/<artifact-id>
+cargo diagnose extent --superblock superblock.bin --block extent.bin --inode 8 --generation 0
+cargo diagnose waits kernel.log --match ext4win! --encoding utf-8
 ```
 
 Artifact diagnostics validate the requested bundle's manifest hashes and analyze
@@ -63,16 +62,17 @@ driver lifecycle or storage. Extent input files must be a complete superblock
 and external extent block; the checksum result does not validate the rest of
 the filesystem. Wait-log extraction reports its match count and any truncation.
 
-The diagnostic contract gate, also run by portable CI, is:
+Diagnostic wire-format, immutable-snapshot and failure contracts run in
+`verify-portable`. On Windows this also checks real volume queries, service
+absence, requester termination and durable session recovery. The elevated
+`verify-windows-host` gate additionally exercises the actual ETW ABI.
 
-```console
-python -B -m unittest discover -s tools/diagnostics -p "test_*.py"
-```
-
-The Windows harness contract gate runs `tools/xtask/live-vhdx.tests.ps1`,
-`tools/xtask/driver-load.tests.ps1`, and `tools/xtask/operational-trace.tests.ps1`.
-It includes parsing the live workflow and compiling its native C# boundary;
-no disposable volume or driver installation is needed for these host tests.
+Linux-local fixture mutations run in a Rust executable built from current
+source before use. Windows builds its statically linked Linux target with the
+repository toolchain and runs it in WSL; e2fsprogs remains the independent
+filesystem oracle. Native Windows handles, directory queries and ETW belong
+to `windows-host`. Hyper-V and certificate-store management commands return
+external observations; Rust owns identity checks, sequencing and recovery.
 
 ## Ext4 durability and interoperability
 
@@ -198,14 +198,14 @@ VHDX reattachment with the same loaded driver. Runtime `verifier /query` reports
 must identify active flags and a currently loaded `ext4win.sys` before and after
 the filesystem scenario. The report parser accepts the English Windows runtime
 format and fails closed on unknown formats. Registry settings alone cannot pass.
-The job retains the transcript, live-session phase manifests, runtime Verifier
+The job retains the transcript, live-session phase records, runtime Verifier
 report, driver-load identity evidence, and signed production bundle, including
 available evidence after failure. It attempts identity-checked session recovery
 even after a failed test step; cleanup success does not turn failed I/O into a
 passing result. A VM crash or job-level timeout can prevent cleanup and artifact
 upload; the hosted VM is discarded, and that run is not acceptance evidence.
 
-The live CI step starts an ETW consumer before the driver registers its provider.
+The Rust live-session owner starts an ETW consumer before the driver registers its provider.
 It streams fixed initialization and discovery stages, status and outcome to the
 job console and retains a bounded ETL alongside session evidence. This makes
 the last delivered kernel stage observable when the runner cannot upload files.
@@ -238,7 +238,9 @@ driver substitutes a Basic Data partition type to obtain a mount point.
 The live scenario requires file create, read, write, rename, hard link,
 patterned enumeration, durable flush, clean dismount, driver unload, package
 removal, and VHDX removal to succeed. Lifecycle side effects are preceded by a
-durably flushed phase manifest. Cleanup revalidates the verified bundle
+durably flushed immutable JSON phase record. An intent records uncertain
+acceptance; only a subsequent observation records completion. Cleanup reloads
+the latest committed record and revalidates the verified bundle
 identity, signer thumbprint, SYS hash, OEM INF, service image path, VHDX path,
 and disk unique ID before acting. An interrupted session also queries the exact
 session volume's mounted state before detaching its VHDX. It performs a clean

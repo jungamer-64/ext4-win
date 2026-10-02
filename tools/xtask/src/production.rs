@@ -399,21 +399,22 @@ pub(crate) fn build_verified_production_bundle(
         }
     };
 
-    println!("production artifact bundle: PASS");
-    println!("identity: {}", identity.as_str());
-    println!("bundle: {}", bundle_directory.display());
-    println!("LLVM IR: ext4win.ll ({})", sealed.ir_hash);
-    println!("link map: ext4win.map ({})", sealed.map_hash,);
-    println!("signed driver: ext4win.sys ({})", sealed.driver_hash,);
-    println!("signed catalog: ext4win.cat ({})", sealed.catalog_hash);
-    println!("installation metadata: ext4win.inf ({})", sealed.inf_hash);
-    Ok(VerifiedProductionBundle {
+    let bundle = VerifiedProductionBundle {
         directory: bundle_directory,
         artifact_id: identity.as_str().to_owned(),
         driver_hash: sealed.driver_hash,
         catalog_hash: sealed.catalog_hash,
         inf_hash: sealed.inf_hash,
-    })
+    };
+    println!("production artifact bundle: PASS");
+    println!("identity: {}", bundle.artifact_id());
+    println!("bundle: {}", bundle.as_path().display());
+    println!("LLVM IR: ext4win.ll ({})", sealed.ir_hash);
+    println!("link map: ext4win.map ({})", sealed.map_hash,);
+    println!("signed driver: ext4win.sys ({})", bundle.driver_hash());
+    println!("signed catalog: ext4win.cat ({})", bundle.catalog_hash());
+    println!("installation metadata: ext4win.inf ({})", bundle.inf_hash());
+    Ok(bundle)
 }
 
 /// Invokes cargo-wdk from the sole driver package with child-local build identity and flags.
@@ -1286,13 +1287,14 @@ mod tests {
         combine_verification_and_cleanup(verification, cleanup)
     }
 
-    /// The process boundary keeps the path, artifact ID, and all three hashes paired.
+    /// Durable recovery evidence is projected directly from the verified production identity.
     ///
     /// # Panics
     ///
     /// Panics if serialization drops, swaps, or splits an identity field.
     #[test]
-    fn verified_bundle_process_arguments_preserve_identity() {
+    #[cfg(windows)]
+    fn verified_bundle_recovery_identity() {
         let bundle = VerifiedProductionBundle {
             directory: PathBuf::from("bundle with spaces/0123456789abcdef0123456789abcdef"),
             artifact_id: "0123456789abcdef0123456789abcdef".to_owned(),
@@ -1300,23 +1302,12 @@ mod tests {
             catalog_hash: "B".repeat(64),
             inf_hash: "C".repeat(64),
         };
-        let mut command = Command::new("powershell.exe");
-        crate::driver_load::append_verified_bundle_arguments(&mut command, &bundle);
-        assert_eq!(
-            command.get_args().collect::<Vec<_>>(),
-            [
-                OsStr::new("-Bundle"),
-                bundle.directory.as_os_str(),
-                OsStr::new("-BundleArtifactId"),
-                OsStr::new(&bundle.artifact_id),
-                OsStr::new("-BundleSysHash"),
-                OsStr::new(&bundle.driver_hash),
-                OsStr::new("-BundleCatalogHash"),
-                OsStr::new(&bundle.catalog_hash),
-                OsStr::new("-BundleInfHash"),
-                OsStr::new(&bundle.inf_hash),
-            ]
-        );
+        let identity = crate::session::BundleIdentity::from_verified(&bundle);
+        assert_eq!(identity.directory, bundle.directory);
+        assert_eq!(identity.artifact, bundle.artifact_id);
+        assert_eq!(identity.sys, bundle.driver_hash);
+        assert_eq!(identity.cat, bundle.catalog_hash);
+        assert_eq!(identity.inf, bundle.inf_hash);
     }
 
     /// Artifact identities satisfy the build-script boundary without using the sentinel.

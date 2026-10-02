@@ -1,5 +1,9 @@
 [alias]
 xtask = "run --package xtask --"
+diagnose = "run --package ext4-diagnostics --"
+
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
 
 [target.x86_64-pc-windows-msvc]
 rustflags = [

@@ -944,24 +944,11 @@ fn populate_directory_image(
     }
 
     let workload = (|| -> TaskResult<()> {
-        let script = r#"import os, sys
-root = sys.argv[1]
-count = int(sys.argv[2])
-depth = os.path.join(root, "depth2")
-os.mkdir(depth)
-for index in range(count):
-    if index % 50000 == 0:
-        target = os.path.join(root, f"target-{index}")
-        open(target, "wb").close()
-    name = f"depth-{index:05d}-"
-    name += "x" * max(0, int(sys.argv[3]) - len(name))
-    os.link(target, os.path.join(depth, name))
-"#;
-        let mut populate = linux.command("python3");
+        let executable = crate::fixture::executable(&crate::process::repository_root()?)?;
+        let mut populate = linux.command(&linux.tool_path(&executable)?);
         populate
             .args([
-                "-c",
-                script,
+                "populate-mounted",
                 &mount_directory,
                 &entry_count.to_string(),
                 &name_bytes.to_string(),
@@ -3710,23 +3697,9 @@ fn verify_locked_directory_enumeration(
     run_checked(populate, "encrypted directory fixture")?;
     // The oracle CLI has no encryption-namespace spelling. Encode only the on-disk namespace
     // byte in its otherwise generated inline attribute; this fixture has no metadata checksum.
-    let namespace_script = r#"import re, struct, subprocess, sys
-image = sys.argv[1]
-for name in ["/locked", "/locked/abcdefghijklmnop", "/locked/ponmlkjihgfedcba"]:
-    output = subprocess.check_output(["/usr/sbin/debugfs", "-R", "imap " + name, image], text=True)
-    block, offset = re.search(r"located at block (\d+), offset (0x[0-9a-fA-F]+)", output).groups()
-    base = int(block) * 4096 + int(offset, 16)
-    with open(image, "r+b") as disk:
-        disk.seek(base + 128)
-        extra = struct.unpack("<H", disk.read(2))[0]
-        disk.seek(base + 128 + extra)
-        header = disk.read(24)
-        assert header[:6] == bytes([0, 0, 2, 234, 1, 0]) and header[20:21] == b"c"
-        disk.seek(base + 128 + extra + 5)
-        disk.write(bytes([9]))
-"#;
-    let mut namespace = linux.command("python3");
-    namespace.args(["-c", namespace_script, &image_path]);
+    let executable = crate::fixture::executable(&crate::process::repository_root()?)?;
+    let mut namespace = linux.command(&linux.tool_path(&executable)?);
+    namespace.args(["encryption-namespace", &image_path]);
     run_checked(namespace, "encryption context namespace encoding")?;
     verify_internal_e2fsck_clean(linux, &image, "encrypted directory fixture")?;
     let directory = drive_internal_core_read_observed(&image, |pass| {

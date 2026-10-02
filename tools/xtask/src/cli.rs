@@ -1,8 +1,9 @@
 use crate::{
     TaskResult,
-    development::{verify_driver, verify_fuzz_replay, verify_portable},
+    development::{verify_driver, verify_fuzz_replay, verify_portable, verify_windows_host},
     driver_load::{
-        check_hosted_driver_host, cleanup_driver_load_session, verify_hosted_driver_load,
+        check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload,
+        verify_hosted_driver_load,
     },
     interop::{verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop},
     live::{check_live_driver_host, cleanup_live_vhdx_session, verify_live_vhdx},
@@ -16,6 +17,8 @@ use std::{env, ffi::OsStr, io, process::ExitCode};
 enum Task {
     /// Runs the complete host-independent development gate.
     Portable,
+    /// Exercises the real elevated Windows ETW provider and consumer ABI.
+    WindowsHost,
     /// Checks, tests, lints, and documents the Windows driver crate.
     Driver,
     /// Replays every tracked corpus through its declared fuzz target once.
@@ -34,6 +37,8 @@ enum Task {
     VerifyHostedDriverLoad,
     /// Reconciles one interrupted DriverStore/service lifecycle session.
     CleanupDriverLoadSession,
+    /// Sends one secured retirement request from a separately supervised requester.
+    PrepareDriverUnload,
     /// Performs read-only validation of a dedicated live-driver host.
     CheckLiveDriverHost,
     /// Builds a verified bundle and exercises it only against a new disposable VHDX.
@@ -47,6 +52,8 @@ impl Task {
     fn parse(argument: &OsStr) -> Option<Self> {
         if argument == "verify-portable" {
             Some(Self::Portable)
+        } else if argument == "verify-windows-host" {
+            Some(Self::WindowsHost)
         } else if argument == "verify-driver" {
             Some(Self::Driver)
         } else if argument == "verify-fuzz-replay" {
@@ -65,6 +72,8 @@ impl Task {
             Some(Self::VerifyHostedDriverLoad)
         } else if argument == "cleanup-driver-load-session" {
             Some(Self::CleanupDriverLoadSession)
+        } else if argument == "prepare-driver-unload" {
+            Some(Self::PrepareDriverUnload)
         } else if argument == "check-live-driver-host" {
             Some(Self::CheckLiveDriverHost)
         } else if argument == "verify-live-vhdx" {
@@ -112,12 +121,17 @@ fn execute() -> TaskResult<()> {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             cleanup_driver_load_session(&repository_root, session_id)
         }
+        Task::PrepareDriverUnload => {
+            let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
+            prepare_driver_unload(&repository_root, session_id)
+        }
         Task::CleanupLiveVhdxSession => {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             cleanup_live_vhdx_session(&repository_root, session_id)
         }
 
         Task::Portable
+        | Task::WindowsHost
         | Task::Driver
         | Task::FuzzReplay
         | Task::JournalInterop
@@ -133,6 +147,7 @@ fn execute() -> TaskResult<()> {
             }
             match task {
                 Task::Portable => verify_portable(&repository_root),
+                Task::WindowsHost => verify_windows_host(&repository_root),
                 Task::Driver => verify_driver(&repository_root),
                 Task::FuzzReplay => verify_fuzz_replay(&repository_root),
                 Task::JournalInterop => verify_journal_interop(&repository_root),
@@ -145,7 +160,9 @@ fn execute() -> TaskResult<()> {
                 Task::VerifyHostedDriverLoad => verify_hosted_driver_load(&repository_root),
                 Task::CheckLiveDriverHost => check_live_driver_host(&repository_root),
                 Task::VerifyLiveVhdx => verify_live_vhdx(&repository_root),
-                Task::CleanupDriverLoadSession | Task::CleanupLiveVhdxSession => {
+                Task::CleanupDriverLoadSession
+                | Task::CleanupLiveVhdxSession
+                | Task::PrepareDriverUnload => {
                     Err(io::Error::other("cleanup task lost its required argument").into())
                 }
             }
@@ -157,7 +174,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -175,6 +192,10 @@ mod tests {
         assert_eq!(
             Task::parse(OsStr::new("verify-portable")),
             Some(Task::Portable)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("verify-windows-host")),
+            Some(Task::WindowsHost)
         );
         assert_eq!(Task::parse(OsStr::new("verify-driver")), Some(Task::Driver));
         assert_eq!(
@@ -208,6 +229,10 @@ mod tests {
         assert_eq!(
             Task::parse(OsStr::new("cleanup-driver-load-session")),
             Some(Task::CleanupDriverLoadSession)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("prepare-driver-unload")),
+            Some(Task::PrepareDriverUnload)
         );
         assert_eq!(
             Task::parse(OsStr::new("check-live-driver-host")),

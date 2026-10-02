@@ -31,8 +31,52 @@ pub(crate) fn verify_portable(repository_root: &Path) -> TaskResult<()> {
         cargo_command(repository_root, &["clippy", "--locked", "--all-targets"]),
         "portable Clippy gate",
     )?;
+    run_checked(
+        cargo_command(
+            repository_root,
+            &["doc", "--locked", "-p", "windows-host", "--no-deps"],
+        ),
+        "host boundary rustdoc gate",
+    )?;
     println!("portable development gates: PASS");
     Ok(())
+}
+
+/// Runs the native ETW ABI contract that requires an elevated Windows host.
+/// # Errors
+/// Returns unsupported hosts, missing elevation or native test failures.
+pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
+    #[cfg(windows)]
+    {
+        windows_host::require_administrator()?;
+        run_checked(
+            cargo_command(
+                root,
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "windows-host",
+                    "native::trace::tests::native_etw_contract",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                ],
+            ),
+            "native ETW host contract gate",
+        )?;
+        println!("native Windows host contracts: PASS");
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _source_root = root;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native ETW validation requires elevated Windows",
+        )
+        .into())
+    }
 }
 
 /// Checks, tests, lints, and documents the Windows kernel driver crate.
@@ -43,14 +87,7 @@ pub(crate) fn verify_portable(repository_root: &Path) -> TaskResult<()> {
 pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     #[cfg(windows)]
     {
-        let mut command = Command::new("powershell.exe");
-        command.current_dir(repository_root).args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            "tools/xtask/executive-resource.tests.ps1",
-        ]);
-        run_checked(command, "native executive resource APC contract")?;
+        verify_executive_resource(repository_root)?;
     }
     run_checked(
         cargo_command(repository_root, &["check", "-p", "ext4win", "--locked"]),
@@ -76,6 +113,42 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     )?;
     println!("driver development gates: PASS");
     Ok(())
+}
+
+/// Compiles and executes the actual native C resource oracle without WDK or C runtime imports.
+/// # Errors
+/// Returns compiler, execution or mandatory generated-directory cleanup failures.
+#[cfg(windows)]
+fn verify_executive_resource(root: &Path) -> TaskResult<()> {
+    let directory = crate::process::create_task_directory(root, "executive-resource")?;
+    let executable = directory.join("resource-tests.exe");
+    let operation = (|| {
+        let mut compiler = Command::new("clang.exe");
+        compiler
+            .args([
+                "--target=x86_64-pc-windows-msvc",
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-nostdlib",
+                "-fuse-ld=lld",
+                "-Xlinker",
+                "/entry:main",
+                "-Xlinker",
+                "/subsystem:console",
+            ])
+            .arg(root.join("crates/ext4-driver/native/executive_resource.tests.c"))
+            .arg("-o")
+            .arg(&executable);
+        run_checked(compiler, "executive resource oracle compilation")?;
+        run_checked(
+            Command::new(&executable),
+            "native executive resource APC contract",
+        )
+    })();
+    let cleanup = crate::process::remove_task_directory(root, &directory, "executive-resource");
+    crate::process::combine_verification_and_cleanup(operation, cleanup)
 }
 
 /// Replays every declared fuzz target against its tracked corpus exactly once.

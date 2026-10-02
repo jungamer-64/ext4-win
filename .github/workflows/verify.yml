@@ -35,22 +35,12 @@ jobs:
       - name: Verify portable workspace
         run: cargo xtask verify-portable
 
-      - name: Verify diagnostic tools
-        shell: bash
-        run: |
-          diagnostic_python=python3
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            diagnostic_python=python
-          fi
-          "$diagnostic_python" -B -m unittest discover -s tools/diagnostics -p 'test_*.py'
-
-      - name: Verify live harness contracts
+      - name: Verify native Windows host contracts
         if: runner.os == 'Windows'
         shell: powershell
         run: |
-          ./tools/xtask/live-vhdx.tests.ps1
-          ./tools/xtask/driver-load.tests.ps1
-          ./tools/xtask/operational-trace.tests.ps1
+          cargo xtask verify-windows-host
+          if ($LASTEXITCODE -ne 0) { throw "Native Windows host contract verification failed" }
 
 
   ext4-interop:
@@ -781,23 +771,14 @@ jobs:
 
           New-Item -ItemType Directory -Path target -Force | Out-Null
           Start-Transcript -Path target/live-vhdx-ci.log
-          $trace = $null
           try {
-            Add-Type -Path ./tools/xtask/operational-trace.cs
-            $trace = [Ext4Win.OperationalTraceSession]::new(
-              (Join-Path $env:GITHUB_WORKSPACE 'crates/ext4-driver/operational-trace-v1.txt'),
-              (Join-Path $env:GITHUB_WORKSPACE 'target/live-driver-trace')
-            )
             cargo xtask verify-live-vhdx
             if ($LASTEXITCODE -ne 0) {
               throw "Live ext4 read-write verification failed with exit code $LASTEXITCODE"
             }
           }
           finally {
-            try {
-              if ($trace) { $trace.Dispose() }
-            }
-            finally { Stop-Transcript }
+            Stop-Transcript
           }
 
       - name: Reconcile interrupted live sessions
@@ -810,8 +791,8 @@ jobs:
           if (Test-Path -LiteralPath $sessionRoot) {
             foreach ($session in Get-ChildItem -LiteralPath $sessionRoot -Directory) {
               # The session owner validates every persisted identity before cleanup.
-              & ./tools/xtask/live-vhdx.ps1 -Mode Cleanup `
-                -RepositoryRoot $env:GITHUB_WORKSPACE -SessionId $session.Name
+              cargo xtask cleanup-live-vhdx-session $session.Name
+              if ($LASTEXITCODE -ne 0) { throw "Live session recovery failed: $($session.Name)" }
             }
           }
 
@@ -832,7 +813,7 @@ jobs:
           path: |
             target/live-vhdx-ci.log
             target/live-driver-trace/*.etl
-            target/live-vhdx-sessions/**/*.manifest
+            target/live-vhdx-sessions/**/*.json
             target/live-vhdx-sessions/**/verifier-runtime.txt
             target/driver-load-sessions/**
           if-no-files-found: warn
