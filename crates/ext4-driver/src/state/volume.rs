@@ -878,33 +878,6 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns access denied when another FILE_OBJECT owns the volume lock, volume dismounted for
     /// a repeated request.
-    pub(crate) fn prepare_dismount_volume(
-        &mut self,
-        owner: KernelFileObject,
-    ) -> DriverResult<PreparedVolumeStateTransition> {
-        let control = &mut self.volume.volume_control;
-        control.state = control.state.begin_dismount(owner)?;
-        Ok(PreparedVolumeStateTransition {
-            kind: PreparedVolumeStateTransitionKind::CleanClose {
-                terminal: CleanCloseTerminal::Dismount,
-            },
-        })
-    }
-
-    /// Enters one-way shutdown closing before any drain or durability suspension.
-    /// # Errors
-    ///
-    /// Returns volume dismounted when another terminal close already began.
-    pub(crate) fn prepare_shutdown(&mut self) -> DriverResult<PreparedVolumeStateTransition> {
-        let control = &mut self.volume.volume_control;
-        control.state = control.state.begin_shutdown()?;
-        Ok(PreparedVolumeStateTransition {
-            kind: PreparedVolumeStateTransitionKind::CleanClose {
-                terminal: CleanCloseTerminal::Shutdown,
-            },
-        })
-    }
-
     /// Publishes one previously validated lifecycle transition after its barrier succeeds.
     /// # Errors
     ///
