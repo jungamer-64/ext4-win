@@ -169,13 +169,45 @@ fn packages(directory: &Path) -> TaskResult<Vec<Package>> {
     Ok(records)
 }
 
+/// Reads exact-thumbprint membership in the two machine stores without a PowerShell provider.
+///
+/// The caller supplies `$thumbprint` from the signed image. Stores are opened read-only and
+/// must already exist. Membership does not validate a certificate chain or authorize installation;
+/// the lifecycle owner applies that policy to the returned counts.
+const CERTIFICATE_STORE_OBSERVATION: &str = r#"
+$counts = @{};
+foreach ($name in @('Root', 'TrustedPublisher')) {
+    $store = [Security.Cryptography.X509Certificates.X509Store]::new(
+        $name, [Security.Cryptography.X509Certificates.StoreLocation]::LocalMachine);
+    try {
+        $store.Open([Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -bor
+            [Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly);
+        $certificates = $store.Certificates;
+        try {
+            $count = 0;
+            foreach ($entry in $certificates) {
+                if ($entry.Thumbprint -eq $thumbprint) { $count++ }
+            }
+            $counts[$name] = $count;
+        } finally {
+            foreach ($entry in $certificates) { $entry.Dispose() }
+        }
+    } finally { $store.Dispose() }
+}
+[pscustomobject]@{
+    thumbprint = $thumbprint;
+    root = $counts['Root'];
+    publishers = $counts['TrustedPublisher'];
+}
+"#;
+
 /// Obtains signer identity and certificate-store matches as external observations.
 /// # Errors
 /// Returns Authenticode extraction or management-boundary failures.
 fn signer(bundle: &BundleIdentity, require_trust: bool) -> TaskResult<String> {
     let path = windows::literal(bundle.directory.join("ext4win.sys").as_os_str())?;
     let observation = windows::management(&format!(
-        "$certificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new([Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile({path})); try {{ [pscustomobject]@{{ thumbprint=$certificate.Thumbprint; root=@(Get-ChildItem Cert:\\LocalMachine\\Root | Where-Object Thumbprint -EQ $certificate.Thumbprint).Count; publishers=@(Get-ChildItem Cert:\\LocalMachine\\TrustedPublisher | Where-Object Thumbprint -EQ $certificate.Thumbprint).Count }} }} finally {{ $certificate.Dispose() }}"
+        "$certificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new([Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile({path})); try {{ $thumbprint=$certificate.Thumbprint; {CERTIFICATE_STORE_OBSERVATION} }} finally {{ $certificate.Dispose() }}"
     ))?;
     let thumbprint = observation
         .get("thumbprint")
@@ -665,4 +697,59 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
     combine_verification_and_cleanup(operation, cleanup)?;
     println!("hosted kernel-load smoke assurance: PASS");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Machine-store observations match the platform thumbprint search without a Cert drive.
+    /// # Errors
+    /// Returns native store, process or JSON failures without modifying certificate-store contents.
+    /// # Panics
+    /// Panics if exact membership or an absent thumbprint is reported incorrectly.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare real read-only certificate observations after fallible execution"
+    )]
+    fn certificate_membership_without_provider() -> TaskResult<()> {
+        let reference = windows::management(
+            "$root=[Security.Cryptography.X509Certificates.X509Store]::new('Root', 'LocalMachine'); \
+             $publishers=[Security.Cryptography.X509Certificates.X509Store]::new('TrustedPublisher', 'LocalMachine'); \
+             try { \
+                 $root.Open('ReadOnly, OpenExistingOnly'); \
+                 $publishers.Open('ReadOnly, OpenExistingOnly'); \
+                 $thumbprint=($root.Certificates | Select-Object -First 1).Thumbprint; \
+                 if (-not $thumbprint) { throw 'machine Root store has no certificate input' }; \
+                 [pscustomobject]@{ thumbprint=$thumbprint; \
+                     root=$root.Certificates.Find('FindByThumbprint', $thumbprint, $false).Count; \
+                     publishers=$publishers.Certificates.Find('FindByThumbprint', $thumbprint, $false).Count } \
+             } finally { $root.Dispose(); $publishers.Dispose() }",
+        )?;
+        let thumbprint = reference
+            .get("thumbprint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io::Error::other("native certificate reference lacks a thumbprint"))?;
+        let absent = serde_json::json!({
+            "thumbprint": "0000000000000000000000000000000000000000",
+            "root": 0,
+            "publishers": 0,
+        });
+        for (thumbprint, expected) in [
+            (thumbprint, &reference),
+            ("0000000000000000000000000000000000000000", &absent),
+        ] {
+            let literal = windows::literal(OsStr::new(thumbprint))?;
+            let observation = windows::management(&format!(
+                "Get-Command ConvertTo-Json | Out-Null; \
+                 Remove-PSDrive Cert -ErrorAction SilentlyContinue; \
+                 $PSModuleAutoLoadingPreference='None'; \
+                 if (Get-PSDrive Cert -ErrorAction SilentlyContinue) {{ throw 'Cert drive still present' }}; \
+                 $thumbprint={literal}; {CERTIFICATE_STORE_OBSERVATION}"
+            ))?;
+            assert_eq!(&observation, expected);
+        }
+        Ok(())
+    }
 }
