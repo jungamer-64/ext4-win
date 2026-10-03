@@ -606,7 +606,29 @@ impl ReceivedIrp {
         unsafe {
             // SAFETY: Dispatch validated a direct-volume handle. The I/O Manager retains that
             // FILE_OBJECT and its mount through completion; no driver queue context was installed.
-            ext4win_forward_device_control(_lower.as_ptr(), self.target.into_raw_irp())
+            ext4win_forward_original_irp(_lower.as_ptr(), self.target.into_raw_irp())
+        }
+        #[cfg(test)]
+        self.complete_result(Err(DriverError::NotSupported))
+    }
+    /// Delegates the original unqueued PnP IRP. Lower drivers own completion and cancellation;
+    /// no top-level Rust completion owner or actor slot remains after IoCallDriver.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the live mounted dispatch lease retains the lower route throughout original-IRP delegation"
+        )
+    )]
+    pub(crate) fn forward_pnp(self, _lower: KernelDevice, minor: PnpMinor) -> NTSTATUS {
+        if minor.initializes_success() {
+            self.target.irp.write_status_block(IrpCompletion::EMPTY);
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: No CSQ capture or cancel routine is installed. The caller retains the
+            // lower route through this consuming call; the I/O Manager then owns the IRP.
+            ext4win_forward_original_irp(_lower.as_ptr(), self.target.into_raw_irp())
         }
         #[cfg(test)]
         self.complete_result(Err(DriverError::NotSupported))
@@ -687,7 +709,7 @@ unsafe extern "system" {
         irp: wdk_sys::PIRP,
         action: MdlAction,
     ) -> NTSTATUS;
-    fn ext4win_forward_device_control(
+    fn ext4win_forward_original_irp(
         device: wdk_sys::PDEVICE_OBJECT,
         irp: wdk_sys::PIRP,
     ) -> NTSTATUS;

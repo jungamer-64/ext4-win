@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 #[cfg(test)]
 use core::cell::UnsafeCell;
 #[cfg(test)]
-use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 use ext4_core::{
     ClusterSize, EpochSequence, FileAllocationSize, FileSize, NodeId, NodeMetadataSnapshot,
 };
@@ -231,6 +231,170 @@ pub(crate) struct StreamContext {
     /// Host equivalent of the ledger-derived native delete-pending projection.
     #[cfg(test)]
     delete_pending: AtomicBool,
+    /// Host equivalent of the volume's monotonic native removal state.
+    #[cfg(test)]
+    storage_removal: AtomicU8,
+}
+
+/// Terminal PnP observations carry different mounted-device retirement authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageRemovalNotification {
+    /// Revoke storage while retaining the mounted device for the later final request.
+    Surprise,
+    /// Revoke storage and permit retirement after retained handles and callbacks drain.
+    Final,
+}
+
+/// Volume-scoped storage admission. A dispatch lease, actor-owned VCB, or retained worker
+/// rundown keeps the native volume stream alive through every use. Node streams consult this
+/// same authority.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VolumeStorageAccess {
+    /// Native volume header; host fixtures retain its atomic equivalent.
+    address: NonNull<c_void>,
+}
+
+/// PnP dispatch may revoke storage; observers and submission owners cannot publish removal.
+#[derive(Debug)]
+pub(crate) struct StorageRemovalPublisher {
+    /// Native volume header retained by mounted-device dispatch rundown.
+    address: NonNull<c_void>,
+}
+
+impl StorageRemovalPublisher {
+    /// Stops storage submissions before forwarding a terminal PnP notification. Surprise removal
+    /// revokes access; final removal additionally permits physical mounted-device retirement.
+    #[expect(
+        unsafe_code,
+        reason = "mounted-device dispatch retains the native gate and its host equivalent through removal publication"
+    )]
+    pub(crate) fn publish(&self, notification: StorageRemovalNotification) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The containing mounted-device dispatch lease retains this volume header.
+            ext4win_stream_remove_storage(
+                self.address.as_ptr(),
+                u8::from(notification == StorageRemovalNotification::Final),
+            );
+        }
+        #[cfg(test)]
+        {
+            let state = unsafe {
+                // SAFETY: Construction captured the retained volume's host atomic.
+                self.address.cast::<AtomicU8>().as_ref()
+            };
+            state.fetch_max(
+                match notification {
+                    StorageRemovalNotification::Surprise => 1,
+                    StorageRemovalNotification::Final => 2,
+                },
+                Ordering::AcqRel,
+            );
+        }
+    }
+}
+
+impl VolumeStorageAccess {
+    /// Requires storage that has received neither surprise nor final removal.
+    /// # Errors
+    ///
+    /// Returns device removed once revocation has begun; cancellation cannot restore access.
+    pub(crate) fn authorize(self) -> DriverResult<()> {
+        if self.removal_state() == 0 {
+            Ok(())
+        } else {
+            Err(DriverError::DeviceRemoved)
+        }
+    }
+
+    /// Distinguishes final REMOVE from the earlier surprise-removal notification.
+    pub(crate) fn final_removal_received(self) -> bool {
+        self.removal_state() == 2
+    }
+
+    /// Captures submission authority through the return of IoCallDriver. Removal waits for these
+    /// short-lived native submissions, not for outstanding lower I/O completion.
+    /// # Errors
+    ///
+    /// Returns device removed if native storage admission has closed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this volume-scoped native resource lease ends on the acquiring actor thread"
+        )
+    )]
+    pub(crate) fn acquire_submission(self) -> DriverResult<StorageSubmissionLease> {
+        #[cfg(not(test))]
+        let admitted = unsafe {
+            // SAFETY: The reactor or dispatch lease retains the volume for this native call.
+            ext4win_stream_begin_storage_submission(self.address.as_ptr()) != 0
+        };
+        #[cfg(test)]
+        let admitted = self.authorize().is_ok();
+        if !admitted {
+            return Err(DriverError::DeviceRemoved);
+        }
+        Ok(StorageSubmissionLease { access: self })
+    }
+
+    /// Observes the one native monotonic presence state.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the device or actor lease retains the native volume header during atomic observation"
+        )
+    )]
+    fn removal_state(self) -> u8 {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Native code observes only the volume's interlocked removal state.
+            ext4win_stream_storage_removal_state(self.address.as_ptr())
+        }
+        #[cfg(test)]
+        self.test_state().load(Ordering::Acquire)
+    }
+
+    /// Borrows the host atomic retained by the same device/stream lifetime as the native header.
+    #[cfg(test)]
+    #[expect(
+        unsafe_code,
+        reason = "private construction ties this pointer to the retained host stream atomic"
+    )]
+    fn test_state(&self) -> &AtomicU8 {
+        unsafe {
+            // SAFETY: Only StreamContext::storage_access constructs this host pointer.
+            self.address.cast::<AtomicU8>().as_ref()
+        }
+    }
+}
+
+/// Same-thread native resource acquisition consumed immediately after lower submission.
+/// This value must never be deferred or moved to another thread.
+#[derive(Debug)]
+pub(crate) struct StorageSubmissionLease {
+    /// Exact volume admission whose shared resource is held.
+    access: VolumeStorageAccess,
+}
+
+impl Drop for StorageSubmissionLease {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the same-thread lease balances its sole native shared-resource acquisition"
+        )
+    )]
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Construction acquired this resource on the current thread; no Send impl exists.
+            ext4win_stream_end_storage_submission(self.access.address.as_ptr());
+        }
+        #[cfg(test)]
+        let _access = self.access;
+    }
 }
 
 impl core::fmt::Debug for StreamContext {
@@ -342,6 +506,7 @@ impl StreamContext {
                 sizes: Mutex::new(sizes),
                 metadata: Mutex::new(metadata),
                 delete_pending: AtomicBool::new(false),
+                storage_removal: AtomicU8::new(0),
             })
         }
     }
@@ -352,7 +517,8 @@ impl StreamContext {
     ///
     /// `owner` must identify the pinned enclosing `FileControlBlock`, and `locks` must identify
     /// that owner's embedded `FILE_LOCK`. Both allocations must outlive this native stream and no
-    /// header may be published before this one-time call succeeds.
+    /// header may be published before this one-time call succeeds. `volume` must be its pinned
+    /// enclosing VCB's volume stream and must outlive this node stream, including section residency.
     /// # Errors
     ///
     /// Returns an invariant error if the native node stream is malformed or already bound.
@@ -362,7 +528,7 @@ impl StreamContext {
         locks: NonNull<wdk_sys::FILE_LOCK>,
         volume: &StreamContext,
     ) -> DriverResult<()> {
-        if self.kind != StreamOwnerKind::Node {
+        if self.kind != StreamOwnerKind::Node || volume.kind != StreamOwnerKind::Volume {
             return Err(DriverError::InternalInvariantViolation);
         }
         #[cfg(not(test))]
@@ -370,7 +536,10 @@ impl StreamContext {
             let status = unsafe {
                 // SAFETY: The caller establishes the pinned common lifetime documented above.
                 ext4win_stream_bind_node_owner(
-                    self.header.as_ptr(), owner.as_ptr(), locks.as_ptr(), volume.header.as_ptr(),
+                    self.header.as_ptr(),
+                    owner.as_ptr(),
+                    locks.as_ptr(),
+                    volume.header.as_ptr(),
                 )
             };
             native_status(status)
@@ -388,6 +557,41 @@ impl StreamContext {
                 .map(|_| ())
                 .map_err(|_| DriverError::InternalInvariantViolation)
         }
+    }
+
+    /// Captures storage authority from a pinned mounted volume. Every copy must be used only
+    /// while an actor/dispatch lease retains this native stream, and withdrawn before it drops.
+    /// # Safety
+    ///
+    /// The caller must retain this volume at its current address through every capability use.
+    /// # Errors
+    ///
+    /// Rejects node streams, which cannot grant volume-wide storage submission or revocation.
+    pub(crate) unsafe fn storage_access(&self) -> DriverResult<VolumeStorageAccess> {
+        if self.kind != StreamOwnerKind::Volume {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        #[cfg(not(test))]
+        let address = self.header;
+        #[cfg(test)]
+        let address = NonNull::from(&self.storage_removal).cast();
+        Ok(VolumeStorageAccess { address })
+    }
+
+    /// Captures removal publication separately from storage observation and submission.
+    /// # Safety
+    /// The caller must own the mounted device's PnP dispatch boundary and retain this volume
+    /// at its current address through every publication under dispatch rundown.
+    /// # Errors
+    /// Rejects a node stream, which has no volume-wide removal authority.
+    pub(crate) unsafe fn storage_removal_publisher(&self) -> DriverResult<StorageRemovalPublisher> {
+        let access = unsafe {
+            // SAFETY: The caller establishes the enclosing mounted-device lifetime above.
+            self.storage_access()
+        }?;
+        Ok(StorageRemovalPublisher {
+            address: access.address,
+        })
     }
 
     /// Binds one pinned VCB as the sole direct-volume stream owner.
@@ -1283,6 +1487,10 @@ unsafe extern "system" {
         owner: wdk_sys::PVOID,
         control_device: wdk_sys::PDEVICE_OBJECT,
     ) -> NTSTATUS;
+    fn ext4win_stream_remove_storage(volume_header: wdk_sys::PVOID, final_remove: u8);
+    fn ext4win_stream_storage_removal_state(volume_header: wdk_sys::PVOID) -> u8;
+    fn ext4win_stream_begin_storage_submission(volume_header: wdk_sys::PVOID) -> u8;
+    fn ext4win_stream_end_storage_submission(volume_header: wdk_sys::PVOID);
     fn ext4win_stream_volume_control_device(
         stream_header: wdk_sys::PVOID,
     ) -> wdk_sys::PDEVICE_OBJECT;
@@ -1405,6 +1613,50 @@ mod tests {
 
     use super::{NativeStreamMetadata, OperationalTrace, Ordering, StreamContext, StreamSizes};
     use crate::kernel::status::{DriverError, DriverResult};
+
+    /// # Errors
+    /// Returns stream allocation failure.
+    /// # Panics
+    /// Panics if terminal storage removal restores I/O or permits premature final retirement.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the local volume stream remains live and unmoved for every capability use"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture construction is fallible; assertions verify removal semantics"
+    )]
+    fn storage_removal_is_terminal_and_distinguishes_final_remove() -> DriverResult<()> {
+        let volume =
+            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let storage = unsafe {
+            // SAFETY: The volume remains live at this stack location until all accesses end.
+            volume.storage_access()
+        }?;
+        let publisher = unsafe {
+            // SAFETY: The fixture is the sole removal owner and retains its local volume.
+            volume.storage_removal_publisher()
+        }?;
+        assert_eq!(storage.authorize(), Ok(()));
+        drop(storage.acquire_submission()?);
+        publisher.publish(super::StorageRemovalNotification::Surprise);
+        assert_eq!(storage.authorize(), Err(DriverError::DeviceRemoved));
+        assert_eq!(
+            storage.acquire_submission().err(),
+            Some(DriverError::DeviceRemoved)
+        );
+        assert!(!storage.final_removal_received());
+        publisher.publish(super::StorageRemovalNotification::Final);
+        publisher.publish(super::StorageRemovalNotification::Surprise);
+        assert!(storage.final_removal_received());
+        assert_eq!(storage.authorize(), Err(DriverError::DeviceRemoved));
+        assert_eq!(
+            DriverError::DeviceRemoved.ntstatus(),
+            wdk_sys::STATUS_DEVICE_REMOVED
+        );
+        Ok(())
+    }
 
     /// # Panics
     ///

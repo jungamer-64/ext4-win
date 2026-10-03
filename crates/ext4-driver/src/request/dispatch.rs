@@ -101,6 +101,7 @@ pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallE
     table.set(DispatchMajor::SetEa, set_ea)?;
     table.set(DispatchMajor::LockControl, lock_control)?;
     table.set(DispatchMajor::Shutdown, shutdown)?;
+    table.set(DispatchMajor::PlugAndPlay, plug_and_play)?;
     table.set(DispatchMajor::QuerySecurity, query_security)?;
 
     table.set(DispatchMajor::Write, write)?;
@@ -396,6 +397,21 @@ unsafe extern "C" fn shutdown(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
     }
 }
 
+/// Handles storage PnP notifications in the original dispatch ownership scope.
+/// # Safety
+///
+/// The I/O Manager must retain this device and original PnP IRP throughout dispatch.
+#[expect(
+    unsafe_code,
+    reason = "the I/O Manager supplies live original PnP dispatch objects"
+)]
+unsafe extern "C" fn plug_and_play(device: PDEVICE_OBJECT, irp: PIRP) -> NTSTATUS {
+    unsafe {
+        // SAFETY: The I/O Manager invokes this for its active PnP request.
+        dispatch(device, irp, DispatchMajor::PlugAndPlay)
+    }
+}
+
 /// Dispatches one IRP through the unified completion-driven receive boundary.
 /// # Safety
 ///
@@ -462,6 +478,8 @@ fn dispatch_received(
 /// Immediate request semantics selected from both the device kind and IRP major function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ImmediateDispatch {
+    /// Device-scoped storage removal and original-IRP lower delegation.
+    PlugAndPlay,
     /// Transfer a direct-volume control IRP to its immutable lower storage route.
     ForwardVolumeControl,
     /// Establishes an uncontextualized handle to the secured control device.
@@ -508,10 +526,12 @@ const fn dispatch_policy(device_kind: DriverDeviceKind, major: DispatchMajor) ->
             | DispatchMajor::SetEa
             | DispatchMajor::LockControl
             | DispatchMajor::Shutdown
+            | DispatchMajor::PlugAndPlay
             | DispatchMajor::QuerySecurity
             | DispatchMajor::SetSecurity => DispatchPolicy::Immediate(ImmediateDispatch::Reject),
         },
         DriverDeviceKind::MountedVolume => match major {
+            DispatchMajor::PlugAndPlay => DispatchPolicy::Immediate(ImmediateDispatch::PlugAndPlay),
             DispatchMajor::DeviceControl => {
                 DispatchPolicy::Immediate(ImmediateDispatch::ForwardVolumeControl)
             }
@@ -539,6 +559,13 @@ const fn dispatch_policy(device_kind: DriverDeviceKind, major: DispatchMajor) ->
 
 /// Executes immediate control semantics, consuming the IRP by completion or lower delegation.
 fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> NTSTATUS {
+    if request == ImmediateDispatch::PlugAndPlay {
+        let minor = received.with_active(|active| Ok(active.current_stack()?.pnp_minor()));
+        return match minor {
+            Ok(minor) => crate::state::MountedVolumeDevice::dispatch_pnp(received, minor),
+            Err(error) => received.complete_result(Err(error)),
+        };
+    }
     if request == ImmediateDispatch::ForwardVolumeControl {
         let lower = received.with_active(|active| {
             let current = active.current_stack()?;
@@ -551,7 +578,7 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
             volume.control_device()
         });
         return match lower {
-            Ok(lower) => received.forward_device_control(lower),
+            Ok(lower) => crate::state::MountedVolumeDevice::forward_volume_control(received, lower),
             Err(error) => received.complete_result(Err(error)),
         };
     }
@@ -572,9 +599,9 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
                 Ok(IrpCompletion::EMPTY)
             })
         }
-        ImmediateDispatch::Reject | ImmediateDispatch::ForwardVolumeControl => {
-            Err(DriverError::InvalidDeviceRequest)
-        }
+        ImmediateDispatch::Reject
+        | ImmediateDispatch::ForwardVolumeControl
+        | ImmediateDispatch::PlugAndPlay => Err(DriverError::InvalidDeviceRequest),
     };
     received.complete_result(result)
 }
@@ -610,6 +637,14 @@ pub(crate) fn admit_owned(
     target: &mut ReactorTarget,
     trace: crate::kernel::operational_trace::OperationalTrace,
 ) -> Result<AdmittedOperation, AdmitOperationError> {
+    if !matches!(
+        owned.actor_request(),
+        ActorRequest::Cleanup | ActorRequest::Close
+    ) && let ReactorTarget::MountedVolume(_) = target
+        && let Err(error) = target.with_mounted_access(|access| access.authorize_storage())
+    {
+        return Err(AdmitOperationError::new(error, owned));
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum HandleRequestClass {
         Device,
@@ -627,6 +662,7 @@ pub(crate) fn admit_owned(
     }
 
     enum Admission {
+        Cleanup,
         Mdl(crate::irp::MdlTransfer),
         Mount(super::file_system_control::MountAdmission),
         Read(ReadRequestKind),
@@ -678,7 +714,7 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::SetVolumeInformation) => {
             Admission::Mutation(MutationRequestKind::SetVolumeInformation)
         }
-        ActorRequest::Cleanup => Admission::Mutation(MutationRequestKind::Cleanup),
+        ActorRequest::Cleanup => Admission::Cleanup,
         ActorRequest::Captured(PreparedRequest::FlushBuffers) => {
             Admission::Flush(FlushRequestKind::FlushBuffers)
         }
@@ -798,7 +834,7 @@ pub(crate) fn admit_owned(
         {
             HandleRequestClass::Paging
         }
-        Admission::Mutation(MutationRequestKind::Cleanup) => HandleRequestClass::Cleanup,
+        Admission::Cleanup => HandleRequestClass::Cleanup,
         Admission::Mutation(_) => HandleRequestClass::Ordinary,
         Admission::Flush(FlushRequestKind::FlushBuffers) => HandleRequestClass::FlushBuffers,
         Admission::Flush(FlushRequestKind::Shutdown) => HandleRequestClass::Device,
@@ -890,6 +926,7 @@ pub(crate) fn admit_owned(
     };
 
     let operation = match admission {
+        Admission::Cleanup => target.with_mounted_access(|_| super::operation::cleanup(owned)),
         Admission::Mdl(action) => {
             target.with_mounted_access(|access| super::operation::mdl(owned, action, access))
         }

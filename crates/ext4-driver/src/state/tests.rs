@@ -174,7 +174,8 @@ fn file_object_with_contexts(
 #[test]
 fn volume_open_flag_rejects_node_stream_context() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let mut handle = OpenedVolumeHandle::new(RawVolumeAccess::MetadataOnly);
     let mut file = file_object_with_contexts(
         fcb.stream_header().as_ptr(),
@@ -374,6 +375,55 @@ fn dismounted_volume_retires_only_after_all_file_objects_close() {
 }
 
 /// # Panics
+/// Panics if removed storage admits new namespace work or retires referenced streams.
+/// # Errors
+/// Returns an invalid-parameter error if the FILE_OBJECT fixture cannot be bound.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the local FILE_OBJECT remains live through the lifecycle assertions"
+)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture construction is fallible; assertions verify release and retirement"
+)]
+fn removed_volume_retains_cleanup_and_reference_retirement() -> Result<(), DriverError> {
+    let mut file = wdk_sys::FILE_OBJECT::default();
+    let owner = unsafe {
+        // SAFETY: This stack-local FILE_OBJECT outlives every identity use in this test.
+        KernelFileObject::from_raw(core::ptr::from_mut(&mut file))
+    }
+    .ok_or(DriverError::InvalidParameter)?;
+    let removed = MountedVolumeState::StorageRemoved;
+    assert_eq!(
+        removed.cleanup(owner),
+        (removed, VolumeHandleCleanup::Released)
+    );
+    assert_eq!(
+        removed.authorize_handle(owner),
+        Err(DriverError::DeviceRemoved)
+    );
+    assert_eq!(removed.authorize_create(), Err(DriverError::DeviceRemoved));
+    assert_eq!(
+        removed.retire_if_unreferenced(false, 0),
+        (removed, VolumeRetirement::Retained)
+    );
+    assert_eq!(
+        removed.retire_if_unreferenced(true, 1),
+        (removed, VolumeRetirement::Retained)
+    );
+    assert_eq!(
+        removed.retire_if_unreferenced(true, 0),
+        (MountedVolumeState::Retiring, VolumeRetirement::Start)
+    );
+    assert_eq!(
+        MountedVolumeState::Retiring.retire_if_unreferenced(true, 0),
+        (MountedVolumeState::Retiring, VolumeRetirement::Retained)
+    );
+    Ok(())
+}
+
+/// # Panics
 ///
 /// Panics if an extended extent changes access rights or uncertain write progress is lost.
 #[test]
@@ -520,7 +570,19 @@ fn with_active_file_object<R>(
 fn test_file_control_block(
     volume: NonNull<VolumeControlBlock>,
     node: NodeId,
-) -> Pin<Box<FileControlBlock>> {
+) -> (
+    Pin<Box<FileControlBlock>>,
+    Box<crate::kernel::stream::StreamContext>,
+) {
+    let volume_stream = crate::memory::boxed_try_with(|| {
+        crate::kernel::stream::StreamContext::try_new_volume(
+            crate::kernel::stream::StreamSizes::EMPTY,
+            crate::kernel::operational_trace::OperationalTrace::host_test(),
+        )
+    })
+    .unwrap_or_else(|_| {
+        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+    });
     let fcb = crate::memory::boxed_try_with(|| {
         FileControlBlock::try_new_staged(
             volume,
@@ -536,10 +598,12 @@ fn test_file_control_block(
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
     });
     let fcb = Box::into_pin(fcb);
-    fcb.as_ref().bind_stream_owner().unwrap_or_else(|_| {
-        KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-    });
-    fcb
+    fcb.as_ref()
+        .bind_stream_owner(&volume_stream)
+        .unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+    (fcb, volume_stream)
 }
 
 /// # Panics
@@ -780,7 +844,8 @@ fn unopened_object_without_contexts_is_invalid_parameter() {
 #[test]
 fn typed_opened_directory_exposes_cursor_without_option() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
         return;
@@ -810,7 +875,8 @@ fn typed_opened_directory_exposes_cursor_without_option() {
 )]
 fn oplock_control_accepts_the_exact_directory_stream() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let expected = NonNull::from(fcb.as_ref().get_ref());
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
@@ -869,7 +935,8 @@ fn oplock_control_accepts_the_exact_directory_stream() {
 )]
 fn opened_directory_reuses_a_stable_notification_name_descriptor() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
         return;
@@ -969,7 +1036,8 @@ fn hard_link_replacement_reports_modified_metadata_filters() {
 #[test]
 fn typed_opened_decoders_reject_wrong_node_kind() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
         return;
@@ -993,7 +1061,8 @@ fn typed_opened_decoders_reject_wrong_node_kind() {
 #[test]
 fn reparse_point_directory_handle_rejects_directory_operations() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) = directory_handle(OpenedNodeMode::ReparsePoint, DataTransferMode::Cached)
     else {
         return;
@@ -1095,7 +1164,8 @@ fn opened_object_preserves_data_transfer_mode() {
         buffer_alignment,
     };
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) =
         directory_handle(OpenedNodeMode::Direct, DataTransferMode::Direct(transfer))
     else {
@@ -1122,7 +1192,8 @@ fn opened_object_preserves_data_transfer_mode() {
 #[test]
 fn synchronous_opened_object_reads_sets_and_advances_position() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
         return;
@@ -1203,7 +1274,8 @@ fn regular_file_handle_retains_write_authority() {
 )]
 fn asynchronous_and_paging_io_do_not_advance_position() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
         return;
@@ -1261,7 +1333,8 @@ fn asynchronous_and_paging_io_do_not_advance_position() {
 #[test]
 fn file_position_and_native_lock_range_reject_signed_overflow() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
-    let fcb = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
+    let fcb = &fixture.0;
     let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
     else {
         return;
@@ -1434,6 +1507,10 @@ fn stream_lifetime_separates_handles_native_residency_and_deferred_leases() {
 )]
 fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Result<(), DriverError>
 {
+    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+        crate::kernel::stream::StreamSizes::EMPTY,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let stream = super::StagedNodeStreamMetadata {
         node: NodeId::Directory(DirectoryNodeId::ROOT),
@@ -1441,6 +1518,7 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
     };
     let fcb = ledger.staged_file_control_block(
         NonNull::dangling(),
+        &volume_stream,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
@@ -1487,6 +1565,10 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
     reason = "fixture failures use Result; assertions verify the paging stream boundary"
 )]
 fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<(), DriverError> {
+    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+        crate::kernel::stream::StreamSizes::EMPTY,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
     let stream = super::StagedNodeStreamMetadata {
@@ -1495,6 +1577,7 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
     };
     let fcb = ledger.staged_file_control_block(
         volume,
+        &volume_stream,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
@@ -1531,6 +1614,10 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
     reason = "fixture failures use Result; assertions verify deferred oplock stream residency"
 )]
 fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), DriverError> {
+    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+        crate::kernel::stream::StreamSizes::EMPTY,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
     let stream = super::StagedNodeStreamMetadata {
@@ -1539,6 +1626,7 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
     };
     let fcb = ledger.staged_file_control_block(
         volume,
+        &volume_stream,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
@@ -1578,6 +1666,10 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
     reason = "fixture failures use Result; assertions verify atomic oplock mutation admission"
 )]
 fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), DriverError> {
+    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+        crate::kernel::stream::StreamSizes::EMPTY,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
     let stream = super::StagedNodeStreamMetadata {
@@ -1586,6 +1678,7 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
     };
     let fcb = ledger.staged_file_control_block(
         volume,
+        &volume_stream,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
@@ -1614,6 +1707,7 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
 
     let reopened = ledger.staged_file_control_block(
         volume,
+        &volume_stream,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;
@@ -1643,6 +1737,10 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
     reason = "fixture failures use Result; assertions verify node-scoped parent oplock authority"
 )]
 fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> {
+    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+        crate::kernel::stream::StreamSizes::EMPTY,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let (absent_mutation, absent_stream) =
         ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
@@ -1654,6 +1752,7 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
     };
     let fcb = ledger.staged_file_control_block(
         NonNull::dangling(),
+        &volume_stream,
         stream,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
     )?;

@@ -12,6 +12,10 @@ pub(crate) struct CurrentIrpStackLocation<'owner> {
 }
 
 impl<'owner> CurrentIrpStackLocation<'owner> {
+    /// Decodes the device-scoped Plug and Play minor without requiring a FILE_OBJECT.
+    pub(crate) fn pnp_minor(self) -> PnpMinor {
+        PnpMinor::decode(self.raw_minor_function())
+    }
     /// Selects the Cache Manager MDL protocol before any byte-buffer capture.
     /// # Errors
     ///

@@ -369,6 +369,37 @@ impl DirectoryChangeNotifier {
             let _context = context;
         }
     }
+    /// Completes all pending directory watches when storage is removed. The notifier remains
+    /// initialized so later per-handle cleanup is idempotent and final teardown can join it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the pinned VCB retains FsRtl synchronization while the sole actor withdraws its watches"
+        )
+    )]
+    #[cfg(not(test))]
+    pub(super) fn cleanup_all(&self) {
+        #[cfg(not(test))]
+        {
+            if !self.initialized {
+                return;
+            }
+            let native = self.native.get();
+            let sync = unsafe {
+                // SAFETY: Initialization populated the VCB-owned synchronization object.
+                (*native).sync
+            };
+            let list_head = unsafe {
+                // SAFETY: The pinned VCB owns this list; FsRtl synchronizes native links.
+                core::ptr::addr_of_mut!((*native).list_head)
+            };
+            unsafe {
+                // SAFETY: No actor-owned registration can race this volume-wide withdrawal.
+                ffi::FsRtlNotifyCleanupAll(sync, list_head);
+            }
+        }
+    }
 }
 
 impl Drop for DirectoryChangeNotifier {
@@ -385,22 +416,8 @@ impl Drop for DirectoryChangeNotifier {
             if !self.initialized {
                 return;
             }
+            self.cleanup_all();
             let native = self.native.get();
-            let sync = unsafe {
-                // SAFETY: `initialized` guarantees FsRtl populated this
-                // mounted VCB's synchronization pointer.
-                (*native).sync
-            };
-            let list_head = unsafe {
-                // SAFETY: This final VCB teardown still owns the stable list
-                // head and no new request can be accepted during destruction.
-                core::ptr::addr_of_mut!((*native).list_head)
-            };
-            unsafe {
-                // SAFETY: FsRtl completes and frees every remaining opaque
-                // notification record before its synchronization object dies.
-                ffi::FsRtlNotifyCleanupAll(sync, list_head);
-            }
             let sync_slot = unsafe {
                 // SAFETY: The initialized sync pointer is stored in this
                 // unique mutable VCB teardown path.

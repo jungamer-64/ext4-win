@@ -876,6 +876,33 @@ pub(crate) enum ReactorTarget {
 }
 
 impl ReactorTarget {
+    /// Captures a same-thread mounted storage submission permit; mounts have no published
+    /// volume gate yet and retain their existing control-device lower ownership protocol.
+    /// # Errors
+    ///
+    /// Returns device removed once a mounted volume has lost storage authority.
+    #[cfg(not(test))]
+    fn acquire_storage_submission(
+        &mut self,
+    ) -> DriverResult<Option<crate::kernel::stream::StorageSubmissionLease>> {
+        match self {
+            Self::ControlDevice => Ok(None),
+            Self::MountedVolume(binding) => binding
+                .with_access(|access| access.acquire_storage_submission())
+                .map(Some),
+        }
+    }
+
+    /// Applies a terminal dispatch observation without performing native writeback on the actor.
+    #[cfg(not(test))]
+    fn observe_storage_removal(&mut self) -> Option<VolumeRetirement> {
+        match self {
+            Self::ControlDevice => None,
+            Self::MountedVolume(binding) => {
+                binding.with_access(|access| access.observe_storage_removal())
+            }
+        }
+    }
     /// Confirms that an operation belongs to the control-device shell.
     pub(crate) fn require_control_device(&self) {
         if !matches!(self, Self::ControlDevice) {
@@ -985,6 +1012,11 @@ pub(crate) struct CompletionReactor {
 }
 
 impl CompletionReactor {
+    /// Wakes the actor after native storage revocation; the native gate carries the state, so
+    /// this notification has no allocation, separate flag authority, or cancellation outcome.
+    pub(crate) fn storage_removal_published(&self) {
+        self.wake();
+    }
     /// Returns the checked reactor lifecycle.
     fn state(&self) -> ReactorState {
         ReactorState::from_raw(self.lifecycle.load(Ordering::Acquire)).unwrap_or_else(|| {
@@ -2132,6 +2164,16 @@ impl CompletionReactor {
     fn run(&self) {
         loop {
             let mut progressed = false;
+            if let Some(retirement) = self.with_target(ReactorTarget::observe_storage_removal) {
+                MountedVolumeDevice::unregister_shutdown_notification(self.device);
+                progressed |= self.cancel_active_for_drain();
+                self.grant_available_commit();
+                self.grant_all_available_waits();
+                if retirement == VolumeRetirement::Start {
+                    MountedVolumeDevice::schedule_retirement(self.device);
+                    progressed = true;
+                }
+            }
             if self.state() == ReactorState::Draining {
                 self.with_scheduler(Scheduler::begin_drain);
                 progressed |= self.cancel_active_for_drain();
@@ -2708,6 +2750,16 @@ impl CompletionReactor {
         work: crate::irp::PassiveWork,
         suspended: SuspendedOperation,
     ) {
+        if !matches!(work, crate::irp::PassiveWork::Uninitialize { .. })
+            && let Err(error) = self.with_mounted_access(|access| access.authorize_storage())
+        {
+            self.set_ready_operation_event(
+                index,
+                suspended,
+                CompletionEvent::PassiveCompleted(work.failed(error)),
+            );
+            return;
+        }
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
@@ -2957,6 +3009,14 @@ impl CompletionReactor {
         index: usize,
         prepared: PreparedStorageCommand<ScheduledStorageOperation>,
     ) {
+        let _submission = match self.with_target(ReactorTarget::acquire_storage_submission) {
+            Ok(permit) => permit,
+            Err(error) => {
+                let (scheduled, request) = prepared.into_command().into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
+                return;
+            }
+        };
         let cancellation = prepared.suspended().cancellation;
         if cancellation == EffectCancellation::AbortBeforeEffect
             && prepared.is_effect_bearing()

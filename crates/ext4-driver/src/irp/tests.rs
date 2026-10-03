@@ -2798,3 +2798,28 @@ fn normalized_names_retain_create_time_traversal_authority() {
         Ok(())
     );
 }
+
+/// # Panics
+/// Panics if device-scoped PnP requires a FILE_OBJECT or loses documented minor semantics.
+#[test]
+fn pnp_minors_decode_without_a_file_object() {
+    for (raw, expected, seeds_success) in [
+        (1, super::PnpMinor::QueryRemove, false),
+        (2, super::PnpMinor::Remove, true),
+        (3, super::PnpMinor::CancelRemove, true),
+        (0x17, super::PnpMinor::SurpriseRemoval, true),
+        (0, super::PnpMinor::Other, false),
+    ] {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MajorFunction: 0x1B,
+            MinorFunction: raw,
+            ..Default::default()
+        };
+        assert!(stack.FileObject.is_null());
+        assert_eq!(
+            current_stack_fixture(&mut stack).map(|current| current.pnp_minor()),
+            Ok(expected)
+        );
+        assert_eq!(expected.initializes_success(), seeds_success);
+    }
+}

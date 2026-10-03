@@ -4,6 +4,7 @@
 #define assert(condition) do { if (!(condition)) { __builtin_trap(); } } while (0)
 
 #define _IRQL_requires_max_(level)
+#define _IRQL_requires_(level)
 #define _When_(condition, annotation)
 #define _Requires_lock_held_(lock)
 #define _Releases_lock_(lock)
@@ -14,6 +15,7 @@
 
 typedef int BOOLEAN;
 typedef void VOID;
+typedef long LONG;
 typedef struct {
     unsigned held;
 } ERESOURCE, *PERESOURCE;
@@ -57,6 +59,21 @@ static VOID ExReleaseResourceLite(PERESOURCE resource)
 }
 
 #include "executive_resource.h"
+
+static LONG InterlockedCompareExchange(volatile LONG *target, LONG replacement, LONG expected)
+{
+    LONG previous = *target;
+    if (previous == expected) { *target = replacement; }
+    return previous;
+}
+static LONG InterlockedExchange(volatile LONG *target, LONG replacement)
+{
+    LONG previous = *target;
+    *target = replacement;
+    return previous;
+}
+
+#include "storage_admission.h"
 
 int main(void)
 {
@@ -103,5 +120,42 @@ int main(void)
         assert(apc_depth == 1 && main_resource.held == 0);
     }
     assert(acquisitions == 20 && releases == 14);
+    {
+        EXT4WIN_STORAGE_ADMISSION storage;
+        storage.Submissions.held = 0;
+        storage.RemovalState = 0;
+        apc_depth = 2;
+        expected_wait = FALSE;
+        acquisition_succeeds = FALSE;
+        assert(!ext4win_storage_begin_submission(&storage));
+        assert(apc_depth == 2 && storage.Submissions.held == 0);
+        assert(ext4win_storage_removal_state(&storage) == 0);
+        acquisition_succeeds = TRUE;
+        assert(ext4win_storage_begin_submission(&storage));
+        assert(apc_depth == 3 && storage.Submissions.held == 1);
+        ext4win_storage_end_submission(&storage);
+        assert(apc_depth == 2 && storage.Submissions.held == 0);
+        expected_wait = TRUE;
+        ext4win_storage_remove(&storage, FALSE);
+        assert(ext4win_storage_removal_state(&storage) == 1);
+        assert(apc_depth == 2 && storage.Submissions.held == 0);
+        expected_wait = FALSE;
+        assert(!ext4win_storage_begin_submission(&storage));
+        assert(apc_depth == 2 && storage.Submissions.held == 0);
+        expected_wait = TRUE;
+        ext4win_storage_remove(&storage, TRUE);
+        ext4win_storage_remove(&storage, FALSE);
+        assert(ext4win_storage_removal_state(&storage) == 2);
+        expected_wait = FALSE;
+        assert(!ext4win_storage_begin_submission(&storage));
+        assert(apc_depth == 2 && storage.Submissions.held == 0);
+        storage.RemovalState = 0;
+        expected_wait = TRUE;
+        ext4win_storage_remove(&storage, TRUE);
+        assert(ext4win_storage_removal_state(&storage) == 2);
+        expected_wait = FALSE;
+        assert(!ext4win_storage_begin_submission(&storage));
+        assert(apc_depth == 2 && storage.Submissions.held == 0);
+    }
     return 0;
 }

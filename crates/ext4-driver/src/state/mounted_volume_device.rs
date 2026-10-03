@@ -30,6 +30,14 @@ pub(crate) struct MountedVolumeDeviceExtension {
     header: DeviceExtensionHeader,
     /// Mount-preallocated work item that performs actor-safe physical retirement.
     retirement_work_item: wdk_sys::PIO_WORKITEM,
+    /// Captured before actor publication; usable only under the header's live dispatch lease.
+    storage: crate::kernel::stream::VolumeStorageAccess,
+    /// PnP-only publication authority; storage workers retain only the narrower access view.
+    removal: crate::kernel::stream::StorageRemovalPublisher,
+    /// Immutable lower route used by device-scoped PnP requests without a FILE_OBJECT.
+    lower: KernelDevice,
+    /// Sole shutdown-notification ownership, consumed once by dismount or removal.
+    shutdown_registered: AtomicU8,
 }
 
 /// Mounted volume device object produced by a successful mount FSCTL.
@@ -110,16 +118,51 @@ impl MountedVolumeDevice {
             device.as_ptr().as_mut()
         }
         .ok_or(DriverError::InvalidParameter)?;
-        let extension = unsafe {
-            // SAFETY: The device was created with a DeviceExtension sized for
-            // MountedVolumeDeviceExtension by this driver.
+        let extension_pointer = NonNull::new(
             device_object
                 .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>()
-                .as_mut()
-        }
+                .cast::<MountedVolumeDeviceExtension>(),
+        )
         .ok_or(DriverError::InvalidParameter)?;
+        let storage = unsafe {
+            // SAFETY: The pinned VCB outlives every reactor/dispatch lease on this extension.
+            vcb.stream_context.storage_access()?
+        };
+        let removal = unsafe {
+            // SAFETY: This mount installs the sole PnP publisher under device dispatch rundown.
+            vcb.stream_context.storage_removal_publisher()?
+        };
+        let lower = vcb.runtime.storage().filesystem_control_device();
+        let storage_slot = unsafe {
+            // SAFETY: The unborrowed extension allocation has the exact mounted-extension layout.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).storage)
+        };
+        unsafe {
+            // SAFETY: This initializes previously uninitialized non-null capability storage.
+            storage_slot.write(storage);
+        }
+        let lower_slot = unsafe {
+            // SAFETY: The mounted-extension allocation contains this lower route field.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).lower)
+        };
+        unsafe {
+            // SAFETY: The captured retained route initializes this non-null field before borrowing.
+            lower_slot.write(lower);
+        }
+        let removal_slot = unsafe {
+            // SAFETY: The mounted allocation contains this uninitialized publisher field.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).removal)
+        };
+        unsafe {
+            // SAFETY: Initialize the publisher before borrowing any typed extension value.
+            removal_slot.write(removal);
+        }
+        let extension = unsafe {
+            // SAFETY: The I/O Manager zeroed extension storage; all non-null fields are now valid.
+            &mut *extension_pointer.as_ptr()
+        };
         extension.retirement_work_item = core::ptr::null_mut();
+        extension.shutdown_registered = AtomicU8::new(0);
         let vpb = unsafe {
             // SAFETY: The VPB was supplied by the I/O Manager for this mount
             // request and is writable during successful mount completion.
@@ -147,6 +190,7 @@ impl MountedVolumeDevice {
             }
             return Err(error);
         }
+        extension.shutdown_registered.store(1, Ordering::Release);
         #[cfg(not(test))]
         let retirement_work_item = unsafe {
             // SAFETY: The new mounted device remains live and unpublished during allocation.
@@ -221,9 +265,7 @@ impl MountedVolumeDevice {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
         let vcb = binding.into_volume();
-        if !vcb.is_logically_dismounted() {
-            Self::unregister_shutdown_notification(device);
-        }
+        Self::unregister_shutdown_notification(device);
         Self::detach_vpb(device);
         drop(vcb);
     }
@@ -357,14 +399,24 @@ impl MountedVolumeDevice {
     }
 
     /// Stops shutdown IRP delivery after this volume has logically dismounted.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-        )
+    #[expect(
+        unsafe_code,
+        reason = "the mounted lifecycle owner retains the device and initialized extension through shutdown release"
     )]
     pub(crate) fn unregister_shutdown_notification(device: KernelDevice) {
+        let device_object = unsafe {
+            // SAFETY: The mounted lifecycle owner retains this live DEVICE_OBJECT.
+            &*device.as_ptr()
+        };
+        let extension = unsafe {
+            // SAFETY: The live mounted device owns its initialized extension throughout this call.
+            &*device_object
+                .DeviceExtension
+                .cast::<MountedVolumeDeviceExtension>()
+        };
+        if extension.shutdown_registered.swap(0, Ordering::AcqRel) == 0 {
+            return;
+        }
         #[cfg(not(test))]
         unsafe {
             // SAFETY: Successful mount registered this live mounted device exactly once, and the
@@ -373,6 +425,87 @@ impl MountedVolumeDevice {
         }
         #[cfg(test)]
         let _device = device;
+    }
+
+    /// Forwards a PnP IRP while mounted state remains retained by dispatch rundown. Terminal
+    /// notifications revoke shared stream/storage admission before handing the original IRP to
+    /// the lower stack. No actor work item, IRP replacement, or completion allocation is required.
+    #[expect(
+        unsafe_code,
+        reason = "the received IRP retains its mounted device and initialized extension through dispatch rundown"
+    )]
+    pub(crate) fn dispatch_pnp(
+        received: ReceivedIrp,
+        minor: crate::irp::PnpMinor,
+    ) -> wdk_sys::NTSTATUS {
+        let device = received.device();
+        let device_object = unsafe {
+            // SAFETY: The received IRP retains this driver's mounted DEVICE_OBJECT.
+            &*device.as_ptr()
+        };
+        let extension = unsafe {
+            // SAFETY: Dispatch classified this driver's live mounted-volume device.
+            &*device_object
+                .DeviceExtension
+                .cast::<MountedVolumeDeviceExtension>()
+        };
+        match extension
+            .header
+            .with_reactor(received, |received, reactor| {
+                match minor {
+                    crate::irp::PnpMinor::QueryRemove => {
+                        return received.complete_result(Err(DriverError::DeviceBusy));
+                    }
+                    crate::irp::PnpMinor::SurpriseRemoval | crate::irp::PnpMinor::Remove => {
+                        let notification = if minor == crate::irp::PnpMinor::Remove {
+                            crate::kernel::stream::StorageRemovalNotification::Final
+                        } else {
+                            crate::kernel::stream::StorageRemovalNotification::Surprise
+                        };
+                        extension.removal.publish(notification);
+                        reactor.storage_removal_published();
+                    }
+                    crate::irp::PnpMinor::CancelRemove | crate::irp::PnpMinor::Other => {}
+                }
+                received.forward_pnp(extension.lower, minor)
+            }) {
+            Ok(status) => status,
+            Err(received) => received.complete_result(Err(DriverError::DeviceRemoved)),
+        }
+    }
+
+    /// Delegates an original volume IOCTL under dispatch lifetime and storage admission. The
+    /// submission resource is released when IoCallDriver returns, including STATUS_PENDING.
+    #[expect(
+        unsafe_code,
+        reason = "the received mounted-device IRP retains this initialized extension"
+    )]
+    pub(crate) fn forward_volume_control(
+        received: ReceivedIrp,
+        lower: KernelDevice,
+    ) -> wdk_sys::NTSTATUS {
+        let device = received.device();
+        let device_object = unsafe {
+            // SAFETY: The received IRP retains this driver's mounted DEVICE_OBJECT.
+            &*device.as_ptr()
+        };
+        let extension = unsafe {
+            // SAFETY: Dispatch classified the driver's live mounted-volume extension.
+            &*device_object
+                .DeviceExtension
+                .cast::<MountedVolumeDeviceExtension>()
+        };
+        match extension
+            .header
+            .with_reactor(received, |received, _reactor| {
+                match extension.storage.acquire_submission() {
+                    Ok(_submission) => received.forward_device_control(lower),
+                    Err(error) => received.complete_result(Err(error)),
+                }
+            }) {
+            Ok(status) => status,
+            Err(received) => received.complete_result(Err(DriverError::DeviceRemoved)),
+        }
     }
 
     /// Notifies FsRtl that this lower storage volume completed a dismount request.

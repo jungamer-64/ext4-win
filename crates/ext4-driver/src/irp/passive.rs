@@ -37,6 +37,9 @@ use super::scheduler::SlotId;
 pub(crate) enum PassiveWork {
     /// Read sector geometry without blocking the actor or retaining its mounted-state borrow.
     SectorSize {
+        /// Borrowed native admission; the suspended mounted operation and worker rundown
+        /// retain its VCB until completion.
+        storage: crate::kernel::stream::VolumeStorageAccess,
         /// Referenced VPB real device released when this work finishes or fails before queueing.
         query: crate::kernel::storage::SectorSizeQuery,
         /// Mount-owned logical unit that the native result must agree with.
@@ -218,8 +221,15 @@ impl PassiveWork {
     /// Executes the sole native call selected before the actor suspended.
     pub(super) fn execute(self) -> PassiveWorkCompletion {
         match self {
-            Self::SectorSize { query, logical } => {
-                PassiveWorkCompletion::SectorSize(query.execute(logical))
+            Self::SectorSize {
+                query,
+                logical,
+                storage,
+            } => {
+                let result = storage.authorize().and_then(|()| query.execute(logical));
+                PassiveWorkCompletion::SectorSize(
+                    result.and_then(|information| storage.authorize().map(|()| information)),
+                )
             }
             Self::Mdl {
                 file_object,

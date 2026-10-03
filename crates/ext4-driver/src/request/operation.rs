@@ -13,9 +13,9 @@ use ext4_core::{
 use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
-    CLEANUP_HANDLE_BARRIER, CLOSE_HANDLE_BARRIER, CompletionEvent, CompletionOperation,
-    ControlDeviceOperation, InfalliblePublication, IntentRequest, MountedVolumeOperation,
-    OperationTransition, PublicationAuthority, ReactorTarget, WaitCondition,
+    CLOSE_HANDLE_BARRIER, CompletionEvent, CompletionOperation, ControlDeviceOperation,
+    InfalliblePublication, IntentRequest, MountedVolumeOperation, OperationTransition,
+    PublicationAuthority, ReactorTarget, WaitCondition,
 };
 use crate::irp::{
     AtomicOplockReservation, CreateCompletion, IrpCompletion, NamespaceOplockPlan,
@@ -81,6 +81,8 @@ mod directory;
 pub(crate) use directory::query_directory;
 mod mdl;
 pub(crate) use mdl::mdl;
+mod cleanup;
+pub(crate) use cleanup::cleanup;
 
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]
@@ -3876,25 +3878,7 @@ impl MutationRequestOperation {
                 | MutationRequestKind::AddEncryptionKey
                 | MutationRequestKind::RemoveEncryptionKey,
             ) => false,
-            PreparedMutationRequest::Other(MutationRequestKind::CleanupDeletion) => {
-                return owned.request().with_active(|active| {
-                    let file_object = active.current_stack()?.file_object()?;
-                    match crate::state::OpenedFileObject::decode(file_object)? {
-                        crate::state::OpenedFileObject::Node(opened) => {
-                            let deletion = opened.create_deletion();
-                            access
-                                .acquire_oplock_mutation(file_object)
-                                .map(|(mutation, stream)| {
-                                    Some(PreparedMutationOplock {
-                                        check: OplockCheck::cleanup(stream, deletion),
-                                        mutation,
-                                    })
-                                })
-                        }
-                        crate::state::OpenedFileObject::Volume(_) => Ok(None),
-                    }
-                });
-            }
+            PreparedMutationRequest::Other(MutationRequestKind::CleanupDeletion) => false,
             PreparedMutationRequest::Other(MutationRequestKind::Write) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
@@ -3925,7 +3909,7 @@ impl MutationRequestOperation {
         mut owned: OwnedIrp,
         kind: MutationRequestKind,
         access: &mut MountedVolumeAccess<'_>,
-    ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    ) -> Result<Box<Self>, AdmitOperationError> {
         let request = match PreparedMutationRequest::prepare(kind, &mut owned, access) {
             Ok(request) => request,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
@@ -5360,47 +5344,43 @@ impl MutationRequestOperation {
                 if matches!(event, OperationEvent::Admitted)
                     && size_changes.is_none()
                     && deletion.is_none()
+                    && let PreparedMutationRequest::DataWrite(authority) = &self.request
                 {
-                    if let PreparedMutationRequest::DataWrite(authority) = &self.request {
-                        let plan = match crate::request::file_info::prepare_write_cache_plan(
-                            owned.request(),
-                            authority,
-                            access,
-                        ) {
-                            Ok(plan) => plan,
-                            Err(error) => {
-                                return MutationStep::Transition(self.complete_error(owned, error));
-                            }
-                        };
-                        match plan {
-                            crate::request::file_info::WriteCachePlan::Cached {
-                                work,
-                                publication,
-                            } => {
-                                self.state =
-                                    MutationOperationState::CacheWriting { owned, publication };
-                                return MutationStep::Transition(
-                                    OperationTransition::SubmitPassiveWork {
-                                        work,
-                                        suspended: self,
-                                    },
-                                );
-                            }
-                            crate::request::file_info::WriteCachePlan::PurgeBeforeDirect(work) => {
-                                self.state = MutationOperationState::CachePurging {
-                                    owned,
-                                    epoch,
-                                    resolve,
-                                };
-                                return MutationStep::Transition(
-                                    OperationTransition::SubmitPassiveWork {
-                                        work,
-                                        suspended: self,
-                                    },
-                                );
-                            }
-                            crate::request::file_info::WriteCachePlan::Direct => {}
+                    let plan = match crate::request::file_info::prepare_write_cache_plan(
+                        owned.request(),
+                        authority,
+                        access,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
                         }
+                    };
+                    match plan {
+                        crate::request::file_info::WriteCachePlan::Cached { work, publication } => {
+                            self.state =
+                                MutationOperationState::CacheWriting { owned, publication };
+                            return MutationStep::Transition(
+                                OperationTransition::SubmitPassiveWork {
+                                    work,
+                                    suspended: self,
+                                },
+                            );
+                        }
+                        crate::request::file_info::WriteCachePlan::PurgeBeforeDirect(work) => {
+                            self.state = MutationOperationState::CachePurging {
+                                owned,
+                                epoch,
+                                resolve,
+                            };
+                            return MutationStep::Transition(
+                                OperationTransition::SubmitPassiveWork {
+                                    work,
+                                    suspended: self,
+                                },
+                            );
+                        }
+                        crate::request::file_info::WriteCachePlan::Direct => {}
                     }
                 }
                 MutationStep::Resolve {
@@ -5416,8 +5396,7 @@ impl MutationRequestOperation {
                 }
             }
             MutationOperationState::CacheWriting { .. }
-            | MutationOperationState::CachePurging { .. }
- => {
+            | MutationOperationState::CachePurging { .. } => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
@@ -5815,7 +5794,6 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 | MutationOperationState::PreparingWriteOpen { .. }
                 | MutationOperationState::CacheWriting { .. }
                 | MutationOperationState::CachePurging { .. }
-    
                 | MutationOperationState::AwaitingVisibility { .. }
                 | MutationOperationState::PublishingDurable { .. }
                 | MutationOperationState::AwaitingCheckpoint(_)
@@ -5842,7 +5820,6 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
-
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
@@ -5936,7 +5913,6 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
-
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
@@ -6075,6 +6051,7 @@ pub(crate) fn mutation(
     access: &mut MountedVolumeAccess<'_>,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
     MutationRequestOperation::try_new(owned, kind, access)
+        .map(|operation| -> Box<dyn CompletionOperation> { operation })
 }
 
 /// Allocates one concrete durability-barrier and lower-flush operation.

@@ -58,6 +58,8 @@ pub(crate) enum DriverError {
     CannotDelete,
     /// The mounted volume has entered its terminal logical dismount state.
     VolumeDismounted,
+    /// PnP revoked access to the mounted storage; remounting this instance is forbidden.
+    DeviceRemoved,
     /// The caller does not own a volume lock that can be released.
     NotLocked,
     /// Caller output buffer cannot hold the required fixed payload.
@@ -145,6 +147,7 @@ impl DriverError {
             Self::RawOutcomeUncertain => STATUS_DEVICE_DATA_ERROR,
             Self::CannotDelete => STATUS_CANNOT_DELETE,
             Self::VolumeDismounted => ntstatus(0xC000_026E),
+            Self::DeviceRemoved => ntstatus(0xC000_02B6),
             Self::NotLocked => ntstatus(0xC000_002A),
             Self::BufferTooSmall => STATUS_BUFFER_TOO_SMALL,
             Self::InfoLengthMismatch => ntstatus(0xC000_0004),

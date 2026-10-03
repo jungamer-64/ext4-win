@@ -39,6 +39,8 @@ pub(crate) enum DispatchMajor {
     LockControl,
     /// Shutdown notification.
     Shutdown,
+    /// Storage Plug and Play notification.
+    PlugAndPlay,
     /// Security descriptor query.
     QuerySecurity,
     /// Security descriptor mutation.
@@ -68,6 +70,7 @@ impl DispatchMajor {
             Self::Cleanup => 0x12,
             Self::QuerySecurity => 0x14,
             Self::SetSecurity => 0x15,
+            Self::PlugAndPlay => 0x1B,
         }
     }
 }

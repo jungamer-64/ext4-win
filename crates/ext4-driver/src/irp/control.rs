@@ -2,6 +2,43 @@
 
 use super::*;
 
+/// PnP minor contracts that affect mounted-storage lifetime. Unknown minors retain the lower
+/// stack's existing status and payload; these notifications carry no file-handle authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PnpMinor {
+    /// Reject a removal attempt whose durable, drained endpoint cannot be guaranteed.
+    QueryRemove,
+    /// A vetoed removal attempt is cancelled.
+    CancelRemove,
+    /// Storage is no longer accessible; final deletion follows separately.
+    SurpriseRemoval,
+    /// Lower-stack removal permits physical retirement after all stream leases close.
+    Remove,
+    /// Payload and status belong exclusively to lower drivers.
+    Other,
+}
+
+impl PnpMinor {
+    /// Decodes WDM PnP minors without interpreting an unknown minor's parameters.
+    pub(crate) const fn decode(raw: u8) -> Self {
+        match raw {
+            1 => Self::QueryRemove,
+            2 => Self::Remove,
+            3 => Self::CancelRemove,
+            0x17 => Self::SurpriseRemoval,
+            _ => Self::Other,
+        }
+    }
+
+    /// Minors requiring this filesystem to seed STATUS_SUCCESS before lower delegation.
+    pub(crate) const fn initializes_success(self) -> bool {
+        matches!(
+            self,
+            Self::CancelRemove | Self::SurpriseRemoval | Self::Remove
+        )
+    }
+}
+
 /// Cache Manager MDL acquisition and release are distinct consuming operations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]

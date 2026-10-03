@@ -194,6 +194,7 @@ fn prepare_query(
         })?;
         return Ok(VolumeQueryPlan::SectorSize {
             work: PassiveWork::SectorSize {
+                storage: operations.storage_access(),
                 query,
                 logical: sector,
             },

@@ -95,7 +95,8 @@ impl FileControlBlock {
         })
     }
 
-    /// Binds the native header after the ledger candidate has been pinned at its final address.
+    /// Binds the pinned native header to the owning volume stream. The VCB retains this stream
+    /// until its ledger has destroyed every FCB and native-residency lease.
     /// # Errors
     ///
     /// Returns an invariant error on repeated binding or malformed native ownership.
@@ -103,7 +104,7 @@ impl FileControlBlock {
         unsafe_code,
         reason = "Pin and private construction establish the native FCB and FILE_LOCK lifetime"
     )]
-    pub(super) fn bind_stream_owner(self: Pin<&Self>) -> DriverResult<()> {
+    pub(super) fn bind_stream_owner(self: Pin<&Self>, volume: &StreamContext) -> DriverResult<()> {
         let fcb = self.get_ref();
         unsafe {
             // SAFETY: `PhantomPinned` prevents safe relocation after this call. Field declaration
@@ -111,6 +112,7 @@ impl FileControlBlock {
             fcb.stream_context.bind_node_owner(
                 NonNull::from(fcb).cast::<c_void>(),
                 fcb.byte_range_locks.native_pointer(),
+                volume,
             )
         }
     }

@@ -77,6 +77,8 @@ pub(super) enum MountedVolumeState {
         /// Prior volume-lock owner retained only for late cleanup accounting.
         lock_owner: Option<KernelFileObject>,
     },
+    /// PnP revoked all data authority; only handle release and final removal remain legal.
+    StorageRemoved,
     /// Last FILE_OBJECT closed and the preallocated retirement work item owns teardown.
     Retiring,
 }
@@ -98,6 +100,7 @@ impl MountedVolumeState {
     pub(super) fn begin_lock(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
             Self::Mounted => Ok(Self::Locking { owner }),
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
             Self::Closing { .. }
             | Self::Dismounted { .. }
@@ -128,6 +131,7 @@ impl MountedVolumeState {
     /// Returns not locked when `owner` does not own the current lock.
     pub(super) fn unlock(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Locked {
                 owner: current_owner,
             } if current_owner == owner => Ok(Self::Mounted),
@@ -160,6 +164,7 @@ impl MountedVolumeState {
     /// Returns access denied for another lock owner or volume dismounted after terminal dismount.
     pub(super) fn begin_dismount(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(Self::Closing {
                 terminal: CleanCloseTerminal::Dismount,
                 lock_owner: None,
@@ -184,6 +189,7 @@ impl MountedVolumeState {
     /// Returns volume dismounted once any terminal close has already begun.
     fn begin_shutdown(self) -> DriverResult<Self> {
         match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(Self::Closing {
                 terminal: CleanCloseTerminal::Shutdown,
                 lock_owner: None,
@@ -221,6 +227,7 @@ impl MountedVolumeState {
     /// Applies implicit lock release when the owning FILE_OBJECT is cleaned up.
     pub(super) fn cleanup(self, owner: KernelFileObject) -> (Self, VolumeHandleCleanup) {
         match self {
+            Self::StorageRemoved => (self, VolumeHandleCleanup::Released),
             Self::Locking { owner: current } if current == owner => {
                 (Self::Mounted, VolumeHandleCleanup::Released)
             }
@@ -266,18 +273,22 @@ impl MountedVolumeState {
         volume_file_objects: u32,
     ) -> (Self, VolumeRetirement) {
         match self {
+            Self::StorageRemoved if namespace_empty && volume_file_objects == 0 => {
+                (Self::Retiring, VolumeRetirement::Start)
+            }
             Self::Dismounted { lock_owner: None }
                 if namespace_empty && volume_file_objects == 0 =>
             {
                 (Self::Retiring, VolumeRetirement::Start)
             }
-            Self::Retiring => KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
+            Self::Retiring => (self, VolumeRetirement::Retained),
             Self::Mounted
             | Self::Locking { .. }
             | Self::Locked { .. }
             | Self::Closing { .. }
             | Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. } => (self, VolumeRetirement::Retained),
+            | Self::ShutdownComplete { .. }
+            | Self::StorageRemoved => (self, VolumeRetirement::Retained),
         }
     }
 
@@ -287,6 +298,7 @@ impl MountedVolumeState {
     /// Returns volume dismounted after the terminal transition.
     pub(super) fn ensure_mounted(self) -> DriverResult<()> {
         match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted | Self::Locking { .. } | Self::Locked { .. } | Self::Closing { .. } => {
                 Ok(())
             }
@@ -302,6 +314,7 @@ impl MountedVolumeState {
     /// Returns access denied while locked or volume dismounted after terminal dismount.
     pub(super) fn authorize_create(self) -> DriverResult<()> {
         match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(()),
             Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
             Self::Closing { .. } => Err(DriverError::AccessDenied),
@@ -317,6 +330,7 @@ impl MountedVolumeState {
     /// Returns access denied for a competing lock owner or volume dismounted after dismount.
     pub(super) fn authorize_handle(self, file_object: KernelFileObject) -> DriverResult<()> {
         match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(()),
             Self::Locked { owner } if owner == file_object => Ok(()),
             Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
@@ -338,6 +352,7 @@ impl MountedVolumeState {
         kind: RawVolumeOperationKind,
     ) -> DriverResult<()> {
         match (self, kind) {
+            (Self::StorageRemoved, _) => Err(DriverError::DeviceRemoved),
             (Self::Locked { owner: current }, RawVolumeOperationKind::Read) if current == owner => {
                 Ok(())
             }
@@ -367,6 +382,7 @@ impl MountedVolumeState {
     /// no longer retained. The lock owner may expand its bound after logical dismount.
     pub(super) fn authorize_raw_extent_change(self, owner: KernelFileObject) -> DriverResult<()> {
         match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(()),
             Self::Locked { owner: current }
             | Self::Dismounted {
@@ -464,6 +480,57 @@ pub(crate) struct MountedVolumeAccess<'volume> {
 }
 
 impl MountedVolumeAccess<'_> {
+    /// Captures volume-scoped native authority for the current actor's retained VCB.
+    #[expect(
+        unsafe_code,
+        reason = "the actor and its device rundown retain the pinned VCB and native header"
+    )]
+    pub(crate) fn storage_access(&self) -> crate::kernel::stream::VolumeStorageAccess {
+        unsafe {
+            // SAFETY: The mounted actor owns the pinned VCB until terminal reactor join.
+            self.volume.stream_context.storage_access()
+        }
+        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck())
+    }
+
+    /// Rejects native storage that has received a terminal PnP notification.
+    /// # Errors
+    ///
+    /// Returns device removed regardless of cached data or the current immutable epoch.
+    pub(crate) fn authorize_storage(&self) -> DriverResult<()> {
+        self.storage_access().authorize()
+    }
+
+    /// Retains one same-thread lower-submission permit through IoCallDriver's return.
+    /// # Errors
+    ///
+    /// Returns device removed once PnP has closed native submission admission.
+    #[cfg(not(test))]
+    pub(crate) fn acquire_storage_submission(
+        &self,
+    ) -> DriverResult<crate::kernel::stream::StorageSubmissionLease> {
+        self.storage_access().acquire_submission()
+    }
+
+    /// Reconciles the dispatch-published revocation on the sole actor. Surprise removal retains
+    /// the device even without handles until final REMOVE arrives. Existing sections and lower
+    /// completions retain their owners; no flush or clean-marker write is attempted here.
+    #[cfg(not(test))]
+    pub(crate) fn observe_storage_removal(&mut self) -> Option<VolumeRetirement> {
+        if self.authorize_storage().is_ok()
+            || self.volume.volume_control.state == MountedVolumeState::Retiring
+        {
+            return None;
+        }
+        if self.volume.volume_control.state != MountedVolumeState::StorageRemoved {
+            self.volume.volume_control.state = MountedVolumeState::StorageRemoved;
+            self.volume.runtime.record_durability_unknown();
+            self.volume.runtime.record_read_unreliable();
+            self.volume.directory_change_notifier.cleanup_all();
+        }
+        Some(self.begin_retirement())
+    }
+
     /// Returns the write-only operational event capability for this mounted volume.
     pub(crate) const fn operational_trace(&self) -> OperationalTrace {
         self.volume.trace
@@ -665,6 +732,9 @@ impl MountedVolumeAccess<'_> {
 
     /// Atomically moves the actor-owned volume into its one physical-retirement transition.
     fn begin_retirement(&mut self) -> VolumeRetirement {
+        if self.authorize_storage().is_err() && !self.storage_access().final_removal_received() {
+            return VolumeRetirement::Retained;
+        }
         let namespace_empty = self.volume.file_control_blocks.is_empty();
         let control = &mut self.volume.volume_control;
         let (state, retirement) = control
@@ -757,10 +827,14 @@ impl MountedVolumeAccess<'_> {
     }
 
     /// Publishes one previously validated lifecycle transition after its barrier succeeds.
+    /// # Errors
+    ///
+    /// Device removal revokes earlier prepared lock/close publication authority.
     pub(crate) fn publish_volume_state_transition(
         &mut self,
         transition: PreparedVolumeStateTransition,
-    ) {
+    ) -> DriverResult<()> {
+        self.authorize_storage()?;
         let control = &mut self.volume.volume_control;
         match transition.kind {
             PreparedVolumeStateTransitionKind::Lock { owner } => {
@@ -774,6 +848,7 @@ impl MountedVolumeAccess<'_> {
                 });
             }
         }
+        Ok(())
     }
 
     /// Consumes a failed lifecycle publication while preserving one-way clean-close semantics.
@@ -781,6 +856,9 @@ impl MountedVolumeAccess<'_> {
         &mut self,
         transition: PreparedVolumeStateTransition,
     ) {
+        if self.authorize_storage().is_err() {
+            return;
+        }
         if let PreparedVolumeStateTransitionKind::Lock { owner } = transition.kind {
             let control = &mut self.volume.volume_control;
             control.state = control.state.abort_lock(owner).unwrap_or_else(|| {
@@ -794,6 +872,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns volume dismounted after a successful forced dismount.
     pub(crate) fn ensure_mounted(&self) -> DriverResult<()> {
+        self.authorize_storage()?;
         self.volume.volume_control.state.ensure_mounted()
     }
 
@@ -802,6 +881,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns access denied while locked or volume dismounted after terminal dismount.
     pub(crate) fn authorize_create(&self) -> DriverResult<()> {
+        self.authorize_storage()?;
         self.volume.volume_control.state.authorize_create()
     }
 
@@ -811,6 +891,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns access denied when another handle owns the lock, or volume dismounted after
     /// terminal logical dismount.
     pub(crate) fn authorize_handle(&self, file_object: KernelFileObject) -> DriverResult<()> {
+        self.authorize_storage()?;
         self.volume
             .volume_control
             .state
@@ -826,6 +907,7 @@ impl MountedVolumeAccess<'_> {
         &self,
         file_object: ActiveFileObject<'_>,
     ) -> DriverResult<PagingStreamLease> {
+        self.authorize_storage()?;
         self.volume
             .file_control_blocks
             .acquire_paging_stream_lease(file_object, NonNull::from(&*self.volume))
@@ -1053,6 +1135,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns the same terminal failure status as future mutation attempts.
     pub(crate) fn authorize_durability(&self) -> DriverResult<()> {
+        self.authorize_storage()?;
         self.volume.runtime.authorize_durability()
     }
 
@@ -1127,6 +1210,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns an error when reads are no longer reliable or the bounded lease registry is full.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
+        self.authorize_storage()?;
         self.volume.runtime.acquire_epoch()
     }
 
@@ -1135,6 +1219,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns an error when mutation is no longer authorized or bounded accounting overflows.
     pub(crate) fn admit_mutation(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
+        self.authorize_storage()?;
         self.volume.runtime.admit_mutation()
     }
 
@@ -1194,6 +1279,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns the volume failure without confusing terminal rejection with a pending grant.
     #[cfg(not(test))]
     pub(crate) fn acquire_commit(&mut self, ticket: u64) -> DriverResult<Option<CommitLease>> {
+        self.authorize_storage()?;
         self.volume.runtime.acquire_commit(ticket)
     }
 

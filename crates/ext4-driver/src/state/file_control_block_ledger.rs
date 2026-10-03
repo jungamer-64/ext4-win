@@ -992,7 +992,12 @@ impl FileControlBlockLedger {
         share_access: ShareAccess,
     ) -> DriverResult<NewFileControlBlockAdmission> {
         let node = stream.node();
-        let candidate = self.staged_file_control_block(volume, stream, trace)?;
+        let volume_stream = unsafe {
+            // SAFETY: The owning pinned VCB retains its disjoint immutable stream field until
+            // this ledger and all native stream leases have been destroyed.
+            &(*volume.as_ptr()).stream_context
+        };
+        let candidate = self.staged_file_control_block(volume, volume_stream, stream, trace)?;
         let fcb = NonNull::from(candidate.as_ref().get_ref());
         let mut discarded = None;
         let mut removed = None;
@@ -1068,7 +1073,12 @@ impl FileControlBlockLedger {
             return result;
         }
 
-        let candidate = self.committed_file_control_block(volume, stream, trace)?;
+        let volume_stream = unsafe {
+            // SAFETY: The owning pinned VCB retains its disjoint immutable stream field until
+            // this ledger and all native stream leases have been destroyed.
+            &(*volume.as_ptr()).stream_context
+        };
+        let candidate = self.committed_file_control_block(volume, volume_stream, stream, trace)?;
         let mut discarded = None;
         let mut removed = None;
         let result = {
@@ -1133,6 +1143,7 @@ impl FileControlBlockLedger {
     pub(super) fn staged_file_control_block(
         &self,
         volume: NonNull<VolumeControlBlock>,
+        volume_stream: &StreamContext,
         stream: StagedNodeStreamMetadata,
         trace: OperationalTrace,
     ) -> DriverResult<Pin<Box<FileControlBlock>>> {
@@ -1140,7 +1151,7 @@ impl FileControlBlockLedger {
             FileControlBlock::try_new_staged(volume, NonNull::from(self), stream, trace)
         })?;
         let candidate = Box::into_pin(candidate);
-        candidate.as_ref().bind_stream_owner()?;
+        candidate.as_ref().bind_stream_owner(volume_stream)?;
         Ok(candidate)
     }
 
@@ -1151,6 +1162,7 @@ impl FileControlBlockLedger {
     fn committed_file_control_block(
         &self,
         volume: NonNull<VolumeControlBlock>,
+        volume_stream: &StreamContext,
         stream: CommittedNodeStreamMetadata,
         trace: OperationalTrace,
     ) -> DriverResult<Pin<Box<FileControlBlock>>> {
@@ -1158,7 +1170,7 @@ impl FileControlBlockLedger {
             FileControlBlock::try_new_committed(volume, NonNull::from(self), stream, trace)
         })?;
         let candidate = Box::into_pin(candidate);
-        candidate.as_ref().bind_stream_owner()?;
+        candidate.as_ref().bind_stream_owner(volume_stream)?;
         Ok(candidate)
     }
 
@@ -2638,14 +2650,6 @@ impl VolumeControlBlock {
             share_access,
             oplock_policy,
         })
-    }
-
-    /// Returns whether logical dismount already consumed shutdown registration.
-    pub(super) fn is_logically_dismounted(&self) -> bool {
-        matches!(
-            self.volume_control.state,
-            MountedVolumeState::Dismounted { .. } | MountedVolumeState::Retiring
-        )
     }
 }
 /// Driver publication values prepared for a child staged in an ephemeral mutation pass.
