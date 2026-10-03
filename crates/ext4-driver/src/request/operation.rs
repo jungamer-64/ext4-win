@@ -2168,7 +2168,9 @@ impl VolumeControlOperation {
         transition: PreparedVolumeStateTransition,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        access.publish_volume_state_transition(transition);
+        if let Err(error) = access.publish_volume_state_transition(transition) {
+            return Self::complete(owned, Err(error));
+        }
         match kind {
             VolumeControlRequestKind::Lock => {
                 MountedVolumeDevice::publish_volume_lock(target.device(), true);
@@ -2874,8 +2876,8 @@ impl FlushRequestOperation {
                 }
             }
             CleanCloseTransition::Complete(Ok(_durability)) => {
-                access.publish_volume_state_transition(transition);
-                Self::complete(owned, Ok(IrpCompletion::EMPTY))
+                let result = access.publish_volume_state_transition(transition);
+                Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
             }
             CleanCloseTransition::Complete(Err(error)) => {
                 Self::complete(owned, Err(DriverError::from(error)))
@@ -3149,7 +3151,7 @@ pub(crate) enum MutationRequestKind {
     /// Remove one mount-scoped fscrypt key snapshot.
     RemoveEncryptionKey,
     /// Cleanup-time namespace deletion after the terminal handle barrier.
-    Cleanup,
+    CleanupDeletion,
 }
 
 /// Mutation request after any paging stream lifetime authority has been captured.
@@ -3597,15 +3599,6 @@ enum MutationOperationState {
         /// Restartable core resolve state entered only after coherency succeeds.
         resolve: MutationResolveOperation,
     },
-    /// Cleanup waits for its FILE_OBJECT private cache map to detach.
-    CacheUninitializing {
-        /// Unique top-level completion authority.
-        owned: OwnedIrp,
-        /// Immutable epoch pinned for any cleanup deletion resolve.
-        epoch: EpochLease,
-        /// Restartable cleanup resolve entered after cache-map detachment returns.
-        resolve: MutationResolveOperation,
-    },
     /// A resolved size mutation establishes its native cache/section gate outside the actor.
     PreparingSizeChange {
         /// Unique top-level completion authority.
@@ -3748,8 +3741,6 @@ struct MutationRequestOperation {
     write_open: Option<crate::state::PreparedStreamWriteOpen>,
     /// Whether a successful pre-commit write has made abort/replay relevant.
     write_effect_observed: bool,
-    /// CLEANUP alone must consume its per-handle terminal barrier before releasing handle state.
-    cleanup_barrier_released: bool,
     /// Pre-cleanup failure returned only after cleanup-owned releases have completed.
     cleanup_deferred_error: Option<DriverError>,
     /// Current consuming state.
@@ -3885,7 +3876,7 @@ impl MutationRequestOperation {
                 | MutationRequestKind::AddEncryptionKey
                 | MutationRequestKind::RemoveEncryptionKey,
             ) => false,
-            PreparedMutationRequest::Other(MutationRequestKind::Cleanup) => {
+            PreparedMutationRequest::Other(MutationRequestKind::CleanupDeletion) => {
                 return owned.request().with_active(|active| {
                     let file_object = active.current_stack()?.file_object()?;
                     match crate::state::OpenedFileObject::decode(file_object)? {
@@ -4002,7 +3993,6 @@ impl MutationRequestOperation {
                     pending_existing_create: None,
                     write_open: None,
                     write_effect_observed: false,
-                    cleanup_barrier_released: false,
                     cleanup_deferred_error: None,
                     state,
                 }
@@ -4252,19 +4242,7 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::Cleanup) => {
-                if state.cleanup_deletion.is_none() {
-                    match crate::request::file_info::cleanup(owned.request(), operations)? {
-                        crate::request::file_info::CleanupResolution::Complete(completion) => {
-                            return Ok(DriverResolveDisposition::Complete(
-                                TopLevelCompletion::Normal(completion),
-                            ));
-                        }
-                        crate::request::file_info::CleanupResolution::Delete(deletion) => {
-                            *state.cleanup_deletion = Some(deletion);
-                        }
-                    }
-                }
+            PreparedMutationRequest::Other(MutationRequestKind::CleanupDeletion) => {
                 let Some(deletion) = state.cleanup_deletion.as_ref() else {
                     return Err(DriverError::InternalInvariantViolation);
                 };
@@ -4428,7 +4406,7 @@ impl MutationRequestOperation {
                 }
                 Ok(DriverResolveDisposition::CheckCleanupParentOplock { parent }) => {
                     drop(pass);
-                    if self.request.kind() != MutationRequestKind::Cleanup
+                    if self.request.kind() != MutationRequestKind::CleanupDeletion
                         || self.cleanup_deletion.is_none()
                         || size_changes.is_some()
                         || deletion.is_some()
@@ -5160,26 +5138,6 @@ impl MutationRequestOperation {
                         };
                     }
                     (
-                        MutationOperationState::CacheUninitializing {
-                            owned,
-                            epoch,
-                            resolve,
-                        },
-                        crate::irp::PassiveWorkCompletion::Uninitialize(result),
-                    ) => {
-                        if let Err(error) = result
-                            && self.cleanup_deferred_error.is_none()
-                        {
-                            self.cleanup_deferred_error = Some(error);
-                        }
-                        return MutationStep::Resolve { operation: self, owned, attempt: ResolutionAttempt {
-                                epoch,
-                                resolve,
-                                size_changes: None,
-                                deletion: None,
-                            }, event: OperationEvent::Admitted };
-                    }
-                    (
                         MutationOperationState::PreparingSizeChange {
                             owned,
                             mut plan,
@@ -5272,34 +5230,6 @@ impl MutationRequestOperation {
                 return MutationStep::Transition(self.complete_error(owned, error));
             }
         };
-        let event = if self.request.kind() == MutationRequestKind::Cleanup
-            && !self.cleanup_barrier_released
-        {
-            match event {
-                OperationEvent::Admitted => {
-                    return MutationStep::Transition(OperationTransition::Wait {
-                        condition: WaitCondition::Barrier {
-                            identity: CLEANUP_HANDLE_BARRIER,
-                        },
-                        suspended: self,
-                    });
-                }
-                OperationEvent::BarrierReleased(permit) => {
-                    if permit.into_identity() != CLEANUP_HANDLE_BARRIER {
-                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                            .bugcheck();
-                    }
-                    self.cleanup_barrier_released = true;
-                    OperationEvent::Admitted
-                }
-                _ => {
-                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                        .bugcheck()
-                }
-            }
-        } else {
-            event
-        };
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
         match state {
             MutationOperationState::CheckingOplock {
@@ -5342,7 +5272,7 @@ impl MutationRequestOperation {
                 match resume {
                     OplockResume::ContinueResolution { epoch, resolve } => {
                         if let Some(error) = oplock_error {
-                            if self.request.kind() != MutationRequestKind::Cleanup {
+                            if self.request.kind() != MutationRequestKind::CleanupDeletion {
                                 return MutationStep::Transition(self.complete_error(owned, error));
                             }
                             if self.cleanup_deferred_error.is_none() {
@@ -5381,7 +5311,7 @@ impl MutationRequestOperation {
                         if let Some(error) = oplock_error {
                             return MutationStep::Transition(self.complete_error(owned, error));
                         }
-                        if self.request.kind() != MutationRequestKind::Cleanup
+                        if self.request.kind() != MutationRequestKind::CleanupDeletion
                             || self.cleanup_deletion.is_none()
                         {
                             return MutationStep::Transition(
@@ -5431,30 +5361,6 @@ impl MutationRequestOperation {
                     && size_changes.is_none()
                     && deletion.is_none()
                 {
-                    if self.request.kind() == MutationRequestKind::Cleanup {
-                        let work = match crate::request::file_info::prepare_cleanup_cache_work(
-                            owned.request(),
-                            access,
-                        ) {
-                            Ok(work) => work,
-                            Err(error) => {
-                                return MutationStep::Transition(self.complete_error(owned, error));
-                            }
-                        };
-                        if let Some(work) = work {
-                            self.state = MutationOperationState::CacheUninitializing {
-                                owned,
-                                epoch,
-                                resolve,
-                            };
-                            return MutationStep::Transition(
-                                OperationTransition::SubmitPassiveWork {
-                                    work,
-                                    suspended: self,
-                                },
-                            );
-                        }
-                    }
                     if let PreparedMutationRequest::DataWrite(authority) = &self.request {
                         let plan = match crate::request::file_info::prepare_write_cache_plan(
                             owned.request(),
@@ -5511,7 +5417,7 @@ impl MutationRequestOperation {
             }
             MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CachePurging { .. }
-            | MutationOperationState::CacheUninitializing { .. } => {
+ => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
@@ -5909,7 +5815,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 | MutationOperationState::PreparingWriteOpen { .. }
                 | MutationOperationState::CacheWriting { .. }
                 | MutationOperationState::CachePurging { .. }
-                | MutationOperationState::CacheUninitializing { .. }
+    
                 | MutationOperationState::AwaitingVisibility { .. }
                 | MutationOperationState::PublishingDurable { .. }
                 | MutationOperationState::AwaitingCheckpoint(_)
@@ -5936,7 +5842,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
-            | MutationOperationState::CacheUninitializing { .. }
+
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
@@ -6030,7 +5936,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
-            | MutationOperationState::CacheUninitializing { .. }
+
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
