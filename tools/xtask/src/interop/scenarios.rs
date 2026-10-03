@@ -1126,6 +1126,17 @@ fn verify_regular_mutation_profile(
         b"set-value",
         "regular-set",
     )?;
+    verify_payload_allocation(linux, image, b"source.bin", 8)?;
+    // The independent unwritten fixture is read-only at the payload boundary. Subsequent mutation
+    // profiles retain their own admission requirements rather than inheriting this read fixture.
+    let unwritten_image = case_root.join("unwritten.img");
+    fs::copy(image, &unwritten_image)?;
+    let image_path = linux.tool_path(&unwritten_image)?;
+    let mut fallocate = linux.command("debugfs");
+    fallocate.args(["-w", "-R", "fallocate /source.bin 5 5", &image_path]);
+    run_checked(fallocate, "unwritten payload allocation fixture")?;
+    verify_payload_allocation(linux, &unwritten_image, b"source.bin", 8)?;
+    verify_internal_e2fsck_clean(linux, &unwritten_image, "unwritten allocation read profile")?;
 
     drive_internal_core_mutation(image, |pass| {
         let (root, file_id) = mutation_root_file(pass, &source)?;
@@ -1186,6 +1197,7 @@ fn verify_regular_mutation_profile(
     )?;
     debugfs_require_absent(linux, image, "/source.bin")?;
     debugfs_require_absent(linux, image, "/renamed.bin")?;
+    verify_payload_allocation(linux, image, b"linked.bin", 4)?;
     debugfs_require_xattr_absent(linux, image, "/linked.bin", b"user.ext4win.interop")?;
     require_free_space_delta(baseline, debugfs_free_space(linux, image)?, 3, 1, "regular")?;
     verify_internal_e2fsck_clean(linux, image, "regular mutation profile")
@@ -1247,6 +1259,7 @@ fn verify_bigalloc_mutation_profile(
         "bigalloc",
     )?;
     debugfs_require_absent(linux, image, "/alpha.bin")?;
+    verify_payload_allocation(linux, image, b"beta.bin", 5)?;
     require_free_space_delta(
         baseline,
         debugfs_free_space(linux, image)?,
@@ -1270,6 +1283,75 @@ fn mutation_file_metadata() -> ext4_core::Result<ext4_core::NewFileMetadata> {
         ),
         ext4_core::Ext4Permissions::new(0o644)?,
     ))
+}
+
+/// Compares committed payload locations and sparse/EOF boundaries with independent debugfs bmap
+/// observations. These profiles use 4 KiB blocks; allocation units may contain multiple blocks.
+/// # Errors
+/// Returns core traversal, suspended storage, image/oracle I/O, or mapping disagreement failures.
+fn verify_payload_allocation(
+    linux: LinuxEnvironment,
+    image: &Path,
+    name: &[u8],
+    blocks: u64,
+) -> TaskResult<()> {
+    let locations = drive_internal_core_read(image, |pass| {
+        let root = pass.load_directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let child = ext4_core::CommittedReadPass::lookup_child(
+            pass,
+            &root,
+            &ext4_core::Ext4Name::new(name)?,
+        )?;
+        let node = match child {
+            ext4_core::ChildLookup::Found(child) => *child.node(),
+            ext4_core::ChildLookup::NotFound => {
+                return Err(ext4_core::Error::InvalidDirectoryEntry);
+            }
+        };
+        let mut locations = Vec::new();
+        locations
+            .try_reserve_exact(
+                usize::try_from(blocks).map_err(|_| ext4_core::Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| ext4_core::Error::OutOfMemory)?;
+        for logical in 0..blocks {
+            let offset = ext4_core::FileOffset::from_bytes(
+                logical
+                    .checked_mul(4096)
+                    .ok_or(ext4_core::Error::ArithmeticOverflow)?,
+            );
+            let run = pass.node_data_allocation(node, offset)?;
+            let physical = run
+                .and_then(ext4_core::DataAllocationRun::physical)
+                .map_or(0, ext4_core::ByteOffset::get);
+            if !physical.is_multiple_of(4096) {
+                return Err(ext4_core::Error::InvalidExtentTree);
+            }
+            locations.push(
+                physical
+                    .checked_div(4096)
+                    .ok_or(ext4_core::Error::ArithmeticOverflow)?,
+            );
+        }
+        Ok(locations)
+    })?;
+    let path = core::str::from_utf8(name)?;
+    for (logical, observed) in locations.iter().copied().enumerate() {
+        let output = debugfs_request_output(linux, image, &format!("bmap /{path} {logical}"))?;
+        let expected = output
+            .lines()
+            .filter_map(|line| {
+                line.split_ascii_whitespace()
+                    .next()
+                    .and_then(|word| word.parse::<u64>().ok())
+            })
+            .collect::<Vec<_>>();
+        if expected.as_slice() != [observed] {
+            return Err(io::Error::other(format!("payload allocation /{path} block {logical} disagrees with debugfs: core={observed}, oracle={output}")).into());
+        }
+    }
+    println!("payload allocation /{path}: PASS ({blocks} independently mapped blocks)");
+    Ok(())
 }
 
 /// Returns the fixed public xattr name exercised by mutation interoperability.

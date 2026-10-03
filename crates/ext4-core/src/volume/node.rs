@@ -630,3 +630,33 @@ pub enum ChildLookup {
     /// No child matched the requested name.
     NotFound,
 }
+
+/// One block-aligned payload allocation run observed in an immutable epoch.
+/// Inode-table, xattr, extent-index and fs-verity metadata are excluded. Unwritten payload
+/// has a physical location even though ordinary reads return zeros.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataAllocationRun {
+    /// Inclusive file coordinate supplied to the allocation query.
+    pub(super) start: crate::FileOffset,
+    /// Exclusive file coordinate; preallocation may extend beyond logical EOF.
+    pub(super) end: crate::FileOffset,
+    /// Physical payload address, or a genuinely unallocated logical range.
+    pub(super) physical: Option<crate::ByteOffset>,
+}
+impl DataAllocationRun {
+    /// Inclusive file coordinate, distinct from the volume address.
+    #[must_use]
+    pub const fn start(self) -> crate::FileOffset {
+        self.start
+    }
+    /// Exclusive file coordinate bounded by the visible payload allocation span.
+    #[must_use]
+    pub const fn end(self) -> crate::FileOffset {
+        self.end
+    }
+    /// Physical address corresponding to `start`; absence denotes a sparse hole.
+    #[must_use]
+    pub const fn physical(self) -> Option<crate::ByteOffset> {
+        self.physical
+    }
+}

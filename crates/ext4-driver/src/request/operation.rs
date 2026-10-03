@@ -693,6 +693,8 @@ pub(crate) enum ReadRequestKind {
     QueryEa,
     /// Security descriptor query.
     QuerySecurity,
+    /// Committed payload allocation query.
+    GetRetrievalPointers,
     /// Reparse-point FSCTL query.
     GetReparsePoint,
 }
@@ -910,6 +912,11 @@ impl ReadRequestOperation {
             }
             PreparedReadRequest::Other(ReadRequestKind::QuerySecurity) => {
                 crate::request::security::query(owned.request(), read)
+            }
+            PreparedReadRequest::Other(ReadRequestKind::GetRetrievalPointers) => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request, access)?;
+                crate::request::retrieval::query(request, read, access.volume_geometry())
             }
             PreparedReadRequest::Other(ReadRequestKind::GetReparsePoint) => {
                 let mut request = owned.request();

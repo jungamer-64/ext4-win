@@ -209,6 +209,8 @@ pub(crate) enum FsControlCode {
     IsVolumeMounted,
     /// Windows `FSCTL_ALLOW_EXTENDED_DASD_IO`.
     AllowExtendedDasdIo,
+    /// Windows `FSCTL_GET_RETRIEVAL_POINTERS`.
+    GetRetrievalPointers,
     /// Windows `FSCTL_GET_REPARSE_POINT`.
     GetReparsePoint,
     /// Windows `FSCTL_SET_REPARSE_POINT`.
@@ -255,6 +257,7 @@ impl FsControlCode {
             FSCTL_DISMOUNT_VOLUME => Ok(Self::DismountVolume),
             FSCTL_IS_VOLUME_MOUNTED => Ok(Self::IsVolumeMounted),
             FSCTL_ALLOW_EXTENDED_DASD_IO => Ok(Self::AllowExtendedDasdIo),
+            FSCTL_GET_RETRIEVAL_POINTERS => Ok(Self::GetRetrievalPointers),
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
             FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
@@ -309,6 +312,7 @@ impl FsControlCode {
             | Self::DismountVolume
             | Self::IsVolumeMounted
             | Self::AllowExtendedDasdIo
+            | Self::GetRetrievalPointers
             | Self::GetReparsePoint
             | Self::SetReparsePoint
             | Self::DeleteReparsePoint
@@ -376,6 +380,8 @@ const FSCTL_IS_VOLUME_MOUNTED: wdk_sys::ULONG = buffered_file_system_control(10)
 /// `FSCTL_ALLOW_EXTENDED_DASD_IO`, from
 /// `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 32, METHOD_NEITHER, FILE_ANY_ACCESS)`.
 const FSCTL_ALLOW_EXTENDED_DASD_IO: wdk_sys::ULONG = neither_file_system_control(32);
+/// `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 28, METHOD_NEITHER, FILE_ANY_ACCESS)`.
+const FSCTL_GET_RETRIEVAL_POINTERS: wdk_sys::ULONG = neither_file_system_control(28);
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
 /// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.

@@ -27,8 +27,8 @@ pub use mount::{
     ResourceVersion, ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
-    ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, NodeMetadataSnapshot,
+    ChildLookup, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,
+    FileNode, FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, NodeMetadataSnapshot,
     NodeReparsePoint, SymlinkNode, SymlinkNodeId,
 };
 pub use operation::{

@@ -4,7 +4,6 @@
 
 /* Neither-I/O lengths are requestor controlled, so each capture stays bounded. */
 #define EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE (128UL * 1024UL)
-#define EXT4WIN_MAX_QUERY_OUTPUT_SIZE (128UL * 1024UL)
 #define EXT4WIN_MAX_EA_NAME_LIST_SIZE (64UL * 1024UL)
 #define EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE (64UL * 1024UL - sizeof(WCHAR))
 #define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS                                      \
@@ -13,7 +12,7 @@
          : EXCEPTION_CONTINUE_SEARCH)
 
 /*
- * This translation unit is the only boundary that touches neither-I/O security
+ * This translation unit is the only boundary that touches neither-I/O output
  * buffers supplied by an untrusted requestor or I/O-manager-owned auxiliary
  * input. Rust receives only an opaque output target or an owned, validated byte
  * snapshot; external mappings never enter Rust's aliasing model.
@@ -25,11 +24,11 @@ typedef struct _EXT4WIN_SID_PREFIX {
     SID_IDENTIFIER_AUTHORITY IdentifierAuthority;
 } EXT4WIN_SID_PREFIX;
 
-typedef struct _EXT4WIN_QUERY_SECURITY_OUTPUT {
+typedef struct _EXT4WIN_REQUESTOR_OUTPUT {
     PMDL Mdl;
     PVOID SystemAddress;
-    ULONG ExactLength;
-} EXT4WIN_QUERY_SECURITY_OUTPUT, *PEXT4WIN_QUERY_SECURITY_OUTPUT;
+    ULONG Capacity;
+} EXT4WIN_REQUESTOR_OUTPUT, *PEXT4WIN_REQUESTOR_OUTPUT;
 
 C_ASSERT(sizeof(SECURITY_DESCRIPTOR_RELATIVE) == 20);
 C_ASSERT(sizeof(EXT4WIN_SID_PREFIX) == 8);
@@ -307,8 +306,8 @@ ext4win_measure_relative_security_descriptor(
 }
 
 static VOID
-ext4win_release_query_security_output_internal(
-    _Frees_ptr_opt_ PEXT4WIN_QUERY_SECURITY_OUTPUT output)
+ext4win_release_requestor_output_internal(
+    _Frees_ptr_opt_ PEXT4WIN_REQUESTOR_OUTPUT output)
 {
     if (output == NULL) {
         return;
@@ -361,35 +360,24 @@ _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
-ext4win_capture_query_security_output(
+ext4win_capture_requestor_output(
     _Outptr_ PVOID *output_out,
-    _Out_ PULONG required_length_out,
-    _Out_writes_bytes_to_opt_(requestor_buffer_length, required_length) PVOID requestor_buffer,
-    _In_ ULONG requestor_buffer_length,
-    _In_ ULONG required_length,
+    _In_opt_ PVOID requestor_buffer,
+    _In_ ULONG capacity,
     _In_ KPROCESSOR_MODE requestor_mode)
 {
-    PEXT4WIN_QUERY_SECURITY_OUTPUT output;
+    PEXT4WIN_REQUESTOR_OUTPUT output;
     PVOID system_address;
     NTSTATUS status;
 
     if (output_out != NULL) {
         *output_out = NULL;
     }
-    if (required_length_out != NULL) {
-        *required_length_out = required_length;
-    }
 
-    if ((output_out == NULL) || (required_length_out == NULL) ||
+    if ((output_out == NULL) ||
         !ext4win_is_requestor_mode_valid(requestor_mode) ||
-        (required_length == 0)) {
+        (capacity == 0)) {
         return STATUS_INVALID_PARAMETER;
-    }
-    if (required_length > EXT4WIN_MAX_QUERY_OUTPUT_SIZE) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
-    if (requestor_buffer_length < required_length) {
-        return STATUS_BUFFER_OVERFLOW;
     }
     if (requestor_buffer == NULL) {
         return STATUS_INVALID_USER_BUFFER;
@@ -397,7 +385,7 @@ ext4win_capture_query_security_output(
 
     /* Successful return transfers this allocation through output_out to the Rust owner. */
 #pragma warning(suppress: 6014)
-    output = (PEXT4WIN_QUERY_SECURITY_OUTPUT)ExAllocatePool2(
+    output = (PEXT4WIN_REQUESTOR_OUTPUT)ExAllocatePool2(
         POOL_FLAG_NON_PAGED,
         sizeof(*output),
         EXT4WIN_SECURITY_POOL_TAG);
@@ -410,12 +398,12 @@ ext4win_capture_query_security_output(
 #pragma warning(suppress: 6001)
     output->Mdl = IoAllocateMdl(
         requestor_buffer,
-        required_length,
+        capacity,
         FALSE,
         FALSE,
         NULL);
     if (output->Mdl == NULL) {
-        ext4win_release_query_security_output_internal(output);
+        ext4win_release_requestor_output_internal(output);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -429,7 +417,7 @@ ext4win_capture_query_security_output(
     if (!NT_SUCCESS(status)) {
         IoFreeMdl(output->Mdl);
         output->Mdl = NULL;
-        ext4win_release_query_security_output_internal(output);
+        ext4win_release_requestor_output_internal(output);
         return status;
     }
 
@@ -437,12 +425,12 @@ ext4win_capture_query_security_output(
         output->Mdl,
         (MM_PAGE_PRIORITY)(NormalPagePriority | MdlMappingNoExecute));
     if (system_address == NULL) {
-        ext4win_release_query_security_output_internal(output);
+        ext4win_release_requestor_output_internal(output);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     output->SystemAddress = system_address;
-    output->ExactLength = required_length;
+    output->Capacity = capacity;
     *output_out = output;
     return STATUS_SUCCESS;
 }
@@ -451,20 +439,20 @@ _IRQL_requires_max_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
-ext4win_copy_query_security_output(
+ext4win_copy_requestor_output(
     _In_ PVOID output_handle,
     _In_reads_bytes_(source_length) const VOID *owned_source,
     _In_ ULONG source_length)
 {
-    PEXT4WIN_QUERY_SECURITY_OUTPUT output;
+    PEXT4WIN_REQUESTOR_OUTPUT output;
     NTSTATUS status;
 
     if (output_handle == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    output = (PEXT4WIN_QUERY_SECURITY_OUTPUT)output_handle;
-    if ((owned_source == NULL) || (source_length != output->ExactLength) ||
+    output = (PEXT4WIN_REQUESTOR_OUTPUT)output_handle;
+    if ((owned_source == NULL) || (source_length > output->Capacity) ||
         (output->Mdl == NULL) || (output->SystemAddress == NULL)) {
         status = STATUS_INVALID_PARAMETER;
     } else {
@@ -472,19 +460,44 @@ ext4win_copy_query_security_output(
         status = STATUS_SUCCESS;
     }
 
-    ext4win_release_query_security_output_internal(output);
+    ext4win_release_requestor_output_internal(output);
     return status;
 }
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 VOID
 NTAPI
-ext4win_release_query_security_output(_Frees_ptr_opt_ PVOID output)
+ext4win_release_requestor_output(_Frees_ptr_opt_ PVOID output)
 {
     /* Rust returns only the initialized opaque handle produced by the capture call. */
 #pragma warning(suppress: 6001)
-    ext4win_release_query_security_output_internal(
-        (PEXT4WIN_QUERY_SECURITY_OUTPUT)output);
+    ext4win_release_requestor_output_internal(
+        (PEXT4WIN_REQUESTOR_OUTPUT)output);
+}
+
+/* Fixed Type3 input is snapshotted in requestor context before actor admission. */
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS NTAPI
+ext4win_capture_starting_vcn(_In_ PIRP irp, _Out_ PLONGLONG value)
+{
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    NTSTATUS status = STATUS_SUCCESS;
+    PVOID source;
+    if ((value == NULL) || (stack->MajorFunction != IRP_MJ_FILE_SYSTEM_CONTROL) ||
+        (stack->Parameters.FileSystemControl.FsControlCode != FSCTL_GET_RETRIEVAL_POINTERS) ||
+        (stack->Parameters.FileSystemControl.InputBufferLength < sizeof(*value)) ||
+        !ext4win_is_requestor_mode_valid(irp->RequestorMode)) { return STATUS_INVALID_PARAMETER; }
+    source = stack->Parameters.FileSystemControl.Type3InputBuffer;
+    if (source == NULL) { return STATUS_INVALID_USER_BUFFER; }
+    __try {
+        if (irp->RequestorMode == UserMode) { ProbeForRead(source, sizeof(*value), TYPE_ALIGNMENT(LONGLONG)); }
+        RtlCopyMemory(value, source, sizeof(*value));
+    }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+        status = ext4win_normalize_buffer_exception(GetExceptionCode());
+    }
+    if (NT_SUCCESS(status) && (*value < 0)) { return STATUS_INVALID_PARAMETER; }
+    return status;
 }
 
 _IRQL_requires_max_(PASSIVE_LEVEL)

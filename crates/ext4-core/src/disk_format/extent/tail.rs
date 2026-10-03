@@ -587,6 +587,65 @@ fn remove_last_entry(node: &mut PathNode) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// # Errors
+    /// Returns fixture decoding or traversal failures.
+    /// # Panics
+    /// Panics if sparse boundaries or unwritten physical locations are discarded by traversal.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture decoding propagates errors while assertions verify physical and sparse allocation semantics"
+    )]
+    fn allocation_runs_preserve_unwritten_addresses_and_skip_sparse_blocks() -> Result<()> {
+        // Independent on-disk root: initialized [0,2) at 100, unwritten [4,6) at 200.
+        let root = [
+            10, 243, 2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 100, 0, 0, 0, 4, 0, 0,
+            0, 2, 128, 0, 0, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ];
+        let mut cursor = ExtentMappingCursor::new(
+            &InodeExtentRoot::from_bytes(root),
+            BlockSize::from_superblock_log(0)?,
+            ExtentTreeContext::none(),
+        )?;
+        let mut reader = NodeImages {
+            images: Vec::new(),
+            reads: Vec::new(),
+        };
+        let maximum = NonZeroU64::new(100).ok_or(Error::InvalidExtentTree)?;
+        assert_eq!(cursor.allocation_end(&mut reader)?, 6);
+        assert_eq!(
+            cursor.map_run(LogicalBlock::try_from(1_u64)?, maximum, &mut reader)?,
+            ExtentBlockRun::Initialized {
+                physical_start: BlockAddress::new(101),
+                blocks: NonZeroU64::MIN
+            }
+        );
+        assert_eq!(
+            cursor.map_run(LogicalBlock::try_from(2_u64)?, maximum, &mut reader)?,
+            ExtentBlockRun::Hole {
+                blocks: NonZeroU64::new(2).ok_or(Error::InvalidExtentTree)?
+            }
+        );
+        assert_eq!(
+            cursor.map_run(LogicalBlock::try_from(4_u64)?, maximum, &mut reader)?,
+            ExtentBlockRun::Uninitialized {
+                physical_start: BlockAddress::new(200),
+                blocks: NonZeroU64::new(2).ok_or(Error::InvalidExtentTree)?
+            }
+        );
+        assert_eq!(
+            cursor.map(LogicalBlock::try_from(4_u64)?, &mut reader)?,
+            BlockMapping::Uninitialized
+        );
+        assert_eq!(
+            cursor.map_run(LogicalBlock::try_from(6_u64)?, maximum, &mut reader)?,
+            ExtentBlockRun::Hole { blocks: maximum }
+        );
+        assert!(reader.reads.is_empty());
+        Ok(())
+    }
+
     /// Exact external-node images; reads are observed without granting mutation authority.
     struct NodeImages {
         /// Routing node followed by two leaf nodes.
@@ -777,7 +836,25 @@ impl ExtentMappingCursor {
             context,
         })
     }
-    /// Reads only the missing descendants of the selected coordinate.
+    /// Reads the rightmost validated route to find the exclusive payload allocation boundary.
+    /// # Errors
+    /// Returns malformed ancestor intervals, checksum, allocation, or backing-read failures.
+    pub(crate) fn allocation_end(&mut self, reader: &mut impl ExtentNodeReader) -> Result<u64> {
+        let _rightmost = self.map_run(
+            LogicalBlock::try_from(u64::from(u32::MAX))?,
+            NonZeroU64::MIN,
+            reader,
+        )?;
+        let node = self.path.last().ok_or(Error::InvalidExtentTree)?;
+        match &node.entries {
+            MappingEntries::Leaf(extents) => {
+                Ok(extents.last().map_or(0, |extent| extent.end_logical()))
+            }
+            MappingEntries::Branch(_) => Err(Error::InvalidExtentTree),
+        }
+    }
+
+    /// Maps one block through the same allocation traversal used for bounded runs.
     /// # Errors
     /// Returns suspended I/O, checksum, malformed routing, or allocation failures.
     pub(crate) fn map(
@@ -785,6 +862,23 @@ impl ExtentMappingCursor {
         logical: LogicalBlock,
         reader: &mut impl ExtentNodeReader,
     ) -> Result<BlockMapping> {
+        Ok(match self.map_run(logical, NonZeroU64::MIN, reader)? {
+            ExtentBlockRun::Initialized { physical_start, .. } => {
+                BlockMapping::Physical(physical_start)
+            }
+            ExtentBlockRun::Uninitialized { .. } => BlockMapping::Uninitialized,
+            ExtentBlockRun::Hole { .. } => BlockMapping::Hole,
+        })
+    }
+    /// Reads only the missing descendants of the selected coordinate.
+    /// # Errors
+    /// Returns suspended I/O, checksum, malformed routing, or allocation failures.
+    pub(crate) fn map_run(
+        &mut self,
+        logical: LogicalBlock,
+        maximum: NonZeroU64,
+        reader: &mut impl ExtentNodeReader,
+    ) -> Result<ExtentBlockRun> {
         let mut level = 0_usize;
         loop {
             let node = self.path.get(level).ok_or(Error::InvalidExtentTree)?;
@@ -793,16 +887,65 @@ impl ExtentMappingCursor {
                     let index = extents.partition_point(|extent| {
                         extent.logical_start().as_u32() <= logical.as_u32()
                     });
-                    return Ok(index
-                        .checked_sub(1)
-                        .and_then(|index| extents.get(index))
-                        .map_or(BlockMapping::Hole, |extent| extent.map_logical(logical)));
+                    let extent = index.checked_sub(1).and_then(|index| extents.get(index));
+                    if let Some(extent) =
+                        extent.filter(|extent| logical.as_u64() < extent.end_logical())
+                    {
+                        let offset = logical
+                            .as_u64()
+                            .checked_sub(extent.logical_start().as_u64())
+                            .ok_or(Error::InvalidExtentTree)?;
+                        let physical_start = BlockAddress::new(
+                            extent
+                                .physical_start()
+                                .get()
+                                .checked_add(offset)
+                                .ok_or(Error::InvalidExtentTree)?,
+                        );
+                        let blocks = NonZeroU64::new(
+                            extent
+                                .end_logical()
+                                .checked_sub(logical.as_u64())
+                                .ok_or(Error::InvalidExtentTree)?
+                                .min(maximum.get()),
+                        )
+                        .ok_or(Error::InvalidExtentTree)?;
+                        return Ok(match extent.initialization() {
+                            ExtentInitialization::Initialized => ExtentBlockRun::Initialized {
+                                physical_start,
+                                blocks,
+                            },
+                            ExtentInitialization::Uninitialized => ExtentBlockRun::Uninitialized {
+                                physical_start,
+                                blocks,
+                            },
+                        });
+                    }
+                    let end = extents
+                        .get(index)
+                        .map_or(node.upper, |extent| extent.logical_start().as_u64());
+                    let blocks = NonZeroU64::new(
+                        end.checked_sub(logical.as_u64())
+                            .ok_or(Error::InvalidExtentTree)?
+                            .min(maximum.get()),
+                    )
+                    .ok_or(Error::InvalidExtentTree)?;
+                    return Ok(ExtentBlockRun::Hole { blocks });
                 }
                 MappingEntries::Branch(branches) => branches,
             };
             let index = branches.partition_point(|(key, _)| *key <= logical.as_u32());
             let Some(selected) = index.checked_sub(1) else {
-                return Ok(BlockMapping::Hole);
+                let end = branches
+                    .first()
+                    .map_or(node.upper, |(key, _)| u64::from(*key));
+                let blocks = NonZeroU64::new(
+                    end.checked_sub(logical.as_u64())
+                        .ok_or(Error::InvalidExtentTree)?
+                        .min(maximum.get()),
+                )
+                .ok_or(Error::InvalidExtentTree)?;
+                return Ok(ExtentBlockRun::Hole { blocks });
             };
             let (lower, block) = branches
                 .get(selected)

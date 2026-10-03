@@ -1,6 +1,6 @@
 //! Windows security descriptor boundary for ext4 owner and mode bits.
 
-use crate::irp::{CapturedQuerySecurityOutput, IrpCompletion, PendingIrpLease};
+use crate::irp::{CapturedRequestorOutput, IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::security_descriptor::{
@@ -104,7 +104,7 @@ pub(crate) fn set(
 /// Decoded query-security request.
 struct QuerySecurityRequest<'a> {
     /// Opaque native target for the exact output descriptor length.
-    output: &'a mut CapturedQuerySecurityOutput,
+    output: &'a mut CapturedRequestorOutput,
     /// Selected security descriptor components.
     selection: SecuritySelection,
     /// ext4 node selected by the opened FILE_OBJECT.
@@ -394,6 +394,11 @@ fn query_security(
     let security = load_ext4_security(read, request.node)?;
     let descriptor = security_descriptor(security, request.selection)?;
     let required = descriptor.len();
+    if required != request.selection.query_descriptor_length()
+        || required != request.output.capacity()
+    {
+        return Err(DriverError::InternalInvariantViolation);
+    }
     request.output.copy_from_owned(descriptor.as_slice())?;
     IrpCompletion::from_usize(required)
 }

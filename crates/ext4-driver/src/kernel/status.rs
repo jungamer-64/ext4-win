@@ -80,6 +80,8 @@ pub(crate) enum DriverError {
     EaListInconsistent,
     /// Opened node has no extended attributes.
     NoEasOnFile,
+    /// A file-space query starts beyond the visible payload allocation span.
+    EndOfFile,
     /// EA enumeration reached the end of the EA list.
     NoMoreEas,
     /// Caller supplied an EA index that does not identify an EA entry.
@@ -158,6 +160,7 @@ impl DriverError {
             Self::InvalidEaName => STATUS_INVALID_EA_NAME,
             Self::EaListInconsistent => STATUS_EA_LIST_INCONSISTENT,
             Self::NoEasOnFile => STATUS_NO_EAS_ON_FILE,
+            Self::EndOfFile => ntstatus(0xC000_0011),
             Self::NoMoreEas => ntstatus(0x8000_0012),
             Self::NonexistentEaEntry => ntstatus(0xC000_0051),
             Self::EaTooLarge => STATUS_EA_TOO_LARGE,

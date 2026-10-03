@@ -731,6 +731,9 @@ pub(crate) fn admit_owned(
             PreparedDirectoryControl::NotifyChangeDirectory,
         )) => Admission::Notification,
         ActorRequest::Captured(PreparedRequest::LockControl) => Admission::ByteRangeLock,
+        ActorRequest::Captured(PreparedRequest::RetrievalPointers { .. }) => {
+            Admission::Read(ReadRequestKind::GetRetrievalPointers)
+        }
         ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
             Admission::FsControl(*minor)
         }
@@ -759,6 +762,7 @@ pub(crate) fn admit_owned(
                     | crate::irp::FsControlCode::OplockBreakAckNoLevel2
                     | crate::irp::FsControlCode::RequestFilterOplock
                     | crate::irp::FsControlCode::RequestOplock => Admission::OplockControl,
+                    crate::irp::FsControlCode::GetRetrievalPointers => Admission::Unsupported,
                     crate::irp::FsControlCode::GetReparsePoint => {
                         Admission::Read(ReadRequestKind::GetReparsePoint)
                     }

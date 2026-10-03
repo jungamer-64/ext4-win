@@ -178,6 +178,19 @@ impl core::fmt::Debug for EpochReadPass<'_, '_, '_> {
 }
 
 impl EpochReadPass<'_, '_, '_> {
+    /// Observes the payload allocation beginning at one block-aligned file coordinate.
+    /// No result means resident data or the end of the visible allocation span. This grants no
+    /// raw-I/O or mutation authority; the result belongs to the pass's immutable epoch.
+    /// # Errors
+    /// Returns invalid identity/range, malformed extent/checksum, allocation, or storage failures.
+    pub fn node_data_allocation(
+        &mut self,
+        node: NodeId,
+        offset: FileOffset,
+    ) -> Result<Option<super::node::DataAllocationRun>> {
+        self.view.node_data_allocation(node, offset)
+    }
+
     /// Loads a regular file by validated identity.
     /// # Errors
     ///

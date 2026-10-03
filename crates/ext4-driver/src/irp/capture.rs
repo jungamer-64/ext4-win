@@ -27,6 +27,9 @@ use super::{
 #[cfg(not(test))]
 const SET_SECURITY_DESCRIPTOR_MAXIMUM: wdk_sys::ULONG = 128 * 1024;
 
+/// Maximum writable prefix pinned by one retrieval request; excess results use NextVcn continuation.
+const RETRIEVAL_OUTPUT_MAXIMUM: usize = 128 * 1024;
+
 /// Owned directory pattern captured before queue insertion.
 #[derive(Debug)]
 pub(crate) enum PreparedDirectoryPattern {
@@ -631,9 +634,19 @@ impl QueueContextOwnership {
     /// Returns an invariant error when this is not captured query-security metadata.
     pub(super) fn query_security_parts(
         &mut self,
-    ) -> DriverResult<(SecuritySelection, &mut CapturedQuerySecurityOutput)> {
+    ) -> DriverResult<(SecuritySelection, &mut CapturedRequestorOutput)> {
         match self {
             Self::Captured(context) => context.query_security_parts(),
+            Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the sealed retrieval payload through the completion owner's unique lease.
+    /// # Errors
+    /// Returns an invariant error for a different prepared request.
+    pub(super) fn retrieval_parts(&mut self) -> DriverResult<(u64, &mut CapturedRequestorOutput)> {
+        match self {
+            Self::Captured(context) => context.retrieval_parts(),
             Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -803,9 +816,22 @@ impl QueueContext {
     /// Returns an invariant error when this context is not a file-scoped query-security request.
     pub(super) fn query_security_parts(
         &mut self,
-    ) -> DriverResult<(SecuritySelection, &mut CapturedQuerySecurityOutput)> {
+    ) -> DriverResult<(SecuritySelection, &mut CapturedRequestorOutput)> {
         match &mut self.prepared {
             PreparedRequest::QuerySecurity { selection, output } => Ok((*selection, output)),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Borrows the copied starting VCN and native output owner.
+    /// # Errors
+    /// Returns an invariant error for a different prepared request.
+    pub(super) fn retrieval_parts(&mut self) -> DriverResult<(u64, &mut CapturedRequestorOutput)> {
+        match &mut self.prepared {
+            PreparedRequest::RetrievalPointers {
+                starting_vcn,
+                output,
+            } => Ok((*starting_vcn, output)),
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -848,6 +874,13 @@ pub(crate) enum PreparedRequest {
     DirectoryControl(PreparedDirectoryControl),
     /// File-system control with a sealed minor-function classification.
     FileSystemControl(FileSystemControlMinorFunction),
+    /// Retrieval request with a copied VCN and uniquely owned locked output pages.
+    RetrievalPointers {
+        /// Nonnegative file-space allocation-unit index decoded in requestor context.
+        starting_vcn: u64,
+        /// Bounded native output capacity retained until publication or cancellation.
+        output: CapturedRequestorOutput,
+    },
     /// Byte-range lock or unlock request whose live lock parameters remain IRP-owned.
     LockControl,
     /// Flush request.
@@ -861,7 +894,7 @@ pub(crate) enum PreparedRequest {
         /// Security components selected in requestor context.
         selection: SecuritySelection,
         /// Opaque native target that never exposes requestor memory to Rust.
-        output: CapturedQuerySecurityOutput,
+        output: CapturedRequestorOutput,
     },
     /// Set-security request with an owned, bounded descriptor snapshot.
     SetSecurity {
@@ -961,7 +994,15 @@ impl PreparedRequest {
                 let minor = stack.file_system_control_minor();
                 let key = match minor {
                     FileSystemControlMinorFunction::MountVolume => QueueCancellationKey::Device,
-                    FileSystemControlMinorFunction::UserFsRequest => generic_key(),
+                    FileSystemControlMinorFunction::UserFsRequest => {
+                        let control = stack
+                            .file_system_control()
+                            .map_err(IrpCompletion::from_error)?;
+                        if control.fs_control_code() == super::FsControlCode::GetRetrievalPointers {
+                            return capture_retrieval_pointers(target, control, generic_key());
+                        }
+                        generic_key()
+                    }
                     FileSystemControlMinorFunction::Unsupported => {
                         return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest));
                     }
@@ -984,11 +1025,12 @@ impl PreparedRequest {
             DispatchMajor::SetEa => Ok((Self::SetEa, generic_key())),
             DispatchMajor::QuerySecurity => {
                 let query = stack.query_security().map_err(IrpCompletion::from_error)?;
-                let output = CapturedQuerySecurityOutput::capture(
-                    target,
-                    query.length(),
-                    query.selection(),
-                )?;
+                let required = query.selection().query_descriptor_length();
+                if query.length().as_usize() < required {
+                    return Err(IrpCompletion::buffer_overflow(required)
+                        .unwrap_or_else(IrpCompletion::from_error));
+                }
+                let output = CapturedRequestorOutput::capture(target, required)?;
                 Ok((
                     Self::QuerySecurity {
                         selection: query.selection(),
@@ -1145,6 +1187,199 @@ impl QueueFileObjectAddress {
     /// Returns whether a CSQ cleanup context names this captured FILE_OBJECT.
     fn matches(self, context: PVOID) -> bool {
         NonZeroUsize::new(context.expose_provenance()) == Some(self.0)
+    }
+}
+
+/// Seals the signed input and a bounded output prefix before leaving requestor context.
+/// The limit bounds pinned pages per IRP; larger declared buffers use continuation semantics.
+/// # Errors
+/// Returns malformed input, short output, or native capture failure before queue publication.
+#[cfg_attr(
+    not(test),
+    expect(
+        unsafe_code,
+        reason = "the native boundary copies Type3 input under SEH before the request can leave its process"
+    )
+)]
+fn capture_retrieval_pointers(
+    target: &ActiveIrp<'_>,
+    stack: super::FileSystemControlStack,
+    key: QueueCancellationKey,
+) -> Result<(PreparedRequest, QueueCancellationKey), IrpCompletion> {
+    if stack.input_buffer_length().as_usize() < 8 {
+        return Err(IrpCompletion::from_error(DriverError::InvalidParameter));
+    }
+    if stack.output_buffer_length().as_usize() < 32 {
+        return Err(IrpCompletion::from_error(DriverError::BufferTooSmall));
+    }
+    #[cfg(not(test))]
+    let starting_vcn = {
+        let mut value = 0_i64;
+        let status = unsafe {
+            // SAFETY: Dispatch owns this live FSCTL IRP in requestor context. Native capture
+            // probes and copies only the fixed STARTING_VCN prefix, never forming a Rust view.
+            ffi::ext4win_capture_starting_vcn(target.irp.as_ptr(), core::ptr::addr_of_mut!(value))
+        };
+        ensure_native_success(status)?;
+        u64::try_from(value)
+            .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?
+    };
+    #[cfg(test)]
+    let starting_vcn = 0;
+    let capacity = stack
+        .output_buffer_length()
+        .as_usize()
+        .min(RETRIEVAL_OUTPUT_MAXIMUM);
+    let output = CapturedRequestorOutput::capture(target, capacity)?;
+    Ok((
+        PreparedRequest::RetrievalPointers {
+            starting_vcn,
+            output,
+        },
+        key,
+    ))
+}
+
+/// Locked requestor pages retained across actor suspension without a Rust memory view.
+/// Capture fixes capacity; one owned prefix publication consumes the pages, and Drop releases
+/// an unpublished target. The pending IRP owns this value until completion or cancellation.
+#[derive(Debug)]
+pub(crate) struct CapturedRequestorOutput {
+    /// Exact writable prefix fixed in requestor context.
+    capacity: NonZeroUsize,
+    /// Unique native ownership; no pointer is exposed to consumers.
+    #[cfg(not(test))]
+    state: RequestorOutputState,
+}
+
+/// Publication consumes native ownership even when the native copy rejects an invalid source.
+#[cfg(not(test))]
+#[derive(Debug)]
+enum RequestorOutputState {
+    /// Native owner of locked pages and their system mapping.
+    Pending(NonNull<c_void>),
+    /// Publication has released the native owner.
+    Consumed,
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the opaque native owner retains locked pages until consuming publication or Drop"
+)]
+// SAFETY: The unique output never forms a Rust reference to requestor memory. Its native MDL
+// owns page residency independently of the requestor thread, and every terminal path releases it.
+unsafe impl Send for CapturedRequestorOutput {}
+
+impl CapturedRequestorOutput {
+    /// Locks only the supplied writable prefix before queue insertion.
+    /// # Errors
+    /// Returns a native page-lock failure or invalid-parameter for empty/excess capacity.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "dispatch owns the IRP and its requestor process while C probes and locks output pages"
+        )
+    )]
+    fn capture(target: &ActiveIrp<'_>, capacity: usize) -> Result<Self, IrpCompletion> {
+        let capacity = NonZeroUsize::new(capacity)
+            .ok_or_else(|| IrpCompletion::from_error(DriverError::InvalidParameter))?;
+        #[cfg(not(test))]
+        {
+            let length = wdk_sys::ULONG::try_from(capacity.get())
+                .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?;
+            let irp = unsafe {
+                // SAFETY: Dispatch retains the live IRP through queue-time capture.
+                target.irp.as_ref()
+            };
+            let mut native = core::ptr::null_mut();
+            let status = unsafe {
+                // SAFETY: Capacity was bounded by the request decoder. C probes and locks exactly
+                // that writable prefix in requestor context and transfers an opaque owner.
+                ffi::ext4win_capture_requestor_output(
+                    core::ptr::addr_of_mut!(native),
+                    irp.UserBuffer,
+                    length,
+                    irp.RequestorMode,
+                )
+            };
+            ensure_native_success(status)?;
+            let native = NonNull::new(native).ok_or_else(|| {
+                IrpCompletion::from_error(DriverError::InternalInvariantViolation)
+            })?;
+            Ok(Self {
+                capacity,
+                state: RequestorOutputState::Pending(native),
+            })
+        }
+        #[cfg(test)]
+        {
+            let _retained = (target, capacity);
+            Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
+        }
+    }
+
+    /// Capacity of the locked prefix, independent of the requestor's larger declared buffer.
+    pub(crate) const fn capacity(&self) -> usize {
+        self.capacity.get()
+    }
+
+    /// Publishes initialized owned bytes and releases native page ownership before returning.
+    /// # Errors
+    /// Returns an invariant failure for excess source length or repeated publication.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "C consumes the unique opaque target while copying disjoint initialized driver bytes"
+        )
+    )]
+    pub(crate) fn copy_from_owned(&mut self, source: &[u8]) -> DriverResult<()> {
+        if source.len() > self.capacity.get() {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        #[cfg(not(test))]
+        {
+            let length = wdk_sys::ULONG::try_from(source.len())
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            let RequestorOutputState::Pending(native) =
+                core::mem::replace(&mut self.state, RequestorOutputState::Consumed)
+            else {
+                return Err(DriverError::InternalInvariantViolation);
+            };
+            let status = unsafe {
+                // SAFETY: Source is owned initialized memory disjoint from the opaque requestor
+                // mapping; the unique native target is consumed, including on failure.
+                ffi::ext4win_copy_requestor_output(native.as_ptr(), source.as_ptr().cast(), length)
+            };
+            if status < STATUS_SUCCESS {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            Ok(())
+        }
+        #[cfg(test)]
+        {
+            Err(DriverError::InvalidDeviceRequest)
+        }
+    }
+}
+
+impl Drop for CapturedRequestorOutput {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "Drop owns and releases the sole unpublished native page target"
+        )
+    )]
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        if let RequestorOutputState::Pending(native) = &self.state {
+            unsafe {
+                // SAFETY: This target has never been consumed; Drop releases it exactly once.
+                ffi::ext4win_release_requestor_output(native.as_ptr());
+            }
+        }
     }
 }
 

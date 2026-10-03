@@ -174,7 +174,7 @@ impl ExtentBlockRun {
     pub const fn blocks(self) -> NonZeroU64 {
         match self {
             Self::Initialized { blocks, .. }
-            | Self::Uninitialized { blocks }
+            | Self::Uninitialized { blocks, .. }
             | Self::Hole { blocks } => blocks,
         }
     }
@@ -943,7 +943,16 @@ fn map_extent_run(
                     blocks,
                 }
             }
-            ExtentInitialization::Uninitialized => ExtentBlockRun::Uninitialized { blocks },
+            ExtentInitialization::Uninitialized => ExtentBlockRun::Uninitialized {
+                physical_start: BlockAddress::new(
+                    extent
+                        .physical_start()
+                        .get()
+                        .checked_add(offset)
+                        .ok_or(Error::InvalidExtentTree)?,
+                ),
+                blocks,
+            },
         });
     }
     Ok(ExtentBlockRun::Hole {

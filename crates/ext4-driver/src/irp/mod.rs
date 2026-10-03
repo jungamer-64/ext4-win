@@ -39,7 +39,7 @@ mod stack;
 pub(crate) use buffer::*;
 use buffer::{mdl_data_buffer_address, stack_flag};
 pub(crate) use capture::{
-    CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
+    CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRead, PreparedRequest,
     PreparedWrite,
 };

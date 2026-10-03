@@ -914,8 +914,15 @@ impl<'a> PendingIrpLease<'a> {
     /// Returns an invariant error when the queued request was not prepared as query-security.
     pub(crate) fn query_security_parts(
         self,
-    ) -> DriverResult<(SecuritySelection, &'a mut CapturedQuerySecurityOutput)> {
+    ) -> DriverResult<(SecuritySelection, &'a mut CapturedRequestorOutput)> {
         self.owner.context.query_security_parts()
+    }
+
+    /// Borrows the copied VCN and locked output for a retrieval query.
+    /// # Errors
+    /// Returns an invariant error when this pending request is not a retrieval query.
+    pub(crate) fn retrieval_parts(self) -> DriverResult<(u64, &'a mut CapturedRequestorOutput)> {
+        self.owner.context.retrieval_parts()
     }
 
     /// Borrows the owned set-security descriptor for the lifetime of this pending request.

@@ -15,3 +15,5 @@ pub(crate) mod operation;
 pub(crate) mod reparse;
 pub(crate) mod security;
 pub(crate) mod volume_info;
+
+mod retrieval;

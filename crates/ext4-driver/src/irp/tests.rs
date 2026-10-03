@@ -819,6 +819,10 @@ fn ext4win_private_fsctl_codes_decode_to_domain_variants() {
 #[test]
 fn standard_volume_fsctl_codes_decode_to_domain_variants() {
     assert_eq!(
+        FsControlCode::from_raw(0x0009_0073),
+        Ok(FsControlCode::GetRetrievalPointers)
+    );
+    assert_eq!(
         FsControlCode::from_raw(0x0009_0018),
         Ok(FsControlCode::LockVolume)
     );

@@ -364,6 +364,76 @@ impl EpochReadView<'_, '_> {
         }
     }
 
+    /// Observes one payload allocation run without reading file contents or building a full tree.
+    /// # Errors
+    /// Returns invalid identity, unaligned/range, extent checksum/routing, or backing I/O failures.
+    pub(super) fn node_data_allocation(
+        &mut self,
+        node: NodeId,
+        offset: FileOffset,
+    ) -> Result<Option<super::node::DataAllocationRun>> {
+        let loaded = self.load_validated_node(node)?;
+        let inode = match &loaded {
+            LoadedNode::File(file) => file.inode(),
+            LoadedNode::Directory(directory) => directory.inode(),
+            LoadedNode::Symlink(symlink) => symlink.inode(),
+        };
+        let root = match inode.storage() {
+            crate::disk_format::inode::InodeStorage::InlineBytes(_) => return Ok(None),
+            crate::disk_format::inode::InodeStorage::Extents(root) => root,
+            crate::disk_format::inode::InodeStorage::UnsupportedBlockMap => {
+                return Err(Error::UnsupportedBlockMap);
+            }
+        };
+        let size = self.superblock.block_size();
+        let bytes = u64::from(size.bytes());
+        if !offset.bytes().is_multiple_of(bytes) {
+            return Err(Error::DeviceRange);
+        }
+        let context = self.extent_tree_context(inode);
+        let mut mapping = ExtentMappingCursor::new(root, size, context)?;
+        let eof = round_up_div(inode.size().bytes(), bytes)?;
+        let end = if inode.protection().is_verity() {
+            eof
+        } else {
+            eof.max(mapping.allocation_end(&mut self.device)?)
+        };
+        let logical = offset
+            .bytes()
+            .checked_div(bytes)
+            .ok_or(Error::InvalidExtentTree)?;
+        if logical >= end {
+            return Ok(None);
+        }
+        let run = mapping.map_run(
+            LogicalBlock::try_from(logical)?,
+            NonZeroU64::new(end.checked_sub(logical).ok_or(Error::InvalidExtentTree)?)
+                .ok_or(Error::InvalidExtentTree)?,
+            &mut self.device,
+        )?;
+        let physical = match run {
+            ExtentBlockRun::Initialized { physical_start, .. }
+            | ExtentBlockRun::Uninitialized { physical_start, .. } => {
+                Some(size.offset_of(physical_start)?)
+            }
+            ExtentBlockRun::Hole { .. } => None,
+        };
+        let end = offset
+            .bytes()
+            .checked_add(
+                run.blocks()
+                    .get()
+                    .checked_mul(bytes)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::ArithmeticOverflow)?;
+        Ok(Some(super::node::DataAllocationRun {
+            start: offset,
+            end: FileOffset::from_bytes(end),
+            physical,
+        }))
+    }
+
     /// Reads file bytes from a typed regular file node.
     ///
     /// # Errors

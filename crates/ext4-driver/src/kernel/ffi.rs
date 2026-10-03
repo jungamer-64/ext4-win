@@ -129,25 +129,29 @@ pub(crate) use wdk_sys::ntddk::{
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe extern "system" {
-    /// Captures an exact-length query-security output as an opaque native target.
-    pub(crate) fn ext4win_capture_query_security_output(
+    /// Copies the fixed signed VCN from the current FSCTL's Type3 buffer under SEH.
+    pub(crate) fn ext4win_capture_starting_vcn(
+        irp: wdk_sys::PIRP,
+        value: *mut i64,
+    ) -> wdk_sys::NTSTATUS;
+
+    /// Locks a bounded writable requestor prefix as an opaque owning native target.
+    pub(crate) fn ext4win_capture_requestor_output(
         output_out: *mut wdk_sys::PVOID,
-        required_length_out: *mut wdk_sys::ULONG,
         requestor_buffer: wdk_sys::PVOID,
-        requestor_buffer_length: wdk_sys::ULONG,
-        required_length: wdk_sys::ULONG,
+        capacity: wdk_sys::ULONG,
         requestor_mode: wdk_sys::KPROCESSOR_MODE,
     ) -> wdk_sys::NTSTATUS;
 
     /// Copies owned bytes into a captured query target, then consumes and unlocks the target.
-    pub(crate) fn ext4win_copy_query_security_output(
+    pub(crate) fn ext4win_copy_requestor_output(
         output: wdk_sys::PVOID,
         owned_source: *const core::ffi::c_void,
         source_length: wdk_sys::ULONG,
     ) -> wdk_sys::NTSTATUS;
 
-    /// Releases a captured query target.
-    pub(crate) fn ext4win_release_query_security_output(output: wdk_sys::PVOID);
+    /// Releases an unconsumed locked requestor output.
+    pub(crate) fn ext4win_release_requestor_output(output: wdk_sys::PVOID);
 
     /// Bounded-copies and validates one caller descriptor into owned, aligned native memory.
     pub(crate) fn ext4win_capture_set_security_descriptor(
