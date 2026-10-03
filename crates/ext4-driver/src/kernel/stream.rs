@@ -344,6 +344,47 @@ impl Drop for QueryRemovalPreparation {
 unsafe impl Send for QueryRemovalPreparation {}
 
 impl StorageRemovalPublisher {
+    /// Forwards the original cancel-remove before undoing reversible create admission.
+    /// Lower failure leaves the query gate closed; terminal removal is never reversed.
+    /// # Safety
+    /// The caller must exclusively own this live unqueued CANCEL_REMOVE IRP on the system PnP
+    /// thread at PASSIVE_LEVEL. Mounted dispatch rundown must retain this header and lower route
+    /// through the native wait. The caller retains completion authority when this call returns.
+    #[expect(
+        unsafe_code,
+        reason = "the original PnP completion owner retains the native header, lower route and IRP through the synchronous boundary"
+    )]
+    pub(crate) unsafe fn cancel_remove(
+        &self,
+        _lower: crate::state::KernelDevice,
+        _irp: NonNull<wdk_sys::IRP>,
+    ) -> NTSTATUS {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The caller owns this original PnP IRP and retains both native devices
+            // through lower completion and the atomic create-gate transition.
+            ext4win_stream_cancel_remove(self.address.as_ptr(), _lower.as_ptr(), _irp.as_ptr())
+        }
+        #[cfg(test)]
+        {
+            let irp = unsafe {
+                // SAFETY: The fixture caller retains the completed lower reply in this live IRP.
+                _irp.as_ref()
+            };
+            let status = unsafe {
+                // SAFETY: The host fixture initializes the status arm of the IO_STATUS_BLOCK.
+                irp.IoStatus.__bindgen_anon_1.Status
+            };
+            if status >= wdk_sys::STATUS_SUCCESS {
+                let state = unsafe {
+                    // SAFETY: The enclosing dispatch fixture retains this host volume query gate.
+                    self.query_address.as_ref()
+                };
+                let _observed = state.compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
+            status
+        }
+    }
     /// Stops storage submissions before forwarding a terminal PnP notification. Surprise removal
     /// revokes access; final removal additionally permits physical mounted-device retirement.
     #[expect(
@@ -1649,7 +1690,11 @@ unsafe extern "system" {
     fn ext4win_stream_prepare_query_remove(volume_header: wdk_sys::PVOID) -> u8;
     fn ext4win_stream_abort_query_remove(volume_header: wdk_sys::PVOID);
     fn ext4win_stream_publish_query_remove(volume_header: wdk_sys::PVOID) -> u8;
-    fn ext4win_stream_cancel_query_remove(volume_header: wdk_sys::PVOID);
+    fn ext4win_stream_cancel_remove(
+        volume_header: wdk_sys::PVOID,
+        lower: wdk_sys::PDEVICE_OBJECT,
+        irp: wdk_sys::PIRP,
+    ) -> NTSTATUS;
     fn ext4win_stream_begin_storage_submission(volume_header: wdk_sys::PVOID) -> u8;
     fn ext4win_stream_end_storage_submission(volume_header: wdk_sys::PVOID);
     fn ext4win_stream_volume_control_device(
@@ -1800,7 +1845,19 @@ mod tests {
             // SAFETY: The fixture owns PnP publication and retains its volume throughout the test.
             volume.storage_removal_publisher()
         }?;
-        publisher.cancel_query_removal();
+        let mut lower_device = wdk_sys::DEVICE_OBJECT::default();
+        let lower = unsafe {
+            // SAFETY: This local device remains live through every host lower-reply observation.
+            crate::state::KernelDevice::from_raw(core::ptr::from_mut(&mut lower_device))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let mut lower_reply = wdk_sys::IRP::default();
+        let reply = core::ptr::NonNull::from(&mut lower_reply);
+        let status = unsafe {
+            // SAFETY: The local unqueued reply and native gate remain retained for this call.
+            publisher.cancel_remove(lower, reply)
+        };
+        assert_eq!(status, wdk_sys::STATUS_SUCCESS);
         assert_eq!(storage.authorize_create(), Ok(()));
         let preparation = unsafe {
             // SAFETY: The local volume outlives this unique preparation.
@@ -1809,7 +1866,11 @@ mod tests {
         assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
         assert_eq!(storage.authorize(), Ok(()));
         drop(storage.acquire_submission()?);
-        publisher.cancel_query_removal();
+        let status = unsafe {
+            // SAFETY: The fixture owns the unqueued reply and retains the volume query gate.
+            publisher.cancel_remove(lower, reply)
+        };
+        assert_eq!(status, wdk_sys::STATUS_SUCCESS);
         assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
         drop(preparation);
         assert_eq!(storage.authorize_create(), Ok(()));
@@ -1819,7 +1880,11 @@ mod tests {
         }?;
         preparation.publish()?;
         assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
-        publisher.cancel_query_removal();
+        let status = unsafe {
+            // SAFETY: The host reply is complete and retained through cancellation publication.
+            publisher.cancel_remove(lower, reply)
+        };
+        assert_eq!(status, wdk_sys::STATUS_SUCCESS);
         assert_eq!(storage.authorize_create(), Ok(()));
         let preparation = unsafe {
             // SAFETY: The fixture retains the unpublished preparation across terminal revocation.
@@ -1827,7 +1892,11 @@ mod tests {
         }?;
         publisher.publish(super::StorageRemovalNotification::Surprise);
         assert_eq!(preparation.publish(), Err(DriverError::DeviceRemoved));
-        publisher.cancel_query_removal();
+        let status = unsafe {
+            // SAFETY: Both the completed reply and terminally revoked volume remain retained.
+            publisher.cancel_remove(lower, reply)
+        };
+        assert_eq!(status, wdk_sys::STATUS_SUCCESS);
         assert_eq!(storage.authorize_create(), Err(DriverError::DeviceRemoved));
         assert_eq!(storage.authorize(), Err(DriverError::DeviceRemoved));
         Ok(())

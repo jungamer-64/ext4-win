@@ -636,34 +636,25 @@ impl ReceivedIrp {
 
     /// Waits for lower cancellation on the PnP system thread before reopening create admission.
     /// No allocation or actor work is needed; dispatch rundown retains the native gate throughout.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "PnP CANCEL_REMOVE arrives at PASSIVE_LEVEL and dispatch rundown retains both devices"
-        )
+    #[expect(
+        unsafe_code,
+        reason = "PnP CANCEL_REMOVE arrives at PASSIVE_LEVEL and dispatch rundown retains both devices"
     )]
     pub(crate) fn cancel_remove(
         self,
         _lower: KernelDevice,
         _publisher: &crate::kernel::stream::StorageRemovalPublisher,
     ) -> NTSTATUS {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: This is the original unqueued CANCEL_REMOVE; the system thread and
-                // mounted dispatch lease retain its stack and lower device through the wait.
-                ext4win_forward_pnp_synchronously(_lower.as_ptr(), self.target.irp.as_ptr())
-            };
-            if status >= STATUS_SUCCESS {
-                _publisher.cancel_query_removal();
-            }
-            self.target
-                .irp
-                .complete(IrpCompletion::from_native_failure(status))
-        }
-        #[cfg(test)]
-        self.complete_result(Err(DriverError::NotSupported))
+        let status = unsafe {
+            // SAFETY: This is the original unqueued CANCEL_REMOVE; the system thread and
+            // mounted dispatch lease retain its stack and lower device through the wait.
+            _publisher.cancel_remove(_lower, self.target.irp.irp)
+        };
+        self.target.irp.complete(if status >= STATUS_SUCCESS {
+            IrpCompletion::EMPTY
+        } else {
+            IrpCompletion::from_native_failure(status)
+        })
     }
     /// Decodes raw WDK dispatch pointers into a received IRP.
     /// # Safety
@@ -742,10 +733,6 @@ unsafe extern "system" {
         action: MdlAction,
     ) -> NTSTATUS;
     fn ext4win_forward_original_irp(
-        device: wdk_sys::PDEVICE_OBJECT,
-        irp: wdk_sys::PIRP,
-    ) -> NTSTATUS;
-    fn ext4win_forward_pnp_synchronously(
         device: wdk_sys::PDEVICE_OBJECT,
         irp: wdk_sys::PIRP,
     ) -> NTSTATUS;

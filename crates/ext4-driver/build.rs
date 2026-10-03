@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");
     println!("cargo:rerun-if-changed=native/executive_resource.h");
     println!("cargo:rerun-if-changed=native/storage_admission.h");
+    println!("cargo:rerun-if-changed=native/pnp_remove.h");
     println!("cargo:rerun-if-changed=native/cache_mdl.h");
     println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_SOURCE}");
     println!("cargo:rerun-if-changed=native/operational_trace.h");

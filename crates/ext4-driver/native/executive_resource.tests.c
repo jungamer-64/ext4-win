@@ -75,6 +75,28 @@ static LONG InterlockedExchange(volatile LONG *target, LONG replacement)
 
 #include "storage_admission.h"
 
+typedef LONG NTSTATUS;
+typedef struct { unsigned identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
+typedef struct { struct { NTSTATUS Status; } IoStatus; } IRP, *PIRP;
+#define STATUS_SUCCESS ((NTSTATUS)0)
+#define STATUS_INVALID_DEVICE_REQUEST ((NTSTATUS)-1)
+static PEXT4WIN_STORAGE_ADMISSION forward_storage;
+static PDEVICE_OBJECT forward_lower;
+static BOOLEAN forward_succeeds;
+static NTSTATUS lower_status;
+
+static BOOLEAN IoForwardIrpSynchronously(PDEVICE_OBJECT lower, PIRP irp)
+{
+    assert(lower == forward_lower);
+    assert(irp->IoStatus.Status == STATUS_SUCCESS);
+    assert(forward_storage->QueryRemoveState == 2);
+    assert(!ext4win_storage_create_admitted(forward_storage));
+    irp->IoStatus.Status = lower_status;
+    return forward_succeeds;
+}
+
+#include "pnp_remove.h"
+
 int main(void)
 {
     unsigned incoming;
@@ -190,6 +212,33 @@ int main(void)
         ext4win_storage_cancel_query_remove(&storage);
         assert(!ext4win_storage_create_admitted(&storage));
         assert(ext4win_storage_removal_state(&storage) == 1);
+    }
+    {
+        EXT4WIN_STORAGE_ADMISSION storage;
+        DEVICE_OBJECT lower;
+        IRP irp;
+        storage.Submissions.held = 0;
+        storage.RemovalState = 0;
+        storage.QueryRemoveState = 2;
+        lower.identity = 1;
+        forward_storage = &storage;
+        forward_lower = &lower;
+        forward_succeeds = FALSE;
+        lower_status = STATUS_SUCCESS;
+        assert(ext4win_pnp_cancel_remove(&storage, &lower, &irp) == STATUS_INVALID_DEVICE_REQUEST);
+        assert(storage.QueryRemoveState == 2);
+        forward_succeeds = TRUE;
+        lower_status = (NTSTATUS)-2;
+        assert(ext4win_pnp_cancel_remove(&storage, &lower, &irp) == lower_status);
+        assert(storage.QueryRemoveState == 2);
+        lower_status = STATUS_SUCCESS;
+        assert(ext4win_pnp_cancel_remove(&storage, &lower, &irp) == STATUS_SUCCESS);
+        assert(ext4win_storage_create_admitted(&storage));
+        storage.QueryRemoveState = 2;
+        storage.RemovalState = 1;
+        assert(ext4win_pnp_cancel_remove(&storage, &lower, &irp) == STATUS_SUCCESS);
+        assert(!ext4win_storage_create_admitted(&storage));
+        assert(storage.RemovalState == 1);
     }
     return 0;
 }
