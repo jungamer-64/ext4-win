@@ -360,6 +360,7 @@ impl StreamContext {
         &self,
         owner: NonNull<c_void>,
         locks: NonNull<wdk_sys::FILE_LOCK>,
+        volume: &StreamContext,
     ) -> DriverResult<()> {
         if self.kind != StreamOwnerKind::Node {
             return Err(DriverError::InternalInvariantViolation);
@@ -368,13 +369,15 @@ impl StreamContext {
         {
             let status = unsafe {
                 // SAFETY: The caller establishes the pinned common lifetime documented above.
-                ext4win_stream_bind_node_owner(self.header.as_ptr(), owner.as_ptr(), locks.as_ptr())
+                ext4win_stream_bind_node_owner(
+                    self.header.as_ptr(), owner.as_ptr(), locks.as_ptr(), volume.header.as_ptr(),
+                )
             };
             native_status(status)
         }
         #[cfg(test)]
         {
-            let _locks = locks;
+            let _retained = (locks, volume);
             self.owner
                 .compare_exchange(
                     core::ptr::null_mut(),
@@ -1273,6 +1276,7 @@ unsafe extern "system" {
         stream_header: wdk_sys::PVOID,
         owner: wdk_sys::PVOID,
         byte_range_locks: *mut wdk_sys::FILE_LOCK,
+        volume_header: wdk_sys::PVOID,
     ) -> NTSTATUS;
     fn ext4win_stream_bind_volume_owner(
         stream_header: wdk_sys::PVOID,

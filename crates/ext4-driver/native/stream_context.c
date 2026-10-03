@@ -75,6 +75,9 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     PVOID Owner;
     /* Published once with the VCB owner, before any volume FILE_OBJECT is exposed. */
     PDEVICE_OBJECT VolumeControlDevice;
+    /* The VCB outlives all ledger-owned node streams, including mapped sections. */
+    struct _EXT4WIN_STREAM_CONTEXT *VolumeStream;
+    volatile LONG StorageRemoved;
     PFILE_LOCK ByteRangeLocks;
     PVOID AePushLock;
     REGHANDLE TraceRegistrationHandle;
@@ -741,17 +744,20 @@ NTAPI
 ext4win_stream_bind_node_owner(
     _In_ PVOID stream_header,
     _In_ PVOID owner,
-    _Inout_ PFILE_LOCK byte_range_locks)
+    _Inout_ PFILE_LOCK byte_range_locks,
+    _In_ PVOID volume_header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
 
     if ((stream == NULL) || (stream->Kind != 1) || (owner == NULL) ||
         (byte_range_locks == NULL) || (stream->Owner != NULL) ||
-        (stream->ByteRangeLocks != NULL)) {
+        (stream->ByteRangeLocks != NULL) || (volume == NULL) || (volume->Kind != 2)) {
         return STATUS_INVALID_PARAMETER;
     }
     stream->Owner = owner;
     stream->ByteRangeLocks = byte_range_locks;
+    stream->VolumeStream = volume;
     ext4win_stream_refresh_fast_io_projection(stream);
     return STATUS_SUCCESS;
 }
