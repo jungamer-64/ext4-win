@@ -305,23 +305,29 @@ fn export(package: &Package, directory: &Path, expected: &str) -> TaskResult<()>
     Ok(())
 }
 
-/// Verifies the exact service policy, raw path, DriverStore mapping and current SYS bytes.
+/// Compares machine-local path components without requiring a surviving package file.
+/// Separator spelling and ASCII case are insignificant; filesystem aliases are not resolved.
+fn same_local_path(left: &Path, right: &Path) -> bool {
+    left.components().count() == right.components().count()
+        && left
+            .components()
+            .zip(right.components())
+            .all(|(left, right)| left.as_os_str().eq_ignore_ascii_case(right.as_os_str()))
+}
+
+/// Binds a service observation to its retained raw spelling and selected package mapping.
 /// # Errors
-/// Returns changed service, path, package or byte identity.
-fn service_identity(
+/// Rejects policy changes, a different package image or a path outside the machine DriverStore.
+fn service_mapping(
     package: &InstalledPackage,
+    configuration: &windows_host::ServiceConfiguration,
     raw: &str,
-    expected: &str,
-    require_file: bool,
-) -> TaskResult<()> {
-    let configuration = windows_host::service_configuration("ext4win")?;
+) -> TaskResult<PathBuf> {
     let path = windows_host::driver_path(&configuration.image)?;
     if configuration.kind != 2
         || configuration.start != 3
         || configuration.image != raw
-        || !path
-            .as_os_str()
-            .eq_ignore_ascii_case(package.image.as_os_str())
+        || !same_local_path(&path, &package.image)
     {
         return Err(io::Error::other(
             "service policy or ImagePath differs from the package-bound identity",
@@ -335,7 +341,7 @@ fn service_identity(
     if !path
         .parent()
         .and_then(Path::parent)
-        .is_some_and(|parent| parent.as_os_str().eq_ignore_ascii_case(root.as_os_str()))
+        .is_some_and(|parent| same_local_path(parent, &root))
         || !path
             .file_name()
             .is_some_and(|name| name.eq_ignore_ascii_case("ext4win.sys"))
@@ -349,6 +355,20 @@ fn service_identity(
             io::Error::other("service ImagePath escaped the selected DriverStore image").into(),
         );
     }
+    Ok(path)
+}
+
+/// Verifies service identity before hashing the current SYS or admitting deleted-image cleanup.
+/// # Errors
+/// Returns changed service, path, package or byte identity.
+fn service_identity(
+    package: &InstalledPackage,
+    raw: &str,
+    expected: &str,
+    require_file: bool,
+) -> TaskResult<()> {
+    let configuration = windows_host::service_configuration("ext4win")?;
+    let path = service_mapping(package, &configuration, raw)?;
     if path.is_file() {
         if !sha256_file(&path)?.eq_ignore_ascii_case(expected) {
             return Err(
@@ -585,7 +605,10 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
             }
         };
         if observed.oem != package.oem
-            || windows_host::driver_store_image(&observed.oem)? != package.image
+            || !same_local_path(
+                &windows_host::driver_store_image(&observed.oem)?,
+                &package.image,
+            )
         {
             return Err(io::Error::other("remaining OEM package identity changed").into());
         }
@@ -702,6 +725,71 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Package binding uses the machine DriverStore path and preserves exact recovery spelling.
+    /// # Errors
+    /// Returns missing machine-root or service-path resolution failures.
+    /// # Panics
+    /// Panics if the selected image is rejected or a changed service identity is admitted.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions check package and service admission after fallible path resolution"
+    )]
+    fn service_mapping_contract() -> TaskResult<()> {
+        let root = std::env::var("SystemRoot")?;
+        let relative =
+            r"System32\DriverStore\FileRepository\ext4win.inf_amd64_0123456789abcdef\ext4win.sys";
+        let package = InstalledPackage {
+            oem: "oem12.inf".into(),
+            image: PathBuf::from(format!(r"{root}\{relative}")),
+        };
+        let configuration = windows_host::ServiceConfiguration {
+            kind: 2,
+            start: 3,
+            image: format!(r"\SystemRoot\{relative}"),
+        };
+        assert_eq!(
+            service_mapping(&package, &configuration, &configuration.image)?,
+            package.image,
+        );
+        let mixed_package = InstalledPackage {
+            oem: package.oem.clone(),
+            image: PathBuf::from(format!(
+                "{root}/System32/DriverStore/FileRepository/ext4win.inf_amd64_0123456789abcdef/EXT4WIN.SYS"
+            )),
+        };
+        assert!(service_mapping(&mixed_package, &configuration, &configuration.image).is_ok());
+        let changed_raw = configuration.image.to_ascii_lowercase();
+        assert!(service_mapping(&package, &configuration, &changed_raw).is_err());
+        let unrelated = InstalledPackage {
+            oem: "oem13.inf".into(),
+            image: PathBuf::from(format!(
+                r"{root}\System32\DriverStore\FileRepository\ext4win.inf_amd64_fedcba9876543210\ext4win.sys"
+            )),
+        };
+        assert!(service_mapping(&unrelated, &configuration, &configuration.image).is_err());
+        let outside = InstalledPackage {
+            oem: "oem12.inf".into(),
+            image: PathBuf::from(format!(
+                r"{root}\Temp\ext4win.inf_amd64_0123456789abcdef\ext4win.sys"
+            )),
+        };
+        let outside_configuration = windows_host::ServiceConfiguration {
+            kind: 2,
+            start: 3,
+            image: outside.image.to_string_lossy().into_owned(),
+        };
+        assert!(
+            service_mapping(
+                &outside,
+                &outside_configuration,
+                &outside_configuration.image
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 
     /// Machine-store observations match the platform thumbprint search without a Cert drive.
     /// # Errors
