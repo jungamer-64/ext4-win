@@ -959,7 +959,12 @@ fn volume_relative_name(
         OpenedLocation::Root => DriverVec::try_copied_from_slice(&[UTF16_BACKSLASH]),
         OpenedLocation::DirectoryEntry { parent, name } => {
             let loaded = read.load_directory(*parent)?;
-            let child = match read.lookup_child(&loaded, name)? {
+            let visible_name = WindowsName::from_ext4(name)?;
+            let child = match read.lookup_windows_child(
+                &loaded,
+                &visible_name,
+                ext4_core::WindowsNameMatch::Exact,
+            )? {
                 ChildLookup::Found(child) if *child.node() == node => child,
                 ChildLookup::Found(_) | ChildLookup::NotFound => {
                     return node_relative_name(read, node);

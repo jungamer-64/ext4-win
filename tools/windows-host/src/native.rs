@@ -889,11 +889,12 @@ pub fn verify_metadata(path: &Path, relative_name: &str, eof: u64) -> io::Result
         Ok(())
     };
     completed(result, second.close())?;
-    FileHandle::open(path, 0x8000_0000, 0)?.close()?;
+    let data = FileHandle::open(path, 0x8000_0000, 0)?;
     completed(
-        verify_file_information(&first, relative_name, eof),
-        first.close(),
-    )
+        verify_file_information(&data, relative_name, eof),
+        data.close(),
+    )?;
+    first.close()
 }
 
 /// Queries one native information class with an exact expected status and bounded output.
