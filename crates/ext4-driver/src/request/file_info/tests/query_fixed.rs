@@ -1,5 +1,23 @@
+use crate::kernel::status::DriverError;
 use crate::request::file_info::test_support::*;
 use alloc::vec;
+
+/// # Panics
+///
+/// Panics if EA information changes its Windows layout or overwrites bytes past the record.
+#[test]
+fn ea_information_reports_charge_and_rejects_short_output_before_writing() {
+    let mut output = [0xA5_u8; 8];
+    let completion = super::pack_ea_information(&mut output, 37);
+    assert_eq!(completion, crate::irp::IrpCompletion::from_usize(4));
+    assert_eq!(output, [37, 0, 0, 0, 0xA5, 0xA5, 0xA5, 0xA5]);
+    let mut short = [0xA5_u8; 3];
+    assert_eq!(
+        super::pack_ea_information(&mut short, 37),
+        Err(DriverError::BufferTooSmall)
+    );
+    assert_eq!(short, [0xA5; 3]);
+}
 
 /// # Panics
 ///

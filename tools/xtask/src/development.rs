@@ -93,6 +93,7 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     #[cfg(windows)]
     {
         verify_executive_resource(repository_root)?;
+        verify_cache_mdl(repository_root)?;
     }
     run_checked(
         cargo_command(repository_root, &["check", "-p", "ext4win", "--locked"]),
@@ -153,6 +154,42 @@ fn verify_executive_resource(root: &Path) -> TaskResult<()> {
         )
     })();
     let cleanup = crate::process::remove_task_directory(root, &directory, "executive-resource");
+    crate::process::combine_verification_and_cleanup(operation, cleanup)
+}
+
+/// Executes the production Cc MDL transfer boundary against an ownership oracle.
+/// # Errors
+///
+/// Returns compiler, execution, or task-directory cleanup failures.
+#[cfg(windows)]
+fn verify_cache_mdl(root: &Path) -> TaskResult<()> {
+    let directory = crate::process::create_task_directory(root, "cache-mdl")?;
+    let executable = directory.join("mdl-tests.exe");
+    let operation = (|| {
+        let mut compiler = Command::new("clang.exe");
+        compiler
+            .args([
+                "--target=x86_64-pc-windows-msvc",
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-nostdlib",
+                "-fuse-ld=lld",
+                "-Xlinker",
+                "/entry:main",
+                "-Xlinker",
+                "/subsystem:console",
+            ])
+            .arg(root.join("crates/ext4-driver/native/cache_mdl.tests.c"))
+            // SDK imports keep the oracle free of CRT initialization while exercising real SEH.
+            .args(["-lkernel32", "-lntdllp"])
+            .arg("-o")
+            .arg(&executable);
+        run_checked(compiler, "Cache Manager MDL oracle compilation")?;
+        run_checked(Command::new(&executable), "native MDL ownership contract")
+    })();
+    let cleanup = crate::process::remove_task_directory(root, &directory, "cache-mdl");
     crate::process::combine_verification_and_cleanup(operation, cleanup)
 }
 

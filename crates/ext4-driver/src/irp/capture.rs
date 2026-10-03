@@ -828,6 +828,8 @@ impl QueueContext {
 /// Complete set of requests accepted by the asynchronous device lane.
 #[derive(Debug)]
 pub(crate) enum PreparedRequest {
+    /// Cache Manager page acquisition; release notifications bypass this cancellable lane.
+    Mdl(super::MdlTransfer),
     /// Create/open request.
     Create,
     /// Read request with its complete output contract captured.
@@ -886,11 +888,27 @@ impl PreparedRequest {
         match major {
             DispatchMajor::Create => Ok((Self::Create, generic_key())),
             DispatchMajor::Read => Ok((
-                Self::Read(PreparedRead::capture(target, stack)?),
+                match stack.mdl_action(false).map_err(IrpCompletion::from_error)? {
+                    Some(super::MdlAction::Read) => Self::Mdl(super::MdlTransfer::Read),
+                    Some(
+                        super::MdlAction::ReadComplete
+                        | super::MdlAction::WriteComplete
+                        | super::MdlAction::Write,
+                    ) => return Err(IrpCompletion::from_error(DriverError::InvalidParameter)),
+                    None => Self::Read(PreparedRead::capture(target, stack)?),
+                },
                 generic_key(),
             )),
             DispatchMajor::Write => Ok((
-                Self::Write(PreparedWrite::capture(target, stack)?),
+                match stack.mdl_action(true).map_err(IrpCompletion::from_error)? {
+                    Some(super::MdlAction::Write) => Self::Mdl(super::MdlTransfer::Write),
+                    Some(
+                        super::MdlAction::ReadComplete
+                        | super::MdlAction::WriteComplete
+                        | super::MdlAction::Read,
+                    ) => return Err(IrpCompletion::from_error(DriverError::InvalidParameter)),
+                    None => Self::Write(PreparedWrite::capture(target, stack)?),
+                },
                 generic_key(),
             )),
             DispatchMajor::QueryInformation => Ok((Self::QueryInformation, generic_key())),
@@ -1473,6 +1491,39 @@ mod tests {
         major: DispatchMajor,
     ) -> Result<QueueContextOwnership, IrpCompletion> {
         received.with_active(|active| QueueContext::capture(active, major))
+    }
+
+    /// # Panics
+    ///
+    /// Panics if page acquisition tries to map absent caller byte buffers.
+    #[test]
+    fn mdl_requests_are_captured_before_ordinary_byte_buffer_mapping() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file_object = wdk_sys::FILE_OBJECT::default();
+        for (major, minor, expected) in [
+            (DispatchMajor::Read, 2, crate::irp::MdlTransfer::Read),
+            (DispatchMajor::Write, 2, crate::irp::MdlTransfer::Write),
+        ] {
+            let mut irp = wdk_sys::IRP::default();
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MinorFunction: minor,
+                FileObject: core::ptr::from_mut(&mut file_object),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.Read.Length = 8192;
+            let target = build_target(&mut device, &mut irp, &mut stack);
+            assert!(target.is_some());
+            let Some(mut target) = target else {
+                return;
+            };
+            let captured = capture_context(&mut target, major);
+            assert!(captured.is_ok());
+            if let Ok(QueueContextOwnership::Captured(context)) = captured {
+                assert!(
+                    matches!(context.prepared, PreparedRequest::Mdl(action) if action == expected)
+                );
+            }
+        }
     }
 
     /// # Panics

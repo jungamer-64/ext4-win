@@ -35,6 +35,15 @@ use super::scheduler::SlotId;
 /// One fully captured Cache Manager call whose stream lease owns every native identity.
 #[derive(Debug)]
 pub(crate) enum CacheWork {
+    /// Acquire Cache Manager pages for the suspended request.
+    Mdl {
+        /// Retains the exact stream through the native call.
+        file_object: FileObjectCacheLease,
+        /// IRP retained by the suspended operation until worker return.
+        irp: NonNull<wdk_sys::IRP>,
+        /// Read access or preparation for a within-EOF write.
+        action: super::MdlTransfer,
+    },
     /// Read cached bytes into a system-addressable top-level IRP mapping.
     Read {
         /// Stream retained independently from the handle CCB.
@@ -97,6 +106,8 @@ pub(crate) enum CacheWork {
 /// Exact result returned by one Cache Manager work item.
 #[derive(Debug)]
 pub(crate) enum CacheWorkCompletion {
+    /// MDL chain acquisition and observed byte count.
+    Mdl(DriverResult<usize>),
     /// Cached read status and observed transfer byte count.
     Read(DriverResult<usize>),
     /// Cached write acceptance status.
@@ -118,6 +129,18 @@ pub(crate) enum CacheWorkCompletion {
 }
 
 impl CacheWork {
+    /// Captures MDL work under the exclusive top-level completion owner.
+    pub(crate) fn mdl(
+        file_object: FileObjectCacheLease,
+        active: &super::ActiveIrp<'_>,
+        action: super::MdlTransfer,
+    ) -> Self {
+        Self::Mdl {
+            file_object,
+            irp: active.irp,
+            action,
+        }
+    }
     /// Builds one cached read after range, mapping, and stream lease capture.
     pub(crate) const fn read(
         file_object: FileObjectCacheLease,
@@ -186,6 +209,11 @@ impl CacheWork {
     /// Executes the sole native Cc/MM call selected before the actor suspended.
     pub(super) fn execute(self) -> CacheWorkCompletion {
         match self {
+            Self::Mdl {
+                file_object,
+                irp,
+                action,
+            } => CacheWorkCompletion::Mdl(file_object.mdl(irp, action)),
             Self::Read {
                 file_object,
                 offset,
@@ -221,6 +249,7 @@ impl CacheWork {
     /// Preserves the selected operation kind when worker preparation fails before queueing.
     pub(super) fn failed(self, error: DriverError) -> CacheWorkCompletion {
         match self {
+            Self::Mdl { .. } => CacheWorkCompletion::Mdl(Err(error)),
             Self::Read { .. } => CacheWorkCompletion::Read(Err(error)),
             Self::Write { .. } => CacheWorkCompletion::Write(Err(error)),
             Self::Flush { .. } => CacheWorkCompletion::Flush(Err(error)),

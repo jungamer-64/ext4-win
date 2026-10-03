@@ -11,9 +11,21 @@
     (FsRtlIsNtstatusExpected((NTSTATUS)GetExceptionCode())                     \
          ? EXCEPTION_EXECUTE_HANDLER                                           \
          : EXCEPTION_CONTINUE_SEARCH)
+#include "cache_mdl.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
+extern VOID NTAPI ext4win_finish_mdl_completion(_Inout_ PIRP irp, _In_ NTSTATUS status);
+
+/* This consuming call preserves buffered/direct/neither IOCTL semantics and lower cancellation. */
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_forward_device_control(_In_ PDEVICE_OBJECT device, _Inout_ PIRP irp)
+{
+    IoSkipCurrentIrpStackLocation(irp);
+    return IoCallDriver(device, irp);
+}
 
 typedef struct _EXT4WIN_STREAM_METADATA {
     ULONGLONG Epoch;
@@ -50,11 +62,19 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     ERESOURCE MainResource;
     ERESOURCE PagingIoResource;
     SECTION_OBJECT_POINTERS SectionObjects;
+    KSPIN_LOCK MdlCompletionLock;
+    LIST_ENTRY MdlCompletions;
+    /* Prepared before Cc can expose any MDL. Releases can therefore queue without allocation. */
+    PIO_WORKITEM MdlCompletionWorkItem;
+    PFILE_OBJECT MdlCompletionOwner;
+    enum { Ext4MdlCompletionIdle, Ext4MdlCompletionScheduled } MdlCompletionState;
     /* Physical storage charge is not the header's logical section bound. */
     LONGLONG AllocationCharge;
     EXT4WIN_PUBLISHED_STREAM_METADATA PublishedMetadata;
     PVOID FileContextSupport;
     PVOID Owner;
+    /* Published once with the VCB owner, before any volume FILE_OBJECT is exposed. */
+    PDEVICE_OBJECT VolumeControlDevice;
     PFILE_LOCK ByteRangeLocks;
     PVOID AePushLock;
     REGHANDLE TraceRegistrationHandle;
@@ -78,6 +98,71 @@ C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, CreationTimeSeconds) == 8);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, FileAttributes) == 24);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, NumberOfLinks) == 28);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, Directory) == 32);
+
+/* The queued-cycle FILE_OBJECT reference retains the FCB until the final native access. */
+static VOID
+NTAPI
+ext4win_mdl_completion_worker(_In_ PDEVICE_OBJECT device, _In_opt_ PVOID context)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = (PEXT4WIN_STREAM_CONTEXT)context;
+    PFILE_OBJECT owner;
+    KIRQL old_irql;
+    UNREFERENCED_PARAMETER(device);
+    KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
+    owner = stream->MdlCompletionOwner;
+    KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+    for (;;) {
+        PLIST_ENTRY entry;
+        PIRP irp;
+        PIO_STACK_LOCATION stack;
+        ULONG action;
+        ULONG_PTR information;
+        NTSTATUS status;
+        KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
+        if (IsListEmpty(&stream->MdlCompletions)) {
+            stream->MdlCompletionOwner = NULL;
+            stream->MdlCompletionState = Ext4MdlCompletionIdle;
+            KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+            break;
+        }
+        entry = RemoveHeadList(&stream->MdlCompletions);
+        KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+        irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+        stack = IoGetCurrentIrpStackLocation(irp);
+        action = (ULONG)(ULONG_PTR)irp->Tail.Overlay.DriverContext[0];
+        irp->Tail.Overlay.DriverContext[0] = NULL;
+        status = ext4win_cache_mdl_transfer(stack->FileObject, irp, action,
+            stack->Parameters.Read.ByteOffset, 0, 0, &information);
+        ext4win_finish_mdl_completion(irp, status);
+    }
+    /* CLOSE can retire `stream` after this release. No stream access follows it. */
+    ObDereferenceObject(owner);
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+static NTSTATUS
+ext4win_prepare_mdl_completion_worker(PEXT4WIN_STREAM_CONTEXT stream, PFILE_OBJECT file_object)
+{
+    PIO_WORKITEM candidate;
+    KIRQL old_irql;
+    KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
+    if (stream->MdlCompletionWorkItem != NULL) {
+        KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+        return STATUS_SUCCESS;
+    }
+    KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+    candidate = IoAllocateWorkItem(IoGetRelatedDeviceObject(file_object));
+    if (candidate == NULL) { return STATUS_INSUFFICIENT_RESOURCES; }
+    KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
+    if (stream->MdlCompletionWorkItem == NULL) {
+        stream->MdlCompletionWorkItem = candidate;
+        candidate = NULL;
+    }
+    KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+    if (candidate != NULL) { IoFreeWorkItem(candidate); }
+    return STATUS_SUCCESS;
+}
 
 _Success_(return != FALSE)
 static BOOLEAN
@@ -621,6 +706,9 @@ ext4win_stream_create(
     }
 
     ExInitializeFastMutex(&stream->HeaderMutex);
+    KeInitializeSpinLock(&stream->MdlCompletionLock);
+    InitializeListHead(&stream->MdlCompletions);
+    stream->MdlCompletionState = Ext4MdlCompletionIdle;
     stream->Header.Resource = &stream->MainResource;
     stream->Header.PagingIoResource = &stream->PagingIoResource;
     stream->Header.AllocationSize.QuadPart = allocation_size;
@@ -674,16 +762,28 @@ NTSTATUS
 NTAPI
 ext4win_stream_bind_volume_owner(
     _In_ PVOID stream_header,
-    _In_ PVOID owner)
+    _In_ PVOID owner,
+    _In_ PDEVICE_OBJECT control_device)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
 
-    if ((stream == NULL) || (stream->Kind != 2) || (owner == NULL) ||
+    if ((stream == NULL) || (stream->Kind != 2) || (owner == NULL) || (control_device == NULL) ||
         (stream->Owner != NULL) || (stream->ByteRangeLocks != NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
+    stream->VolumeControlDevice = control_device;
     stream->Owner = owner;
     return STATUS_SUCCESS;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+PDEVICE_OBJECT
+NTAPI
+ext4win_stream_volume_control_device(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    return ((stream != NULL) && (stream->Kind == 2) && (stream->Owner != NULL))
+        ? stream->VolumeControlDevice : NULL;
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -1172,6 +1272,91 @@ ext4win_stream_cache_write(
     ext4win_release_resource(&stream->MainResource);
     ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_WRITE, status);
     return status;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cache_mdl(
+    _In_ PVOID stream_header,
+    _Inout_ PFILE_OBJECT file_object,
+    _Inout_ PIRP irp,
+    _In_ ULONG action,
+    _Out_ ULONG_PTR *information_out)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    PIO_STACK_LOCATION stack;
+    LARGE_INTEGER offset;
+    ULONG length;
+    LONGLONG eof;
+    NTSTATUS status;
+
+    if (!ext4win_stream_matches_file_object(stream, file_object) ||
+        (irp == NULL) || (information_out == NULL) || ((action != 0) && (action != 2))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    *information_out = 0;
+    stack = IoGetCurrentIrpStackLocation(irp);
+    offset = stack->Parameters.Read.ByteOffset;
+    length = stack->Parameters.Read.Length;
+    if ((offset.QuadPart < 0) || (irp->MdlAddress != NULL)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    status = ext4win_stream_cache_initialize(stream_header, file_object);
+    if (!NT_SUCCESS(status) || (length == 0)) {
+        return status;
+    }
+    status = ext4win_prepare_mdl_completion_worker(stream, file_object);
+    if (!NT_SUCCESS(status)) { return status; }
+    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    eof = stream->Header.FileSize.QuadPart;
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    status = ext4win_cache_mdl_transfer(file_object, irp, action, offset, length, eof, information_out);
+    ext4win_release_resource(&stream->MainResource);
+    return status;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_queue_mdl_completion(
+    _In_ PFILE_OBJECT file_object,
+    _Inout_ PIRP irp,
+    _In_ ULONG action)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    PIO_WORKITEM work_item;
+    KIRQL old_irql;
+    BOOLEAN queue_worker = FALSE;
+    if ((file_object == NULL) || (irp == NULL) || (irp->MdlAddress == NULL) ||
+        ((action != 1) && (action != 3)) ||
+        ((stream = ext4win_stream_from_header(file_object->FsContext)) == NULL) ||
+        (stream->Kind != 1)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
+    work_item = stream->MdlCompletionWorkItem;
+    if (work_item == NULL) {
+        KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    IoMarkIrpPending(irp);
+    irp->Tail.Overlay.DriverContext[0] = (PVOID)(ULONG_PTR)action;
+    InsertTailList(&stream->MdlCompletions, &irp->Tail.Overlay.ListEntry);
+    if (stream->MdlCompletionState == Ext4MdlCompletionIdle) {
+        ObReferenceObject(file_object);
+        stream->MdlCompletionOwner = file_object;
+        stream->MdlCompletionState = Ext4MdlCompletionScheduled;
+        queue_worker = TRUE;
+    }
+    KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+    if (queue_worker) {
+        IoQueueWorkItem(work_item, ext4win_mdl_completion_worker, DelayedWorkQueue, stream);
+    }
+    return STATUS_PENDING;
 }
 
 _IRQL_requires_max_(APC_LEVEL)
@@ -2166,6 +2351,8 @@ ext4win_mdl_read(
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
+    if (!NT_SUCCESS(ext4win_prepare_mdl_completion_worker(stream, file_object))) { return FALSE; }
     *mdl_chain = NULL;
     handled = FALSE;
     if (!ext4win_stream_acquire_fast_io_main(stream)) {
@@ -2178,6 +2365,11 @@ ext4win_mdl_read(
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+    }
+    if (!NT_SUCCESS(io_status->Status) && (*mdl_chain != NULL)) {
+        CcMdlReadComplete(file_object, *mdl_chain);
+        *mdl_chain = NULL;
         io_status->Information = 0;
     }
     ext4win_release_resource(&stream->MainResource);
@@ -2201,7 +2393,7 @@ ext4win_mdl_read_complete(
     BOOLEAN handled;
 
     UNREFERENCED_PARAMETER(device_object);
-    if ((mdl_chain == NULL) || !ext4win_stream_fast_io_stream(file_object, &stream)) {
+    if ((KeGetCurrentIrql() != PASSIVE_LEVEL) || (mdl_chain == NULL) || !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
@@ -2250,6 +2442,8 @@ ext4win_prepare_mdl_write(
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
+    if (!NT_SUCCESS(ext4win_prepare_mdl_completion_worker(stream, file_object))) { return FALSE; }
     *mdl_chain = NULL;
     handled = FALSE;
     if (!ext4win_stream_acquire_fast_io_main(stream)) {
@@ -2262,6 +2456,11 @@ ext4win_prepare_mdl_write(
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         io_status->Status = GetExceptionCode();
+        io_status->Information = 0;
+    }
+    if (!NT_SUCCESS(io_status->Status) && (*mdl_chain != NULL)) {
+        CcMdlWriteAbort(file_object, *mdl_chain);
+        *mdl_chain = NULL;
         io_status->Information = 0;
     }
     ext4win_release_resource(&stream->MainResource);
@@ -2286,7 +2485,7 @@ ext4win_mdl_write_complete(
     BOOLEAN handled;
 
     UNREFERENCED_PARAMETER(device_object);
-    if ((file_offset == NULL) || (mdl_chain == NULL) ||
+    if ((KeGetCurrentIrql() != PASSIVE_LEVEL) || (file_offset == NULL) || (mdl_chain == NULL) ||
         !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return FALSE;
     }
@@ -2433,10 +2632,17 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
     NTSTATUS paging_status;
     NTSTATUS main_status;
+    KIRQL old_irql;
+    BOOLEAN mdl_idle;
 
     if (stream == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
+    KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
+    mdl_idle = (stream->MdlCompletionState == Ext4MdlCompletionIdle) &&
+        (stream->MdlCompletionOwner == NULL) && IsListEmpty(&stream->MdlCompletions);
+    KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
+    if (!mdl_idle) { return STATUS_DEVICE_BUSY; }
     if ((stream->SectionObjects.DataSectionObject != NULL) ||
         (stream->SectionObjects.SharedCacheMap != NULL) ||
         (stream->SectionObjects.ImageSectionObject != NULL) ||
@@ -2448,6 +2654,10 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     }
 
     stream->Signature = 0;
+    if (stream->MdlCompletionWorkItem != NULL) {
+        IoFreeWorkItem(stream->MdlCompletionWorkItem);
+        stream->MdlCompletionWorkItem = NULL;
+    }
     stream->Owner = NULL;
     if (stream->OplockInitialized) {
         FsRtlUninitializeOplock(&stream->Header.Oplock);

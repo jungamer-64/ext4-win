@@ -491,6 +491,66 @@ pub(crate) struct ReceivedIrp {
 }
 
 impl ReceivedIrp {
+    /// Transfers a consuming MDL notification to its stream's preallocated passive worker.
+    /// Cancellation cannot skip chain release. Allocation was completed before page acquisition.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "native queue publication consumes this unqueued IRP and retains its FILE_OBJECT until completion"
+        )
+    )]
+    pub(crate) fn delegate_mdl_completion(mut self, _completion: MdlCompletion) -> NTSTATUS {
+        let file_object = match self.with_active(|active| {
+            active
+                .current_stack()?
+                .file_object()
+                .map(ActiveFileObject::as_ptr)
+        }) {
+            Ok(file_object) => file_object,
+            Err(error) => return self.complete_result(Err(error)),
+        };
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The native queue holds this original IRP until Cc returns its chain.
+                // A pending result consumes completion authority, even for synchronous dequeue.
+                ext4win_queue_mdl_completion(
+                    file_object,
+                    self.target.irp.as_ptr(),
+                    _completion.action(),
+                )
+            };
+            if status == STATUS_PENDING {
+                return status;
+            }
+            self.complete_result(Err(DriverError::CacheManagerFailure(status)))
+        }
+        #[cfg(test)]
+        {
+            let _file_object = file_object;
+            self.complete_result(Err(DriverError::NotSupported))
+        }
+    }
+    /// Transfers this original control request, including its transfer method, to lower storage.
+    /// Completion and cancellation belong to the lower stack after this consuming boundary.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the consumed dispatch IRP and its volume FILE_OBJECT retain the lower target through delegation"
+        )
+    )]
+    pub(crate) fn forward_device_control(self, _lower: KernelDevice) -> NTSTATUS {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Dispatch validated a direct-volume handle. The I/O Manager retains that
+            // FILE_OBJECT and its mount through completion; no driver queue context was installed.
+            ext4win_forward_device_control(_lower.as_ptr(), self.target.into_raw_irp())
+        }
+        #[cfg(test)]
+        self.complete_result(Err(DriverError::NotSupported))
+    }
     /// Decodes raw WDK dispatch pointers into a received IRP.
     /// # Safety
     ///
@@ -554,6 +614,50 @@ impl ReceivedIrp {
         }
         completion.status()
     }
+}
+
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this native boundary consumes the original unqueued control IRP"
+)]
+unsafe extern "system" {
+    fn ext4win_queue_mdl_completion(
+        file_object: *mut wdk_sys::FILE_OBJECT,
+        irp: wdk_sys::PIRP,
+        action: MdlAction,
+    ) -> NTSTATUS;
+    fn ext4win_forward_device_control(
+        device: wdk_sys::PDEVICE_OBJECT,
+        irp: wdk_sys::PIRP,
+    ) -> NTSTATUS;
+}
+
+/// Completes exactly the IRP consumed by the native MDL completion queue at PASSIVE_LEVEL.
+/// # Safety
+///
+/// The native worker must own this live, unqueued-to-CSQ IRP after clearing its consumed chain.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the native MDL worker transfers unique terminal ownership to this completion-context boundary"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_finish_mdl_completion(irp: PIRP, status: NTSTATUS) {
+    let irp = unsafe {
+        // SAFETY: The native worker removed this unique IRP from its intrusive completion queue.
+        KernelIrp::from_raw(irp)
+    }
+    .unwrap_or_else(|| {
+        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+            .bugcheck()
+    });
+    let completion = if status >= STATUS_SUCCESS {
+        IrpCompletion::EMPTY
+    } else {
+        IrpCompletion::from_native_failure(status)
+    };
+    let _status = irp.complete(completion);
 }
 
 /// Prepared IRP ready to transfer into the cancel-safe queue.

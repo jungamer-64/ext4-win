@@ -12,6 +12,13 @@ pub(crate) struct CurrentIrpStackLocation<'owner> {
 }
 
 impl<'owner> CurrentIrpStackLocation<'owner> {
+    /// Selects the Cache Manager MDL protocol before any byte-buffer capture.
+    /// # Errors
+    ///
+    /// Rejects unknown read/write minor bits rather than treating them as ordinary byte I/O.
+    pub(crate) fn mdl_action(self, write: bool) -> DriverResult<Option<MdlAction>> {
+        MdlAction::decode(self.raw_minor_function(), write)
+    }
     /// Binds a raw stack location to an active IRP owner borrow.
     /// # Errors
     ///

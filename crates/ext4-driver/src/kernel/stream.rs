@@ -216,6 +216,9 @@ pub(crate) struct StreamContext {
     /// Host equivalent of the immutable native owner identity.
     #[cfg(test)]
     owner: AtomicPtr<c_void>,
+    /// Host equivalent of the volume-only immutable native lower control route.
+    #[cfg(test)]
+    control_device: AtomicPtr<wdk_sys::DEVICE_OBJECT>,
     /// Stable host ABI storage; tests access fields only through the external pointer boundary.
     #[cfg(test)]
     section_objects: UnsafeCell<wdk_sys::SECTION_OBJECT_POINTERS>,
@@ -334,6 +337,7 @@ impl StreamContext {
             Ok(Self {
                 kind,
                 owner: AtomicPtr::new(core::ptr::null_mut()),
+                control_device: AtomicPtr::new(core::ptr::null_mut()),
                 section_objects: UnsafeCell::new(wdk_sys::SECTION_OBJECT_POINTERS::default()),
                 sizes: Mutex::new(sizes),
                 metadata: Mutex::new(metadata),
@@ -388,11 +392,16 @@ impl StreamContext {
     /// # Safety
     ///
     /// `owner` must identify the pinned enclosing `VolumeControlBlock`, which must outlive this
-    /// native stream. No header may be published before this one-time call succeeds.
+    /// native stream. `control_device` must be the mount's retained partition target.
+    /// No header may be published before this one-time call succeeds.
     /// # Errors
     ///
     /// Returns an invariant error if the native volume stream is malformed or already bound.
-    pub(crate) unsafe fn bind_volume_owner(&self, owner: NonNull<c_void>) -> DriverResult<()> {
+    pub(crate) unsafe fn bind_volume_owner(
+        &self,
+        owner: NonNull<c_void>,
+        control_device: crate::state::KernelDevice,
+    ) -> DriverResult<()> {
         if self.kind != StreamOwnerKind::Volume {
             return Err(DriverError::InternalInvariantViolation);
         }
@@ -400,7 +409,11 @@ impl StreamContext {
         {
             let status = unsafe {
                 // SAFETY: The caller establishes the pinned enclosing lifetime documented above.
-                ext4win_stream_bind_volume_owner(self.header.as_ptr(), owner.as_ptr())
+                ext4win_stream_bind_volume_owner(
+                    self.header.as_ptr(),
+                    owner.as_ptr(),
+                    control_device.as_ptr(),
+                )
             };
             native_status(status)
         }
@@ -413,9 +426,45 @@ impl StreamContext {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
-                .map(|_| ())
-                .map_err(|_| DriverError::InternalInvariantViolation)
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            self.control_device
+                .store(control_device.as_ptr(), Ordering::Release);
+            Ok(())
         }
+    }
+
+    /// Reads the native volume's immutable lower control route without borrowing its Rust VCB.
+    /// # Safety
+    ///
+    /// `header` must be retained by an active direct-volume FILE_OBJECT for this call and every
+    /// subsequent use of the returned device. Its bound mount must retain that lower target.
+    /// # Errors
+    ///
+    /// Returns an invariant failure for an unbound or non-volume header.
+    pub(crate) unsafe fn decode_volume_control_device(
+        header: NonNull<c_void>,
+    ) -> DriverResult<crate::state::KernelDevice> {
+        #[cfg(not(test))]
+        let device = unsafe {
+            // SAFETY: The caller retains the header and its immutable native routing projection.
+            ext4win_stream_volume_control_device(header.as_ptr())
+        };
+        #[cfg(test)]
+        let device = {
+            let stream = unsafe {
+                // SAFETY: Host headers identify the retained StreamContext itself.
+                header.cast::<Self>().as_ref()
+            };
+            if stream.kind != StreamOwnerKind::Volume {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            stream.control_device.load(Ordering::Acquire)
+        };
+        unsafe {
+            // SAFETY: The volume FILE_OBJECT and its mount retain this published device identity.
+            crate::state::KernelDevice::from_raw(device)
+        }
+        .ok_or(DriverError::InternalInvariantViolation)
     }
 
     /// Transfers one live filesystem-control IRP to the stream-owned FsRtl oplock package.
@@ -760,6 +809,39 @@ impl StreamContext {
                 )
             };
             cache_status(status)
+        }
+        #[cfg(test)]
+        Err(DriverError::NotSupported)
+    }
+
+    /// Executes an already captured MDL IRP without borrowing requestor byte memory.
+    /// # Errors
+    ///
+    /// Returns the exact native status; writes extending the committed EOF are rejected.
+    /// On success the IRP carries the Cache Manager-owned output chain. Failure releases
+    /// any partially acquired chain before returning.
+    pub(crate) fn cached_mdl(
+        &self,
+        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
+        _irp: NonNull<wdk_sys::IRP>,
+        _action: crate::irp::MdlTransfer,
+    ) -> DriverResult<usize> {
+        #[cfg(not(test))]
+        {
+            let mut information = 0;
+            let status = unsafe {
+                // SAFETY: The cache lease retains the stream and FILE_OBJECT. The suspended
+                // operation exclusively owns this IRP until the worker publishes its result.
+                ext4win_stream_cache_mdl(
+                    self.header.as_ptr(),
+                    _file_object.as_ptr(),
+                    _irp.as_ptr(),
+                    _action.action(),
+                    core::ptr::addr_of_mut!(information),
+                )
+            };
+            cache_status(status)?;
+            Ok(information)
         }
         #[cfg(test)]
         Err(DriverError::NotSupported)
@@ -1169,6 +1251,13 @@ fn cache_status(status: NTSTATUS) -> DriverResult<()> {
     reason = "these declarations expose the audited native advanced-FCB-header ownership boundary"
 )]
 unsafe extern "system" {
+    fn ext4win_stream_cache_mdl(
+        stream_header: wdk_sys::PVOID,
+        file_object: *mut wdk_sys::FILE_OBJECT,
+        irp: wdk_sys::PIRP,
+        action: crate::irp::MdlAction,
+        information_out: *mut usize,
+    ) -> NTSTATUS;
     fn ext4win_stream_create(
         kind: wdk_sys::ULONG,
         allocation_size: i64,
@@ -1188,7 +1277,11 @@ unsafe extern "system" {
     fn ext4win_stream_bind_volume_owner(
         stream_header: wdk_sys::PVOID,
         owner: wdk_sys::PVOID,
+        control_device: wdk_sys::PDEVICE_OBJECT,
     ) -> NTSTATUS;
+    fn ext4win_stream_volume_control_device(
+        stream_header: wdk_sys::PVOID,
+    ) -> wdk_sys::PDEVICE_OBJECT;
 
     fn ext4win_stream_oplock_fsctrl(
         stream_header: wdk_sys::PVOID,

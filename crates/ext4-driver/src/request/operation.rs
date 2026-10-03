@@ -79,6 +79,8 @@ macro_rules! impl_mounted_operation_adapter {
 #[path = "operation/directory.rs"]
 mod directory;
 pub(crate) use directory::query_directory;
+mod mdl;
+pub(crate) use mdl::mdl;
 
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]

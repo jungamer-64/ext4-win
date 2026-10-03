@@ -569,6 +569,20 @@ impl StreamCacheLease {
 }
 
 impl FileObjectCacheLease {
+    /// Executes the MDL protocol while the containing work item retains the suspended IRP.
+    /// # Errors
+    ///
+    /// Returns the Cache Manager status without converting the MDL to a byte-buffer mapping.
+    pub(crate) fn mdl(
+        &self,
+        irp: NonNull<wdk_sys::IRP>,
+        action: crate::irp::MdlTransfer,
+    ) -> DriverResult<usize> {
+        self.stream
+            .stream()
+            .stream_context
+            .cached_mdl(self.file_object.as_non_null(), irp, action)
+    }
     /// Attenuates this FILE_OBJECT authority to the shared stream cache only.
     pub(crate) fn into_stream(self) -> StreamCacheLease {
         self.stream
@@ -2542,8 +2556,10 @@ impl VolumeControlBlock {
         unsafe {
             // SAFETY: `PhantomPinned` prevents safe relocation and the stream is destroyed before
             // the enclosing pinned VCB allocation is released.
-            vcb.stream_context
-                .bind_volume_owner(NonNull::from(vcb).cast::<c_void>())
+            vcb.stream_context.bind_volume_owner(
+                NonNull::from(vcb).cast::<c_void>(),
+                vcb.runtime.storage().filesystem_control_device(),
+            )
         }
     }
 

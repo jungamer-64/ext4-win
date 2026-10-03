@@ -2,6 +2,118 @@
 
 use super::*;
 
+/// Cache Manager MDL acquisition and release are distinct consuming operations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub(crate) enum MdlAction {
+    /// Acquire cached read pages.
+    Read = 0,
+    /// Return read pages to Cache Manager.
+    ReadComplete = 1,
+    /// Acquire writable cached pages.
+    Write = 2,
+    /// Commit dirty pages and return the write MDL chain.
+    WriteComplete = 3,
+}
+
+/// Only page acquisition may enter the cancellable device mailbox.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MdlTransfer {
+    /// Acquire readable cache pages.
+    Read,
+    /// Acquire writable cache pages within committed EOF.
+    Write,
+}
+
+impl MdlTransfer {
+    /// Encodes the native page-acquisition action.
+    #[cfg(not(test))]
+    pub(crate) const fn action(self) -> MdlAction {
+        match self {
+            Self::Read => MdlAction::Read,
+            Self::Write => MdlAction::Write,
+        }
+    }
+}
+
+/// Allocation-free chain release runs before any cancellable queue admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MdlCompletion {
+    /// Consume a read chain.
+    Read,
+    /// Consume a writable chain and mark its cache pages dirty.
+    Write,
+}
+
+impl MdlCompletion {
+    /// Encodes the native consuming completion action.
+    #[cfg(not(test))]
+    pub(crate) const fn action(self) -> MdlAction {
+        match self {
+            Self::Read => MdlAction::ReadComplete,
+            Self::Write => MdlAction::WriteComplete,
+        }
+    }
+}
+
+#[cfg(test)]
+mod mdl_tests {
+    use super::*;
+
+    /// # Panics
+    ///
+    /// Panics if DPC changes the protocol or completion is decoded as page acquisition.
+    #[test]
+    fn windows_minor_bits_select_acquisition_and_consuming_completion() {
+        assert_eq!(MdlAction::decode(0, false), Ok(None));
+        assert_eq!(MdlAction::decode(1, true), Ok(None));
+        assert_eq!(MdlAction::decode(2, false), Ok(Some(MdlAction::Read)));
+        assert_eq!(MdlAction::decode(3, true), Ok(Some(MdlAction::Write)));
+        assert_eq!(
+            MdlAction::decode(4, false),
+            Ok(Some(MdlAction::ReadComplete))
+        );
+        assert_eq!(
+            MdlAction::decode(6, true),
+            Ok(Some(MdlAction::WriteComplete))
+        );
+        assert_eq!(
+            MdlAction::decode(7, false),
+            Ok(Some(MdlAction::ReadComplete))
+        );
+        assert_eq!(
+            MdlAction::decode(8, true),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+}
+
+impl MdlAction {
+    /// Decodes the Windows read/write minor-function bit contract.
+    /// # Errors
+    ///
+    /// Returns invalid-parameter for unknown minor bits.
+    pub(crate) fn decode(minor: u8, write: bool) -> DriverResult<Option<Self>> {
+        const DPC: u8 = 1;
+        const MDL: u8 = 2;
+        const COMPLETE: u8 = 4;
+        if minor & !(DPC | MDL | COMPLETE) != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(if minor & COMPLETE != 0 {
+            Some(if write {
+                Self::WriteComplete
+            } else {
+                Self::ReadComplete
+            })
+        } else if minor & MDL != 0 {
+            Some(if write { Self::Write } else { Self::Read })
+        } else {
+            None
+        })
+    }
+}
+
 /// Decoded file-system-control minor function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FileSystemControlMinorFunction {
@@ -354,6 +466,8 @@ pub(crate) enum QueryFileInformationClass {
     Internal,
     /// Windows `FilePositionInformation`.
     Position,
+    /// Windows `FileEaInformation`.
+    Ea,
     /// Windows `FileNetworkOpenInformation`.
     NetworkOpen,
     /// Windows `FileNameInformation`.
@@ -375,6 +489,7 @@ impl QueryFileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileStandardLinkInformation => Ok(Self::StandardLink),
             wdk_sys::_FILE_INFORMATION_CLASS::FileInternalInformation => Ok(Self::Internal),
             wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => Ok(Self::Position),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileEaInformation => Ok(Self::Ea),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => Ok(Self::NetworkOpen),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNameInformation => Ok(Self::Name),
             wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation => Ok(Self::AttributeTag),

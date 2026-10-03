@@ -23,6 +23,34 @@ const FILE_GET_EA_NAME_OFFSET: usize = 5;
 /// EA records are DWORD-aligned when another record follows.
 const EA_RECORD_ALIGNMENT: usize = 4;
 
+/// Returns the Windows EA byte charge, excluding alignment between query output records.
+/// # Errors
+///
+/// Returns the persisted EA decoding failure or a size that cannot fit `FILE_EA_INFORMATION`.
+pub(crate) fn information_size(
+    read: &mut impl CommittedReadPass,
+    node: ext4_core::NodeId,
+) -> DriverResult<u32> {
+    let entries = load_windows_eas(read, node)?;
+    windows_ea_size(entries.as_slice())
+}
+
+/// Windows charges one list header and packed attributes without `NextEntryOffset` or padding.
+/// # Errors
+///
+/// Returns an error when the Windows EA charge exceeds its 32-bit size domain.
+fn windows_ea_size(entries: &[WindowsEaRecord]) -> DriverResult<u32> {
+    let header: usize = if entries.is_empty() { 0 } else { 4 };
+    let size = entries.iter().try_fold(header, |size, entry| {
+        let packed = full_ea_record_length(entry.name.len(), entry.value.len())?
+            .checked_sub(4)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        size.checked_add(packed)
+            .ok_or(DriverError::InvalidBufferSize)
+    })?;
+    u32::try_from(size).map_err(|_| DriverError::InvalidBufferSize)
+}
+
 /// Creates a wire offset from an EA record-relative byte position.
 const fn wire_offset(offset: usize) -> WireOffset {
     WireOffset::new(offset)
@@ -880,6 +908,15 @@ fn align_to_four(value: usize) -> DriverResult<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// # Panics
+    ///
+    /// Panics if EA accounting includes wire offsets or query record alignment.
+    #[test]
+    fn ea_information_charges_one_header_and_packed_attribute_payloads() {
+        assert_eq!(super::windows_ea_size(&[]), Ok(0));
+        let entries = sample_ea_records();
+        assert_eq!(super::windows_ea_size(entries.as_slice()), Ok(44));
+    }
     use alloc::vec;
     use core::ffi::c_void;
 

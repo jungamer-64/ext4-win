@@ -1793,6 +1793,22 @@ pub(crate) struct OpenedVolume<'owner> {
 }
 
 impl<'owner> OpenedVolume<'owner> {
+    /// Lower-device control authority fixed in the native volume header at mount publication.
+    /// # Errors
+    ///
+    /// Returns an invariant failure when the bound native control route is absent.
+    #[expect(
+        unsafe_code,
+        reason = "the active FILE_OBJECT retains its immutable native volume control route until CLOSE"
+    )]
+    pub(crate) fn control_device(&self) -> DriverResult<KernelDevice> {
+        let header = NonNull::new(self.file_object.as_ref().FsContext)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        unsafe {
+            // SAFETY: Decode validated this header. FILE_OBJECT retains it and its mount target.
+            StreamContext::decode_volume_control_device(header)
+        }
+    }
     /// Decodes a direct-volume FILE_OBJECT through its advanced-header owner identity.
     /// # Errors
     ///

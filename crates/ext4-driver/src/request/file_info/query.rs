@@ -92,6 +92,7 @@ pub(super) fn query_file_information(
                 return Ok(QueryFilePlan::HardLinks { length, target });
             }
             QueryFileInformationClass::Basic
+            | QueryFileInformationClass::Ea
             | QueryFileInformationClass::Standard
             | QueryFileInformationClass::StandardLink
             | QueryFileInformationClass::Internal
@@ -138,6 +139,13 @@ pub(super) fn query_file_information(
             return query_hard_link_information(request, length, target, read);
         }
     };
+    if information_class == QueryFileInformationClass::Ea {
+        let size = crate::request::ea::information_size(read, node)?;
+        return request.with_active(|active| {
+            let mut buffer = active.buffered_output(length)?;
+            pack_ea_information(buffer.as_mut_slice(), size)
+        });
+    }
     let metadata = metadata_from_node(read, node)?;
     request.with_active(|active| {
         let mut buffer = active.buffered_output(length)?;
@@ -164,10 +172,21 @@ pub(super) fn query_file_information(
                 pack_attribute_tag_information(buffer.as_mut_slice(), metadata)
             }
             QueryFileInformationClass::Position
+            | QueryFileInformationClass::Ea
             | QueryFileInformationClass::Name
             | QueryFileInformationClass::HardLink => Err(DriverError::InternalInvariantViolation),
         }
     })
+}
+
+/// Packs the persisted Windows EA byte charge.
+/// # Errors
+///
+/// Returns buffer-too-small without writing a partial fixed record.
+fn pack_ea_information(output: &mut [u8], ea_size: u32) -> DriverResult<IrpCompletion> {
+    let size = core::mem::size_of::<wdk_sys::FILE_EA_INFORMATION>();
+    fixed_record_writer(output, size)?.write_u32(WireOffset::new(0), ea_size)?;
+    IrpCompletion::from_usize(size)
 }
 
 /// Traverses and packs every Windows-visible hard-link name without retaining caller memory across

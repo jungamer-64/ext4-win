@@ -4427,7 +4427,8 @@ mod tests {
                     return;
                 };
                 match completion {
-                    crate::irp::CacheWorkCompletion::Read(result) => {
+                    crate::irp::CacheWorkCompletion::Read(result)
+                    | crate::irp::CacheWorkCompletion::Mdl(result) => {
                         let _result = result;
                     }
                     crate::irp::CacheWorkCompletion::Write(result)

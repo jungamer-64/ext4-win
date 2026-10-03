@@ -195,6 +195,11 @@ impl MountedStorageRoute {
         }
     }
 
+    /// Returns the mounted partition target for volume DeviceControl delegation.
+    pub(crate) const fn filesystem_control_device(self) -> KernelDevice {
+        self.filesystem.device
+    }
+
     /// Returns the complete lower partition length for direct-volume bounds validation.
     pub(crate) const fn filesystem_device_length(self) -> DeviceLength {
         self.filesystem.length
