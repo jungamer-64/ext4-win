@@ -399,6 +399,8 @@ pub(crate) enum QueryVolumeInformationClass {
     Attribute,
     /// Windows `FileFsFullSizeInformation`.
     FullSize,
+    /// Windows `FileFsSectorSizeInformation`.
+    SectorSize,
 }
 
 impl QueryVolumeInformationClass {
@@ -413,6 +415,7 @@ impl QueryVolumeInformationClass {
             FILE_FS_DEVICE_INFORMATION_CLASS => Ok(Self::Device),
             FILE_FS_ATTRIBUTE_INFORMATION_CLASS => Ok(Self::Attribute),
             FILE_FS_FULL_SIZE_INFORMATION_CLASS => Ok(Self::FullSize),
+            FILE_FS_SECTOR_SIZE_INFORMATION_CLASS => Ok(Self::SectorSize),
             _ => Err(DriverError::InvalidInfoClass),
         }
     }
@@ -450,6 +453,8 @@ const FILE_FS_DEVICE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 4;
 const FILE_FS_ATTRIBUTE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 5;
 /// `FileFsFullSizeInformation`.
 const FILE_FS_FULL_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 7;
+/// `FileFsSectorSizeInformation`.
+const FILE_FS_SECTOR_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 11;
 
 /// Decoded query-file information class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

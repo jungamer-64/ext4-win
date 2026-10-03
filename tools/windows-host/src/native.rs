@@ -242,7 +242,7 @@ pub struct VolumeQuery {
     /// Synchronous call latency; there is no kernel-operation cancellation claim.
     pub milliseconds: f64,
 }
-/// Reads five native volume classes through an attribute-only handle.
+/// Reads native volume identity, allocation and sector classes through an attribute-only handle.
 /// # Errors
 /// Returns open, malformed length, or explicit handle-release failures.
 pub fn volume_information(path: &Path) -> io::Result<Vec<VolumeQuery>> {
@@ -255,6 +255,7 @@ pub fn volume_information(path: &Path) -> io::Result<Vec<VolumeQuery>> {
             ("device", 4),
             ("attributes", 5),
             ("full-size", 7),
+            ("sector-size", 11),
         ] {
             let mut data = vec![0_u8; 4096];
             let mut status_block = IO_STATUS_BLOCK::default();
@@ -859,42 +860,119 @@ pub fn volume_at_mount(path: &Path) -> io::Result<String> {
 /// Returns opening, native metadata, identity or explicit release failures.
 pub fn verify_metadata(path: &Path, relative_name: &str, eof: u64) -> io::Result<()> {
     let first = FileHandle::open(path, 0x80, 0)?;
-    let second = FileHandle::open(path, 0, 0)?;
-    let mut label = [0_u16; 261];
-    let mut filesystem = [0_u16; 261];
-    let mut serial = 0;
-    let mut maximum = 0;
-    let mut flags = 0;
-    let raw = second.raw()?;
-    let queried = unsafe {
-        // SAFETY: both native string buffers and scalar outputs are writable for the advertised capacities.
-        GetVolumeInformationByHandleW(
-            raw,
-            label.as_mut_ptr(),
-            261,
-            &mut serial,
-            &mut maximum,
-            &mut flags,
-            filesystem.as_mut_ptr(),
-            261,
+    let result = (|| {
+        let second = FileHandle::open(path, 0, 0)?;
+        let mut label = [0_u16; 261];
+        let mut filesystem = [0_u16; 261];
+        let mut serial = 0;
+        let mut maximum = 0;
+        let mut flags = 0;
+        let raw = second.raw()?;
+        let queried = unsafe {
+            // SAFETY: both native string buffers and scalar outputs are writable for the advertised capacities.
+            GetVolumeInformationByHandleW(
+                raw,
+                label.as_mut_ptr(),
+                261,
+                &mut serial,
+                &mut maximum,
+                &mut flags,
+                filesystem.as_mut_ptr(),
+                261,
+            )
+        };
+        let result = if queried == 0 {
+            Err(io::Error::last_os_error())
+        } else if decode(&filesystem) != "EXT4WIN" || maximum != 255 {
+            Err(io::Error::other(
+                "volume identity from metadata handle differs",
+            ))
+        } else {
+            Ok(())
+        };
+        completed(result, second.close())?;
+        let [logical, _, _, effective, ..] = sector_information(&first)?;
+        if logical != effective {
+            return Err(io::Error::other(
+                "filesystem effective sector differs from its transfer unit",
+            ));
+        }
+        let data = FileHandle::open(path, 0x8000_0000, 0)?;
+        completed(
+            verify_file_information(&data, relative_name, eof),
+            data.close(),
+        )
+    })();
+    completed(result, first.close())
+}
+
+/// Queries one native volume class and preserves exact status and returned length.
+/// # Errors
+/// Returns an unexpected native status or a returned length outside the owned buffer.
+fn volume_information_query(
+    file: &FileHandle,
+    class: i32,
+    capacity: u32,
+    expected: u32,
+) -> io::Result<Vec<u8>> {
+    let mut output = vec![0xA5; usize::try_from(capacity).map_err(io::Error::other)?];
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        // SAFETY: The synchronous handle and owned output/status buffers remain live until the
+        // native query returns. The native routine receives their actual buffer capacity.
+        NtQueryVolumeInformationFile(
+            file.raw()?,
+            &mut io_status,
+            output.as_mut_ptr().cast(),
+            capacity,
+            class,
         )
     };
-    let result = if queried == 0 {
-        Err(io::Error::last_os_error())
-    } else if decode(&filesystem) != "EXT4WIN" || maximum != 255 {
-        Err(io::Error::other(
-            "volume identity from metadata handle differs",
-        ))
-    } else {
-        Ok(())
-    };
-    completed(result, second.close())?;
-    let data = FileHandle::open(path, 0x8000_0000, 0)?;
-    completed(
-        verify_file_information(&data, relative_name, eof),
-        data.close(),
-    )?;
-    first.close()
+    if status.cast_unsigned() != expected || io_status.Information > output.len() {
+        return Err(io::Error::other(format!(
+            "volume information class {class}: status {:08X}, expected {expected:08X}, returned {}",
+            status.cast_unsigned(),
+            io_status.Information
+        )));
+    }
+    output.truncate(io_status.Information);
+    Ok(output)
+}
+
+/// Observes sector information and checks its agreement with independent allocation queries.
+/// # Errors
+/// Returns native failures, incorrect fixed-record lengths or inconsistent sector units.
+fn sector_information(file: &FileHandle) -> io::Result<[u32; 7]> {
+    let bytes = volume_information_query(file, 11, 28, 0)?;
+    if bytes.len() != 28 || !volume_information_query(file, 11, 27, 0xC000_0004)?.is_empty() {
+        return Err(io::Error::other(
+            "sector information length contract differs",
+        ));
+    }
+    let mut sector = [0_u32; 7];
+    for (value, bytes) in sector.iter_mut().zip(bytes.as_chunks::<4>().0) {
+        *value = u32::from_le_bytes(*bytes);
+    }
+    let [logical, atomic, performance, effective, ..] = sector;
+    if !logical.is_power_of_two()
+        || atomic < logical
+        || performance < logical
+        || effective < logical
+    {
+        return Err(io::Error::other("invalid native sector geometry"));
+    }
+    for (class, length, sectors_offset, bytes_offset) in [(3, 24, 16, 20), (7, 32, 24, 28)] {
+        let allocation = volume_information_query(file, class, length, 0)?;
+        if allocation.len() != usize::try_from(length).map_err(io::Error::other)?
+            || u32::from_le_bytes(field(&allocation, bytes_offset)?) != logical
+            || u32::from_le_bytes(field(&allocation, sectors_offset)?) == 0
+        {
+            return Err(io::Error::other(
+                "allocation and sector information disagree",
+            ));
+        }
+    }
+    Ok(sector)
 }
 
 /// Queries one native information class with an exact expected status and bounded output.
@@ -1265,9 +1343,13 @@ mod tests {
         reason = "assertions intentionally fail native host contracts after fallible observation"
     )]
     fn host_observation_contract() -> io::Result<()> {
-        let queries = volume_information(&std::env::temp_dir())?;
-        assert_eq!(queries.len(), 5);
+        let path = std::env::temp_dir();
+        let queries = volume_information(&path)?;
+        assert_eq!(queries.len(), 6);
         assert!(queries.iter().all(|query| query.data.len() <= 4096));
+        let file = FileHandle::open(&path, 0x80, FILE_FLAG_BACKUP_SEMANTICS)?;
+        let sector = completed(sector_information(&file), file.close())?;
+        assert!(sector.first().is_some_and(|logical| *logical >= 512));
         let name = format!("ext4win-absent-{}", std::process::id());
         assert!(!service_registered(&name)?);
         assert!(service_state(&name)?.is_none());

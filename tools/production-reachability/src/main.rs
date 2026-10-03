@@ -139,6 +139,12 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "ext4win_announce_volume",
     ),
     ("raw-volume operation admission", "raw_volume"),
+    (
+        "volume sector information observation",
+        "FsRtlGetSectorSizeInformation",
+    ),
+    ("real-device reference acquisition", "ObfReferenceObject"),
+    ("passive native worker callback", "passive_work_item"),
 ];
 
 /// AMD64 COFF machine identifier.
@@ -2399,6 +2405,9 @@ mod tests {
              ext4win_read_volume_prefix\n\
              ext4win_announce_volume\n\
              raw_volume\n\
+             FsRtlGetSectorSizeInformation\n\
+             ObfReferenceObject\n\
+             passive_work_item\n\
              EXT4WIN_PRODUCTION_ARTIFACT_ID\n"
         )
     }

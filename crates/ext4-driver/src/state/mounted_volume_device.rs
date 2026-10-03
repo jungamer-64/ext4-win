@@ -76,7 +76,7 @@ impl MountedVolumeDevice {
     /// # Errors
     ///
     /// Returns an error when the mounted DEVICE_OBJECT, device extension, or VPB initialization
-    /// target is absent or invalid.
+    /// target is absent or invalid, or allocation clusters are not integral logical sectors.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -93,6 +93,11 @@ impl MountedVolumeDevice {
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
         let transfer_alignment = real_device.transfer_buffer_alignment()?;
+        let sector_size = vcb.runtime.storage().filesystem_sector_size();
+        let _sectors = sector_size
+            .sectors_per_cluster(vcb.runtime.current_epoch().geometry().cluster_size())?;
+        let sector_bytes =
+            u16::try_from(sector_size.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
         let trace = vcb.trace;
         let mounted_flag = u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
         let identity = vcb.runtime.identity();
@@ -165,6 +170,7 @@ impl MountedVolumeDevice {
         device_object.Flags |= DO_DIRECT_IO;
         device_object.StackSize = stack_size;
         device_object.AlignmentRequirement = transfer_alignment.as_mask();
+        device_object.SectorSize = sector_bytes;
 
         vpb.SerialNumber = serial_number;
         volume_label.write_to(vpb);
@@ -293,6 +299,29 @@ impl MountedVolumeDevice {
         let vpb = NonNull::new(device_object.Vpb).ok_or(DriverError::InvalidParameter)?;
         let label = VpbLabel::encode(volume_label)?;
         Ok(PreparedVpbLabelPublication { vpb, label })
+    }
+
+    /// Retains the VPB's real device before a sector query leaves actor ownership.
+    /// # Errors
+    ///
+    /// Rejects a missing mounted VPB or real device without queueing native work.
+    pub(crate) fn prepare_sector_query(
+        device: KernelDevice,
+    ) -> DriverResult<crate::kernel::storage::SectorSizeQuery> {
+        Self::with_vpb(device, |vpb| {
+            #[expect(
+                unsafe_code,
+                reason = "the VPB lock protects the live real-device association during reference acquisition"
+            )]
+            let real_device = unsafe {
+                // SAFETY: The mounted VPB and its real device remain live under the VPB lock.
+                KernelDevice::from_raw(vpb.RealDevice)
+            }
+            .ok_or(DriverError::InvalidParameter)?;
+            Ok(crate::kernel::storage::SectorSizeQuery::reference(
+                real_device,
+            ))
+        })?
     }
 
     /// Publishes whether the mounted VPB rejects creates for a volume lock.

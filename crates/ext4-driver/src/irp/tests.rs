@@ -1720,24 +1720,31 @@ fn set_volume_stack_preserves_length_and_class() {
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
 fn query_volume_stack_decodes_supported_information_class() {
-    let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-    stack.Parameters.QueryVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_13 {
-        Length: 128,
-        __bindgen_padding_0: 0,
-        FsInformationClass: wdk_sys::_FSINFOCLASS::FileFsFullSizeInformation,
-    };
-
-    let current = current_stack_fixture(&mut stack);
-    assert!(current.is_ok());
-    if let Ok(current) = current {
-        let query = current.query_volume();
-        assert!(query.is_ok());
-        if let Ok(query) = query {
-            assert_eq!(query.length().as_usize(), 128);
-            assert_eq!(
-                query.information_class(),
-                QueryVolumeInformationClass::FullSize
-            );
+    for (raw, expected) in [
+        (
+            wdk_sys::_FSINFOCLASS::FileFsFullSizeInformation,
+            QueryVolumeInformationClass::FullSize,
+        ),
+        (
+            wdk_sys::_FSINFOCLASS::FileFsSectorSizeInformation,
+            QueryVolumeInformationClass::SectorSize,
+        ),
+    ] {
+        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        stack.Parameters.QueryVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_13 {
+            Length: 128,
+            __bindgen_padding_0: 0,
+            FsInformationClass: raw,
+        };
+        let current = current_stack_fixture(&mut stack);
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            let query = current.query_volume();
+            assert!(query.is_ok());
+            if let Ok(query) = query {
+                assert_eq!(query.length().as_usize(), 128);
+                assert_eq!(query.information_class(), expected);
+            }
         }
     }
 }

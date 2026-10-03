@@ -88,6 +88,23 @@ impl KernelDevice {
         .ok_or(DriverError::InvalidParameter)?;
         TransferBufferAlignment::from_requirement_mask(device.AlignmentRequirement)
     }
+
+    /// Captures the logical transfer unit advertised by this live device.
+    /// # Errors
+    ///
+    /// Rejects absent, zero or non-power-of-two sector geometry.
+    #[expect(
+        unsafe_code,
+        reason = "the live device identity retains immutable transfer geometry"
+    )]
+    pub(crate) fn transfer_sector_size(self) -> DriverResult<TransferSectorSize> {
+        let device = unsafe {
+            // SAFETY: The caller retains the live device; only its transfer geometry is read.
+            self.as_ptr().as_ref()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        TransferSectorSize::from_bytes(u32::from(device.SectorSize))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,9 +149,34 @@ pub(crate) struct TransferSectorSize {
 }
 
 impl TransferSectorSize {
+    /// Establishes the nonzero power-of-two transfer unit.
+    /// # Errors
+    ///
+    /// Rejects invalid device geometry before divisibility checks may use it.
+    pub(crate) fn from_bytes(bytes: u32) -> DriverResult<Self> {
+        if !bytes.is_power_of_two() {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(Self { bytes })
+    }
+
     /// Returns the sector size in bytes.
     pub(crate) const fn as_u32(self) -> u32 {
         self.bytes
+    }
+
+    /// Converts one allocation cluster to an integral count of logical sectors.
+    /// # Errors
+    ///
+    /// Rejects allocation units smaller than, or not divisible by, this device's logical sector.
+    pub(crate) fn sectors_per_cluster(self, cluster: ClusterSize) -> DriverResult<u32> {
+        let bytes = cluster.bytes();
+        if bytes < self.bytes || !bytes.is_multiple_of(self.bytes) {
+            return Err(DriverError::InvalidParameter);
+        }
+        bytes
+            .checked_div(self.bytes)
+            .ok_or(DriverError::InvalidParameter)
     }
 
     /// Returns whether `value` is an integral sector multiple.
@@ -165,10 +207,10 @@ impl NoIntermediateTransfer {
     /// Builds no-intermediate transfer constraints from the mounted device boundary.
     /// # Errors
     ///
-    /// Returns an error when the mounted device cannot expose a valid transfer alignment.
+    /// Returns an error when the mounted device has invalid sector geometry or buffer alignment.
     pub(crate) fn from_device(device: KernelDevice) -> DriverResult<Self> {
         Ok(Self {
-            sector_size: TransferSectorSize::WINDOWS_REPORTED,
+            sector_size: device.transfer_sector_size()?,
             buffer_alignment: device.transfer_buffer_alignment()?,
         })
     }

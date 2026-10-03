@@ -1,7 +1,7 @@
 //! Cached, direct, and windowed file-data transfer protocols.
 
 use super::*;
-use crate::{irp::CacheWork, state::DataTransferMode};
+use crate::{irp::PassiveWork, state::DataTransferMode};
 
 /// Maximum requestor data bytes copied through driver-owned memory at one time.
 const MAX_DATA_TRANSFER_WINDOW_BYTES: usize = 65_536;
@@ -28,14 +28,14 @@ pub(crate) enum ReadCachePlan {
     /// Cached bytes will complete the request after worker return.
     Cached {
         /// Sole Cc operation executed outside the actor.
-        work: CacheWork,
+        work: PassiveWork,
         /// Range start used for synchronous cursor publication.
         start: FileOffset,
         /// Maximum worker transfer validated before submission.
         requested: usize,
     },
     /// A direct handle must first flush and purge any shared cached state.
-    PurgeBeforeDirect(CacheWork),
+    PurgeBeforeDirect(PassiveWork),
     /// Paging I/O already uses its independent stream authority and bypasses handle cache policy.
     Direct,
 }
@@ -46,12 +46,12 @@ pub(crate) enum WriteCachePlan {
     /// A within-EOF write will complete when Cache Manager accepts every byte.
     Cached {
         /// Sole cache call executed outside the actor.
-        work: CacheWork,
+        work: PassiveWork,
         /// Infallible cursor and byte-count publication prepared before cache acceptance.
         publication: PreparedWritePublication,
     },
     /// Direct, write-through, append, or extending I/O first establishes cache coherency.
-    PurgeBeforeDirect(CacheWork),
+    PurgeBeforeDirect(PassiveWork),
     /// Paging writeback uses its independent stream lease and journal path directly.
     Direct,
 }
@@ -102,7 +102,7 @@ pub(crate) fn prepare_read_cache_plan(
         )?;
         let file_cache = access.acquire_file_object_cache_lease(file_object)?;
         if matches!(opened.data_transfer_mode(), DataTransferMode::Direct(_)) {
-            return Ok(ReadCachePlan::PurgeBeforeDirect(CacheWork::purge(
+            return Ok(ReadCachePlan::PurgeBeforeDirect(PassiveWork::purge(
                 file_cache.into_stream(),
             )));
         }
@@ -127,7 +127,7 @@ pub(crate) fn prepare_read_cache_plan(
         let offset =
             i64::try_from(range.start().bytes()).map_err(|_| DriverError::InvalidParameter)?;
         Ok(ReadCachePlan::Cached {
-            work: CacheWork::read(file_cache, offset, requested, output),
+            work: PassiveWork::read(file_cache, offset, requested, output),
             start: range.start(),
             requested,
         })
@@ -217,7 +217,7 @@ pub(crate) fn prepare_write_cache_plan(
             || write_through
             || end > eof
         {
-            return Ok(WriteCachePlan::PurgeBeforeDirect(CacheWork::purge(
+            return Ok(WriteCachePlan::PurgeBeforeDirect(PassiveWork::purge(
                 file_cache.into_stream(),
             )));
         }
@@ -230,7 +230,7 @@ pub(crate) fn prepare_write_cache_plan(
             range.length(),
         )?;
         Ok(WriteCachePlan::Cached {
-            work: CacheWork::write(file_cache, offset, input, range.length()),
+            work: PassiveWork::write(file_cache, offset, input, range.length()),
             publication: PreparedWritePublication {
                 completion,
                 position,

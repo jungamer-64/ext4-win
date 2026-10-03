@@ -42,6 +42,8 @@ pub(crate) enum DriverError {
     PrivilegeRecordingFailed(NTSTATUS),
     /// Cache Manager or Memory Manager rejected an operation with this exact status.
     CacheManagerFailure(NTSTATUS),
+    /// The storage sector query failed with an exact native status; no filesystem mutation occurred.
+    SectorQueryFailure(NTSTATUS),
     /// FsRtl rejected or cancelled an oplock-conflicting operation with this exact status.
     OplockFailure(NTSTATUS),
     /// The target inode has entered the terminal delete-pending namespace state.
@@ -135,6 +137,7 @@ impl DriverError {
             Self::SecurityCheckFailed(status)
             | Self::PrivilegeRecordingFailed(status)
             | Self::CacheManagerFailure(status)
+            | Self::SectorQueryFailure(status)
             | Self::OplockFailure(status) => status,
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),

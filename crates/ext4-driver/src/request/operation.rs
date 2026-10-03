@@ -1045,7 +1045,7 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     start,
                     requested,
                 },
-                CompletionEvent::CacheCompleted(crate::irp::CacheWorkCompletion::Read(result)),
+                CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Read(result)),
             ) => {
                 if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
                     return self.restart_cache_plan(owned, access);
@@ -1061,7 +1061,7 @@ impl MountedVolumeOperation for ReadRequestOperation {
             }
             (
                 ReadOperationState::Purging { owned, read },
-                CompletionEvent::CacheCompleted(crate::irp::CacheWorkCompletion::Purge(result)),
+                CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Purge(result)),
             ) => match result {
                 Ok(()) => (owned, read, OperationEvent::Admitted, true),
                 Err(DriverError::CacheManagerFailure(STATUS_RETRY)) => {
@@ -1107,14 +1107,14 @@ impl MountedVolumeOperation for ReadRequestOperation {
                         start,
                         requested,
                     };
-                    return OperationTransition::SubmitCacheWork {
+                    return OperationTransition::SubmitPassiveWork {
                         work,
                         suspended: self,
                     };
                 }
                 crate::request::file_info::ReadCachePlan::PurgeBeforeDirect(work) => {
                     self.state = ReadOperationState::Purging { owned, read };
-                    return OperationTransition::SubmitCacheWork {
+                    return OperationTransition::SubmitPassiveWork {
                         work,
                         suspended: self,
                     };
@@ -2218,8 +2218,8 @@ impl VolumeControlOperation {
                 devices,
                 drain,
             };
-            return OperationTransition::SubmitCacheWork {
-                work: crate::irp::CacheWork::drain_for_volume_lock(stream),
+            return OperationTransition::SubmitPassiveWork {
+                work: crate::irp::PassiveWork::drain_for_volume_lock(stream),
                 suspended: self,
             };
         }
@@ -2310,7 +2310,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
-            CompletionEvent::CacheCompleted(completion) => {
+            CompletionEvent::PassiveCompleted(completion) => {
                 let state =
                     core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
                 let (
@@ -2321,7 +2321,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                         devices,
                         drain,
                     },
-                    crate::irp::CacheWorkCompletion::DrainForVolumeLock(result),
+                    crate::irp::PassiveWorkCompletion::DrainForVolumeLock(result),
                 ) = (state, completion)
                 else {
                     crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -2753,7 +2753,7 @@ impl FlushRequestOperation {
         &self,
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
-    ) -> DriverResult<Option<crate::irp::CacheWork>> {
+    ) -> DriverResult<Option<crate::irp::PassiveWork>> {
         if self.kind == FlushRequestKind::Shutdown {
             return Ok(None);
         }
@@ -2767,7 +2767,7 @@ impl FlushRequestOperation {
                 crate::state::OpenedFileObject::Node(_) => access
                     .acquire_file_object_cache_lease(file_object)
                     .map(crate::state::FileObjectCacheLease::into_stream)
-                    .map(crate::irp::CacheWork::flush)
+                    .map(crate::irp::PassiveWork::flush)
                     .map(Some),
                 crate::state::OpenedFileObject::Volume(_) => Ok(None),
             }
@@ -2792,7 +2792,7 @@ impl FlushRequestOperation {
         };
         if let Some(work) = work {
             self.state = FlushOperationState::CacheFlushing { owned, scope };
-            OperationTransition::SubmitCacheWork {
+            OperationTransition::SubmitPassiveWork {
                 work,
                 suspended: self,
             }
@@ -2912,11 +2912,11 @@ impl MountedVolumeOperation for FlushRequestOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
-            CompletionEvent::CacheCompleted(completion) => {
+            CompletionEvent::PassiveCompleted(completion) => {
                 let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
                 let (
                     FlushOperationState::CacheFlushing { owned, scope },
-                    crate::irp::CacheWorkCompletion::Flush(result),
+                    crate::irp::PassiveWorkCompletion::Flush(result),
                 ) = (state, completion)
                 else {
                     crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -4536,8 +4536,8 @@ impl MutationRequestOperation {
                         owned,
                         size_changes,
                     };
-                    return MutationStep::Transition(OperationTransition::SubmitCacheWork {
-                        work: crate::irp::CacheWork::prepare_deletion(stream),
+                    return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                        work: crate::irp::PassiveWork::prepare_deletion(stream),
                         suspended: self,
                     });
                 }
@@ -4559,8 +4559,8 @@ impl MutationRequestOperation {
                         }
                     };
                     self.state = MutationOperationState::PreparingWriteOpen { owned };
-                    return MutationStep::Transition(OperationTransition::SubmitCacheWork {
-                        work: crate::irp::CacheWork::prepare_write_open(stream),
+                    return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                        work: crate::irp::PassiveWork::prepare_write_open(stream),
                         suspended: self,
                     });
                 }
@@ -5111,12 +5111,12 @@ impl MutationRequestOperation {
     ) -> MutationStep {
         let event = match event {
             CompletionEvent::Core(event) => event,
-            CompletionEvent::CacheCompleted(completion) => {
+            CompletionEvent::PassiveCompleted(completion) => {
                 let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
                 match (state, completion) {
                     (
                         MutationOperationState::CacheWriting { owned, publication },
-                        crate::irp::CacheWorkCompletion::Write(result),
+                        crate::irp::PassiveWorkCompletion::Write(result),
                     ) => {
                         if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
                             return self.restart_resolution(owned, None, None, access);
@@ -5141,7 +5141,7 @@ impl MutationRequestOperation {
                             epoch,
                             resolve,
                         },
-                        crate::irp::CacheWorkCompletion::Purge(result),
+                        crate::irp::PassiveWorkCompletion::Purge(result),
                     ) => {
                         return match result {
                             Ok(()) => MutationStep::Resolve { operation: self, owned, attempt: ResolutionAttempt {
@@ -5165,7 +5165,7 @@ impl MutationRequestOperation {
                             epoch,
                             resolve,
                         },
-                        crate::irp::CacheWorkCompletion::Uninitialize(result),
+                        crate::irp::PassiveWorkCompletion::Uninitialize(result),
                     ) => {
                         if let Err(error) = result
                             && self.cleanup_deferred_error.is_none()
@@ -5185,7 +5185,7 @@ impl MutationRequestOperation {
                             mut plan,
                             deletion,
                         },
-                        crate::irp::CacheWorkCompletion::PrepareSizeChange(result),
+                        crate::irp::PassiveWorkCompletion::PrepareSizeChange(result),
                     ) => {
                         return match result {
                             Ok(size_change) => {
@@ -5198,8 +5198,8 @@ impl MutationRequestOperation {
                                         plan,
                                         deletion,
                                     };
-                                    MutationStep::Transition(OperationTransition::SubmitCacheWork {
-                                        work: crate::irp::CacheWork::prepare_size_change(stream),
+                                    MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                                        work: crate::irp::PassiveWork::prepare_size_change(stream),
                                         suspended: self,
                                     })
                                 } else {
@@ -5226,7 +5226,7 @@ impl MutationRequestOperation {
                             owned,
                             size_changes,
                         },
-                        crate::irp::CacheWorkCompletion::PrepareDeletion(result),
+                        crate::irp::PassiveWorkCompletion::PrepareDeletion(result),
                     ) => {
                         return match result {
                             Ok(deletion) => {
@@ -5240,7 +5240,7 @@ impl MutationRequestOperation {
                     }
                     (
                         MutationOperationState::PreparingWriteOpen { owned },
-                        crate::irp::CacheWorkCompletion::PrepareWriteOpen(result),
+                        crate::irp::PassiveWorkCompletion::PrepareWriteOpen(result),
                     ) => {
                         return match result {
                             Ok(write_open) => {
@@ -5448,7 +5448,7 @@ impl MutationRequestOperation {
                                 resolve,
                             };
                             return MutationStep::Transition(
-                                OperationTransition::SubmitCacheWork {
+                                OperationTransition::SubmitPassiveWork {
                                     work,
                                     suspended: self,
                                 },
@@ -5474,7 +5474,7 @@ impl MutationRequestOperation {
                                 self.state =
                                     MutationOperationState::CacheWriting { owned, publication };
                                 return MutationStep::Transition(
-                                    OperationTransition::SubmitCacheWork {
+                                    OperationTransition::SubmitPassiveWork {
                                         work,
                                         suspended: self,
                                     },
@@ -5487,7 +5487,7 @@ impl MutationRequestOperation {
                                     resolve,
                                 };
                                 return MutationStep::Transition(
-                                    OperationTransition::SubmitCacheWork {
+                                    OperationTransition::SubmitPassiveWork {
                                         work,
                                         suspended: self,
                                     },
@@ -5599,8 +5599,8 @@ impl MutationRequestOperation {
                             size_changes,
                         };
                         return MutationStep::Transition(
-                            OperationTransition::SubmitCacheWorkAfterIntentRelease {
-                                work: crate::irp::CacheWork::prepare_deletion(stream),
+                            OperationTransition::SubmitPassiveWorkAfterIntentRelease {
+                                work: crate::irp::PassiveWork::prepare_deletion(stream),
                                 suspended: self,
                             },
                         );
@@ -5646,8 +5646,8 @@ impl MutationRequestOperation {
                             deletion,
                         };
                         return MutationStep::Transition(
-                            OperationTransition::SubmitCacheWorkAfterIntentRelease {
-                                work: crate::irp::CacheWork::prepare_size_change(stream),
+                            OperationTransition::SubmitPassiveWorkAfterIntentRelease {
+                                work: crate::irp::PassiveWork::prepare_size_change(stream),
                                 suspended: self,
                             },
                         );

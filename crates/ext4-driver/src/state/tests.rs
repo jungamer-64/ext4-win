@@ -621,7 +621,14 @@ fn no_intermediate_transfer_validates_range_and_buffer_alignment() {
         return;
     };
     let mode = DataTransferMode::Direct(NoIntermediateTransfer {
-        sector_size: TransferSectorSize::WINDOWS_REPORTED,
+        sector_size: {
+            let sector = TransferSectorSize::from_bytes(512);
+            assert!(sector.is_ok());
+            let Ok(sector) = sector else {
+                return;
+            };
+            sector
+        },
         buffer_alignment,
     });
 
@@ -667,6 +674,70 @@ fn no_intermediate_transfer_validates_range_and_buffer_alignment() {
         mode.validate_buffer(misaligned),
         Err(DriverError::InvalidParameter)
     );
+}
+
+/// # Errors
+/// Returns invalid device or cluster fixture geometry.
+/// # Panics
+/// Panics if 4Kn transfers accept a 512-byte range or allocation clusters lose sector divisibility.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "a stack-owned device fixture remains live throughout transfer constraint capture"
+)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions deliberately fail native transfer geometry contracts after fixture validation"
+)]
+fn native_sector_geometry_controls_direct_ranges_and_allocation_units() -> Result<(), DriverError> {
+    let mut device = wdk_sys::DEVICE_OBJECT {
+        SectorSize: 4096,
+        AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
+        ..Default::default()
+    };
+    let kernel = unsafe {
+        // SAFETY: This stack-owned fixture remains live for the entire test and is not shared.
+        KernelDevice::from_raw(&raw mut device)
+    }
+    .ok_or(DriverError::InvalidParameter)?;
+    let transfer = NoIntermediateTransfer::from_device(kernel)?;
+    let mode = DataTransferMode::Direct(transfer);
+    assert_eq!(mode.validate_range(4096, 4096), Ok(()));
+    assert_eq!(
+        mode.validate_range(512, 4096),
+        Err(DriverError::InvalidParameter)
+    );
+    assert_eq!(
+        mode.validate_range(4096, 512),
+        Err(DriverError::InvalidParameter)
+    );
+    assert_eq!(
+        mode.validate_position(512),
+        Err(DriverError::InvalidParameter)
+    );
+    assert_eq!(
+        transfer
+            .sector_size
+            .sectors_per_cluster(ext4_core::ClusterSize::new(16384)?),
+        Ok(4)
+    );
+    assert_eq!(
+        transfer
+            .sector_size
+            .sectors_per_cluster(ext4_core::ClusterSize::new(1024)?),
+        Err(DriverError::InvalidParameter)
+    );
+    assert_eq!(
+        transfer
+            .sector_size
+            .sectors_per_cluster(ext4_core::ClusterSize::new(6144)?),
+        Err(DriverError::InvalidParameter)
+    );
+    assert_eq!(
+        TransferSectorSize::from_bytes(0),
+        Err(DriverError::InvalidParameter)
+    );
+    Ok(())
 }
 
 /// # Panics
@@ -1013,7 +1084,14 @@ fn opened_object_preserves_data_transfer_mode() {
         return;
     };
     let transfer = NoIntermediateTransfer {
-        sector_size: TransferSectorSize::WINDOWS_REPORTED,
+        sector_size: {
+            let sector = TransferSectorSize::from_bytes(512);
+            assert!(sector.is_ok());
+            let Ok(sector) = sector else {
+                return;
+            };
+            sector
+        },
         buffer_alignment,
     };
     let volume = NonNull::<VolumeControlBlock>::dangling();

@@ -195,8 +195,8 @@ pub(crate) enum Phase {
     Registering,
     /// A completion envelope owns the lower lifetime.
     Lower,
-    /// A non-cancellable PASSIVE_LEVEL cache work envelope owns the operation.
-    Cache,
+    /// A non-cancellable PASSIVE_LEVEL native work envelope owns the operation.
+    Passive,
     /// FsRtl owns the top-level IRP while an oplock break is pending.
     Oplock,
 }
@@ -604,7 +604,7 @@ impl Scheduler {
             Phase::Oplock => CancelDisposition::CancelOplock,
             Phase::Retry => CancelDisposition::AwaitRetry,
             Phase::Registering | Phase::Actor => CancelDisposition::AwaitRegistration,
-            Phase::Cache | Phase::Vacant => CancelDisposition::Ignored,
+            Phase::Passive | Phase::Vacant => CancelDisposition::Ignored,
         }
     }
 
@@ -1218,7 +1218,7 @@ mod tests {
             (Phase::Retry, CancelDisposition::AwaitRetry),
             (Phase::Registering, CancelDisposition::AwaitRegistration),
             (Phase::Lower, CancelDisposition::CancelLower),
-            (Phase::Cache, CancelDisposition::Ignored),
+            (Phase::Passive, CancelDisposition::Ignored),
             (Phase::Oplock, CancelDisposition::CancelOplock),
         ] {
             let slot = require_some!(scheduler.reserve());

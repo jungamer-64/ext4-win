@@ -1005,7 +1005,8 @@ impl MountedVolumeAccess<'_> {
         };
         Ok(RawVolumeIoPermit {
             bound,
-            sector_size: route.filesystem_sector_size(),
+            sector_size: usize::try_from(route.filesystem_sector_size().as_u32())
+                .map_err(|_| DriverError::InvalidParameter)?,
         })
     }
 

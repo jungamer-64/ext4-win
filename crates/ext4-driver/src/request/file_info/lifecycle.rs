@@ -9,7 +9,7 @@ use super::*;
 pub(crate) fn prepare_cleanup_cache_work(
     mut request: PendingIrpLease<'_>,
     operations: &MountedVolumeAccess<'_>,
-) -> DriverResult<Option<crate::irp::CacheWork>> {
+) -> DriverResult<Option<crate::irp::PassiveWork>> {
     request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
         if file_object.has_no_file_system_contexts() {
@@ -18,7 +18,7 @@ pub(crate) fn prepare_cleanup_cache_work(
         match OpenedFileObject::decode(file_object)? {
             OpenedFileObject::Node(_) => operations
                 .acquire_file_object_cache_lease(file_object)
-                .map(crate::irp::CacheWork::uninitialize)
+                .map(crate::irp::PassiveWork::uninitialize)
                 .map(Some),
             OpenedFileObject::Volume(_) => Ok(None),
         }

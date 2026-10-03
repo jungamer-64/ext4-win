@@ -1,6 +1,7 @@
 //! Volume information query and mutation boundary.
 
-use ext4_core::{ClusterSize, Ext4VolumeLabel, VolumeGeometry, VolumeIdentity};
+use alloc::boxed::Box;
+use ext4_core::{Ext4VolumeLabel, OperationEvent, VolumeGeometry, VolumeIdentity};
 use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
@@ -9,8 +10,14 @@ use wdk_sys::{
 };
 
 use crate::{
-    irp::{IrpCompletion, PendingIrpLease, QueryVolumeInformationClass, SetVolumeInformationClass},
-    kernel::status::{DriverError, DriverResult},
+    irp::{
+        IrpBufferLength, IrpCompletion, OwnedIrp, PassiveWork, PassiveWorkCompletion,
+        PendingIrpLease, QueryVolumeInformationClass, SetVolumeInformationClass,
+    },
+    kernel::{
+        status::{DriverError, DriverResult},
+        storage::{SectorSizeInformation, StorageFailureClass},
+    },
     memory::{self, DriverVec},
     state::{
         MountedVolumeAccess, MountedVolumeDevice, PreparedVpbLabelPublication, TransferSectorSize,
@@ -19,34 +26,203 @@ use crate::{
     wire::{LittleEndianInput, LittleEndianOutput, WireOffset, WireRange},
 };
 
-use super::DriverMutationPass;
+use super::{DriverMutationPass, operation::AdmitOperationError};
+use crate::irp::reactor::{
+    CompletionEvent, CompletionOperation, MountedVolumeOperation, OperationTransition,
+    ReactorTarget,
+};
+
+/// Ownership phase of a volume query; native work can outlive the actor's mounted-state borrow.
+#[derive(Debug)]
+enum VolumeQueryState {
+    /// No native work has been queued.
+    Ready(OwnedIrp),
+    /// The referenced device transfers to a passive worker at queueing. Cancellation before
+    /// queueing consumes this state; queued work drains and returns its exact native result.
+    SectorSize {
+        /// Retains the FILE_OBJECT and output mapping until worker completion.
+        owned: OwnedIrp,
+        /// Caller capacity captured before leaving actor ownership.
+        length: IrpBufferLength,
+    },
+    /// Completion ownership has been consumed.
+    Terminal,
+}
+
+/// Queries committed filesystem information or delegates blocking storage observation.
+#[derive(Debug)]
+struct VolumeQueryOperation {
+    /// Exclusive IRP ownership and current completion protocol.
+    state: VolumeQueryState,
+}
+
+/// Admits one volume query without losing completion authority on allocation failure.
+/// # Errors
+///
+/// Returns the still-owned IRP when operation allocation fails.
+pub(crate) fn query(owned: OwnedIrp) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
+    memory::boxed_try_map(owned, |owned| VolumeQueryOperation {
+        state: VolumeQueryState::Ready(owned),
+    })
+    .map(|operation| -> Box<dyn CompletionOperation> { operation })
+    .map_err(|failure| {
+        let (error, owned) = failure.into_parts();
+        AdmitOperationError::new(error, owned)
+    })
+}
+
+/// Prepared effect selected while mounted access is available.
+enum VolumeQueryPlan {
+    /// No blocking work is required for this class.
+    Complete(IrpCompletion),
+    /// Native observation holds its own lifetime authority.
+    SectorSize {
+        /// Native call with independently retained device lifetime.
+        work: PassiveWork,
+        /// Output capacity retained by the suspended IRP.
+        length: IrpBufferLength,
+    },
+}
+
+impl MountedVolumeOperation for VolumeQueryOperation {
+    fn advance_mounted(
+        mut self: Box<Self>,
+        event: CompletionEvent,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let state = core::mem::replace(&mut self.state, VolumeQueryState::Terminal);
+        let (owned, result) = match (state, event) {
+            (
+                VolumeQueryState::Ready(mut owned),
+                CompletionEvent::Core(OperationEvent::Admitted),
+            ) => match prepare_query(owned.request(), access) {
+                Ok(VolumeQueryPlan::Complete(completion)) => (owned, Ok(completion)),
+                Ok(VolumeQueryPlan::SectorSize { work, length }) => {
+                    self.state = VolumeQueryState::SectorSize { owned, length };
+                    return OperationTransition::SubmitPassiveWork {
+                        work,
+                        suspended: self,
+                    };
+                }
+                Err(error) => (owned, Err(error)),
+            },
+            (
+                VolumeQueryState::Ready(owned) | VolumeQueryState::SectorSize { owned, .. },
+                CompletionEvent::Core(OperationEvent::CancelRequested),
+            ) => (
+                owned,
+                Err(DriverError::from(ext4_core::Error::OperationCancelled)),
+            ),
+            (
+                VolumeQueryState::SectorSize { mut owned, length },
+                CompletionEvent::PassiveCompleted(PassiveWorkCompletion::SectorSize(result)),
+            ) => {
+                let result = result.and_then(|information| {
+                    let mut request = owned.request();
+                    super::file_system_control::authorize_path_handle(&mut request, access)?;
+                    request.with_active(|active| {
+                        let mut output = active.buffered_output(length)?;
+                        pack_sector_size_information(&information, output.as_mut_slice())
+                    })
+                });
+                (owned, result)
+            }
+            _ => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        };
+        OperationTransition::Complete(owned.prepare_result(result))
+    }
+
+    fn record_mounted_storage_failure(
+        &mut self,
+        _failure: StorageFailureClass,
+        _access: &mut MountedVolumeAccess<'_>,
+    ) {
+        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+            .bugcheck();
+    }
+}
+
+impl CompletionOperation for VolumeQueryOperation {
+    fn advance(
+        self: Box<Self>,
+        event: CompletionEvent,
+        target: &mut ReactorTarget,
+    ) -> OperationTransition {
+        target.with_mounted_access(|access| self.advance_mounted(event, access))
+    }
+
+    fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {
+        target.with_mounted_access(|access| self.record_mounted_storage_failure(failure, access));
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "unique IRP authority moves only through the reactor and an owned work envelope"
+)]
+// SAFETY: The suspended operation retains the IRP and its FILE_OBJECT; no borrowed actor state
+// crosses worker execution. Every native result returns to the unique reactor completion owner.
+unsafe impl Send for VolumeQueryOperation {}
 
 /// Filesystem name exposed through `FileFsAttributeInformation`.
 const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x0049, 0x004E];
 
-/// Executes volume information queries.
+/// Packs committed classes or captures a referenced-device query before actor suspension.
 /// # Errors
 ///
-/// Returns an error when volume stack decoding or information packing fails.
-pub(crate) fn query(
+/// Rejects closed/dismounted handles, malformed stacks, insufficient output, or missing device
+/// associations before queueing native work. Packing failures also retain sole IRP ownership.
+fn prepare_query(
     mut request: PendingIrpLease<'_>,
     operations: &MountedVolumeAccess<'_>,
-) -> DriverResult<IrpCompletion> {
+) -> DriverResult<VolumeQueryPlan> {
+    super::file_system_control::authorize_path_handle(&mut request, operations)?;
     let stack = request.with_active(|active| active.current_stack()?.query_volume())?;
-    request.with_active(|active| {
-        let length = stack.length();
-        let mut buffer = active.buffered_output(length)?;
-        let output = buffer.as_mut_slice();
-        let identity = operations.volume_identity();
-        let geometry = operations.volume_geometry();
-        match stack.information_class() {
-            QueryVolumeInformationClass::Volume => pack_volume_information(identity, output),
-            QueryVolumeInformationClass::Size => pack_size_information(geometry, output),
-            QueryVolumeInformationClass::Device => pack_device_information(output),
-            QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
-            QueryVolumeInformationClass::FullSize => pack_full_size_information(geometry, output),
+    let sector = operations.storage_route().filesystem_sector_size();
+    if stack.information_class() == QueryVolumeInformationClass::SectorSize {
+        if stack.length().as_usize()
+            < core::mem::size_of::<wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION>()
+        {
+            return Err(DriverError::InfoLengthMismatch);
         }
-    })
+        let query = request.with_active(|active| {
+            let _output = active.buffered_output(stack.length())?;
+            MountedVolumeDevice::prepare_sector_query(active.device())
+        })?;
+        return Ok(VolumeQueryPlan::SectorSize {
+            work: PassiveWork::SectorSize {
+                query,
+                logical: sector,
+            },
+            length: stack.length(),
+        });
+    }
+    request
+        .with_active(|active| {
+            let length = stack.length();
+            let mut buffer = active.buffered_output(length)?;
+            let output = buffer.as_mut_slice();
+            let identity = operations.volume_identity();
+            let geometry = operations.volume_geometry();
+            match stack.information_class() {
+                QueryVolumeInformationClass::Volume => pack_volume_information(identity, output),
+                QueryVolumeInformationClass::Size => {
+                    pack_size_information(geometry, sector, output)
+                }
+                QueryVolumeInformationClass::Device => pack_device_information(output),
+                QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
+                QueryVolumeInformationClass::FullSize => {
+                    pack_full_size_information(geometry, sector, output)
+                }
+                QueryVolumeInformationClass::SectorSize => {
+                    Err(DriverError::InternalInvariantViolation)
+                }
+            }
+        })
+        .map(VolumeQueryPlan::Complete)
 }
 
 /// Executes volume information mutations.
@@ -215,6 +391,7 @@ fn pack_volume_information(
 /// or the output buffer is too small.
 fn pack_size_information(
     geometry: VolumeGeometry,
+    sector: TransferSectorSize,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<FILE_FS_SIZE_INFORMATION>();
@@ -240,14 +417,14 @@ fn pack_size_information(
             FILE_FS_SIZE_INFORMATION,
             SectorsPerAllocationUnit
         )),
-        sectors_per_allocation_unit(geometry.cluster_size())?,
+        sector.sectors_per_cluster(geometry.cluster_size())?,
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
             FILE_FS_SIZE_INFORMATION,
             BytesPerSector
         )),
-        TransferSectorSize::WINDOWS_REPORTED.as_u32(),
+        sector.as_u32(),
     )?;
     information_length(size)
 }
@@ -283,6 +460,7 @@ fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
 /// `FILE_FS_FULL_SIZE_INFORMATION` or the output buffer is too small.
 fn pack_full_size_information(
     geometry: VolumeGeometry,
+    sector: TransferSectorSize,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
     let total = i64::try_from(geometry.cluster_count().as_u64())
@@ -317,14 +495,14 @@ fn pack_full_size_information(
             FILE_FS_FULL_SIZE_INFORMATION,
             SectorsPerAllocationUnit
         )),
-        sectors_per_allocation_unit(geometry.cluster_size())?,
+        sector.sectors_per_cluster(geometry.cluster_size())?,
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
             FILE_FS_FULL_SIZE_INFORMATION,
             BytesPerSector
         )),
-        TransferSectorSize::WINDOWS_REPORTED.as_u32(),
+        sector.as_u32(),
     )?;
     information_length(size)
 }
@@ -392,16 +570,32 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
     information_length(required)
 }
 
-/// Returns sectors per ext4 allocation cluster for Windows allocation units.
+/// Encodes the seven specification-defined ULONG fields without native padding or excess output.
 /// # Errors
 ///
-/// Returns an error when the cluster size is smaller than one sector.
-fn sectors_per_allocation_unit(cluster_size: ClusterSize) -> DriverResult<u32> {
-    cluster_size
-        .bytes()
-        .checked_div(TransferSectorSize::WINDOWS_REPORTED.as_u32())
-        .filter(|sectors| *sectors != 0)
-        .ok_or(DriverError::InvalidParameter)
+/// Returns information length mismatch for fewer than 28 output bytes.
+fn pack_sector_size_information(
+    information: &SectorSizeInformation,
+    output: &mut [u8],
+) -> DriverResult<IrpCompletion> {
+    let record = information.record();
+    let fields = [
+        record.LogicalBytesPerSector,
+        record.PhysicalBytesPerSectorForAtomicity,
+        record.PhysicalBytesPerSectorForPerformance,
+        record.FileSystemEffectivePhysicalBytesPerSectorForAtomicity,
+        record.Flags,
+        record.ByteOffsetForSectorAlignment,
+        record.ByteOffsetForPartitionAlignment,
+    ];
+    let required = core::mem::size_of_val(&fields);
+    let output = output
+        .get_mut(..required)
+        .ok_or(DriverError::InfoLengthMismatch)?;
+    for (bytes, field) in output.as_chunks_mut::<4>().0.iter_mut().zip(fields) {
+        memory::copy_exact(bytes, &field.to_le_bytes())?;
+    }
+    information_length(required)
 }
 
 /// Converts a byte count to `IO_STATUS_BLOCK::Information`.
@@ -436,6 +630,58 @@ mod tests {
         pack_attribute_information, pack_device_information, volume_label_from_file_fs_label,
     };
     use ext4_core::Ext4VolumeLabel;
+
+    /// # Errors
+    /// Returns invalid fixture geometry or bounded output errors.
+    /// # Panics
+    /// Panics when the specification's field offsets, effective unit or exact output length differ.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions intentionally fail the sector information contract after fallible fixture construction"
+    )]
+    fn sector_information_preserves_physical_geometry_and_unknown_offsets()
+    -> Result<(), DriverError> {
+        for (logical, physical, performance) in [(512, 4096, 65536), (4096, 4096, 4096)] {
+            let information = super::SectorSizeInformation::from_record(
+                wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION {
+                    LogicalBytesPerSector: logical,
+                    PhysicalBytesPerSectorForAtomicity: physical,
+                    PhysicalBytesPerSectorForPerformance: performance,
+                    FileSystemEffectivePhysicalBytesPerSectorForAtomicity: 0,
+                    Flags: 0x0C,
+                    ByteOffsetForSectorAlignment: u32::MAX,
+                    ByteOffsetForPartitionAlignment: u32::MAX,
+                },
+                crate::state::TransferSectorSize::from_bytes(logical)?,
+            )?;
+            let mut output = [0xA5_u8; 32];
+            assert_eq!(
+                super::pack_sector_size_information(&information, &mut output)?,
+                IrpCompletion::from_usize(28)?
+            );
+            let input = LittleEndianInput::new(&output);
+            for (offset, value) in [
+                (0, logical),
+                (4, physical),
+                (8, performance),
+                (12, logical),
+                (16, 0x0C),
+                (20, u32::MAX),
+                (24, u32::MAX),
+            ] {
+                assert_eq!(input.read_u32(WireOffset::new(offset))?, value);
+            }
+            assert_eq!(output.get(28..), Some([0xA5; 4].as_slice()));
+            let mut short = [0xA5; 27];
+            assert_eq!(
+                super::pack_sector_size_information(&information, &mut short),
+                Err(DriverError::InfoLengthMismatch)
+            );
+            assert_eq!(short, [0xA5; 27]);
+        }
+        Ok(())
+    }
 
     /// # Panics
     ///

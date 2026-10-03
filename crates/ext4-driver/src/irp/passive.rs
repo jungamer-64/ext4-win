@@ -32,9 +32,16 @@ use super::reactor::{CompletionOperation, CompletionReactor};
 #[cfg(not(test))]
 use super::scheduler::SlotId;
 
-/// One fully captured Cache Manager call whose stream lease owns every native identity.
+/// One captured native call whose resource lease owns every identity through worker completion.
 #[derive(Debug)]
 pub(crate) enum PassiveWork {
+    /// Read sector geometry without blocking the actor or retaining its mounted-state borrow.
+    SectorSize {
+        /// Referenced VPB real device released when this work finishes or fails before queueing.
+        query: crate::kernel::storage::SectorSizeQuery,
+        /// Mount-owned logical unit that the native result must agree with.
+        logical: crate::state::TransferSectorSize,
+    },
     /// Acquire Cache Manager pages for the suspended request.
     Mdl {
         /// Retains the exact stream through the native call.
@@ -103,9 +110,11 @@ pub(crate) enum PassiveWork {
     },
 }
 
-/// Exact result returned by one Cache Manager work item.
+/// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// Native sector observation, including its exact failure status.
+    SectorSize(DriverResult<crate::kernel::storage::SectorSizeInformation>),
     /// MDL chain acquisition and observed byte count.
     Mdl(DriverResult<usize>),
     /// Cached read status and observed transfer byte count.
@@ -206,9 +215,12 @@ impl PassiveWork {
         Self::Uninitialize { file_object }
     }
 
-    /// Executes the sole native Cc/MM call selected before the actor suspended.
+    /// Executes the sole native call selected before the actor suspended.
     pub(super) fn execute(self) -> PassiveWorkCompletion {
         match self {
+            Self::SectorSize { query, logical } => {
+                PassiveWorkCompletion::SectorSize(query.execute(logical))
+            }
             Self::Mdl {
                 file_object,
                 irp,
@@ -249,12 +261,15 @@ impl PassiveWork {
     /// Preserves the selected operation kind when worker preparation fails before queueing.
     pub(super) fn failed(self, error: DriverError) -> PassiveWorkCompletion {
         match self {
+            Self::SectorSize { .. } => PassiveWorkCompletion::SectorSize(Err(error)),
             Self::Mdl { .. } => PassiveWorkCompletion::Mdl(Err(error)),
             Self::Read { .. } => PassiveWorkCompletion::Read(Err(error)),
             Self::Write { .. } => PassiveWorkCompletion::Write(Err(error)),
             Self::Flush { .. } => PassiveWorkCompletion::Flush(Err(error)),
             Self::Purge { .. } => PassiveWorkCompletion::Purge(Err(error)),
-            Self::DrainForVolumeLock { .. } => PassiveWorkCompletion::DrainForVolumeLock(Err(error)),
+            Self::DrainForVolumeLock { .. } => {
+                PassiveWorkCompletion::DrainForVolumeLock(Err(error))
+            }
             Self::PrepareSizeChange { .. } => PassiveWorkCompletion::PrepareSizeChange(Err(error)),
             Self::PrepareDeletion { .. } => PassiveWorkCompletion::PrepareDeletion(Err(error)),
             Self::PrepareWriteOpen { .. } => PassiveWorkCompletion::PrepareWriteOpen(Err(error)),
@@ -265,10 +280,11 @@ impl PassiveWork {
 
 #[expect(
     unsafe_code,
-    reason = "the suspended IRP and cache stream lease retain every pre-captured mapping and identity"
+    reason = "suspended IRPs, stream leases and referenced devices retain every captured mapping and identity through native work"
 )]
-// SAFETY: Each pointer belongs to the unique suspended top-level IRP. `PassiveWork` moves into one
-// work envelope and is consumed before that operation can resume or release its mappings.
+// SAFETY: IRP mappings belong to the unique suspended operation, stream leases retain Cc/MM
+// identities, and sector queries own a device reference. One work envelope consumes the call
+// before the operation can resume or release any input resource.
 unsafe impl Send for PassiveWork {}
 
 /// Preparation failure that returns the unique suspended operation to the reactor.
@@ -278,7 +294,7 @@ pub(super) struct PassiveWorkPreparationError {
     error: DriverError,
     /// Operation that never crossed the worker effect boundary.
     suspended: Box<dyn CompletionOperation>,
-    /// Prepared cache call that never crossed the worker effect boundary.
+    /// Prepared native call that never crossed the worker effect boundary.
     work: PassiveWork,
 }
 
@@ -290,7 +306,7 @@ impl PassiveWorkPreparationError {
     }
 }
 
-/// Stable work-item allocation published into the reactor cache-completion inbox.
+/// Stable work-item allocation published into the reactor passive-completion inbox.
 #[cfg(not(test))]
 #[repr(C)]
 pub(super) struct PassiveWorkEnvelope {
@@ -308,7 +324,7 @@ pub(super) struct PassiveWorkEnvelope {
     rundown: CompletionRundownLease,
     /// Unique top-level operation suspended outside actor ownership.
     suspended: Option<Box<dyn CompletionOperation>>,
-    /// Cache call consumed exactly once by the work-item callback.
+    /// Native call consumed exactly once by the work-item callback.
     work: Option<PassiveWork>,
     /// Result published only after `work` has been consumed.
     completion: Option<PassiveWorkCompletion>,
@@ -332,7 +348,7 @@ impl fmt::Debug for PassiveWorkEnvelope {
     reason = "the work-item envelope is the audited owner of WDK allocation, queue, and intrusive-list boundaries"
 )]
 impl PassiveWorkEnvelope {
-    /// Allocates the WDK work item and stable envelope before any Cc/MM effect can occur.
+    /// Allocates the WDK work item and stable envelope before any native effect can occur.
     /// # Errors
     ///
     /// Returns the exact allocation failure together with both unconsumed ownership values.
@@ -422,7 +438,7 @@ impl PassiveWorkEnvelope {
             // SAFETY: The envelope and work item remain live until the callback consumes both.
             ffi::IoQueueWorkItem(
                 work_item.as_ptr(),
-                Some(cache_work_item),
+                Some(passive_work_item),
                 wdk_sys::_WORK_QUEUE_TYPE::DelayedWorkQueue,
                 raw.cast::<c_void>(),
             );
@@ -437,7 +453,7 @@ impl PassiveWorkEnvelope {
     /// Recovers an envelope from its first-field intrusive node.
     /// # Safety
     ///
-    /// `node` must have been removed exactly once from the cache-completion inbox.
+    /// `node` must have been removed exactly once from the passive-completion inbox.
     pub(super) unsafe fn from_node(node: NonNull<LIST_ENTRY>) -> NonNull<Self> {
         node.cast()
     }
@@ -477,16 +493,16 @@ impl PassiveWorkEnvelope {
 // limited to the immutable reactor destination retained by the rundown lease.
 unsafe impl Send for PassiveWorkEnvelope {}
 
-/// PASSIVE_LEVEL callback that executes one Cc/MM call and publishes its typed result.
+/// PASSIVE_LEVEL callback that executes one native call and publishes its typed result.
 /// # Safety
 ///
 /// `device` and `context` must be the pair queued by [`PassiveWorkEnvelope::queue`].
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
-    reason = "the I/O Manager returns the unique raw cache work envelope supplied at queue time"
+    reason = "the I/O Manager returns the unique raw passive work envelope supplied at queue time"
 )]
-unsafe extern "C" fn cache_work_item(device: wdk_sys::PDEVICE_OBJECT, context: wdk_sys::PVOID) {
+unsafe extern "C" fn passive_work_item(device: wdk_sys::PDEVICE_OBJECT, context: wdk_sys::PVOID) {
     let envelope = NonNull::new(context.cast::<PassiveWorkEnvelope>()).unwrap_or_else(|| {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
     });
@@ -515,6 +531,6 @@ unsafe extern "C" fn cache_work_item(device: wdk_sys::PDEVICE_OBJECT, context: w
     };
     unsafe {
         // SAFETY: Callback transfers its unique, completed, unlinked envelope to the reactor.
-        reactor.enqueue_cache_completion(NonNull::from(envelope));
+        reactor.enqueue_passive_completion(NonNull::from(envelope));
     }
 }

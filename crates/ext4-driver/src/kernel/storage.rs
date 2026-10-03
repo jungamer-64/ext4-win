@@ -19,7 +19,7 @@ use crate::irp::lower::{
 };
 use crate::kernel::status::{DriverError, DriverResult, STATUS_RETRY};
 use crate::memory;
-use crate::state::KernelDevice;
+use crate::state::{KernelDevice, TransferSectorSize};
 
 /// Retryable lower status `STATUS_DEVICE_BUSY`.
 const STATUS_DEVICE_BUSY: NTSTATUS = i32::from_ne_bytes(0x8000_0011_u32.to_ne_bytes());
@@ -39,6 +39,133 @@ const STATUS_NONEXISTENT_SECTOR: NTSTATUS = i32::from_ne_bytes(0xC000_0015_u32.t
 /// Initial try plus two delayed retries.
 const MAX_STORAGE_ATTEMPTS: u8 = 3;
 
+/// A referenced real-device capability consumed by one passive sector query.
+/// Reference acquisition precedes queueing, and every build failure or completed worker releases
+/// it. The capability permits observation only; it does not grant storage mutation authority.
+#[derive(Debug)]
+pub(crate) struct SectorSizeQuery {
+    /// Independently retained I/O Manager device, including across mounted-state transitions.
+    device: KernelDevice,
+}
+
+impl SectorSizeQuery {
+    /// References a real device while its mounted VPB association is still retained.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the mounted VPB lease establishes liveness before Object Manager reference acquisition"
+        )
+    )]
+    pub(crate) fn reference(device: KernelDevice) -> Self {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The mounted-device boundary holds the VPB lock and retains this real device.
+            let _references = crate::kernel::ffi::ObfReferenceObject(device.as_ptr().cast());
+        }
+        Self { device }
+    }
+
+    /// Executes the read-only native query outside the actor at PASSIVE_LEVEL.
+    /// # Errors
+    ///
+    /// Preserves the native failure status. Invalid sizes or a changed logical transfer unit
+    /// fail with STATUS_BAD_DEVICE_TYPE, without publishing any output or claiming a media verify.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the owned device reference and initialized record span the synchronous FsRtl call"
+        )
+    )]
+    pub(crate) fn execute(
+        self,
+        logical: TransferSectorSize,
+    ) -> DriverResult<SectorSizeInformation> {
+        #[cfg(not(test))]
+        {
+            let mut record = wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION::default();
+            let status = unsafe {
+                // SAFETY: The worker runs at PASSIVE_LEVEL, the capability retains the real
+                // device, and FsRtl writes only to this exclusively owned initialized record.
+                crate::kernel::ffi::FsRtlGetSectorSizeInformation(
+                    self.device.as_ptr(),
+                    &raw mut record,
+                )
+            };
+            if status < wdk_sys::STATUS_SUCCESS {
+                return Err(DriverError::SectorQueryFailure(status));
+            }
+            SectorSizeInformation::from_record(record, logical)
+        }
+        #[cfg(test)]
+        {
+            let _retained = (self.device, logical);
+            // User-mode fixtures cannot execute a kernel storage query.
+            Err(DriverError::SectorQueryFailure(
+                wdk_sys::STATUS_INVALID_DEVICE_REQUEST,
+            ))
+        }
+    }
+}
+
+impl Drop for SectorSizeQuery {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this owner balances its single Object Manager acquisition after native work or unsubmitted failure"
+        )
+    )]
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This unique capability acquired one reference and releases it exactly once.
+            let _references = crate::kernel::ffi::ObfDereferenceObject(self.device.as_ptr().cast());
+        }
+    }
+}
+
+/// Validated storage information with the filesystem's actual transfer unit established.
+#[derive(Debug)]
+pub(crate) struct SectorSizeInformation {
+    /// Native layout has no independent serialization or storage authority.
+    record: wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION,
+}
+
+impl SectorSizeInformation {
+    /// Establishes agreement between the native result and mount-owned transfer geometry.
+    /// # Errors
+    ///
+    /// Rejects invalid physical sizes or a logical sector different from the mounted unit.
+    pub(crate) fn from_record(
+        mut record: wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION,
+        logical: TransferSectorSize,
+    ) -> DriverResult<Self> {
+        if record.LogicalBytesPerSector != logical.as_u32()
+            || !record.PhysicalBytesPerSectorForAtomicity.is_power_of_two()
+            || record.PhysicalBytesPerSectorForAtomicity < logical.as_u32()
+            || !record
+                .PhysicalBytesPerSectorForPerformance
+                .is_power_of_two()
+            || record.PhysicalBytesPerSectorForPerformance < logical.as_u32()
+        {
+            return Err(DriverError::SectorQueryFailure(i32::from_ne_bytes(
+                0xC000_00CB_u32.to_ne_bytes(),
+            )));
+        }
+        // Lower transfers cover logical sectors, including read-modify-write for a partial core
+        // range. The filesystem does not require alignment to the device's larger physical unit.
+        record.FileSystemEffectivePhysicalBytesPerSectorForAtomicity = logical.as_u32();
+        Ok(Self { record })
+    }
+
+    /// Returns the established native record for bounded Windows output encoding.
+    pub(crate) const fn record(&self) -> &wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION {
+        &self.record
+    }
+}
+
 /// Physical lower-device transfer constraints fixed at mount.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LowerStorageDevice {
@@ -46,8 +173,8 @@ pub struct LowerStorageDevice {
     device: KernelDevice,
     /// Validated device byte length.
     length: DeviceLength,
-    /// Whole-sector lower transfer unit.
-    sector_size: usize,
+    /// Logical-sector lower transfer unit.
+    sector_size: TransferSectorSize,
     /// Required virtual-address alignment.
     buffer_alignment: usize,
     /// Buffer representation consumed by the stack.
@@ -69,17 +196,13 @@ impl LowerStorageDevice {
             device.as_ptr().as_ref()
         }
         .ok_or(DriverError::InvalidParameter)?;
-        let sector_size = usize::from(object.SectorSize);
+        let sector_size = device.transfer_sector_size()?;
         let alignment_mask = usize::try_from(object.AlignmentRequirement)
             .map_err(|_| DriverError::InvalidParameter)?;
         let buffer_alignment = alignment_mask
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
-        if length.is_empty()
-            || sector_size == 0
-            || !sector_size.is_power_of_two()
-            || !buffer_alignment.is_power_of_two()
-        {
+        if length.is_empty() || !buffer_alignment.is_power_of_two() {
             return Err(DriverError::InvalidParameter);
         }
         Ok(Self {
@@ -91,7 +214,7 @@ impl LowerStorageDevice {
         })
     }
 
-    /// Covers one arbitrary core byte range with whole physical sectors.
+    /// Covers one arbitrary core byte range with whole logical sectors.
     /// # Errors
     ///
     /// Returns an error when the requested or covering range overflows, exceeds the device, or
@@ -105,8 +228,7 @@ impl LowerStorageDevice {
         if requested_end > self.length.bytes() {
             return Err(DriverError::InvalidParameter);
         }
-        let sector_size =
-            u64::try_from(self.sector_size).map_err(|_| DriverError::InternalInvariantViolation)?;
+        let sector_size = u64::from(self.sector_size.as_u32());
         let sector_mask = sector_size
             .checked_sub(1)
             .ok_or(DriverError::InternalInvariantViolation)?;
@@ -205,8 +327,8 @@ impl MountedStorageRoute {
         self.filesystem.length
     }
 
-    /// Returns the physical sector unit required for direct-volume offsets and lengths.
-    pub(crate) const fn filesystem_sector_size(self) -> usize {
+    /// Returns the logical sector unit required for file and direct-volume transfers.
+    pub(crate) const fn filesystem_sector_size(self) -> TransferSectorSize {
         self.filesystem.sector_size
     }
 }
@@ -590,10 +712,6 @@ impl<O> PreparedStorageCommand<O> {
     /// Returns the suspended command when IRP, MDL, envelope, or completion-rundown preparation
     /// fails before registration.
     #[cfg(not(test))]
-    #[expect(
-        clippy::result_large_err,
-        reason = "pre-submission failure must return the command and its suspended owner without allocating another fallible error container"
-    )]
     pub fn build_lower<R>(
         self,
         destination: R,
@@ -1125,6 +1243,51 @@ mod tests {
     use crate::memory;
     use crate::state::KernelDevice;
     use ext4_core::{ByteOffset, DeviceLength, Error, StorageRequest, StorageTarget};
+
+    /// # Errors
+    /// Returns invalid constant transfer geometry.
+    /// # Panics
+    /// Panics if invalid or changed storage geometry is published as a valid observation.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions fail the native geometry contract after fallible fixture construction"
+    )]
+    fn sector_observation_rejects_changed_or_invalid_device_units() -> Result<(), DriverError> {
+        let logical = crate::state::TransferSectorSize::from_bytes(512)?;
+        let valid = wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION {
+            LogicalBytesPerSector: 512,
+            PhysicalBytesPerSectorForAtomicity: 4096,
+            PhysicalBytesPerSectorForPerformance: 4096,
+            ..Default::default()
+        };
+        for record in [
+            wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION {
+                LogicalBytesPerSector: 4096,
+                ..valid
+            },
+            wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION {
+                PhysicalBytesPerSectorForAtomicity: 0,
+                ..valid
+            },
+            wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION {
+                PhysicalBytesPerSectorForPerformance: 768,
+                ..valid
+            },
+            wdk_sys::FILE_FS_SECTOR_SIZE_INFORMATION {
+                PhysicalBytesPerSectorForAtomicity: 256,
+                ..valid
+            },
+        ] {
+            let observed = super::SectorSizeInformation::from_record(record, logical);
+            assert!(
+                matches!(observed, Err(DriverError::SectorQueryFailure(status)) if status == i32::from_ne_bytes(0xC000_00CB_u32.to_ne_bytes()))
+            );
+        }
+        let status = wdk_sys::STATUS_IO_DEVICE_ERROR;
+        assert_eq!(DriverError::SectorQueryFailure(status).ntstatus(), status);
+        Ok(())
+    }
 
     struct StorageFixture {
         _owner: Box<wdk_sys::DEVICE_OBJECT>,

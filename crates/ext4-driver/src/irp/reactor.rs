@@ -27,12 +27,12 @@ use crate::state::{MountedVolumeDevice, VolumeRetirement};
 #[cfg(not(test))]
 use super::ActiveCancelDestination;
 #[cfg(not(test))]
-use super::cache::CacheWorkEnvelope;
-#[cfg(not(test))]
 use super::lower::{LowerCompletionEnvelope, LowerCompletionRoute, PublishedLowerRequest};
 use super::oplock::{OplockCheck, OplockContinuation};
 #[cfg(not(test))]
 use super::oplock::{OplockEnvelope, OplockSubmission, PublishedOplockRequest};
+#[cfg(not(test))]
+use super::passive::PassiveWorkEnvelope;
 #[cfg(not(test))]
 use super::scheduler::{
     Admission as SchedulerAdmission, AdmissionStart, CancelDisposition, HandleId, IntentDisposition,
@@ -339,8 +339,8 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
 pub(crate) enum CompletionEvent {
     /// A filesystem event with its original consuming grant or lower completion.
     Core(OperationEvent),
-    /// One PASSIVE_LEVEL Cache Manager work item returned to the unique reactor owner.
-    CacheCompleted(crate::irp::CacheWorkCompletion),
+    /// One PASSIVE_LEVEL native work item returned to the unique reactor owner.
+    PassiveCompleted(crate::irp::PassiveWorkCompletion),
     /// The volume can no longer satisfy a pre-effect commit or durability wait.
     VolumeFailed(DriverError),
 }
@@ -351,7 +351,7 @@ impl CompletionEvent {
     pub(crate) fn into_core(self) -> OperationEvent {
         match self {
             Self::Core(event) => event,
-            Self::CacheCompleted(_) | Self::VolumeFailed(_) => {
+            Self::PassiveCompleted(_) | Self::VolumeFailed(_) => {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             }
         }
@@ -460,18 +460,18 @@ pub(crate) enum OperationTransition {
         /// Close operation that must continue even when top-level cancellation is pending.
         suspended: Box<dyn CompletionOperation>,
     },
-    /// Execute one prepared Cache Manager call outside the actor and requester threads.
-    SubmitCacheWork {
-        /// Fully captured Cc/MM operation whose stream lease owns every referenced identity.
-        work: crate::irp::CacheWork,
+    /// Execute one prepared native call outside the actor and requester threads.
+    SubmitPassiveWork {
+        /// Fully captured native operation whose resource lease owns every referenced identity.
+        work: crate::irp::PassiveWork,
         /// Operation moved by value into the work-item completion envelope.
         suspended: Box<dyn CompletionOperation>,
     },
-    /// Release a provisional mutation intent before a reentrant Cache Manager call.
-    SubmitCacheWorkAfterIntentRelease {
-        /// Fully captured Cc/MM operation whose stream lease owns every native identity.
-        work: crate::irp::CacheWork,
-        /// Operation resumed only after cache work, then re-resolved before requesting intent.
+    /// Release a provisional mutation intent before a reentrant native call.
+    SubmitPassiveWorkAfterIntentRelease {
+        /// Fully captured native operation whose resource lease owns every identity.
+        work: crate::irp::PassiveWork,
+        /// Operation resumed only after native work, then re-resolved before requesting intent.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Transfer one break-causing top-level IRP to the stream-owned FsRtl oplock package.
@@ -941,8 +941,8 @@ pub(crate) struct CompletionReactor {
     completion_head: UnsafeCell<LIST_ENTRY>,
     /// Completed mount length-query envelopes kept type-separated from storage commands.
     length_completion_head: UnsafeCell<LIST_ENTRY>,
-    /// Completed Cache Manager work envelopes kept type-separated from lower I/O.
-    cache_completion_head: UnsafeCell<LIST_ENTRY>,
+    /// Completed native work envelopes kept type-separated from lower I/O.
+    passive_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Completed oplock-wait envelopes kept type-separated from all lower and worker callbacks.
     oplock_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Pending plus active operation count, bounded by `MAX_OPERATIONS`.
@@ -1085,7 +1085,7 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
-            core::ptr::addr_of_mut!((*reactor).cache_completion_head)
+            core::ptr::addr_of_mut!((*reactor).passive_completion_head)
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
@@ -1269,7 +1269,7 @@ impl CompletionReactor {
             pending_head: _,
             completion_head: _,
             length_completion_head: _,
-            cache_completion_head: _,
+            passive_completion_head: _,
             oplock_completion_head: _,
             admitted: _,
             wake_event: _,
@@ -1307,7 +1307,7 @@ impl CompletionReactor {
         }
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
-            initialize_list_head(reactor.cache_completion_head.get());
+            initialize_list_head(reactor.passive_completion_head.get());
         }
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
@@ -2014,9 +2014,9 @@ impl CompletionReactor {
             // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
             list_is_empty(reactor.length_completion_head.get())
         };
-        let cache_completion_list_empty = unsafe {
+        let passive_completion_list_empty = unsafe {
             // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
-            list_is_empty(reactor.cache_completion_head.get())
+            list_is_empty(reactor.passive_completion_head.get())
         };
         let oplock_completion_list_empty = unsafe {
             // SAFETY: Rundown is closed and teardown exclusively owns this initialized list.
@@ -2029,7 +2029,7 @@ impl CompletionReactor {
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
             || !completion_list_empty
             || !length_completion_list_empty
-            || !cache_completion_list_empty
+            || !passive_completion_list_empty
             || !oplock_completion_list_empty
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -2139,7 +2139,7 @@ impl CompletionReactor {
             }
             progressed |= self.drain_storage_completions();
             progressed |= self.drain_length_completions();
-            progressed |= self.drain_cache_completions();
+            progressed |= self.drain_passive_completions();
             progressed |= self.drain_oplock_completions();
             progressed |= self.drain_active_cancels();
             progressed |= self.drain_retry_events();
@@ -2154,9 +2154,9 @@ impl CompletionReactor {
                 // SAFETY: The sole reactor actor observes this initialized inbox list.
                 list_is_empty(self.length_completion_head.get())
             };
-            let cache_completion_list_empty = unsafe {
+            let passive_completion_list_empty = unsafe {
                 // SAFETY: The sole reactor actor observes this initialized inbox list.
-                list_is_empty(self.cache_completion_head.get())
+                list_is_empty(self.passive_completion_head.get())
             };
             let oplock_completion_list_empty = unsafe {
                 // SAFETY: The sole reactor actor observes this initialized inbox list.
@@ -2169,7 +2169,7 @@ impl CompletionReactor {
                 && self.delayed_close_ready.load(Ordering::Acquire) == 0
                 && completion_list_empty
                 && length_completion_list_empty
-                && cache_completion_list_empty
+                && passive_completion_list_empty
                 && oplock_completion_list_empty
             {
                 self.lifecycle
@@ -2397,10 +2397,10 @@ impl CompletionReactor {
                     EffectCancellation::ContinueClosing,
                 );
             }
-            OperationTransition::SubmitCacheWork { work, suspended } => {
-                self.submit_cache_work(index, work, suspended);
+            OperationTransition::SubmitPassiveWork { work, suspended } => {
+                self.submit_passive_work(index, work, suspended);
             }
-            OperationTransition::SubmitCacheWorkAfterIntentRelease { work, suspended } => {
+            OperationTransition::SubmitPassiveWorkAfterIntentRelease { work, suspended } => {
                 let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
                 else {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -2408,7 +2408,7 @@ impl CompletionReactor {
                 if !self.with_scheduler(|scheduler| scheduler.release_required_intent(identity)) {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
-                self.submit_cache_work(index, work, suspended);
+                self.submit_passive_work(index, work, suspended);
                 self.grant_available_intents();
             }
             OperationTransition::CheckOplock {
@@ -2700,12 +2700,12 @@ impl CompletionReactor {
         }
     }
 
-    /// Allocates and queues one PASSIVE_LEVEL Cache Manager call outside actor ownership.
+    /// Allocates and queues one PASSIVE_LEVEL native call outside actor ownership.
     #[cfg(not(test))]
-    fn submit_cache_work(
+    fn submit_passive_work(
         &self,
         index: usize,
-        work: crate::irp::CacheWork,
+        work: crate::irp::PassiveWork,
         suspended: SuspendedOperation,
     ) {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
@@ -2717,7 +2717,9 @@ impl CompletionReactor {
                 self.set_ready_operation_event(
                     index,
                     suspended,
-                    CompletionEvent::CacheCompleted(work.failed(DriverError::InvalidDeviceRequest)),
+                    CompletionEvent::PassiveCompleted(
+                        work.failed(DriverError::InvalidDeviceRequest),
+                    ),
                 );
                 return;
             }
@@ -2725,12 +2727,12 @@ impl CompletionReactor {
                 self.set_ready_operation_event(
                     index,
                     suspended,
-                    CompletionEvent::CacheCompleted(work.failed(error)),
+                    CompletionEvent::PassiveCompleted(work.failed(error)),
                 );
                 return;
             }
         };
-        let prepared = match CacheWorkEnvelope::try_new(
+        let prepared = match PassiveWorkEnvelope::try_new(
             self.device,
             NonNull::from(self),
             identity,
@@ -2744,13 +2746,13 @@ impl CompletionReactor {
                 self.set_ready_operation_event(
                     index,
                     suspended,
-                    CompletionEvent::CacheCompleted(work.failed(error)),
+                    CompletionEvent::PassiveCompleted(work.failed(error)),
                 );
                 return;
             }
         };
         if self.cancellation_is_pending(index) {
-            let (_work, suspended) = CacheWorkEnvelope::cancel_before_queue(prepared);
+            let (_work, suspended) = PassiveWorkEnvelope::cancel_before_queue(prepared);
             self.set_ready_operation_event(
                 index,
                 suspended,
@@ -2758,10 +2760,10 @@ impl CompletionReactor {
             );
             return;
         }
-        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Cache)) {
+        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
-        CacheWorkEnvelope::queue(prepared);
+        PassiveWorkEnvelope::queue(prepared);
     }
 
     /// Allocates one stable continuation and delegates an IRP without retaining driver completion
@@ -3258,7 +3260,7 @@ impl CompletionReactor {
         progressed
     }
 
-    /// Links one completed Cache Manager work envelope into its type-separated inbox.
+    /// Links one completed native work envelope into its type-separated inbox.
     /// # Safety
     ///
     /// `envelope` must be uniquely worker-owned, unlinked, nonpaged, and protected by this
@@ -3268,7 +3270,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "the work callback transfers one completed intrusive envelope under the reactor lock"
     )]
-    pub(super) unsafe fn enqueue_cache_completion(&self, envelope: NonNull<CacheWorkEnvelope>) {
+    pub(super) unsafe fn enqueue_passive_completion(&self, envelope: NonNull<PassiveWorkEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes work callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
@@ -3279,7 +3281,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
-            insert_tail_list(self.cache_completion_head.get(), node);
+            insert_tail_list(self.passive_completion_head.get(), node);
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
@@ -3288,40 +3290,40 @@ impl CompletionReactor {
         self.wake();
     }
 
-    /// Removes one completed cache work envelope, if present.
+    /// Removes one completed passive work envelope, if present.
     #[cfg(not(test))]
     #[expect(
         unsafe_code,
-        reason = "the reactor lock protects the typed cache-completion intrusive list"
+        reason = "the reactor lock protects the typed passive-completion intrusive list"
     )]
-    fn pop_cache_completion(&self) -> Option<NonNull<CacheWorkEnvelope>> {
+    fn pop_passive_completion(&self) -> Option<NonNull<PassiveWorkEnvelope>> {
         let old_irql = unsafe {
-            // SAFETY: Stable reactor lock serializes cache-completion list access.
+            // SAFETY: Stable reactor lock serializes passive-completion list access.
             ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
         };
         let node = unsafe {
             // SAFETY: The reactor lock is held for this initialized completion list.
-            remove_head_list(self.cache_completion_head.get())
+            remove_head_list(self.passive_completion_head.get())
         };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
             ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
         }
         node.map(|node| unsafe {
-            // SAFETY: The cache envelope's node is its first field.
-            CacheWorkEnvelope::from_node(node)
+            // SAFETY: The passive envelope's node is its first field.
+            PassiveWorkEnvelope::from_node(node)
         })
     }
 
-    /// Reclaims and routes every completed Cache Manager work item.
+    /// Reclaims and routes every completed native work item.
     #[cfg(not(test))]
     #[expect(
         unsafe_code,
-        reason = "inbox removal grants unique ownership of the completed cache envelope"
+        reason = "inbox removal grants unique ownership of the completed passive envelope"
     )]
-    fn drain_cache_completions(&self) -> bool {
+    fn drain_passive_completions(&self) -> bool {
         let mut progressed = false;
-        while let Some(envelope) = self.pop_cache_completion() {
+        while let Some(envelope) = self.pop_passive_completion() {
             progressed = true;
             let identity = unsafe {
                 // SAFETY: Inbox ownership retains the complete envelope through this observation.
@@ -3329,7 +3331,7 @@ impl CompletionReactor {
             };
             let index = identity.index();
             let entered = self.with_scheduler(|scheduler| {
-                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Cache))
+                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Passive))
             });
             if entered != Some(identity)
                 || !self.with_payloads(|payloads| {
@@ -3344,11 +3346,11 @@ impl CompletionReactor {
                 // SAFETY: Inbox removal and exact slot-generation validation grant unique ownership.
                 Box::from_raw(envelope.as_ptr())
             };
-            let (suspended, completion) = CacheWorkEnvelope::reclaim(envelope);
+            let (suspended, completion) = PassiveWorkEnvelope::reclaim(envelope);
             self.set_ready_operation_event(
                 index,
                 suspended,
-                CompletionEvent::CacheCompleted(completion),
+                CompletionEvent::PassiveCompleted(completion),
             );
         }
         progressed
@@ -4416,52 +4418,55 @@ mod tests {
                 drop(request);
                 drop(suspended);
             }
-            OperationTransition::SubmitCacheWork { work, suspended } => {
+            OperationTransition::SubmitPassiveWork { work, suspended } => {
                 let _failed_boundary: fn(
-                    crate::irp::CacheWork,
+                    crate::irp::PassiveWork,
                     DriverError,
-                ) -> crate::irp::CacheWorkCompletion = crate::irp::CacheWork::failed;
+                ) -> crate::irp::PassiveWorkCompletion = crate::irp::PassiveWork::failed;
                 let completion = work.execute();
-                let event = CompletionEvent::CacheCompleted(completion);
-                let CompletionEvent::CacheCompleted(completion) = event else {
+                let event = CompletionEvent::PassiveCompleted(completion);
+                let CompletionEvent::PassiveCompleted(completion) = event else {
                     return;
                 };
                 match completion {
-                    crate::irp::CacheWorkCompletion::Read(result)
-                    | crate::irp::CacheWorkCompletion::Mdl(result) => {
+                    crate::irp::PassiveWorkCompletion::SectorSize(result) => {
                         let _result = result;
                     }
-                    crate::irp::CacheWorkCompletion::Write(result)
-                    | crate::irp::CacheWorkCompletion::Flush(result)
-                    | crate::irp::CacheWorkCompletion::Purge(result)
-                    | crate::irp::CacheWorkCompletion::Uninitialize(result) => {
+                    crate::irp::PassiveWorkCompletion::Read(result)
+                    | crate::irp::PassiveWorkCompletion::Mdl(result) => {
                         let _result = result;
                     }
-                    crate::irp::CacheWorkCompletion::DrainForVolumeLock(result) => {
+                    crate::irp::PassiveWorkCompletion::Write(result)
+                    | crate::irp::PassiveWorkCompletion::Flush(result)
+                    | crate::irp::PassiveWorkCompletion::Purge(result)
+                    | crate::irp::PassiveWorkCompletion::Uninitialize(result) => {
                         let _result = result;
                     }
-                    crate::irp::CacheWorkCompletion::PrepareSizeChange(result) => {
+                    crate::irp::PassiveWorkCompletion::DrainForVolumeLock(result) => {
                         let _result = result;
                     }
-                    crate::irp::CacheWorkCompletion::PrepareDeletion(result) => {
+                    crate::irp::PassiveWorkCompletion::PrepareSizeChange(result) => {
                         let _result = result;
                     }
-                    crate::irp::CacheWorkCompletion::PrepareWriteOpen(result) => {
+                    crate::irp::PassiveWorkCompletion::PrepareDeletion(result) => {
+                        let _result = result;
+                    }
+                    crate::irp::PassiveWorkCompletion::PrepareWriteOpen(result) => {
                         let _result = result;
                     }
                 }
                 drop(suspended);
             }
-            OperationTransition::SubmitCacheWorkAfterIntentRelease { work, suspended } => {
+            OperationTransition::SubmitPassiveWorkAfterIntentRelease { work, suspended } => {
                 let completion = work.execute();
                 match completion {
-                    crate::irp::CacheWorkCompletion::PrepareSizeChange(result) => {
+                    crate::irp::PassiveWorkCompletion::PrepareSizeChange(result) => {
                         let _result = result;
                     }
-                    crate::irp::CacheWorkCompletion::PrepareDeletion(result) => {
+                    crate::irp::PassiveWorkCompletion::PrepareDeletion(result) => {
                         let _result = result;
                     }
-                    crate::irp::CacheWorkCompletion::PrepareWriteOpen(result) => {
+                    crate::irp::PassiveWorkCompletion::PrepareWriteOpen(result) => {
                         let _result = result;
                     }
                     _ => return,

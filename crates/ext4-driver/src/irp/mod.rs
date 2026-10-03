@@ -38,7 +38,6 @@ mod stack;
 
 pub(crate) use buffer::*;
 use buffer::{mdl_data_buffer_address, stack_flag};
-pub(crate) use passive::{PassiveWork, PassiveWorkCompletion};
 pub(crate) use capture::{
     CapturedQuerySecurityOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRead, PreparedRequest,
@@ -59,6 +58,7 @@ pub(crate) use oplock::{
     AtomicOplockReservation, NamespaceOplockPlan, NamespaceParentOplock,
     NamespaceParentOplockEffect, OplockCheck, OplockContinuation,
 };
+pub(crate) use passive::{PassiveWork, PassiveWorkCompletion};
 pub(crate) use reactor::CompletionReactor;
 pub(crate) use stack::*;
 

@@ -2,7 +2,8 @@
 
 use super::*;
 use crate::irp::{
-    CacheWork, CacheWorkCompletion, DataIoKind, MdlTransfer, ReadStartingPoint, WriteStartingPoint,
+    DataIoKind, MdlTransfer, PassiveWork, PassiveWorkCompletion, ReadStartingPoint,
+    WriteStartingPoint,
 };
 use crate::state::{DataTransferMode, OpenedRegularFile};
 
@@ -93,7 +94,7 @@ impl MdlOperation {
         &self,
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
-    ) -> DriverResult<(CacheWork, MdlCursor)> {
+    ) -> DriverResult<(PassiveWork, MdlCursor)> {
         owned.request().with_active(|active| {
             let current = active.current_stack()?;
             let file_object = current.file_object()?;
@@ -153,7 +154,7 @@ impl MdlOperation {
                 start,
                 requested: length,
             };
-            Ok((CacheWork::mdl(lease, active, self.action), cursor))
+            Ok((PassiveWork::mdl(lease, active, self.action), cursor))
         })
     }
 }
@@ -199,7 +200,7 @@ impl MountedVolumeOperation for MdlOperation {
                     }
                 };
                 self.state = MdlState::Executing { owned, cursor };
-                OperationTransition::SubmitCacheWork {
+                OperationTransition::SubmitPassiveWork {
                     work,
                     suspended: self,
                 }
@@ -215,7 +216,7 @@ impl MountedVolumeOperation for MdlOperation {
             ),
             (
                 MdlState::Executing { mut owned, cursor },
-                CompletionEvent::CacheCompleted(CacheWorkCompletion::Mdl(result)),
+                CompletionEvent::PassiveCompleted(PassiveWorkCompletion::Mdl(result)),
             ) => {
                 let MdlCursor { start, requested } = cursor;
                 let result = crate::request::file_info::finish_cached_read(
