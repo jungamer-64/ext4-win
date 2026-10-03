@@ -465,7 +465,10 @@ impl MountedVolumeDevice {
                         extension.removal.publish(notification);
                         reactor.storage_removal_published();
                     }
-                    crate::irp::PnpMinor::CancelRemove | crate::irp::PnpMinor::Other => {}
+                    crate::irp::PnpMinor::CancelRemove => {
+                        return received.cancel_remove(extension.lower, &extension.removal);
+                    }
+                    crate::irp::PnpMinor::Other => {}
                 }
                 received.forward_pnp(extension.lower, minor)
             }) {

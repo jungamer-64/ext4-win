@@ -524,6 +524,8 @@ pub(crate) enum OperationTransition {
     },
     /// Release operation authority before notifying upper drivers of the prepared result.
     Complete(super::lifecycle::PreparedIrpCompletion),
+    /// Relinquish the actor slot before submitting the original query-remove IRP on a worker.
+    ForwardQueryRemove(super::lifecycle::PreparedPnpForward),
     /// Operation has no remaining IRP authority (delegated or already acknowledged).
     Retired,
 }
@@ -2589,6 +2591,10 @@ impl CompletionReactor {
                 self.retire_operation(index);
                 let _status = completion.notify();
             }
+            OperationTransition::ForwardQueryRemove(forwarding) => {
+                self.retire_operation(index);
+                forwarding.queue();
+            }
             OperationTransition::Retired => self.retire_operation(index),
         }
     }
@@ -4454,6 +4460,7 @@ mod tests {
 
     fn consume_transition(transition: OperationTransition) {
         match transition {
+            OperationTransition::ForwardQueryRemove(forwarding) => forwarding.queue(),
             OperationTransition::QueryDeviceLength {
                 completion_owner: _completion_owner,
                 target: _target,

@@ -124,6 +124,29 @@ int main(void)
         EXT4WIN_STORAGE_ADMISSION storage;
         storage.Submissions.held = 0;
         storage.RemovalState = 0;
+        storage.QueryRemoveState = 0;
+        assert(ext4win_storage_create_admitted(&storage));
+        ext4win_storage_cancel_query_remove(&storage);
+        assert(ext4win_storage_prepare_query_remove(&storage));
+        assert(!ext4win_storage_create_admitted(&storage));
+        assert(!ext4win_storage_prepare_query_remove(&storage));
+        ext4win_storage_cancel_query_remove(&storage);
+        assert(storage.QueryRemoveState == 1);
+        ext4win_storage_abort_query_remove(&storage);
+        assert(ext4win_storage_create_admitted(&storage));
+        assert(ext4win_storage_prepare_query_remove(&storage));
+        assert(ext4win_storage_publish_query_remove(&storage));
+        ext4win_storage_abort_query_remove(&storage);
+        assert(storage.QueryRemoveState == 2);
+        assert(!ext4win_storage_create_admitted(&storage));
+        apc_depth = 2;
+        expected_wait = FALSE;
+        acquisition_succeeds = TRUE;
+        assert(ext4win_storage_begin_submission(&storage));
+        ext4win_storage_end_submission(&storage);
+        assert(apc_depth == 2 && storage.Submissions.held == 0);
+        ext4win_storage_cancel_query_remove(&storage);
+        assert(ext4win_storage_create_admitted(&storage));
         apc_depth = 2;
         expected_wait = FALSE;
         acquisition_succeeds = FALSE;
@@ -138,6 +161,9 @@ int main(void)
         expected_wait = TRUE;
         ext4win_storage_remove(&storage, FALSE);
         assert(ext4win_storage_removal_state(&storage) == 1);
+        ext4win_storage_cancel_query_remove(&storage);
+        assert(!ext4win_storage_create_admitted(&storage));
+        assert(!ext4win_storage_prepare_query_remove(&storage));
         assert(apc_depth == 2 && storage.Submissions.held == 0);
         expected_wait = FALSE;
         assert(!ext4win_storage_begin_submission(&storage));
@@ -156,6 +182,14 @@ int main(void)
         expected_wait = FALSE;
         assert(!ext4win_storage_begin_submission(&storage));
         assert(apc_depth == 2 && storage.Submissions.held == 0);
+        storage.RemovalState = 0;
+        assert(ext4win_storage_prepare_query_remove(&storage));
+        assert(ext4win_storage_publish_query_remove(&storage));
+        expected_wait = TRUE;
+        ext4win_storage_remove(&storage, FALSE);
+        ext4win_storage_cancel_query_remove(&storage);
+        assert(!ext4win_storage_create_admitted(&storage));
+        assert(ext4win_storage_removal_state(&storage) == 1);
     }
     return 0;
 }

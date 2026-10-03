@@ -665,6 +665,7 @@ pub(crate) fn admit_owned(
     }
 
     enum Admission {
+        QueryRemove,
         Cleanup,
         Mdl(crate::irp::MdlTransfer),
         Mount(super::file_system_control::MountAdmission),
@@ -724,6 +725,7 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::Shutdown) => {
             Admission::Flush(FlushRequestKind::Shutdown)
         }
+        ActorRequest::Captured(PreparedRequest::QueryRemove) => Admission::QueryRemove,
         ActorRequest::Close => Admission::Immediate(ImmediateRequestKind::Close),
         ActorRequest::Captured(PreparedRequest::DirectoryControl(
             PreparedDirectoryControl::NotifyChangeDirectory,
@@ -824,7 +826,7 @@ pub(crate) fn admit_owned(
     };
     let handle_class = match &admission {
         Admission::Mdl(_) => HandleRequestClass::Ordinary,
-        Admission::Mount(_) => HandleRequestClass::Device,
+        Admission::Mount(_) | Admission::QueryRemove => HandleRequestClass::Device,
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
             HandleRequestClass::Paging
         }
@@ -929,6 +931,9 @@ pub(crate) fn admit_owned(
     };
 
     let operation = match admission {
+        Admission::QueryRemove => {
+            target.with_mounted_access(|_| super::operation::query_remove(owned))
+        }
         Admission::Cleanup => target.with_mounted_access(|_| super::operation::cleanup(owned)),
         Admission::Mdl(action) => {
             target.with_mounted_access(|access| super::operation::mdl(owned, action, access))

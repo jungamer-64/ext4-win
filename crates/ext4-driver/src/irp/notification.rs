@@ -80,7 +80,15 @@ struct NotificationSlot {
     /// Destination lifetime retained even while the reactor has no active operation for this IRP.
     rundown: UnsafeCell<Option<CompletionRundownLease>>,
     /// Terminal notification installed once immediately before queue publication.
-    job: UnsafeCell<Option<(KernelIrp, wdk_sys::NTSTATUS)>>,
+    job: UnsafeCell<Option<NotificationJob>>,
+}
+
+/// Mutually exclusive terminal ownership selected before the actor releases its slot.
+enum NotificationJob {
+    /// Notify upper drivers of a prepared status.
+    Complete(KernelIrp, wdk_sys::NTSTATUS),
+    /// Submit the original query-remove IRP; lower drivers then own completion.
+    QueryRemove(super::lifecycle::PnpSubmission),
 }
 
 impl NotificationSlot {
@@ -171,18 +179,28 @@ impl NotificationPermit {
     }
 
     /// Queues terminal notification after actor borrows, cancellation and handle lanes are gone.
+    pub(super) fn queue(self, irp: KernelIrp, status: wdk_sys::NTSTATUS) {
+        self.queue_job(NotificationJob::Complete(irp, status));
+    }
+
+    /// Uses the reserved worker to transfer an original PnP request outside the actor.
+    pub(super) fn queue_query_remove(self, forwarding: super::lifecycle::PnpSubmission) {
+        self.queue_job(NotificationJob::QueryRemove(forwarding));
+    }
+
+    /// Publishes the sole consuming action; its preallocated work item cannot fail admission.
     #[expect(
         unsafe_code,
-        reason = "the unique permit transfers initialized job ownership to the native work queue"
+        reason = "the unique notification permit publishes one retained job to the native queue"
     )]
-    pub(super) fn queue(self, irp: KernelIrp, status: wdk_sys::NTSTATUS) {
+    fn queue_job(self, job: NotificationJob) {
         let slot = unsafe {
             // SAFETY: This permit retains and exclusively owns the reserved slot.
             self.slot.as_ref()
         };
         unsafe {
             // SAFETY: The slot is not queued, and this is its sole terminal job publication.
-            *slot.job.get() = Some((irp, status));
+            *slot.job.get() = Some(job);
         }
         let work_item = slot.work_item;
         let context = self.slot.as_ptr().cast();
@@ -264,11 +282,16 @@ unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_s
         // SAFETY: The work queue transferred sole permit ownership to this invocation.
         permit.slot.as_ref()
     };
-    let (irp, status) = unsafe {
+    let job = unsafe {
         // SAFETY: Queue publication initialized the job, and the permit excludes all other access.
         (&mut *slot.job.get()).take()
     }
     .unwrap_or_else(|| KernelWideInconsistency::completion_reactor_state_corruption().bugcheck());
-    let _status = irp.finish_completion(status);
+    match job {
+        NotificationJob::Complete(irp, status) => {
+            let _status = irp.finish_completion(status);
+        }
+        NotificationJob::QueryRemove(forwarding) => forwarding.submit(),
+    }
     drop(permit);
 }

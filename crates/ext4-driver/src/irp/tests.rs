@@ -2804,7 +2804,7 @@ fn normalized_names_retain_create_time_traversal_authority() {
 #[test]
 fn pnp_minors_decode_without_a_file_object() {
     for (raw, expected, seeds_success) in [
-        (1, super::PnpMinor::QueryRemove, false),
+        (1, super::PnpMinor::QueryRemove, true),
         (2, super::PnpMinor::Remove, true),
         (3, super::PnpMinor::CancelRemove, true),
         (0x17, super::PnpMinor::SurpriseRemoval, true),

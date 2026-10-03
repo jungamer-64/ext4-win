@@ -35,6 +35,15 @@ pub(super) struct VolumeControlPlane {
 }
 
 impl VolumeControlPlane {
+    /// PnP can prepare a reversible removal only while no direct FILE_OBJECT remains.
+    /// # Errors
+    /// Returns device busy for locks, terminal transitions, or an outstanding direct open.
+    fn authorize_query_removal(&self) -> DriverResult<()> {
+        if self.state != MountedVolumeState::Mounted || self.volume_file_objects != 0 {
+            return Err(DriverError::DeviceBusy);
+        }
+        Ok(())
+    }
     /// Creates the control plane for a newly mounted volume.
     pub(super) const fn mounted() -> Self {
         Self {
@@ -42,6 +51,30 @@ impl VolumeControlPlane {
             handles: FileObjectShares::new(),
             volume_file_objects: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod query_removal_tests {
+    use super::{DriverError, MountedVolumeState, VolumeControlPlane};
+
+    /// # Panics
+    /// Panics if a retained direct FILE_OBJECT or terminal lifecycle can enter reversible removal.
+    #[test]
+    fn query_removal_requires_an_unlocked_volume_without_direct_file_objects() {
+        let mut control = VolumeControlPlane::mounted();
+        assert_eq!(control.authorize_query_removal(), Ok(()));
+        control.volume_file_objects = 1;
+        assert_eq!(
+            control.authorize_query_removal(),
+            Err(DriverError::DeviceBusy)
+        );
+        control.volume_file_objects = 0;
+        control.state = MountedVolumeState::ShutdownComplete { lock_owner: None };
+        assert_eq!(
+            control.authorize_query_removal(),
+            Err(DriverError::DeviceBusy)
+        );
     }
 }
 
@@ -480,6 +513,52 @@ pub(crate) struct MountedVolumeAccess<'volume> {
 }
 
 impl MountedVolumeAccess<'_> {
+    /// Closes new-create admission before waiting for already admitted mutations to drain.
+    /// # Errors
+    /// Returns device busy for a direct open or competing lifecycle, terminal media failure,
+    /// or another query-remove reservation. No durable marker is changed by this operation.
+    #[expect(
+        unsafe_code,
+        reason = "the sole mounted actor retains its pinned volume through the preparation"
+    )]
+    pub(crate) fn prepare_query_removal(
+        &self,
+    ) -> DriverResult<crate::kernel::stream::QueryRemovalPreparation> {
+        self.authorize_durability()?;
+        self.volume.volume_control.authorize_query_removal()?;
+        unsafe {
+            // SAFETY: The suspended operation and reactor rundown retain this VCB and native gate.
+            self.volume.stream_context.prepare_query_removal()
+        }
+    }
+
+    /// Revalidates direct opens and lifecycle after previously admitted work has finished.
+    /// # Errors
+    /// Returns device removed or terminal durability failure, or device busy if prior work
+    /// published an open while query removal was draining.
+    pub(crate) fn authorize_query_removal(&self) -> DriverResult<()> {
+        self.authorize_durability()?;
+        self.volume.volume_control.authorize_query_removal()
+    }
+
+    /// Retains every cache stream after pre-query mutations have drained.
+    /// # Errors
+    /// Returns device busy for namespace handles, or the exact allocation/lease failure.
+    pub(crate) fn prepare_query_removal_cache_drain(
+        &self,
+    ) -> DriverResult<PreparedStreamCacheDrain> {
+        self.authorize_query_removal()?;
+        self.volume
+            .file_control_blocks
+            .prepare_volume_lock_cache_drain()
+            .map_err(|error| {
+                if error == DriverError::AccessDenied {
+                    DriverError::DeviceBusy
+                } else {
+                    error
+                }
+            })
+    }
     /// Captures volume-scoped native authority for the current actor's retained VCB.
     #[expect(
         unsafe_code,
@@ -881,7 +960,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns access denied while locked or volume dismounted after terminal dismount.
     pub(crate) fn authorize_create(&self) -> DriverResult<()> {
-        self.authorize_storage()?;
+        self.storage_access().authorize_create()?;
         self.volume.volume_control.state.authorize_create()
     }
 

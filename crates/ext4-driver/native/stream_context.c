@@ -28,6 +28,17 @@ ext4win_forward_original_irp(_In_ PDEVICE_OBJECT device, _Inout_ PIRP irp)
     return IoCallDriver(device, irp);
 }
 
+/* PnP dispatch runs on a PASSIVE_LEVEL system thread. Preserve driver completion
+ * ownership until lower cancellation has finished, without allocating a context. */
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS NTAPI
+ext4win_forward_pnp_synchronously(_In_ PDEVICE_OBJECT device, _Inout_ PIRP irp)
+{
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    if (!IoForwardIrpSynchronously(device, irp)) { return STATUS_INVALID_DEVICE_REQUEST; }
+    return irp->IoStatus.Status;
+}
+
 typedef struct _EXT4WIN_STREAM_METADATA {
     ULONGLONG Epoch;
     ULONG CreationTimeSeconds;
@@ -274,6 +285,48 @@ ext4win_stream_storage_removal_state(_In_ PVOID volume_header)
     PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
     if ((volume == NULL) || (volume->Kind != 2)) { return 2; }
     return (UCHAR)ext4win_storage_removal_state(&volume->StorageAdmission);
+}
+
+BOOLEAN NTAPI
+ext4win_stream_create_admitted(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    return (volume != NULL) && (volume->Kind == 2)
+        && ext4win_storage_create_admitted(&volume->StorageAdmission);
+}
+
+BOOLEAN NTAPI
+ext4win_stream_prepare_query_remove(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    return (volume != NULL) && (volume->Kind == 2)
+        && ext4win_storage_prepare_query_remove(&volume->StorageAdmission);
+}
+
+VOID NTAPI
+ext4win_stream_abort_query_remove(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    if ((volume != NULL) && (volume->Kind == 2)) {
+        ext4win_storage_abort_query_remove(&volume->StorageAdmission);
+    }
+}
+
+BOOLEAN NTAPI
+ext4win_stream_publish_query_remove(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    return (volume != NULL) && (volume->Kind == 2)
+        && ext4win_storage_publish_query_remove(&volume->StorageAdmission);
+}
+
+VOID NTAPI
+ext4win_stream_cancel_query_remove(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    if ((volume != NULL) && (volume->Kind == 2)) {
+        ext4win_storage_cancel_query_remove(&volume->StorageAdmission);
+    }
 }
 
 _IRQL_requires_max_(APC_LEVEL)

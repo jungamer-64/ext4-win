@@ -633,6 +633,38 @@ impl ReceivedIrp {
         #[cfg(test)]
         self.complete_result(Err(DriverError::NotSupported))
     }
+
+    /// Waits for lower cancellation on the PnP system thread before reopening create admission.
+    /// No allocation or actor work is needed; dispatch rundown retains the native gate throughout.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "PnP CANCEL_REMOVE arrives at PASSIVE_LEVEL and dispatch rundown retains both devices"
+        )
+    )]
+    pub(crate) fn cancel_remove(
+        self,
+        _lower: KernelDevice,
+        _publisher: &crate::kernel::stream::StorageRemovalPublisher,
+    ) -> NTSTATUS {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: This is the original unqueued CANCEL_REMOVE; the system thread and
+                // mounted dispatch lease retain its stack and lower device through the wait.
+                ext4win_forward_pnp_synchronously(_lower.as_ptr(), self.target.irp.as_ptr())
+            };
+            if status >= STATUS_SUCCESS {
+                _publisher.cancel_query_removal();
+            }
+            self.target
+                .irp
+                .complete(IrpCompletion::from_native_failure(status))
+        }
+        #[cfg(test)]
+        self.complete_result(Err(DriverError::NotSupported))
+    }
     /// Decodes raw WDK dispatch pointers into a received IRP.
     /// # Safety
     ///
@@ -710,6 +742,10 @@ unsafe extern "system" {
         action: MdlAction,
     ) -> NTSTATUS;
     fn ext4win_forward_original_irp(
+        device: wdk_sys::PDEVICE_OBJECT,
+        irp: wdk_sys::PIRP,
+    ) -> NTSTATUS;
+    fn ext4win_forward_pnp_synchronously(
         device: wdk_sys::PDEVICE_OBJECT,
         irp: wdk_sys::PIRP,
     ) -> NTSTATUS;
@@ -921,6 +957,35 @@ impl<'a> PendingIrpLease<'a> {
 }
 
 impl OwnedIrp {
+    /// Releases queue and cancellation ownership before the actor hands query removal to lower
+    /// drivers. The reserved notification retains the mounted volume until submission returns.
+    pub(crate) fn prepare_query_remove_forward(
+        self,
+        lower: KernelDevice,
+        storage: crate::kernel::stream::VolumeStorageAccess,
+    ) -> PreparedPnpForward {
+        let Self {
+            target,
+            context,
+            #[cfg(not(test))]
+            notification,
+            #[cfg(not(test))]
+            active_cancellation,
+        } = self;
+        #[cfg(not(test))]
+        drop(active_cancellation);
+        drop(context);
+        target.irp.write_status_block(IrpCompletion::EMPTY);
+        PreparedPnpForward {
+            submission: PnpSubmission {
+                irp: target.irp,
+                lower,
+                storage,
+            },
+            #[cfg(not(test))]
+            notification,
+        }
+    }
     /// Takes queue context and terminal completion authority from one exclusively removed IRP.
     /// # Safety
     ///
@@ -1256,6 +1321,66 @@ pub(crate) struct PreparedIrpCompletion {
     irp: KernelIrp,
     /// Saved status; notification may free the IRP before returning.
     status: NTSTATUS,
+}
+
+/// Original query-remove IRP whose terminal authority moves to lower storage on submission.
+#[derive(Debug)]
+#[must_use]
+pub(crate) struct PreparedPnpForward {
+    /// Captured original IRP and retained route transferred together to the native worker.
+    submission: PnpSubmission,
+    /// Sole terminal worker reservation, acquired before CSQ admission.
+    #[cfg(not(test))]
+    notification: super::notification::NotificationPermit,
+}
+
+/// Original PnP submission retained by the preallocated notification worker.
+#[derive(Debug)]
+pub(super) struct PnpSubmission {
+    /// Original IRP retained until the native consuming call.
+    irp: KernelIrp,
+    /// Mounted partition route retained by notification rundown.
+    lower: KernelDevice,
+    /// Observation only; terminal removal can veto a still-unsubmitted query.
+    storage: crate::kernel::stream::VolumeStorageAccess,
+}
+
+impl PreparedPnpForward {
+    /// Queues the already reserved worker after actor scheduling authority has been released.
+    pub(super) fn queue(self) {
+        #[cfg(not(test))]
+        self.notification.queue_query_remove(self.submission);
+        #[cfg(test)]
+        self.submission.submit();
+    }
+}
+
+impl PnpSubmission {
+    /// Consumes original-IRP authority exactly once, outside all actor borrows.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "notification rundown retains the mounted route and original IRP through lower delegation"
+        )
+    )]
+    pub(super) fn submit(self) {
+        if let Err(error) = self.storage.authorize() {
+            let _status = self.irp.complete(IrpCompletion::from_error(error));
+            return;
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Queue and driver cancellation capture were removed before publication.
+            // Lower drivers consume the original IRP; no driver completion callback remains.
+            let _status = ext4win_forward_original_irp(self.lower.as_ptr(), self.irp.as_ptr());
+        }
+        #[cfg(test)]
+        {
+            let _lower = self.lower;
+            let _status = self.irp.complete(IrpCompletion::EMPTY);
+        }
+    }
 }
 
 impl PreparedIrpCompletion {

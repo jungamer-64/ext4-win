@@ -6,9 +6,9 @@ use super::*;
 /// stack's existing status and payload; these notifications carry no file-handle authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PnpMinor {
-    /// Reject a removal attempt whose durable, drained endpoint cannot be guaranteed.
+    /// Prepare a drained durable endpoint and close new-create admission.
     QueryRemove,
-    /// A vetoed removal attempt is cancelled.
+    /// Undo reversible removal preparation after lower cancellation completes.
     CancelRemove,
     /// Storage is no longer accessible; final deletion follows separately.
     SurpriseRemoval,
@@ -34,7 +34,7 @@ impl PnpMinor {
     pub(crate) const fn initializes_success(self) -> bool {
         matches!(
             self,
-            Self::CancelRemove | Self::SurpriseRemoval | Self::Remove
+            Self::QueryRemove | Self::CancelRemove | Self::SurpriseRemoval | Self::Remove
         )
     }
 }

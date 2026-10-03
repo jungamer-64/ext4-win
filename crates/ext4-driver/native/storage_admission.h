@@ -7,7 +7,44 @@
 typedef struct _EXT4WIN_STORAGE_ADMISSION {
     ERESOURCE Submissions;
     volatile LONG RemovalState;
+    /* 0 admits creates, 1 owns preparation, 2 awaits cancel or removal. */
+    volatile LONG QueryRemoveState;
 } EXT4WIN_STORAGE_ADMISSION, *PEXT4WIN_STORAGE_ADMISSION;
+
+static BOOLEAN
+ext4win_storage_create_admitted(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    return (InterlockedCompareExchange(&storage->RemovalState, 0, 0) == 0)
+        && (InterlockedCompareExchange(&storage->QueryRemoveState, 0, 0) == 0);
+}
+
+static BOOLEAN
+ext4win_storage_prepare_query_remove(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    return (InterlockedCompareExchange(&storage->RemovalState, 0, 0) == 0)
+        && (InterlockedCompareExchange(&storage->QueryRemoveState, 1, 0) == 0);
+}
+
+static VOID
+ext4win_storage_abort_query_remove(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    (VOID)InterlockedCompareExchange(&storage->QueryRemoveState, 0, 1);
+}
+
+static BOOLEAN
+ext4win_storage_publish_query_remove(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    return (InterlockedCompareExchange(&storage->RemovalState, 0, 0) == 0)
+        && (InterlockedCompareExchange(&storage->QueryRemoveState, 2, 1) == 1);
+}
+
+/* Called only after the lower CANCEL_REMOVE has completed successfully. A terminal
+ * removal is independent and cannot be undone by clearing this reversible create gate. */
+static VOID
+ext4win_storage_cancel_query_remove(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    (VOID)InterlockedCompareExchange(&storage->QueryRemoveState, 0, 2);
+}
 
 static LONG
 ext4win_storage_removal_state(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)

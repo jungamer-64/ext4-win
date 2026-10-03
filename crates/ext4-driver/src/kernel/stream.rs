@@ -234,6 +234,9 @@ pub(crate) struct StreamContext {
     /// Host equivalent of the volume's monotonic native removal state.
     #[cfg(test)]
     storage_removal: AtomicU8,
+    /// Host equivalent of the independent reversible PnP create gate.
+    #[cfg(test)]
+    query_removal: AtomicU8,
 }
 
 /// Terminal PnP observations carry different mounted-device retirement authority.
@@ -252,6 +255,9 @@ pub(crate) enum StorageRemovalNotification {
 pub(crate) struct VolumeStorageAccess {
     /// Native volume header; host fixtures retain its atomic equivalent.
     address: NonNull<c_void>,
+    /// Host query gate shares the retained volume lifetime with `address`.
+    #[cfg(test)]
+    query_address: NonNull<AtomicU8>,
 }
 
 /// PnP dispatch may revoke storage; observers and submission owners cannot publish removal.
@@ -259,7 +265,83 @@ pub(crate) struct VolumeStorageAccess {
 pub(crate) struct StorageRemovalPublisher {
     /// Native volume header retained by mounted-device dispatch rundown.
     address: NonNull<c_void>,
+    /// Host query gate retained by mounted dispatch rundown.
+    #[cfg(test)]
+    query_address: NonNull<AtomicU8>,
 }
+
+/// One reversible create-admission closure owned by the sole query-remove operation.
+/// Dropping preparation reopens creates; publication transfers that responsibility to PnP.
+#[derive(Debug)]
+pub(crate) struct QueryRemovalPreparation {
+    /// Retained native storage identities; the mounted operation owns their lifetime.
+    storage: VolumeStorageAccess,
+}
+
+impl QueryRemovalPreparation {
+    /// Leaves creates closed until a successful lower cancel-remove or terminal removal.
+    /// # Errors
+    /// Returns device removed if storage was revoked before remove-pending publication.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the owning mounted operation retains the native volume through publication"
+        )
+    )]
+    pub(crate) fn publish(self) -> DriverResult<()> {
+        self.storage.authorize()?;
+        #[cfg(not(test))]
+        let published = unsafe {
+            // SAFETY: The preparation owns the sole reversible native gate on this retained VCB.
+            ext4win_stream_publish_query_remove(self.storage.address.as_ptr()) != 0
+        };
+        #[cfg(test)]
+        let published = self
+            .storage
+            .query_state()
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if !published {
+            self.storage.authorize()?;
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for QueryRemovalPreparation {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "preparation retains this volume and only unpublished preparation can be aborted"
+        )
+    )]
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The mounted operation retains the header; CAS cannot undo a published query.
+            ext4win_stream_abort_query_remove(self.storage.address.as_ptr());
+        }
+        #[cfg(test)]
+        {
+            let _observed = self.storage.query_state().compare_exchange(
+                1,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the mounted actor retains the VCB while the unique preparation moves through owned worker envelopes"
+)]
+// SAFETY: No thread-affine native resource is held; only the native atomic create gate is retained.
+unsafe impl Send for QueryRemovalPreparation {}
 
 impl StorageRemovalPublisher {
     /// Stops storage submissions before forwarding a terminal PnP notification. Surprise removal
@@ -295,6 +377,45 @@ impl StorageRemovalPublisher {
 }
 
 impl VolumeStorageAccess {
+    /// Requires both media presence and an open reversible PnP create gate.
+    /// # Errors
+    /// Returns device removed after revocation, or access denied during query removal.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the retained native volume owns its interlocked create gate"
+        )
+    )]
+    pub(crate) fn authorize_create(self) -> DriverResult<()> {
+        self.authorize()?;
+        #[cfg(not(test))]
+        let admitted = unsafe {
+            // SAFETY: The actor or dispatch retention keeps this header live during observation.
+            ext4win_stream_create_admitted(self.address.as_ptr()) != 0
+        };
+        #[cfg(test)]
+        let admitted = self.query_state().load(Ordering::Acquire) == 0;
+        if admitted {
+            Ok(())
+        } else {
+            self.authorize()?;
+            Err(DriverError::AccessDenied)
+        }
+    }
+
+    /// Borrows the independent host query atomic under the retained volume lifetime.
+    #[cfg(test)]
+    #[expect(
+        unsafe_code,
+        reason = "only the volume stream constructor supplies this retained host identity"
+    )]
+    fn query_state(&self) -> &AtomicU8 {
+        unsafe {
+            // SAFETY: The same volume retention that covers `address` covers this host query gate.
+            self.query_address.as_ref()
+        }
+    }
     /// Requires storage that has received neither surprise nor final removal.
     /// # Errors
     ///
@@ -507,6 +628,7 @@ impl StreamContext {
                 metadata: Mutex::new(metadata),
                 delete_pending: AtomicBool::new(false),
                 storage_removal: AtomicU8::new(0),
+                query_removal: AtomicU8::new(0),
             })
         }
     }
@@ -575,7 +697,39 @@ impl StreamContext {
         let address = self.header;
         #[cfg(test)]
         let address = NonNull::from(&self.storage_removal).cast();
-        Ok(VolumeStorageAccess { address })
+        Ok(VolumeStorageAccess {
+            address,
+            #[cfg(test)]
+            query_address: NonNull::from(&self.query_removal),
+        })
+    }
+
+    /// Reserves the reversible PnP create gate for the sole mounted query-remove operation.
+    /// # Safety
+    /// The pinned mounted VCB must outlive the returned preparation and all uses of its header.
+    /// # Errors
+    /// Returns device removed for lost storage, or device busy for another removal preparation.
+    pub(crate) unsafe fn prepare_query_removal(&self) -> DriverResult<QueryRemovalPreparation> {
+        let storage = unsafe {
+            // SAFETY: The caller retains this pinned volume through the returned preparation.
+            self.storage_access()
+        }?;
+        storage.authorize()?;
+        #[cfg(not(test))]
+        let acquired = unsafe {
+            // SAFETY: This actor owns the live mounted volume and reserves its native atomic gate.
+            ext4win_stream_prepare_query_remove(storage.address.as_ptr()) != 0
+        };
+        #[cfg(test)]
+        let acquired = storage
+            .query_state()
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if !acquired {
+            storage.authorize()?;
+            return Err(DriverError::DeviceBusy);
+        }
+        Ok(QueryRemovalPreparation { storage })
     }
 
     /// Captures removal publication separately from storage observation and submission.
@@ -591,6 +745,8 @@ impl StreamContext {
         }?;
         Ok(StorageRemovalPublisher {
             address: access.address,
+            #[cfg(test)]
+            query_address: access.query_address,
         })
     }
 
@@ -1489,6 +1645,11 @@ unsafe extern "system" {
     ) -> NTSTATUS;
     fn ext4win_stream_remove_storage(volume_header: wdk_sys::PVOID, final_remove: u8);
     fn ext4win_stream_storage_removal_state(volume_header: wdk_sys::PVOID) -> u8;
+    fn ext4win_stream_create_admitted(volume_header: wdk_sys::PVOID) -> u8;
+    fn ext4win_stream_prepare_query_remove(volume_header: wdk_sys::PVOID) -> u8;
+    fn ext4win_stream_abort_query_remove(volume_header: wdk_sys::PVOID);
+    fn ext4win_stream_publish_query_remove(volume_header: wdk_sys::PVOID) -> u8;
+    fn ext4win_stream_cancel_query_remove(volume_header: wdk_sys::PVOID);
     fn ext4win_stream_begin_storage_submission(volume_header: wdk_sys::PVOID) -> u8;
     fn ext4win_stream_end_storage_submission(volume_header: wdk_sys::PVOID);
     fn ext4win_stream_volume_control_device(
@@ -1613,6 +1774,64 @@ mod tests {
 
     use super::{NativeStreamMetadata, OperationalTrace, Ordering, StreamContext, StreamSizes};
     use crate::kernel::status::{DriverError, DriverResult};
+
+    /// # Errors
+    /// Returns stream allocation or query preparation failure.
+    /// # Panics
+    /// Panics if reversible query closure blocks existing I/O, loses rollback, or undoes removal.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this local volume fixture stays live and unmoved through every captured capability"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture construction and assertions verify distinct PnP transitions"
+    )]
+    fn query_removal_closes_creates_and_cancellation_preserves_terminal_removal() -> DriverResult<()>
+    {
+        let volume =
+            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let storage = unsafe {
+            // SAFETY: The fixture stays at this address until all capabilities are consumed.
+            volume.storage_access()
+        }?;
+        let publisher = unsafe {
+            // SAFETY: The fixture owns PnP publication and retains its volume throughout the test.
+            volume.storage_removal_publisher()
+        }?;
+        publisher.cancel_query_removal();
+        assert_eq!(storage.authorize_create(), Ok(()));
+        let preparation = unsafe {
+            // SAFETY: The local volume outlives this unique preparation.
+            volume.prepare_query_removal()
+        }?;
+        assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
+        assert_eq!(storage.authorize(), Ok(()));
+        drop(storage.acquire_submission()?);
+        publisher.cancel_query_removal();
+        assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
+        drop(preparation);
+        assert_eq!(storage.authorize_create(), Ok(()));
+        let preparation = unsafe {
+            // SAFETY: The local volume retains this second preparation through publication.
+            volume.prepare_query_removal()
+        }?;
+        preparation.publish()?;
+        assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
+        publisher.cancel_query_removal();
+        assert_eq!(storage.authorize_create(), Ok(()));
+        let preparation = unsafe {
+            // SAFETY: The fixture retains the unpublished preparation across terminal revocation.
+            volume.prepare_query_removal()
+        }?;
+        publisher.publish(super::StorageRemovalNotification::Surprise);
+        assert_eq!(preparation.publish(), Err(DriverError::DeviceRemoved));
+        publisher.cancel_query_removal();
+        assert_eq!(storage.authorize_create(), Err(DriverError::DeviceRemoved));
+        assert_eq!(storage.authorize(), Err(DriverError::DeviceRemoved));
+        Ok(())
+    }
 
     /// # Errors
     /// Returns stream allocation failure.

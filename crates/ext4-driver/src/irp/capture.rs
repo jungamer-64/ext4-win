@@ -1999,20 +1999,29 @@ mod tests {
             }
         }
 
-        let mut irp = wdk_sys::IRP::default();
-        let mut stack = wdk_sys::IO_STACK_LOCATION {
-            MajorFunction: u8::try_from(wdk_sys::IRP_MJ_SHUTDOWN).unwrap_or_default(),
-            ..wdk_sys::IO_STACK_LOCATION::default()
-        };
-        let target = build_target(&mut device, &mut irp, &mut stack);
-        assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::Shutdown);
-            assert!(context.is_ok());
-            if let Ok(QueueContextOwnership::Captured(context)) = context {
-                assert!(!context.matches_cancellation_context(
-                    core::ptr::addr_of_mut!(file_object).cast::<c_void>()
-                ));
+        for (major, minor) in [
+            (DispatchMajor::Shutdown, 0),
+            (DispatchMajor::PlugAndPlay, 1),
+        ] {
+            let mut irp = wdk_sys::IRP::default();
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: u8::try_from(major.table_index()).unwrap_or_default(),
+                MinorFunction: minor,
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            let target = build_target(&mut device, &mut irp, &mut stack);
+            assert!(target.is_some());
+            if let Some(mut target) = target {
+                let context = capture_context(&mut target, major);
+                assert!(context.is_ok());
+                if let Ok(QueueContextOwnership::Captured(context)) = context {
+                    assert!(!context.matches_cancellation_context(
+                        core::ptr::addr_of_mut!(file_object).cast::<c_void>()
+                    ));
+                    if major == DispatchMajor::PlugAndPlay {
+                        assert!(matches!(context.prepared(), PreparedRequest::QueryRemove));
+                    }
+                }
             }
         }
     }

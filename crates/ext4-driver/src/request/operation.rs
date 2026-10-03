@@ -83,6 +83,8 @@ mod mdl;
 pub(crate) use mdl::mdl;
 mod cleanup;
 pub(crate) use cleanup::cleanup;
+mod pnp;
+pub(crate) use pnp::query_remove;
 
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]
