@@ -105,14 +105,17 @@ C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, NumberOfLinks) == 28);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, Directory) == 32);
 
 /* The queued-cycle FILE_OBJECT reference retains the FCB until the final native access. */
+static IO_WORKITEM_ROUTINE ext4win_mdl_completion_worker;
+
+_Use_decl_annotations_
 static VOID
-NTAPI
-ext4win_mdl_completion_worker(_In_ PDEVICE_OBJECT device, _In_opt_ PVOID context)
+ext4win_mdl_completion_worker(PDEVICE_OBJECT device, PVOID context)
 {
     PEXT4WIN_STREAM_CONTEXT stream = (PEXT4WIN_STREAM_CONTEXT)context;
     PFILE_OBJECT owner;
     KIRQL old_irql;
     UNREFERENCED_PARAMETER(device);
+    if (stream == NULL) { return; }
     KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
     owner = stream->MdlCompletionOwner;
     KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
