@@ -156,6 +156,8 @@ pub enum ExtentBlockRun {
     },
     /// Consecutive allocated blocks whose contents must read as zero.
     Uninitialized {
+        /// First physical block, retained independently of zero-read semantics.
+        physical_start: BlockAddress,
         /// Non-zero consecutive block count.
         blocks: NonZeroU64,
     },
