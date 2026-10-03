@@ -26,8 +26,14 @@ ext4win_acquire_resource_exclusive(
     _Inout_ _When_(return != FALSE, _Acquires_exclusive_lock_(*_Curr_)) PERESOURCE resource,
     _In_ BOOLEAN wait)
 {
+    BOOLEAN acquired;
+
     KeEnterCriticalRegion();
-    if (ExAcquireResourceExclusiveLite(resource, wait)) {
+    /* WDK requires a literal wait mode to track the conditional lock contract. */
+    acquired = wait
+        ? ExAcquireResourceExclusiveLite(resource, TRUE)
+        : ExAcquireResourceExclusiveLite(resource, FALSE);
+    if (acquired) {
         return TRUE;
     }
     KeLeaveCriticalRegion();

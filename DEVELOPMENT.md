@@ -5,6 +5,11 @@ boundary. Default Cargo commands select the host-independent members recorded
 in `Cargo.toml`. Use the repository tasks
 below instead of substituting generic Cargo commands for a canonical gate.
 
+`verify-portable` fetches the locked workspace dependency sources before running
+tests. The source-notice sealing test reads the Windows driver's dependency
+closure offline even on a non-Windows host; fetching those sources does not
+compile the driver or require WDK.
+
 ## Verification commands
 
 | Command | Host requirements | What it establishes |

@@ -84,7 +84,13 @@ jobs:
         run: cargo build --locked --package xtask
 
       - name: Verify HTree interoperability
-        run: sudo ./target/debug/xtask verify-htree-interop
+        # The verifier builds its current-source fixture while running as root.
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=$(rustup show home)" \
+            ./target/debug/xtask verify-htree-interop
 
 
   production-driver:

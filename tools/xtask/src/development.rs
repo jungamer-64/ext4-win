@@ -9,7 +9,8 @@ use alloc::collections::BTreeSet;
 use std::{env, process::Command};
 use std::{fs, io, path::Path};
 
-/// Runs formatting, checking, tests, and Clippy without selecting the WDK crate.
+/// Fetches locked source inputs and runs formatting, checking, tests, and Clippy without
+/// compiling the WDK crate. Source-notice verification also reads the driver's dependencies.
 ///
 /// # Errors
 ///
@@ -18,6 +19,10 @@ pub(crate) fn verify_portable(repository_root: &Path) -> TaskResult<()> {
     run_checked(
         cargo_command(repository_root, &["fmt", "--all", "--", "--check"]),
         "portable formatting gate",
+    )?;
+    run_checked(
+        cargo_command(repository_root, &["fetch", "--locked"]),
+        "locked dependency source fetch",
     )?;
     run_checked(
         cargo_command(repository_root, &["check", "--locked", "--all-targets"]),
