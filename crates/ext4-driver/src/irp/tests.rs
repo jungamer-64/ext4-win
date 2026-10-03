@@ -143,6 +143,74 @@ fn buffered_output_initializes_only_its_declared_range_before_borrow() {
 }
 
 /// # Panics
+/// Panics when aggregate publication destroys upstream-owned fields, writes beyond Information,
+/// or publishes a malformed prefix before rejecting it.
+#[test]
+fn all_information_publication_preserves_upstream_fields() {
+    let mut output = [0xA5_u8; 120];
+    let source = [0x3C_u8; 108];
+    let mut device_storage = wdk_sys::DEVICE_OBJECT::default();
+    let device = kernel_device_fixture(&mut device_storage);
+    assert!(device.is_some());
+    let Some(device) = device else {
+        return;
+    };
+    let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+    let mut file_object = wdk_sys::FILE_OBJECT::default();
+    stack.FileObject = core::ptr::from_mut(&mut file_object);
+    stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
+        Length: 120,
+        __bindgen_padding_0: 0,
+        FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileAllInformation,
+    };
+    let mut irp = wdk_sys::IRP::default();
+    irp.AssociatedIrp.SystemBuffer = output.as_mut_ptr().cast();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::from_mut(&mut stack);
+    let mut active = super::ActiveIrp {
+        device,
+        irp: NonNull::from(&mut irp),
+        owner: core::marker::PhantomData,
+    };
+    assert_eq!(active.publish_all_file_information(&source), Ok(()));
+    assert!(
+        output
+            .get(..76)
+            .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0x3C))
+    );
+    assert_eq!(output.get(76..80), Some([0xA5; 4].as_slice()));
+    assert_eq!(output.get(80..88), Some([0x3C; 8].as_slice()));
+    assert_eq!(output.get(88..96), Some([0xA5; 8].as_slice()));
+    assert_eq!(output.get(96..108), Some([0x3C; 12].as_slice()));
+    assert_eq!(output.get(108..), Some([0xA5; 12].as_slice()));
+    let previous = output;
+    assert_eq!(
+        active.publish_all_file_information(&[0; 99]),
+        Err(DriverError::InvalidBufferSize)
+    );
+    assert_eq!(output, previous);
+    stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
+        Length: 103,
+        __bindgen_padding_0: 0,
+        FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileAllInformation,
+    };
+    assert_eq!(
+        current_stack_fixture(&mut stack)
+            .and_then(|current| current.query_file())
+            .map(|query| query.length().as_usize()),
+        Ok(103),
+    );
+    assert_eq!(
+        active.publish_all_file_information(&source),
+        Err(DriverError::InfoLengthMismatch)
+    );
+    assert_eq!(output, previous);
+}
+
+/// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
@@ -2185,6 +2253,14 @@ fn query_file_stack_decodes_name_attribute_tag_and_link_classes() {
             QueryFileInformationClass::Name,
         ),
         (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileNormalizedNameInformation,
+            QueryFileInformationClass::NormalizedName,
+        ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAllInformation,
+            QueryFileInformationClass::All,
+        ),
+        (
             wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation,
             QueryFileInformationClass::AttributeTag,
         ),
@@ -2692,5 +2768,26 @@ fn reserve_filter_oplock_requires_exact_access_and_sharing() {
             read_only_share,
         ),
         Err(DriverError::InvalidParameter)
+    );
+}
+/// # Panics
+/// Panics when normalized-name disclosure does not require traversal for a file-id open.
+#[test]
+fn normalized_names_retain_create_time_traversal_authority() {
+    use crate::state::{NormalizedNameAccess, OpenedLocation};
+
+    let metadata_only = super::GrantedAccess::from_authorized(wdk_sys::FILE_READ_ATTRIBUTES);
+    assert_eq!(
+        NormalizedNameAccess::for_open(&OpenedLocation::Root, metadata_only).require(),
+        Ok(())
+    );
+    assert_eq!(
+        NormalizedNameAccess::for_open(&OpenedLocation::FileReference, metadata_only).require(),
+        Err(DriverError::AccessDenied)
+    );
+    let traverse = super::GrantedAccess::from_authorized(wdk_sys::FILE_TRAVERSE);
+    assert_eq!(
+        NormalizedNameAccess::for_open(&OpenedLocation::FileReference, traverse).require(),
+        Ok(())
     );
 }

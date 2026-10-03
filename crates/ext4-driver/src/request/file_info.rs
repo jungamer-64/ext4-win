@@ -35,7 +35,7 @@ use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset
 
 use super::DriverMutationPass;
 use directory::{
-    align_to_eight, clear_record, field_offset, record_field_offset, signed_i64, utf16_byte_len,
+    align_to_eight, clear_record, field_offset, record_field_offset, utf16_byte_len,
     windows_time_quad, wire_offset, wire_range, write_utf16,
 };
 use query::{

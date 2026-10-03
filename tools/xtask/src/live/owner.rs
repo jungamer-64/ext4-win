@@ -553,7 +553,7 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         operation,
         windows_host::close_file(file).map_err(Into::into),
     )?;
-    windows_host::verify_metadata(&alpha)?;
+    windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
     if fs::read(&alpha)? != payload {
         return Err(io::Error::other("live readback differs from payload").into());
     }

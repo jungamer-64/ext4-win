@@ -139,6 +139,7 @@ fn directory_handle(
         retained_handle_deletion(),
         data_transfer_mode,
         RegularFileWriteAccess::Denied,
+        super::NormalizedNameAccess::Granted,
     );
     assert!(handle.is_ok());
     handle.ok()
@@ -1106,6 +1107,7 @@ fn regular_file_handle_retains_write_authority() {
                 OpenedLocation::Root,
                 retained_handle_deletion(),
                 DataTransferMode::Cached,
+                super::NormalizedNameAccess::Granted,
             ),
             kind: super::OpenedHandleKind::File { write_access },
         };

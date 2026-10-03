@@ -28,10 +28,10 @@ use crate::{
         ChildCreationTarget, CommittedNodeStreamMetadata, DataTransferMode, DirectoryChange,
         DirectoryChangeAction, ExistingStreamResidency, FileControlBlock, HandleDeletion,
         KernelDevice, KernelFileObject, MountedVolumeAccess, NoIntermediateTransfer,
-        NodeStreamMetadata, OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject,
-        OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion, PreparedStreamWriteOpen,
-        RawVolumeAccess, StagedNodeStreamMetadata, UninitializedFileObject, VolumeControlBlock,
-        WriteCommitment, abandon_file_control_block,
+        NodeStreamMetadata, NormalizedNameAccess, OpenedHandle, OpenedLocation, OpenedNodeMode,
+        OpenedObject, OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion,
+        PreparedStreamWriteOpen, RawVolumeAccess, StagedNodeStreamMetadata,
+        UninitializedFileObject, VolumeControlBlock, WriteCommitment, abandon_file_control_block,
     },
 };
 
@@ -1184,6 +1184,8 @@ impl PendingExistingCreateOpen {
             return Err(DriverError::InternalInvariantViolation);
         }
         let validation_location = location.try_to_owned_location()?;
+        let normalized_name_access =
+            NormalizedNameAccess::for_open(&location, policy.granted_access());
         let handle = memory::boxed_try_with(|| {
             OpenedHandle::new(
                 node,
@@ -1192,6 +1194,7 @@ impl PendingExistingCreateOpen {
                 policy.handle_deletion(),
                 policy.data_transfer_mode(),
                 policy.regular_file_write_access(),
+                normalized_name_access,
             )
         })?;
         let file_object =
@@ -1727,6 +1730,7 @@ fn create_missing_node(
     let mut creation = operations.begin_child_creation(mutation, parent, name, target)?;
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
+    let normalized_name_access = NormalizedNameAccess::for_open(&location, policy.granted_access());
     let handle = memory::boxed_try_with(|| {
         OpenedHandle::new(
             node,
@@ -1735,6 +1739,7 @@ fn create_missing_node(
             policy.handle_deletion(),
             policy.data_transfer_mode(),
             policy.regular_file_write_access(),
+            normalized_name_access,
         )
     })?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;

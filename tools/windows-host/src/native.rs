@@ -11,7 +11,9 @@ use std::{
     time::Instant,
 };
 use windows_sys::{
-    Wdk::Storage::FileSystem::{NtQueryDirectoryFile, NtQueryVolumeInformationFile},
+    Wdk::Storage::FileSystem::{
+        NtQueryDirectoryFile, NtQueryInformationFile, NtQueryVolumeInformationFile,
+    },
     Win32::{
         Devices::DeviceAndDriverInstallation::SetupGetInfDriverStoreLocationW,
         Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, UNICODE_STRING},
@@ -851,10 +853,11 @@ pub fn volume_at_mount(path: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::other("invalid volume name"))
 }
 
-/// Exercises independent lifetime of metadata-only, zero-access and data handles.
+/// Exercises metadata-only, zero-access and data handle lifetimes, aggregate information, and
+/// complete and truncated root-relative name records against the supplied fixture facts.
 /// # Errors
 /// Returns opening, native metadata, identity or explicit release failures.
-pub fn verify_metadata(path: &Path) -> io::Result<()> {
+pub fn verify_metadata(path: &Path, relative_name: &str, eof: u64) -> io::Result<()> {
     let first = FileHandle::open(path, 0x80, 0)?;
     let second = FileHandle::open(path, 0, 0)?;
     let mut label = [0_u16; 261];
@@ -887,7 +890,143 @@ pub fn verify_metadata(path: &Path) -> io::Result<()> {
     };
     completed(result, second.close())?;
     FileHandle::open(path, 0x8000_0000, 0)?.close()?;
-    first.close()
+    completed(
+        verify_file_information(&first, relative_name, eof),
+        first.close(),
+    )
+}
+
+/// Queries one native information class with an exact expected status and bounded output.
+/// # Errors
+/// Returns native failures, unexpected status, or an out-of-range returned byte count.
+fn file_information_query(
+    file: &FileHandle,
+    class: i32,
+    capacity: usize,
+    expected: u32,
+) -> io::Result<Vec<u8>> {
+    let mut output = vec![0xA5_u8; capacity];
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let raw = file.raw()?;
+    let capacity = u32::try_from(capacity).map_err(io::Error::other)?;
+    let status = unsafe {
+        // SAFETY: The synchronous file handle and exclusive status/output buffers remain live
+        // until the query returns. No callback or overlapped lifetime is established.
+        NtQueryInformationFile(
+            raw,
+            &mut io_status,
+            output.as_mut_ptr().cast(),
+            capacity,
+            class,
+        )
+    };
+    if status.cast_unsigned() != expected || io_status.Information > output.len() {
+        return Err(io::Error::other(format!(
+            "file information class {class}: status {:08X}, expected {expected:08X}, returned {}",
+            status.cast_unsigned(),
+            io_status.Information,
+        )));
+    }
+    output.truncate(io_status.Information);
+    Ok(output)
+}
+
+/// Checks a specification-defined name record against independently supplied UTF-16 units.
+/// # Errors
+/// Returns a header, payload, or initialized-prefix length mismatch.
+fn file_name_record(
+    output: &[u8],
+    offset: usize,
+    expected: &[u16],
+    returned_units: usize,
+) -> io::Result<()> {
+    let record = output
+        .get(offset..)
+        .ok_or_else(|| io::Error::other("missing file name record"))?;
+    let expected_bytes = expected
+        .len()
+        .checked_mul(2)
+        .ok_or_else(|| io::Error::other("file name length overflow"))?;
+    if usize::try_from(u32::from_le_bytes(field(record, 0)?)).map_err(io::Error::other)?
+        != expected_bytes
+    {
+        return Err(io::Error::other("file name required length differs"));
+    }
+    let payload = record
+        .get(4..)
+        .ok_or_else(|| io::Error::other("missing file name payload"))?;
+    let expected = expected
+        .get(..returned_units)
+        .ok_or_else(|| io::Error::other("invalid expected name prefix"))?;
+    let (pairs, remainder) = payload.as_chunks::<2>();
+    if !remainder.is_empty()
+        || pairs.len() != expected.len()
+        || !pairs
+            .iter()
+            .zip(expected)
+            .all(|(bytes, expected)| u16::from_le_bytes(*bytes) == *expected)
+    {
+        return Err(io::Error::other("file name payload differs"));
+    }
+    Ok(())
+}
+
+/// Verifies the aggregate layout using separate information classes and fixture EOF/name facts.
+/// # Errors
+/// Returns native query or observable information-contract mismatches.
+fn verify_file_information(file: &FileHandle, relative_name: &str, eof: u64) -> io::Result<()> {
+    let expected: Vec<_> = relative_name.encode_utf16().collect();
+    if expected.len() < 3 || expected.first() != Some(&0x005C) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "fixture requires a root-relative name longer than two WCHARs",
+        ));
+    }
+    for class in [9, 48] {
+        let complete = file_information_query(file, class, 4096, 0)?;
+        file_name_record(&complete, 0, &expected, expected.len())?;
+        let prefix = file_information_query(file, class, 9, 0x8000_0005)?;
+        file_name_record(&prefix, 0, &expected, 2)?;
+        if !file_information_query(file, class, 7, 0xC000_0004)?.is_empty() {
+            return Err(io::Error::other("short name query returned bytes"));
+        }
+    }
+    let all = file_information_query(file, 18, 4096, 0)?;
+    file_name_record(&all, 96, &expected, expected.len())?;
+    if u64::from_le_bytes(field(&all, 48)?) != eof {
+        return Err(io::Error::other(
+            "aggregate EOF differs from fixture content",
+        ));
+    }
+    for (class, offset, size) in [
+        (4, 0_usize, 40_usize),
+        (5, 40, 24),
+        (6, 64, 8),
+        (7, 72, 4),
+        (8, 76, 4),
+        (14, 80, 8),
+        (16, 88, 4),
+        (17, 92, 4),
+    ] {
+        let separate = file_information_query(file, class, size, 0)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or_else(|| io::Error::other("aggregate field overflow"))?;
+        if all.get(offset..end) != Some(separate.as_slice()) {
+            return Err(io::Error::other(format!(
+                "aggregate field for class {class} differs from separate query"
+            )));
+        }
+    }
+    let partial = file_information_query(file, 18, 105, 0x8000_0005)?;
+    file_name_record(&partial, 96, &expected, 2)?;
+    if partial.get(..100) != all.get(..100) {
+        return Err(io::Error::other("truncated aggregate lost fixed metadata"));
+    }
+    if !file_information_query(file, 18, 103, 0xC000_0004)?.is_empty() {
+        return Err(io::Error::other("short aggregate query returned bytes"));
+    }
+    Ok(())
 }
 
 /// Consumes a Rust file at a live operation's explicit native close boundary.
@@ -1088,6 +1227,32 @@ pub fn verify_directory(directory: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Panics
+    /// Panics when the real Windows I/O Manager supplies aggregate handle fields that differ
+    /// from their independently queried values.
+    #[test]
+    fn aggregate_handle_fields_match_native_queries() {
+        let result = (|| {
+            let file = FileHandle::open(&std::env::current_exe()?, 0x8000_0000, 0)?;
+            let observed = (|| {
+                let all = file_information_query(&file, 18, 4096, 0)?;
+                for (class, offset) in [(8, 76_usize), (16, 88), (17, 92)] {
+                    let separate = file_information_query(&file, class, 4, 0)?;
+                    let end = offset
+                        .checked_add(4)
+                        .ok_or_else(|| io::Error::other("field overflow"))?;
+                    if all.get(offset..end) != Some(separate.as_slice()) {
+                        return Err(io::Error::other(format!(
+                            "native aggregate class {class} field differs"
+                        )));
+                    }
+                }
+                Ok(())
+            })();
+            completed(observed, file.close())
+        })();
+        assert!(result.is_ok(), "{result:?}");
+    }
     /// Checks real attribute-only volume queries, exact service absence and native GUID encoding.
     /// # Errors
     /// Returns host observation or field decoding failures.

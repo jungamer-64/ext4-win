@@ -106,6 +106,66 @@ impl ActiveIrp<'_> {
         BufferedOutput::from_active(self.associated_system_buffer()?, length.as_usize())
     }
 
+    /// Publishes only filesystem-owned FILE_ALL_INFORMATION fields from initialized driver
+    /// storage. Access, mode, and alignment belong to the upstream query owner and are neither
+    /// read nor overwritten. No Rust reference is formed to the raw output buffer.
+    /// # Errors
+    /// Returns invalid-info-class for another query, info-length-mismatch for short capacity,
+    /// invalid-buffer-size for an invalid initialized prefix, or a null-buffer error before writes.
+    #[expect(
+        unsafe_code,
+        reason = "selective publication must preserve upstream-owned fields without borrowing uninitialized output bytes"
+    )]
+    pub(crate) fn publish_all_file_information(&mut self, source: &[u8]) -> DriverResult<()> {
+        let stack = self.current_stack()?.query_file()?;
+        if stack.information_class() != QueryFileInformationClass::All {
+            return Err(DriverError::InvalidInfoClass);
+        }
+        if stack.length().as_usize() < core::mem::size_of::<wdk_sys::FILE_ALL_INFORMATION>() {
+            return Err(DriverError::InfoLengthMismatch);
+        }
+        if source.len() > stack.length().as_usize() {
+            return Err(DriverError::InvalidBufferSize);
+        }
+        let access = core::mem::offset_of!(wdk_sys::FILE_ALL_INFORMATION, AccessInformation);
+        let position = core::mem::offset_of!(wdk_sys::FILE_ALL_INFORMATION, PositionInformation);
+        let mode = core::mem::offset_of!(wdk_sys::FILE_ALL_INFORMATION, ModeInformation);
+        let name = core::mem::offset_of!(wdk_sys::FILE_ALL_INFORMATION, NameInformation);
+        let ranges = [
+            (
+                0,
+                source.get(..access).ok_or(DriverError::InvalidBufferSize)?,
+            ),
+            (
+                position,
+                source
+                    .get(position..mode)
+                    .ok_or(DriverError::InvalidBufferSize)?,
+            ),
+            (
+                name,
+                source
+                    .get(name..)
+                    .filter(|bytes| bytes.len() >= 4)
+                    .ok_or(DriverError::InvalidBufferSize)?,
+            ),
+        ];
+        let address = self.associated_system_buffer()?.as_ptr();
+        for (offset, bytes) in ranges {
+            let destination = unsafe {
+                // SAFETY: Every field offset is within the validated system-buffer capacity.
+                address.add(offset)
+            };
+            unsafe {
+                // SAFETY: All source ranges are initialized driver-owned bytes disjoint from the
+                // active query's writable system buffer. Capacity and every range were validated
+                // before publication. Only filesystem-owned fields are copied.
+                core::ptr::copy_nonoverlapping(bytes.as_ptr(), destination, bytes.len());
+            }
+        }
+        Ok(())
+    }
+
     /// Returns an opaque requestor-input range tied to this active owner borrow.
     ///
     /// The range can only be copied into driver-owned storage; it never becomes a Rust slice.

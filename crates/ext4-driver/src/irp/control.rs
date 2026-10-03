@@ -456,6 +456,8 @@ const FILE_FS_FULL_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 7;
 pub(crate) enum QueryFileInformationClass {
     /// Windows `FileBasicInformation`.
     Basic,
+    /// Windows `FileAllInformation`.
+    All,
     /// Windows `FileStandardInformation`.
     Standard,
     /// Windows `FileHardLinkInformation`.
@@ -472,6 +474,8 @@ pub(crate) enum QueryFileInformationClass {
     NetworkOpen,
     /// Windows `FileNameInformation`.
     Name,
+    /// Windows `FileNormalizedNameInformation`.
+    NormalizedName,
     /// Windows `FileAttributeTagInformation`.
     AttributeTag,
 }
@@ -484,6 +488,7 @@ impl QueryFileInformationClass {
     pub(super) fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAllInformation => Ok(Self::All),
             wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation => Ok(Self::Standard),
             wdk_sys::_FILE_INFORMATION_CLASS::FileHardLinkInformation => Ok(Self::HardLink),
             wdk_sys::_FILE_INFORMATION_CLASS::FileStandardLinkInformation => Ok(Self::StandardLink),
@@ -492,6 +497,9 @@ impl QueryFileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileEaInformation => Ok(Self::Ea),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => Ok(Self::NetworkOpen),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNameInformation => Ok(Self::Name),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileNormalizedNameInformation => {
+                Ok(Self::NormalizedName)
+            }
             wdk_sys::_FILE_INFORMATION_CLASS::FileAttributeTagInformation => Ok(Self::AttributeTag),
             _ => Err(DriverError::InvalidInfoClass),
         }

@@ -227,6 +227,41 @@ impl OpenedLocation {
     }
 }
 
+/// Retained permission to disclose the normalized path through this handle.
+///
+/// Named opens already underwent path traversal. File-id opens require independently granted
+/// FILE_TRAVERSE; this decision remains fixed even when a later rename changes the location.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NormalizedNameAccess {
+    /// The name may be queried through this open.
+    Granted,
+    /// A file-id open did not receive traversal permission.
+    Denied,
+}
+
+impl NormalizedNameAccess {
+    /// Attenuates successful create rights to normalized-name disclosure authority.
+    pub(crate) const fn for_open(location: &OpenedLocation, access: GrantedAccess) -> Self {
+        if matches!(location, OpenedLocation::FileReference)
+            && access.as_raw() & wdk_sys::FILE_TRAVERSE == 0
+        {
+            Self::Denied
+        } else {
+            Self::Granted
+        }
+    }
+
+    /// Requires the permission retained by create.
+    /// # Errors
+    /// Returns access denied when traversal was not granted to a file-id open.
+    pub(crate) const fn require(self) -> DriverResult<()> {
+        match self {
+            Self::Granted => Ok(()),
+            Self::Denied => Err(DriverError::AccessDenied),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Cleanup lifecycle of one successfully opened FILE_OBJECT.
 enum HandleLifecycleState {
@@ -853,6 +888,8 @@ pub(super) struct OpenedHandleState {
     deletion: HandleDeletion,
     /// Data transfer buffering policy requested for this handle.
     data_transfer_mode: DataTransferMode,
+    /// Normalized-name disclosure authority retained from create.
+    normalized_name_access: NormalizedNameAccess,
     /// Stable FsRtl directory-name descriptor, retained even if the opened node changes kind.
     directory_notification_name: UnsafeCell<DirectoryNotificationName>,
     /// FILE_OBJECT-local continuation for ordinary EA enumeration.
@@ -866,6 +903,7 @@ impl OpenedHandleState {
         location: OpenedLocation,
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
+        normalized_name_access: NormalizedNameAccess,
     ) -> Self {
         Self {
             node_mode,
@@ -873,6 +911,7 @@ impl OpenedHandleState {
             lifecycle: HandleLifecycle::active(),
             deletion,
             data_transfer_mode,
+            normalized_name_access,
             directory_notification_name: UnsafeCell::new(DirectoryNotificationName::Unregistered),
             ea_cursor: UnsafeCell::new(EaCursor::START),
         }
@@ -1059,6 +1098,7 @@ impl OpenedHandle {
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
+        normalized_name_access: NormalizedNameAccess,
     ) -> DriverResult<Self> {
         Self::from_parts(
             node,
@@ -1067,6 +1107,7 @@ impl OpenedHandle {
             deletion,
             data_transfer_mode,
             regular_file_write_access,
+            normalized_name_access,
         )
     }
 
@@ -1081,8 +1122,15 @@ impl OpenedHandle {
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
         regular_file_write_access: RegularFileWriteAccess,
+        normalized_name_access: NormalizedNameAccess,
     ) -> DriverResult<Self> {
-        let state = OpenedHandleState::new(node_mode, location, deletion, data_transfer_mode);
+        let state = OpenedHandleState::new(
+            node_mode,
+            location,
+            deletion,
+            data_transfer_mode,
+            normalized_name_access,
+        );
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File {
                 write_access: regular_file_write_access,
@@ -1379,6 +1427,13 @@ impl<'owner> OpenedObject<'owner> {
     /// Returns `FILE_WRITE_ATTRIBUTES` authority retained when this handle was created.
     pub(crate) fn file_attributes_write_access(&self) -> FileAttributesWriteAccess {
         self.handle().file_attributes_write_access()
+    }
+
+    /// Requires create-time normalized-name disclosure authority.
+    /// # Errors
+    /// Returns access denied for a file-id open without traversal permission.
+    pub(crate) fn require_normalized_name_access(&self) -> DriverResult<()> {
+        self.handle().state.normalized_name_access.require()
     }
 
     /// Copies this handle's exact deletable location into stable FCB-owned storage.
