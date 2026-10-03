@@ -820,32 +820,6 @@ fn pack_network_open_information(
     IrpCompletion::from_usize(size)
 }
 
-/// Packs FILE_NAME_INFORMATION.
-/// # Errors
-///
-/// Returns an error when the opened location cannot be projected to UTF-16, the name length
-/// overflows, or the output buffer is too small.
-fn pack_name_information(
-    output: &mut [u8],
-    opened_file: &OpenedObject,
-) -> DriverResult<IrpCompletion> {
-    let units = opened_location_name_units(opened_file.location())?;
-    let name_bytes = utf16_byte_len(units.as_slice())?;
-    let required = FILE_NAME_INFORMATION_NAME_OFFSET
-        .checked_add(name_bytes)
-        .ok_or(DriverError::InvalidParameter)?;
-    if output.len() < required {
-        return Err(DriverError::BufferOverflow);
-    }
-    clear_record(output, 0, required)?;
-    LittleEndianOutput::new(output).write_u32(
-        WireOffset::new(FILE_NAME_INFORMATION_NAME_LENGTH_OFFSET),
-        u32::try_from(name_bytes).map_err(|_| DriverError::InvalidParameter)?,
-    )?;
-    write_utf16(output, FILE_NAME_INFORMATION_NAME_OFFSET, units.as_slice())?;
-    IrpCompletion::from_usize(required)
-}
-
 /// Packs FILE_ATTRIBUTE_TAG_INFORMATION.
 /// # Errors
 ///
@@ -871,21 +845,6 @@ fn pack_attribute_tag_information(
         reparse_tag(metadata.reparse_point),
     )?;
     IrpCompletion::from_usize(size)
-}
-
-/// Projects an opened location to the name payload returned to Windows.
-/// # Errors
-///
-/// Returns an error when the location has no path name or a child ext4 name cannot be represented
-/// as a Windows UTF-16 name.
-fn opened_location_name_units(location: &OpenedLocation) -> DriverResult<DriverVec<u16>> {
-    match location {
-        OpenedLocation::Root => DriverVec::try_copied_from_slice(&[UTF16_BACKSLASH]),
-        OpenedLocation::DirectoryEntry { name, .. } => {
-            DriverVec::try_copied_from_slice(WindowsName::from_ext4(name)?.utf16())
-        }
-        OpenedLocation::FileReference => Err(DriverError::NotSupported),
-    }
 }
 
 /// Returns the reparse tag associated with file metadata.
