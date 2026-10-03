@@ -132,9 +132,6 @@ pub(crate) struct TransferSectorSize {
 }
 
 impl TransferSectorSize {
-    /// Sector size currently reported through `FileFs*SizeInformation`.
-    pub(crate) const WINDOWS_REPORTED: Self = Self { bytes: 512 };
-
     /// Returns the sector size in bytes.
     pub(crate) const fn as_u32(self) -> u32 {
         self.bytes

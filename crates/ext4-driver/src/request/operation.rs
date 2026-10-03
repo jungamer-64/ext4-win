@@ -1533,8 +1533,6 @@ unsafe impl Send for RawVolumeOperation {}
 /// Synchronous request kinds that require no lower-storage state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
-    /// Volume information query from already committed runtime state.
-    QueryVolumeInformation,
     /// Terminal FILE_OBJECT close.
     Close,
     /// Fscrypt key-status query from the committed epoch snapshot.
@@ -1625,9 +1623,6 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
         };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
-                ImmediateRequestKind::QueryVolumeInformation => {
-                    crate::request::volume_info::query(owned.request(), access)
-                }
                 ImmediateRequestKind::Close => owned
                     .request()
                     .with_active(|active| crate::request::file_info::close(active, access)),

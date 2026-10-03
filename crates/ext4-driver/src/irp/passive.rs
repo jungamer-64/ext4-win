@@ -1,4 +1,4 @@
-//! PASSIVE_LEVEL Cache Manager work and reactor completion ownership.
+//! Owned PASSIVE_LEVEL native work and reactor completion ownership.
 
 use core::ptr::NonNull;
 
@@ -34,7 +34,7 @@ use super::scheduler::SlotId;
 
 /// One fully captured Cache Manager call whose stream lease owns every native identity.
 #[derive(Debug)]
-pub(crate) enum CacheWork {
+pub(crate) enum PassiveWork {
     /// Acquire Cache Manager pages for the suspended request.
     Mdl {
         /// Retains the exact stream through the native call.
@@ -105,7 +105,7 @@ pub(crate) enum CacheWork {
 
 /// Exact result returned by one Cache Manager work item.
 #[derive(Debug)]
-pub(crate) enum CacheWorkCompletion {
+pub(crate) enum PassiveWorkCompletion {
     /// MDL chain acquisition and observed byte count.
     Mdl(DriverResult<usize>),
     /// Cached read status and observed transfer byte count.
@@ -128,7 +128,7 @@ pub(crate) enum CacheWorkCompletion {
     Uninitialize(DriverResult<()>),
 }
 
-impl CacheWork {
+impl PassiveWork {
     /// Captures MDL work under the exclusive top-level completion owner.
     pub(crate) fn mdl(
         file_object: FileObjectCacheLease,
@@ -207,58 +207,58 @@ impl CacheWork {
     }
 
     /// Executes the sole native Cc/MM call selected before the actor suspended.
-    pub(super) fn execute(self) -> CacheWorkCompletion {
+    pub(super) fn execute(self) -> PassiveWorkCompletion {
         match self {
             Self::Mdl {
                 file_object,
                 irp,
                 action,
-            } => CacheWorkCompletion::Mdl(file_object.mdl(irp, action)),
+            } => PassiveWorkCompletion::Mdl(file_object.mdl(irp, action)),
             Self::Read {
                 file_object,
                 offset,
                 length,
                 output,
-            } => CacheWorkCompletion::Read(file_object.read(offset, length, output)),
+            } => PassiveWorkCompletion::Read(file_object.read(offset, length, output)),
             Self::Write {
                 file_object,
                 offset,
                 input,
                 length,
-            } => CacheWorkCompletion::Write(file_object.write(offset, input, length)),
-            Self::Flush { stream } => CacheWorkCompletion::Flush(stream.flush()),
-            Self::Purge { stream } => CacheWorkCompletion::Purge(stream.purge()),
+            } => PassiveWorkCompletion::Write(file_object.write(offset, input, length)),
+            Self::Flush { stream } => PassiveWorkCompletion::Flush(stream.flush()),
+            Self::Purge { stream } => PassiveWorkCompletion::Purge(stream.purge()),
             Self::DrainForVolumeLock { stream } => {
-                CacheWorkCompletion::DrainForVolumeLock(stream.execute())
+                PassiveWorkCompletion::DrainForVolumeLock(stream.execute())
             }
             Self::PrepareSizeChange { stream } => {
-                CacheWorkCompletion::PrepareSizeChange(stream.execute())
+                PassiveWorkCompletion::PrepareSizeChange(stream.execute())
             }
             Self::PrepareDeletion { stream } => {
-                CacheWorkCompletion::PrepareDeletion(stream.execute())
+                PassiveWorkCompletion::PrepareDeletion(stream.execute())
             }
             Self::PrepareWriteOpen { stream } => {
-                CacheWorkCompletion::PrepareWriteOpen(stream.execute())
+                PassiveWorkCompletion::PrepareWriteOpen(stream.execute())
             }
             Self::Uninitialize { file_object } => {
-                CacheWorkCompletion::Uninitialize(file_object.uninitialize())
+                PassiveWorkCompletion::Uninitialize(file_object.uninitialize())
             }
         }
     }
 
     /// Preserves the selected operation kind when worker preparation fails before queueing.
-    pub(super) fn failed(self, error: DriverError) -> CacheWorkCompletion {
+    pub(super) fn failed(self, error: DriverError) -> PassiveWorkCompletion {
         match self {
-            Self::Mdl { .. } => CacheWorkCompletion::Mdl(Err(error)),
-            Self::Read { .. } => CacheWorkCompletion::Read(Err(error)),
-            Self::Write { .. } => CacheWorkCompletion::Write(Err(error)),
-            Self::Flush { .. } => CacheWorkCompletion::Flush(Err(error)),
-            Self::Purge { .. } => CacheWorkCompletion::Purge(Err(error)),
-            Self::DrainForVolumeLock { .. } => CacheWorkCompletion::DrainForVolumeLock(Err(error)),
-            Self::PrepareSizeChange { .. } => CacheWorkCompletion::PrepareSizeChange(Err(error)),
-            Self::PrepareDeletion { .. } => CacheWorkCompletion::PrepareDeletion(Err(error)),
-            Self::PrepareWriteOpen { .. } => CacheWorkCompletion::PrepareWriteOpen(Err(error)),
-            Self::Uninitialize { .. } => CacheWorkCompletion::Uninitialize(Err(error)),
+            Self::Mdl { .. } => PassiveWorkCompletion::Mdl(Err(error)),
+            Self::Read { .. } => PassiveWorkCompletion::Read(Err(error)),
+            Self::Write { .. } => PassiveWorkCompletion::Write(Err(error)),
+            Self::Flush { .. } => PassiveWorkCompletion::Flush(Err(error)),
+            Self::Purge { .. } => PassiveWorkCompletion::Purge(Err(error)),
+            Self::DrainForVolumeLock { .. } => PassiveWorkCompletion::DrainForVolumeLock(Err(error)),
+            Self::PrepareSizeChange { .. } => PassiveWorkCompletion::PrepareSizeChange(Err(error)),
+            Self::PrepareDeletion { .. } => PassiveWorkCompletion::PrepareDeletion(Err(error)),
+            Self::PrepareWriteOpen { .. } => PassiveWorkCompletion::PrepareWriteOpen(Err(error)),
+            Self::Uninitialize { .. } => PassiveWorkCompletion::Uninitialize(Err(error)),
         }
     }
 }
@@ -267,25 +267,25 @@ impl CacheWork {
     unsafe_code,
     reason = "the suspended IRP and cache stream lease retain every pre-captured mapping and identity"
 )]
-// SAFETY: Each pointer belongs to the unique suspended top-level IRP. `CacheWork` moves into one
+// SAFETY: Each pointer belongs to the unique suspended top-level IRP. `PassiveWork` moves into one
 // work envelope and is consumed before that operation can resume or release its mappings.
-unsafe impl Send for CacheWork {}
+unsafe impl Send for PassiveWork {}
 
 /// Preparation failure that returns the unique suspended operation to the reactor.
 #[cfg(not(test))]
-pub(super) struct CacheWorkPreparationError {
+pub(super) struct PassiveWorkPreparationError {
     /// Exact allocation or rundown failure.
     error: DriverError,
     /// Operation that never crossed the worker effect boundary.
     suspended: Box<dyn CompletionOperation>,
     /// Prepared cache call that never crossed the worker effect boundary.
-    work: CacheWork,
+    work: PassiveWork,
 }
 
 #[cfg(not(test))]
-impl CacheWorkPreparationError {
+impl PassiveWorkPreparationError {
     /// Recovers the failure and unique operation authority.
-    pub(super) fn into_parts(self) -> (DriverError, CacheWork, Box<dyn CompletionOperation>) {
+    pub(super) fn into_parts(self) -> (DriverError, PassiveWork, Box<dyn CompletionOperation>) {
         (self.error, self.work, self.suspended)
     }
 }
@@ -293,7 +293,7 @@ impl CacheWorkPreparationError {
 /// Stable work-item allocation published into the reactor cache-completion inbox.
 #[cfg(not(test))]
 #[repr(C)]
-pub(super) struct CacheWorkEnvelope {
+pub(super) struct PassiveWorkEnvelope {
     /// First-field intrusive node used only after worker execution completes.
     node: LIST_ENTRY,
     /// I/O work item that pins the mounted device through callback entry.
@@ -309,16 +309,16 @@ pub(super) struct CacheWorkEnvelope {
     /// Unique top-level operation suspended outside actor ownership.
     suspended: Option<Box<dyn CompletionOperation>>,
     /// Cache call consumed exactly once by the work-item callback.
-    work: Option<CacheWork>,
+    work: Option<PassiveWork>,
     /// Result published only after `work` has been consumed.
-    completion: Option<CacheWorkCompletion>,
+    completion: Option<PassiveWorkCompletion>,
 }
 
 #[cfg(not(test))]
-impl fmt::Debug for CacheWorkEnvelope {
+impl fmt::Debug for PassiveWorkEnvelope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CacheWorkEnvelope")
+            .debug_struct("PassiveWorkEnvelope")
             .field("identity", &self.identity)
             .field("work", &self.work)
             .field("completion", &self.completion)
@@ -331,7 +331,7 @@ impl fmt::Debug for CacheWorkEnvelope {
     unsafe_code,
     reason = "the work-item envelope is the audited owner of WDK allocation, queue, and intrusive-list boundaries"
 )]
-impl CacheWorkEnvelope {
+impl PassiveWorkEnvelope {
     /// Allocates the WDK work item and stable envelope before any Cc/MM effect can occur.
     /// # Errors
     ///
@@ -340,16 +340,16 @@ impl CacheWorkEnvelope {
         device: KernelDevice,
         reactor: NonNull<CompletionReactor>,
         identity: SlotId,
-        work: CacheWork,
+        work: PassiveWork,
         suspended: Box<dyn CompletionOperation>,
         rundown: CompletionRundownLease,
-    ) -> Result<Box<Self>, CacheWorkPreparationError> {
+    ) -> Result<Box<Self>, PassiveWorkPreparationError> {
         let work_item = NonNull::new(unsafe {
             // SAFETY: The live mounted device remains retained by the active top-level operation.
             ffi::IoAllocateWorkItem(device.as_ptr())
         });
         let Some(work_item) = work_item else {
-            return Err(CacheWorkPreparationError {
+            return Err(PassiveWorkPreparationError {
                 error: DriverError::InsufficientResources,
                 suspended,
                 work,
@@ -375,7 +375,7 @@ impl CacheWorkEnvelope {
                     // SAFETY: Allocation succeeded but this item was never queued.
                     ffi::IoFreeWorkItem(work_item.as_ptr());
                 }
-                Err(CacheWorkPreparationError {
+                Err(PassiveWorkPreparationError {
                     error,
                     suspended,
                     work,
@@ -391,7 +391,7 @@ impl CacheWorkEnvelope {
     )]
     pub(super) fn cancel_before_queue(
         mut envelope: Box<Self>,
-    ) -> (CacheWork, Box<dyn CompletionOperation>) {
+    ) -> (PassiveWork, Box<dyn CompletionOperation>) {
         let work_item = envelope.work_item.take().unwrap_or_else(|| {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
         });
@@ -454,7 +454,7 @@ impl CacheWorkEnvelope {
     )]
     pub(super) fn reclaim(
         mut envelope: Box<Self>,
-    ) -> (Box<dyn CompletionOperation>, CacheWorkCompletion) {
+    ) -> (Box<dyn CompletionOperation>, PassiveWorkCompletion) {
         if envelope.work_item.is_some() || envelope.work.is_some() {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -475,19 +475,19 @@ impl CacheWorkEnvelope {
 )]
 // SAFETY: Ownership is exclusive: actor -> work queue -> reactor inbox. Shared callback access is
 // limited to the immutable reactor destination retained by the rundown lease.
-unsafe impl Send for CacheWorkEnvelope {}
+unsafe impl Send for PassiveWorkEnvelope {}
 
 /// PASSIVE_LEVEL callback that executes one Cc/MM call and publishes its typed result.
 /// # Safety
 ///
-/// `device` and `context` must be the pair queued by [`CacheWorkEnvelope::queue`].
+/// `device` and `context` must be the pair queued by [`PassiveWorkEnvelope::queue`].
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "the I/O Manager returns the unique raw cache work envelope supplied at queue time"
 )]
 unsafe extern "C" fn cache_work_item(device: wdk_sys::PDEVICE_OBJECT, context: wdk_sys::PVOID) {
-    let envelope = NonNull::new(context.cast::<CacheWorkEnvelope>()).unwrap_or_else(|| {
+    let envelope = NonNull::new(context.cast::<PassiveWorkEnvelope>()).unwrap_or_else(|| {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
     });
     let envelope = unsafe {
