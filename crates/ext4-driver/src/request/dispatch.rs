@@ -562,6 +562,9 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
     if request == ImmediateDispatch::PlugAndPlay {
         let minor = received.with_active(|active| Ok(active.current_stack()?.pnp_minor()));
         return match minor {
+            Ok(crate::irp::PnpMinor::QueryRemove) => {
+                crate::state::queue_device_request(received, DispatchMajor::PlugAndPlay)
+            }
             Ok(minor) => crate::state::MountedVolumeDevice::dispatch_pnp(received, minor),
             Err(error) => received.complete_result(Err(error)),
         };

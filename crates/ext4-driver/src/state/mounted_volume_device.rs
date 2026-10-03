@@ -454,7 +454,7 @@ impl MountedVolumeDevice {
             .with_reactor(received, |received, reactor| {
                 match minor {
                     crate::irp::PnpMinor::QueryRemove => {
-                        return received.complete_result(Err(DriverError::DeviceBusy));
+                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     }
                     crate::irp::PnpMinor::SurpriseRemoval | crate::irp::PnpMinor::Remove => {
                         let notification = if minor == crate::irp::PnpMinor::Remove {

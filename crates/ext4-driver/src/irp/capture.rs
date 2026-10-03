@@ -872,6 +872,8 @@ pub(crate) enum PreparedRequest {
     },
     /// Filesystem shutdown request.
     Shutdown,
+    /// Device-scoped reversible removal preparation; no FILE_OBJECT is required.
+    QueryRemove,
 }
 
 impl PreparedRequest {
@@ -1023,6 +1025,9 @@ impl PreparedRequest {
                 ))
             }
             DispatchMajor::Shutdown => Ok((Self::Shutdown, QueueCancellationKey::Device)),
+            DispatchMajor::PlugAndPlay if stack.pnp_minor() == super::PnpMinor::QueryRemove => {
+                Ok((Self::QueryRemove, QueueCancellationKey::Device))
+            }
             DispatchMajor::Close
             | DispatchMajor::Cleanup
             | DispatchMajor::DeviceControl
