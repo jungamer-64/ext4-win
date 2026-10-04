@@ -731,19 +731,15 @@ impl EpochReadView<'_, '_> {
         }
         let block_size = self.superblock.block_size();
         let extent_context = self.extent_tree_context(file.inode());
-        let extent_tree = ExtentTree::load_inode_tree(
-            file.inode().extent_root()?,
-            block_size,
-            &mut self.device,
-            extent_context,
-        )?;
+        let mut extent_tree =
+            ExtentMappingCursor::new(file.inode().extent_root()?, block_size, extent_context)?;
         let contents_key = if file.protection().is_encrypted() {
             Some(self.fscrypt_contents_key_for_inode(file.inode(), crypto)?)
         } else {
             None
         };
         let (metadata, descriptor) =
-            self.read_verity_descriptor(file, &extent_tree, contents_key.as_ref(), crypto)?;
+            self.read_verity_descriptor(file, &mut extent_tree, contents_key.as_ref(), crypto)?;
         if descriptor.block_size().bytes() > block_size.bytes() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -751,7 +747,7 @@ impl EpochReadView<'_, '_> {
         if verifier.tree_bytes() != metadata.merkle_tree_bytes() {
             return Err(Error::InvalidVerityMetadata);
         }
-        let plan = VerityReadPlan {
+        let mut plan = VerityReadPlan {
             extent_tree,
             contents_key,
             metadata,
@@ -795,13 +791,13 @@ impl EpochReadView<'_, '_> {
             let data_bytes = usize::try_from(data_bytes).map_err(|_| Error::ArithmeticOverflow)?;
             self.read_prepared_plaintext_stream_range(
                 plan.contents_key.as_ref(),
-                &plan.extent_tree,
+                &mut plan.extent_tree,
                 block_start,
                 data_block.get_mut(..data_bytes).ok_or(Error::DeviceRange)?,
                 crypto,
             )?;
             self.verify_verity_data_block(
-                &plan,
+                &mut plan,
                 data_block_index,
                 &data_block,
                 &mut proof_block,
@@ -863,7 +859,10 @@ impl EpochReadView<'_, '_> {
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<(Ext4VerityMetadataLayout, FsverityDescriptor)> {
         let block_size = self.superblock.block_size();
-        let metadata_end = extent_payload_end_bytes(extent_tree, block_size)?;
+        let metadata_end = extent_tree
+            .allocation_end(&mut self.device)?
+            .checked_mul(u64::from(block_size.bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
         if metadata_end <= file.size().bytes() {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -926,7 +925,7 @@ impl EpochReadView<'_, '_> {
                 .ok_or(Error::ArithmeticOverflow)?;
             self.read_prepared_plaintext_stream_range(
                 plan.contents_key.as_ref(),
-                &plan.extent_tree,
+                &mut plan.extent_tree,
                 stream_offset,
                 proof_block,
                 crypto,
@@ -936,7 +935,7 @@ impl EpochReadView<'_, '_> {
         verification.finish()
     }
 
-    /// Reads plaintext from a preloaded extent tree and optional pre-derived fscrypt contents key.
+    /// Reads plaintext through a bounded extent path and optional pre-derived fscrypt contents key.
     /// # Errors
     ///
     /// Returns an error when extent traversal, device I/O, or block decryption fails.
@@ -1184,16 +1183,12 @@ impl EpochReadView<'_, '_> {
             inode.size().remaining_from(offset)?,
         );
         let context = self.extent_tree_context(inode);
-        let extent_tree = ExtentTree::load_inode_tree(
-            inode.extent_root()?,
-            self.superblock.block_size(),
-            &mut self.device,
-            context,
-        )?;
+        let mut extent_tree =
+            ExtentMappingCursor::new(inode.extent_root()?, self.superblock.block_size(), context)?;
         let readable_len = usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?;
         self.read_inode_plaintext_stream_range(
             inode,
-            &extent_tree,
+            &mut extent_tree,
             offset.bytes(),
             out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
             crypto,
@@ -1221,15 +1216,11 @@ impl EpochReadView<'_, '_> {
             inode.size().remaining_from(offset)?,
         );
         let context = self.extent_tree_context(inode);
-        let extent_tree = ExtentTree::load_inode_tree(
-            inode.extent_root()?,
-            self.superblock.block_size(),
-            &mut self.device,
-            context,
-        )?;
+        let mut extent_tree =
+            ExtentMappingCursor::new(inode.extent_root()?, self.superblock.block_size(), context)?;
         let readable_len = usize::try_from(readable).map_err(|_| Error::ArithmeticOverflow)?;
         self.read_inode_stream_range(
-            &extent_tree,
+            &mut extent_tree,
             offset.bytes(),
             out.get_mut(..readable_len).ok_or(Error::DeviceRange)?,
         )?;
@@ -1303,7 +1294,7 @@ impl EpochReadView<'_, '_> {
                 .checked_add(chunk)
                 .ok_or(Error::ArithmeticOverflow)?;
 
-            match extent_tree.map_logical(LogicalBlock::try_from(logical_block)?) {
+            match extent_tree.map(LogicalBlock::try_from(logical_block)?, &mut self.device)? {
                 BlockMapping::Physical(physical_block) => {
                     let target = out.get_mut(completed..end).ok_or(Error::DeviceRange)?;
                     if in_block == 0 && chunk == block_bytes {
@@ -1383,8 +1374,11 @@ impl EpochReadView<'_, '_> {
             let maximum_blocks = round_up_div(spanned, block_size)?;
             let maximum_blocks =
                 NonZeroU64::new(maximum_blocks).ok_or(Error::ArithmeticOverflow)?;
-            let run =
-                extent_tree.map_run(LogicalBlock::try_from(logical_block)?, maximum_blocks)?;
+            let run = extent_tree.map_run(
+                LogicalBlock::try_from(logical_block)?,
+                maximum_blocks,
+                &mut self.device,
+            )?;
             let run_bytes = run
                 .blocks()
                 .get()
@@ -1521,4 +1515,3 @@ impl EpochReadView<'_, '_> {
         }
     }
 }
-

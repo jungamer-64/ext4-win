@@ -988,3 +988,82 @@ impl ExtentMappingCursor {
         }
     }
 }
+
+#[cfg(test)]
+mod mapping_tests {
+    use super::*;
+
+    /// Reader whose unselected node is deliberately unreadable.
+    struct SelectedNode {
+        /// Count of selected metadata transfers.
+        reads: usize,
+        /// Independently encoded ext4 leaf bytes.
+        leaf: [u8; 1024],
+    }
+
+    impl ExtentNodeReader for SelectedNode {
+        fn read_extent_bytes(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+            if offset != ByteOffset::new(7168) {
+                return Err(Error::DeviceIo);
+            }
+            self.reads = self.reads.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+            memory::copy_exact(out, &self.leaf)
+        }
+    }
+
+    /// Only the selected route is needed; resident descendants serve adjacent coordinates.
+    /// # Errors
+    /// Returns fixture encoding or mapping failures.
+    /// # Panics
+    /// Panics when routing or transfer counts violate the requested-path contract.
+    #[test]
+    fn selected_route_preserves_parent_interval_and_reuses_its_leaf() -> Result<()> {
+        let mut root = [0_u8; 60];
+        put_le_u16(&mut root, disk_offset(0), 0xf30a)?;
+        put_le_u16(&mut root, disk_offset(2), 2)?;
+        put_le_u16(&mut root, disk_offset(4), 4)?;
+        put_le_u16(&mut root, disk_offset(6), 1)?;
+        put_le_u32(&mut root, disk_offset(16), 7)?;
+        put_le_u32(&mut root, disk_offset(24), 100)?;
+        put_le_u32(&mut root, disk_offset(28), 8)?;
+        let mut reader = SelectedNode {
+            reads: 0,
+            leaf: [0; 1024],
+        };
+        put_le_u16(&mut reader.leaf, disk_offset(0), 0xf30a)?;
+        put_le_u16(&mut reader.leaf, disk_offset(2), 1)?;
+        put_le_u16(&mut reader.leaf, disk_offset(4), 84)?;
+        put_le_u16(&mut reader.leaf, disk_offset(16), 8)?;
+        put_le_u32(&mut reader.leaf, disk_offset(20), 40)?;
+        let block_size = BlockSize::from_superblock_log(0)?;
+        let mut cursor = ExtentMappingCursor::new(
+            &InodeExtentRoot::from_bytes(root),
+            block_size,
+            ExtentTreeContext::none(),
+        )?;
+        assert_eq!(
+            cursor.map(LogicalBlock::try_from(1_u64)?, &mut reader)?,
+            BlockMapping::Physical(BlockAddress::new(41))
+        );
+        assert_eq!(
+            cursor.map(LogicalBlock::try_from(2_u64)?, &mut reader)?,
+            BlockMapping::Physical(BlockAddress::new(42))
+        );
+        assert_eq!(reader.reads, 1);
+        assert_eq!(
+            cursor.map(LogicalBlock::try_from(100_u64)?, &mut reader),
+            Err(Error::DeviceIo)
+        );
+        put_le_u16(&mut reader.leaf, disk_offset(16), 101)?;
+        let mut malformed = ExtentMappingCursor::new(
+            &InodeExtentRoot::from_bytes(root),
+            block_size,
+            ExtentTreeContext::none(),
+        )?;
+        assert_eq!(
+            malformed.map(LogicalBlock::try_from(1_u64)?, &mut reader),
+            Err(Error::InvalidExtentTree)
+        );
+        Ok(())
+    }
+}
