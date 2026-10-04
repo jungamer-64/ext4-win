@@ -32,24 +32,6 @@ struct CleanupOperation {
     mutation: Option<crate::state::OplockMutationLease>,
 }
 
-/// Allocates cleanup ownership without requiring an epoch, crypto context, or mutation ticket.
-/// # Errors
-///
-/// Returns the still-owned IRP when allocation fails before cleanup admission is published.
-pub(crate) fn cleanup(
-    owned: OwnedIrp,
-) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    memory::boxed_try_map(owned, |owned| CleanupOperation {
-        state: CleanupState::Ready(owned),
-        failure: None,
-        mutation: None,
-    })
-    .map(|operation| -> Box<dyn CompletionOperation> { operation })
-    .map_err(|failure| {
-        let (error, owned) = failure.into_parts();
-        AdmitOperationError::new(error, owned)
-    })
-}
 
 impl CleanupOperation {
     /// Captures the cleanup notification while its FILE_OBJECT retains the stream, even when

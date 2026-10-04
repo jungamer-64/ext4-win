@@ -82,7 +82,7 @@ pub(crate) use directory::query_directory;
 mod mdl;
 pub(crate) use mdl::mdl;
 mod cleanup;
-pub(crate) use cleanup::cleanup;
+
 mod volume_close;
 pub(crate) use volume_close::{VolumeCloseRequest, volume_close};
 mod pnp;
@@ -1546,8 +1546,6 @@ unsafe impl Send for RawVolumeOperation {}
 /// Synchronous request kinds that require no lower-storage state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
-    /// Terminal FILE_OBJECT close.
-    Close,
     /// Fscrypt key-status query from the committed epoch snapshot.
     GetEncryptionKeyStatus,
 }
@@ -1568,8 +1566,6 @@ struct ImmediateRequestOperation {
     kind: ImmediateRequestKind,
     /// Explicit ownership phase.
     state: ImmediateOperationState,
-    /// CLOSE alone consumes one terminal barrier before touching FILE_OBJECT contexts.
-    close_barrier_released: bool,
 }
 
 impl ImmediateRequestOperation {
@@ -1584,7 +1580,6 @@ impl ImmediateRequestOperation {
         match memory::boxed_try_map(owned, |owned| Self {
             kind,
             state: ImmediateOperationState::Ready(owned),
-            close_barrier_released: false,
         }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
@@ -1607,38 +1602,8 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                 .bugcheck();
         };
-        let event = if self.kind == ImmediateRequestKind::Close && !self.close_barrier_released {
-            match event {
-                OperationEvent::Admitted => {
-                    self.state = ImmediateOperationState::Ready(owned);
-                    return OperationTransition::Wait {
-                        condition: WaitCondition::Barrier {
-                            identity: CLOSE_HANDLE_BARRIER,
-                        },
-                        suspended: self,
-                    };
-                }
-                OperationEvent::BarrierReleased(permit) => {
-                    if permit.into_identity() != CLOSE_HANDLE_BARRIER {
-                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                            .bugcheck();
-                    }
-                    self.close_barrier_released = true;
-                    OperationEvent::Admitted
-                }
-                _ => {
-                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                        .bugcheck()
-                }
-            }
-        } else {
-            event
-        };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
-                ImmediateRequestKind::Close => owned
-                    .request()
-                    .with_active(|active| crate::request::file_info::close(active, access)),
                 ImmediateRequestKind::GetEncryptionKeyStatus => (|| {
                     let mut request = owned.request();
                     crate::request::file_system_control::authorize_path_handle(
