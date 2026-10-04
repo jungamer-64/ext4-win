@@ -6,7 +6,9 @@ use crate::{
         verify_hosted_driver_load,
     },
     interop::{verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop},
-    live::{check_live_driver_host, cleanup_live_vhdx_session, verify_live_vhdx},
+    live::{
+        benchmark_multi_file, check_live_driver_host, cleanup_live_vhdx_session, verify_live_vhdx,
+    },
     process::repository_root,
     production::verify_production_driver,
 };
@@ -15,6 +17,8 @@ use std::{env, ffi::OsStr, io, process::ExitCode};
 /// One supported host workflow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Task {
+    /// Measures multi-file random I/O on an identity-bound disposable live session.
+    BenchmarkMultiFile,
     /// Runs the complete host-independent development gate.
     Portable,
     /// Exercises the real elevated Windows ETW provider and consumer ABI.
@@ -50,7 +54,9 @@ enum Task {
 impl Task {
     /// Parses one exact task name.
     fn parse(argument: &OsStr) -> Option<Self> {
-        if argument == "verify-portable" {
+        if argument == "benchmark-multi-file" {
+            Some(Self::BenchmarkMultiFile)
+        } else if argument == "verify-portable" {
             Some(Self::Portable)
         } else if argument == "verify-windows-host" {
             Some(Self::WindowsHost)
@@ -130,7 +136,8 @@ fn execute() -> TaskResult<()> {
             cleanup_live_vhdx_session(&repository_root, session_id)
         }
 
-        Task::Portable
+        Task::BenchmarkMultiFile
+        | Task::Portable
         | Task::WindowsHost
         | Task::Driver
         | Task::FuzzReplay
@@ -146,6 +153,7 @@ fn execute() -> TaskResult<()> {
                 return Err(usage_error().into());
             }
             match task {
+                Task::BenchmarkMultiFile => benchmark_multi_file(&repository_root),
                 Task::Portable => verify_portable(&repository_root),
                 Task::WindowsHost => verify_windows_host(&repository_root),
                 Task::Driver => verify_driver(&repository_root),
@@ -174,7 +182,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -189,6 +197,10 @@ mod tests {
     /// Panics if a documented workflow is missing or an unspecified umbrella name is accepted.
     #[test]
     fn task_parser_accepts_only_documented_commands() {
+        assert_eq!(
+            Task::parse(OsStr::new("benchmark-multi-file")),
+            Some(Task::BenchmarkMultiFile)
+        );
         assert_eq!(
             Task::parse(OsStr::new("verify-portable")),
             Some(Task::Portable)

@@ -31,10 +31,105 @@ fn execute(arguments: Vec<String>) -> io::Result<()> {
         ),
         [command, image] if command == "encryption-namespace" => namespace(Path::new(image)),
         [command, image] if command == "live-directory" => live(Path::new(image)),
+        [command, image] if command == "live-random-files" => random_files(Path::new(image)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ext4-fixture <populate-mounted ROOT COUNT NAME_BYTES|encryption-namespace IMAGE|live-directory IMAGE>",
+            "ext4-fixture <populate-mounted ROOT COUNT NAME_BYTES|encryption-namespace IMAGE|live-directory IMAGE|live-random-files IMAGE>",
         )),
+    }
+}
+
+/// Creates distinct inodes and sparse multi-leaf extent trees using the independent disk oracle.
+/// # Errors
+/// Returns host file, debugfs, filesystem-check or temporary-file cleanup failures.
+fn random_files(image: &Path) -> io::Result<()> {
+    let instant = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let directory =
+        env::temp_dir().join(format!("ext4win-random-{}-{instant}", std::process::id()));
+    fs::create_dir(&directory)?;
+    let result = (|| {
+        let regular = directory.join("regular");
+        let fragmented = directory.join("fragmented");
+        let requests = directory.join("requests");
+        let payload: Vec<_> = (0_usize..4096)
+            .map(|position| u8::try_from(position % 251).map_err(io::Error::other))
+            .collect::<io::Result<_>>()?;
+        let mut file = File::create(&regular)?;
+        for _ in 0..16 {
+            file.write_all(&payload)?;
+        }
+        file.sync_all()?;
+        let mut file = File::create(&fragmented)?;
+        for block in 0_u64..512 {
+            file.seek(SeekFrom::Start(
+                block
+                    .checked_mul(8192)
+                    .ok_or_else(|| io::Error::other("fixture offset overflow"))?,
+            ))?;
+            file.write_all(&payload)?;
+        }
+        file.set_len(4_194_304)?;
+        file.sync_all()?;
+        let mut writer = io::BufWriter::new(File::create(&requests)?);
+        writeln!(writer, "mkdir /live-ci/random-io")?;
+        writeln!(writer, "set_inode_field /live-ci/random-io mode 040777")?;
+        for (name, count, source) in [("files", 8192, &regular), ("fragmented", 64, &fragmented)] {
+            writeln!(writer, "mkdir /live-ci/random-io/{name}")?;
+            writeln!(
+                writer,
+                "set_inode_field /live-ci/random-io/{name} mode 040777"
+            )?;
+            let source = source
+                .to_str()
+                .ok_or_else(|| io::Error::other("non-UTF-8 fixture path"))?;
+            if source.contains(['"', '\n', '\r']) {
+                return Err(io::Error::other("unsafe debugfs source path"));
+            }
+            for index in 0..count {
+                writeln!(
+                    writer,
+                    "write \"{source}\" /live-ci/random-io/{name}/file-{index:05}"
+                )?;
+                writeln!(
+                    writer,
+                    "set_inode_field /live-ci/random-io/{name}/file-{index:05} mode 0100666"
+                )?;
+            }
+        }
+        writer.flush()?;
+        drop(writer);
+        let output = Command::new("debugfs")
+            .args(["-w", "-f"])
+            .arg(&requests)
+            .arg(image)
+            .output()?;
+        if !output.status.success()
+            || String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .any(|line| !line.is_empty() && !line.starts_with("debugfs "))
+        {
+            return Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ));
+        }
+        let status = Command::new("e2fsck").arg("-fyD").arg(image).status()?;
+        if !matches!(status.code(), Some(0 | 1)) {
+            return Err(io::Error::other(format!(
+                "random fixture check failed: {status}"
+            )));
+        }
+        Ok(())
+    })();
+    let cleanup = fs::remove_dir_all(&directory);
+    match (result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(operation), Err(cleanup)) => Err(io::Error::other(format!(
+            "fixture: {operation}; cleanup: {cleanup}"
+        ))),
     }
 }
 /// Creates a mounted directory through Linux native hard-link operations, preserving kernel HTree construction.

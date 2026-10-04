@@ -21,6 +21,18 @@ use std::{
     time::Instant,
 };
 
+#[path = "benchmark.rs"]
+mod benchmark;
+
+/// Storage and workload selected before the disposable session acquires resources.
+#[derive(Clone, Copy, Debug)]
+enum LiveWorkload {
+    /// Existing filesystem and driver assurance scenario.
+    Assurance,
+    /// Independent random-I/O dataset and repeated native measurements.
+    RandomIo,
+}
+
 /// WSL attachment stage; interrupted intent is not assumed to have rolled back.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum WslAttachment {
@@ -313,11 +325,15 @@ fn attachment(session: &mut Session<LiveState>, attach: bool) -> TaskResult<()> 
 /// Creates a new fixed-size VHDX, records disk identity and independently captures its Linux data GPT extent.
 /// # Errors
 /// Returns construction, partition, identity or durable publication failures.
-fn create_storage(session: &mut Session<LiveState>) -> TaskResult<()> {
+fn create_storage(session: &mut Session<LiveState>, workload: LiveWorkload) -> TaskResult<()> {
     let path = windows::literal(vhdx(session).as_os_str())?;
     session.publish(Phase::Intent(Operation::CreateVhdx))?;
+    let bytes = match workload {
+        LiveWorkload::Assurance => 268_435_456_u64,
+        LiveWorkload::RandomIo => 2_147_483_648,
+    };
     windows::management(&format!(
-        "New-VHD -Path {path} -Fixed -SizeBytes 268435456 | Out-Null; $true"
+        "New-VHD -Path {path} -Fixed -SizeBytes {bytes} | Out-Null; $true"
     ))?;
     session.publish(Phase::Observed(Operation::CreateVhdx))?;
     attachment(session, true)?;
@@ -346,7 +362,11 @@ fn create_storage(session: &mut Session<LiveState>) -> TaskResult<()> {
 /// Formats and populates through Linux tools before any Windows-driver mount can occur.
 /// # Errors
 /// Returns device-difference, GPT identity, oracle, helper or WSL detachment failures.
-fn format_storage(session: &mut Session<LiveState>, helper: &Path) -> TaskResult<()> {
+fn format_storage(
+    session: &mut Session<LiveState>,
+    helper: &Path,
+    workload: LiveWorkload,
+) -> TaskResult<()> {
     let before = wsl_words(&["--exec", "lsblk", "-dn", "-o", "NAME"])?;
     session.state_mut().wsl = WslAttachment::Requested;
     session.publish(Phase::Intent(Operation::AttachWsl))?;
@@ -426,6 +446,9 @@ fn format_storage(session: &mut Session<LiveState>, helper: &Path) -> TaskResult
     }
     let helper = linux_path(helper)?;
     wsl_words(&["--exec", &helper, "live-directory", &partition])?;
+    if matches!(workload, LiveWorkload::RandomIo) {
+        wsl_words(&["--exec", &helper, "live-random-files", &partition])?;
+    }
     wsl_words(&["--exec", "e2fsck", "-fn", &partition])?;
     session.publish(Phase::Observed(Operation::Format))?;
     detach_wsl(session)?;
@@ -682,6 +705,7 @@ fn exercise_driver(
     root: &Path,
     bundle: &VerifiedProductionBundle,
     session: &mut Session<LiveState>,
+    workload: LiveWorkload,
 ) -> TaskResult<()> {
     attachment(session, true)?;
     let scope = scope(session)?;
@@ -710,6 +734,15 @@ fn exercise_driver(
     observe_verifier(session)?;
     let mount = mount_namespace(session)?;
     let payload = exercise_io(session, &mount)?;
+    if matches!(workload, LiveWorkload::RandomIo) {
+        session.publish(Phase::Intent(Operation::FilesystemIo))?;
+        benchmark::run(
+            &mount.join("live-ci/random-io"),
+            &session.directory().join("random-io.json"),
+            bundle.artifact_id(),
+        )?;
+        session.publish(Phase::Observed(Operation::FilesystemIo))?;
+    }
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     attachment(session, false)?;
@@ -800,6 +833,20 @@ pub(crate) fn cleanup_live_vhdx_session(root: &Path, id: &OsStr) -> TaskResult<(
 /// # Errors
 /// Returns any build, live operation, identity, trace or mandatory cleanup failure.
 pub(crate) fn verify_live_vhdx(root: &Path) -> TaskResult<()> {
+    run_live_session(root, LiveWorkload::Assurance)
+}
+
+/// Measures an exact signed artifact on independently populated disposable storage.
+/// # Errors
+/// Returns build, workload, integrity or mandatory joined cleanup failures.
+pub(crate) fn benchmark_multi_file(root: &Path) -> TaskResult<()> {
+    run_live_session(root, LiveWorkload::RandomIo)
+}
+
+/// Owns the complete joined storage, driver and trace session for one workload.
+/// # Errors
+/// Returns preflight, build, live operations or mandatory cleanup failures.
+fn run_live_session(root: &Path, workload: LiveWorkload) -> TaskResult<()> {
     check_live_driver_host(root)?;
     let helper = fixture::executable(root)?;
     let bundle = build_verified_production_bundle(root)?;
@@ -816,9 +863,9 @@ pub(crate) fn verify_live_vhdx(root: &Path) -> TaskResult<()> {
         &root.join("target/live-driver-trace"),
     )?;
     let operation = (|| {
-        create_storage(&mut session)?;
-        format_storage(&mut session, &helper)?;
-        exercise_driver(root, &bundle, &mut session)
+        create_storage(&mut session, workload)?;
+        format_storage(&mut session, &helper, workload)?;
+        exercise_driver(root, &bundle, &mut session, workload)
     })();
     let resources = cleanup_live_vhdx_session(root, OsStr::new(session.id().as_str()));
     let operation = combine_verification_and_cleanup(operation, resources);

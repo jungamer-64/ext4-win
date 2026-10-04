@@ -4,6 +4,8 @@ mod owner;
 #[cfg(not(windows))]
 use crate::TaskResult;
 #[cfg(windows)]
+pub(crate) use owner::benchmark_multi_file;
+#[cfg(windows)]
 pub(crate) use owner::{check_live_driver_host, cleanup_live_vhdx_session, verify_live_vhdx};
 #[cfg(not(windows))]
 use std::{ffi::OsStr, io, path::Path};
@@ -23,6 +25,13 @@ pub(crate) fn check_live_driver_host(_root: &Path) -> TaskResult<()> {
 /// Always returns Unsupported outside Windows.
 #[cfg(not(windows))]
 pub(crate) fn verify_live_vhdx(root: &Path) -> TaskResult<()> {
+    check_live_driver_host(root)
+}
+/// Rejects driver performance measurement on unsupported hosts.
+/// # Errors
+/// Always returns Unsupported outside Windows.
+#[cfg(not(windows))]
+pub(crate) fn benchmark_multi_file(root: &Path) -> TaskResult<()> {
     check_live_driver_host(root)
 }
 /// Rejects Windows storage reconciliation on portable hosts.

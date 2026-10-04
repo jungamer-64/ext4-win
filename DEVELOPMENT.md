@@ -27,6 +27,7 @@ compile the driver or require WDK.
 | `cargo xtask cleanup-driver-load-session <session-id>` | Elevated Windows host | Reconciles an interrupted service/package session only after its durable bundle, signer, and package identities match. |
 | `cargo xtask check-live-driver-host` | Dedicated host that passes the hosted preflight and also provides Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier | Performs the read-only preflight for disposable live VHDX validation. |
 | `cargo xtask verify-live-vhdx` | A host that passes the live preflight | Builds a verified bundle and exercises it only against a newly created disposable VHDX. |
+| `cargo xtask benchmark-multi-file` | A host that passes the live preflight | Measures native random reads and writes on independently populated disposable storage, retaining artifact-bound latency and flush evidence. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
 
 `verify-fuzz-replay` is the deterministic pull-request gate for previously retained inputs.
