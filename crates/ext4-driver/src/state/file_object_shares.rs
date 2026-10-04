@@ -139,6 +139,67 @@ impl fmt::Debug for FileObjectShares {
 mod tests {
     use super::*;
 
+    /// # Errors
+    /// Returns stream-header, ledger or retained-cache-lease allocation failure.
+    /// # Panics
+    /// Panics if terminal writeback omits an active stream or loses it when its last handle closes.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the fixture exclusively owns unpublished stream share state"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "setup returns errors while assertions verify terminal writeback retention"
+    )]
+    fn close_writeback_retains_active_streams_through_last_close() -> DriverResult<()> {
+        let volume_stream =
+            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let mut ledger = FileControlBlockLedger::try_new()?;
+        let fcb = ledger.staged_file_control_block(
+            NonNull::dangling(),
+            &volume_stream,
+            StagedNodeStreamMetadata {
+                node: NodeId::Directory(DirectoryNodeId::ROOT),
+                sizes: StreamSizes::EMPTY,
+            },
+            OperationalTrace::host_test(),
+        )?;
+        let pointer = NonNull::from(fcb.as_ref().get_ref());
+        unsafe {
+            // SAFETY: No request or ledger entry observes this exclusively owned fixture yet.
+            (*fcb.open_state.get()).shares.active_handles = 1;
+        }
+        ledger
+            .table
+            .get_mut()
+            .try_push_owned(fcb)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert!(matches!(
+            ledger.prepare_volume_lock_cache_drain(),
+            Err(DriverError::AccessDenied)
+        ));
+        let mut streams = ledger.prepare_close_cache_writeback()?;
+        assert_eq!(streams.len(), 1);
+        let retained_fcb = unsafe {
+            // SAFETY: The ledger and snapshot both retain this live FCB at its original address.
+            pointer.as_ref()
+        };
+        unsafe {
+            // SAFETY: This single-threaded fixture exclusively owns share state while emulating cleanup.
+            (*retained_fcb.open_state.get()).shares.active_handles = 0;
+        }
+        ledger.close(pointer);
+        assert!(!ledger.is_empty());
+        let stream = streams
+            .pop()
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        stream.close_writeback()?;
+        drop(stream);
+        assert!(ledger.is_empty());
+        Ok(())
+    }
+
     /// # Panics
     /// Panics if admission capacity depends on the native subset count or can overflow.
     #[test]

@@ -359,26 +359,24 @@ impl MountedVolumeState {
         namespace_empty: bool,
         volume_file_objects: u32,
     ) -> (Self, VolumeRetirement) {
-        match self {
-            Self::StorageRemoved if namespace_empty && volume_file_objects == 0 => {
-                (Self::Retiring, VolumeRetirement::Start)
-            }
-            Self::Dismounted { lock_owner: None }
-            | Self::CloseFailed {
-                lock_owner: None, ..
-            } if namespace_empty && volume_file_objects == 0 => {
-                (Self::Retiring, VolumeRetirement::Start)
-            }
-            Self::Retiring => (self, VolumeRetirement::Retained),
-            Self::Mounted
-            | Self::Locking { .. }
-            | Self::Locked { .. }
-            | Self::Closing { .. }
-            | Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::StorageRemoved => (self, VolumeRetirement::Retained),
+        if self.permits_retirement() && namespace_empty && volume_file_objects == 0 {
+            (Self::Retiring, VolumeRetirement::Start)
+        } else {
+            (self, VolumeRetirement::Retained)
         }
+    }
+
+    /// Logical termination permits teardown; FILE_OBJECT, stream and media lifetimes still gate it.
+    fn permits_retirement(self) -> bool {
+        matches!(
+            self,
+            Self::StorageRemoved
+                | Self::Dismounted { lock_owner: None }
+                | Self::CloseFailed {
+                    lock_owner: None,
+                    ..
+                }
+        )
     }
 
     /// Reports whether this volume remains logically mounted.
@@ -834,6 +832,17 @@ impl MountedVolumeAccess<'_> {
     /// Rechecks physical retirement after one namespace FILE_OBJECT has closed.
     pub(crate) fn close_node_file_object(&mut self) -> VolumeRetirement {
         self.begin_retirement()
+    }
+
+    /// A terminal operation may finish after the last Close, so actor progress must also select
+    /// retirement. Ordinary mounted operation does not acquire the stream ledger for this check.
+    #[cfg(not(test))]
+    pub(crate) fn recheck_terminal_retirement(&mut self) -> VolumeRetirement {
+        if self.volume.volume_control.state.permits_retirement() {
+            self.begin_retirement()
+        } else {
+            VolumeRetirement::Retained
+        }
     }
 
     /// Returns whether one or more handle-free streams still have native cache/section residents.

@@ -915,6 +915,17 @@ impl ReactorTarget {
             }
         }
     }
+
+    /// Terminal close completion owns retirement even when no later FILE_OBJECT Close will arrive.
+    #[cfg(not(test))]
+    fn recheck_terminal_retirement(&mut self) -> VolumeRetirement {
+        match self {
+            Self::ControlDevice => VolumeRetirement::Retained,
+            Self::MountedVolume(binding) => {
+                binding.with_access(|access| access.recheck_terminal_retirement())
+            }
+        }
+    }
     /// Confirms that an operation belongs to the control-device shell.
     pub(crate) fn require_control_device(&self) {
         if !matches!(self, Self::ControlDevice) {
@@ -2452,6 +2463,12 @@ impl CompletionReactor {
             progressed |= self.drive_ready_operations();
             progressed |= self.drain_deferred_notifications();
             progressed |= self.maintain_delayed_close();
+            if self.with_target(ReactorTarget::recheck_terminal_retirement)
+                == VolumeRetirement::Start
+            {
+                MountedVolumeDevice::schedule_retirement(self.device);
+                progressed = true;
+            }
             let completion_list_empty = unsafe {
                 // SAFETY: The sole reactor actor observes this initialized inbox list.
                 list_is_empty(self.completion_head.get())
@@ -3077,8 +3094,11 @@ impl CompletionReactor {
         work: crate::irp::PassiveWork,
         suspended: SuspendedOperation,
     ) {
-        if !matches!(work, crate::irp::PassiveWork::Uninitialize { .. })
-            && let Err(error) = self.with_mounted_access(|access| access.authorize_storage())
+        if !matches!(
+            work,
+            crate::irp::PassiveWork::Uninitialize { .. }
+                | crate::irp::PassiveWork::CleanupOplock { .. }
+        ) && let Err(error) = self.with_mounted_access(|access| access.authorize_storage())
         {
             self.set_ready_operation_event(
                 index,
