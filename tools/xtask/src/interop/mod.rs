@@ -1197,7 +1197,7 @@ fn prepare_core_mutation<S, F, R>(
     storage: &mut S,
     profile: &ext4_core::MountedProfile,
     epoch: &ext4_core::CommittedEpoch,
-    coordinator: &ext4_core::MutationCoordinatorState,
+    coordinator: &mut ext4_core::MutationCoordinatorState,
     ticket: u64,
     mut mutate: F,
 ) -> TaskResult<(ext4_core::CommitReadyMutation, R)>
@@ -1272,11 +1272,17 @@ fn prepare_volume_label_commit<S: HostStorage>(
 )> {
     let (profile, epoch, mut coordinator) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
-    let (prepared, ()) =
-        prepare_core_mutation(storage, &profile, &epoch, &coordinator, ticket, |pass| {
+    let (prepared, ()) = prepare_core_mutation(
+        storage,
+        &profile,
+        &epoch,
+        &mut coordinator,
+        ticket,
+        |pass| {
             pass.set_volume_label(ext4_core::Ext4VolumeLabel::new(label)?);
             Ok(())
-        })?;
+        },
+    )?;
     Ok((prepared, coordinator, ticket))
 }
 
@@ -1334,7 +1340,7 @@ where
     let (profile, epoch, mut coordinator) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let (prepared, output) =
-        prepare_core_mutation(storage, &profile, &epoch, &coordinator, ticket, mutate)?;
+        prepare_core_mutation(storage, &profile, &epoch, &mut coordinator, ticket, mutate)?;
     let _checkpointed_epoch =
         complete_prepared_mutation(storage, &mut coordinator, ticket, prepared)?;
     complete_core_clean_close(storage, filesystem_length, profile.journal_target())?;

@@ -178,6 +178,110 @@ struct ResourceVersionTable {
     occupied: usize,
 }
 
+impl ResourceVersionTable {
+    /// Starts without allocation; capacity is admitted by commit preparation.
+    const fn empty() -> Self {
+        Self {
+            slots: Vec::new(),
+            occupied: 0,
+        }
+    }
+
+    /// Finds an existing resource or its first empty slot in a power-of-two table.
+    fn slot(&self, resource: MutationResource) -> Option<usize> {
+        let domain = match resource.domain {
+            MutationResourceDomain::Inode => 1_u64,
+            MutationResourceDomain::BlockGroup => 2,
+            MutationResourceDomain::VolumeMetadata => 3,
+            MutationResourceDomain::KeySet => 4,
+        };
+        let mut hash = resource.identity ^ domain.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        let mask = self.slots.len().checked_sub(1)?;
+        let mut position = usize::try_from(hash & u64::try_from(mask).ok()?).ok()?;
+        for _ in 0..self.slots.len() {
+            match self.slots.get(position)? {
+                None => return Some(position),
+                Some(entry) if entry.resource == resource => return Some(position),
+                Some(_) => position = position.wrapping_add(1) & mask,
+            }
+        }
+        None
+    }
+
+    /// Treats a resource that has never changed as the initial version.
+    fn version(&self, resource: MutationResource) -> ResourceVersion {
+        self.slot(resource)
+            .and_then(|slot| self.slots.get(slot))
+            .and_then(Option::as_ref)
+            .map_or(ResourceVersion::INITIAL, |entry| entry.version)
+    }
+
+    /// Reserves index space without changing any committed version.
+    /// # Errors
+    /// Returns capacity arithmetic or allocation failure before lower I/O.
+    fn reserve(&mut self, additional: usize) -> Result<()> {
+        let required = self
+            .occupied
+            .checked_add(additional)
+            .and_then(|count| count.checked_mul(2))
+            .ok_or(Error::ArithmeticOverflow)?
+            .max(16)
+            .checked_next_power_of_two()
+            .ok_or(Error::ArithmeticOverflow)?;
+        if required <= self.slots.len() {
+            return Ok(());
+        }
+        let mut next = Self {
+            slots: memory::repeated_vec(None, required)?,
+            occupied: self.occupied,
+        };
+        for entry in self.slots.iter().flatten().copied() {
+            let slot = next.slot(entry.resource).ok_or(Error::ArithmeticOverflow)?;
+            *next.slots.get_mut(slot).ok_or(Error::ArithmeticOverflow)? = Some(entry);
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// Installs identity at version zero and computes its durable increment.
+    /// # Errors
+    /// Returns version overflow or a violated pre-reservation boundary.
+    fn prepare_increment(
+        &mut self,
+        resource: MutationResource,
+    ) -> Result<(usize, ResourceVersion)> {
+        let slot = self.slot(resource).ok_or(Error::ArithmeticOverflow)?;
+        let cell = self.slots.get_mut(slot).ok_or(Error::ArithmeticOverflow)?;
+        let version = cell
+            .as_ref()
+            .map_or(ResourceVersion::INITIAL, |entry| entry.version)
+            .next()?;
+        if cell.is_none() {
+            self.occupied = self
+                .occupied
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?;
+            *cell = Some(ResourceVersionEntry {
+                resource,
+                version: ResourceVersion::INITIAL,
+            });
+        }
+        Ok((slot, version))
+    }
+
+    /// Consumes slot increments prepared under the serialized commit grant.
+    fn publish(&mut self, publication: ResourceVersionPublication) {
+        for (slot, version) in publication.delta {
+            if let Some(Some(entry)) = self.slots.get_mut(slot) {
+                entry.version = version;
+            }
+        }
+    }
+}
+
 /// Version increments computed while commit authority is held, before lower I/O.
 #[derive(Debug)]
 pub(crate) struct ResourceVersionPublication {
@@ -476,7 +580,7 @@ pub struct MutationCoordinatorState {
     pub(crate) journal: JournalCoordinatorState,
     /// Monotonic FIFO ticket assigned to the next mutation admission.
     next_ticket: u64,
-    /// Fixed-capacity committed resource versions.
+    /// Indexed committed resource versions, expanded before commit I/O.
     resource_versions: ResourceVersionTable,
 }
 
@@ -516,28 +620,33 @@ impl MutationCoordinatorState {
             .all(|entry| self.resource_versions.version(entry.resource) == entry.version)
     }
 
-    /// Prepares the complete next version table while failure is still harmless.
+    /// Reserves the index and computes only changed versions while failure is harmless.
     /// # Errors
     ///
-    /// Returns an error when observed versions are stale, the fixed table is exhausted, or a
+    /// Returns an error when observed versions are stale, index allocation fails, or a
     /// resource version cannot advance.
     pub(crate) fn prepare_version_publication(
-        &self,
+        &mut self,
         observed: &ObservedResourceVersionSet,
     ) -> Result<ResourceVersionPublication> {
         if !self.revalidate(observed) {
             return Err(Error::ClusterReferenceConflict);
         }
-        let mut next = self.resource_versions.try_clone()?;
+        self.resource_versions.reserve(observed.entries.len())?;
+        let mut delta = Vec::new();
+        delta
+            .try_reserve_exact(observed.entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
         for entry in &observed.entries {
-            next.advance(entry.resource)?;
+            delta.try_push(self.resource_versions.prepare_increment(entry.resource)?)?;
         }
-        Ok(ResourceVersionPublication { next })
+        Ok(ResourceVersionPublication { delta })
     }
 
-    /// Publishes a prevalidated resource table without allocation or failure.
+    /// Publishes reserved slot increments without allocation or failure.
+    /// The serialized commit grant prevents index growth between preparation and publication.
     pub(crate) fn publish_versions(&mut self, publication: ResourceVersionPublication) {
-        self.resource_versions = publication.next;
+        self.resource_versions.publish(publication);
     }
 }
 
@@ -1899,6 +2008,40 @@ mod tests {
 
     use super::{CleanCloseOperation, CleanCloseTransition};
     use crate::volume::OperationEvent;
+
+    /// # Panics
+    /// Panics if distinct resources are capped or a delta changes unrelated versions.
+    #[test]
+    fn resource_versions_publish_more_than_eight_thousand_distinct_inodes() {
+        let result = (|| -> Result<()> {
+            let mut table = super::ResourceVersionTable::empty();
+            for inode in 1..=8192 {
+                let resource = super::MutationResource::inode(super::InodeId::try_from(inode)?);
+                table.reserve(1)?;
+                let increment = table.prepare_increment(resource)?;
+                assert_eq!(table.version(resource), super::ResourceVersion::INITIAL);
+                table.publish(super::ResourceVersionPublication {
+                    delta: crate::memory::copied_slice(&[increment])?,
+                });
+                assert_eq!(table.version(resource), super::ResourceVersion(1));
+            }
+            for inode in 1..=8192 {
+                let resource = super::MutationResource::inode(super::InodeId::try_from(inode)?);
+                assert_eq!(table.version(resource), super::ResourceVersion(1));
+            }
+            let resource = super::MutationResource::inode(super::InodeId::try_from(4000)?);
+            table.reserve(1)?;
+            let increment = table.prepare_increment(resource)?;
+            let capacity = table.slots.capacity();
+            table.publish(super::ResourceVersionPublication {
+                delta: crate::memory::copied_slice(&[increment])?,
+            });
+            assert_eq!(table.slots.capacity(), capacity);
+            assert_eq!(table.version(resource), super::ResourceVersion(2));
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
 
     /// Request shape observed by the clean-close host adapter.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

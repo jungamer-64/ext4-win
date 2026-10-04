@@ -1407,15 +1407,13 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns a core mutation error when commit preparation cannot consume the supplied grant.
     pub(crate) fn prepare_mutation_commit(
-        &self,
+        &mut self,
         reserved: ReservedMutation,
         commit: CommitLease,
     ) -> Result<CommitReadyMutation, ext4_core::Error> {
-        reserved.prepare_commit(
-            self.volume.runtime.coordinator(),
-            self.volume.runtime.current_epoch(),
-            commit,
-        )
+        self.volume
+            .runtime
+            .prepare_mutation_commit(reserved, commit)
     }
 
     /// Reserves both immutable epoch publication slots before the first lower write.

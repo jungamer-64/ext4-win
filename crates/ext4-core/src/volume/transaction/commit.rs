@@ -308,7 +308,7 @@ impl ReservedMutation {
     /// any pre-publication allocation fails.
     pub fn prepare_commit(
         self,
-        coordinator: &MutationCoordinatorState,
+        coordinator: &mut MutationCoordinatorState,
         current_epoch: &CommittedEpoch,
         commit: super::super::CommitLease,
     ) -> Result<CommitReadyMutation> {
@@ -317,11 +317,11 @@ impl ReservedMutation {
         {
             return Err(Error::ClusterReferenceConflict);
         }
+        let version_publication =
+            coordinator.prepare_version_publication(&self.resolved.observed)?;
         let JournalCoordinatorState::Ready(journal) = &coordinator.journal else {
             return Err(Error::JournalCorrupt);
         };
-        let version_publication =
-            coordinator.prepare_version_publication(&self.resolved.observed)?;
 
         let durable_clusters = current_epoch
             .clusters

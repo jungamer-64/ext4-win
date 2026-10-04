@@ -384,6 +384,17 @@ impl VolumeRuntime {
         &self.coordinator
     }
 
+    /// Reserves coordinator index capacity under the granted commit lane.
+    /// # Errors
+    /// Returns core version, serialization, or allocation failures before lower writes.
+    pub(crate) fn prepare_mutation_commit(
+        &mut self,
+        reserved: ext4_core::ReservedMutation,
+        commit: ext4_core::CommitLease,
+    ) -> Result<ext4_core::CommitReadyMutation, ext4_core::Error> {
+        reserved.prepare_commit(&mut self.coordinator, self.epochs.current(), commit)
+    }
+
     /// Allocates one stable FIFO mutation ticket before resolve begins.
     /// # Errors
     ///

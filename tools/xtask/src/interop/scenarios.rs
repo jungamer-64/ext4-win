@@ -3646,7 +3646,7 @@ fn run_external_file_mutation_until_boundary(
         &mut storage,
         &profile,
         &epoch,
-        &coordinator,
+        &mut coordinator,
         ticket,
         |pass| {
             let (root, file_id) = mutation_root_file(pass, source_name)?;
@@ -3689,7 +3689,7 @@ fn run_internal_htree_mutation_until_boundary(
         &mut storage,
         &profile,
         &epoch,
-        &coordinator,
+        &mut coordinator,
         ticket,
         |pass| {
             let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
