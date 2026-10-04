@@ -8,6 +8,7 @@ use std::{
     io,
     os::windows::fs::{FileExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    sync::{Barrier, mpsc},
     thread,
     time::Instant,
 };
@@ -74,8 +75,10 @@ struct Measurement {
     p95_us: f64,
     /// Native-operation 99th percentile in microseconds.
     p99_us: f64,
-    /// Sum of explicit worker flush durations in milliseconds, outside operation timing.
+    /// Wall duration of the synchronized flush phase, outside operation timing.
     flush_ms: f64,
+    /// Trace start through durable flush completion, including cached-write acceptance.
+    durability_ms: f64,
 }
 /// Worker-owned completion evidence, collected even when another worker fails.
 struct WorkerMeasurement {
@@ -83,8 +86,8 @@ struct WorkerMeasurement {
     window: (Instant, Instant),
     /// Native operation timings in nanoseconds.
     latencies: Vec<u64>,
-    /// Explicit durability acknowledgement duration in milliseconds.
-    flush_ms: f64,
+    /// Bounds of the flush phase, excluding readback and fixture restoration.
+    flush_window: (Instant, Instant),
 }
 
 /// Opens one session-owned file with the exact selected completion semantics.
@@ -99,20 +102,96 @@ fn open(path: &Path, mode: TransferMode) -> io::Result<File> {
     options.open(path)
 }
 
-/// Generates a host-owned expected payload independently of filesystem parsing and mapping.
+/// Seeds the independently generated fixture's fixed block body.
 /// # Errors
 /// Returns an unrepresentable host index.
-fn pattern(bytes: &mut [u8], file: usize, stamp: u64) -> io::Result<()> {
-    let salt = if stamp == 0 {
-        0
-    } else {
-        stamp ^ u64::try_from(file).map_err(io::Error::other)?
-    };
+fn seed(bytes: &mut [u8]) -> io::Result<()> {
     for (position, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::try_from((u64::try_from(position).map_err(io::Error::other)? ^ salt) % 251)
-            .map_err(io::Error::other)?;
+        *byte = u8::try_from(position % 251).map_err(io::Error::other)?;
     }
     Ok(())
+}
+
+/// Encodes a trace identity without regenerating the 4 KiB body inside the measured loop.
+/// # Errors
+/// Returns an unrepresentable file identity or a short payload.
+fn stamp_header(bytes: &mut [u8], file: usize, stamp: u64) -> io::Result<()> {
+    let header = bytes
+        .get_mut(..16)
+        .ok_or_else(|| io::Error::other("short trace payload"))?;
+    if stamp == 0 {
+        return seed(header);
+    }
+    let identity = u64::try_from(file).map_err(io::Error::other)?.to_le_bytes();
+    for (target, byte) in header
+        .iter_mut()
+        .zip(stamp.to_le_bytes().into_iter().chain(identity))
+    {
+        *target = byte;
+    }
+    Ok(())
+}
+
+/// Phase barriers exclude warmup, readback and restoration from other workers' measurement.
+struct TraceBarriers {
+    /// Every worker has finished warming its entire active inode set.
+    start: Barrier,
+    /// Every measured operation has completed before the first explicit flush.
+    finish: Barrier,
+    /// Every explicit flush has completed before the first readback or restoration.
+    flushed: Barrier,
+}
+
+/// A failed participant still joins all remaining barriers so the owner can join every worker.
+enum Phase {
+    /// Warmup has not joined the trace admission barrier.
+    Warming,
+    /// Measured operations may execute.
+    Running,
+    /// Explicit flushes may execute.
+    Flushing,
+    /// No remaining synchronization obligation.
+    Finished,
+}
+
+/// Owns barrier participation through failure and panic unwinding.
+struct Participant<'trace> {
+    /// Barriers live until all scoped workers have joined.
+    barriers: &'trace TraceBarriers,
+    /// The next synchronization obligation.
+    phase: Phase,
+}
+
+impl Participant<'_> {
+    /// Admits the measured phase after every worker's warmup.
+    fn begin(&mut self) {
+        if matches!(self.phase, Phase::Warming) {
+            self.barriers.start.wait();
+            self.phase = Phase::Running;
+        }
+    }
+    /// Admits explicit flush only after all measured operations have completed.
+    fn finish(&mut self) {
+        self.begin();
+        if matches!(self.phase, Phase::Running) {
+            self.barriers.finish.wait();
+            self.phase = Phase::Flushing;
+        }
+    }
+    /// Admits readback only after all durability acknowledgements have completed.
+    fn flushed(&mut self) {
+        self.finish();
+        if matches!(self.phase, Phase::Flushing) {
+            self.barriers.flushed.wait();
+            self.phase = Phase::Finished;
+        }
+    }
+}
+
+impl Drop for Participant<'_> {
+    fn drop(&mut self) {
+        self.flushed();
+    }
 }
 
 /// Executes a complete native transfer without treating a short success as completion.
@@ -133,7 +212,16 @@ fn transfer(file: &File, bytes: &mut [u8], offset: u64, write: bool) -> io::Resu
 /// Owns one disjoint inode set, verifies every observed block, and restores the fixture.
 /// # Errors
 /// Returns allocation, native operation, data mismatch, flush or explicit close failures.
-fn worker(root: &Path, profile: Profile, worker: usize) -> io::Result<WorkerMeasurement> {
+fn worker(
+    root: &Path,
+    profile: Profile,
+    worker: usize,
+    barriers: &TraceBarriers,
+) -> io::Result<WorkerMeasurement> {
+    let mut participant = Participant {
+        barriers,
+        phase: Phase::Warming,
+    };
     let ids: Vec<_> = (worker..profile.files).step_by(profile.workers).collect();
     let blocks = if profile.fragmented {
         512_usize
@@ -202,22 +290,32 @@ fn worker(root: &Path, profile: Profile, worker: usize) -> io::Result<WorkerMeas
         let mut random = u64::try_from(worker)
             .map_err(io::Error::other)?
             .wrapping_add(1);
-        pattern(&mut expected, 0, 0)?;
+        seed(&mut expected)?;
         for (selected, path) in paths.iter().enumerate() {
-            if let Some(file) = retained.get(selected) {
+            let warm = |file: &File, buffer: &mut [u8]| -> io::Result<()> {
                 transfer(file, buffer, 0, false)?;
+                if buffer != expected {
+                    return Err(io::Error::other("warmup differs from independent fixture"));
+                }
+                // Exercise every inode's update resource, including the complete 8,192-file set.
+                if !matches!(profile.workload, Workload::Read) {
+                    transfer(file, buffer, 0, true)?;
+                    file.sync_all()?;
+                }
+                Ok(())
+            };
+            if let Some(file) = retained.get(selected) {
+                warm(file, buffer)?;
             } else {
                 let file = open(path, profile.mode)?;
                 combine_verification_and_cleanup(
-                    transfer(&file, buffer, 0, false).map_err(Into::into),
+                    warm(&file, buffer).map_err(Into::into),
                     windows_host::close_file(file).map_err(Into::into),
                 )
                 .map_err(|error| io::Error::other(error.to_string()))?;
             }
-            if buffer != expected {
-                return Err(io::Error::other("warmup differs from independent fixture"));
-            }
         }
+        participant.begin();
         let started = Instant::now();
         for operation in 0_usize..OPERATIONS {
             random ^= random << 13;
@@ -254,11 +352,9 @@ fn worker(root: &Path, profile: Profile, worker: usize) -> io::Result<WorkerMeas
             let id = *ids
                 .get(selected)
                 .ok_or_else(|| io::Error::other("file index"))?;
-            pattern(&mut expected, id, if write { next } else { *stamp })?;
+            stamp_header(&mut expected, id, if write { next } else { *stamp })?;
             if write {
-                for (target, byte) in buffer.iter_mut().zip(&expected) {
-                    *target = *byte;
-                }
+                stamp_header(buffer, id, next)?;
             }
             let offset = u64::try_from(block)
                 .map_err(io::Error::other)?
@@ -291,13 +387,21 @@ fn worker(root: &Path, profile: Profile, worker: usize) -> io::Result<WorkerMeas
             }
         }
         let completed = Instant::now();
-        let mut flush_ms = 0.0;
+        participant.finish();
+        let flush_started = Instant::now();
+        for path in &paths {
+            let file = open(path, profile.mode)?;
+            combine_verification_and_cleanup(
+                file.sync_all().map_err(Into::into),
+                windows_host::close_file(file).map_err(Into::into),
+            )
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        }
+        let flushed = Instant::now();
+        participant.flushed();
         for (selected, path) in paths.iter().enumerate() {
             let file = open(path, profile.mode)?;
             let validation = (|| {
-                let begun = Instant::now();
-                file.sync_all()?;
-                flush_ms += begun.elapsed().as_secs_f64() * 1000.0;
                 for block in 0..blocks {
                     let index = selected
                         .checked_mul(blocks)
@@ -313,7 +417,7 @@ fn worker(root: &Path, profile: Profile, worker: usize) -> io::Result<WorkerMeas
                         .map_err(io::Error::other)?
                         .checked_mul(if profile.fragmented { 8192 } else { 4096 })
                         .ok_or_else(|| io::Error::other("offset overflow"))?;
-                    pattern(
+                    stamp_header(
                         &mut expected,
                         *ids.get(selected)
                             .ok_or_else(|| io::Error::other("file index"))?,
@@ -325,7 +429,7 @@ fn worker(root: &Path, profile: Profile, worker: usize) -> io::Result<WorkerMeas
                             "random write readback differs from independent trace",
                         ));
                     }
-                    pattern(buffer, 0, 0)?;
+                    stamp_header(buffer, 0, 0)?;
                     transfer(&file, buffer, offset, true)?;
                 }
                 file.sync_all()
@@ -339,7 +443,7 @@ fn worker(root: &Path, profile: Profile, worker: usize) -> io::Result<WorkerMeas
         Ok(WorkerMeasurement {
             window: (started, completed),
             latencies,
-            flush_ms,
+            flush_window: (flush_started, flushed),
         })
     })();
     let mut cleanup = Ok(());
@@ -390,25 +494,56 @@ pub(super) fn run(root: &Path, output: &Path, artifact: &str) -> io::Result<()> 
                             fragmented,
                         };
                         for repetition in 0..5 {
+                            let barriers = TraceBarriers {
+                                start: Barrier::new(workers),
+                                finish: Barrier::new(workers),
+                                flushed: Barrier::new(workers),
+                            };
                             let results = thread::scope(|scope| {
-                                let tasks: Vec<_> = (0..workers)
-                                    .map(|id| scope.spawn(move || worker(root, profile, id)))
-                                    .collect();
-                                tasks
+                                let mut tasks = Vec::new();
+                                tasks.try_reserve_exact(workers).map_err(io::Error::other)?;
+                                let mut failure = None;
+                                for id in 0..workers {
+                                    let (admit, admission) = mpsc::sync_channel(1);
+                                    let barriers = &barriers;
+                                    match thread::Builder::new().spawn_scoped(scope, move || {
+                                        if admission.recv().map_err(io::Error::other)? {
+                                            worker(root, profile, id, barriers)
+                                        } else {
+                                            Err(io::Error::other("trace admission failed"))
+                                        }
+                                    }) {
+                                        Ok(task) => tasks.push((admit, task)),
+                                        Err(error) => {
+                                            failure = Some(error);
+                                            break;
+                                        }
+                                    }
+                                }
+                                // A partial spawn never admits any barrier participant. Every
+                                // successfully created thread is signalled and joined on failure.
+                                for (admit, _) in &tasks {
+                                    if let Err(error) = admit.send(failure.is_none()) {
+                                        failure = Some(io::Error::other(error));
+                                    }
+                                }
+                                let results = tasks
                                     .into_iter()
-                                    .map(|task| {
+                                    .map(|(_, task)| {
                                         task.join()
                                             .map_err(|_| {
                                                 io::Error::other("random I/O worker panicked")
                                             })
                                             .and_then(|result| result)
                                     })
-                                    .collect::<Vec<_>>()
-                            });
+                                    .collect::<Vec<_>>();
+                                failure.map_or(Ok(results), Err)
+                            })?;
                             let mut first = None;
                             let mut last = None;
                             let mut samples = Vec::new();
-                            let mut flush_ms = 0.0;
+                            let mut flush_first = None;
+                            let mut flush_last = None;
                             for result in results {
                                 let result = result?;
                                 first = Some(first.map_or(result.window.0, |value: Instant| {
@@ -418,7 +553,16 @@ pub(super) fn run(root: &Path, output: &Path, artifact: &str) -> io::Result<()> 
                                     value.max(result.window.1)
                                 }));
                                 samples.extend(result.latencies);
-                                flush_ms += result.flush_ms;
+                                flush_first = Some(
+                                    flush_first.map_or(result.flush_window.0, |value: Instant| {
+                                        value.min(result.flush_window.0)
+                                    }),
+                                );
+                                flush_last = Some(
+                                    flush_last.map_or(result.flush_window.1, |value: Instant| {
+                                        value.max(result.flush_window.1)
+                                    }),
+                                );
                             }
                             #[expect(
                                 clippy::disallowed_methods,
@@ -438,7 +582,18 @@ pub(super) fn run(root: &Path, output: &Path, artifact: &str) -> io::Result<()> 
                                 p50_us: percentile(&samples, 50)?,
                                 p95_us: percentile(&samples, 95)?,
                                 p99_us: percentile(&samples, 99)?,
-                                flush_ms,
+                                flush_ms: flush_last
+                                    .zip(flush_first)
+                                    .map(|(last, first)| {
+                                        last.duration_since(first).as_secs_f64() * 1000.0
+                                    })
+                                    .ok_or_else(|| io::Error::other("empty flush window"))?,
+                                durability_ms: flush_last
+                                    .zip(first)
+                                    .map(|(last, first)| {
+                                        last.duration_since(first).as_secs_f64() * 1000.0
+                                    })
+                                    .ok_or_else(|| io::Error::other("empty durability window"))?,
                             });
                             let report = serde_json::json!({ "artifact_id": artifact, "transfer_bytes": TRANSFER, "operations_per_worker": OPERATIONS, "measurements": measurements });
                             fs::write(output, serde_json::to_vec_pretty(&report)?)?;
@@ -452,4 +607,70 @@ pub(super) fn run(root: &Path, output: &Path, artifact: &str) -> io::Result<()> 
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Errors
+    /// Returns payload encoding or latency selection failures.
+    /// # Panics
+    /// Fails if independent trace coordinates alias or the fixed block body changes.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible trace encoding is separate from independent byte and latency assertions"
+    )]
+    fn trace_identity_and_latency_units_are_independent() -> io::Result<()> {
+        let mut bytes = [0_u8; TRANSFER];
+        seed(&mut bytes)?;
+        let baseline = bytes;
+        stamp_header(&mut bytes, 8191, 31)?;
+        assert_eq!(bytes.get(..8), Some(31_u64.to_le_bytes().as_slice()));
+        assert_eq!(bytes.get(8..16), Some(8191_u64.to_le_bytes().as_slice()));
+        assert_eq!(bytes.get(16..), baseline.get(16..));
+        stamp_header(&mut bytes, 0, 0)?;
+        assert_eq!(bytes, baseline);
+        assert!(stamp_header(&mut [0; 15], 0, 1).is_err());
+        assert_eq!(percentile(&[1000, 2000, 3000], 50)?, 2.0);
+        assert!(percentile(&[], 50).is_err());
+        Ok(())
+    }
+
+    /// # Panics
+    /// Fails if a rejected worker strands another participant at a remaining barrier.
+    #[test]
+    fn early_failure_joins_every_remaining_trace_phase() {
+        for phase in [Phase::Warming, Phase::Running, Phase::Flushing] {
+            let barriers = TraceBarriers {
+                start: Barrier::new(2),
+                finish: Barrier::new(2),
+                flushed: Barrier::new(2),
+            };
+            thread::scope(|scope| {
+                let task = scope.spawn(|| {
+                    let mut participant = Participant {
+                        barriers: &barriers,
+                        phase: Phase::Warming,
+                    };
+                    participant.begin();
+                    participant.finish();
+                    participant.flushed();
+                });
+                let mut failed = Participant {
+                    barriers: &barriers,
+                    phase: Phase::Warming,
+                };
+                if matches!(phase, Phase::Running | Phase::Flushing) {
+                    failed.begin();
+                }
+                if matches!(phase, Phase::Flushing) {
+                    failed.finish();
+                }
+                drop(failed);
+                assert!(task.join().is_ok());
+            });
+        }
+    }
 }
