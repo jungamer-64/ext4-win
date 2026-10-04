@@ -209,6 +209,24 @@ fn transfer(file: &File, bytes: &mut [u8], offset: u64, write: bool) -> io::Resu
     Ok(())
 }
 
+/// Selects disjoint block coordinates for workers sharing the single control inode.
+/// # Errors
+/// Returns trace-coordinate overflow.
+fn trace_offset(profile: Profile, worker: usize, block: usize) -> io::Result<u64> {
+    let logical = if profile.files == 1 {
+        block
+            .checked_mul(profile.workers)
+            .and_then(|block| block.checked_add(worker))
+    } else {
+        Some(block)
+    }
+    .ok_or_else(|| io::Error::other("trace block overflow"))?;
+    u64::try_from(logical)
+        .map_err(io::Error::other)?
+        .checked_mul(if profile.fragmented { 8192 } else { 4096 })
+        .ok_or_else(|| io::Error::other("offset overflow"))
+}
+
 /// Owns one disjoint inode set, verifies every observed block, and restores the fixture.
 /// # Errors
 /// Returns allocation, native operation, data mismatch, flush or explicit close failures.
@@ -222,7 +240,11 @@ fn worker(
         barriers,
         phase: Phase::Warming,
     };
-    let ids: Vec<_> = (worker..profile.files).step_by(profile.workers).collect();
+    let ids: Vec<_> = if profile.files == 1 {
+        vec![0]
+    } else {
+        (worker..profile.files).step_by(profile.workers).collect()
+    };
     let blocks = if profile.fragmented {
         512_usize
     } else {
@@ -230,6 +252,8 @@ fn worker(
     };
     let directory = if profile.fragmented {
         "fragmented"
+    } else if profile.files == 1 {
+        "single"
     } else {
         "files"
     };
@@ -293,13 +317,15 @@ fn worker(
         seed(&mut expected)?;
         for (selected, path) in paths.iter().enumerate() {
             let warm = |file: &File, buffer: &mut [u8]| -> io::Result<()> {
-                transfer(file, buffer, 0, false)?;
-                if buffer != expected {
-                    return Err(io::Error::other("warmup differs from independent fixture"));
+                for block in 0..blocks {
+                    transfer(file, buffer, trace_offset(profile, worker, block)?, false)?;
+                    if buffer != expected {
+                        return Err(io::Error::other("warmup differs from independent fixture"));
+                    }
                 }
                 // Exercise every inode's update resource, including the complete 8,192-file set.
                 if !matches!(profile.workload, Workload::Read) {
-                    transfer(file, buffer, 0, true)?;
+                    transfer(file, buffer, trace_offset(profile, worker, 0)?, true)?;
                     file.sync_all()?;
                 }
                 Ok(())
@@ -356,10 +382,7 @@ fn worker(
             if write {
                 stamp_header(buffer, id, next)?;
             }
-            let offset = u64::try_from(block)
-                .map_err(io::Error::other)?
-                .checked_mul(if profile.fragmented { 8192 } else { 4096 })
-                .ok_or_else(|| io::Error::other("offset overflow"))?;
+            let offset = trace_offset(profile, worker, block)?;
             let begun = Instant::now();
             if let Some(file) = retained.get(selected) {
                 transfer(file, buffer, offset, write)?;
@@ -413,10 +436,7 @@ fn worker(
                     if stamp == 0 {
                         continue;
                     }
-                    let offset = u64::try_from(block)
-                        .map_err(io::Error::other)?
-                        .checked_mul(if profile.fragmented { 8192 } else { 4096 })
-                        .ok_or_else(|| io::Error::other("offset overflow"))?;
+                    let offset = trace_offset(profile, worker, block)?;
                     stamp_header(
                         &mut expected,
                         *ids.get(selected)
@@ -481,7 +501,7 @@ fn percentile(samples: &[u64], percent: usize) -> io::Result<f64> {
 pub(super) fn run(root: &Path, output: &Path, artifact: &str) -> io::Result<()> {
     let mut measurements = Vec::new();
     for (files, fragmented) in [(1, false), (1024, false), (8192, false), (64, true)] {
-        for workers in [1_usize, 8, 32].into_iter().filter(|count| *count <= files) {
+        for workers in [1_usize, 8, 32] {
             for handles in [Handles::Retained, Handles::Reopened] {
                 for mode in [TransferMode::Cached, TransferMode::Direct] {
                     for workload in [Workload::Read, Workload::Write, Workload::Mixed] {
@@ -612,6 +632,37 @@ pub(super) fn run(root: &Path, output: &Path, artifact: &str) -> io::Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns trace-coordinate failures.
+    /// # Panics
+    /// Fails if concurrent writes to the control inode share a block or exceed its fixture.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible coordinate encoding is separate from independent disjoint-range assertions"
+    )]
+    fn single_inode_control_has_disjoint_ranges_at_every_concurrency() -> io::Result<()> {
+        for workers in [1, 8, 32] {
+            let profile = Profile {
+                files: 1,
+                workers,
+                handles: Handles::Reopened,
+                mode: TransferMode::Cached,
+                workload: Workload::Mixed,
+                fragmented: false,
+            };
+            let mut offsets = std::collections::BTreeSet::new();
+            for worker in 0..workers {
+                for block in 0..16 {
+                    let offset = trace_offset(profile, worker, block)?;
+                    assert!(offsets.insert(offset));
+                    assert!(offset < 2_097_152 && offset.is_multiple_of(4096));
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// # Errors
     /// Returns payload encoding or latency selection failures.

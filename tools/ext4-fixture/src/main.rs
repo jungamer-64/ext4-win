@@ -52,6 +52,7 @@ fn random_files(image: &Path) -> io::Result<()> {
     fs::create_dir(&directory)?;
     let result = (|| {
         let regular = directory.join("regular");
+        let single = directory.join("single");
         let fragmented = directory.join("fragmented");
         let requests = directory.join("requests");
         let payload: Vec<_> = (0_usize..4096)
@@ -59,6 +60,11 @@ fn random_files(image: &Path) -> io::Result<()> {
             .collect::<io::Result<_>>()?;
         let mut file = File::create(&regular)?;
         for _ in 0..16 {
+            file.write_all(&payload)?;
+        }
+        file.sync_all()?;
+        let mut file = File::create(&single)?;
+        for _ in 0..512 {
             file.write_all(&payload)?;
         }
         file.sync_all()?;
@@ -76,7 +82,11 @@ fn random_files(image: &Path) -> io::Result<()> {
         let mut writer = io::BufWriter::new(File::create(&requests)?);
         writeln!(writer, "mkdir /live-ci/random-io")?;
         writeln!(writer, "set_inode_field /live-ci/random-io mode 040777")?;
-        for (name, count, source) in [("files", 8192, &regular), ("fragmented", 64, &fragmented)] {
+        for (name, count, source) in [
+            ("files", 8192, &regular),
+            ("single", 1, &single),
+            ("fragmented", 64, &fragmented),
+        ] {
             writeln!(writer, "mkdir /live-ci/random-io/{name}")?;
             writeln!(
                 writer,
