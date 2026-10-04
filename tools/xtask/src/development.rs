@@ -92,7 +92,7 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
 pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     #[cfg(windows)]
     {
-        verify_executive_resource(repository_root)?;
+        verify_native_synchronization(repository_root)?;
         verify_cache_mdl(repository_root)?;
     }
     run_checked(
@@ -121,40 +121,51 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Compiles and executes the actual native C resource oracle without WDK or C runtime imports.
+/// Executes native APC ownership and section-mutation notification oracles without WDK imports.
 /// # Errors
 /// Returns compiler, execution or mandatory generated-directory cleanup failures.
 #[cfg(windows)]
-fn verify_executive_resource(root: &Path) -> TaskResult<()> {
-    let directory = crate::process::create_task_directory(root, "executive-resource")?;
-    let executable = directory.join("resource-tests.exe");
-    let operation = (|| {
-        let mut compiler = Command::new("clang.exe");
-        compiler
-            .args([
-                "--target=x86_64-pc-windows-msvc",
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-nostdlib",
-                "-fuse-ld=lld",
-                "-Xlinker",
-                "/entry:main",
-                "-Xlinker",
-                "/subsystem:console",
-            ])
-            .arg(root.join("crates/ext4-driver/native/executive_resource.tests.c"))
-            .arg("-o")
-            .arg(&executable);
-        run_checked(compiler, "executive resource oracle compilation")?;
-        run_checked(
-            Command::new(&executable),
+fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
+    for (name, source, contract) in [
+        (
+            "executive-resource",
+            "executive_resource.tests.c",
             "native executive resource APC contract",
-        )
-    })();
-    let cleanup = crate::process::remove_task_directory(root, &directory, "executive-resource");
-    crate::process::combine_verification_and_cleanup(operation, cleanup)
+        ),
+        (
+            "section-mutation",
+            "section_mutation.tests.c",
+            "native section mutation notification contract",
+        ),
+    ] {
+        let directory = crate::process::create_task_directory(root, name)?;
+        let executable = directory.join("synchronization-tests.exe");
+        let operation = (|| {
+            let mut compiler = Command::new("clang.exe");
+            compiler
+                .args([
+                    "--target=x86_64-pc-windows-msvc",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-nostdlib",
+                    "-fuse-ld=lld",
+                    "-Xlinker",
+                    "/entry:main",
+                    "-Xlinker",
+                    "/subsystem:console",
+                ])
+                .arg(root.join("crates/ext4-driver/native").join(source))
+                .arg("-o")
+                .arg(&executable);
+            run_checked(compiler, "native synchronization oracle compilation")?;
+            run_checked(Command::new(&executable), contract)
+        })();
+        let cleanup = crate::process::remove_task_directory(root, &directory, name);
+        crate::process::combine_verification_and_cleanup(operation, cleanup)?;
+    }
+    Ok(())
 }
 
 /// Executes the production Cc MDL transfer boundary against an ownership oracle.
