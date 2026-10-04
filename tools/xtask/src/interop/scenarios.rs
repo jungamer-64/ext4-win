@@ -1073,7 +1073,7 @@ fn format_mutation_image(
     run_checked(mke2fs, "fresh mutation image format")
 }
 
-/// Exercises create, multi-block write, grow, shrink, rename, hard link, unlink, and xattr
+/// Exercises create, initialized overwrite, multi-block write, grow, shrink, rename, hard link, unlink, and xattr
 /// set/update/delete on one fresh 4 KiB filesystem.
 ///
 /// # Errors
@@ -1094,12 +1094,44 @@ fn verify_regular_mutation_profile(
     let source = ext4_core::Ext4Name::new(b"source.bin").map_err(core_task_error)?;
     let renamed = ext4_core::Ext4Name::new(b"renamed.bin").map_err(core_task_error)?;
     let linked = ext4_core::Ext4Name::new(b"linked.bin").map_err(core_task_error)?;
-    let initial = vec![0x5A_u8; INITIAL_BYTES];
+    let mut initial = vec![0x5A_u8; INITIAL_BYTES];
     drive_internal_core_mutation(image, |pass| {
         let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
         let file = pass.create_file(root, &source, mutation_file_metadata()?)?;
         pass.write_file_range(file, ext4_core::FileOffset::ZERO, &initial)
     })?;
+
+    let image_path = linux.tool_path(image)?;
+    let allocated = debugfs_block_sequence(linux, &image_path, "blocks /source.bin")?;
+    let space = debugfs_free_space(linux, image)?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_root, file_id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(file_id)?;
+        pass.write_file_range(file, ext4_core::FileOffset::from_bytes(4096), &[0x62; 4096])?;
+        pass.write_file_range(file, ext4_core::FileOffset::from_bytes(8188), &[0x17; 12])
+    })?;
+    initial
+        .get_mut(4096..8192)
+        .ok_or_else(|| io::Error::other("overwrite oracle range"))?
+        .fill(0x62);
+    initial
+        .get_mut(8188..8200)
+        .ok_or_else(|| io::Error::other("partial overwrite oracle range"))?
+        .fill(0x17);
+    if debugfs_block_sequence(linux, &image_path, "blocks /source.bin")? != allocated
+        || debugfs_free_space(linux, image)? != space
+    {
+        return Err(io::Error::other("initialized overwrite changed block ownership").into());
+    }
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/source.bin",
+        &initial,
+        1,
+        "initialized-overwrite",
+    )?;
 
     drive_internal_core_mutation(image, |pass| {
         let (_root, file_id) = mutation_root_file(pass, &source)?;
@@ -1127,8 +1159,7 @@ fn verify_regular_mutation_profile(
         "regular-set",
     )?;
     verify_payload_allocation(linux, image, b"source.bin", 8)?;
-    // The independent unwritten fixture is read-only at the payload boundary. Subsequent mutation
-    // profiles retain their own admission requirements rather than inheriting this read fixture.
+    // Initialized destinations remain writable when an unrelated extent is unwritten.
     let unwritten_image = case_root.join("unwritten.img");
     fs::copy(image, &unwritten_image)?;
     let image_path = linux.tool_path(&unwritten_image)?;
@@ -1136,6 +1167,17 @@ fn verify_regular_mutation_profile(
     fallocate.args(["-w", "-R", "fallocate /source.bin 5 5", &image_path]);
     run_checked(fallocate, "unwritten payload allocation fixture")?;
     verify_payload_allocation(linux, &unwritten_image, b"source.bin", 8)?;
+    let unwritten_blocks = debugfs_block_sequence(linux, &image_path, "blocks /source.bin")?;
+    drive_internal_core_mutation(&unwritten_image, |pass| {
+        let (_root, file_id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(file_id)?;
+        pass.write_file_range(file, ext4_core::FileOffset::ZERO, &[0x5A; 64])
+    })?;
+    if debugfs_block_sequence(linux, &image_path, "blocks /source.bin")? != unwritten_blocks {
+        return Err(
+            io::Error::other("initialized overwrite changed unrelated unwritten storage").into(),
+        );
+    }
     verify_internal_e2fsck_clean(linux, &unwritten_image, "unwritten allocation read profile")?;
 
     drive_internal_core_mutation(image, |pass| {
