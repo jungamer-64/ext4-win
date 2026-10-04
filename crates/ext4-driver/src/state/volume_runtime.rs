@@ -263,6 +263,14 @@ enum CommitGateState {
 }
 
 impl CommitGateState {
+    /// Revokes only the ticket owning the pre-write lane and its cache registration fence.
+    /// Unrelated tickets and checkpoint authority cannot reopen metadata registration.
+    fn abandon(&mut self, ticket: u64, cache: &mut ext4_core::MetadataCache) {
+        if *self == (Self::CommitGranted { ticket }) {
+            cache.abandon_mutation();
+            *self = Self::Ready;
+        }
+    }
     /// Acquires clean journal space only while the volume still permits mutation.
     /// # Errors
     ///
@@ -446,10 +454,7 @@ impl VolumeRuntime {
 
     /// Releases a commit grant before the first lower write was issued.
     pub(crate) fn abandon_commit(&mut self, ticket: u64) {
-        self.metadata_cache.abandon_mutation();
-        if self.commit_gate == (CommitGateState::CommitGranted { ticket }) {
-            self.commit_gate = CommitGateState::Ready;
-        }
+        self.commit_gate.abandon(ticket, &mut self.metadata_cache);
     }
 
     /// Grants the short visibility swap independently of checkpoint I/O.
@@ -721,6 +726,18 @@ mod tests {
         let mut vacant = CommitGateState::Ready;
         assert!(matches!(vacant.acquire(9, failed), Err(failure) if failure == error));
         assert_eq!(vacant, CommitGateState::Ready);
+        let mut cache = ext4_core::MetadataCache::default();
+        gate.abandon(8, &mut cache);
+        assert!(matches!(
+            gate.acquire(9, VolumeFailureState::Operational),
+            Ok(None)
+        ));
+        gate.abandon(7, &mut cache);
+        assert_eq!(
+            gate.acquire(9, VolumeFailureState::Operational)
+                .map(|grant| grant.map(ext4_core::CommitLease::into_ticket)),
+            Ok(Some(9))
+        );
     }
 
     /// Keeps serialized commit, visibility, and checkpoint grants in the unit-test production
