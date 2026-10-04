@@ -128,6 +128,7 @@ impl MetadataCache {
             .checked_mul(size_of::<CacheSet>())
             .and_then(|value| value.checked_add(storage.bytes.capacity()))
             .and_then(|value| value.checked_add(size_of::<Self>()))
+            .and_then(|value| value.checked_add(256))
             .ok_or(Error::ArithmeticOverflow)?;
         if allocated > BUDGET {
             return Err(Error::OutOfMemory);
