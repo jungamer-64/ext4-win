@@ -22,9 +22,6 @@ use crate::disk_format::superblock::{
     WriteSessionState,
 };
 
-/// Maximum distinct resources whose committed versions are tracked by one mounted volume.
-const MAX_TRACKED_RESOURCES: usize = 4096;
-
 /// Opaque resource identity used by scheduler intent arbitration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationResource {
@@ -172,74 +169,20 @@ struct ResourceVersionEntry {
     version: ResourceVersion,
 }
 
-/// Bounded table cloned before commit so post-durability publication cannot fail.
+/// Fallibly expanding index of committed resource versions.
 #[derive(Debug)]
 struct ResourceVersionTable {
-    /// Populated entries, bounded independently of allocator capacity.
-    entries: Vec<ResourceVersionEntry>,
+    /// Open-addressed slots, with growth admitted before lower I/O.
+    slots: Vec<Option<ResourceVersionEntry>>,
+    /// Number of populated resource identities.
+    occupied: usize,
 }
 
-impl ResourceVersionTable {
-    /// Builds an empty version table without allocation or a large stack object.
-    const fn empty() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    /// Fallibly copies the current table before the first lower write.
-    /// # Errors
-    ///
-    /// Returns [`Error::OutOfMemory`] when the independent publication table cannot be allocated.
-    fn try_clone(&self) -> Result<Self> {
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.entries.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for entry in self.entries.iter().copied() {
-            entries.try_push(entry)?;
-        }
-        Ok(Self { entries })
-    }
-
-    /// Looks up one resource, treating absent entries as the initial version.
-    fn version(&self, resource: MutationResource) -> ResourceVersion {
-        self.entries
-            .iter()
-            .find(|entry| entry.resource == resource)
-            .map_or(ResourceVersion::INITIAL, |entry| entry.version)
-    }
-
-    /// Advances one resource in this private pre-publication table.
-    /// # Errors
-    ///
-    /// Returns an error when the version overflows, the table bound is exhausted, or storage for
-    /// a new entry cannot be allocated.
-    fn advance(&mut self, resource: MutationResource) -> Result<()> {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.resource == resource)
-        {
-            entry.version = entry.version.next()?;
-            return Ok(());
-        }
-        if self.entries.len() >= MAX_TRACKED_RESOURCES {
-            return Err(Error::OutOfMemory);
-        }
-        self.entries.try_push(ResourceVersionEntry {
-            resource,
-            version: ResourceVersion::INITIAL.next()?,
-        })?;
-        Ok(())
-    }
-}
-
-/// Complete next version table allocated and validated before the first lower write.
+/// Version increments computed while commit authority is held, before lower I/O.
 #[derive(Debug)]
 pub(crate) struct ResourceVersionPublication {
-    /// Table moved into the coordinator at infallible publish.
-    next: ResourceVersionTable,
+    /// Changed slots in the reserved index; publication cannot grow the index.
+    delta: Vec<(usize, ResourceVersion)>,
 }
 
 /// Stable filesystem identity exposed outside the raw superblock domain.
