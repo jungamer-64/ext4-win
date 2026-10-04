@@ -14,6 +14,7 @@
          ? EXCEPTION_EXECUTE_HANDLER                                           \
          : EXCEPTION_CONTINUE_SEARCH)
 #include "cache_mdl.h"
+#include "cache_close.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
@@ -260,6 +261,40 @@ ext4win_stream_storage_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
     return (volume != NULL) && (ext4win_storage_removal_state(&volume->StorageAdmission) == 0);
+}
+
+/* Cache/Fast I/O authority is independent from lower storage presence. */
+static BOOLEAN
+ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
+    return ext4win_stream_storage_available(stream)
+        && (ext4win_storage_close_state(&volume->StorageAdmission) == 0);
+}
+
+BOOLEAN NTAPI
+ext4win_stream_begin_close(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    return (volume != NULL) && (volume->Kind == 2)
+        && ext4win_storage_begin_close(&volume->StorageAdmission);
+}
+
+VOID NTAPI
+ext4win_stream_seal_close(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    if ((volume != NULL) && (volume->Kind == 2)) {
+        ext4win_storage_seal_close(&volume->StorageAdmission);
+    }
+}
+
+UCHAR NTAPI
+ext4win_stream_close_state(_In_ PVOID volume_header)
+{
+    PEXT4WIN_STREAM_CONTEXT volume = ext4win_stream_from_header(volume_header);
+    if ((volume == NULL) || (volume->Kind != 2)) { return 2; }
+    return (UCHAR)ext4win_storage_close_state(&volume->StorageAdmission);
 }
 
 _IRQL_requires_(PASSIVE_LEVEL)
@@ -546,7 +581,7 @@ ext4win_stream_fast_io_candidate(
     _Outptr_ PEXT4WIN_STREAM_CONTEXT *stream_out)
 {
     if (!ext4win_stream_fast_io_stream(file_object, stream_out) ||
-        !ext4win_stream_storage_available(*stream_out) ||
+        !ext4win_stream_ordinary_io_available(*stream_out) ||
         ((file_object->Flags & FO_NO_INTERMEDIATE_BUFFERING) != 0) ||
         (file_object->PrivateCacheMap == NULL) ||
         ((file_object->Flags & FO_CACHE_SUPPORTED) == 0) ||
@@ -1243,13 +1278,13 @@ ext4win_stream_cache_initialize(
     if (!ext4win_stream_matches_file_object(stream, file_object)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (!ext4win_stream_storage_available(stream)) { return STATUS_DEVICE_REMOVED; }
+    if (!ext4win_stream_ordinary_io_available(stream)) { return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED; }
 
     status = STATUS_SUCCESS;
     (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
-    if (!ext4win_stream_storage_available(stream)) {
+    if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
-        return STATUS_DEVICE_REMOVED;
+        return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
     }
     __try {
         if (file_object->PrivateCacheMap == NULL) {
@@ -1309,9 +1344,9 @@ ext4win_stream_cache_read(
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
     (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
-    if (!ext4win_stream_storage_available(stream)) {
+    if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
-        return STATUS_DEVICE_REMOVED;
+        return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
     }
     ExAcquireFastMutex(&stream->HeaderMutex);
     current_file_size = stream->Header.FileSize.QuadPart;
@@ -1369,9 +1404,9 @@ ext4win_stream_cache_write(
 
     file_offset.QuadPart = offset;
     (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
-    if (!ext4win_stream_storage_available(stream)) {
+    if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
-        return STATUS_DEVICE_REMOVED;
+        return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
     }
     ExAcquireFastMutex(&stream->HeaderMutex);
     current_file_size = stream->Header.FileSize.QuadPart;
@@ -1432,9 +1467,9 @@ ext4win_stream_cache_mdl(
     status = ext4win_prepare_mdl_completion_worker(stream, file_object);
     if (!NT_SUCCESS(status)) { return status; }
     (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
-    if (!ext4win_stream_storage_available(stream)) {
+    if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
-        return STATUS_DEVICE_REMOVED;
+        return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
     }
     ExAcquireFastMutex(&stream->HeaderMutex);
     eof = stream->Header.FileSize.QuadPart;
@@ -1521,6 +1556,29 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
     }
     ext4win_release_resource(&stream->MainResource);
     ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHE_FLUSH, status);
+    return status;
+}
+
+/* Native close flush preserves active FILE_OBJECT cache maps. A remaining mapped view or
+ * pinned page prevents clean-close publication; cleanup may still release that residency. */
+_IRQL_requires_(PASSIVE_LEVEL)
+_Must_inspect_result_
+NTSTATUS NTAPI
+ext4win_stream_cache_close_writeback(_In_ PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status = STATUS_SUCCESS;
+    if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
+    if (!ext4win_stream_storage_available(stream)) { return STATUS_DEVICE_REMOVED; }
+    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+    __try {
+        if (!ext4win_stream_storage_available(stream)) { status = STATUS_DEVICE_REMOVED; }
+        else {
+            status = ext4win_cache_close_writeback(&stream->SectionObjects);
+        }
+    }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { status = GetExceptionCode(); }
+    ext4win_release_resource(&stream->MainResource);
     return status;
 }
 
@@ -2448,28 +2506,35 @@ ext4win_fast_io_unlock_all_by_key(
     return TRUE;
 }
 
-static VOID
-NTAPI
-ext4win_acquire_file_for_section(_In_ PFILE_OBJECT file_object)
+/* Section creation is a fallible authority boundary. SyncTypeOther is a resource-only
+ * acquisition used by Cc/MM and must remain available while terminal writeback drains. */
+static NTSTATUS NTAPI
+ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_ PVOID *context)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
-
-    if (ext4win_stream_section_callback_stream(file_object, &stream)) {
-        ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION);
-        (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
-        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_SECTION, STATUS_SUCCESS);
+    *context = NULL;
+    if (!ext4win_stream_section_callback_stream(data->FileObject, &stream)) {
+        return STATUS_SUCCESS;
     }
+    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+    if ((data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection)
+        && !ext4win_stream_ordinary_io_available(stream)) {
+        ext4win_release_resource(&stream->MainResource);
+        return STATUS_FILE_LOCK_CONFLICT;
+    }
+    return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
-static VOID
-NTAPI
-ext4win_release_file_for_section(_In_ PFILE_OBJECT file_object)
+static NTSTATUS NTAPI
+ext4win_pre_release_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_ PVOID *context)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
-
-    if (ext4win_stream_section_callback_stream(file_object, &stream)) {
-        ext4win_release_resource(&stream->MainResource);
+    *context = NULL;
+    if (!ext4win_stream_section_callback_stream(data->FileObject, &stream)) {
+        return STATUS_SUCCESS;
     }
+    ext4win_release_resource(&stream->MainResource);
+    return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
 _Success_(return != FALSE)
@@ -2657,16 +2722,13 @@ ext4win_mdl_write_complete(
 
 static NTSTATUS
 NTAPI
-ext4win_acquire_for_mod_write(
-    _In_ PFILE_OBJECT file_object,
-    _In_ PLARGE_INTEGER ending_offset,
-    _Outptr_ PERESOURCE *resource_to_release,
-    _In_ PDEVICE_OBJECT device_object)
+ext4win_pre_acquire_mod_write(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_ PVOID *context)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
 
-    UNREFERENCED_PARAMETER(ending_offset);
-    UNREFERENCED_PARAMETER(device_object);
+    PFILE_OBJECT file_object = data->FileObject;
+    PERESOURCE *resource_to_release = data->Parameters.AcquireForModifiedPageWriter.ResourceToRelease;
+    *context = NULL;
     if ((resource_to_release == NULL) ||
         !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
@@ -2678,59 +2740,72 @@ ext4win_acquire_for_mod_write(
     }
     *resource_to_release = &stream->PagingIoResource;
     ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_SUCCESS);
-    return STATUS_SUCCESS;
+    return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
 static NTSTATUS
 NTAPI
-ext4win_release_for_mod_write(
-    _In_ PFILE_OBJECT file_object,
-    _In_ PERESOURCE resource_to_release,
-    _In_ PDEVICE_OBJECT device_object)
+ext4win_pre_release_mod_write(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_ PVOID *context)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
 
-    UNREFERENCED_PARAMETER(device_object);
+    PFILE_OBJECT file_object = data->FileObject;
+    PERESOURCE resource_to_release = data->Parameters.ReleaseForModifiedPageWriter.ResourceToRelease;
+    *context = NULL;
     if ((resource_to_release == NULL) || (file_object == NULL) ||
         ((stream = ext4win_stream_from_header(file_object->FsContext)) == NULL) ||
         (resource_to_release != &stream->PagingIoResource)) {
         return STATUS_INVALID_PARAMETER;
     }
     ext4win_release_resource(resource_to_release);
-    return STATUS_SUCCESS;
+    return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
 static NTSTATUS
 NTAPI
-ext4win_acquire_for_cc_flush(
-    _In_ PFILE_OBJECT file_object,
-    _In_ PDEVICE_OBJECT device_object)
+ext4win_pre_acquire_cc_flush(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_ PVOID *context)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
 
-    UNREFERENCED_PARAMETER(device_object);
+    PFILE_OBJECT file_object = data->FileObject;
+    *context = NULL;
     if (!ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
     }
     ext4win_stream_acquire_main_after_sealed_section_mutation(stream);
-    return STATUS_SUCCESS;
+    return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
 static NTSTATUS
 NTAPI
-ext4win_release_for_cc_flush(
-    _In_ PFILE_OBJECT file_object,
-    _In_ PDEVICE_OBJECT device_object)
+ext4win_pre_release_cc_flush(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_ PVOID *context)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
 
-    UNREFERENCED_PARAMETER(device_object);
+    PFILE_OBJECT file_object = data->FileObject;
+    *context = NULL;
     if ((file_object == NULL) ||
         ((stream = ext4win_stream_from_header(file_object->FsContext)) == NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
     ext4win_release_resource(&stream->MainResource);
-    return STATUS_SUCCESS;
+    return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
+}
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS NTAPI
+ext4win_register_section_callbacks(_In_ PDRIVER_OBJECT driver)
+{
+    FS_FILTER_CALLBACKS callbacks;
+    RtlZeroMemory(&callbacks, sizeof(callbacks));
+    callbacks.SizeOfFsFilterCallbacks = sizeof(callbacks);
+    callbacks.PreAcquireForSectionSynchronization = ext4win_pre_acquire_section;
+    callbacks.PreReleaseForSectionSynchronization = ext4win_pre_release_section;
+    callbacks.PreAcquireForModifiedPageWriter = ext4win_pre_acquire_mod_write;
+    callbacks.PreReleaseForModifiedPageWriter = ext4win_pre_release_mod_write;
+    callbacks.PreAcquireForCcFlush = ext4win_pre_acquire_cc_flush;
+    callbacks.PreReleaseForCcFlush = ext4win_pre_release_cc_flush;
+    return FsRtlRegisterFileSystemFilterCallbacks(driver, &callbacks);
 }
 
 static FAST_IO_DISPATCH ext4win_fast_io_dispatch_table = {
@@ -2745,11 +2820,11 @@ static FAST_IO_DISPATCH ext4win_fast_io_dispatch_table = {
     ext4win_fast_io_unlock_all,
     ext4win_fast_io_unlock_all_by_key,
     NULL,
-    ext4win_acquire_file_for_section,
-    ext4win_release_file_for_section,
+    NULL,
+    NULL,
     NULL,
     ext4win_fast_io_query_network_open_info,
-    ext4win_acquire_for_mod_write,
+    NULL,
     ext4win_mdl_read,
     ext4win_mdl_read_complete,
     ext4win_prepare_mdl_write,
@@ -2759,9 +2834,9 @@ static FAST_IO_DISPATCH ext4win_fast_io_dispatch_table = {
     NULL,
     NULL,
     NULL,
-    ext4win_release_for_mod_write,
-    ext4win_acquire_for_cc_flush,
-    ext4win_release_for_cc_flush
+    NULL,
+    NULL,
+    NULL
 };
 
 _IRQL_requires_max_(DISPATCH_LEVEL)

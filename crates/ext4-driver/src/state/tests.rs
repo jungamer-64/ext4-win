@@ -351,6 +351,46 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
 }
 
 /// # Panics
+/// Panics if failed close resurrects admission or prevents unreferenced physical retirement.
+#[test]
+fn failed_volume_close_remains_terminal_and_retires_after_last_reference() {
+    for terminal in [CleanCloseTerminal::Dismount, CleanCloseTerminal::Shutdown] {
+        let closing = MountedVolumeState::Closing {
+            terminal,
+            lock_owner: None,
+        };
+        let failed = closing.fail_close(terminal, DriverError::InsufficientResources);
+        let expected = MountedVolumeState::CloseFailed {
+            terminal,
+            lock_owner: None,
+            error: DriverError::InsufficientResources,
+        };
+        assert_eq!(failed, Some(expected));
+        assert_eq!(
+            expected.ensure_mounted(),
+            Err(DriverError::VolumeDismounted)
+        );
+        assert_eq!(
+            expected.authorize_create(),
+            Err(DriverError::VolumeDismounted)
+        );
+        assert_eq!(expected.finish_close(terminal), None);
+        assert_eq!(
+            expected.retire_if_unreferenced(false, 0),
+            (expected, VolumeRetirement::Retained)
+        );
+        assert_eq!(
+            expected.retire_if_unreferenced(true, 1),
+            (expected, VolumeRetirement::Retained)
+        );
+        assert_eq!(
+            expected.retire_if_unreferenced(true, 0),
+            (MountedVolumeState::Retiring, VolumeRetirement::Start)
+        );
+    }
+}
+
+/// # Panics
 ///
 /// Panics when physical retirement starts before every FILE_OBJECT is gone.
 #[test]

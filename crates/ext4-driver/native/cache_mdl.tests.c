@@ -69,6 +69,26 @@ static void CcMdlWriteAbort(PFILE_OBJECT file, PMDL chain)
 
 #include "cache_mdl.h"
 
+#define STATUS_CACHE_PAGE_LOCKED 1
+#define STATUS_USER_MAPPED_FILE (-4)
+typedef struct { unsigned dirty; unsigned mapped; } SECTION_OBJECT_POINTERS, *PSECTION_OBJECT_POINTERS;
+static NTSTATUS flush_status;
+static unsigned flush_calls;
+static void CcCoherencyFlushAndPurgeCache(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *offset,
+    ULONG length, IO_STATUS_BLOCK *status, ULONG flags)
+{
+    assert(offset == NULL && length == 0 && flags == 0);
+    flush_calls++;
+    status->Status = flush_status;
+    if (flush_status == STATUS_SUCCESS) { sections->dirty = 0; }
+}
+static int MmCanFileBeTruncated(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *size)
+{
+    assert(size->QuadPart == 0);
+    return !sections->mapped;
+}
+#include "cache_close.h"
+
 int main(void)
 {
     FILE_OBJECT file;
@@ -119,5 +139,20 @@ int main(void)
     offset.QuadPart = -1;
     assert(ext4win_cache_mdl_transfer(&file, &irp, 0, offset, 1, 100, &information) == STATUS_INVALID_PARAMETER);
     assert(reads == 3 && prepares == 4 && irp.MdlAddress == NULL);
+    {
+        SECTION_OBJECT_POINTERS sections = {1, 0};
+        flush_status = STATUS_SUCCESS;
+        assert(ext4win_cache_close_writeback(&sections) == STATUS_SUCCESS);
+        assert(flush_calls == 1 && sections.dirty == 0);
+        sections.dirty = 1;
+        sections.mapped = 1;
+        assert(ext4win_cache_close_writeback(&sections) == STATUS_USER_MAPPED_FILE);
+        assert(sections.dirty == 0);
+        sections.mapped = 0;
+        flush_status = STATUS_CACHE_PAGE_LOCKED;
+        assert(ext4win_cache_close_writeback(&sections) == STATUS_USER_MAPPED_FILE);
+        flush_status = STATUS_UNSUCCESSFUL;
+        assert(ext4win_cache_close_writeback(&sections) == STATUS_UNSUCCESSFUL);
+    }
     return 0;
 }

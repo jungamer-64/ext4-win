@@ -9,13 +9,36 @@ typedef struct _EXT4WIN_STORAGE_ADMISSION {
     volatile LONG RemovalState;
     /* 0 admits creates, 1 owns preparation, 2 awaits cancel or removal. */
     volatile LONG QueryRemoveState;
+    /* 0 admits ordinary I/O, 1 admits only writeback, 2 seals filesystem I/O.
+     * Lower submissions remain available for the owner's final journal/device flush. */
+    volatile LONG CloseState;
 } EXT4WIN_STORAGE_ADMISSION, *PEXT4WIN_STORAGE_ADMISSION;
 
 static BOOLEAN
 ext4win_storage_create_admitted(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
 {
     return (InterlockedCompareExchange(&storage->RemovalState, 0, 0) == 0)
-        && (InterlockedCompareExchange(&storage->QueryRemoveState, 0, 0) == 0);
+        && (InterlockedCompareExchange(&storage->QueryRemoveState, 0, 0) == 0)
+        && (InterlockedCompareExchange(&storage->CloseState, 0, 0) == 0);
+}
+
+static LONG
+ext4win_storage_close_state(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    return InterlockedCompareExchange(&storage->CloseState, 0, 0);
+}
+
+static BOOLEAN
+ext4win_storage_begin_close(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    return (InterlockedCompareExchange(&storage->RemovalState, 0, 0) == 0)
+        && (InterlockedCompareExchange(&storage->CloseState, 1, 0) == 0);
+}
+
+static VOID
+ext4win_storage_seal_close(_Inout_ PEXT4WIN_STORAGE_ADMISSION storage)
+{
+    InterlockedExchange(&storage->CloseState, 2);
 }
 
 static BOOLEAN

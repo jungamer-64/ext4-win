@@ -234,6 +234,9 @@ pub(crate) struct StreamContext {
     /// Host equivalent of the volume's monotonic native removal state.
     #[cfg(test)]
     storage_removal: AtomicU8,
+    /// Host equivalent of ordinary/writeback/sealed filesystem admission.
+    #[cfg(test)]
+    close_state: AtomicU8,
     /// Host equivalent of the independent reversible PnP create gate.
     #[cfg(test)]
     query_removal: AtomicU8,
@@ -258,6 +261,9 @@ pub(crate) struct VolumeStorageAccess {
     /// Host query gate shares the retained volume lifetime with `address`.
     #[cfg(test)]
     query_address: NonNull<AtomicU8>,
+    /// Host filesystem close authority retained by the same volume.
+    #[cfg(test)]
+    close_address: NonNull<AtomicU8>,
 }
 
 /// PnP dispatch may revoke storage; observers and submission owners cannot publish removal.
@@ -418,6 +424,82 @@ impl StorageRemovalPublisher {
 }
 
 impl VolumeStorageAccess {
+    /// Starts one-way writeback admission while the actor owns the close transition.
+    /// # Errors
+    /// Returns removal or repeated terminal-close rejection.
+    #[expect(
+        unsafe_code,
+        reason = "retained volume storage owns the native/host atomic admission"
+    )]
+    pub(crate) fn begin_close_writeback(self) -> DriverResult<()> {
+        self.authorize()?;
+        #[cfg(not(test))]
+        let admitted = unsafe {
+            // SAFETY: Actor retention pins this native volume header through the atomic transition.
+            ext4win_stream_begin_close(self.address.as_ptr()) != 0
+        };
+        #[cfg(test)]
+        let admitted = unsafe {
+            // SAFETY: The retained host volume supplies this atomic identity.
+            self.close_address.as_ref()
+        }
+        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok();
+        if admitted {
+            Ok(())
+        } else {
+            Err(DriverError::VolumeDismounted)
+        }
+    }
+
+    /// Stops new paging admission. Lower closing I/O keeps its separate media capability.
+    #[expect(
+        unsafe_code,
+        reason = "actor retention covers native and host close publication"
+    )]
+    pub(crate) fn seal_close_writeback(self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Actor retention pins this volume until its closing operations finish.
+            ext4win_stream_seal_close(self.address.as_ptr());
+        }
+        #[cfg(test)]
+        unsafe {
+            // SAFETY: The retained host volume supplies this atomic identity.
+            self.close_address.as_ref().store(2, Ordering::Release);
+        }
+    }
+
+    /// Paging remains admitted through cache writeback, then is irreversibly sealed.
+    /// # Errors
+    /// Returns removal or filesystem-close rejection without granting a paging lease.
+    pub(crate) fn authorize_paging(self) -> DriverResult<()> {
+        self.authorize()?;
+        if self.close_state() < 2 {
+            Ok(())
+        } else {
+            Err(DriverError::VolumeDismounted)
+        }
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the retained native/host close atomic shares the volume lifetime"
+    )]
+    /// Observes the native admission phase independently of lower-storage availability.
+    fn close_state(self) -> u8 {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Retention of this volume spans the atomic native observation.
+            ext4win_stream_close_state(self.address.as_ptr())
+        }
+        #[cfg(test)]
+        unsafe {
+            // SAFETY: The retained host volume owns this stable atomic.
+            self.close_address.as_ref().load(Ordering::Acquire)
+        }
+    }
+
     /// Requires both media presence and an open reversible PnP create gate.
     /// # Errors
     /// Returns device removed after revocation, or access denied during query removal.
@@ -436,7 +518,7 @@ impl VolumeStorageAccess {
             ext4win_stream_create_admitted(self.address.as_ptr()) != 0
         };
         #[cfg(test)]
-        let admitted = self.query_state().load(Ordering::Acquire) == 0;
+        let admitted = self.query_state().load(Ordering::Acquire) == 0 && self.close_state() == 0;
         if admitted {
             Ok(())
         } else {
@@ -669,6 +751,7 @@ impl StreamContext {
                 metadata: Mutex::new(metadata),
                 delete_pending: AtomicBool::new(false),
                 storage_removal: AtomicU8::new(0),
+                close_state: AtomicU8::new(0),
                 query_removal: AtomicU8::new(0),
             })
         }
@@ -742,6 +825,8 @@ impl StreamContext {
             address,
             #[cfg(test)]
             query_address: NonNull::from(&self.query_removal),
+            #[cfg(test)]
+            close_address: NonNull::from(&self.close_state),
         })
     }
 
@@ -1270,6 +1355,24 @@ impl StreamContext {
         }
     }
 
+    /// Flushes terminal cached data under exclusive stream ownership without closing handles.
+    /// # Errors
+    /// Returns native writeback failure or mapped/pinned-page conflict.
+    pub(crate) fn close_cache_writeback(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The owning stream lease retains this shared native section set.
+                ext4win_stream_cache_close_writeback(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
+    }
+
     /// Flushes and purges cached data before a coherent direct mutation or size change.
     /// # Errors
     ///
@@ -1568,7 +1671,16 @@ impl StreamContext {
     unsafe_code,
     reason = "the native image-lifetime dispatch table crosses one audited pointer ABI boundary"
 )]
-pub(crate) fn fast_io_dispatch() -> DriverResult<NonNull<wdk_sys::FAST_IO_DISPATCH>> {
+pub(crate) fn fast_io_dispatch(
+    driver: &mut wdk_sys::DRIVER_OBJECT,
+) -> DriverResult<NonNull<wdk_sys::FAST_IO_DISPATCH>> {
+    let status = unsafe {
+        // SAFETY: DriverEntry exclusively owns this live driver before publishing any device.
+        ext4win_register_section_callbacks(core::ptr::from_mut(driver))
+    };
+    if status < STATUS_SUCCESS {
+        return Err(DriverError::CacheManagerFailure(status));
+    }
     let pointer = unsafe {
         // SAFETY: Native code returns the address of one image-lifetime static dispatch table.
         ext4win_fast_io_dispatch()
@@ -1684,6 +1796,10 @@ unsafe extern "system" {
         owner: wdk_sys::PVOID,
         control_device: wdk_sys::PDEVICE_OBJECT,
     ) -> NTSTATUS;
+    fn ext4win_stream_begin_close(volume_header: *mut c_void) -> u8;
+    fn ext4win_stream_seal_close(volume_header: *mut c_void);
+    fn ext4win_stream_close_state(volume_header: *mut c_void) -> u8;
+    fn ext4win_stream_cache_close_writeback(stream_header: *mut c_void) -> NTSTATUS;
     fn ext4win_stream_remove_storage(volume_header: wdk_sys::PVOID, final_remove: u8);
     fn ext4win_stream_storage_removal_state(volume_header: wdk_sys::PVOID) -> u8;
     fn ext4win_stream_create_admitted(volume_header: wdk_sys::PVOID) -> u8;
@@ -1810,6 +1926,7 @@ unsafe extern "system" {
     ) -> NTSTATUS;
 
     fn ext4win_stream_destroy(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+    fn ext4win_register_section_callbacks(driver: wdk_sys::PDRIVER_OBJECT) -> NTSTATUS;
     fn ext4win_fast_io_dispatch() -> *mut wdk_sys::FAST_IO_DISPATCH;
 }
 
@@ -1819,6 +1936,42 @@ mod tests {
 
     use super::{NativeStreamMetadata, OperationalTrace, Ordering, StreamContext, StreamSizes};
     use crate::kernel::status::{DriverError, DriverResult};
+
+    /// # Errors
+    /// Returns fixture allocation or unexpected close admission failure.
+    /// # Panics
+    /// Panics if sealing permits paging or also revokes the closing owner's lower I/O.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the local volume fixture retains its atomic admission identities"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture setup precedes semantic admission assertions"
+    )]
+    fn close_admission_drains_paging_before_sealing() -> DriverResult<()> {
+        let volume =
+            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let storage = unsafe {
+            // SAFETY: This fixture remains live and unmoved until all captured access ends.
+            volume.storage_access()
+        }?;
+        storage.begin_close_writeback()?;
+        assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
+        assert_eq!(storage.authorize_paging(), Ok(()));
+        storage.seal_close_writeback();
+        assert_eq!(
+            storage.authorize_paging(),
+            Err(DriverError::VolumeDismounted)
+        );
+        assert_eq!(storage.authorize(), Ok(()));
+        assert_eq!(
+            storage.begin_close_writeback(),
+            Err(DriverError::VolumeDismounted)
+        );
+        Ok(())
+    }
 
     /// # Errors
     /// Returns stream allocation or query preparation failure.

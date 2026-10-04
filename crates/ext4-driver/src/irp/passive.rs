@@ -81,6 +81,11 @@ pub(crate) enum PassiveWork {
         /// Stream retained through flush completion.
         stream: StreamCacheLease,
     },
+    /// Terminal cache writeback after ordinary admission closes.
+    CloseWriteback {
+        /// Stream retained until the native writeback call returns.
+        stream: StreamCacheLease,
+    },
     /// Flush and purge one stream before direct or size-changing I/O.
     Purge {
         /// Stream retained through the coherency boundary.
@@ -126,6 +131,8 @@ pub(crate) enum PassiveWorkCompletion {
     Write(DriverResult<()>),
     /// Dirty-page flush status.
     Flush(DriverResult<()>),
+    /// Terminal writeback status, including pinned/mapped-page conflicts.
+    CloseWriteback(DriverResult<()>),
     /// Coherency flush/purge status.
     Purge(DriverResult<()>),
     /// Volume-lock cache and section drain status.
@@ -249,6 +256,9 @@ impl PassiveWork {
                 length,
             } => PassiveWorkCompletion::Write(file_object.write(offset, input, length)),
             Self::Flush { stream } => PassiveWorkCompletion::Flush(stream.flush()),
+            Self::CloseWriteback { stream } => {
+                PassiveWorkCompletion::CloseWriteback(stream.close_writeback())
+            }
             Self::Purge { stream } => PassiveWorkCompletion::Purge(stream.purge()),
             Self::DrainForVolumeLock { stream } => {
                 PassiveWorkCompletion::DrainForVolumeLock(stream.execute())
@@ -276,6 +286,7 @@ impl PassiveWork {
             Self::Read { .. } => PassiveWorkCompletion::Read(Err(error)),
             Self::Write { .. } => PassiveWorkCompletion::Write(Err(error)),
             Self::Flush { .. } => PassiveWorkCompletion::Flush(Err(error)),
+            Self::CloseWriteback { .. } => PassiveWorkCompletion::CloseWriteback(Err(error)),
             Self::Purge { .. } => PassiveWorkCompletion::Purge(Err(error)),
             Self::DrainForVolumeLock { .. } => {
                 PassiveWorkCompletion::DrainForVolumeLock(Err(error))

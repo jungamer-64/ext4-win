@@ -4505,6 +4505,7 @@ mod tests {
                     }
                     crate::irp::PassiveWorkCompletion::Write(result)
                     | crate::irp::PassiveWorkCompletion::Flush(result)
+                    | crate::irp::PassiveWorkCompletion::CloseWriteback(result)
                     | crate::irp::PassiveWorkCompletion::Purge(result)
                     | crate::irp::PassiveWorkCompletion::Uninitialize(result) => {
                         let _result = result;

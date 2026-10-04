@@ -147,6 +147,10 @@ int main(void)
         storage.Submissions.held = 0;
         storage.RemovalState = 0;
         storage.QueryRemoveState = 0;
+        storage.CloseState = 0;
+        storage.Submissions.held = 0;
+        storage.RemovalState = 0;
+        storage.QueryRemoveState = 0;
         assert(ext4win_storage_create_admitted(&storage));
         ext4win_storage_cancel_query_remove(&storage);
         assert(ext4win_storage_prepare_query_remove(&storage));
@@ -215,6 +219,10 @@ int main(void)
     }
     {
         EXT4WIN_STORAGE_ADMISSION storage;
+        storage.Submissions.held = 0;
+        storage.RemovalState = 0;
+        storage.QueryRemoveState = 0;
+        storage.CloseState = 0;
         DEVICE_OBJECT lower;
         IRP irp;
         storage.Submissions.held = 0;
@@ -239,6 +247,29 @@ int main(void)
         assert(ext4win_pnp_cancel_remove(&storage, &lower, &irp) == STATUS_SUCCESS);
         assert(!ext4win_storage_create_admitted(&storage));
         assert(storage.RemovalState == 1);
+    }
+    {
+        EXT4WIN_STORAGE_ADMISSION storage;
+        storage.Submissions.held = 0;
+        storage.RemovalState = 0;
+        storage.QueryRemoveState = 0;
+        storage.CloseState = 0;
+        assert(ext4win_storage_close_state(&storage) == 0);
+        assert(ext4win_storage_begin_close(&storage));
+        assert(!ext4win_storage_create_admitted(&storage));
+        assert(ext4win_storage_close_state(&storage) == 1);
+        assert(!ext4win_storage_begin_close(&storage));
+        expected_wait = FALSE;
+        assert(ext4win_storage_begin_submission(&storage));
+        ext4win_storage_end_submission(&storage);
+        ext4win_storage_seal_close(&storage);
+        assert(ext4win_storage_close_state(&storage) == 2);
+        ext4win_storage_cancel_query_remove(&storage);
+        assert(!ext4win_storage_create_admitted(&storage));
+        assert(ext4win_storage_begin_submission(&storage));
+        ext4win_storage_end_submission(&storage);
+        storage.RemovalState = 1;
+        assert(!ext4win_storage_begin_submission(&storage));
     }
     return 0;
 }

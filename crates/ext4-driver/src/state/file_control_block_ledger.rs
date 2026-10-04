@@ -2,6 +2,15 @@
 
 use super::*;
 
+/// Admission condition for the retained-stream snapshot.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum StreamCacheSnapshotPurpose {
+    /// Exclusive lock requires all user handles to have cleaned up.
+    VolumeLock,
+    /// Terminal close writes back caches while handles remain open.
+    CloseWriteback,
+}
+
 /// VCB-owned FCB table and share accounting protected by one concrete executive resource.
 pub(super) struct FileControlBlockLedger {
     /// Mutable ledger state reachable only while `lock` is held.
@@ -549,6 +558,13 @@ impl StreamCacheLease {
     /// Returns the exact Cache Manager flush status.
     pub(crate) fn flush(&self) -> DriverResult<()> {
         self.stream().stream_context.flush_cache()
+    }
+
+    /// Writes back a retained stream during terminal close.
+    /// # Errors
+    /// Returns a native writeback or mapped-section conflict.
+    pub(crate) fn close_writeback(&self) -> DriverResult<()> {
+        self.stream().stream_context.close_cache_writeback()
     }
 
     /// Flushes and purges the shared cache before direct or size-changing I/O.
@@ -1464,11 +1480,32 @@ impl FileControlBlockLedger {
     ///
     /// Returns access denied while any namespace handle remains active, or the exact allocation
     /// or finite deferred-lease failure before any Cache Manager work is submitted.
+    pub(super) fn prepare_volume_lock_cache_drain(&self) -> DriverResult<PreparedStreamCacheDrain> {
+        self.prepare_stream_cache_snapshot(StreamCacheSnapshotPurpose::VolumeLock)
+    }
+
+    /// Retains every resident stream, including active handles, for terminal writeback.
+    /// # Errors
+    /// Returns snapshot allocation or deferred-lease capacity failure.
+    pub(super) fn prepare_close_cache_writeback(
+        &self,
+    ) -> DriverResult<DriverVec<StreamCacheLease>> {
+        self.prepare_stream_cache_snapshot(StreamCacheSnapshotPurpose::CloseWriteback)
+            .map(|snapshot| snapshot.remaining)
+    }
+
     #[expect(
         unsafe_code,
-        reason = "two ledger passes separate allocation from validated lease acquisition"
+        reason = "the ledger resource serializes snapshot observation and stream retention"
     )]
-    pub(super) fn prepare_volume_lock_cache_drain(&self) -> DriverResult<PreparedStreamCacheDrain> {
+    /// Allocates before taking the ledger resource, then revalidates and retains every stream.
+    /// Native cache operations run only after this resource has been released.
+    /// # Errors
+    /// Returns allocation or lease-capacity failure, or changed membership/admission conditions.
+    fn prepare_stream_cache_snapshot(
+        &self,
+        purpose: StreamCacheSnapshotPurpose,
+    ) -> DriverResult<PreparedStreamCacheDrain> {
         let stream_count = {
             let _guard = self.lock.acquire();
             let table = unsafe {
@@ -1480,7 +1517,7 @@ impl FileControlBlockLedger {
                     // SAFETY: The table owns each FCB and the resource remains held.
                     &*fcb.open_state.get()
                 };
-                if state.has_active_handle() {
+                if purpose == StreamCacheSnapshotPurpose::VolumeLock && state.has_active_handle() {
                     return Err(DriverError::AccessDenied);
                 }
             }
@@ -1504,7 +1541,9 @@ impl FileControlBlockLedger {
                         // SAFETY: This table owns the FCB while the resource is held.
                         &mut *fcb.open_state.get()
                     };
-                    if state.has_active_handle() {
+                    if purpose == StreamCacheSnapshotPurpose::VolumeLock
+                        && state.has_active_handle()
+                    {
                         result = Err(DriverError::AccessDenied);
                         break;
                     }

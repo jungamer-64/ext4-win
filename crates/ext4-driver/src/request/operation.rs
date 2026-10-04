@@ -83,6 +83,8 @@ mod mdl;
 pub(crate) use mdl::mdl;
 mod cleanup;
 pub(crate) use cleanup::cleanup;
+mod volume_close;
+pub(crate) use volume_close::{VolumeCloseRequest, volume_close};
 mod pnp;
 pub(crate) use pnp::query_remove;
 
@@ -2073,8 +2075,6 @@ pub(crate) enum VolumeControlRequestKind {
     Lock,
     /// Releases a lock already owned by this direct-volume handle.
     Unlock,
-    /// Flushes a clean journal before terminal logical dismount publication.
-    Dismount,
     /// Observes whether the volume remains logically mounted.
     IsMounted,
     /// Expands only this handle's raw extent bound to the complete lower partition.
@@ -2120,17 +2120,6 @@ enum VolumeControlOperationState {
         transition: PreparedVolumeStateTransition,
         /// Exact lower completion identity.
         expected: StorageRequestIdentity,
-    },
-    /// One-way dismount close is preparing or executing its durability sequence.
-    CleanClosing {
-        /// Unique top-level completion authority.
-        owned: OwnedIrp,
-        /// Stable direct-volume identities.
-        target: crate::request::file_system_control::DirectVolumeTarget,
-        /// Terminal publication retained until durable marker clearance.
-        transition: PreparedVolumeStateTransition,
-        /// Suspended core clean-close operation.
-        close: Box<CleanCloseOperation>,
     },
     /// Terminal completion consumed the IRP.
     Terminal,
@@ -2186,11 +2175,6 @@ impl VolumeControlOperation {
             VolumeControlRequestKind::Lock => {
                 MountedVolumeDevice::publish_volume_lock(target.device(), true);
             }
-            VolumeControlRequestKind::Dismount => {
-                MountedVolumeDevice::publish_direct_writes_allowed(target.device());
-                MountedVolumeDevice::unregister_shutdown_notification(target.device());
-                MountedVolumeDevice::complete_dismount(target.device());
-            }
             VolumeControlRequestKind::Unlock
             | VolumeControlRequestKind::IsMounted
             | VolumeControlRequestKind::AllowExtendedDasdIo => {
@@ -2209,7 +2193,7 @@ impl VolumeControlOperation {
         error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        access.fail_volume_state_transition(transition);
+        access.fail_volume_state_transition(transition, error);
         Self::complete(owned, Err(error))
     }
 
@@ -2265,53 +2249,6 @@ impl VolumeControlOperation {
     ) -> OperationTransition {
         record_cache_coherency_failure(error, access);
         Self::fail_transition(owned, transition, error, access)
-    }
-
-    /// Allocates the core clean-close operation from immutable mounted geometry.
-    /// # Errors
-    ///
-    /// Returns a driver allocation error if the close state machine cannot be reserved before the
-    /// closing durability sequence begins.
-    fn prepare_clean_close(
-        access: &MountedVolumeAccess<'_>,
-    ) -> DriverResult<Box<CleanCloseOperation>> {
-        let profile = access.mounted_profile();
-        let filesystem_length = profile.filesystem_length();
-        let journal_target = profile.journal_target();
-        memory::boxed_try_with(|| Ok(CleanCloseOperation::new(filesystem_length, journal_target)))
-    }
-
-    /// Drives one uninterruptible dismount durability transition.
-    fn drive_clean_close(
-        mut self: Box<Self>,
-        owned: OwnedIrp,
-        target: crate::request::file_system_control::DirectVolumeTarget,
-        transition: PreparedVolumeStateTransition,
-        result: CleanCloseTransition,
-        access: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
-        match result {
-            CleanCloseTransition::SubmitLower { request, suspended } => {
-                let devices = access.storage_route();
-                self.state = VolumeControlOperationState::CleanClosing {
-                    owned,
-                    target,
-                    transition,
-                    close: suspended,
-                };
-                OperationTransition::SubmitClosingLower {
-                    devices,
-                    request,
-                    suspended: self,
-                }
-            }
-            CleanCloseTransition::Complete(Ok(_durability)) => {
-                Self::publish(self.kind, owned, target, transition, access)
-            }
-            CleanCloseTransition::Complete(Err(error)) => {
-                Self::fail_transition(owned, transition, DriverError::from(error), access)
-            }
-        }
     }
 }
 
@@ -2409,23 +2346,6 @@ impl MountedVolumeOperation for VolumeControlOperation {
                                 owned, target, transition, devices, drain, access,
                             )
                         }
-                        VolumeControlRequestKind::Dismount => {
-                            let transition = match access.prepare_dismount_volume(target.owner()) {
-                                Ok(transition) => transition,
-                                Err(error) => return Self::complete(owned, Err(error)),
-                            };
-                            let devices = access.storage_route();
-                            self.state = VolumeControlOperationState::Waiting {
-                                owned,
-                                target,
-                                transition,
-                                devices,
-                            };
-                            OperationTransition::WaitForClosingDrain {
-                                condition: WaitCondition::JournalClean,
-                                suspended: self,
-                            }
-                        }
                     }
                 }
                 OperationEvent::CancelRequested => {
@@ -2457,31 +2377,20 @@ impl MountedVolumeOperation for VolumeControlOperation {
                             access,
                         );
                     }
-                    if transition.is_clean_close() {
-                        let close = match Self::prepare_clean_close(access) {
-                            Ok(close) => close,
-                            Err(error) => {
-                                return Self::fail_transition(owned, transition, error, access);
-                            }
-                        };
-                        let result = close.advance(OperationEvent::Admitted);
-                        self.drive_clean_close(owned, target, transition, result, access)
-                    } else {
-                        let request = StorageRequest::Flush {
-                            target: ext4_core::StorageTarget::Filesystem,
-                        };
-                        let expected = StorageRequestIdentity::from_request(&request);
-                        self.state = VolumeControlOperationState::Flushing {
-                            owned,
-                            target,
-                            transition,
-                            expected,
-                        };
-                        OperationTransition::SubmitLower {
-                            devices,
-                            request,
-                            suspended: self,
-                        }
+                    let request = StorageRequest::Flush {
+                        target: ext4_core::StorageTarget::Filesystem,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = VolumeControlOperationState::Flushing {
+                        owned,
+                        target,
+                        transition,
+                        expected,
+                    };
+                    OperationTransition::SubmitLower {
+                        devices,
+                        request,
+                        suspended: self,
                     }
                 }
                 OperationEvent::CancelRequested => Self::fail_transition(
@@ -2533,15 +2442,6 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     }
                 }
             }
-            VolumeControlOperationState::CleanClosing {
-                owned,
-                target,
-                transition,
-                close,
-            } => {
-                let result = close.advance(event);
-                self.drive_clean_close(owned, target, transition, result, access)
-            }
             VolumeControlOperationState::CacheDraining {
                 owned, transition, ..
             } => match event {
@@ -2579,8 +2479,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
             return;
         }
         let _target = match &self.state {
-            VolumeControlOperationState::Flushing { target, .. }
-            | VolumeControlOperationState::CleanClosing { target, .. } => *target,
+            VolumeControlOperationState::Flushing { target, .. } => *target,
             VolumeControlOperationState::Ready(_)
             | VolumeControlOperationState::CacheDraining { .. }
             | VolumeControlOperationState::Waiting { .. }
@@ -2597,15 +2496,6 @@ impl MountedVolumeOperation for VolumeControlOperation {
 // SAFETY: Stable VCB/FILE_OBJECT identities remain pinned by the IRP and mounted device; state
 // moves only by value between the sole reactor thread and stable lower envelopes.
 unsafe impl Send for VolumeControlOperation {}
-
-/// Durability barrier semantics selected by the top-level major function.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum FlushRequestKind {
-    /// Ordinary file/volume flush: commit durability plus filesystem device flush.
-    FlushBuffers,
-    /// Shutdown: clean checkpointed journal plus filesystem device flush.
-    Shutdown,
-}
 
 /// Explicit ownership phase of one flush request.
 #[derive(Debug)]
@@ -2637,8 +2527,6 @@ enum FlushOperationState {
     Waiting {
         /// Unique top-level completion authority.
         owned: OwnedIrp,
-        /// Shutdown terminal publication, absent for ordinary flush buffers.
-        transition: Option<PreparedVolumeStateTransition>,
     },
     /// One filesystem flush is owned by a lower completion envelope.
     InFlight {
@@ -2648,15 +2536,6 @@ enum FlushOperationState {
         expected: StorageRequestIdentity,
         /// Mounted journal or terminal raw device whose flush is being observed.
         scope: crate::state::VolumeFlushScope,
-    },
-    /// One-way shutdown close is preparing or executing its durability sequence.
-    CleanClosing {
-        /// Unique top-level completion authority.
-        owned: OwnedIrp,
-        /// Shutdown terminal publication retained until durable marker clearance.
-        transition: PreparedVolumeStateTransition,
-        /// Suspended core clean-close operation.
-        close: Box<CleanCloseOperation>,
     },
     /// Terminal completion consumed the IRP.
     Terminal,
@@ -2675,8 +2554,6 @@ struct PreparedFlushTarget {
 struct FlushRequestOperation {
     /// Mounted lower devices.
     devices: MountedStorageRoute,
-    /// Barrier semantics.
-    kind: FlushRequestKind,
     /// Current consuming state.
     state: FlushOperationState,
 }
@@ -2688,13 +2565,11 @@ impl FlushRequestOperation {
     /// Returns the still-owned IRP when mounted-state lookup or operation allocation fails.
     fn try_new(
         owned: OwnedIrp,
-        kind: FlushRequestKind,
         access: &MountedVolumeAccess<'_>,
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
         let devices = access.storage_route();
         match memory::boxed_try_map(owned, |owned| Self {
             devices,
-            kind,
             state: FlushOperationState::Ready(owned),
         }) {
             Ok(operation) => Ok(operation),
@@ -2715,13 +2590,6 @@ impl FlushRequestOperation {
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<PreparedFlushTarget> {
         owned.request().with_active(|active| {
-            if self.kind == FlushRequestKind::Shutdown {
-                access.authorize_durability()?;
-                return Ok(PreparedFlushTarget {
-                    scope: crate::state::VolumeFlushScope::Filesystem,
-                    oplock: None,
-                });
-            }
             let stack = active.current_stack()?;
             match stack.file_object() {
                 Ok(file_object) => match crate::state::OpenedFileObject::decode(file_object)? {
@@ -2767,9 +2635,6 @@ impl FlushRequestOperation {
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Option<crate::irp::PassiveWork>> {
-        if self.kind == FlushRequestKind::Shutdown {
-            return Ok(None);
-        }
         owned.request().with_active(|active| {
             let file_object = match active.current_stack()?.file_object() {
                 Ok(file_object) => file_object,
@@ -2819,7 +2684,7 @@ impl FlushRequestOperation {
         mut self: Box<Self>,
         owned: OwnedIrp,
         scope: crate::state::VolumeFlushScope,
-        access: &mut MountedVolumeAccess<'_>,
+        _access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         if let crate::state::VolumeFlushScope::RawDevice(_) = scope {
             let request = StorageRequest::Flush {
@@ -2837,62 +2702,10 @@ impl FlushRequestOperation {
                 suspended: self,
             };
         }
-        match self.kind {
-            FlushRequestKind::FlushBuffers => {
-                self.state = FlushOperationState::Waiting {
-                    owned,
-                    transition: None,
-                };
-                OperationTransition::Wait {
-                    condition: WaitCondition::VolumeDurability,
-                    suspended: self,
-                }
-            }
-            FlushRequestKind::Shutdown => {
-                let transition = match access.prepare_shutdown() {
-                    Ok(transition) => transition,
-                    Err(error) => return Self::complete(owned, Err(error)),
-                };
-                self.state = FlushOperationState::Waiting {
-                    owned,
-                    transition: Some(transition),
-                };
-                OperationTransition::WaitForClosingDrain {
-                    condition: WaitCondition::JournalClean,
-                    suspended: self,
-                }
-            }
-        }
-    }
-
-    /// Drives one uninterruptible shutdown durability transition.
-    fn drive_clean_close(
-        mut self: Box<Self>,
-        owned: OwnedIrp,
-        transition: PreparedVolumeStateTransition,
-        result: CleanCloseTransition,
-        access: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
-        match result {
-            CleanCloseTransition::SubmitLower { request, suspended } => {
-                self.state = FlushOperationState::CleanClosing {
-                    owned,
-                    transition,
-                    close: suspended,
-                };
-                OperationTransition::SubmitClosingLower {
-                    devices: self.devices,
-                    request,
-                    suspended: self,
-                }
-            }
-            CleanCloseTransition::Complete(Ok(_durability)) => {
-                let result = access.publish_volume_state_transition(transition);
-                Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
-            }
-            CleanCloseTransition::Complete(Err(error)) => {
-                Self::complete(owned, Err(DriverError::from(error)))
-            }
+        self.state = FlushOperationState::Waiting { owned };
+        OperationTransition::Wait {
+            condition: WaitCondition::VolumeDurability,
+            suspended: self,
         }
     }
 }
@@ -2945,12 +2758,9 @@ impl MountedVolumeOperation for FlushRequestOperation {
             }
             CompletionEvent::VolumeFailed(error) => {
                 let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
-                let FlushOperationState::Waiting { owned, transition } = state else {
+                let FlushOperationState::Waiting { owned } = state else {
                     crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 };
-                if let Some(transition) = transition {
-                    access.fail_volume_state_transition(transition);
-                }
                 return Self::complete(owned, Err(error));
             }
         };
@@ -3022,46 +2832,27 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
-            FlushOperationState::Waiting { owned, transition } => match event {
+            FlushOperationState::Waiting { owned } => match event {
                 OperationEvent::BarrierReleased(permit) => {
-                    let expected_identity = match self.kind {
-                        FlushRequestKind::FlushBuffers => 0,
-                        FlushRequestKind::Shutdown => 1,
-                    };
-                    if permit.into_identity() != expected_identity {
+                    if permit.into_identity() != 0 {
                         return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
                     }
-                    match (self.kind, transition) {
-                        (FlushRequestKind::FlushBuffers, None) => {
-                            let request = StorageRequest::Flush {
-                                target: ext4_core::StorageTarget::Filesystem,
-                            };
-                            let expected = StorageRequestIdentity::from_request(&request);
-                            self.state = FlushOperationState::InFlight {
-                                owned,
-                                expected,
-                                scope: crate::state::VolumeFlushScope::Filesystem,
-                            };
-                            OperationTransition::SubmitLower {
-                                devices: self.devices,
-                                request,
-                                suspended: self,
-                            }
-                        }
-                        (FlushRequestKind::Shutdown, Some(transition)) => {
-                            let close = match VolumeControlOperation::prepare_clean_close(access) {
-                                Ok(close) => close,
-                                Err(error) => return Self::complete(owned, Err(error)),
-                            };
-                            let result = close.advance(OperationEvent::Admitted);
-                            self.drive_clean_close(owned, transition, result, access)
-                        }
-                        (FlushRequestKind::FlushBuffers, Some(_))
-                        | (FlushRequestKind::Shutdown, None) => {
-                            Self::complete(owned, Err(DriverError::InternalInvariantViolation))
-                        }
+                    let request = StorageRequest::Flush {
+                        target: ext4_core::StorageTarget::Filesystem,
+                    };
+                    let expected = StorageRequestIdentity::from_request(&request);
+                    self.state = FlushOperationState::InFlight {
+                        owned,
+                        expected,
+                        scope: crate::state::VolumeFlushScope::Filesystem,
+                    };
+                    OperationTransition::SubmitLower {
+                        devices: self.devices,
+                        request,
+                        suspended: self,
                     }
                 }
+
                 OperationEvent::CancelRequested => {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
@@ -3103,14 +2894,6 @@ impl MountedVolumeOperation for FlushRequestOperation {
                         Self::complete(owned, Err(error))
                     }
                 }
-            }
-            FlushOperationState::CleanClosing {
-                owned,
-                transition,
-                close,
-            } => {
-                let result = close.advance(event);
-                self.drive_clean_close(owned, transition, result, access)
             }
             FlushOperationState::Terminal => OperationTransition::Retired,
         }
@@ -6069,10 +5852,9 @@ pub(crate) fn mutation(
 /// Returns the still-owned IRP when flush admission or operation allocation fails.
 pub(crate) fn flush(
     owned: OwnedIrp,
-    kind: FlushRequestKind,
     access: &MountedVolumeAccess<'_>,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    FlushRequestOperation::try_new(owned, kind, access)
+    FlushRequestOperation::try_new(owned, access)
 }
 
 #[cfg(test)]

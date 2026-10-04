@@ -11,8 +11,7 @@ use crate::{
 };
 
 use super::operation::{
-    AdmitOperationError, FlushRequestKind, ImmediateRequestKind, MutationRequestKind,
-    ReadRequestKind,
+    AdmitOperationError, ImmediateRequestKind, MutationRequestKind, ReadRequestKind,
 };
 use crate::irp::reactor::{
     AdmittedOperation, HandleOperationLane, OperationAdmission, PostCleanupRequest, ReactorTarget,
@@ -78,7 +77,7 @@ impl<'driver> DispatchTable<'driver> {
 pub(crate) fn install(driver: &mut DRIVER_OBJECT) -> Result<(), DispatchInstallError> {
     #[cfg(not(test))]
     {
-        driver.FastIoDispatch = crate::kernel::stream::fast_io_dispatch()
+        driver.FastIoDispatch = crate::kernel::stream::fast_io_dispatch(driver)
             .map_err(|_| DispatchInstallError)?
             .as_ptr();
     }
@@ -673,7 +672,8 @@ pub(crate) fn admit_owned(
         Directory,
         Raw(crate::state::RawVolumeOperationKind),
         Mutation(MutationRequestKind),
-        Flush(FlushRequestKind),
+        Flush,
+        VolumeClose(super::operation::VolumeCloseRequest),
         Immediate(ImmediateRequestKind),
         Notification,
         ByteRangeLock,
@@ -719,11 +719,9 @@ pub(crate) fn admit_owned(
             Admission::Mutation(MutationRequestKind::SetVolumeInformation)
         }
         ActorRequest::Cleanup => Admission::Cleanup,
-        ActorRequest::Captured(PreparedRequest::FlushBuffers) => {
-            Admission::Flush(FlushRequestKind::FlushBuffers)
-        }
+        ActorRequest::Captured(PreparedRequest::FlushBuffers) => Admission::Flush,
         ActorRequest::Captured(PreparedRequest::Shutdown) => {
-            Admission::Flush(FlushRequestKind::Shutdown)
+            Admission::VolumeClose(super::operation::VolumeCloseRequest::Shutdown)
         }
         ActorRequest::Captured(PreparedRequest::QueryRemove) => Admission::QueryRemove,
         ActorRequest::Close => Admission::Immediate(ImmediateRequestKind::Close),
@@ -790,9 +788,9 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::UnlockVolume => {
                         Admission::VolumeControl(super::operation::VolumeControlRequestKind::Unlock)
                     }
-                    crate::irp::FsControlCode::DismountVolume => Admission::VolumeControl(
-                        super::operation::VolumeControlRequestKind::Dismount,
-                    ),
+                    crate::irp::FsControlCode::DismountVolume => {
+                        Admission::VolumeClose(super::operation::VolumeCloseRequest::Dismount)
+                    }
                     crate::irp::FsControlCode::IsVolumeMounted => Admission::VolumeControl(
                         super::operation::VolumeControlRequestKind::IsMounted,
                     ),
@@ -845,8 +843,13 @@ pub(crate) fn admit_owned(
         }
         Admission::Cleanup => HandleRequestClass::Cleanup,
         Admission::Mutation(_) => HandleRequestClass::Ordinary,
-        Admission::Flush(FlushRequestKind::FlushBuffers) => HandleRequestClass::FlushBuffers,
-        Admission::Flush(FlushRequestKind::Shutdown) => HandleRequestClass::Device,
+        Admission::Flush => HandleRequestClass::FlushBuffers,
+        Admission::VolumeClose(super::operation::VolumeCloseRequest::Shutdown) => {
+            HandleRequestClass::Device
+        }
+        Admission::VolumeClose(super::operation::VolumeCloseRequest::Dismount) => {
+            HandleRequestClass::Ordinary
+        }
         Admission::Immediate(ImmediateRequestKind::Close) => HandleRequestClass::Close,
         Admission::Immediate(_)
         | Admission::Notification
@@ -934,58 +937,60 @@ pub(crate) fn admit_owned(
         }
     };
 
-    let operation = match admission {
-        Admission::QueryRemove => {
-            target.with_mounted_access(|_| super::operation::query_remove(owned))
-        }
-        Admission::Cleanup => target.with_mounted_access(|_| super::operation::cleanup(owned)),
-        Admission::Mdl(action) => {
-            target.with_mounted_access(|access| super::operation::mdl(owned, action, access))
-        }
-        Admission::Mount(admission) => {
-            target.require_control_device();
-            super::operation::mount(owned, admission, trace)
-        }
-        Admission::Directory => {
-            target.with_mounted_access(|access| super::operation::query_directory(owned, access))
-        }
-        Admission::Read(kind) => {
-            target.with_mounted_access(|access| super::operation::read(owned, kind, access))
-        }
-        Admission::Raw(kind) => {
-            target.with_mounted_access(|access| super::operation::raw_volume(owned, kind, access))
-        }
-        Admission::Mutation(kind) => {
-            target.with_mounted_access(|access| super::operation::mutation(owned, kind, access))
-        }
-        Admission::Flush(kind) => {
-            target.with_mounted_access(|access| super::operation::flush(owned, kind, access))
-        }
-        Admission::Immediate(kind) => {
-            target.with_mounted_access(|_| super::operation::immediate(owned, kind))
-        }
-        Admission::VolumeQuery => target.with_mounted_access(|_| super::volume_info::query(owned)),
-        Admission::Notification => {
-            target.with_mounted_access(|_| super::operation::notification(owned))
-        }
-        Admission::ByteRangeLock => {
-            target.with_mounted_access(|access| super::operation::byte_range_lock(owned, access))
-        }
-        Admission::OplockControl => {
-            target.with_mounted_access(|_| super::operation::oplock_control(owned))
-        }
-        Admission::VolumeControl(kind) => {
-            target.with_mounted_access(|_| super::operation::volume_control(owned, kind))
-        }
-        Admission::FsControl(_) => Err(AdmitOperationError::new(
-            DriverError::InternalInvariantViolation,
-            owned,
-        )),
-        Admission::Unsupported => Err(AdmitOperationError::new(
-            DriverError::InvalidDeviceRequest,
-            owned,
-        )),
-    }?;
+    let operation =
+        match admission {
+            Admission::QueryRemove => {
+                target.with_mounted_access(|_| super::operation::query_remove(owned))
+            }
+            Admission::Cleanup => target.with_mounted_access(|_| super::operation::cleanup(owned)),
+            Admission::Mdl(action) => {
+                target.with_mounted_access(|access| super::operation::mdl(owned, action, access))
+            }
+            Admission::Mount(admission) => {
+                target.require_control_device();
+                super::operation::mount(owned, admission, trace)
+            }
+            Admission::Directory => target
+                .with_mounted_access(|access| super::operation::query_directory(owned, access)),
+            Admission::Read(kind) => {
+                target.with_mounted_access(|access| super::operation::read(owned, kind, access))
+            }
+            Admission::Raw(kind) => target
+                .with_mounted_access(|access| super::operation::raw_volume(owned, kind, access)),
+            Admission::Mutation(kind) => {
+                target.with_mounted_access(|access| super::operation::mutation(owned, kind, access))
+            }
+            Admission::Flush => {
+                target.with_mounted_access(|access| super::operation::flush(owned, access))
+            }
+            Admission::VolumeClose(kind) => target
+                .with_mounted_access(|access| super::operation::volume_close(owned, kind, access)),
+            Admission::Immediate(kind) => {
+                target.with_mounted_access(|_| super::operation::immediate(owned, kind))
+            }
+            Admission::VolumeQuery => {
+                target.with_mounted_access(|_| super::volume_info::query(owned))
+            }
+            Admission::Notification => {
+                target.with_mounted_access(|_| super::operation::notification(owned))
+            }
+            Admission::ByteRangeLock => target
+                .with_mounted_access(|access| super::operation::byte_range_lock(owned, access)),
+            Admission::OplockControl => {
+                target.with_mounted_access(|_| super::operation::oplock_control(owned))
+            }
+            Admission::VolumeControl(kind) => {
+                target.with_mounted_access(|_| super::operation::volume_control(owned, kind))
+            }
+            Admission::FsControl(_) => Err(AdmitOperationError::new(
+                DriverError::InternalInvariantViolation,
+                owned,
+            )),
+            Admission::Unsupported => Err(AdmitOperationError::new(
+                DriverError::InvalidDeviceRequest,
+                owned,
+            )),
+        }?;
     match lifecycle_publication {
         LifecyclePublication::None => {}
         LifecyclePublication::Cleanup(prepared) => prepared.begin_cleanup(),
