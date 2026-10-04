@@ -1007,6 +1007,35 @@ ext4win_stream_check_oplock(
     return status;
 }
 
+/* Cleanup never waits for an oplock acknowledgment and never transfers IRP ownership.
+ * It must release FsRtl state even when storage admission has been revoked. */
+_IRQL_requires_max_(APC_LEVEL)
+_Must_inspect_result_
+NTSTATUS
+NTAPI
+ext4win_stream_cleanup_oplock(_In_ PVOID stream_header, _Inout_ PIRP irp, _In_ ULONG flags)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    NTSTATUS status;
+    if ((stream == NULL) || (stream->Kind != 1) || (irp == NULL) ||
+        (IoGetCurrentIrpStackLocation(irp)->MajorFunction != IRP_MJ_CLEANUP) ||
+        ((flags != 0) && (flags != OPLOCK_FLAG_CLOSING_DELETE_ON_CLOSE))) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
+    ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
+    __try {
+        status = FsRtlCheckOplockEx(&stream->Header.Oplock, irp, flags, NULL, NULL, NULL);
+    }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { status = GetExceptionCode(); }
+    ext4win_release_resource(&stream->MainResource);
+    ext4win_acquire_resource_exclusive(&stream->MainResource, TRUE);
+    ext4win_stream_refresh_fast_io_projection(stream);
+    ext4win_release_resource(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK, status);
+    return status;
+}
+
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS

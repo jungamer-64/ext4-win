@@ -1025,6 +1025,17 @@ impl StreamContext {
         }
     }
 
+    /// Releases the exact cleanup handle's oplock without client acknowledgment or IRP delegation.
+    /// # Safety
+    /// The passive worker must retain the live cleanup IRP and FILE_OBJECT until synchronous return.
+    #[cfg(not(test))]
+    pub(crate) unsafe fn cleanup_oplock(&self, irp: NonNull<wdk_sys::IRP>, flags: u32) -> NTSTATUS {
+        unsafe {
+            // SAFETY: The caller owns the cleanup IRP and stream; native SEH contains synchronous FsRtl faults.
+            ext4win_stream_cleanup_oplock(self.header.as_ptr(), irp.as_ptr(), flags)
+        }
+    }
+
     /// Reverts one create-time atomic oplock reservation before the create IRP fails.
     ///
     /// # Safety
@@ -1822,6 +1833,11 @@ unsafe extern "system" {
         irp: *mut wdk_sys::IRP,
         open_count: wdk_sys::ULONG,
         flags: wdk_sys::ULONG,
+    ) -> NTSTATUS;
+    fn ext4win_stream_cleanup_oplock(
+        stream_header: *mut c_void,
+        irp: wdk_sys::PIRP,
+        flags: u32,
     ) -> NTSTATUS;
     fn ext4win_stream_check_oplock(
         stream_header: wdk_sys::PVOID,

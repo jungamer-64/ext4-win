@@ -638,6 +638,7 @@ pub(crate) fn admit_owned(
     mut owned: OwnedIrp,
     target: &mut ReactorTarget,
     trace: crate::kernel::operational_trace::OperationalTrace,
+    finalization: &mut crate::irp::FinalizationPool,
 ) -> Result<AdmittedOperation, AdmitOperationError> {
     if !matches!(
         owned.actor_request(),
@@ -666,6 +667,7 @@ pub(crate) fn admit_owned(
     enum Admission {
         QueryRemove,
         Cleanup,
+        Close,
         Mdl(crate::irp::MdlTransfer),
         Mount(super::file_system_control::MountAdmission),
         Read(ReadRequestKind),
@@ -724,7 +726,7 @@ pub(crate) fn admit_owned(
             Admission::VolumeClose(super::operation::VolumeCloseRequest::Shutdown)
         }
         ActorRequest::Captured(PreparedRequest::QueryRemove) => Admission::QueryRemove,
-        ActorRequest::Close => Admission::Immediate(ImmediateRequestKind::Close),
+        ActorRequest::Close => Admission::Close,
         ActorRequest::Captured(PreparedRequest::DirectoryControl(
             PreparedDirectoryControl::NotifyChangeDirectory,
         )) => Admission::Notification,
@@ -850,7 +852,7 @@ pub(crate) fn admit_owned(
         Admission::VolumeClose(super::operation::VolumeCloseRequest::Dismount) => {
             HandleRequestClass::Ordinary
         }
-        Admission::Immediate(ImmediateRequestKind::Close) => HandleRequestClass::Close,
+        Admission::Close => HandleRequestClass::Close,
         Admission::Immediate(_)
         | Admission::Notification
         | Admission::ByteRangeLock
@@ -942,7 +944,12 @@ pub(crate) fn admit_owned(
             Admission::QueryRemove => {
                 target.with_mounted_access(|_| super::operation::query_remove(owned))
             }
-            Admission::Cleanup => target.with_mounted_access(|_| super::operation::cleanup(owned)),
+            Admission::Cleanup => {
+                Ok(finalization.activate(crate::irp::FinalizationRequest::Cleanup, owned))
+            }
+            Admission::Close => {
+                Ok(finalization.activate(crate::irp::FinalizationRequest::Close, owned))
+            }
             Admission::Mdl(action) => {
                 target.with_mounted_access(|access| super::operation::mdl(owned, action, access))
             }

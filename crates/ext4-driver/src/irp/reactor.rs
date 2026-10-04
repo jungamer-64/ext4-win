@@ -41,7 +41,7 @@ pub(crate) use super::scheduler::{
     CLEANUP_HANDLE_BARRIER, CLOSE_HANDLE_BARRIER, HandleOperationLane, IntentRequest,
     MAX_OPERATIONS, PostCleanupRequest, WaitCondition,
 };
-use super::scheduler::{Phase, Scheduler, SlotId};
+use super::scheduler::{ExecutionClass, Phase, Scheduler, SlotId};
 use super::{
     ActiveCancelEnvelope, DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, QueueContext,
     ReceivedIrp, lower::CompletionRundown,
@@ -241,22 +241,18 @@ impl PublishedReactorLower {
     }
 }
 
-/// Synchronous selector borrowed only for one `IoCsqRemoveNextIrp` traversal.
-#[repr(C)]
-struct PendingIrpSelection {
-    /// FILE_OBJECT whose not-yet-started requests are considered.
-    file_object: KernelFileObject,
-    /// Whether paging/internal requests and terminal markers must remain queued.
-    ordinary_cleanup_only: bool,
+/// Selector borrowed only during a locked pending-queue traversal.
+#[derive(Clone, Copy, Debug)]
+enum PendingIrpSelection {
+    /// Cleanup may cancel only eligible ordinary requests on its FILE_OBJECT.
+    Cleanup(KernelFileObject),
+    /// Admit work only from the class whose execution and notification reserves are available.
+    Execution(ExecutionClass),
 }
-
 impl PendingIrpSelection {
-    /// Selects only ordinary requests that CLEANUP is authorized to cancel.
+    /// Selects ordinary requests that Cleanup owns cancellation authority over.
     const fn cleanup(file_object: KernelFileObject) -> Self {
-        Self {
-            file_object,
-            ordinary_cleanup_only: true,
-        }
+        Self::Cleanup(file_object)
     }
 }
 
@@ -288,7 +284,7 @@ impl OperationAdmission {
     }
 }
 
-/// Fallibly allocated operation paired with its allocation-free scheduler admission identity.
+/// Owned continuation paired with its allocation-free scheduler admission identity.
 #[derive(Debug)]
 pub(crate) struct AdmittedOperation {
     /// Consuming operation state machine.
@@ -524,6 +520,20 @@ pub(crate) enum OperationTransition {
     },
     /// Release operation authority before notifying upper drivers of the prepared result.
     Complete(super::lifecycle::PreparedIrpCompletion),
+    /// Releases handle-finalization authority and returns its preallocated continuation.
+    CompleteFinalization {
+        /// Status prepared after all mandatory releases.
+        completion: super::PreparedIrpCompletion,
+        /// Cleared continuation owned by the reactor reserve before slot retirement.
+        reusable: Box<dyn super::FinalizationOperation>,
+    },
+    /// Mandatory releases completed; optional journaled deletion now owns the same request.
+    ContinueAfterFinalization {
+        /// Cleared mandatory-release continuation.
+        reusable: Box<dyn super::FinalizationOperation>,
+        /// Fallibly prepared mutation, with its own commit and recovery authority.
+        next: Box<dyn CompletionOperation>,
+    },
     /// Relinquish the actor slot before submitting the original query-remove IRP on a worker.
     ForwardQueryRemove(super::lifecycle::PreparedPnpForward),
     /// Operation has no remaining IRP authority (delegated or already acknowledged).
@@ -563,28 +573,28 @@ impl ReactorState {
     }
 }
 
-/// One operation-capacity reservation retained until top-level terminal completion.
+/// Pending-queue reservation released when actor admission or cancellation removes the IRP.
 #[derive(Debug)]
 struct OperationReservation {
     /// Stable per-device count.
-    admitted: NonNull<AtomicUsize>,
+    pending: NonNull<AtomicUsize>,
 }
 
 impl OperationReservation {
-    /// Reserves one of the device's fixed operation slots.
+    /// Reserves one request in this independent pending queue budget.
     /// # Errors
     ///
-    /// Returns [`DriverError::InsufficientResources`] when all bounded operation slots are in use.
-    fn acquire(admitted: &AtomicUsize) -> DriverResult<Self> {
-        admitted
+    /// Returns [`DriverError::DeviceBusy`] when this finite pending queue budget is exhausted.
+    fn acquire(pending: &AtomicUsize) -> DriverResult<Self> {
+        pending
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
                     .checked_add(1)
                     .filter(|next| *next <= MAX_OPERATIONS)
             })
-            .map_err(|_| DriverError::InsufficientResources)?;
+            .map_err(|_| DriverError::DeviceBusy)?;
         Ok(Self {
-            admitted: NonNull::from(admitted),
+            pending: NonNull::from(pending),
         })
     }
 
@@ -601,8 +611,8 @@ impl Drop for OperationReservation {
     )]
     fn drop(&mut self) {
         release_operation_reservation(unsafe {
-            // SAFETY: Device teardown waits for the admitted count to reach zero.
-            self.admitted.as_ref()
+            // SAFETY: Device teardown waits for this pending queue count to reach zero.
+            self.pending.as_ref()
         });
     }
 }
@@ -974,8 +984,21 @@ pub(crate) struct CompletionReactor {
     passive_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Completed oplock-wait envelopes kept type-separated from all lower and worker callbacks.
     oplock_completion_head: UnsafeCell<LIST_ENTRY>,
-    /// Pending plus active operation count, bounded by `MAX_OPERATIONS`.
-    admitted: AtomicUsize,
+    /// Ordinary pending queue budget; execution capacity is independently reserved.
+    ordinary_pending: AtomicUsize,
+    /// Paging pending budget cannot be consumed by ordinary callers.
+    paging_pending: AtomicUsize,
+    /// Non-cancellable terminal IRPs retain the native FILE_OBJECT resources they release.
+    terminal_pending: AtomicUsize,
+    /// Allocation-free terminal FIFO, protected by the same native queue lock.
+    terminal_head: UnsafeCell<LIST_ENTRY>,
+    /// Actor-owned terminal statuses awaiting an available outer notification worker.
+    deferred_notification_head: UnsafeCell<LIST_ENTRY>,
+    /// Single actor-owned mandatory-release continuation reserve.
+    finalization: UnsafeCell<super::FinalizationPool>,
+    /// Preallocated private-cache-map work storage for the finalization execution lane.
+    #[cfg(not(test))]
+    finalization_work: UnsafeCell<Option<Box<PassiveWorkEnvelope>>>,
     /// Auto-reset event signaled only when a concrete event is published.
     wake_event: wdk_sys::KEVENT,
     /// Bitset of retry timer events published by DPC callbacks.
@@ -1014,6 +1037,77 @@ pub(crate) struct CompletionReactor {
 }
 
 impl CompletionReactor {
+    /// Defers a never-started queue cancellation so no upper callback runs inside the actor.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the actor uniquely owns the IRP node after context and cancellation release"
+    )]
+    pub(super) fn defer_notification(&self, irp: KernelIrp) {
+        let node = unsafe {
+            // SAFETY: Sole actor ownership retains this status-prepared IRP and its unlinked node.
+            irp_list_entry(irp.as_ptr())
+        }
+        .unwrap_or_else(|| {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+        });
+        unsafe {
+            // SAFETY: The sole actor transfers its unlinked node into its initialized backlog.
+            insert_tail_list(self.deferred_notification_head.get(), node);
+        }
+        self.wake();
+    }
+
+    /// Worker exhaustion delays notification without discarding any completion obligation.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the actor owns the intrusive notification backlog until a worker permit consumes its IRP"
+    )]
+    fn drain_deferred_notifications(&self) -> bool {
+        let mut progressed = false;
+        loop {
+            if unsafe {
+                // SAFETY: The sole actor owns this initialized backlog.
+                list_is_empty(self.deferred_notification_head.get())
+            } {
+                return progressed;
+            }
+            let permit = match self
+                .notifications
+                .reserve(&self.completion_rundown, ExecutionClass::Ordinary)
+            {
+                Ok(permit) => permit,
+                Err(_) => return progressed,
+            };
+            let node = unsafe {
+                // SAFETY: The sole actor owns this nonempty initialized backlog.
+                remove_head_list(self.deferred_notification_head.get())
+            }
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
+            let raw = unsafe {
+                // SAFETY: The removed node belongs to a live status-prepared IRP.
+                irp_from_list_entry(node.as_ptr())
+            };
+            let irp = unsafe {
+                // SAFETY: Backlog removal transferred unique completion ownership of this live IRP.
+                KernelIrp::from_raw(raw)
+            }
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
+            permit.queue(irp, irp.prepared_status());
+            progressed = true;
+        }
+    }
+
+    /// Terminal workers free their reusable slots before invoking potentially reentrant drivers.
+    #[cfg(not(test))]
+    pub(super) fn notification_released(&self) {
+        self.wake();
+    }
     /// Wakes the actor after native storage revocation; the native gate carries the state, so
     /// this notification has no allocation, separate flag authority, or cancellation outcome.
     pub(crate) fn storage_removal_published(&self) {
@@ -1074,9 +1168,68 @@ impl CompletionReactor {
         let reactor_storage = NonNull::new(reactor).ok_or(DriverError::InvalidParameter)?;
         let completion_rundown = CompletionRundown::try_new()?;
         #[cfg(not(test))]
-        let notifications = super::notification::NotificationPool::try_new(device, MAX_OPERATIONS)?;
+        let notifications =
+            super::notification::NotificationPool::try_new(device, reactor_storage)?;
+        let finalization = crate::request::operation::prepare_finalization()?;
+        #[cfg(not(test))]
+        let finalization_work = PassiveWorkEnvelope::prepare_reserve(
+            device,
+            completion_rundown
+                .acquire()?
+                .ok_or(DriverError::InvalidDeviceRequest)?,
+        )?;
         // Complete fallible preparation before moving resource owners into raw fields. Every
         // remaining field constructor is infallible; native setup below is guarded as one value.
+        let destination = unsafe {
+            // SAFETY: This field belongs to exclusive final-address initialization.
+            core::ptr::addr_of_mut!((*reactor).paging_pending)
+        };
+        unsafe {
+            // SAFETY: The projected destination is initialized once before reactor publication.
+            destination.write(AtomicUsize::new(0));
+        };
+        let destination = unsafe {
+            // SAFETY: This field belongs to exclusive final-address initialization.
+            core::ptr::addr_of_mut!((*reactor).terminal_pending)
+        };
+        unsafe {
+            // SAFETY: The projected destination is initialized once before reactor publication.
+            destination.write(AtomicUsize::new(0));
+        };
+        let destination = unsafe {
+            // SAFETY: This field belongs to exclusive final-address initialization.
+            core::ptr::addr_of_mut!((*reactor).deferred_notification_head)
+        };
+        unsafe {
+            // SAFETY: The projected destination is initialized once before reactor publication.
+            destination.write(UnsafeCell::new(LIST_ENTRY::default()));
+        };
+        let destination = unsafe {
+            // SAFETY: This field belongs to exclusive final-address initialization.
+            core::ptr::addr_of_mut!((*reactor).terminal_head)
+        };
+        unsafe {
+            // SAFETY: The projected destination is initialized once before reactor publication.
+            destination.write(UnsafeCell::new(LIST_ENTRY::default()));
+        };
+        let destination = unsafe {
+            // SAFETY: This field belongs to exclusive final-address initialization.
+            core::ptr::addr_of_mut!((*reactor).finalization)
+        };
+        unsafe {
+            // SAFETY: The projected destination is initialized once before reactor publication.
+            destination.write(UnsafeCell::new(finalization));
+        };
+        #[cfg(not(test))]
+        let destination = unsafe {
+            // SAFETY: This field belongs to exclusive final-address initialization.
+            core::ptr::addr_of_mut!((*reactor).finalization_work)
+        };
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The projected destination is initialized once before reactor publication.
+            destination.write(UnsafeCell::new(Some(finalization_work)));
+        };
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
             core::ptr::addr_of_mut!((*reactor).csq)
@@ -1135,7 +1288,7 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
-            core::ptr::addr_of_mut!((*reactor).admitted)
+            core::ptr::addr_of_mut!((*reactor).ordinary_pending)
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
@@ -1305,7 +1458,14 @@ impl CompletionReactor {
             length_completion_head: _,
             passive_completion_head: _,
             oplock_completion_head: _,
-            admitted: _,
+            ordinary_pending: _,
+            paging_pending: _,
+            terminal_pending: _,
+            terminal_head: _,
+            deferred_notification_head: _,
+            finalization: _,
+            #[cfg(not(test))]
+                finalization_work: _,
             wake_event: _,
             retry_ready: _,
             delayed_close_ready: _,
@@ -1330,6 +1490,14 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
             initialize_list_head(reactor.pending_head.get());
+        }
+        unsafe {
+            // SAFETY: Exclusive final-address initialization owns the terminal FIFO head.
+            initialize_list_head(reactor.terminal_head.get());
+        }
+        unsafe {
+            // SAFETY: Exclusive final-address initialization owns the completion backlog head.
+            initialize_list_head(reactor.deferred_notification_head.get());
         }
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
@@ -1449,27 +1617,22 @@ impl CompletionReactor {
         if self.state() != ReactorState::Running {
             return received.complete_result(Err(DriverError::InvalidDeviceRequest));
         }
-        let reservation = match OperationReservation::acquire(&self.admitted) {
-            Ok(reservation) => reservation,
-            Err(error) => return received.complete_result(Err(error)),
-        };
-        #[cfg(not(test))]
-        let notification = match self.notifications.reserve(&self.completion_rundown) {
-            Ok(permit) => permit,
-            Err(error) => return received.complete_result(Err(error)),
-        };
         let context = match received.with_active(|active| QueueContext::capture(active, major)) {
             Ok(context) => context,
             Err(completion) => return received.complete(completion),
         };
-        let pending = PendingIrp::from_received(
-            received,
-            context,
-            #[cfg(not(test))]
-            notification,
-        );
+        let class = context.execution_class();
+        let reservation = if class == ExecutionClass::Finalization {
+            None
+        } else {
+            match OperationReservation::acquire(self.pending_budget(class)) {
+                Ok(reservation) => Some(reservation),
+                Err(error) => return received.complete_result(Err(error)),
+            }
+        };
+        let pending = PendingIrp::from_received(received, context);
         let status = pending.dispatch_status();
-        self.enqueue(pending, reservation);
+        self.enqueue(pending, reservation, class);
         status
     }
 
@@ -1487,9 +1650,14 @@ impl CompletionReactor {
             }
             let owned = unsafe {
                 // SAFETY: CSQ removal returned this live IRP with exclusive queue ownership.
-                OwnedIrp::from_queued_raw(self.device, irp)
+                OwnedIrp::from_queued_raw(
+                    self.device,
+                    irp,
+                    #[cfg(not(test))]
+                    super::notification::IrpNotification::Deferred(NonNull::from(self)),
+                )
             };
-            release_operation_reservation(&self.admitted);
+            release_operation_reservation(self.pending_budget(owned.execution_class()));
             let _status = owned.prepare_cancelled().notify();
         }
     }
@@ -1499,11 +1667,43 @@ impl CompletionReactor {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn enqueue(&self, pending: PendingIrp, reservation: OperationReservation) {
-        #[cfg(test)]
-        mark_pending_for_csq_test(pending.target.irp);
+    fn enqueue(
+        &self,
+        pending: PendingIrp,
+        reservation: Option<OperationReservation>,
+        class: ExecutionClass,
+    ) {
+        mark_pending(pending.target.irp);
         let irp = pending.publish();
-        reservation.publish();
+        if let Some(reservation) = reservation {
+            reservation.publish();
+        }
+        if class == ExecutionClass::Finalization {
+            self.terminal_pending.fetch_add(1, Ordering::AcqRel);
+            #[cfg(not(test))]
+            let old_irql = unsafe {
+                // SAFETY: The initialized reactor lock protects the terminal FIFO.
+                ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            };
+            let entry = unsafe {
+                // SAFETY: Pending ownership retains this live IRP and its unlinked node.
+                irp_list_entry(irp)
+            }
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
+            unsafe {
+                // SAFETY: The queue lock owns transfer of this unlinked IRP into the terminal FIFO.
+                insert_tail_list(self.terminal_head.get(), entry);
+            }
+            #[cfg(not(test))]
+            unsafe {
+                // SAFETY: Releases the exact acquisition above.
+                ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            }
+            self.wake();
+            return;
+        }
         #[cfg(not(test))]
         unsafe {
             // SAFETY: Context and reservation ownership transfer before CSQ insertion; inline
@@ -1717,14 +1917,61 @@ impl CompletionReactor {
     /// # Errors
     ///
     /// Returns an invariant error when no slot is vacant or the selected generation overflows.
-    fn reserve_active_slot(&self) -> DriverResult<usize> {
-        if self.state() != ReactorState::Running {
-            self.with_scheduler(Scheduler::begin_drain);
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        self.with_scheduler(Scheduler::reserve)
+    fn reserve_active_slot(&self, class: ExecutionClass) -> DriverResult<usize> {
+        self.with_scheduler(|scheduler| scheduler.reserve(class))
             .map(SlotId::index)
             .ok_or(DriverError::InternalInvariantViolation)
+    }
+
+    /// Chooses the finite pending budget while terminal lifetime supplies its own bound.
+    fn pending_budget(&self, class: ExecutionClass) -> &AtomicUsize {
+        match class {
+            ExecutionClass::Ordinary => &self.ordinary_pending,
+            ExecutionClass::Paging => &self.paging_pending,
+            ExecutionClass::Finalization => &self.terminal_pending,
+        }
+    }
+
+    /// Removes one non-cancellable handle-finalization request under the queue lock.
+    #[expect(
+        unsafe_code,
+        reason = "the shared native queue lock grants exclusive terminal FIFO ownership"
+    )]
+    fn remove_terminal_irp(&self) -> PIRP {
+        #[cfg(not(test))]
+        let old_irql = unsafe {
+            // SAFETY: Stable reactor lifetime retains its initialized queue lock.
+            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+        };
+        let node = unsafe {
+            // SAFETY: Native lock or isolated single-threaded fixture owns this terminal FIFO.
+            remove_head_list(self.terminal_head.get())
+        };
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Releases the exact acquisition above.
+            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+        }
+        node.map_or(core::ptr::null_mut(), |node| unsafe {
+            // SAFETY: This removed node belongs to one uniquely owned pending IRP.
+            irp_from_list_entry(node.as_ptr())
+        })
+    }
+
+    /// Borrows only the actor-owned terminal continuation reserve.
+    #[expect(
+        unsafe_code,
+        reason = "the sole actor serializes all finalization reserve transitions"
+    )]
+    #[cfg(not(test))]
+    fn with_finalization<R>(
+        &self,
+        transition: impl FnOnce(&mut super::FinalizationPool) -> R,
+    ) -> R {
+        unsafe {
+            // SAFETY: Callers execute only on the reactor actor or an isolated fixture.
+            transition(&mut *self.finalization.get())
+        }
     }
 
     /// Installs an operation after cancellation was bound to its reserved fixed slot.
@@ -1995,9 +2242,14 @@ impl CompletionReactor {
             }
             let owned = unsafe {
                 // SAFETY: Drain removed this live IRP exclusively from the CSQ.
-                OwnedIrp::from_queued_raw(reactor.device, irp)
+                OwnedIrp::from_queued_raw(
+                    reactor.device,
+                    irp,
+                    #[cfg(not(test))]
+                    super::notification::IrpNotification::Dispatch,
+                )
             };
-            release_operation_reservation(&reactor.admitted);
+            release_operation_reservation(reactor.pending_budget(owned.execution_class()));
             let _status = owned.prepare_cancelled().notify();
         }
         reactor.wake();
@@ -2036,6 +2288,11 @@ impl CompletionReactor {
             ffi::KeFlushQueuedDpcs();
         }
 
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Actor join proves no request or native callback owns the finalization reserve.
+            drop((&mut *reactor.finalization_work.get()).take());
+        }
         unsafe {
             // SAFETY: The thread is joined and every completion can still reach this empty inbox.
             reactor.completion_rundown.close_and_wait();
@@ -2057,7 +2314,9 @@ impl CompletionReactor {
             list_is_empty(reactor.oplock_completion_head.get())
         };
         if reactor.state() != ReactorState::Stopped
-            || reactor.admitted.load(Ordering::Acquire) != 0
+            || reactor.ordinary_pending.load(Ordering::Acquire) != 0
+            || reactor.paging_pending.load(Ordering::Acquire) != 0
+            || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
             || reactor.delayed_close_timer_state() != DelayedCloseTimerState::Idle
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
@@ -2092,7 +2351,9 @@ impl CompletionReactor {
         };
         if reactor.state() != ReactorState::Stopped
             || !reactor.thread_handle.load(Ordering::Acquire).is_null()
-            || reactor.admitted.load(Ordering::Acquire) != 0
+            || reactor.ordinary_pending.load(Ordering::Acquire) != 0
+            || reactor.paging_pending.load(Ordering::Acquire) != 0
+            || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
             || reactor.delayed_close_timer_state() != DelayedCloseTimerState::Idle
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
@@ -2189,6 +2450,7 @@ impl CompletionReactor {
             progressed |= self.drain_retry_events();
             progressed |= self.admit_pending_requests();
             progressed |= self.drive_ready_operations();
+            progressed |= self.drain_deferred_notifications();
             progressed |= self.maintain_delayed_close();
             let completion_list_empty = unsafe {
                 // SAFETY: The sole reactor actor observes this initialized inbox list.
@@ -2207,10 +2469,16 @@ impl CompletionReactor {
                 list_is_empty(self.oplock_completion_head.get())
             };
             if self.state() == ReactorState::Draining
-                && self.admitted.load(Ordering::Acquire) == 0
+                && self.ordinary_pending.load(Ordering::Acquire) == 0
+                && self.paging_pending.load(Ordering::Acquire) == 0
+                && self.terminal_pending.load(Ordering::Acquire) == 0
                 && !self.has_active()
                 && self.delayed_close_timer_state() == DelayedCloseTimerState::Idle
                 && self.delayed_close_ready.load(Ordering::Acquire) == 0
+                && unsafe {
+                    // SAFETY: The sole actor owns this initialized notification backlog.
+                    list_is_empty(self.deferred_notification_head.get())
+                }
                 && completion_list_empty
                 && length_completion_list_empty
                 && passive_completion_list_empty
@@ -2331,42 +2599,76 @@ impl CompletionReactor {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn admit_pending_requests(&self) -> bool {
+        if self.state() != ReactorState::Running {
+            self.with_scheduler(Scheduler::begin_drain);
+        }
         let mut admitted_any = false;
-        loop {
-            let irp = self.remove_next_irp(None);
-            if irp.is_null() {
-                return admitted_any;
-            }
-            admitted_any = true;
-            let mut owned = unsafe {
-                // SAFETY: CSQ removal returned this live IRP with exclusive completion ownership.
-                OwnedIrp::from_queued_raw(self.device, irp)
-            };
-            let index = match self.reserve_active_slot() {
-                Ok(index) => index,
-                Err(_) => {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        for class in [
+            ExecutionClass::Finalization,
+            ExecutionClass::Paging,
+            ExecutionClass::Ordinary,
+        ] {
+            while self.with_scheduler(|scheduler| scheduler.available(class)) {
+                let notification = match self.notifications.reserve(&self.completion_rundown, class)
+                {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                };
+                let selection = PendingIrpSelection::Execution(class);
+                let irp = if class == ExecutionClass::Finalization {
+                    self.remove_terminal_irp()
+                } else {
+                    self.remove_next_irp(Some(&selection))
+                };
+                if irp.is_null() {
+                    break;
                 }
-            };
-            let Some(envelope) = self.cancel_envelopes.get(index) else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-            };
-            owned.install_active_cancellation(NonNull::from(envelope));
-            match self.with_target(|target| {
-                crate::request::dispatch::admit_owned(owned, target, self.trace)
-            }) {
-                Ok(operation) => {
-                    self.install_admitted_at(index, operation);
+                admitted_any = true;
+                release_operation_reservation(self.pending_budget(class));
+                let mut owned = unsafe {
+                    // SAFETY: Removal owns the live IRP and actor admission supplies its worker permit.
+                    OwnedIrp::from_queued_raw(
+                        self.device,
+                        irp,
+                        super::notification::IrpNotification::Worker(notification),
+                    )
+                };
+                let index = self.reserve_active_slot(class).unwrap_or_else(|_| {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                });
+                if class != ExecutionClass::Finalization {
+                    let envelope = self.cancel_envelopes.get(index).unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    });
+                    owned.install_active_cancellation(NonNull::from(envelope));
                 }
-                Err(error) => {
-                    let (error, owned) = error.into_parts();
-                    release_operation_reservation(&self.admitted);
-                    let completion = owned.prepare_result(Err(error));
-                    self.retire_cancel_slot(index);
-                    let _status = completion.notify();
+                let admitted = self.with_finalization(|pool| {
+                    self.with_target(|target| {
+                        crate::request::dispatch::admit_owned(owned, target, self.trace, pool)
+                    })
+                });
+                match admitted {
+                    Ok(operation) => self.install_admitted_at(index, operation),
+                    Err(error) => {
+                        let (error, owned) = error.into_parts();
+                        let completion = owned.prepare_result(Err(error));
+                        self.retire_cancel_slot(index);
+                        let identity = self
+                            .with_scheduler(|scheduler| scheduler.identity(index))
+                            .unwrap_or_else(|| {
+                                KernelWideInconsistency::completion_reactor_state_corruption()
+                                    .bugcheck()
+                            });
+                        if !self.with_scheduler(|scheduler| scheduler.complete(identity)) {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck();
+                        }
+                        let _status = completion.notify();
+                    }
                 }
             }
         }
+        admitted_any
     }
 
     /// Advances every slot that already owns one concrete event, never probing waiting slots.
@@ -2587,6 +2889,22 @@ impl CompletionReactor {
                     let _status = completion.notify();
                 }
             }
+            OperationTransition::CompleteFinalization {
+                completion,
+                reusable,
+            } => {
+                self.with_finalization(|pool| pool.restore(reusable));
+                self.retire_operation(index);
+                let _status = completion.notify();
+            }
+            OperationTransition::ContinueAfterFinalization { reusable, next } => {
+                self.with_finalization(|pool| pool.restore(reusable));
+                self.set_ready_operation_event(
+                    index,
+                    next,
+                    CompletionEvent::Core(OperationEvent::Admitted),
+                );
+            }
             OperationTransition::Complete(completion) => {
                 self.retire_operation(index);
                 let _status = completion.notify();
@@ -2612,7 +2930,6 @@ impl CompletionReactor {
         if !self.with_scheduler(|scheduler| scheduler.complete(identity)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
-        release_operation_reservation(&self.admitted);
         self.grant_available_intents();
         self.grant_available_commit();
         self.grant_all_available_waits();
@@ -2750,6 +3067,10 @@ impl CompletionReactor {
 
     /// Allocates and queues one PASSIVE_LEVEL native call outside actor ownership.
     #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the sole actor transfers its preallocated finalization worker reserve"
+    )]
     fn submit_passive_work(
         &self,
         index: usize,
@@ -2769,6 +3090,21 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
+        if ExecutionClass::Finalization.slots().contains(&index) {
+            let reserve = unsafe {
+                // SAFETY: The sole finalization slot and actor own this preallocated worker reserve.
+                (&mut *self.finalization_work.get()).take()
+            }
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
+            let prepared = reserve.bind(NonNull::from(self), identity, work, suspended);
+            if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            PassiveWorkEnvelope::queue(prepared);
+            return;
+        }
         let rundown = match self.completion_rundown.acquire() {
             Ok(Some(rundown)) => rundown,
             Ok(None) => {
@@ -3412,7 +3748,18 @@ impl CompletionReactor {
                 // SAFETY: Inbox removal and exact slot-generation validation grant unique ownership.
                 Box::from_raw(envelope.as_ptr())
             };
-            let (suspended, completion) = PassiveWorkEnvelope::reclaim(envelope);
+            let (suspended, completion, reserve) = PassiveWorkEnvelope::reclaim(envelope);
+            if let Some(reserve) = reserve {
+                unsafe {
+                    // SAFETY: The sole actor reclaims its finalization reserve after exact generation validation.
+                    if (&mut *self.finalization_work.get())
+                        .replace(reserve)
+                        .is_some()
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                }
+            }
             self.set_ready_operation_event(
                 index,
                 suspended,
@@ -4106,9 +4453,14 @@ unsafe extern "C" fn csq_complete_canceled_irp(csq: PIO_CSQ, irp: PIRP) {
     };
     let owned = unsafe {
         // SAFETY: The CSQ removed this live IRP exclusively before invoking cancellation.
-        OwnedIrp::from_queued_raw(reactor.device, irp)
+        OwnedIrp::from_queued_raw(
+            reactor.device,
+            irp,
+            #[cfg(not(test))]
+            super::notification::IrpNotification::Dispatch,
+        )
     };
-    release_operation_reservation(&reactor.admitted);
+    release_operation_reservation(reactor.pending_budget(owned.execution_class()));
     let _status = owned.prepare_cancelled().notify();
 }
 
@@ -4297,51 +4649,53 @@ unsafe fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
     if context.is_null() {
         return unsafe {
             // SAFETY: Queue membership retains the published context throughout this comparison.
-            irp.published_queue_context_matches(core::ptr::null_mut(), false)
+            irp.published_queue_context_matches(core::ptr::null_mut(), false, None)
         };
     }
     let selection = unsafe {
         // SAFETY: `remove_next_irp` lends this exact selector for the synchronous CSQ traversal.
         &*context.cast::<PendingIrpSelection>()
     };
-    unsafe {
-        // SAFETY: Queue membership retains the published context throughout this comparison.
-        irp.published_queue_context_matches(
-            selection.file_object.as_ptr().cast::<c_void>(),
-            selection.ordinary_cleanup_only,
-        )
+    match selection {
+        PendingIrpSelection::Cleanup(file_object) => unsafe {
+            // SAFETY: The queue lock retains the captured request throughout this comparison.
+            irp.published_queue_context_matches(file_object.as_ptr().cast(), true, None)
+        },
+        PendingIrpSelection::Execution(class) => unsafe {
+            // SAFETY: The queue lock retains the captured execution class throughout selection.
+            irp.published_queue_context_matches(core::ptr::null_mut(), false, Some(*class))
+        },
     }
 }
 
-/// Models the CSQ pending transition in unit tests.
-#[cfg(test)]
+/// Marks pending before publication to either the CSQ or the non-cancellable terminal FIFO.
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-fn mark_pending_for_csq_test(irp: KernelIrp) {
+fn mark_pending(irp: KernelIrp) {
     let pending_bit = match u8::try_from(wdk_sys::SL_PENDING_RETURNED) {
         Ok(bit) => bit,
         Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
     };
     let mut raw_irp = irp.irp;
     let raw_irp = unsafe {
-        // SAFETY: Test reactor owns this not-yet-inserted IRP.
+        // SAFETY: Queue publication owns this not-yet-inserted IRP.
         raw_irp.as_mut()
     };
     let overlay = unsafe {
-        // SAFETY: Fixture initialized the current-stack tail overlay.
+        // SAFETY: The I/O Manager initialized the current-stack tail overlay.
         raw_irp.Tail.Overlay
     };
     let current_stack = unsafe {
-        // SAFETY: Fixture selected the current-stack union representation.
+        // SAFETY: The current-stack pointer occupies this tail-overlay arm.
         overlay
             .__bindgen_anon_2
             .__bindgen_anon_1
             .CurrentStackLocation
     };
     let Some(stack) = (unsafe {
-        // SAFETY: Queue capture validated the fixture stack pointer.
+        // SAFETY: Queue capture validated this current-stack pointer.
         current_stack.as_mut()
     }) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -4366,11 +4720,126 @@ mod tests {
 
     use super::{
         AdmittedOperation, CompletionEvent, CompletionOperation, CompletionReactor,
-        DelayedCloseTimerState, HandleOperationLane, InfalliblePublication, MAX_OPERATIONS,
-        OperationAdmission, OperationTransition, PendingIrpSelection, PublicationAuthority,
-        SlotPayload, SuspendedOperation, driver_error_to_core, initialize_list_head,
-        insert_tail_list, list_is_empty, remove_head_list, slot_bit,
+        DelayedCloseTimerState, ExecutionClass, HandleOperationLane, InfalliblePublication,
+        MAX_OPERATIONS, OperationAdmission, OperationTransition, PendingIrpSelection,
+        PublicationAuthority, SlotPayload, SuspendedOperation, driver_error_to_core,
+        initialize_list_head, insert_tail_list, list_is_empty, remove_head_list, slot_bit,
     };
+
+    /// # Panics
+    /// Panics if normal queue exhaustion refuses terminal release or cancellation removes it.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the fixture owns final-address reactor, FILE_OBJECT and IRP storage through queue release"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "fixture-owned pointers and decoded request stacks are required test preconditions"
+    )]
+    fn terminal_queue_survives_normal_budget_exhaustion_and_cleanup_cancellation() {
+        let mut raw_device = wdk_sys::DEVICE_OBJECT::default();
+        let mut raw_file = wdk_sys::FILE_OBJECT::default();
+        let device = unsafe {
+            // SAFETY: This fixture retains its live device through reactor destruction.
+            KernelDevice::from_raw(core::ptr::from_mut(&mut raw_device))
+        }
+        .expect("fixture owns a non-null kernel identity");
+        let file = unsafe {
+            // SAFETY: All queued IRPs refer to this fixture until their completion owners release.
+            KernelFileObject::from_raw(core::ptr::from_mut(&mut raw_file))
+        }
+        .expect("fixture owns a non-null kernel identity");
+        let mut storage = MaybeUninit::<CompletionReactor>::uninit();
+        let result = unsafe {
+            // SAFETY: The fixture holds reactor storage at this address until final release.
+            CompletionReactor::initialize_at(
+                storage.as_mut_ptr(),
+                device,
+                super::ReactorTarget::ControlDevice,
+                OperationalTrace::host_test(),
+            )
+        };
+        assert!(result.is_ok());
+        if result.is_err() {
+            return;
+        }
+        let reactor = unsafe {
+            // SAFETY: Successful initialization wrote every field in final-address storage.
+            &*storage.as_ptr()
+        };
+        let mut irps = [wdk_sys::IRP::default(); MAX_OPERATIONS + 3];
+        let mut stacks = [wdk_sys::IO_STACK_LOCATION::default(); MAX_OPERATIONS + 3];
+        for (index, (irp, stack)) in irps.iter_mut().zip(stacks.iter_mut()).enumerate() {
+            stack.FileObject = file.as_ptr();
+            let major = if index < MAX_OPERATIONS + 1 {
+                super::DispatchMajor::Create
+            } else if index == MAX_OPERATIONS + 1 {
+                super::DispatchMajor::Cleanup
+            } else {
+                super::DispatchMajor::Close
+            };
+            stack.MajorFunction =
+                u8::try_from(major.table_index()).expect("fixture supplies a valid request stack");
+            irp.Tail
+                .Overlay
+                .__bindgen_anon_2
+                .__bindgen_anon_1
+                .CurrentStackLocation = core::ptr::from_mut(stack);
+            let received = unsafe {
+                // SAFETY: Reactor dispatch receives unique IRP ownership; fixture storage remains live.
+                super::ReceivedIrp::decode(device.as_ptr(), core::ptr::from_mut(irp))
+            }
+            .expect("fixture supplies a valid request stack");
+            let status = reactor.receive(received, major);
+            if index == MAX_OPERATIONS {
+                assert_eq!(status, DriverError::DeviceBusy.ntstatus());
+            } else {
+                assert_eq!(status, wdk_sys::STATUS_PENDING);
+            }
+        }
+        assert_eq!(
+            reactor.ordinary_pending.load(Ordering::Acquire),
+            MAX_OPERATIONS
+        );
+        assert_eq!(reactor.terminal_pending.load(Ordering::Acquire), 2);
+        reactor.cancel_pending_ordinary(file);
+        assert_eq!(reactor.terminal_pending.load(Ordering::Acquire), 2);
+        // Create is device-scoped and remains queued; teardown owns cancellation of that queue.
+        for kind in [
+            crate::irp::FinalizationRequest::Cleanup,
+            crate::irp::FinalizationRequest::Close,
+        ] {
+            let raw = reactor.remove_terminal_irp();
+            assert!(!raw.is_null());
+            let owned = unsafe {
+                // SAFETY: FIFO removal transfers the unique terminal completion owner.
+                super::OwnedIrp::from_queued_raw(device, raw)
+            };
+            assert!(matches!(
+                (kind, owned.actor_request()),
+                (
+                    crate::irp::FinalizationRequest::Cleanup,
+                    crate::irp::ActorRequest::Cleanup
+                ) | (
+                    crate::irp::FinalizationRequest::Close,
+                    crate::irp::ActorRequest::Close
+                )
+            ));
+            super::release_operation_reservation(&reactor.terminal_pending);
+            let _status = owned
+                .prepare_result(Ok(crate::irp::IrpCompletion::EMPTY))
+                .notify();
+        }
+        assert!(reactor.remove_terminal_irp().is_null());
+        // Exercise execution selection under the same production queue traversal.
+        let selection = PendingIrpSelection::Execution(ExecutionClass::Paging);
+        assert!(reactor.remove_next_irp(Some(&selection)).is_null());
+        unsafe {
+            // SAFETY: Terminal FIFO is empty; teardown cancels the remaining normal queue and joins owners.
+            CompletionReactor::release_at(storage.as_mut_ptr());
+        }
+    }
 
     #[derive(Debug)]
     struct TestOperation;
@@ -4507,6 +4976,7 @@ mod tests {
                     | crate::irp::PassiveWorkCompletion::Flush(result)
                     | crate::irp::PassiveWorkCompletion::CloseWriteback(result)
                     | crate::irp::PassiveWorkCompletion::Purge(result)
+                    | crate::irp::PassiveWorkCompletion::CleanupOplock(result)
                     | crate::irp::PassiveWorkCompletion::Uninitialize(result) => {
                         let _result = result;
                     }
@@ -4574,6 +5044,17 @@ mod tests {
                 drop(suspended);
             }
             OperationTransition::Publish { publication } => drop(publication),
+            OperationTransition::CompleteFinalization {
+                completion,
+                reusable,
+            } => {
+                let _status = completion.notify();
+                drop(reusable);
+            }
+            OperationTransition::ContinueAfterFinalization { reusable, next } => {
+                drop(reusable);
+                drop(next);
+            }
             OperationTransition::Complete(completion) => {
                 let _status = completion.notify();
             }
@@ -4629,8 +5110,9 @@ mod tests {
         assert_ne!(ordinary, cleanup);
 
         let selection = PendingIrpSelection::cleanup(file_object);
-        assert_eq!(selection.file_object, file_object);
-        assert!(selection.ordinary_cleanup_only);
+        assert!(
+            matches!(selection, PendingIrpSelection::Cleanup(selected) if selected == file_object)
+        );
 
         let admitted = AdmittedOperation::new(test_operation!(), cleanup);
         let (operation, admission) = admitted.into_parts();
@@ -4677,7 +5159,7 @@ mod tests {
             // SAFETY: Initialization wrote a complete reactor value.
             &*storage.as_ptr()
         };
-        let index = reactor.reserve_active_slot();
+        let index = reactor.reserve_active_slot(ExecutionClass::Ordinary);
         assert_eq!(index, Ok(0));
         let Ok(index) = index else {
             return;

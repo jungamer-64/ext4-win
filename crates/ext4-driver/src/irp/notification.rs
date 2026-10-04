@@ -1,4 +1,4 @@
-//! Preallocated PASSIVE_LEVEL terminal notifications, independent of the volume actor.
+//! Preallocated outer completions. Paging DPCs cannot be starved by Cache Manager workers.
 
 use core::{
     cell::UnsafeCell,
@@ -30,14 +30,27 @@ impl NotificationPool {
     /// Allocates all native work items before the device accepts requests.
     /// # Errors
     /// Returns allocation failure without publishing any slot.
-    pub(super) fn try_new(device: KernelDevice, capacity: usize) -> DriverResult<Self> {
-        let mut slots = KernelVec::try_with_capacity(capacity)?;
-        for _ in 0..capacity {
-            slots
-                .push_reserved_owned(NotificationSlot::try_new(device)?)
-                .map_err(|failure| failure.into_parts().0)?;
+    pub(super) fn try_new(
+        device: KernelDevice,
+        reactor: NonNull<super::reactor::CompletionReactor>,
+    ) -> DriverResult<Self> {
+        let mut slots = KernelVec::try_with_capacity(super::scheduler::MAX_OPERATIONS)?;
+        for class in [
+            super::scheduler::ExecutionClass::Ordinary,
+            super::scheduler::ExecutionClass::Paging,
+            super::scheduler::ExecutionClass::Finalization,
+        ] {
+            for _ in class.slots() {
+                slots
+                    .push_reserved_owned(NotificationSlot::try_new(device, reactor, class)?)
+                    .map_err(|failure| failure.into_parts().0)?;
+            }
         }
-        Ok(Self { slots })
+        let pool = Self { slots };
+        for slot in pool.slots.iter() {
+            slot.initialize_callback();
+        }
+        Ok(pool)
     }
 
     /// Reserves one notification through its terminal callback, independently of actor slots.
@@ -48,11 +61,18 @@ impl NotificationPool {
         unsafe_code,
         reason = "atomic reservation grants unique payload access and the rundown lease pins the pool"
     )]
-    pub(super) fn reserve(&self, rundown: &CompletionRundown) -> DriverResult<NotificationPermit> {
+    pub(super) fn reserve(
+        &self,
+        rundown: &CompletionRundown,
+        class: super::scheduler::ExecutionClass,
+    ) -> DriverResult<NotificationPermit> {
         let lease = rundown
             .acquire()?
             .ok_or(DriverError::InvalidDeviceRequest)?;
-        for slot in self.slots.iter() {
+        for (index, slot) in self.slots.iter().enumerate() {
+            if !class.slots().contains(&index) {
+                continue;
+            }
             if slot
                 .occupied
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -73,14 +93,24 @@ impl NotificationPool {
 
 /// One work item reused only after the previous callback has finished all slot access.
 struct NotificationSlot {
-    /// WDK-owned, preallocated work item for the retaining device.
-    work_item: NonNull<wdk_sys::_IO_WORKITEM>,
-    /// Exclusive reservation spanning dispatch, the actor, and native notification.
+    /// Actor wake destination retained by stored or callback-owned rundown.
+    reactor: NonNull<super::reactor::CompletionReactor>,
+    /// Native callback storage whose queue matches the request's progress responsibility.
+    callback: NotificationCallback,
+    /// Exclusive reservation spanning actor admission through native notification publication.
     occupied: AtomicBool,
     /// Destination lifetime retained even while the reactor has no active operation for this IRP.
     rundown: UnsafeCell<Option<CompletionRundownLease>>,
     /// Terminal notification installed once immediately before queue publication.
     job: UnsafeCell<Option<NotificationJob>>,
+}
+
+/// Paging completion is DISPATCH_LEVEL-safe and independent of blocking native cache workers.
+enum NotificationCallback {
+    /// Ordinary and terminal handle notifications may call PASSIVE_LEVEL native routines.
+    Worker(NonNull<wdk_sys::_IO_WORKITEM>),
+    /// Resident final-address DPC storage for paging read/write completion.
+    Paging(UnsafeCell<wdk_sys::KDPC>),
 }
 
 /// Mutually exclusive terminal ownership selected before the actor releases its slot.
@@ -99,17 +129,46 @@ impl NotificationSlot {
         unsafe_code,
         reason = "the initializing device remains alive through pool construction and destruction"
     )]
-    fn try_new(device: KernelDevice) -> DriverResult<Self> {
-        let work_item = unsafe {
-            // SAFETY: Initialization retains this live device; no callback has been published.
-            ffi::IoAllocateWorkItem(device.as_ptr())
+    fn try_new(
+        device: KernelDevice,
+        reactor: NonNull<super::reactor::CompletionReactor>,
+        class: super::scheduler::ExecutionClass,
+    ) -> DriverResult<Self> {
+        let callback = if class == super::scheduler::ExecutionClass::Paging {
+            NotificationCallback::Paging(UnsafeCell::new(wdk_sys::KDPC::default()))
+        } else {
+            let work_item = unsafe {
+                // SAFETY: Initialization retains this live device; no callback is published.
+                ffi::IoAllocateWorkItem(device.as_ptr())
+            };
+            NotificationCallback::Worker(
+                NonNull::new(work_item).ok_or(DriverError::InsufficientResources)?,
+            )
         };
         Ok(Self {
-            work_item: NonNull::new(work_item).ok_or(DriverError::InsufficientResources)?,
+            reactor,
+            callback,
             occupied: AtomicBool::new(false),
             rundown: UnsafeCell::new(None),
             job: UnsafeCell::new(None),
         })
+    }
+    /// Initializes resident DPC identity only after all slots occupy their final allocation.
+    #[expect(
+        unsafe_code,
+        reason = "pool construction retains exclusive final-address DPC initialization authority"
+    )]
+    fn initialize_callback(&self) {
+        if let NotificationCallback::Paging(dpc) = &self.callback {
+            unsafe {
+                // SAFETY: This resident slot will never move and no request can yet acquire it.
+                ffi::KeInitializeDpc(
+                    dpc.get(),
+                    Some(notify_paging),
+                    core::ptr::from_ref(self).cast_mut().cast(),
+                );
+            }
+        }
     }
 }
 
@@ -122,14 +181,17 @@ impl Drop for NotificationSlot {
         if self.occupied.load(Ordering::Acquire) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
-        unsafe {
-            // SAFETY: Construction rollback or completed rundown proves this item is not queued.
-            ffi::IoFreeWorkItem(self.work_item.as_ptr());
+        if let NotificationCallback::Worker(work_item) = &self.callback {
+            unsafe {
+                // SAFETY: Rollback or completed rundown proves the work item is not queued.
+                ffi::IoFreeWorkItem(work_item.as_ptr());
+            }
         }
+        // Paging DPC storage is resident; joined notification rundown and DPC drain precede drop.
     }
 }
 
-/// Unique reservation transferred through DriverContext[2], then the owned IRP, then a callback.
+/// Unique callback reservation transferred from an admitted IRP to terminal notification.
 #[derive(Debug)]
 pub(super) struct NotificationPermit {
     /// Slot retained by its stored rundown lease until this permit releases it.
@@ -144,40 +206,6 @@ pub(super) struct NotificationPermit {
 unsafe impl Send for NotificationPermit {}
 
 impl NotificationPermit {
-    /// Transfers the pre-admitted reservation into the pending IRP's unused context slot.
-    #[expect(
-        unsafe_code,
-        reason = "the pending IRP is uniquely owned before CSQ insertion"
-    )]
-    pub(super) fn publish(self, irp: KernelIrp) {
-        unsafe {
-            // SAFETY: Context[2] belongs to this notification protocol, separately from capture
-            // and cancellation. Pending publication owns the IRP and transfers the permit once.
-            *notification_context(irp) = self.slot.as_ptr().cast();
-        }
-        core::mem::forget(self);
-    }
-
-    /// Recovers the reservation after exclusive CSQ removal.
-    /// # Safety
-    /// The IRP must have been published with a permit and removed exactly once from the CSQ.
-    #[expect(
-        unsafe_code,
-        reason = "the caller proves exclusive pending IRP ownership and matching context publication"
-    )]
-    pub(super) unsafe fn take(irp: KernelIrp) -> Self {
-        let context = unsafe {
-            // SAFETY: The caller uniquely owns the removed IRP and its notification context.
-            notification_context(irp)
-        };
-        let raw = core::mem::replace(context, core::ptr::null_mut());
-        Self {
-            slot: NonNull::new(raw.cast()).unwrap_or_else(|| {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-            }),
-        }
-    }
-
     /// Queues terminal notification after actor borrows, cancellation and handle lanes are gone.
     pub(super) fn queue(self, irp: KernelIrp, status: wdk_sys::NTSTATUS) {
         self.queue_job(NotificationJob::Complete(irp, status));
@@ -202,43 +230,33 @@ impl NotificationPermit {
             // SAFETY: The slot is not queued, and this is its sole terminal job publication.
             *slot.job.get() = Some(job);
         }
-        let work_item = slot.work_item;
         let context = self.slot.as_ptr().cast();
+        // Copy only native queue identity before publication permits callback-driven slot reuse.
+        let (work_item, dpc) = match &slot.callback {
+            NotificationCallback::Worker(work_item) => (Some(*work_item), core::ptr::null_mut()),
+            NotificationCallback::Paging(dpc) => (None, dpc.get()),
+        };
         core::mem::forget(self);
-        unsafe {
-            // SAFETY: The callback receives sole permit ownership; its rundown lease retains the
-            // slot until the callback's last access. IoQueueWorkItem retains the driver device.
-            ffi::IoQueueWorkItem(
-                work_item.as_ptr(),
-                Some(notify_irp),
-                wdk_sys::_WORK_QUEUE_TYPE::DelayedWorkQueue,
-                context,
-            );
+        if let Some(work_item) = work_item {
+            unsafe {
+                // SAFETY: The unique permit owns an unqueued work item and its retained job.
+                ffi::IoQueueWorkItem(
+                    work_item.as_ptr(),
+                    Some(notify_irp),
+                    wdk_sys::_WORK_QUEUE_TYPE::DelayedWorkQueue,
+                    context,
+                );
+            }
+        } else {
+            let queued = unsafe {
+                // SAFETY: The unique permit owns this resident unqueued DPC and its retained job.
+                ffi::KeInsertQueueDpc(dpc, core::ptr::null_mut(), core::ptr::null_mut())
+            };
+            if queued == 0 {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
         }
     }
-}
-
-/// Borrows the notification-owned context field during exclusive IRP ownership.
-/// # Safety
-/// The caller must exclusively own this live IRP for the returned borrow's lifetime.
-#[expect(
-    unsafe_code,
-    reason = "this boundary isolates WDK tail-overlay union projection"
-)]
-unsafe fn notification_context<'a>(irp: KernelIrp) -> &'a mut wdk_sys::PVOID {
-    let irp = unsafe {
-        // SAFETY: The caller supplies unique, live IRP ownership for this borrow.
-        &mut *irp.as_ptr()
-    };
-    let overlay = unsafe {
-        // SAFETY: Driver context occupies the IRP's active tail-overlay arm.
-        &mut irp.Tail.Overlay
-    };
-    let storage = unsafe {
-        // SAFETY: This union arm holds DriverContext, independently of the CSQ list entry.
-        &mut overlay.__bindgen_anon_1.__bindgen_anon_1
-    };
-    &mut storage.DriverContext[2]
 }
 
 impl Drop for NotificationPermit {
@@ -265,14 +283,14 @@ impl Drop for NotificationPermit {
     }
 }
 
-/// Executes terminal notification at PASSIVE_LEVEL while the volume actor remains available.
+/// Copies terminal ownership out and releases callback storage before upper-driver reentry.
 /// # Safety
-/// `context` must be the unique slot queued by NotificationPermit::queue.
+/// Context must be the unique slot published once through NotificationPermit::queue_job.
 #[expect(
     unsafe_code,
-    reason = "the I/O Manager transfers the queued permit to this PASSIVE_LEVEL callback"
+    reason = "native callback entry owns all reserved payloads until atomic slot release"
 )]
-unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_sys::PVOID) {
+unsafe fn take_notification(context: wdk_sys::PVOID) -> (NotificationJob, CompletionRundownLease) {
     let permit = NotificationPermit {
         slot: NonNull::new(context.cast()).unwrap_or_else(|| {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
@@ -287,11 +305,102 @@ unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_s
         (&mut *slot.job.get()).take()
     }
     .unwrap_or_else(|| KernelWideInconsistency::completion_reactor_state_corruption().bugcheck());
+    let lease = unsafe {
+        // SAFETY: This callback uniquely owns payloads before the slot is released.
+        (&mut *slot.rundown.get()).take()
+    }
+    .unwrap_or_else(|| KernelWideInconsistency::completion_reactor_state_corruption().bugcheck());
+    let reactor = slot.reactor;
+    slot.occupied.store(false, Ordering::Release);
+    core::mem::forget(permit);
+    unsafe {
+        // SAFETY: Callback-owned rundown pins the actor after slot reuse is enabled.
+        reactor.as_ref().notification_released();
+    }
+    (job, lease)
+}
+
+/// Executes terminal notification at PASSIVE_LEVEL while the volume actor remains available.
+/// # Safety
+/// `context` must be the unique slot queued by NotificationPermit::queue.
+#[expect(
+    unsafe_code,
+    reason = "the I/O Manager transfers the queued permit to this PASSIVE_LEVEL callback"
+)]
+unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_sys::PVOID) {
+    let (job, lease) = unsafe {
+        // SAFETY: Work queue entry receives the unique published notification slot.
+        take_notification(context)
+    };
+    // No slot access follows release; reentrant completion may reuse the same work item.
     match job {
         NotificationJob::Complete(irp, status) => {
             let _status = irp.finish_completion(status);
         }
         NotificationJob::QueryRemove(forwarding) => forwarding.submit(),
     }
-    drop(permit);
+    drop(lease);
+}
+
+/// Routing distinguishes actor ownership from a never-started queue rejection.
+#[derive(Debug)]
+pub(super) enum IrpNotification {
+    /// Upper completion must run outside the actor's state transition.
+    Worker(NotificationPermit),
+    /// Queue removal owns completion outside the actor and needs no worker.
+    Dispatch,
+    /// Actor-originated cancellation retains an IRP backlog until a worker can consume it.
+    Deferred(NonNull<super::reactor::CompletionReactor>),
+}
+impl IrpNotification {
+    /// Dispatch routes complete immediately; actor routes consume their prepared worker.
+    #[expect(
+        unsafe_code,
+        reason = "the actor is the sole producer of deferred queue completions and retains its own lifetime"
+    )]
+    pub(super) fn queue(self, irp: KernelIrp, status: wdk_sys::NTSTATUS) {
+        match self {
+            Self::Worker(permit) => permit.queue(irp, status),
+            Self::Dispatch => {
+                let _status = irp.finish_completion(status);
+            }
+            Self::Deferred(reactor) => unsafe {
+                // SAFETY: Deferred routing is created only during this retaining actor's transition.
+                reactor.as_ref().defer_notification(irp);
+            },
+        }
+    }
+    /// Query removal uses its admitted worker to cross the actor boundary.
+    pub(super) fn queue_query_remove(self, forwarding: super::lifecycle::PnpSubmission) {
+        match self {
+            Self::Worker(permit) => permit.queue_query_remove(forwarding),
+            Self::Dispatch | Self::Deferred(_) => {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            }
+        }
+    }
+}
+
+/// Paging completion never waits for the system workers that may be blocked on this same IRP.
+/// # Safety
+/// The native DPC must return the final-address slot initialized by NotificationSlot.
+#[expect(
+    unsafe_code,
+    reason = "the DPC owns a status-prepared paging IRP and resident notification slot"
+)]
+unsafe extern "C" fn notify_paging(
+    _dpc: *mut wdk_sys::KDPC,
+    context: wdk_sys::PVOID,
+    _first: wdk_sys::PVOID,
+    _second: wdk_sys::PVOID,
+) {
+    let (job, lease) = unsafe {
+        // SAFETY: DPC publication uniquely transferred this paging slot and its lifetime lease.
+        take_notification(context)
+    };
+    let NotificationJob::Complete(irp, status) = job else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    let _status = irp.finish_completion(status);
+    drop(lease);
 }

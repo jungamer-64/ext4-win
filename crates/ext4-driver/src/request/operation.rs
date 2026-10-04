@@ -82,11 +82,22 @@ pub(crate) use directory::query_directory;
 mod mdl;
 pub(crate) use mdl::mdl;
 mod cleanup;
+mod close;
 
 mod volume_close;
 pub(crate) use volume_close::{VolumeCloseRequest, volume_close};
 mod pnp;
 pub(crate) use pnp::query_remove;
+
+/// Establishes terminal resource ownership before any FILE_OBJECT can be admitted.
+/// # Errors
+/// Returns allocation failure while device initialization can still roll back.
+pub(crate) fn prepare_finalization() -> DriverResult<crate::irp::FinalizationPool> {
+    Ok(crate::irp::FinalizationPool::new(
+        cleanup::CleanupOperation::prepare()?,
+        close::prepare()?,
+    ))
+}
 
 /// Admission failure that preserves the unique top-level completion authority.
 #[derive(Debug)]

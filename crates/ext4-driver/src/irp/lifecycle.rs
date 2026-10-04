@@ -769,9 +769,6 @@ unsafe extern "system" fn ext4win_finish_mdl_completion(irp: PIRP, status: NTSTA
 #[derive(Debug)]
 #[must_use]
 pub(super) struct PendingIrp {
-    /// Pre-admitted PASSIVE_LEVEL terminal work reservation.
-    #[cfg(not(test))]
-    notification: super::notification::NotificationPermit,
     /// Dispatch target whose completion authority transfers with queue insertion.
     pub(super) target: DispatchTarget,
     /// Requestor-context capture transferred through `DriverContext[0]` before insertion.
@@ -780,15 +777,9 @@ pub(super) struct PendingIrp {
 
 impl PendingIrp {
     /// Joins the received completion authority with its fully captured queue context.
-    pub(super) fn from_received(
-        received: ReceivedIrp,
-        context: QueueContextOwnership,
-        #[cfg(not(test))] notification: super::notification::NotificationPermit,
-    ) -> Self {
+    pub(super) fn from_received(received: ReceivedIrp, context: QueueContextOwnership) -> Self {
         Self {
             target: received.target,
-            #[cfg(not(test))]
-            notification,
             context,
         }
     }
@@ -796,8 +787,6 @@ impl PendingIrp {
     /// Publishes the context into `DriverContext[0]` and transfers queue ownership.
     pub(super) fn publish(self) -> PIRP {
         self.target.irp.publish_queue_context(self.context);
-        #[cfg(not(test))]
-        self.notification.publish(self.target.irp);
         self.target.irp.as_ptr()
     }
 
@@ -811,9 +800,9 @@ impl PendingIrp {
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct OwnedIrp {
-    /// Pre-admitted PASSIVE_LEVEL terminal work reservation.
+    /// Completion routing owns a worker only after actor admission.
     #[cfg(not(test))]
-    notification: super::notification::NotificationPermit,
+    notification: super::notification::IrpNotification,
     /// Target whose IRP can be completed exactly once by this owner.
     target: DispatchTarget,
     /// Request capture removed exactly once from `DriverContext[0]` with queue ownership.
@@ -830,9 +819,9 @@ pub(crate) struct OwnedIrp {
 #[cfg(not(test))]
 #[derive(Debug)]
 pub(super) struct DelegatedIrp {
-    /// Pre-admitted PASSIVE_LEVEL terminal work reservation.
+    /// Completion routing owns a worker only after actor admission.
     #[cfg(not(test))]
-    notification: super::notification::NotificationPermit,
+    notification: super::notification::IrpNotification,
     /// Dispatch target whose raw IRP was transferred to FsRtl.
     target: DispatchTarget,
     /// Request capture retained independently from the IRP's temporary external owner.
@@ -951,6 +940,11 @@ impl<'a> PendingIrpLease<'a> {
 }
 
 impl OwnedIrp {
+    /// Removal consumes the pending reservation of the immutable captured progress class.
+    pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
+        self.context.execution_class()
+    }
+
     /// Releases queue and cancellation ownership before the actor hands query removal to lower
     /// drivers. The reserved notification retains the mounted volume until submission returns.
     pub(crate) fn prepare_query_remove_forward(
@@ -989,7 +983,11 @@ impl OwnedIrp {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(super) unsafe fn from_queued_raw(device: KernelDevice, irp: PIRP) -> Self {
+    pub(super) unsafe fn from_queued_raw(
+        device: KernelDevice,
+        irp: PIRP,
+        #[cfg(not(test))] notification: super::notification::IrpNotification,
+    ) -> Self {
         let Some(irp) = (unsafe {
             // SAFETY: The caller owns the exclusively removed live IRP.
             KernelIrp::from_raw(irp)
@@ -998,11 +996,6 @@ impl OwnedIrp {
                 .bugcheck();
         };
         let context = irp.take_queue_context();
-        #[cfg(not(test))]
-        let notification = unsafe {
-            // SAFETY: Exclusive CSQ removal recovers the permit published with this pending IRP.
-            super::notification::NotificationPermit::take(irp)
-        };
         Self {
             target: DispatchTarget { device, irp },
             context,
@@ -1310,7 +1303,7 @@ unsafe impl Send for OwnedIrp {}
 pub(crate) struct PreparedIrpCompletion {
     /// Pre-admitted worker slot retained through upper completion callbacks.
     #[cfg(not(test))]
-    notification: super::notification::NotificationPermit,
+    notification: super::notification::IrpNotification,
     /// Live IRP whose status and auxiliary buffer have already been published.
     irp: KernelIrp,
     /// Saved status; notification may free the IRP before returning.
@@ -1325,7 +1318,7 @@ pub(crate) struct PreparedPnpForward {
     submission: PnpSubmission,
     /// Sole terminal worker reservation, acquired before CSQ admission.
     #[cfg(not(test))]
-    notification: super::notification::NotificationPermit,
+    notification: super::notification::IrpNotification,
 }
 
 /// Original PnP submission retained by the preallocated notification worker.
@@ -1511,6 +1504,7 @@ impl KernelIrp {
         self,
         cancellation: *mut c_void,
         ordinary_cleanup_only: bool,
+        execution: Option<super::scheduler::ExecutionClass>,
     ) -> bool {
         let irp = unsafe {
             // SAFETY: The caller's CSQ lock contract keeps the queued IRP and context live.
@@ -1535,7 +1529,10 @@ impl KernelIrp {
             context.as_ptr().cast_const(),
             queue_context_marker(CLOSE_QUEUE_CONTEXT_MARKER).cast_const(),
         ) {
-            return cancellation.is_null() && !ordinary_cleanup_only;
+            return cancellation.is_null()
+                && !ordinary_cleanup_only
+                && execution
+                    .is_none_or(|class| class == super::scheduler::ExecutionClass::Finalization);
         }
         let context = context.cast::<QueueContext>();
         let context = unsafe {
@@ -1544,12 +1541,30 @@ impl KernelIrp {
         };
         context.matches_cancellation_context(cancellation)
             && (!ordinary_cleanup_only || context.cleanup_cancel_eligible())
+            && execution.is_none_or(|class| class == context.execution_class())
     }
 
     /// Returns the raw IRP pointer for writes to the WDK completion fields.
     #[cfg(not(test))]
     fn as_mut_ptr(self) -> *mut wdk_sys::IRP {
         self.irp.as_ptr()
+    }
+
+    /// Reads the status already published by the sole prepared-completion owner.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the actor backlog retains this status-prepared IRP until notification transfers ownership"
+    )]
+    pub(super) fn prepared_status(self) -> NTSTATUS {
+        let irp = unsafe {
+            // SAFETY: Prepared-completion ownership retains this live IRP through notification.
+            self.irp.as_ref()
+        };
+        unsafe {
+            // SAFETY: The sole prepared-completion owner initialized the status union arm.
+            irp.IoStatus.__bindgen_anon_1.Status
+        }
     }
 
     /// Writes status and byte count to the IRP status block.

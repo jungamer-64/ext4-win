@@ -595,6 +595,14 @@ pub(super) enum QueueContextOwnership {
 }
 
 impl QueueContextOwnership {
+    /// Derives the independent progress lane from the immutable captured request.
+    pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
+        match self {
+            Self::Cleanup | Self::Close => super::scheduler::ExecutionClass::Finalization,
+            Self::Captured(context) => context.execution_class(),
+        }
+    }
+
     /// Borrows the read contract captured before queue insertion.
     /// # Errors
     ///
@@ -686,6 +694,20 @@ impl QueueContextOwnership {
 }
 
 impl QueueContext {
+    /// Paging must progress even while ordinary Cache Manager work owns its execution slots.
+    pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
+        let paging = match &self.prepared {
+            PreparedRequest::Read(read) => read.kind() == DataIoKind::Paging,
+            PreparedRequest::Write(write) => write.kind() == DataIoKind::Paging,
+            _ => false,
+        };
+        if paging {
+            super::scheduler::ExecutionClass::Paging
+        } else {
+            super::scheduler::ExecutionClass::Ordinary
+        }
+    }
+
     /// Captures one queued request while dispatch still runs in the requestor's context.
     /// # Errors
     ///

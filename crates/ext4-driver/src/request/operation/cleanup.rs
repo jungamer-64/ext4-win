@@ -7,14 +7,14 @@ use crate::irp::reactor::CLEANUP_HANDLE_BARRIER;
 /// Sole resource-release ownership phase of one CLEANUP IRP.
 #[derive(Debug)]
 enum CleanupState {
+    /// Reactor reserve owns this cleared continuation before a request acquires it.
+    Dormant,
     /// Wait for earlier requests on this FILE_OBJECT before releasing its resources.
     Ready(OwnedIrp),
     /// The per-handle barrier owns ordering through cleanup.
     Waiting(OwnedIrp),
-    /// FsRtl temporarily owns IRP completion while processing the cleanup notification.
-    Delegated,
-    /// Returned original IRP with its exact oplock notification outcome.
-    Returned(OwnedIrp, wdk_sys::NTSTATUS),
+    /// A reserved native worker notifies FsRtl; cleanup never transfers IRP completion ownership.
+    Notifying(OwnedIrp),
     /// Native private cache-map release runs outside the actor.
     Uninitializing(OwnedIrp),
     /// A terminal completion or deletion mutation owns the original IRP.
@@ -23,7 +23,7 @@ enum CleanupState {
 
 /// Cleanup owns releases independently from journal mutation admission.
 #[derive(Debug)]
-struct CleanupOperation {
+pub(super) struct CleanupOperation {
     /// Exclusive IRP and external callback ownership.
     state: CleanupState,
     /// First native failure observed before handle release completed.
@@ -32,8 +32,46 @@ struct CleanupOperation {
     mutation: Option<crate::state::OplockMutationLease>,
 }
 
+/// Oplock release and grant exclusion retain distinct native and mutation responsibilities.
+struct PreparedCleanupOplock {
+    /// Exact native stream release to run outside the actor.
+    check: crate::irp::CleanupOplock,
+    /// Prevents grant races until mandatory release or optional namespace deletion completes.
+    mutation: crate::state::OplockMutationLease,
+}
 
 impl CleanupOperation {
+    /// Prepares the release continuation before device request admission exists.
+    /// # Errors
+    /// Returns allocation failure while initialization still owns rollback.
+    pub(super) fn prepare() -> DriverResult<Box<dyn crate::irp::FinalizationOperation>> {
+        memory::boxed_try_with(|| {
+            Ok(Self {
+                state: CleanupState::Dormant,
+                failure: None,
+                mutation: None,
+            })
+        })
+        .map(|operation| -> Box<dyn crate::irp::FinalizationOperation> { operation })
+    }
+    /// Clears all per-handle authority before the reserve can serve another request.
+    fn reset(&mut self) {
+        self.state = CleanupState::Dormant;
+        self.failure = None;
+        self.mutation = None;
+    }
+    /// Returns the cleared continuation with terminal completion, without allocating.
+    fn finish(
+        mut self: Box<Self>,
+        completion: crate::irp::PreparedIrpCompletion,
+    ) -> OperationTransition {
+        self.reset();
+        OperationTransition::CompleteFinalization {
+            completion,
+            reusable: self,
+        }
+    }
+
     /// Captures the cleanup notification while its FILE_OBJECT retains the stream, even when
     /// storage has gone. FsRtl must still release its own handle-specific oplock state.
     /// # Errors
@@ -42,7 +80,7 @@ impl CleanupOperation {
     fn prepare_oplock(
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
-    ) -> DriverResult<Option<PreparedMutationOplock>> {
+    ) -> DriverResult<Option<PreparedCleanupOplock>> {
         owned.request().with_active(|active| {
             let file_object = active.current_stack()?.file_object()?;
             match crate::state::OpenedFileObject::decode(file_object)? {
@@ -51,8 +89,8 @@ impl CleanupOperation {
                     access
                         .acquire_oplock_mutation(file_object)
                         .map(|(mutation, stream)| {
-                            Some(PreparedMutationOplock {
-                                check: OplockCheck::cleanup(stream, deletion),
+                            Some(PreparedCleanupOplock {
+                                check: crate::irp::CleanupOplock::new(stream, deletion),
                                 mutation,
                             })
                         })
@@ -98,7 +136,7 @@ impl CleanupOperation {
     /// after release leaves the FILE_OBJECT cleaned; CLOSE can reclaim it without retrying an
     /// uncertain deletion. A deletion plan stays pending only if a later lower effect is unknown.
     fn release(
-        mut self,
+        mut self: Box<Self>,
         mut owned: OwnedIrp,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
@@ -106,12 +144,12 @@ impl CleanupOperation {
         match result {
             Ok(crate::request::file_info::CleanupResolution::Complete(completion)) => {
                 let result = self.failure.map_or(Ok(completion), Err);
-                OperationTransition::Complete(owned.prepare_result(result))
+                self.finish(owned.prepare_result(result))
             }
             Ok(crate::request::file_info::CleanupResolution::Delete(deletion)) => {
                 if let Err(error) = access.authorize_durability() {
                     drop(deletion);
-                    return OperationTransition::Complete(owned.prepare_result(Err(error)));
+                    return self.finish(owned.prepare_result(Err(error)));
                 }
                 match MutationRequestOperation::try_new(
                     owned,
@@ -122,19 +160,20 @@ impl CleanupOperation {
                         operation.cleanup_deletion = Some(deletion);
                         operation.cleanup_deferred_error = self.failure;
                         operation.oplock_mutation = self.mutation.take();
-                        operation.advance_mounted(
-                            CompletionEvent::Core(OperationEvent::Admitted),
-                            access,
-                        )
+                        self.reset();
+                        OperationTransition::ContinueAfterFinalization {
+                            reusable: self,
+                            next: operation,
+                        }
                     }
                     Err(failure) => {
                         drop(deletion);
                         let (error, owned) = failure.into_parts();
-                        OperationTransition::Complete(owned.prepare_result(Err(error)))
+                        self.finish(owned.prepare_result(Err(error)))
                     }
                 }
             }
-            Err(error) => OperationTransition::Complete(owned.prepare_result(Err(error))),
+            Err(error) => self.finish(owned.prepare_result(Err(error))),
         }
     }
 }
@@ -166,10 +205,12 @@ impl MountedVolumeOperation for CleanupOperation {
                 match Self::prepare_oplock(&mut owned, access) {
                     Ok(Some(prepared)) => {
                         self.mutation = Some(prepared.mutation);
-                        self.state = CleanupState::Delegated;
-                        OperationTransition::CheckOplock {
-                            check: prepared.check,
-                            owned,
+                        let work = owned.request().with_active(|active| {
+                            crate::irp::PassiveWork::cleanup_oplock(prepared.check, active)
+                        });
+                        self.state = CleanupState::Notifying(owned);
+                        OperationTransition::SubmitPassiveWork {
+                            work,
                             suspended: self,
                         }
                     }
@@ -181,12 +222,12 @@ impl MountedVolumeOperation for CleanupOperation {
                 }
             }
             (
-                CleanupState::Returned(owned, status),
-                CompletionEvent::Core(OperationEvent::Admitted),
+                CleanupState::Notifying(owned),
+                CompletionEvent::PassiveCompleted(
+                    crate::irp::PassiveWorkCompletion::CleanupOplock(result),
+                ),
             ) => {
-                if status < STATUS_SUCCESS {
-                    self.record_failure(Err(DriverError::OplockFailure(status)));
-                }
+                self.record_failure(result);
                 self.uninitialize(owned, access)
             }
             (
@@ -196,13 +237,6 @@ impl MountedVolumeOperation for CleanupOperation {
                 )),
             ) => {
                 self.record_failure(result);
-                self.release(owned, access)
-            }
-            (
-                CleanupState::Uninitializing(owned),
-                CompletionEvent::Core(OperationEvent::CancelRequested),
-            ) => {
-                self.record_failure(Err(DriverError::from(Error::OperationCancelled)));
                 self.release(owned, access)
             }
             _ => {
@@ -222,18 +256,17 @@ impl MountedVolumeOperation for CleanupOperation {
     }
 }
 
-impl OplockContinuation for CleanupOperation {
-    fn resume_after_oplock(
-        mut self: Box<Self>,
-        owned: OwnedIrp,
-        status: wdk_sys::NTSTATUS,
-    ) -> Box<dyn CompletionOperation> {
-        if !matches!(self.state, CleanupState::Delegated) {
+impl crate::irp::FinalizationOperation for CleanupOperation {
+    fn activate(mut self: Box<Self>, owned: OwnedIrp) -> Box<dyn CompletionOperation> {
+        if !matches!(self.state, CleanupState::Dormant) {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                 .bugcheck();
         }
-        self.state = CleanupState::Returned(owned, status);
+        self.state = CleanupState::Ready(owned);
         self
+    }
+    fn kind(&self) -> crate::irp::FinalizationRequest {
+        crate::irp::FinalizationRequest::Cleanup
     }
 }
 

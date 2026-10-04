@@ -3,11 +3,72 @@
 pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::IoCompleteRequest;
+#[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
-    IoCheckShareAccess, IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink,
-    IoRegisterFileSystem, IoRemoveShareAccess, IoUnregisterFileSystem, KeQuerySystemTimePrecise,
-    RtlSecondsSince1970ToTime, RtlTimeToSecondsSince1970,
+    IoCheckShareAccess, IoRemoveShareAccess, KeQuerySystemTimePrecise,
 };
+pub(crate) use wdk_sys::ntddk::{
+    IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink,
+    IoRegisterFileSystem, IoUnregisterFileSystem, RtlSecondsSince1970ToTime,
+    RtlTimeToSecondsSince1970,
+};
+
+/// # Safety
+/// Retains the native sharing boundary; host fixtures cannot establish kernel share claims.
+/// # Panics
+/// Fails if a host fixture attempts native share admission.
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::panic,
+    clippy::disallowed_macros,
+    reason = "host tests must not report native sharing behavior without the I/O Manager"
+)]
+pub(crate) unsafe fn IoCheckShareAccess(
+    _access: wdk_sys::ACCESS_MASK,
+    _sharing: wdk_sys::ULONG,
+    _file: wdk_sys::PFILE_OBJECT,
+    _shares: wdk_sys::PSHARE_ACCESS,
+    _update: wdk_sys::BOOLEAN,
+) -> wdk_sys::NTSTATUS {
+    panic!("native share admission requires the I/O Manager")
+}
+
+/// # Safety
+/// Retains the native sharing boundary; host fixtures cannot own kernel share claims.
+/// # Panics
+/// Fails if a host fixture attempts native share removal.
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::panic,
+    clippy::disallowed_macros,
+    reason = "host tests cannot consume a native claim that they never acquired"
+)]
+pub(crate) unsafe fn IoRemoveShareAccess(
+    _file: wdk_sys::PFILE_OBJECT,
+    _shares: wdk_sys::PSHARE_ACCESS,
+) {
+    panic!("native share removal requires the I/O Manager")
+}
+
+/// # Safety
+/// Retains the kernel clock ABI without synthesizing a native time observation.
+/// # Panics
+/// Fails if a host fixture reaches the kernel-only clock boundary.
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::panic,
+    clippy::disallowed_macros,
+    reason = "host tests must supply timestamps before crossing the kernel clock boundary"
+)]
+pub(crate) unsafe fn KeQuerySystemTimePrecise(_time: wdk_sys::PLARGE_INTEGER) {
+    panic!("kernel clock observation requires a loaded driver")
+}
 
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::MmMapLockedPagesSpecifyCache;
@@ -105,9 +166,9 @@ pub(crate) use wdk_sys::ntddk::{
     IoReleaseVpbSpinLock, IoSetCompletionRoutineEx, IoSetTopLevelIrp,
     IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeCancelTimer,
     KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer,
-    KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool,
-    MmUnlockPages, ObfDereferenceObject, ObfReferenceObject, PsCreateSystemThread,
-    PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
+    KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject,
+    MmBuildMdlForNonPagedPool, MmUnlockPages, ObfDereferenceObject, ObfReferenceObject,
+    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]

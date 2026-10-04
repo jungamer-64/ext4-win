@@ -25,7 +25,9 @@ mod completion;
 mod control;
 mod create;
 mod dispatch;
+mod finalization;
 mod lifecycle;
+pub(crate) use finalization::{FinalizationOperation, FinalizationPool, FinalizationRequest};
 #[cfg(not(test))]
 mod notification;
 pub(crate) use lifecycle::PreparedIrpCompletion;
@@ -55,7 +57,7 @@ pub(crate) use dispatch::*;
 pub(crate) use lifecycle::*;
 use lifecycle::{KernelIrp, PendingIrp, copy_requestor_input_window, copy_requestor_output_window};
 pub(crate) use oplock::{
-    AtomicOplockReservation, NamespaceOplockPlan, NamespaceParentOplock,
+    AtomicOplockReservation, CleanupOplock, NamespaceOplockPlan, NamespaceParentOplock,
     NamespaceParentOplockEffect, OplockCheck, OplockContinuation,
 };
 pub(crate) use passive::{PassiveWork, PassiveWorkCompletion};

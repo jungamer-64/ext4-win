@@ -7,8 +7,30 @@ use ext4_core::{EpochSequence, MutationResource};
 
 use crate::memory::DriverVec;
 
-/// Hard bound shared by pending and active filesystem operations on one device.
+/// Fixed execution storage on one device, partitioned to preserve paging and finalization progress.
 pub(crate) const MAX_OPERATIONS: usize = 64;
+
+/// Execution capacity belongs to independent progress responsibilities.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ExecutionClass {
+    /// User work may block in Cache Manager while paging completes independently.
+    Ordinary,
+    /// Cache and Memory Manager I/O needed by already admitted user work.
+    Paging,
+    /// Non-cancellable handle release, serialized over reusable terminal resources.
+    Finalization,
+}
+
+impl ExecutionClass {
+    /// Each class owns disjoint execution and notification slots.
+    pub(crate) const fn slots(self) -> core::ops::Range<usize> {
+        match self {
+            Self::Ordinary => 0..47,
+            Self::Paging => 47..63,
+            Self::Finalization => 63..64,
+        }
+    }
+}
 
 /// Scheduler-local identity for the per-handle CLEANUP terminal barrier.
 pub(crate) const CLEANUP_HANDLE_BARRIER: u64 = 2;
@@ -356,18 +378,16 @@ impl Scheduler {
     }
 
     /// Reserves one vacant slot with a fresh generation.
-    pub(crate) fn reserve(&mut self) -> Option<SlotId> {
-        if self.draining {
+    pub(crate) fn reserve(&mut self, class: ExecutionClass) -> Option<SlotId> {
+        if self.draining && class != ExecutionClass::Finalization {
             return None;
         }
-        let (index, slot) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| matches!(slot.phase, Phase::Vacant))?;
+        let (index, slot) = self.slots.iter_mut().enumerate().find(|(index, slot)| {
+            class.slots().contains(index) && matches!(slot.phase, Phase::Vacant)
+        })?;
         slot.generation = slot.generation.checked_add(1)?;
         slot.cancel_pending = false;
-        slot.cancel_enabled = true;
+        slot.cancel_enabled = class != ExecutionClass::Finalization;
         slot.admission = None;
         slot.predecessor = None;
         slot.phase = Phase::Actor;
@@ -375,6 +395,14 @@ impl Scheduler {
             index,
             generation: slot.generation,
         })
+    }
+
+    /// Reports whether this class can execute without consuming another class's progress capacity.
+    pub(crate) fn available(&self, class: ExecutionClass) -> bool {
+        (!self.draining || class == ExecutionClass::Finalization)
+            && self.slots.iter().enumerate().any(|(index, slot)| {
+                class.slots().contains(&index) && matches!(slot.phase, Phase::Vacant)
+            })
     }
 
     /// Returns the current identity at a fixed index.
@@ -417,8 +445,8 @@ impl Scheduler {
             return None;
         }
         let terminal = admission.is_terminal_barrier();
-        slot.cancel_enabled = !terminal;
-        slot.cancel_pending = cancelled && !terminal;
+        slot.cancel_enabled = slot.cancel_enabled && !terminal;
+        slot.cancel_pending = cancelled && slot.cancel_enabled;
         slot.admission = Some(admission);
         slot.predecessor = predecessor;
         let start = if slot.cancel_pending {
@@ -966,9 +994,9 @@ mod tests {
     use crate::memory::DriverVec;
 
     use super::{
-        Admission, AdmissionStart, CLEANUP_HANDLE_BARRIER, CancelDisposition, HandleId,
-        HandleOperationLane, IntentRequest, MAX_OPERATIONS, Phase, PostCleanupRequest, Scheduler,
-        SlotId, WaitCondition,
+        Admission, AdmissionStart, CLEANUP_HANDLE_BARRIER, CancelDisposition, ExecutionClass,
+        HandleId, HandleOperationLane, IntentRequest, MAX_OPERATIONS, Phase, PostCleanupRequest,
+        Scheduler, SlotId, WaitCondition,
     };
 
     /// Extracts required fixture state while preserving assertion-based test failure.
@@ -1012,14 +1040,26 @@ mod tests {
             storage.assume_init()
         };
         let mut slots = [None; MAX_OPERATIONS];
-        for slot in &mut slots {
-            *slot = scheduler.reserve();
-            assert!(slot.is_some());
+        for class in [
+            ExecutionClass::Ordinary,
+            ExecutionClass::Paging,
+            ExecutionClass::Finalization,
+        ] {
+            for index in class.slots() {
+                let slot = require_some!(slots.get_mut(index));
+                *slot = scheduler.reserve(class);
+                assert!(slot.is_some());
+            }
+            assert!(!scheduler.available(class));
+            assert!(scheduler.reserve(class).is_none());
+            if class == ExecutionClass::Ordinary {
+                assert!(scheduler.available(ExecutionClass::Paging));
+                assert!(scheduler.available(ExecutionClass::Finalization));
+            }
         }
-        assert!(scheduler.reserve().is_none());
         let first = require_some!(slots.first().copied().flatten());
         assert!(scheduler.complete(first));
-        let reused = require_some!(scheduler.reserve());
+        let reused = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(reused.index(), first.index());
         assert_eq!(reused.generation(), first.generation() + 1);
     }
@@ -1041,9 +1081,9 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let first = require_some!(scheduler.reserve());
-        let second = require_some!(scheduler.reserve());
-        let disjoint = require_some!(scheduler.reserve());
+        let first = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        let second = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        let disjoint = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let first_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         let second_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         let disjoint_resources = require_some!(resources(&[MutationResource::KEY_SET]));
@@ -1082,8 +1122,8 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let preparation = require_some!(scheduler.reserve());
-        let paging = require_some!(scheduler.reserve());
+        let preparation = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        let paging = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let preparation_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         let paging_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(
@@ -1118,8 +1158,8 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let later = require_some!(scheduler.reserve());
-        let earlier = require_some!(scheduler.reserve());
+        let later = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        let earlier = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert!(scheduler.request_commit(later, 20));
         assert!(scheduler.request_commit(earlier, 10));
         let mut attempted = [false; MAX_OPERATIONS];
@@ -1162,7 +1202,7 @@ mod tests {
         };
         let mut previous = None;
         for cancelled in [false, true] {
-            let identity = require_some!(scheduler.reserve());
+            let identity = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
             assert!(!scheduler.cancellation_is_pending(identity.index(), false));
             assert!(scheduler.set_phase(identity, Phase::Oplock));
             if let Some(stale) = previous {
@@ -1221,7 +1261,7 @@ mod tests {
             (Phase::Passive, CancelDisposition::Ignored),
             (Phase::Oplock, CancelDisposition::CancelOplock),
         ] {
-            let slot = require_some!(scheduler.reserve());
+            let slot = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
             assert!(scheduler.set_phase(slot, phase));
             assert_eq!(scheduler.request_cancel(slot.index()), expected);
             if expected == CancelDisposition::AwaitRegistration {
@@ -1242,7 +1282,7 @@ mod tests {
             assert!(scheduler.complete(identity));
         }
 
-        let intent = require_some!(scheduler.reserve());
+        let intent = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let intent_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(
             scheduler.request_intent(intent, IntentRequest::new(9, intent_resources),),
@@ -1268,7 +1308,7 @@ mod tests {
             WaitCondition::JournalClean,
             WaitCondition::Barrier { identity: 13 },
         ] {
-            let waiting = require_some!(scheduler.reserve());
+            let waiting = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
             assert!(scheduler.request_wait(waiting, condition));
             assert_eq!(
                 scheduler.request_cancel(waiting.index()),
@@ -1296,7 +1336,7 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let slot = require_some!(scheduler.reserve());
+        let slot = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert!(!scheduler.cancellation_is_pending(slot.index(), false));
         assert!(scheduler.set_phase(slot, Phase::Oplock));
         assert_eq!(
@@ -1321,7 +1361,7 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let slot = require_some!(scheduler.reserve());
+        let slot = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(
             scheduler.install(slot, Admission::Device, false),
             Some(AdmissionStart::Admitted)
@@ -1359,7 +1399,7 @@ mod tests {
             storage.assume_init()
         };
 
-        let intent_waiter = require_some!(scheduler.reserve());
+        let intent_waiter = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let intent_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(
             scheduler.request_intent(intent_waiter, IntentRequest::new(1, intent_resources),),
@@ -1374,7 +1414,7 @@ mod tests {
         assert!(scheduler.checkpoint_authority_is_clear(resumed_intent));
         assert!(scheduler.complete(resumed_intent));
 
-        let commit_waiter = require_some!(scheduler.reserve());
+        let commit_waiter = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let commit_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(
             scheduler.request_intent(commit_waiter, IntentRequest::new(2, commit_resources),),
@@ -1413,10 +1453,10 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let slot = require_some!(scheduler.reserve());
-        let lower = require_some!(scheduler.reserve());
+        let slot = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        let lower = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert!(scheduler.set_phase(lower, Phase::Lower));
-        let terminal = require_some!(scheduler.reserve());
+        let terminal = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let handle = HandleId::from_address(17);
         assert_eq!(
             scheduler.install(
@@ -1441,7 +1481,14 @@ mod tests {
             Some(AdmissionStart::Admitted)
         );
         scheduler.begin_drain();
-        assert!(scheduler.reserve().is_none());
+        assert!(scheduler.reserve(ExecutionClass::Ordinary).is_none());
+        assert!(scheduler.reserve(ExecutionClass::Paging).is_none());
+        let finalization = require_some!(scheduler.reserve(ExecutionClass::Finalization));
+        assert_eq!(
+            scheduler.install(finalization, Admission::Device, true),
+            Some(AdmissionStart::Admitted)
+        );
+        assert!(!scheduler.cancellation_is_pending(finalization.index(), true));
         assert_eq!(
             scheduler.drain_cancel_mask(),
             (1_u64 << slot.index()) | (1_u64 << lower.index())
@@ -1464,6 +1511,9 @@ mod tests {
         let terminal_actor = require_some!(scheduler.take_ready());
         assert_eq!(terminal_actor, terminal);
         assert!(scheduler.complete(terminal_actor));
+        let finalization_actor = require_some!(scheduler.take_ready());
+        assert_eq!(finalization_actor, finalization);
+        assert!(scheduler.complete(finalization_actor));
         assert!(!scheduler.has_active());
     }
 
@@ -1486,7 +1536,7 @@ mod tests {
         };
         let handle = HandleId::from_address(17);
         let other = HandleId::from_address(23);
-        let first = require_some!(scheduler.reserve());
+        let first = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(
             scheduler.install(
                 first,
@@ -1498,7 +1548,7 @@ mod tests {
             ),
             Some(AdmissionStart::Admitted)
         );
-        let cleanup = require_some!(scheduler.reserve());
+        let cleanup = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(
             scheduler.install(
                 cleanup,
@@ -1510,7 +1560,7 @@ mod tests {
             ),
             Some(AdmissionStart::HandleTurn)
         );
-        let independent = require_some!(scheduler.reserve());
+        let independent = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(
             scheduler.install(
                 independent,
@@ -1566,12 +1616,12 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let first = require_some!(scheduler.reserve());
+        let first = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert!(!scheduler.consume_cancel_before_effect(first.index(), false));
         assert!(scheduler.set_phase(first, Phase::Retry));
         assert!(scheduler.enter_retry(first));
         assert!(scheduler.complete(first));
-        let reused = require_some!(scheduler.reserve());
+        let reused = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(reused.index(), first.index());
         assert!(!scheduler.enter_retry(SlotId::from_parts(first.index(), first.generation())));
         assert!(scheduler.set_phase(reused, Phase::Retry));
@@ -1596,7 +1646,7 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let cancel_first = require_some!(scheduler.reserve());
+        let cancel_first = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert!(scheduler.set_phase(cancel_first, Phase::Lower));
         assert_eq!(
             scheduler.request_cancel(cancel_first.index()),
@@ -1607,7 +1657,7 @@ mod tests {
         );
         assert!(scheduler.complete(completed));
 
-        let completion_first = require_some!(scheduler.reserve());
+        let completion_first = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert!(scheduler.set_phase(completion_first, Phase::Lower));
         let completed = require_some!(scheduler.enter_phase(completion_first.index(), |phase| {
             matches!(phase, Phase::Lower)
@@ -1636,7 +1686,7 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
-        let mutation = require_some!(scheduler.reserve());
+        let mutation = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let mutation_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(
             scheduler.request_intent(mutation, IntentRequest::new(7, mutation_resources),),
@@ -1653,7 +1703,7 @@ mod tests {
         assert!(scheduler.checkpoint_authority_is_clear(mutation));
         assert!(scheduler.complete(mutation));
 
-        let device = require_some!(scheduler.reserve());
+        let device = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(
             scheduler.install(device, Admission::Device, false),
             Some(AdmissionStart::Admitted)

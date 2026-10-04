@@ -142,17 +142,6 @@ impl OplockCheck {
         Self { stream, flags: 0 }
     }
 
-    /// Builds the break check for one node-handle cleanup transition.
-    ///
-    /// FsRtl must see the closing-delete flag only for a handle whose create request selected
-    /// `FILE_DELETE_ON_CLOSE`; a later disposition request does not alter this create-time fact.
-    pub(crate) const fn cleanup(stream: OplockStreamLease, deletion: CreateDeletion) -> Self {
-        Self {
-            stream,
-            flags: cleanup_oplock_flags(deletion),
-        }
-    }
-
     /// Builds the parent-directory break check required before removing a file or link.
     pub(crate) const fn parent_removal(stream: OplockStreamLease) -> Self {
         Self {
@@ -204,6 +193,51 @@ impl OplockCheck {
             self.stream
                 .stream_context()
                 .check_oplock(irp, self.flags, continuation)
+        }
+    }
+}
+
+/// Cleanup breaks its handle oplock without waiting for client acknowledgment or delegating IRP ownership.
+#[derive(Debug)]
+pub(crate) struct CleanupOplock {
+    /// The native call retains the stream while the terminal IRP retains the FILE_OBJECT.
+    stream: OplockStreamLease,
+    /// Create-time deletion is independent of later disposition changes.
+    deletion: CreateDeletion,
+}
+impl CleanupOplock {
+    /// Captures the exact cleanup release authority before native worker transfer.
+    pub(crate) const fn new(stream: OplockStreamLease, deletion: CreateDeletion) -> Self {
+        Self { stream, deletion }
+    }
+    /// Native cleanup requires no acknowledgment and preserves driver completion ownership.
+    /// # Errors
+    /// Returns the exact synchronous FsRtl failure without suppressing later cache/handle releases.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the passive envelope retains both the cleanup IRP and exact stream through this synchronous call"
+        )
+    )]
+    pub(super) fn execute(self, irp: NonNull<wdk_sys::IRP>) -> Result<(), DriverError> {
+        let flags = cleanup_oplock_flags(self.deletion);
+        #[cfg(not(test))]
+        let status = unsafe {
+            // SAFETY: The worker owns this retained stream and live cleanup IRP; native code verifies its major.
+            self.stream.stream_context().cleanup_oplock(irp, flags)
+        };
+        #[cfg(test)]
+        let status = {
+            let _retained = (&self.stream, irp, flags);
+            wdk_sys::STATUS_SUCCESS
+        };
+        if status == STATUS_PENDING {
+            Err(DriverError::InternalInvariantViolation)
+        } else if status < wdk_sys::STATUS_SUCCESS {
+            Err(DriverError::OplockFailure(status))
+        } else {
+            Ok(())
         }
     }
 }
@@ -600,10 +634,6 @@ impl OplockEnvelope {
     }
 
     /// Reclaims a fully allocated envelope before its oplock-break effect boundary.
-    #[expect(
-        clippy::boxed_local,
-        reason = "the Box owns the stable address prepared for the native callback"
-    )]
     pub(super) fn cancel_before_submit(
         mut envelope: Box<Self>,
     ) -> (OplockCheck, OwnedIrp, Box<dyn OplockContinuation>) {
@@ -714,10 +744,6 @@ impl OplockEnvelope {
     }
 
     /// Consumes one callback state and returns the exact driver-owned IRP continuation.
-    #[expect(
-        clippy::boxed_local,
-        reason = "consuming the stable callback allocation is the unique deallocation authority"
-    )]
     fn reclaim(
         mut envelope: Box<Self>,
         expected_state: u8,
