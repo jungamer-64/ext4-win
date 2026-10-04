@@ -14,7 +14,7 @@ enum StreamCacheSnapshotPurpose {
 /// VCB-owned FCB table and share accounting protected by one concrete executive resource.
 pub(super) struct FileControlBlockLedger {
     /// Mutable ledger state reachable only while `lock` is held.
-    pub(super) table: UnsafeCell<DriverVec<Pin<Box<FileControlBlock>>>>,
+    pub(super) table: UnsafeCell<FcbRegistry>,
     /// Node-keyed mutation reservations that remain authoritative without a resident FCB.
     oplock_mutations: UnsafeCell<DriverVec<OplockMutationEntry>>,
     /// Stable-address executive resource for every table/share/reference transition.
@@ -962,7 +962,7 @@ impl FileControlBlockLedger {
     /// Returns an error when the stable executive resource cannot be allocated or initialized.
     pub(super) fn try_new() -> DriverResult<Self> {
         Ok(Self {
-            table: UnsafeCell::new(DriverVec::new()),
+            table: UnsafeCell::new(FcbRegistry::new()),
             oplock_mutations: UnsafeCell::new(DriverVec::new()),
             lock: FileControlBlockLedgerLock::try_new()?,
         })
@@ -2372,7 +2372,7 @@ impl FileControlBlockLedger {
     )]
     fn validate_deferred_stream(
         &self,
-        table: &DriverVec<Pin<Box<FileControlBlock>>>,
+        table: &FcbRegistry,
         file_object: ActiveFileObject<'_>,
         volume: NonNull<VolumeControlBlock>,
         target: DeferredStreamTarget,
@@ -2779,7 +2779,7 @@ impl PendingChildCreation {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 fn record_reused_file_control_block_open(
-    table: &DriverVec<Pin<Box<FileControlBlock>>>,
+    table: &FcbRegistry,
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
     desired_access: GrantedAccess,
@@ -2808,7 +2808,7 @@ fn record_reused_file_control_block_open(
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 fn record_file_control_block_share(
-    table: &DriverVec<Pin<Box<FileControlBlock>>>,
+    table: &FcbRegistry,
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
     desired_access: GrantedAccess,
@@ -2830,7 +2830,7 @@ fn record_file_control_block_share(
     reason = "the ledger resource uniquely owns stream-lifetime mutation and table removal"
 )]
 fn release_file_object_lease_in_table(
-    table: &mut DriverVec<Pin<Box<FileControlBlock>>>,
+    table: &mut FcbRegistry,
     fcb: NonNull<FileControlBlock>,
     native_resident: bool,
 ) -> Option<Pin<Box<FileControlBlock>>> {
@@ -2908,7 +2908,7 @@ fn oplock_grant_available(mutations: &DriverVec<OplockMutationEntry>, node: Node
 
 /// Finds a VCB-owned FCB by node identity.
 fn find_file_control_block_in_table(
-    table: &DriverVec<Pin<Box<FileControlBlock>>>,
+    table: &FcbRegistry,
     node: NodeId,
 ) -> Option<NonNull<FileControlBlock>> {
     table
@@ -2919,7 +2919,7 @@ fn find_file_control_block_in_table(
 
 /// Returns one ledger-owned FCB's open-state address after validating table ownership.
 fn ledger_file_control_block_open_state(
-    table: &DriverVec<Pin<Box<FileControlBlock>>>,
+    table: &FcbRegistry,
     fcb: NonNull<FileControlBlock>,
 ) -> NonNull<FileControlBlockOpenState> {
     let fcb = table
