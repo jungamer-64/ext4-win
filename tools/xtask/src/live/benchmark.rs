@@ -652,7 +652,7 @@ mod tests {
                 workload: Workload::Mixed,
                 fragmented: false,
             };
-            let mut offsets = std::collections::BTreeSet::new();
+            let mut offsets = alloc::collections::BTreeSet::new();
             for worker in 0..workers {
                 for block in 0..16 {
                     let offset = trace_offset(profile, worker, block)?;
