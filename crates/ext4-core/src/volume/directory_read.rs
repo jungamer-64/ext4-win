@@ -729,6 +729,7 @@ impl DirectoryReadOperation {
         mut self,
         event: super::OperationEvent,
         epoch: &CommittedEpoch,
+        cache: &mut crate::MetadataCache,
         crypto: &mut dyn CryptographicOperation,
     ) -> DirectoryReadTransition {
         match event {

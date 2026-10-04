@@ -429,6 +429,7 @@ impl EpochReadOperation {
         mut self,
         event: super::OperationEvent,
         epoch: &CommittedEpoch,
+        cache: crate::MetadataCacheAccess<'_>,
         crypto: &mut dyn CryptographicOperation,
         resolve: impl FnOnce(&mut EpochReadPass<'_, '_, '_>) -> Result<T>,
     ) -> ReadTransition<T> {
@@ -548,6 +549,7 @@ impl MutationResolveReady {
     pub fn begin_pass<'pass>(
         &'pass mut self,
         epoch: &'pass CommittedEpoch,
+        cache: crate::MetadataCacheAccess<'pass>,
         now: Ext4Timestamp,
         crypto: &'pass mut dyn CryptographicOperation,
     ) -> MutationResolvePass<'pass, 'pass, 'pass> {

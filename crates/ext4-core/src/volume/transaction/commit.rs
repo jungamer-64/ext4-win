@@ -310,6 +310,7 @@ impl ReservedMutation {
         self,
         coordinator: &mut MutationCoordinatorState,
         current_epoch: &CommittedEpoch,
+        cache: &mut crate::MetadataCache,
         commit: super::super::CommitLease,
     ) -> Result<CommitReadyMutation> {
         if commit.into_ticket() != self.resolved.observed.ticket()
