@@ -567,21 +567,29 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         .map(|index| u8::try_from(index % 251).map_err(io::Error::other))
         .collect::<io::Result<_>>()?;
     session.publish(Phase::Intent(Operation::FilesystemIo))?;
+    println!("live filesystem I/O: create payload file");
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(&alpha)?;
+    println!("live filesystem I/O: write payload");
     let operation = file.write_all(&payload).map_err(Into::into);
+    println!("live filesystem I/O: close payload handle");
     combine_verification_and_cleanup(
         operation,
         windows_host::close_file(file).map_err(Into::into),
     )?;
+    println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
+    println!("live filesystem I/O: read back payload");
     if fs::read(&alpha)? != payload {
         return Err(io::Error::other("live readback differs from payload").into());
     }
+    println!("live filesystem I/O: rename payload file");
     fs::rename(&alpha, &beta)?;
+    println!("live filesystem I/O: create hard link");
     fs::hard_link(&beta, &link)?;
+    println!("live filesystem I/O: enumerate hard-link names");
     let names = windows_host::pattern_files(&root.join("beta*"))?;
     if names.len() != 2
         || !names.contains(&OsString::from("beta.bin"))
@@ -591,18 +599,23 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
             io::Error::other("patterned enumeration did not return both hard-link names").into(),
         );
     }
+    println!("live filesystem I/O: open durability handle");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(0x8000_0000)
         .open(&beta)?;
+    println!("live filesystem I/O: flush payload");
     let operation = file.sync_all().map_err(Into::into);
+    println!("live filesystem I/O: close durability handle");
     combine_verification_and_cleanup(
         operation,
         windows_host::close_file(file).map_err(Into::into),
     )?;
     let directory = root.join("large-directory");
+    println!("live filesystem I/O: verify native directory cursor contracts");
     windows_host::verify_directory(&directory)?;
+    println!("live filesystem I/O: enumerate 100000 directory entries");
     let start = Instant::now();
     let mut first = None;
     let mut seen = BTreeSet::new();
@@ -613,6 +626,12 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         }
         if !seen.insert(entry.file_name()) {
             return Err(io::Error::other("large directory returned a duplicate name").into());
+        }
+        if seen.len().is_multiple_of(10000) {
+            println!(
+                "live filesystem I/O: enumerated {} directory entries",
+                seen.len()
+            );
         }
     }
     if seen.len() != 100000 {
@@ -632,8 +651,10 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
             &serde_json::json!({"entries": seen.len(), "first_ms": first, "total_ms": start.elapsed().as_secs_f64() * 1000.0}),
         )?,
     )?;
+    println!("live filesystem I/O: validate storage identity");
     storage::validate(&scope(session)?)?;
     session.publish(Phase::Observed(Operation::FilesystemIo))?;
+    println!("live filesystem I/O: PASS");
     Ok(payload)
 }
 
