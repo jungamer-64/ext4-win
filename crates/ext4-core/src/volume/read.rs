@@ -10,7 +10,7 @@ const MAX_READ_WINDOW_BYTES: usize = 65_536;
 /// Fully validated protection and mapping state for one fs-verity range read.
 struct VerityReadPlan {
     /// File payload and post-EOF metadata mapping.
-    extent_tree: ExtentTree,
+    extent_tree: ExtentMappingCursor,
     /// Per-inode plaintext recovery key when fscrypt also protects this inode.
     contents_key: Option<FscryptContentsKey>,
     /// ext4 post-EOF placement of the serialized Merkle tree.
@@ -858,7 +858,7 @@ impl EpochReadView<'_, '_> {
     fn read_verity_descriptor(
         &mut self,
         file: &FileNode,
-        extent_tree: &ExtentTree,
+        extent_tree: &mut ExtentMappingCursor,
         contents_key: Option<&FscryptContentsKey>,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<(Ext4VerityMetadataLayout, FsverityDescriptor)> {
@@ -909,7 +909,7 @@ impl EpochReadView<'_, '_> {
     /// Returns `VerityMismatch` for any data, proof-slot, proof-block, or root mismatch.
     fn verify_verity_data_block(
         &mut self,
-        plan: &VerityReadPlan,
+        plan: &mut VerityReadPlan,
         data_block_index: u64,
         data_block: &[u8],
         proof_block: &mut [u8],
@@ -943,7 +943,7 @@ impl EpochReadView<'_, '_> {
     fn read_prepared_plaintext_stream_range(
         &mut self,
         contents_key: Option<&FscryptContentsKey>,
-        extent_tree: &ExtentTree,
+        extent_tree: &mut ExtentMappingCursor,
         offset: u64,
         out: &mut [u8],
         crypto: &mut dyn CryptographicOperation,
@@ -1243,7 +1243,7 @@ impl EpochReadView<'_, '_> {
     pub(super) fn read_inode_plaintext_stream_range(
         &mut self,
         inode: &Inode,
-        extent_tree: &ExtentTree,
+        extent_tree: &mut ExtentMappingCursor,
         offset: u64,
         out: &mut [u8],
         crypto: &mut dyn CryptographicOperation,
@@ -1264,7 +1264,7 @@ impl EpochReadView<'_, '_> {
     pub(super) fn read_encrypted_inode_stream_range(
         &mut self,
         contents_key: &FscryptContentsKey,
-        extent_tree: &ExtentTree,
+        extent_tree: &mut ExtentMappingCursor,
         offset: u64,
         out: &mut [u8],
         crypto: &mut dyn CryptographicOperation,
@@ -1347,7 +1347,7 @@ impl EpochReadView<'_, '_> {
     /// read.
     pub(super) fn read_inode_stream_range(
         &mut self,
-        extent_tree: &ExtentTree,
+        extent_tree: &mut ExtentMappingCursor,
         offset: u64,
         out: &mut [u8],
     ) -> Result<()> {
@@ -1522,16 +1522,3 @@ impl EpochReadView<'_, '_> {
     }
 }
 
-/// Returns the exclusive byte end of the logical inode stream described by extents.
-/// # Errors
-///
-/// Returns an error when extent end calculation or final block-to-byte multiplication overflows.
-fn extent_payload_end_bytes(extent_tree: &ExtentTree, block_size: BlockSize) -> Result<u64> {
-    let mut end_blocks = 0_u64;
-    for extent in extent_tree.extents().iter().copied() {
-        end_blocks = end_blocks.max(extent.end_logical());
-    }
-    end_blocks
-        .checked_mul(u64::from(block_size.bytes()))
-        .ok_or(Error::ArithmeticOverflow)
-}
