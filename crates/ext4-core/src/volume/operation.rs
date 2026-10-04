@@ -6,6 +6,10 @@ use crate::disk::storage::{StorageTarget, StorageTranscript};
 
 /// One consuming transition of a committed-epoch read operation.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "owned transcripts and read provenance travel by value across I/O suspension without adding a heap allocation to each completion"
+)]
 pub enum ReadTransition<T> {
     /// Submit one owned lower request and suspend only this operation.
     SubmitLower {
@@ -428,11 +432,11 @@ impl EpochReadOperation {
     pub fn run<T>(
         mut self,
         event: super::OperationEvent,
-        epoch: &CommittedEpoch,
         cache: crate::MetadataCacheAccess<'_>,
         crypto: &mut dyn CryptographicOperation,
         resolve: impl FnOnce(&mut EpochReadPass<'_, '_, '_>) -> Result<T>,
     ) -> ReadTransition<T> {
+        let epoch = cache.epoch();
         match event {
             super::OperationEvent::Admitted => {}
             super::OperationEvent::StorageCompleted(completion) => {
@@ -454,7 +458,7 @@ impl EpochReadOperation {
             }
         }
         let result = {
-            let device = OperationDevice::with_overlay(&mut self.filesystem, epoch);
+            let device = OperationDevice::with_overlay(&mut self.filesystem, epoch, Some(cache));
             let mut view = EpochReadView::committed(device, epoch);
             let mut pass = EpochReadPass {
                 view: &mut view,
@@ -548,12 +552,12 @@ impl MutationResolveReady {
     #[must_use]
     pub fn begin_pass<'pass>(
         &'pass mut self,
-        epoch: &'pass CommittedEpoch,
         cache: crate::MetadataCacheAccess<'pass>,
         now: Ext4Timestamp,
         crypto: &'pass mut dyn CryptographicOperation,
     ) -> MutationResolvePass<'pass, 'pass, 'pass> {
-        let device = OperationDevice::with_overlay(&mut self.filesystem, epoch);
+        let epoch = cache.epoch();
+        let device = OperationDevice::with_overlay(&mut self.filesystem, epoch, Some(cache));
         MutationResolvePass::begin(EpochReadView::committed(device, epoch), now, crypto)
     }
 

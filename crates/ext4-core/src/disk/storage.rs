@@ -268,6 +268,8 @@ struct CompletedRead {
     offset: ByteOffset,
     /// Returned bytes.
     bytes: Vec<u8>,
+    /// Metadata registration provenance preserved from request creation.
+    stamp: Option<crate::volume::CacheReadStamp>,
 }
 
 /// Metadata retained while one read request is owned by a lower-I/O envelope.
@@ -277,6 +279,8 @@ struct InFlightRead {
     offset: ByteOffset,
     /// Exact requested byte count.
     byte_count: usize,
+    /// Metadata registration provenance; payload reads carry none.
+    stamp: Option<crate::volume::CacheReadStamp>,
 }
 
 /// Per-device read transcript retained by exactly one filesystem operation.
@@ -293,7 +297,7 @@ pub(crate) struct StorageTranscript {
     /// Completed exact reads available to later resolve passes.
     completed_reads: Vec<CompletedRead>,
     /// Request built by the current pass but not yet moved into an envelope.
-    pending_request: Option<StorageRequest>,
+    pending_request: Option<(StorageRequest, Option<crate::volume::CacheReadStamp>)>,
     /// Request currently owned by a lower-I/O envelope.
     in_flight: Option<InFlightRead>,
 }
@@ -339,27 +343,36 @@ impl StorageTranscript {
     ///
     /// Returns an error when the range is invalid, storage allocation fails, another request is
     /// already outstanding, or the caller must suspend for the newly prepared lower read.
-    pub(crate) fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+    pub(crate) fn read_exact_at(
+        &mut self,
+        offset: ByteOffset,
+        out: &mut [u8],
+        stamp: Option<crate::volume::CacheReadStamp>,
+    ) -> Result<Option<crate::volume::CacheReadStamp>> {
         validate_device_range(self.length, offset, out.len())?;
         if out.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(read) = self
             .completed_reads
             .iter()
             .find(|read| read.offset == offset && read.bytes.len() == out.len())
         {
-            return memory::copy_exact(out, &read.bytes);
+            memory::copy_exact(out, &read.bytes)?;
+            return Ok(read.stamp);
         }
         if self.pending_request.is_some() || self.in_flight.is_some() {
             return Err(Error::OperationSuspended);
         }
         let buffer = memory::repeated_vec(0_u8, out.len())?;
-        self.pending_request = Some(StorageRequest::Read {
-            target: self.target,
-            offset,
-            buffer,
-        });
+        self.pending_request = Some((
+            StorageRequest::Read {
+                target: self.target,
+                offset,
+                buffer,
+            },
+            stamp,
+        ));
         Err(Error::OperationSuspended)
     }
 
@@ -371,13 +384,14 @@ impl StorageTranscript {
         if self.in_flight.is_some() {
             return Err(Error::DeviceIo);
         }
-        let request = self.pending_request.take().ok_or(Error::DeviceIo)?;
+        let (request, stamp) = self.pending_request.take().ok_or(Error::DeviceIo)?;
         let StorageRequest::Read { offset, buffer, .. } = &request else {
             return Err(Error::DeviceIo);
         };
         self.in_flight = Some(InFlightRead {
             offset: *offset,
             byte_count: buffer.len(),
+            stamp,
         });
         Ok(request)
     }
@@ -408,6 +422,7 @@ impl StorageTranscript {
         self.completed_reads.try_push(CompletedRead {
             offset,
             bytes: buffer,
+            stamp: expected.stamp,
         })
     }
 }
@@ -419,10 +434,16 @@ pub(crate) struct OperationDevice<'transcript> {
     transcript: &'transcript mut StorageTranscript,
     /// Immutable committed overlay applied after each exact backing read.
     overlay: Option<&'transcript dyn StorageReadOverlay>,
+    /// Epoch-bound raw metadata reuse; absent while constructing the mount.
+    cache: Option<crate::MetadataCacheAccess<'transcript>>,
 }
 
 /// Immutable overlay capable of patching an exact backing-device read.
 pub(crate) trait StorageReadOverlay: core::fmt::Debug {
+    /// Supplies a fully covered exact read without consulting mutable backing storage.
+    /// # Errors
+    /// Returns overlay range or copy failures.
+    fn read(&self, target: StorageTarget, offset: ByteOffset, out: &mut [u8]) -> Result<bool>;
     /// Applies all durable overlay bytes intersecting one completed exact read.
     /// # Errors
     ///
@@ -436,6 +457,7 @@ impl<'transcript> OperationDevice<'transcript> {
         Self {
             transcript,
             overlay: None,
+            cache: None,
         }
     }
 
@@ -443,10 +465,12 @@ impl<'transcript> OperationDevice<'transcript> {
     pub(crate) const fn with_overlay(
         transcript: &'transcript mut StorageTranscript,
         overlay: &'transcript dyn StorageReadOverlay,
+        cache: Option<crate::MetadataCacheAccess<'transcript>>,
     ) -> Self {
         Self {
             transcript,
             overlay: Some(overlay),
+            cache,
         }
     }
 
@@ -461,9 +485,100 @@ impl<'transcript> OperationDevice<'transcript> {
     /// Returns an error from the transcript read or when the committed overlay cannot be applied
     /// to the requested range.
     pub(crate) fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
-        self.transcript.read_exact_at(offset, out)?;
+        if let Some(overlay) = self.overlay
+            && overlay.read(self.transcript.target, offset, out)?
+        {
+            return Ok(());
+        }
+        let _stamp = self.transcript.read_exact_at(offset, out, None)?;
         if let Some(overlay) = self.overlay {
             overlay.apply(self.transcript.target, offset, out)?;
+        }
+        Ok(())
+    }
+
+    /// Reads raw metadata by complete filesystem blocks, with overlay preceding shared reuse.
+    /// # Errors
+    /// Returns range, allocation, short-completion or suspended lower-read failures.
+    pub(crate) fn read_metadata_exact_at(
+        &mut self,
+        offset: ByteOffset,
+        out: &mut [u8],
+    ) -> Result<()> {
+        validate_device_range(self.transcript.len(), offset, out.len())?;
+        let Some(cache) = self.cache.as_mut().filter(|cache| cache.enabled()) else {
+            return self.read_exact_at(offset, out);
+        };
+        let block_size = cache.block_size();
+        let width = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let mut completed = 0_usize;
+        while completed < out.len() {
+            let position = offset
+                .get()
+                .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let block = crate::disk::block::BlockAddress::new(
+                position
+                    .checked_div(u64::from(block_size.bytes()))
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
+            let start = usize::try_from(
+                position
+                    .checked_rem(u64::from(block_size.bytes()))
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let chunk = width
+                .checked_sub(start)
+                .ok_or(Error::ArithmeticOverflow)?
+                .min(
+                    out.len()
+                        .checked_sub(completed)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                );
+            let end = completed
+                .checked_add(chunk)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let source_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
+            let target = out.get_mut(completed..end).ok_or(Error::DeviceRange)?;
+            let offset = block_size.offset_of(block)?;
+            let target_offset = ByteOffset::new(position);
+            if self
+                .overlay
+                .map(|overlay| overlay.read(self.transcript.target, target_offset, target))
+                .transpose()?
+                .unwrap_or(false)
+                || cache.read(block, start..source_end, target)
+            {
+                completed = end;
+                continue;
+            }
+            let mut bytes = memory::repeated_vec(0_u8, width)?;
+            let stamp = cache.stamp();
+            let completed_stamp = if self
+                .overlay
+                .map(|overlay| overlay.read(self.transcript.target, offset, &mut bytes))
+                .transpose()?
+                .unwrap_or(false)
+            {
+                Some(stamp)
+            } else {
+                let completed_stamp =
+                    self.transcript
+                        .read_exact_at(offset, &mut bytes, Some(stamp))?;
+                if let Some(overlay) = self.overlay {
+                    overlay.apply(self.transcript.target, offset, &mut bytes)?;
+                }
+                completed_stamp
+            };
+            memory::copy_exact(
+                target,
+                bytes.get(start..source_end).ok_or(Error::DeviceRange)?,
+            )?;
+            if let Some(stamp) = completed_stamp {
+                cache.insert(block, &bytes, stamp);
+            }
+            completed = end;
         }
         Ok(())
     }

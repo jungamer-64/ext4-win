@@ -402,6 +402,14 @@ impl ReservedMutation {
             clean_journal,
             checkpointed_epoch,
         };
+        cache.begin_mutation(
+            ordered_data_writes
+                .iter()
+                .chain(journal_writes.iter())
+                .chain(core::iter::once(&commit_write))
+                .chain(checkpoint.home_writes.iter())
+                .chain(core::iter::once(&checkpoint.clean_write)),
+        )?;
         Ok(CommitReadyMutation {
             ordered_data_writes,
             journal_writes,

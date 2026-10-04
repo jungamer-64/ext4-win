@@ -1207,6 +1207,7 @@ where
         &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
     ) -> ext4_core::Result<R>,
 {
+    let mut cache = ext4_core::MetadataCache::try_new(epoch).unwrap_or_default();
     let mut operation = ext4_core::MutationResolveOperation::new(profile);
     let mut event = ext4_core::OperationEvent::Admitted;
     let (resolved, output) = loop {
@@ -1215,7 +1216,7 @@ where
         let result = {
             let mut crypto = RejectingCryptographicOperation;
             let mut pass = ready.begin_pass(
-                epoch,
+                cache.access(epoch),
                 ext4_core::Ext4Timestamp::from_unix_seconds(1),
                 &mut crypto,
             );
@@ -1247,7 +1248,12 @@ where
         .reserve(coordinator, ext4_core::MutationLease::granted(ticket))
         .map_err(core_task_error)?;
     let prepared = reserved
-        .prepare_commit(coordinator, epoch, ext4_core::CommitLease::granted(ticket))
+        .prepare_commit(
+            coordinator,
+            epoch,
+            &mut cache,
+            ext4_core::CommitLease::granted(ticket),
+        )
         .map_err(core_task_error)?;
     Ok((prepared, output))
 }
@@ -1396,12 +1402,13 @@ where
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_internal_core(&mut storage)?;
     let (profile, epoch, _coordinator) = (*completed).into_parts();
+    let mut cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
     let mut operation = ext4_core::EpochReadOperation::new(&profile);
     let mut event = ext4_core::OperationEvent::Admitted;
     let mut lower_reads = 0_usize;
     let output = loop {
         let mut crypto = RejectingCryptographicOperation;
-        match operation.run(event, &epoch, &mut crypto, |pass| read(pass)) {
+        match operation.run(event, cache.access(&epoch), &mut crypto, |pass| read(pass)) {
             ext4_core::ReadTransition::SubmitLower { request, suspended } => {
                 if !matches!(&request, ext4_core::StorageRequest::Read { .. }) {
                     return Err(io::Error::other(
@@ -1687,7 +1694,11 @@ fn drive_directory_enumeration(
     let started = std::time::Instant::now();
     let mut first = None;
     let cursor = loop {
-        match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+        match operation.advance(
+            event,
+            ext4_core::MetadataCache::default().access(&epoch),
+            &mut RejectingCryptographicOperation,
+        ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                 reads = reads
                     .checked_add(1)
@@ -1731,7 +1742,7 @@ fn drive_directory_enumeration(
     }
     match ext4_core::DirectoryReadOperation::new(&profile, directory, cursor).advance(
         ext4_core::OperationEvent::Admitted,
-        &epoch,
+        ext4_core::MetadataCache::default().access(&epoch),
         &mut RejectingCryptographicOperation,
     ) {
         ext4_core::DirectoryReadTransition::Complete(Ok(end)) if end == cursor => {}
@@ -1766,7 +1777,11 @@ fn verify_directory_read_faults(
     );
     let mut event = ext4_core::OperationEvent::Admitted;
     loop {
-        match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+        match operation.advance(
+            event,
+            ext4_core::MetadataCache::default().access(&epoch),
+            &mut RejectingCryptographicOperation,
+        ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                 read_count = read_count
                     .checked_add(1)
@@ -1804,7 +1819,11 @@ fn verify_directory_read_faults(
             let mut emitted = 0_usize;
             let mut injected = false;
             loop {
-                match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+                match operation.advance(
+                    event,
+                    ext4_core::MetadataCache::default().access(&epoch),
+                    &mut RejectingCryptographicOperation,
+                ) {
                     ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                         if !injected && reads == fault {
                             event = if failure == ext4_core::Error::OperationCancelled {
@@ -1820,7 +1839,7 @@ fn verify_directory_read_faults(
                             };
                             match suspended.advance(
                                 event,
-                                &epoch,
+                                ext4_core::MetadataCache::default().access(&epoch),
                                 &mut RejectingCryptographicOperation,
                             ) {
                                 ext4_core::DirectoryReadTransition::Complete(Err(error))
@@ -1903,7 +1922,11 @@ fn read_directory_request(
     let mut event = ext4_core::OperationEvent::Admitted;
     let mut names = Vec::new();
     let cursor = loop {
-        match operation.advance(event, &epoch, &mut RejectingCryptographicOperation) {
+        match operation.advance(
+            event,
+            ext4_core::MetadataCache::default().access(&epoch),
+            &mut RejectingCryptographicOperation,
+        ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                 event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(
                     &mut storage,

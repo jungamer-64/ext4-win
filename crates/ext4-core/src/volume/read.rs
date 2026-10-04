@@ -517,7 +517,7 @@ impl EpochReadView<'_, '_> {
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         self.device
-            .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+            .read_metadata_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
         Ok(DirectoryBlock::new(bytes, self.directory_checksum(inode)))
     }
 
@@ -1435,7 +1435,8 @@ impl EpochReadView<'_, '_> {
 
         let mut bytes =
             memory::repeated_vec(0_u8, usize::from(self.superblock.inode_size().as_u16()))?;
-        self.device.read_exact_at(inode_offset, &mut bytes)?;
+        self.device
+            .read_metadata_exact_at(inode_offset, &mut bytes)?;
         Ok(RawInodeRecord {
             id: inode_id,
             offset: inode_offset,
@@ -1484,7 +1485,7 @@ impl EpochReadView<'_, '_> {
                 .map_err(|_| Error::ArithmeticOverflow)?,
         )?;
         self.device
-            .read_exact_at(self.superblock.block_size().offset_of(block)?, &mut bytes)?;
+            .read_metadata_exact_at(self.superblock.block_size().offset_of(block)?, &mut bytes)?;
         let external = xattr_storage::parse_external_xattr_block(&bytes, block, &self.superblock)?;
         xattr_storage::merge_xattr_sets(inline, external)
     }

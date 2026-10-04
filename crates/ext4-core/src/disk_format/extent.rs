@@ -35,7 +35,7 @@ pub(crate) trait ExtentNodeReader {
 
 impl ExtentNodeReader for OperationDevice<'_> {
     fn read_extent_bytes(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
-        self.read_exact_at(offset, out)
+        self.read_metadata_exact_at(offset, out)
     }
 }
 /// Size of one extent leaf or index entry in bytes.

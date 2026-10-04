@@ -1083,7 +1083,7 @@ impl MutationResolvePass<'_, '_, '_> {
             self.mutation
                 .volume
                 .device
-                .read_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+                .read_metadata_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
             bytes
         };
         Ok((

@@ -507,6 +507,38 @@ impl CommittedEpoch {
 }
 
 impl StorageReadOverlay for CommittedEpoch {
+    fn read(&self, target: StorageTarget, offset: ByteOffset, out: &mut [u8]) -> Result<bool> {
+        if target != StorageTarget::Filesystem {
+            return Ok(false);
+        }
+        let end = offset
+            .get()
+            .checked_add(u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?)
+            .ok_or(Error::ArithmeticOverflow)?;
+        for image in &self.overlay {
+            let start = self.superblock.block_size().offset_of(image.block())?.get();
+            let image_end = start
+                .checked_add(
+                    u64::try_from(image.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
+                )
+                .ok_or(Error::ArithmeticOverflow)?;
+            if offset.get() >= start && end <= image_end {
+                let from = usize::try_from(
+                    offset
+                        .get()
+                        .checked_sub(start)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .map_err(|_| Error::ArithmeticOverflow)?;
+                let to = from
+                    .checked_add(out.len())
+                    .ok_or(Error::ArithmeticOverflow)?;
+                memory::copy_exact(out, image.bytes().get(from..to).ok_or(Error::DeviceRange)?)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     fn apply(&self, target: StorageTarget, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
         if target != StorageTarget::Filesystem || out.is_empty() {
             return Ok(());

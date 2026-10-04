@@ -1147,10 +1147,10 @@ impl MountedVolumeOperation for ReadRequestOperation {
             }
         }
         let request = &self.request;
-        let transition =
+        let transition = access.with_metadata_cache(|cache, access| {
             read.run(
                 event,
-                self.epoch.epoch(),
+                cache.access(self.epoch.epoch()),
                 &mut self.crypto,
                 |pass| match Self::execute_pass(request, &mut owned, access, pass) {
                     Err(DriverError::Core(Error::OperationSuspended)) => {
@@ -1158,7 +1158,8 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     }
                     result => Ok(result),
                 },
-            );
+            )
+        });
         match transition {
             ReadTransition::SubmitLower { request, suspended } => {
                 self.state = ReadOperationState::Running {
@@ -4098,11 +4099,25 @@ impl MutationRequestOperation {
 
     /// Integrates one resolution event and emits only its matching next action.
     fn advance_resolution(
+        self: Box<Self>,
+        owned: OwnedIrp,
+        attempt: ResolutionAttempt,
+        event: OperationEvent,
+        operations: &mut MountedVolumeAccess<'_>,
+    ) -> MutationStep {
+        operations.with_metadata_cache(|cache, operations| {
+            self.resolve_event(owned, attempt, event, operations, cache)
+        })
+    }
+
+    /// Integrates resolution using cache authority scoped to this synchronous reactor pass.
+    fn resolve_event(
         mut self: Box<Self>,
         mut owned: OwnedIrp,
         attempt: ResolutionAttempt,
         event: OperationEvent,
         operations: &mut MountedVolumeAccess<'_>,
+        cache: &mut ext4_core::MetadataCache,
     ) -> MutationStep {
         let ResolutionAttempt {
             epoch,
@@ -4127,7 +4142,8 @@ impl MutationRequestOperation {
         let mut publication = None;
         let resolved = {
             let request = &self.request;
-            let mut pass = ready.begin_pass(epoch.epoch(), self.now, &mut self.crypto);
+            let mut pass =
+                ready.begin_pass(cache.access(epoch.epoch()), self.now, &mut self.crypto);
             match Self::execute_resolve(
                 request,
                 DriverResolveState {

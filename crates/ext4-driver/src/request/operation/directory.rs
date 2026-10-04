@@ -107,7 +107,9 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
         loop {
             match core::mem::replace(&mut self.phase, DirectoryPhase::Terminal) {
                 DirectoryPhase::Walking(walk) => {
-                    match walk.advance(event, self.epoch.epoch(), &mut self.crypto) {
+                    match access.with_metadata_cache(|cache, _access| {
+                        walk.advance(event, cache.access(self.epoch.epoch()), &mut self.crypto)
+                    }) {
                         DirectoryReadTransition::SubmitLower { request, suspended } => {
                             self.phase = DirectoryPhase::Walking(suspended);
                             return OperationTransition::SubmitLower {
@@ -152,10 +154,19 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                     }
                 }
                 DirectoryPhase::Metadata { walk, record, read } => {
-                    let transition =
-                        read.run(event, self.epoch.epoch(), &mut self.crypto, |pass| {
-                            ext4_core::CommittedReadPass::load_node_metadata(pass, record.node())
-                        });
+                    let transition = access.with_metadata_cache(|cache, _access| {
+                        read.run(
+                            event,
+                            cache.access(self.epoch.epoch()),
+                            &mut self.crypto,
+                            |pass| {
+                                ext4_core::CommittedReadPass::load_node_metadata(
+                                    pass,
+                                    record.node(),
+                                )
+                            },
+                        )
+                    });
                     match transition {
                         ReadTransition::SubmitLower { request, suspended } => {
                             self.phase = DirectoryPhase::Metadata {

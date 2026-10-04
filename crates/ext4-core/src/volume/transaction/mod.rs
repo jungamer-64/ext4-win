@@ -32,7 +32,7 @@ struct TransactionExtentSource<'source, 'device> {
 
 impl crate::disk_format::extent::ExtentNodeReader for TransactionExtentSource<'_, '_> {
     fn read_extent_bytes(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
-        self.device.read_exact_at(offset, out)?;
+        self.device.read_metadata_exact_at(offset, out)?;
         let request_start = offset.get();
         let request_end = request_start
             .checked_add(u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?)

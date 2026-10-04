@@ -172,7 +172,7 @@ impl MetadataMutation<'_, '_> {
         )?;
         self.volume
             .device
-            .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+            .read_metadata_exact_at(block_size.offset_of(block)?, &mut bytes)?;
         Ok(bytes)
     }
 

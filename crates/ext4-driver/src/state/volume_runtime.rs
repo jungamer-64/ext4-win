@@ -302,6 +302,8 @@ enum VisibilityGateState {
 /// mutation coordination.
 #[derive(Debug)]
 pub(crate) struct VolumeRuntime {
+    /// Raw metadata reuse owned by this volume and borrowed only by the sole reactor actor.
+    pub(super) metadata_cache: ext4_core::MetadataCache,
     /// Immutable feature, geometry, and device identity.
     profile: MountedProfile,
     /// Current immutable epoch owner.
@@ -331,7 +333,9 @@ impl VolumeRuntime {
     pub(crate) fn try_new(mount: CompletedMount, storage: MountedStorage) -> DriverResult<Self> {
         let (profile, epoch, coordinator) = mount.into_parts();
         let crypto = CngProvider::try_open()?;
+        let metadata_cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
         Ok(Self {
+            metadata_cache,
             profile,
             epochs: EpochRegistry::try_new(epoch)?,
             coordinator,
@@ -392,7 +396,12 @@ impl VolumeRuntime {
         reserved: ext4_core::ReservedMutation,
         commit: ext4_core::CommitLease,
     ) -> Result<ext4_core::CommitReadyMutation, ext4_core::Error> {
-        reserved.prepare_commit(&mut self.coordinator, self.epochs.current(), commit)
+        reserved.prepare_commit(
+            &mut self.coordinator,
+            self.epochs.current(),
+            &mut self.metadata_cache,
+            commit,
+        )
     }
 
     /// Allocates one stable FIFO mutation ticket before resolve begins.
@@ -437,6 +446,7 @@ impl VolumeRuntime {
 
     /// Releases a commit grant before the first lower write was issued.
     pub(crate) fn abandon_commit(&mut self, ticket: u64) {
+        self.metadata_cache.abandon_mutation();
         if self.commit_gate == (CommitGateState::CommitGranted { ticket }) {
             self.commit_gate = CommitGateState::Ready;
         }
@@ -483,6 +493,7 @@ impl VolumeRuntime {
         let published: PublishedMutation = mutation.publish(self.coordinator_mut(), visibility);
         let (epoch, checkpoint) = published.into_parts();
         let sequence = epoch.sequence();
+        self.metadata_cache.publish(&epoch);
         self.epochs.publish(durable_slot, epoch);
         self.commit_gate = CommitGateState::CheckpointPending { epoch: sequence };
         self.visibility_gate = VisibilityGateState::Ready;
@@ -504,6 +515,7 @@ impl VolumeRuntime {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         let checkpointed = durability.completed(self.coordinator_mut());
+        self.metadata_cache.publish(&checkpointed);
         self.epochs.publish(publication, checkpointed);
         self.commit_gate = CommitGateState::Ready;
     }

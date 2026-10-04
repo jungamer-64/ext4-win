@@ -144,7 +144,7 @@ impl BlockGroupDescriptor {
             0_u8,
             usize::try_from(block_bytes).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        reader.read_exact_at(block_offset, &mut block)?;
+        reader.read_metadata_exact_at(block_offset, &mut block)?;
         let start = usize::try_from(within_block).map_err(|_| Error::ArithmeticOverflow)?;
         let end = start
             .checked_add(usize::from(superblock.descriptor_size().as_u16()))

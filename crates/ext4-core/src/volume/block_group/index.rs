@@ -738,6 +738,380 @@ fn read_resize_pointer_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Drives raw metadata through the production device boundary and counts actual lower reads.
+    /// # Errors
+    /// Returns unexpected requests, failed completion or range errors.
+    fn cached_metadata_read(
+        transcript: &mut StorageTranscript,
+        epoch: &crate::CommittedEpoch,
+        cache: &mut crate::MetadataCache,
+        offset: ByteOffset,
+        out: &mut [u8],
+        backing: u8,
+    ) -> Result<usize> {
+        let mut reads = 0_usize;
+        loop {
+            match OperationDevice::with_overlay(transcript, epoch, Some(cache.access(epoch)))
+                .read_metadata_exact_at(offset, out)
+            {
+                Ok(()) => return Ok(reads),
+                Err(Error::OperationSuspended) => {
+                    let mut request = transcript.take_pending_request()?;
+                    let StorageRequest::Read { buffer, .. } = &mut request else {
+                        return Err(Error::DeviceIo);
+                    };
+                    buffer.fill(backing);
+                    let count = request.byte_count();
+                    transcript.complete(StorageCompletion::success(
+                        CompletedStorageTransfer::from_request(request),
+                        count,
+                    ))?;
+                    reads = reads.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// # Errors
+    /// Returns fixture, allocation or storage-completion failures.
+    /// # Panics
+    /// Fails if reuse admits stale bytes or publication evicts unrelated metadata.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture errors propagate while independent lower-I/O counts and bytes assert coherence"
+    )]
+    fn shared_metadata_reuse_survives_invalidation_publication_checkpoint_and_late_io() -> Result<()>
+    {
+        let (superblock, _allocation) = allocation_fixture(0, 4096, 128)?;
+        let initial = crate::CommittedEpoch::initial(
+            superblock,
+            crate::FscryptKeySet::empty(),
+            ClusterReferenceIndex::new(),
+        );
+        let mut cache = crate::MetadataCache::try_new(&initial)?;
+        let transcript = || {
+            StorageTranscript::new(
+                StorageTarget::Filesystem,
+                DeviceLength::from_bytes(4096 * 1024),
+            )
+        };
+        let mut out = [0_u8; 64];
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &initial,
+                &mut cache,
+                ByteOffset::new(3100),
+                &mut out,
+                1
+            )?,
+            1
+        );
+        assert_eq!(out, [1; 64]);
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &initial,
+                &mut cache,
+                ByteOffset::new(3200),
+                &mut out,
+                9
+            )?,
+            0
+        );
+        assert_eq!(out, [1; 64]);
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &initial,
+                &mut cache,
+                ByteOffset::new(4100),
+                &mut out,
+                1
+            )?,
+            1
+        );
+        let mut delayed = transcript();
+        assert_eq!(
+            OperationDevice::with_overlay(&mut delayed, &initial, Some(cache.access(&initial)))
+                .read_metadata_exact_at(ByteOffset::new(5120), &mut out),
+            Err(Error::OperationSuspended)
+        );
+        let mut request = delayed.take_pending_request()?;
+        let changed = crate::disk_format::journal::MetadataBlock::new(
+            BlockAddress::new(3),
+            memory::repeated_vec(2_u8, 1024)?,
+        );
+        let durable = crate::CommittedEpoch::prepared(
+            initial.sequence().next()?,
+            superblock,
+            crate::FscryptKeySet::empty(),
+            ClusterReferenceIndex::new(),
+            alloc::vec![changed],
+        );
+        let writes = [
+            StorageRequest::Write {
+                target: StorageTarget::Filesystem,
+                offset: ByteOffset::new(5120),
+                buffer: memory::repeated_vec(7_u8, 1024)?,
+            },
+            StorageRequest::Write {
+                target: StorageTarget::Filesystem,
+                offset: ByteOffset::new(3072),
+                buffer: memory::repeated_vec(2_u8, 1024)?,
+            },
+        ];
+        cache.begin_mutation(writes.iter())?;
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &initial,
+                &mut cache,
+                ByteOffset::new(4100),
+                &mut out,
+                9
+            )?,
+            0
+        );
+        assert_eq!(out, [1; 64]);
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &initial,
+                &mut cache,
+                ByteOffset::new(3100),
+                &mut out,
+                1
+            )?,
+            1
+        );
+        if let StorageRequest::Read { buffer, .. } = &mut request {
+            buffer.fill(1);
+        }
+        let count = request.byte_count();
+        delayed.complete(StorageCompletion::success(
+            CompletedStorageTransfer::from_request(request),
+            count,
+        ))?;
+        assert_eq!(
+            cached_metadata_read(
+                &mut delayed,
+                &initial,
+                &mut cache,
+                ByteOffset::new(5120),
+                &mut out,
+                9
+            )?,
+            0
+        );
+        cache.publish(&durable);
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &durable,
+                &mut cache,
+                ByteOffset::new(3100),
+                &mut out,
+                9
+            )?,
+            0
+        );
+        assert_eq!(out, [2; 64]);
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &durable,
+                &mut cache,
+                ByteOffset::new(4100),
+                &mut out,
+                9
+            )?,
+            0
+        );
+        assert_eq!(out, [1; 64]);
+        // The delayed completion could not register a block touched by the first lower write.
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &durable,
+                &mut cache,
+                ByteOffset::new(5120),
+                &mut out,
+                7
+            )?,
+            1
+        );
+        assert_eq!(out, [7; 64]);
+        let checkpoint = crate::CommittedEpoch::prepared(
+            durable.sequence().next()?,
+            superblock,
+            crate::FscryptKeySet::empty(),
+            ClusterReferenceIndex::new(),
+            Vec::new(),
+        );
+        cache.publish(&checkpoint);
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &checkpoint,
+                &mut cache,
+                ByteOffset::new(3100),
+                &mut out,
+                9
+            )?,
+            0
+        );
+        assert_eq!(out, [2; 64]);
+        // Same-epoch abort also revokes registration of reads issued before invalidation.
+        let reuse = [StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(3072),
+            buffer: memory::repeated_vec(5_u8, 1024)?,
+        }];
+        cache.begin_mutation(reuse.iter())?;
+        cache.abandon_mutation();
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &checkpoint,
+                &mut cache,
+                ByteOffset::new(3100),
+                &mut out,
+                5
+            )?,
+            1
+        );
+        assert_eq!(out, [5; 64]);
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &initial,
+                &mut cache,
+                ByteOffset::new(4100),
+                &mut out,
+                8
+            )?,
+            1
+        );
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &checkpoint,
+                &mut cache,
+                ByteOffset::new(4100),
+                &mut out,
+                9
+            )?,
+            0
+        );
+        assert_eq!(out, [1; 64]);
+        let mut short = transcript();
+        assert_eq!(
+            OperationDevice::with_overlay(&mut short, &checkpoint, Some(cache.access(&checkpoint)))
+                .read_metadata_exact_at(ByteOffset::new(6144), &mut out),
+            Err(Error::OperationSuspended)
+        );
+        let request = short.take_pending_request()?;
+        assert_eq!(
+            short.complete(StorageCompletion::success(
+                CompletedStorageTransfer::from_request(request),
+                63
+            )),
+            Err(Error::DeviceIo)
+        );
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &checkpoint,
+                &mut cache,
+                ByteOffset::new(6144),
+                &mut out,
+                6
+            )?,
+            1
+        );
+        assert_eq!(out, [6; 64]);
+        let mut cancelled = transcript();
+        assert_eq!(
+            OperationDevice::with_overlay(
+                &mut cancelled,
+                &checkpoint,
+                Some(cache.access(&checkpoint))
+            )
+            .read_metadata_exact_at(ByteOffset::new(7168), &mut out),
+            Err(Error::OperationSuspended)
+        );
+        let request = cancelled.take_pending_request()?;
+        assert_eq!(
+            cancelled.complete(StorageCompletion::failure(
+                CompletedStorageTransfer::from_request(request),
+                Error::OperationCancelled
+            )),
+            Err(Error::OperationCancelled)
+        );
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &checkpoint,
+                &mut cache,
+                ByteOffset::new(7168),
+                &mut out,
+                7
+            )?,
+            1
+        );
+        let mut payload = transcript();
+        assert_eq!(
+            OperationDevice::with_overlay(
+                &mut payload,
+                &checkpoint,
+                Some(cache.access(&checkpoint))
+            )
+            .read_exact_at(ByteOffset::new(8192), &mut out),
+            Err(Error::OperationSuspended)
+        );
+        let mut request = payload.take_pending_request()?;
+        if let StorageRequest::Read { buffer, .. } = &mut request {
+            buffer.fill(8);
+        }
+        let count = request.byte_count();
+        payload.complete(StorageCompletion::success(
+            CompletedStorageTransfer::from_request(request),
+            count,
+        ))?;
+        OperationDevice::with_overlay(&mut payload, &checkpoint, Some(cache.access(&checkpoint)))
+            .read_exact_at(ByteOffset::new(8192), &mut out)?;
+        assert_eq!(
+            cached_metadata_read(
+                &mut transcript(),
+                &checkpoint,
+                &mut cache,
+                ByteOffset::new(8192),
+                &mut out,
+                8
+            )?,
+            1
+        );
+        let mut disabled = crate::MetadataCache::default();
+        for _ in 0..2 {
+            assert_eq!(
+                cached_metadata_read(
+                    &mut transcript(),
+                    &checkpoint,
+                    &mut disabled,
+                    ByteOffset::new(4100),
+                    &mut out,
+                    4
+                )?,
+                1
+            );
+            assert_eq!(out, [4; 64]);
+        }
+        Ok(())
+    }
     use crate::disk::storage::{
         CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
     };

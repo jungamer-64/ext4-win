@@ -728,10 +728,10 @@ impl DirectoryReadOperation {
     pub fn advance(
         mut self,
         event: super::OperationEvent,
-        epoch: &CommittedEpoch,
-        cache: &mut crate::MetadataCache,
+        mut cache: crate::MetadataCacheAccess<'_>,
         crypto: &mut dyn CryptographicOperation,
     ) -> DirectoryReadTransition {
+        let epoch = cache.epoch();
         match event {
             super::OperationEvent::Admitted => {}
             super::OperationEvent::StorageCompleted(completion) => {
@@ -746,7 +746,8 @@ impl DirectoryReadOperation {
         }
         loop {
             let step = {
-                let device = OperationDevice::with_overlay(&mut self.storage, epoch);
+                let device =
+                    OperationDevice::with_overlay(&mut self.storage, epoch, Some(cache.reborrow()));
                 let mut view = EpochReadView::committed(device, epoch);
                 self.reader.step(&mut view, crypto)
             };

@@ -572,6 +572,19 @@ pub(crate) struct MountedVolumeAccess<'volume> {
 }
 
 impl MountedVolumeAccess<'_> {
+    /// Lends the cache to one synchronous pass while retaining independent driver authorities.
+    /// The sole reactor actor cannot admit another pass while this closure runs. The owner is
+    /// restored before any returned scheduler transition is acted upon; no cache borrow can
+    /// enter a lower envelope. Temporary absence is an ordinary disabled cache representation.
+    pub(crate) fn with_metadata_cache<T>(
+        &mut self,
+        operation: impl FnOnce(&mut ext4_core::MetadataCache, &mut Self) -> T,
+    ) -> T {
+        let mut cache = core::mem::take(&mut self.volume.runtime.metadata_cache);
+        let result = operation(&mut cache, self);
+        self.volume.runtime.metadata_cache = cache;
+        result
+    }
     /// Closes new-create admission before waiting for already admitted mutations to drain.
     /// # Errors
     /// Returns device busy for a direct open or competing lifecycle, terminal media failure,
