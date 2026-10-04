@@ -1017,6 +1017,10 @@ mod mapping_tests {
     /// # Panics
     /// Panics when routing or transfer counts violate the requested-path contract.
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture setup is fallible; assertions independently observe selected-route behavior"
+    )]
     fn selected_route_preserves_parent_interval_and_reuses_its_leaf() -> Result<()> {
         let mut root = [0_u8; 60];
         put_le_u16(&mut root, disk_offset(0), 0xf30a)?;

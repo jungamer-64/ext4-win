@@ -2,7 +2,161 @@
 
 use super::*;
 
+/// Allocation authority is absent from an EOF-bounded initialized overwrite.
+enum FileWritePlan {
+    /// Every payload byte has a validated initialized physical destination.
+    Overwrite(InitializedOverwrite),
+    /// Owns the allocation and extent serialization required by holes or EOF changes.
+    AllocationChange(MutableExtentTree),
+}
+
+/// Private witness constructed only after the complete requested range has been mapped.
+struct InitializedOverwrite {
+    /// Ordered source slices and physical destinations; no inode allocation state changes.
+    blocks: Vec<OverwriteBlock>,
+}
+
+/// One block-sized or partial-block destination within a validated overwrite.
+struct OverwriteBlock {
+    /// Encryption data-unit coordinate.
+    logical: LogicalBlock,
+    /// Existing initialized storage block.
+    physical: BlockAddress,
+    /// Byte position inside the physical block.
+    in_block: u64,
+    /// Exact slice in the original write payload.
+    source: core::ops::Range<usize>,
+}
+
 impl MutationResolvePass<'_, '_, '_> {
+    /// Resolves the entire overwrite before staging any data or acquiring allocation authority.
+    /// # Errors
+    /// Returns selected-node validation, I/O, range, or allocation failures.
+    fn prepare_file_write(
+        &mut self,
+        inode: &Inode,
+        offset: FileOffset,
+        len: usize,
+    ) -> Result<FileWritePlan> {
+        if offset.checked_add_len(len)?.bytes() > inode.size().bytes() {
+            return Ok(FileWritePlan::AllocationChange(
+                self.mutation.mutable_extent_tree(inode)?,
+            ));
+        }
+        let block_size = self.mutation.volume.superblock.block_size();
+        let width = u64::from(block_size.bytes());
+        let mut cursor = ExtentMappingCursor::new(
+            inode.extent_root()?,
+            block_size,
+            self.mutation.volume.extent_tree_context(inode),
+        )?;
+        let mut blocks = Vec::new();
+        let mut completed = 0_usize;
+        while completed < len {
+            let position = offset
+                .bytes()
+                .checked_add(u64::try_from(completed).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let logical = LogicalBlock::try_from(
+                position
+                    .checked_div(width)
+                    .ok_or(Error::InvalidSuperblock)?,
+            )?;
+            let in_block = position
+                .checked_rem(width)
+                .ok_or(Error::InvalidSuperblock)?;
+            let chunk = usize::try_from(
+                width
+                    .checked_sub(in_block)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?
+            .min(
+                len.checked_sub(completed)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
+            let physical = {
+                let mut source = TransactionExtentSource {
+                    device: &mut self.mutation.volume.device,
+                    staged: &self.mutation.extent_updates,
+                    block_size,
+                };
+                match cursor.map(logical, &mut source)? {
+                    BlockMapping::Physical(physical) => physical,
+                    BlockMapping::Uninitialized | BlockMapping::Hole => {
+                        return Ok(FileWritePlan::AllocationChange(
+                            self.mutation.mutable_extent_tree(inode)?,
+                        ));
+                    }
+                }
+            };
+            let end = completed
+                .checked_add(chunk)
+                .ok_or(Error::ArithmeticOverflow)?;
+            blocks.try_push(OverwriteBlock {
+                logical,
+                physical,
+                in_block,
+                source: completed..end,
+            })?;
+            completed = end;
+        }
+        Ok(FileWritePlan::Overwrite(InitializedOverwrite { blocks }))
+    }
+
+    /// Consumes mapped destinations without modifying or serializing the inode's extent root.
+    /// # Errors
+    /// Returns payload-copy, encryption, partial-block read, or staging allocation failures.
+    fn stage_initialized_overwrite(
+        &mut self,
+        inode: &Inode,
+        plan: InitializedOverwrite,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let key = if inode.protection().is_encrypted() {
+            Some(
+                self.mutation
+                    .volume
+                    .fscrypt_contents_key_for_inode(inode, self.crypto)?,
+            )
+        } else {
+            None
+        };
+        let block_size = self.mutation.volume.superblock.block_size();
+        for block in plan.blocks {
+            let payload = bytes.get(block.source).ok_or(Error::DeviceRange)?;
+            if let Some(key) = &key {
+                let base = if block.in_block == 0
+                    && payload.len()
+                        == usize::try_from(block_size.bytes())
+                            .map_err(|_| Error::ArithmeticOverflow)?
+                {
+                    EncryptedBlockBase::ZeroedPlaintext
+                } else {
+                    EncryptedBlockBase::ExistingPlaintext
+                };
+                self.stage_encrypted_file_block_update(
+                    key,
+                    block.logical,
+                    block.physical,
+                    block.in_block,
+                    payload,
+                    base,
+                )?;
+            } else {
+                let offset = block_size
+                    .offset_of(block.physical)?
+                    .get()
+                    .checked_add(block.in_block)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                self.mutation.data_writes.try_push(RangeWrite {
+                    offset: ByteOffset::new(offset),
+                    bytes: memory::copied_slice(payload)?,
+                })?;
+            }
+        }
+        Ok(())
+    }
     /// Writes bytes into a regular file and extends EOF when the range reaches beyond it.
     ///
     /// # Errors
@@ -43,7 +197,9 @@ impl MutationResolvePass<'_, '_, '_> {
 
         let plan = self.prepare_file_write(&inode, offset, bytes.len())?;
         match plan {
-            FileWritePlan::Overwrite(plan) => self.stage_initialized_overwrite(&inode, plan, bytes)?,
+            FileWritePlan::Overwrite(plan) => {
+                self.stage_initialized_overwrite(&inode, plan, bytes)?
+            }
             FileWritePlan::AllocationChange(mut tree) => {
                 if tree.contains_uninitialized() {
                     return Err(Error::UnsupportedInodeMutation);
@@ -52,7 +208,12 @@ impl MutationResolvePass<'_, '_, '_> {
                     self.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)?;
                 }
                 if inode.protection().is_encrypted() {
-                    self.stage_encrypted_inode_stream_write(&inode, &mut tree, offset.bytes(), bytes)?;
+                    self.stage_encrypted_inode_stream_write(
+                        &inode,
+                        &mut tree,
+                        offset.bytes(),
+                        bytes,
+                    )?;
                 } else {
                     self.stage_inode_stream_write(&mut tree, offset.bytes(), bytes)?;
                 }
@@ -62,7 +223,10 @@ impl MutationResolvePass<'_, '_, '_> {
         if let Some(encoded_new_size) = encoded_new_size {
             raw_inode.set_encoded_size(encoded_new_size)?;
         }
-        raw_inode.set_timestamps(self.now, self.mutation.volume.superblock.inode_timestamp_encoding())?;
+        raw_inode.set_timestamps(
+            self.now,
+            self.mutation.volume.superblock.inode_timestamp_encoding(),
+        )?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
