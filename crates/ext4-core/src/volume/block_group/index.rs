@@ -1610,4 +1610,311 @@ mod tests {
         ));
         Ok(())
     }
+    mod stream_tests {
+        use super::*;
+        use crate::disk::storage::StorageTranscript;
+        use crate::disk_format::inode::InodeExtentRoot;
+        use crate::{CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget};
+        use hkdf::Hkdf;
+        use sha2::{Digest, Sha256, Sha512};
+
+        /// Independent raw stream images and their committed geometry.
+        struct StreamFixture {
+            /// Mounted block geometry used by production range reads.
+            epoch: CommittedEpoch,
+            /// Inode routing leaves an intentionally unreadable middle branch.
+            root: InodeExtentRoot,
+            /// Only the selected routes and authenticated data/proof blocks exist.
+            images: Vec<(u64, Vec<u8>)>,
+        }
+
+        /// Independent hashes and a reversible transport double; platform cipher vectors belong to CNG.
+        #[derive(Debug, Default)]
+        struct StreamCrypto {
+            /// Logical data units submitted for recovery from the selected physical blocks.
+            units: Vec<u64>,
+        }
+
+        impl CryptographicOperation for StreamCrypto {
+            fn fill_random(&mut self, _: &mut [u8]) -> Result<()> {
+                Err(Error::CryptographicFailure)
+            }
+            fn hkdf_sha512(&mut self, key: &[u8], info: &[u8], out: &mut [u8]) -> Result<()> {
+                Hkdf::<Sha512>::new(None, key)
+                    .expand(info, out)
+                    .map_err(|_| Error::CryptographicFailure)
+            }
+            fn encrypt_aes_256_xts(
+                &mut self,
+                key: &[u8; 64],
+                unit: u64,
+                bytes: &mut [u8],
+            ) -> Result<()> {
+                for (byte, key) in bytes.iter_mut().zip(key.iter().cycle()) {
+                    *byte ^= key;
+                }
+                for (byte, tweak) in bytes.iter_mut().zip(unit.to_le_bytes().into_iter().cycle()) {
+                    *byte ^= tweak;
+                }
+                Ok(())
+            }
+            fn decrypt_aes_256_xts(
+                &mut self,
+                key: &[u8; 64],
+                unit: u64,
+                bytes: &mut [u8],
+            ) -> Result<()> {
+                self.units.try_push(unit)?;
+                self.encrypt_aes_256_xts(key, unit, bytes)
+            }
+            fn encrypt_aes_256_cbc_cs3(&mut self, _: &[u8; 32], _: &mut [u8]) -> Result<()> {
+                Err(Error::CryptographicFailure)
+            }
+            fn decrypt_aes_256_cbc_cs3(&mut self, _: &[u8; 32], _: &mut [u8]) -> Result<()> {
+                Err(Error::CryptographicFailure)
+            }
+            fn sha256(&mut self, input: &[u8]) -> Result<[u8; 32]> {
+                Ok(Sha256::digest(input).into())
+            }
+            fn sha512(&mut self, input: &[u8]) -> Result<[u8; 64]> {
+                Ok(Sha512::digest(input).into())
+            }
+        }
+
+        /// Encodes the ext4 wire fields without the production tree serializer or verifier.
+        /// # Errors
+        /// Returns independent geometry or byte-copy failures.
+        fn stream_fixture() -> Result<StreamFixture> {
+            let (superblock, _allocation) = super::allocation_fixture(0, 4096, 128)?;
+            let epoch = CommittedEpoch::initial(
+                superblock,
+                FscryptKeySet::empty(),
+                ClusterReferenceIndex::new(),
+            );
+            let mut root = [0_u8; 60];
+            for (offset, value) in [(0, 0xf30a), (2, 3), (4, 4), (6, 1)] {
+                put_le_u16(&mut root, disk_offset(offset), value)?;
+            }
+            for (offset, value) in [(16, 7), (24, 8), (28, 8), (36, 64), (40, 9)] {
+                put_le_u32(&mut root, disk_offset(offset), value)?;
+            }
+            let mut images = Vec::new();
+            for (physical, logical, start) in [(7, 0, 40), (9, 64, 50)] {
+                let mut leaf = memory::repeated_vec(0_u8, 1024)?;
+                for (offset, value) in [(0, 0xf30a), (2, 1), (4, 84), (16, 2)] {
+                    put_le_u16(&mut leaf, disk_offset(offset), value)?;
+                }
+                put_le_u32(&mut leaf, disk_offset(12), logical)?;
+                put_le_u32(&mut leaf, disk_offset(20), start)?;
+                images.try_push((physical, leaf))?;
+            }
+            images.try_push((40, memory::repeated_vec(1, 1024)?))?;
+            images.try_push((41, memory::repeated_vec(2, 1024)?))?;
+            let mut proof = memory::repeated_vec(0_u8, 1024)?;
+            for (slot, payload) in [(0..32, 1_u8), (32..64, 2_u8)] {
+                memory::copy_exact(
+                    proof.get_mut(slot).ok_or(Error::DeviceRange)?,
+                    &Sha256::digest([payload; 1024]),
+                )?;
+            }
+            let mut descriptor = memory::repeated_vec(0_u8, 1024)?;
+            memory::copy_exact(
+                descriptor.get_mut(..4).ok_or(Error::DeviceRange)?,
+                &[1, 1, 10, 0],
+            )?;
+            memory::copy_exact(
+                descriptor.get_mut(8..16).ok_or(Error::DeviceRange)?,
+                &2048_u64.to_le_bytes(),
+            )?;
+            memory::copy_exact(
+                descriptor.get_mut(16..48).ok_or(Error::DeviceRange)?,
+                &Sha256::digest(&proof),
+            )?;
+            put_le_u32(&mut descriptor, disk_offset(1020), 256)?;
+            images.try_push((50, proof))?;
+            images.try_push((51, descriptor))?;
+            Ok(StreamFixture {
+                epoch,
+                root: InodeExtentRoot::from_bytes(root),
+                images,
+            })
+        }
+
+        /// Drives real lower envelopes, rejecting every physical block absent from the independent fixture.
+        /// # Errors
+        /// Returns traversal, verification, allocation or unexpected lower-route failures.
+        fn drive_stream<R>(
+            epoch: &CommittedEpoch,
+            images: &[(u64, Vec<u8>)],
+            mut read: impl FnMut(&mut EpochReadView<'_, '_>) -> Result<R>,
+        ) -> Result<(R, Vec<u64>)> {
+            let mut transcript = StorageTranscript::new(
+                StorageTarget::Filesystem,
+                DeviceLength::from_bytes(4_194_304),
+            );
+            let mut cache = crate::MetadataCache::try_new(epoch)?;
+            let mut requests = Vec::new();
+            for _ in 0..16 {
+                let result = read(&mut EpochReadView::committed(
+                    OperationDevice::with_overlay(
+                        &mut transcript,
+                        epoch,
+                        Some(cache.access(epoch)),
+                    ),
+                    epoch,
+                ));
+                match result {
+                    Ok(value) => return Ok((value, requests)),
+                    Err(Error::OperationSuspended) => {
+                        let mut request = transcript.take_pending_request()?;
+                        let StorageRequest::Read { offset, buffer, .. } = &mut request else {
+                            return Err(Error::DeviceIo);
+                        };
+                        let physical = offset
+                            .get()
+                            .checked_div(1024)
+                            .ok_or(Error::ArithmeticOverflow)?;
+                        let start = usize::try_from(
+                            offset
+                                .get()
+                                .checked_rem(1024)
+                                .ok_or(Error::ArithmeticOverflow)?,
+                        )
+                        .map_err(|_| Error::ArithmeticOverflow)?;
+                        let end = start
+                            .checked_add(buffer.len())
+                            .ok_or(Error::ArithmeticOverflow)?;
+                        let bytes = images
+                            .iter()
+                            .find(|(block, _)| *block == physical)
+                            .and_then(|(_, bytes)| bytes.get(start..end))
+                            .ok_or(Error::DeviceIo)?;
+                        memory::copy_exact(buffer, bytes)?;
+                        requests.try_push(physical)?;
+                        let count = request.byte_count();
+                        transcript.complete(StorageCompletion::success(
+                            CompletedStorageTransfer::from_request(request),
+                            count,
+                        ))?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(Error::DeviceIo)
+        }
+
+        /// # Errors
+        /// Returns independent fixture or selected-path/decryption failures.
+        /// # Panics
+        /// Fails if an unrequested node/data block is read or decryption uses a physical coordinate.
+        #[test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "fixture and lower I/O failures propagate separately from route assertions"
+        )]
+        fn encrypted_partial_read_uses_only_its_extent_route_and_logical_data_unit() -> Result<()> {
+            let StreamFixture {
+                epoch,
+                root,
+                mut images,
+            } = stream_fixture()?;
+            let mut crypto = StreamCrypto::default();
+            let key = FscryptMasterKey::from_raw(&[7; 32], &mut crypto)?
+                .derive_contents_key(FscryptFileNonce::new([9; 16]), &mut crypto)?;
+            let bytes = &mut images
+                .iter_mut()
+                .find(|(block, _)| *block == 41)
+                .ok_or(Error::DeviceIo)?
+                .1;
+            key.encrypt_block(1, bytes, &mut crypto)?;
+            let mut out = [0_u8; 64];
+            let (_, requests) = drive_stream(&epoch, &images, |view| {
+                let mut cursor = ExtentMappingCursor::new(
+                    &root,
+                    epoch.superblock.block_size(),
+                    ExtentTreeContext::none(),
+                )?;
+                view.read_encrypted_inode_stream_range(
+                    &key,
+                    &mut cursor,
+                    1031,
+                    &mut out,
+                    &mut crypto,
+                )
+            })?;
+            assert_eq!(out, [2; 64]);
+            assert_eq!(requests, vec![7, 41]);
+            assert_eq!(crypto.units, vec![1]);
+            Ok(())
+        }
+
+        /// # Errors
+        /// Returns independent fixture, inode parse, or proof traversal failures.
+        /// # Panics
+        /// Fails if unrelated file extents/data are needed or unauthenticated bytes become visible.
+        #[test]
+        #[expect(
+            clippy::panic_in_result_fn,
+            reason = "independent fixture setup is separate from bounded proof and corruption assertions"
+        )]
+        fn verity_range_reads_only_data_descriptor_and_required_proof_routes() -> Result<()> {
+            let StreamFixture {
+                epoch,
+                root,
+                mut images,
+            } = stream_fixture()?;
+            let mut raw = [0_u8; 256];
+            put_le_u16(&mut raw, disk_offset(0), 0x8000)?;
+            put_le_u16(&mut raw, disk_offset(26), 1)?;
+            put_le_u32(&mut raw, disk_offset(4), 2048)?;
+            put_le_u32(&mut raw, disk_offset(28), 8)?;
+            put_le_u32(&mut raw, disk_offset(32), 0x0018_0000)?;
+            memory::copy_exact(
+                raw.get_mut(40..100).ok_or(Error::DeviceRange)?,
+                root.bytes(),
+            )?;
+            let LoadedNode::File(file) = LoadedNode::from_inode(Inode::parse(
+                InodeId::try_from(12)?,
+                &raw,
+                epoch.superblock.inode_data_encoding(),
+            )?) else {
+                return Err(Error::WrongInodeKind);
+            };
+            let mut crypto = StreamCrypto::default();
+            let mut out = [0xa5_u8; 64];
+            let (read, requests) = drive_stream(&epoch, &images, |view| {
+                view.read_verified_file(&file, FileOffset::from_bytes(1031), &mut out, &mut crypto)
+            })?;
+            assert_eq!(read.as_usize(), 64);
+            assert_eq!(out, [2; 64]);
+            assert_eq!(requests.iter().filter(|block| **block == 7).count(), 1);
+            assert_eq!(requests.iter().filter(|block| **block == 9).count(), 1);
+            assert!(!requests.iter().any(|block| matches!(*block, 8 | 40)));
+            let (read, requests) = drive_stream(&epoch, &images, |view| {
+                view.read_verified_file(&file, FileOffset::from_bytes(2048), &mut out, &mut crypto)
+            })?;
+            assert_eq!(read.as_usize(), 0);
+            assert!(requests.is_empty());
+            images
+                .iter_mut()
+                .find(|(block, _)| *block == 41)
+                .ok_or(Error::DeviceIo)?
+                .1
+                .get_mut(0)
+                .ok_or(Error::DeviceRange)?
+                .clone_from(&3);
+            out.fill(0xa5);
+            assert!(matches!(
+                drive_stream(&epoch, &images, |view| view.read_verified_file(
+                    &file,
+                    FileOffset::from_bytes(1031),
+                    &mut out,
+                    &mut crypto
+                )),
+                Err(Error::VerityMismatch)
+            ));
+            assert_eq!(out, [0xa5; 64]);
+            Ok(())
+        }
+    }
 }
