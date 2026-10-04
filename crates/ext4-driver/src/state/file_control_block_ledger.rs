@@ -184,7 +184,15 @@ impl FcbRegistry {
         let reserve = count.and_then(|count| {
             self.nodes.reserve(count)?;
             self.pointers.reserve(count)?;
-            self.owned.try_reserve_exact(1)
+            let capacity = count
+                .checked_next_power_of_two()
+                .ok_or(DriverError::InsufficientResources)?
+                .max(16);
+            self.owned.try_reserve_exact(
+                capacity
+                    .checked_sub(self.len())
+                    .ok_or(DriverError::InsufficientResources)?,
+            )
         });
         if let Err(error) = reserve {
             return Err(memory::PushError::Reserve { error, value });
