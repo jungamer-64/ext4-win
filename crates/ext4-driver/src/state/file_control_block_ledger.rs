@@ -2,6 +2,266 @@
 
 use super::*;
 
+/// Owning pinned storage and its two projections mutate under the ledger resource.
+/// Reserving all three allocations precedes insertion; deletion repairs swapped positions.
+pub(super) struct FcbRegistry {
+    /// The sole ownership authority; moving boxes cannot move an FCB.
+    owned: DriverVec<Pin<Box<FileControlBlock>>>,
+    /// Node identities projected to owning positions.
+    nodes: FcbIndex,
+    /// Observed pointer addresses projected to owning positions; never pointer constructors.
+    pointers: FcbIndex,
+}
+
+/// One occupied open-addressed index cell.
+#[derive(Clone, Copy)]
+struct FcbIndexEntry {
+    /// Node or address key in the index's single identity domain.
+    key: u64,
+    /// Position in the registry's owning storage.
+    owner: usize,
+}
+
+/// Fallibly growing index; deletion rehashes the following cluster without tombstones.
+struct FcbIndex {
+    /// Power-of-two slot storage, kept at most half occupied.
+    slots: DriverVec<Option<FcbIndexEntry>>,
+}
+
+impl FcbIndex {
+    /// Creates an allocation-free empty index.
+    const fn new() -> Self {
+        Self {
+            slots: DriverVec::new(),
+        }
+    }
+
+    /// Locates the requested key or the first vacant slot.
+    fn slot(&self, key: u64) -> Option<usize> {
+        let mut hash = (key ^ (key >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        hash ^= hash >> 31;
+        let mask = self.slots.len().checked_sub(1)?;
+        let mut position = usize::try_from(hash & u64::try_from(mask).ok()?).ok()?;
+        for _ in 0..self.slots.len() {
+            match self.slots.as_slice().get(position)? {
+                None => return Some(position),
+                Some(entry) if entry.key == key => return Some(position),
+                Some(_) => position = position.wrapping_add(1) & mask,
+            }
+        }
+        None
+    }
+
+    /// Projects an existing key to its owning position.
+    fn owner(&self, key: u64) -> Option<usize> {
+        self.slot(key)
+            .and_then(|slot| self.slots.as_slice().get(slot))
+            .and_then(Option::as_ref)
+            .map(|entry| entry.owner)
+    }
+
+    /// Admits enough index storage for the resulting owner count.
+    /// # Errors
+    /// Returns insufficient resources before ownership changes.
+    fn reserve(&mut self, owners: usize) -> DriverResult<()> {
+        let required = owners
+            .checked_mul(2)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or(DriverError::InsufficientResources)?
+            .max(16);
+        if required <= self.slots.len() {
+            return Ok(());
+        }
+        let mut next = Self {
+            slots: DriverVec::try_repeated_copy(None, required)?,
+        };
+        for entry in self.slots.iter().flatten().copied() {
+            next.set(entry.key, entry.owner);
+        }
+        *self = next;
+        Ok(())
+    }
+
+    /// Updates a previously admitted slot without allocation.
+    fn set(&mut self, key: u64, owner: usize) {
+        let slot = self.slot(key).unwrap_or_else(|| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        let cell = self.slots.as_mut_slice().get_mut(slot).unwrap_or_else(|| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        *cell = Some(FcbIndexEntry { key, owner });
+    }
+
+    /// Erases a key and restores search termination at the next vacant slot.
+    fn remove(&mut self, key: u64) {
+        let slot = self.slot(key).unwrap_or_else(|| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        let cell = self.slots.as_mut_slice().get_mut(slot).unwrap_or_else(|| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        });
+        if cell.take().is_none() {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+        let mask = self.slots.len().saturating_sub(1);
+        let mut position = slot.wrapping_add(1) & mask;
+        loop {
+            let entry = self
+                .slots
+                .as_mut_slice()
+                .get_mut(position)
+                .and_then(Option::take);
+            let Some(entry) = entry else {
+                break;
+            };
+            self.set(entry.key, entry.owner);
+            position = position.wrapping_add(1) & mask;
+        }
+    }
+}
+
+impl FcbRegistry {
+    /// Creates all projections without allocating.
+    const fn new() -> Self {
+        Self {
+            owned: DriverVec::new(),
+            nodes: FcbIndex::new(),
+            pointers: FcbIndex::new(),
+        }
+    }
+    /// Existing owning count.
+    fn len(&self) -> usize {
+        self.owned.len()
+    }
+    /// Whether any lifetime authority remains.
+    pub(super) fn is_empty(&self) -> bool {
+        self.owned.is_empty()
+    }
+    /// Iterates owners for operations whose contract covers all resident streams.
+    pub(super) fn iter(&self) -> core::slice::Iter<'_, Pin<Box<FileControlBlock>>> {
+        self.owned.iter()
+    }
+    /// Reads one indexed owner without deriving authority from an unchecked pointer.
+    fn get(&self, index: usize) -> Option<&Pin<Box<FileControlBlock>>> {
+        self.owned.as_slice().get(index)
+    }
+    /// Projects a node identity to owning storage.
+    fn node_index(&self, node: NodeId) -> Option<usize> {
+        self.nodes.owner(Self::node_key(node))
+    }
+    /// Validates pointer membership through its address index.
+    fn pointer_index(&self, pointer: NonNull<FileControlBlock>) -> Option<usize> {
+        self.pointers.owner(Self::pointer_key(pointer))
+    }
+    /// Encodes kind and inode without merging different node identity domains.
+    fn node_key(node: NodeId) -> u64 {
+        let kind = match node {
+            NodeId::File(_) => 0_u64,
+            NodeId::Directory(_) => 1,
+            NodeId::Symlink(_) => 2,
+        };
+        (kind << 32) | u64::from(node.file_index())
+    }
+    /// Observes an address exclusively for membership; storage retains pointer provenance.
+    fn pointer_key(pointer: NonNull<FileControlBlock>) -> u64 {
+        u64::try_from(pointer.as_ptr().addr()).unwrap_or_else(|_| {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+        })
+    }
+    /// Reserves ownership and both projections before publishing one FCB.
+    /// # Errors
+    /// Returns the unchanged candidate when any allocation fails.
+    pub(super) fn try_push_owned(
+        &mut self,
+        value: Pin<Box<FileControlBlock>>,
+    ) -> Result<(), memory::PushError<Pin<Box<FileControlBlock>>>> {
+        let count = self
+            .len()
+            .checked_add(1)
+            .ok_or(DriverError::InsufficientResources);
+        let reserve = count.and_then(|count| {
+            self.nodes.reserve(count)?;
+            self.pointers.reserve(count)?;
+            self.owned.try_reserve_exact(1)
+        });
+        if let Err(error) = reserve {
+            return Err(memory::PushError::Reserve { error, value });
+        }
+        let node = Self::node_key(value.node());
+        let pointer = Self::pointer_key(NonNull::from(value.as_ref().get_ref()));
+        let position = self.len();
+        self.owned.push_reserved_owned(value)?;
+        self.nodes.set(node, position);
+        self.pointers.set(pointer, position);
+        Ok(())
+    }
+    /// Erases projections and repairs the owner moved into the vacated position.
+    fn swap_remove(&mut self, index: usize) -> Option<Pin<Box<FileControlBlock>>> {
+        let owner = self.get(index)?;
+        let node = Self::node_key(owner.node());
+        let pointer = Self::pointer_key(NonNull::from(owner.as_ref().get_ref()));
+        self.nodes.remove(node);
+        self.pointers.remove(pointer);
+        let removed = self.owned.swap_remove(index);
+        if let Some(moved) = self.get(index) {
+            let node = Self::node_key(moved.node());
+            let pointer = Self::pointer_key(NonNull::from(moved.as_ref().get_ref()));
+            self.nodes.set(node, index);
+            self.pointers.set(pointer, index);
+        }
+        removed
+    }
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    /// # Panics
+    /// Panics if growth, cluster deletion or address reuse loses another resident owner.
+    #[test]
+    fn indexed_membership_survives_growth_deletion_and_reuse() {
+        let result = (|| -> DriverResult<()> {
+            let mut index = FcbIndex::new();
+            for owner in 0_usize..8192 {
+                index.reserve(
+                    owner
+                        .checked_add(1)
+                        .ok_or(DriverError::InsufficientResources)?,
+                )?;
+                index.set(
+                    u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?,
+                    owner,
+                );
+            }
+            for owner in (0_usize..8192).step_by(2) {
+                index.remove(u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?);
+            }
+            for owner in 0_usize..8192 {
+                let key = u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?;
+                assert_eq!(
+                    index.owner(key),
+                    if owner % 2 == 0 { None } else { Some(owner) }
+                );
+                if owner % 2 == 0 {
+                    index.set(key, 8192);
+                }
+            }
+            for owner in 0_usize..8192 {
+                let key = u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?;
+                assert_eq!(
+                    index.owner(key),
+                    Some(if owner % 2 == 0 { 8192 } else { owner })
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+}
+
 /// Admission condition for the retained-stream snapshot.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StreamCacheSnapshotPurpose {
@@ -2209,10 +2469,7 @@ impl FileControlBlockLedger {
             // SAFETY: The executive resource serializes table lookup and lifetime mutation.
             &*self.table.get()
         };
-        if !table
-            .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
-        {
+        if !table.pointer_index(fcb).is_some() {
             return Err(DriverError::InternalInvariantViolation);
         }
         let mut state = ledger_file_control_block_open_state(table, fcb);
@@ -2246,10 +2503,7 @@ impl FileControlBlockLedger {
             // SAFETY: The executive resource serializes table lookup and lifetime mutation.
             &*self.table.get()
         };
-        if !table
-            .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
-        {
+        if !table.pointer_index(fcb).is_some() {
             return Err(DriverError::InternalInvariantViolation);
         }
         let node = unsafe {
@@ -2293,10 +2547,7 @@ impl FileControlBlockLedger {
             // SAFETY: The executive resource serializes table membership and open state.
             &*self.table.get()
         };
-        if !table
-            .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
-        {
+        if !table.pointer_index(fcb).is_some() {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
         }
         let node = unsafe {
@@ -2389,10 +2640,7 @@ impl FileControlBlockLedger {
             StreamContext::decode_owner(header, StreamOwnerKind::Node)?
         }
         .cast::<FileControlBlock>();
-        if !table
-            .iter()
-            .any(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
-        {
+        if !table.pointer_index(fcb).is_some() {
             return Err(DriverError::InvalidParameter);
         }
         let stream = unsafe {
@@ -2438,10 +2686,7 @@ impl FileControlBlockLedger {
                 // SAFETY: The executive resource uniquely owns table and lifetime mutation.
                 &mut *self.table.get()
             };
-            let Some(index) = table
-                .iter()
-                .position(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
-            else {
+            let Some(index) = table.pointer_index(fcb) else {
                 KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
             };
             let mut state = ledger_file_control_block_open_state(table, fcb);
@@ -2834,10 +3079,7 @@ fn release_file_object_lease_in_table(
     fcb: NonNull<FileControlBlock>,
     native_resident: bool,
 ) -> Option<Pin<Box<FileControlBlock>>> {
-    let Some(index) = table
-        .iter()
-        .position(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
-    else {
+    let Some(index) = table.pointer_index(fcb) else {
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
     };
     let mut state = ledger_file_control_block_open_state(table, fcb);
@@ -2912,8 +3154,8 @@ fn find_file_control_block_in_table(
     node: NodeId,
 ) -> Option<NonNull<FileControlBlock>> {
     table
-        .iter()
-        .find(|fcb| fcb.node() == node)
+        .node_index(node)
+        .and_then(|index| table.get(index))
         .map(|fcb| NonNull::from(fcb.as_ref().get_ref()))
 }
 
@@ -2923,8 +3165,8 @@ fn ledger_file_control_block_open_state(
     fcb: NonNull<FileControlBlock>,
 ) -> NonNull<FileControlBlockOpenState> {
     let fcb = table
-        .iter()
-        .find(|candidate| NonNull::from(candidate.as_ref().get_ref()) == fcb)
+        .pointer_index(fcb)
+        .and_then(|index| table.get(index))
         .map(|candidate| candidate.as_ref().get_ref())
         .unwrap_or_else(|| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
