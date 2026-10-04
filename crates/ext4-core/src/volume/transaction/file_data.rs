@@ -41,27 +41,28 @@ impl MutationResolvePass<'_, '_, '_> {
             None
         };
 
-        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        if tree.contains_uninitialized() {
-            return Err(Error::UnsupportedInodeMutation);
+        let plan = self.prepare_file_write(&inode, offset, bytes.len())?;
+        match plan {
+            FileWritePlan::Overwrite(plan) => self.stage_initialized_overwrite(&inode, plan, bytes)?,
+            FileWritePlan::AllocationChange(mut tree) => {
+                if tree.contains_uninitialized() {
+                    return Err(Error::UnsupportedInodeMutation);
+                }
+                if offset.bytes() > inode.size().bytes() {
+                    self.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)?;
+                }
+                if inode.protection().is_encrypted() {
+                    self.stage_encrypted_inode_stream_write(&inode, &mut tree, offset.bytes(), bytes)?;
+                } else {
+                    self.stage_inode_stream_write(&mut tree, offset.bytes(), bytes)?;
+                }
+                self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            }
         }
-        if offset.bytes() > inode.size().bytes() {
-            self.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)?;
-        }
-        if inode.protection().is_encrypted() {
-            self.stage_encrypted_inode_stream_write(&inode, &mut tree, offset.bytes(), bytes)?;
-        } else {
-            self.stage_inode_stream_write(&mut tree, offset.bytes(), bytes)?;
-        }
-
         if let Some(encoded_new_size) = encoded_new_size {
             raw_inode.set_encoded_size(encoded_new_size)?;
         }
-        raw_inode.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
-        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+        raw_inode.set_timestamps(self.now, self.mutation.volume.superblock.inode_timestamp_encoding())?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
