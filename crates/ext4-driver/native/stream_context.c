@@ -2574,7 +2574,7 @@ ext4win_mdl_read(
     _In_ PLARGE_INTEGER file_offset,
     _In_ ULONG length,
     _In_ ULONG lock_key,
-    _Outptr_ PMDL *mdl_chain,
+    _Out_ PMDL *mdl_chain,
     _Out_ PIO_STATUS_BLOCK io_status,
     _In_ PDEVICE_OBJECT device_object)
 {
@@ -2664,7 +2664,7 @@ ext4win_prepare_mdl_write(
     _In_ PLARGE_INTEGER file_offset,
     _In_ ULONG length,
     _In_ ULONG lock_key,
-    _Outptr_ PMDL *mdl_chain,
+    _Out_ PMDL *mdl_chain,
     _Out_ PIO_STATUS_BLOCK io_status,
     _In_ PDEVICE_OBJECT device_object)
 {
