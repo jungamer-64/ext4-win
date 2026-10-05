@@ -29,9 +29,9 @@ sha2 = { version = "0.11", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Pipes", "Win32_System_Registry", "Win32_System_Services", "Win32_System_Diagnostics_Etw", "Win32_System_Time", "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation", "Win32_Devices_DeviceAndDriverInstallation", "Wdk_Storage_FileSystem", "Wdk_Foundation"] }
-wdk-build = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "4483d72d02b52962989a78025f502faacd9b33ca" }
-wdk-sys = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "4483d72d02b52962989a78025f502faacd9b33ca" }
-wdk-alloc = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "4483d72d02b52962989a78025f502faacd9b33ca" }
+wdk-build = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "9d8a613800f7e4be066d035aeeea1daee6be55d3" }
+wdk-sys = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "9d8a613800f7e4be066d035aeeea1daee6be55d3" }
+wdk-alloc = { git = "https://github.com/jungamer-64/windows-drivers-rs", rev = "9d8a613800f7e4be066d035aeeea1daee6be55d3" }
 
 [profile.dev]
 panic = "abort"

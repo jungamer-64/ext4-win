@@ -122,7 +122,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     if is_msvc_target {
-        let map_path = package_link_map_path()?;
+        let map_path = driver_link_map_path()?;
         let map_parent = map_path
             .parent()
             .ok_or_else(|| io::Error::other("the ext4win link-map path has no parent directory"))?;
@@ -570,12 +570,12 @@ fn production_artifact_id() -> Result<String, io::Error> {
     Ok(value)
 }
 
-/// Resolves the fixed link-map path consumed by `cargo-wdk` packaging.
+/// Resolves the fixed linker output consumed by the production artifact gate.
 ///
 /// # Errors
 ///
 /// Returns an environment or layout error when Cargo's profile directory cannot be identified.
-fn package_link_map_path() -> Result<PathBuf, io::Error> {
+fn driver_link_map_path() -> Result<PathBuf, io::Error> {
     let out_directory =
         PathBuf::from(std::env::var_os("OUT_DIR").ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "Cargo did not provide OUT_DIR")

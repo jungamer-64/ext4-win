@@ -113,7 +113,7 @@ impl SourceSnapshot {
 struct ProductionArtifacts {
     /// Release LLVM IR emitted by rustc.
     ir: PathBuf,
-    /// Final-image link map copied into the cargo-wdk package.
+    /// Final-image link map emitted by the driver linker.
     link_map: PathBuf,
     /// Signed driver image copied into the cargo-wdk package.
     driver: PathBuf,
@@ -445,7 +445,7 @@ fn build_production_driver(repository_root: &Path, identity: &ArtifactIdentity) 
     Ok(())
 }
 
-/// Finds the fixed package outputs and the only LLVM IR carrying this build's identity.
+/// Finds the fixed linker and package outputs and the only LLVM IR carrying this build's identity.
 ///
 /// # Errors
 ///
@@ -457,11 +457,11 @@ fn locate_production_artifacts(
 ) -> TaskResult<ProductionArtifacts> {
     let release_root = repository_root.join("target").join("release");
     let package_root = release_root.join("ext4win_package");
-    let link_map = package_root.join("ext4win.map");
+    let link_map = release_root.join("deps").join("ext4win.map");
     let driver = package_root.join("ext4win.sys");
     let catalog = package_root.join("ext4win.cat");
     let inf = package_root.join("ext4win.inf");
-    require_file(&link_map, "cargo-wdk package link map")?;
+    require_file(&link_map, "driver linker map")?;
     require_file(&driver, "cargo-wdk signed package driver")?;
     require_file(&catalog, "cargo-wdk signed package catalog")?;
     require_file(&inf, "cargo-wdk package installation metadata")?;
@@ -1203,6 +1203,64 @@ fn hash_source_record(hasher: &mut Sha256, relative_path: &str, contents: Option
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Artifact discovery requires all linker/package outputs and exactly one current-identity IR.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture I/O, discovery, contract violation, or cleanup errors.
+    #[test]
+    fn production_artifact_discovery_requires_complete_unique_evidence() -> TaskResult<()> {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()?;
+        let directory = create_task_directory(&repository_root, "artifact-discovery-test")?;
+        let verification = (|| -> TaskResult<()> {
+            let identity = ArtifactIdentity::create(&directory)?;
+            let release_root = directory.join("target").join("release");
+            let dependencies = release_root.join("deps");
+            let package = release_root.join("ext4win_package");
+            let stale = release_root.join("build").join("stale").join("out");
+            fs::create_dir_all(&dependencies)?;
+            fs::create_dir_all(&package)?;
+            fs::create_dir_all(&stale)?;
+            let link_map = dependencies.join("ext4win.map");
+            let ir = dependencies.join("ext4win.ll");
+            fs::write(&link_map, b"linker map")?;
+            fs::write(&ir, identity.marker())?;
+            fs::write(
+                stale.join("ext4win.ll"),
+                format!("{ARTIFACT_ID_MARKER}{UNVERIFIED_ARTIFACT_ID}"),
+            )?;
+            for name in ["ext4win.sys", "ext4win.cat", "ext4win.inf"] {
+                fs::write(package.join(name), b"package artifact")?;
+            }
+
+            let artifacts = locate_production_artifacts(&directory, &identity)?;
+            if artifacts.link_map != link_map
+                || artifacts.ir != ir
+                || artifacts.driver != package.join("ext4win.sys")
+                || artifacts.catalog != package.join("ext4win.cat")
+                || artifacts.inf != package.join("ext4win.inf")
+            {
+                return Err(io::Error::other("incorrect production artifact selection").into());
+            }
+
+            fs::remove_file(&link_map)?;
+            if locate_production_artifacts(&directory, &identity).is_ok() {
+                return Err(io::Error::other("missing linker map was accepted").into());
+            }
+            fs::write(&link_map, b"linker map")?;
+            fs::write(stale.join("ext4win.ll"), identity.marker())?;
+            if locate_production_artifacts(&directory, &identity).is_ok() {
+                return Err(io::Error::other("ambiguous current-identity IR was accepted").into());
+            }
+            Ok(())
+        })();
+        let cleanup =
+            remove_task_directory(&repository_root, &directory, "artifact-discovery-test");
+        combine_verification_and_cleanup(verification, cleanup)
+    }
 
     /// License closure selection excludes build/development edges and rejects incomplete evidence.
     ///
