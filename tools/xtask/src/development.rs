@@ -93,7 +93,7 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     #[cfg(windows)]
     {
         verify_native_synchronization(repository_root)?;
-        verify_cache_mdl(repository_root)?;
+        verify_cache_manager(repository_root)?;
     }
     run_checked(
         cargo_command(repository_root, &["check", "-p", "ext4win", "--locked"]),
@@ -168,40 +168,54 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Executes the production Cc MDL transfer boundary against an ownership oracle.
+/// Executes production Cc ownership, metadata progress and post-commit failure oracles.
 /// # Errors
 ///
 /// Returns compiler, execution, or task-directory cleanup failures.
 #[cfg(windows)]
-fn verify_cache_mdl(root: &Path) -> TaskResult<()> {
-    let directory = crate::process::create_task_directory(root, "cache-mdl")?;
-    let executable = directory.join("mdl-tests.exe");
-    let operation = (|| {
-        let mut compiler = Command::new("clang.exe");
-        compiler
-            .args([
-                "--target=x86_64-pc-windows-msvc",
-                "-std=c11",
-                "-Wall",
-                "-Wextra",
-                "-Werror",
-                "-nostdlib",
-                "-fuse-ld=lld",
-                "-Xlinker",
-                "/entry:main",
-                "-Xlinker",
-                "/subsystem:console",
-            ])
-            .arg(root.join("crates/ext4-driver/native/cache_mdl.tests.c"))
-            // SDK imports keep the oracle free of CRT initialization while exercising real SEH.
-            .args(["-lkernel32", "-lntdllp"])
-            .arg("-o")
-            .arg(&executable);
-        run_checked(compiler, "Cache Manager MDL oracle compilation")?;
-        run_checked(Command::new(&executable), "native MDL ownership contract")
-    })();
-    let cleanup = crate::process::remove_task_directory(root, &directory, "cache-mdl");
-    crate::process::combine_verification_and_cleanup(operation, cleanup)
+fn verify_cache_manager(root: &Path) -> TaskResult<()> {
+    for (name, source, contract) in [
+        (
+            "cache-mdl",
+            "cache_mdl.tests.c",
+            "native MDL ownership contract",
+        ),
+        (
+            "stream-metadata",
+            "stream_metadata.tests.c",
+            "native metadata publication progress contract",
+        ),
+    ] {
+        let directory = crate::process::create_task_directory(root, name)?;
+        let executable = directory.join("cache-tests.exe");
+        let operation = (|| {
+            let mut compiler = Command::new("clang.exe");
+            compiler
+                .args([
+                    "--target=x86_64-pc-windows-msvc",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-nostdlib",
+                    "-fuse-ld=lld",
+                    "-Xlinker",
+                    "/entry:main",
+                    "-Xlinker",
+                    "/subsystem:console",
+                ])
+                .arg(root.join("crates/ext4-driver/native").join(source))
+                // SDK imports keep the oracle free of CRT initialization while exercising real SEH.
+                .args(["-lkernel32", "-lntdllp"])
+                .arg("-o")
+                .arg(&executable);
+            run_checked(compiler, "Cache Manager oracle compilation")?;
+            run_checked(Command::new(&executable), contract)
+        })();
+        let cleanup = crate::process::remove_task_directory(root, &directory, name);
+        crate::process::combine_verification_and_cleanup(operation, cleanup)?;
+    }
+    Ok(())
 }
 
 /// Replays every declared fuzz target against its tracked corpus exactly once.
