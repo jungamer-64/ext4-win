@@ -87,6 +87,8 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ),
     ("cached read boundary", "ext4win_stream_cache_read"),
     ("cached write boundary", "ext4win_stream_cache_write"),
+    ("MDL worker preparation", "ext4win_prepare_mdl_completion"),
+    ("native cache-page return", "ext4win_complete_cache_mdl"),
     ("cache flush boundary", "ext4win_stream_cache_flush"),
     (
         "cache coherency boundary",
@@ -134,9 +136,10 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "hidden volume recognition read",
         "ext4win_read_volume_prefix",
     ),
+    ("Mount Manager publication owner", "announce_volume_arrival"),
     (
-        "Mount Manager volume publication",
-        "ext4win_announce_volume",
+        "synchronous volume protocol transport",
+        "ext4win_discovery_ioctl",
     ),
     ("raw-volume operation admission", "raw_volume"),
     (
@@ -2380,6 +2383,8 @@ mod tests {
              ext4win_stream_cache_initialize\n\
              ext4win_stream_cache_read\n\
              ext4win_stream_cache_write\n\
+             ext4win_prepare_mdl_completion\n\
+             ext4win_complete_cache_mdl\n\
              ext4win_stream_cache_flush\n\
              ext4win_stream_cache_coherency_flush_and_purge\n\
              ext4win_stream_cache_uninitialize\n\
@@ -2403,7 +2408,8 @@ mod tests {
              EtwUnregister\n\
              ext4win_query_volume_partition\n\
              ext4win_read_volume_prefix\n\
-             ext4win_announce_volume\n\
+             announce_volume_arrival\n\
+             ext4win_discovery_ioctl\n\
              raw_volume\n\
              FsRtlGetSectorSizeInformation\n\
              ObfReferenceObject\n\
