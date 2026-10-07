@@ -138,6 +138,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native Fast I/O transfer admission contract",
         ),
         (
+            "file-lock-completion",
+            "file_lock_completion.tests.c",
+            "native FsRtl file-lock completion delegation contract",
+        ),
+        (
             "section-mutation",
             "section_mutation.tests.c",
             "native section mutation notification contract",

@@ -939,16 +939,22 @@ impl StreamContext {
     /// # Safety
     ///
     /// `irp` must identify the active `IRP_MJ_LOCK_CONTROL` request for this stream, and the caller
-    /// must transfer terminal completion authority exactly once.
+    /// must transfer terminal completion authority exactly once. `completion` must be the
+    /// worker reserved for that same IRP before any lock effect or conflict wait begins.
     #[cfg(not(test))]
     pub(crate) unsafe fn process_file_lock(
         &self,
         irp: NonNull<wdk_sys::IRP>,
         completion: crate::irp::FileLockCompletion,
     ) -> NTSTATUS {
+        let context = unsafe {
+            // SAFETY: The caller transfers this live lock request; native delegation immediately
+            // passes its context to the registered FsRtl completion routine, including rejection.
+            completion.into_context(irp)
+        };
         unsafe {
-            // SAFETY: The caller supplies the consuming IRP capability documented above.
-            ext4win_stream_process_file_lock(self.header.as_ptr(), irp.as_ptr())
+            // SAFETY: This consumes the exact IRP and its reserved terminal notification context.
+            ext4win_stream_process_file_lock(self.header.as_ptr(), irp.as_ptr(), context.as_ptr())
         }
     }
 
@@ -1721,6 +1727,7 @@ unsafe extern "system" {
     fn ext4win_stream_process_file_lock(
         stream_header: wdk_sys::PVOID,
         irp: *mut wdk_sys::IRP,
+        completion: wdk_sys::PVOID,
     ) -> NTSTATUS;
     fn ext4win_stream_unlock_all(
         stream_header: wdk_sys::PVOID,

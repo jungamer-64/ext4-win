@@ -119,6 +119,8 @@ enum NotificationJob {
     Complete(KernelIrp, wdk_sys::NTSTATUS),
     /// Submit the original query-remove IRP; lower drivers then own completion.
     QueryRemove(super::lifecycle::PnpSubmission),
+    /// FsRtl retains the IRP until its completion callback queues the reserved worker.
+    AwaitFileLock(KernelIrp),
 }
 
 impl NotificationSlot {
@@ -189,6 +191,87 @@ impl Drop for NotificationSlot {
         }
         // Paging DPC storage is resident; joined notification rundown and DPC drain precede drop.
     }
+}
+
+/// Unique reserved terminal worker retained across FsRtl byte-range lock waiting.
+#[derive(Debug)]
+pub(crate) struct FileLockCompletion {
+    /// The permit's lease retains the notification pool through synchronous or delayed completion.
+    permit: NotificationPermit,
+}
+
+impl FileLockCompletion {
+    /// Transfers this reservation to the exact consuming FsRtl request.
+    /// # Safety
+    /// The caller must own this live lock-control IRP and immediately delegate it to FsRtl with
+    /// the returned context. Its registered completion routine must consume the context once.
+    #[expect(
+        unsafe_code,
+        reason = "typed completion ownership is transferred once to the native callback context"
+    )]
+    pub(crate) unsafe fn into_context(
+        self,
+        irp: NonNull<wdk_sys::IRP>,
+    ) -> NonNull<core::ffi::c_void> {
+        let slot = unsafe {
+            // SAFETY: The unique permit retains this reserved, not-yet-published slot.
+            self.permit.slot.as_ref()
+        };
+        unsafe {
+            // SAFETY: No callback owns the slot until the immediately following FsRtl delegation.
+            *slot.job.get() = Some(NotificationJob::AwaitFileLock(KernelIrp { irp }));
+        }
+        let context = self.permit.slot.cast();
+        core::mem::forget(self);
+        context
+    }
+}
+
+/// Transfers FsRtl's prepared terminal status to its already reserved outer notification worker.
+/// # Safety
+/// `context` must be the context consumed from FileLockCompletion for this exact IRP. FsRtl must
+/// have ended its cancellation/wait ownership and may invoke this completion exactly once.
+#[unsafe(no_mangle)]
+#[expect(
+    unsafe_code,
+    reason = "the native lock completion returns unique IRP and notification-slot ownership"
+)]
+pub(crate) unsafe extern "C" fn ext4win_complete_file_lock(
+    context: wdk_sys::PVOID,
+    irp: wdk_sys::PIRP,
+) -> wdk_sys::NTSTATUS {
+    let permit = NotificationPermit {
+        slot: NonNull::new(context.cast()).unwrap_or_else(|| {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+        }),
+    };
+    let slot = unsafe {
+        // SAFETY: FsRtl transferred the unique reserved slot to this callback.
+        permit.slot.as_ref()
+    };
+    let job = unsafe {
+        // SAFETY: The native wait owner excluded all other payload access until this callback.
+        (&mut *slot.job.get()).take()
+    };
+    let Some(NotificationJob::AwaitFileLock(identity)) = job else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    if identity.as_ptr() != irp {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    }
+    let irp = unsafe {
+        // SAFETY: Equality with the retained non-null identity proves this live terminal IRP.
+        identity.irp.as_ref()
+    };
+    let status = unsafe {
+        // SAFETY: FsRtl initialized the terminal NTSTATUS arm before invoking completion.
+        irp.IoStatus.__bindgen_anon_1.Status
+    };
+    // Queueing is allocation-free and invokes no upper driver on the FsRtl/actor stack.
+    permit.queue(identity, status);
+    // This callback accepted terminal ownership. Request failure is already in IoStatus;
+    // callback success preserves the byte-range package's own grant/failure decision.
+    wdk_sys::STATUS_SUCCESS
 }
 
 /// Unique callback reservation transferred from an admitted IRP to terminal notification.
@@ -338,6 +421,9 @@ unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_s
             let _status = irp.finish_completion(status);
         }
         NotificationJob::QueryRemove(forwarding) => forwarding.submit(),
+        NotificationJob::AwaitFileLock(_) => {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
     }
     drop(lease);
 }
@@ -370,6 +456,16 @@ impl IrpNotification {
             },
         }
     }
+    /// Retains the admitted worker while FsRtl owns conflict waiting and cancellation.
+    pub(super) fn for_file_lock(self) -> FileLockCompletion {
+        match self {
+            Self::Worker(permit) => FileLockCompletion { permit },
+            Self::Dispatch | Self::Deferred(_) => {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            }
+        }
+    }
+
     /// Query removal uses its admitted worker to cross the actor boundary.
     pub(super) fn queue_query_remove(self, forwarding: super::lifecycle::PnpSubmission) {
         match self {

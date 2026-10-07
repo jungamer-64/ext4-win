@@ -1228,8 +1228,12 @@ impl OwnedIrp {
             file_control_block.as_ref()
         };
         #[cfg(not(test))]
-        drop(notification);
-        file_control_block.process_byte_range_lock(target)
+        let completion = notification.for_file_lock();
+        file_control_block.process_byte_range_lock(
+            target,
+            #[cfg(not(test))]
+            completion,
+        )
     }
 
     /// Transfers this queued namespace-stream oplock FSCTL's terminal completion to FsRtl.

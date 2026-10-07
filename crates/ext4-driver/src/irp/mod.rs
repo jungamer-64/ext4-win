@@ -66,6 +66,9 @@ pub(crate) use reactor::CompletionReactor;
 pub(crate) use stack::*;
 
 #[cfg(not(test))]
+pub(crate) use notification::{FileLockCompletion, ext4win_complete_file_lock};
+
+#[cfg(not(test))]
 pub(crate) use cancel::ActiveCancelDestination;
 pub(crate) use cancel::ActiveCancelEnvelope;
 

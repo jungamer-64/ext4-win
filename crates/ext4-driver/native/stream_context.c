@@ -835,27 +835,7 @@ ext4win_stream_backout_atomic_oplock(
     return status;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-NTAPI
-ext4win_stream_process_file_lock(
-    _In_ PVOID stream_header,
-    _Inout_ PIRP irp)
-{
-    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-    NTSTATUS status;
-
-    if ((stream == NULL) || (stream->Kind != 1) ||
-        (stream->ByteRangeLocks == NULL) || (irp == NULL)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    ext4win_acquire_resource_exclusive(&stream->MainResource, TRUE);
-    status = FsRtlProcessFileLock(stream->ByteRangeLocks, irp, NULL);
-    ext4win_stream_refresh_fast_io_projection(stream);
-    ext4win_release_resource(&stream->MainResource);
-    return status;
-}
+#include "file_lock_completion.h"
 
 _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_

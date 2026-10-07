@@ -184,7 +184,7 @@ impl FileControlBlock {
             };
             unsafe {
                 // SAFETY: `target` was consumed and no driver completion owner remains.
-                self.stream_context.process_file_lock(irp)
+                self.stream_context.process_file_lock(irp, completion)
             }
         }
         #[cfg(test)]
@@ -1006,7 +1006,11 @@ impl FileByteRangeLocks {
             unsafe {
                 // SAFETY: `native` points to uninitialized FILE_LOCK storage
                 // owned exclusively by this newly created FCB.
-                ffi::FsRtlInitializeFileLock(locks.native.get(), None, None);
+                ffi::FsRtlInitializeFileLock(
+                    locks.native.get(),
+                    Some(crate::irp::ext4win_complete_file_lock),
+                    None,
+                );
             }
             locks
         }
