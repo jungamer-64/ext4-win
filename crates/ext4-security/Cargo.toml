@@ -1,0 +1,12 @@
+[package]
+name = "ext4-security"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[dependencies]
+ext4-core = { path = "../ext4-core" }
+
+[lints]
+workspace = true

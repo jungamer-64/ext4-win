@@ -308,11 +308,19 @@ name = "ext4-fixture"
 version = "0.1.0"
 
 [[package]]
+name = "ext4-security"
+version = "0.1.0"
+dependencies = [
+ "ext4-core",
+]
+
+[[package]]
 name = "ext4win"
 version = "0.1.0"
 dependencies = [
  "cc",
  "ext4-core",
+ "ext4-security",
  "wdk-alloc",
  "wdk-build",
  "wdk-sys",

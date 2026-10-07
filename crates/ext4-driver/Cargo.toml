@@ -18,6 +18,7 @@ wdk-build.workspace = true
 
 [dependencies]
 ext4-core = { path = "../ext4-core" }
+ext4-security = { path = "../ext4-security" }
 wdk-alloc.workspace = true
 wdk-sys.workspace = true
 
