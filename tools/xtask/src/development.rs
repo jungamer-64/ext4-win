@@ -121,7 +121,7 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Executes native APC ownership and section-mutation notification oracles without WDK imports.
+/// Executes native APC, section-mutation and filesystem callback oracles without WDK imports.
 /// # Errors
 /// Returns compiler, execution or mandatory generated-directory cleanup failures.
 #[cfg(windows)]
@@ -136,6 +136,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "section-mutation",
             "section_mutation.tests.c",
             "native section mutation notification contract",
+        ),
+        (
+            "fs-filter-callbacks",
+            "fs_filter_callbacks.tests.c",
+            "native filesystem callback completion-context contract",
         ),
     ] {
         let directory = crate::process::create_task_directory(root, name)?;
