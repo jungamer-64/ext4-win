@@ -163,23 +163,6 @@ impl SecuritySelection {
         information
     }
 
-    /// Returns the exact byte length of the descriptor emitted for this selection.
-    pub(crate) const fn query_descriptor_length(self) -> usize {
-        use SecurityComponentSelection::{Omitted, Selected};
-
-        match (self.owner, self.group, self.dacl) {
-            (Omitted, Omitted, Omitted) => SECURITY_DESCRIPTOR_RELATIVE_BYTES,
-            (Selected, Omitted, Omitted) | (Omitted, Selected, Omitted) => {
-                SINGLE_IDENTITY_DESCRIPTOR_BYTES
-            }
-            (Selected, Selected, Omitted) => BOTH_IDENTITIES_DESCRIPTOR_BYTES,
-            (Omitted, Omitted, Selected) => DACL_DESCRIPTOR_BYTES,
-            (Selected, Omitted, Selected) | (Omitted, Selected, Selected) => {
-                IDENTITY_AND_DACL_DESCRIPTOR_BYTES
-            }
-            (Selected, Selected, Selected) => COMPLETE_DESCRIPTOR_BYTES,
-        }
-    }
 }
 
 /// Converts one security bit into component selection.

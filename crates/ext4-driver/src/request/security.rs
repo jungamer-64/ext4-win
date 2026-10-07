@@ -855,21 +855,6 @@ fn dacl_from_permissions(security: Ext4Security) -> DriverResult<DriverVec<u8>> 
     Ok(acl)
 }
 
-/// Returns a Windows access mask for a POSIX rwx permission class.
-fn permission_class_mask(bits: u16) -> WindowsAccessMask {
-    let mut mask = WindowsAccessMask::EMPTY.as_u32();
-    if bits & 0o4 != 0 {
-        mask |= wdk_sys::FILE_GENERIC_READ;
-    }
-    if bits & 0o2 != 0 {
-        mask |= wdk_sys::FILE_GENERIC_WRITE;
-    }
-    if bits & 0o1 != 0 {
-        mask |= wdk_sys::FILE_GENERIC_EXECUTE;
-    }
-    WindowsAccessMask::from_u32(mask)
-}
-
 /// Appends one component to the self-relative descriptor.
 /// # Errors
 ///

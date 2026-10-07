@@ -649,17 +649,6 @@ pub(super) const fn map_file_generic_access(raw: wdk_sys::ACCESS_MASK) -> wdk_sy
     mapped
 }
 
-/// Expands the full file access request only for trusted kernel opens or newly created objects
-/// whose parent and privilege-only access have already been checked.
-const fn unrestricted_file_access(raw: wdk_sys::ACCESS_MASK) -> wdk_sys::ACCESS_MASK {
-    let mapped = map_file_generic_access(raw);
-    if mapped & wdk_sys::MAXIMUM_ALLOWED != 0 {
-        (mapped & !wdk_sys::MAXIMUM_ALLOWED) | wdk_sys::FILE_ALL_ACCESS
-    } else {
-        mapped
-    }
-}
-
 impl ExistingOperationAccess {
     /// Returns the WDK access mask for `IoCheckShareAccess`.
     pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
