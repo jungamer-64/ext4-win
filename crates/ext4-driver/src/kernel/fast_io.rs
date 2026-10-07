@@ -167,12 +167,15 @@ unsafe extern "system" fn ext4win_fast_io_check_if_possible(
     if status.is_null() {
         return 0;
     }
-    let status = unsafe {
-        // SAFETY: The callback owns this kernel status record for its duration.
-        &mut *status
-    };
-    status.Information = 0;
-    status.__bindgen_anon_1.Status = wdk_sys::STATUS_NOT_SUPPORTED;
+    unsafe {
+        // SAFETY: The callback owns this output storage; initialize it without borrowing unread fields.
+        status.write(wdk_sys::IO_STATUS_BLOCK {
+            __bindgen_anon_1: wdk_sys::_IO_STATUS_BLOCK__bindgen_ty_1 {
+                Status: wdk_sys::STATUS_NOT_SUPPORTED,
+            },
+            Information: 0,
+        });
+    }
     if wait == 0 || offset.is_null() {
         return 0;
     }
