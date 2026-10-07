@@ -373,7 +373,7 @@ impl CompletionRundownState {
         Ok(Some(CompletionRundownLease { owner: lease }))
     }
 
-    /// Closes acquisition and waits for every completion envelope to be reclaimed.
+    /// Closes acquisition and waits for envelopes and completion publishers to release their leases.
     /// # Safety
     ///
     /// The caller must first guarantee that every in-flight completion can still reach and wake
@@ -449,7 +449,7 @@ impl CompletionRundown {
         CompletionRundownState::acquire(&self.owner)
     }
 
-    /// Closes acquisition and waits for every completion envelope to be reclaimed.
+    /// Closes acquisition and waits for envelopes and completion publishers to release their leases.
     /// # Safety
     ///
     /// The caller must first guarantee that every in-flight completion can still reach and wake
@@ -508,8 +508,10 @@ unsafe impl Sync for CompletionRundownState {}
 ///
 /// # Safety
 ///
-/// Implementations run in a lower completion callback. They must retain a stable destination until
-/// rundown completes, publish the exact envelope once, and neither allocate nor block.
+/// Implementations run in a lower completion callback. They must retain the destination through
+/// their final access independently of the envelope once published, publish the exact envelope
+/// once, and neither allocate nor block. A route is copied before publication so reclaiming the
+/// envelope cannot invalidate the publisher's receiver.
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -1511,7 +1513,7 @@ mod tests {
             unsafe_code,
             reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
         )]
-        unsafe fn publish(&self, envelope: NonNull<TestEnvelope>) {
+        unsafe fn publish(self, envelope: NonNull<TestEnvelope>) {
             let inbox = unsafe {
                 // SAFETY: Each test keeps the uniquely writable inbox live through publication.
                 &mut *self.inbox.as_ptr()
@@ -1627,6 +1629,47 @@ mod tests {
             rundown.close_and_wait();
         }
         assert!(matches!(rundown.acquire(), Ok(None)));
+    }
+
+    /// # Panics
+    /// Panics if teardown finishes before the publisher's final destination access.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the isolated gate is closed concurrently while both lease owners remain tracked"
+    )]
+    fn rundown_waits_for_publisher_after_envelope_release() {
+        let Ok(rundown) = CompletionRundown::try_new() else {
+            return;
+        };
+        let Ok(Some(envelope)) = rundown.acquire() else {
+            return;
+        };
+        let Ok(Some(publication)) = rundown.acquire() else {
+            return;
+        };
+        let finished = core::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                unsafe {
+                    // SAFETY: This test closes a standalone gate; the publisher needs no actor
+                    // work to release its retained lease.
+                    rundown.close_and_wait();
+                }
+                finished.store(true, Ordering::Release);
+            });
+            drop(envelope);
+            while rundown.owner.get().state.load(Ordering::Acquire) & super::TEST_RUNDOWN_CLOSED
+                == 0
+            {
+                std::thread::yield_now();
+            }
+            let finished_before_publication = finished.load(Ordering::Acquire);
+            drop(publication);
+            assert!(waiter.join().is_ok());
+            assert!(!finished_before_publication);
+            assert!(finished.load(Ordering::Acquire));
+        });
     }
 
     /// # Panics

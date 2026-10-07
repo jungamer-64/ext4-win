@@ -622,13 +622,10 @@ unsafe extern "C" fn passive_work_item(device: wdk_sys::PDEVICE_OBJECT, context:
     };
     let reactor = job.reactor;
     envelope.state = PassiveState::Completed(job, work.execute());
-    let reactor = unsafe {
-        // SAFETY: The completed envelope's lifetime lease pins its reactor through publication.
-        reactor.as_ref()
-    };
     unsafe {
-        // SAFETY: The completed, unlinked envelope transfers unique ownership into this inbox.
-        reactor.enqueue_passive_completion(address);
+        // SAFETY: The completed envelope retains this destination until publication takes its
+        // own lease, then transfers the unique unlinked node without borrowing its payload.
+        CompletionReactor::enqueue_passive_completion(reactor, address);
     }
     // The actor may reclaim or reuse storage immediately; no envelope access is permitted here.
 }

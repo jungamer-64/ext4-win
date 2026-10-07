@@ -843,13 +843,12 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
     if !envelope.callback.mark_completed(status) {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     }
-    let reactor = unsafe {
-        // SAFETY: The envelope's rundown lease retains this stable completion destination.
-        envelope.reactor.as_ref()
-    };
+    let reactor = envelope.reactor;
+    let envelope = NonNull::from(envelope);
     unsafe {
-        // SAFETY: Callback transfers its unique completed, unlinked envelope to the reactor.
-        reactor.enqueue_oplock_completion(NonNull::from(envelope));
+        // SAFETY: The completed envelope retains this destination until publication takes its
+        // own lease, then transfers the unique node without borrowing reclaimable storage.
+        CompletionReactor::enqueue_oplock_completion(reactor, envelope);
     }
 }
 

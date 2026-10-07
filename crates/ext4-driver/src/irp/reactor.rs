@@ -88,6 +88,7 @@ type ReactorLengthEnvelope = LowerCompletionEnvelope<ReactorLengthProbe, LengthC
 
 /// Stable, statically dispatched destination for storage-command completions.
 #[cfg(not(test))]
+#[derive(Clone, Copy)]
 struct StorageCompletionRoute {
     /// Reactor retained live by the envelope's rundown lease.
     reactor: NonNull<CompletionReactor>,
@@ -95,6 +96,7 @@ struct StorageCompletionRoute {
 
 /// Stable, statically dispatched destination for device-length completions.
 #[cfg(not(test))]
+#[derive(Clone, Copy)]
 struct LengthCompletionRoute {
     /// Reactor retained live by the envelope's rundown lease.
     reactor: NonNull<CompletionReactor>,
@@ -134,20 +136,18 @@ unsafe impl Sync for LengthCompletionRoute {}
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-// SAFETY: This route performs only typed intrusive publication and wakeup under the reactor lock.
+// SAFETY: Publication retains a separate rundown lease through the final wakeup and locks
+// every inbox mutation; copying this identity does not confer envelope ownership.
 unsafe impl LowerCompletionRoute<ReactorStorageCommand> for StorageCompletionRoute {
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn publish(&self, envelope: NonNull<ReactorStorageEnvelope>) {
-        let reactor = unsafe {
-            // SAFETY: The envelope's rundown lease retains the stable reactor through publication.
-            self.reactor.as_ref()
-        };
+    unsafe fn publish(self, envelope: NonNull<ReactorStorageEnvelope>) {
         unsafe {
-            // SAFETY: Completion transfers its unique unlinked node to the storage inbox.
-            reactor.enqueue_storage(envelope);
+            // SAFETY: The unlinked envelope retains its destination until publication takes its
+            // own lease; this copied route does not borrow storage the actor can reclaim.
+            CompletionReactor::enqueue_storage(self.reactor, envelope);
         }
     }
 }
@@ -157,20 +157,18 @@ unsafe impl LowerCompletionRoute<ReactorStorageCommand> for StorageCompletionRou
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-// SAFETY: This route performs only typed intrusive publication and wakeup under the reactor lock.
+// SAFETY: Publication retains a separate rundown lease through the final wakeup and locks
+// every inbox mutation; copying this identity does not confer envelope ownership.
 unsafe impl LowerCompletionRoute<ReactorLengthProbe> for LengthCompletionRoute {
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn publish(&self, envelope: NonNull<ReactorLengthEnvelope>) {
-        let reactor = unsafe {
-            // SAFETY: The envelope's rundown lease retains the stable reactor through publication.
-            self.reactor.as_ref()
-        };
+    unsafe fn publish(self, envelope: NonNull<ReactorLengthEnvelope>) {
         unsafe {
-            // SAFETY: Completion transfers its unique unlinked node to the length inbox.
-            reactor.enqueue_length(envelope);
+            // SAFETY: The unlinked envelope retains its destination until publication takes its
+            // own lease; this copied route does not borrow storage the actor can reclaim.
+            CompletionReactor::enqueue_length(self.reactor, envelope);
         }
     }
 }
@@ -1744,7 +1742,8 @@ impl CompletionReactor {
     fn wake(&self) {
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: Event lifetime covers admission through reactor-thread join.
+            // SAFETY: Admission callers retain device ownership; completion publishers retain their
+            // independent rundown lease through this event access, including after actor exit.
             let _previous = ffi::KeSetEvent(self.wake_event.get(), 0, 0);
         }
     }
@@ -2469,22 +2468,6 @@ impl CompletionReactor {
                 MountedVolumeDevice::schedule_retirement(self.device);
                 progressed = true;
             }
-            let completion_list_empty = unsafe {
-                // SAFETY: The sole reactor actor observes this initialized inbox list.
-                list_is_empty(self.completion_head.get())
-            };
-            let length_completion_list_empty = unsafe {
-                // SAFETY: The sole reactor actor observes this initialized inbox list.
-                list_is_empty(self.length_completion_head.get())
-            };
-            let passive_completion_list_empty = unsafe {
-                // SAFETY: The sole reactor actor observes this initialized inbox list.
-                list_is_empty(self.passive_completion_head.get())
-            };
-            let oplock_completion_list_empty = unsafe {
-                // SAFETY: The sole reactor actor observes this initialized inbox list.
-                list_is_empty(self.oplock_completion_head.get())
-            };
             if self.state() == ReactorState::Draining
                 && self.ordinary_pending.load(Ordering::Acquire) == 0
                 && self.paging_pending.load(Ordering::Acquire) == 0
@@ -2496,10 +2479,7 @@ impl CompletionReactor {
                     // SAFETY: The sole actor owns this initialized notification backlog.
                     list_is_empty(self.deferred_notification_head.get())
                 }
-                && completion_list_empty
-                && length_completion_list_empty
-                && passive_completion_list_empty
-                && oplock_completion_list_empty
+                && self.completion_inboxes_empty()
             {
                 self.lifecycle
                     .store(ReactorState::Stopped.as_raw(), Ordering::Release);
@@ -2509,6 +2489,40 @@ impl CompletionReactor {
                 self.wait_for_event();
             }
         }
+    }
+
+    /// Observes all callback inboxes under the same lock used for their insertion and removal.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "callback inbox links are read only while holding their native spin lock"
+    )]
+    fn completion_inboxes_empty(&self) -> bool {
+        let old_irql = unsafe {
+            // SAFETY: The live reactor retains its initialized inbox lock.
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
+        };
+        let storage_empty = unsafe {
+            // SAFETY: This acquisition excludes every writer of these initialized list links.
+            list_is_empty(self.completion_head.get())
+        };
+        let length_empty = unsafe {
+            // SAFETY: The same lock excludes length completion insertion and removal.
+            list_is_empty(self.length_completion_head.get())
+        };
+        let passive_empty = unsafe {
+            // SAFETY: The same lock excludes passive completion insertion and removal.
+            list_is_empty(self.passive_completion_head.get())
+        };
+        let oplock_empty = unsafe {
+            // SAFETY: The same lock excludes oplock completion insertion and removal.
+            list_is_empty(self.oplock_completion_head.get())
+        };
+        unsafe {
+            // SAFETY: Releases this exact acquisition after the complete snapshot.
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
+        }
+        storage_empty && length_empty && passive_empty && oplock_empty
     }
 
     /// Returns the shared delayed-close timer state owned by this actor thread.
@@ -3490,9 +3504,26 @@ impl CompletionReactor {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     unsafe fn enqueue_storage(reactor: NonNull<Self>, envelope: NonNull<ReactorStorageEnvelope>) {
+        let reactor = unsafe {
+            // SAFETY: The incoming, still unlinked envelope retains this exact destination.
+            reactor.as_ref()
+        };
+        // Acquire before the actor can reclaim the envelope and release its lease. Each retained
+        // reference requires distinct live envelope or callback storage, so this private gate
+        // cannot reach usize::MAX references. Shutdown cannot close acquisition while an
+        // unpublished envelope remains.
+        let publication = reactor
+            .completion_rundown
+            .acquire()
+            .unwrap_or_else(|_| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            })
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
+            ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3500,13 +3531,16 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
-            insert_tail_list(self.completion_head.get(), node);
+            insert_tail_list(reactor.completion_head.get(), node);
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
+            ffi::KeReleaseSpinLock(reactor.lock.get(), old_irql);
         }
-        self.wake();
+        reactor.wake();
+        // The actor may already have reclaimed the envelope. Release only after the last
+        // destination access; teardown waits for this independent publication lease.
+        drop(publication);
     }
 
     /// Removes one completed storage envelope, if present.
@@ -3603,9 +3637,26 @@ impl CompletionReactor {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     unsafe fn enqueue_length(reactor: NonNull<Self>, envelope: NonNull<ReactorLengthEnvelope>) {
+        let reactor = unsafe {
+            // SAFETY: The incoming, still unlinked envelope retains this exact destination.
+            reactor.as_ref()
+        };
+        // Acquire before the actor can reclaim the envelope and release its lease. Each retained
+        // reference requires distinct live envelope or callback storage, so this private gate
+        // cannot reach usize::MAX references. Shutdown cannot close acquisition while an
+        // unpublished envelope remains.
+        let publication = reactor
+            .completion_rundown
+            .acquire()
+            .unwrap_or_else(|_| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            })
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
+            ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3613,13 +3664,16 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
-            insert_tail_list(self.length_completion_head.get(), node);
+            insert_tail_list(reactor.length_completion_head.get(), node);
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
+            ffi::KeReleaseSpinLock(reactor.lock.get(), old_irql);
         }
-        self.wake();
+        reactor.wake();
+        // The actor may already have reclaimed the envelope. Release only after the last
+        // destination access; teardown waits for this independent publication lease.
+        drop(publication);
     }
 
     /// Removes one completed length-query envelope, if present.
@@ -3694,9 +3748,26 @@ impl CompletionReactor {
         reactor: NonNull<Self>,
         envelope: NonNull<PassiveWorkEnvelope>,
     ) {
+        let reactor = unsafe {
+            // SAFETY: The incoming, still unlinked envelope retains this exact destination.
+            reactor.as_ref()
+        };
+        // Acquire before the actor can reclaim the envelope and release its lease. Each retained
+        // reference requires distinct live envelope or callback storage, so this private gate
+        // cannot reach usize::MAX references. Shutdown cannot close acquisition while an
+        // unpublished envelope remains.
+        let publication = reactor
+            .completion_rundown
+            .acquire()
+            .unwrap_or_else(|_| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            })
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes work callbacks and inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
+            ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3704,13 +3775,16 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
-            insert_tail_list(self.passive_completion_head.get(), node);
+            insert_tail_list(reactor.passive_completion_head.get(), node);
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
+            ffi::KeReleaseSpinLock(reactor.lock.get(), old_irql);
         }
-        self.wake();
+        reactor.wake();
+        // The actor may already have reclaimed the envelope. Release only after the last
+        // destination access; teardown waits for this independent publication lease.
+        drop(publication);
     }
 
     /// Removes one completed passive work envelope, if present.
@@ -3804,9 +3878,26 @@ impl CompletionReactor {
         reactor: NonNull<Self>,
         envelope: NonNull<OplockEnvelope>,
     ) {
+        let reactor = unsafe {
+            // SAFETY: The incoming, still unlinked envelope retains this exact destination.
+            reactor.as_ref()
+        };
+        // Acquire before the actor can reclaim the envelope and release its lease. Each retained
+        // reference requires distinct live envelope or callback storage, so this private gate
+        // cannot reach usize::MAX references. Shutdown cannot close acquisition while an
+        // unpublished envelope remains.
+        let publication = reactor
+            .completion_rundown
+            .acquire()
+            .unwrap_or_else(|_| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            })
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes callbacks and typed inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
+            ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3814,13 +3905,16 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
-            insert_tail_list(self.oplock_completion_head.get(), node);
+            insert_tail_list(reactor.oplock_completion_head.get(), node);
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
+            ffi::KeReleaseSpinLock(reactor.lock.get(), old_irql);
         }
-        self.wake();
+        reactor.wake();
+        // The actor may already have reclaimed the envelope. Release only after the last
+        // destination access; teardown waits for this independent publication lease.
+        drop(publication);
     }
 
     /// Removes one completed oplock envelope, if present.
