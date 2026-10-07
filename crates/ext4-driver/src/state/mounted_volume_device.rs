@@ -47,27 +47,29 @@ pub(crate) struct MountedVolumeDevice;
 /// Prevalidated VPB label update consumed only after journal commit visibility.
 #[derive(Debug)]
 pub(crate) struct PreparedVpbLabelPublication {
-    /// Stable VPB retained by the mounted device until reactor drain.
-    vpb: NonNull<wdk_sys::VPB>,
+    /// Mounted association retained by the operation until reactor drain.
+    device: KernelDevice,
     /// Fully encoded fixed-capacity VPB label.
     label: VpbLabel,
 }
 
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-// SAFETY: The VPB is I/O Manager-owned stable mounted state and publication remains serialized by
-// the device reactor.
-unsafe impl Send for PreparedVpbLabelPublication {}
+impl PreparedVpbLabelPublication {
+    /// Publishes under the VPB lock after ext4 commit; retirement cannot race the owning operation.
+    pub(crate) fn publish(self) {
+        VpbSpinLock::with_mounted(self.device, |vpb| self.label.write_to(vpb)).unwrap_or_else(
+            |_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
+        );
+    }
+}
 
 impl MountedVolumeDevice {
     /// Initializes an IoCreateDevice-created mounted device and takes ownership
     /// of the VCB.
     /// # Errors
     ///
-    /// Returns an error when the mounted DEVICE_OBJECT, device extension, or VPB initialization
-    /// target is absent or invalid, or allocation clusters are not integral logical sectors.
+    /// Returns an error for invalid device/sector geometry, resource initialization failure,
+    /// or a VPB that has no real device, is occupied, or is being removed. A failed mount leaves
+    /// the supplied VPB unchanged and releases extension-owned resources before device deletion.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -75,38 +77,36 @@ impl MountedVolumeDevice {
     pub(crate) fn initialize(
         device: KernelDevice,
         vcb: Pin<Box<VolumeControlBlock>>,
-        vpb: NonNull<wdk_sys::VPB>,
-        real_device: KernelDevice,
+        vpb: KernelVpb,
+        target_device: KernelDevice,
     ) -> DriverResult<()> {
-        let stack_size = real_device
+        let stack_size = target_device
             .stack_size()
             .ok_or(DriverError::InvalidParameter)?
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
-        let transfer_alignment = real_device.transfer_buffer_alignment()?;
+        let transfer_alignment = target_device.transfer_buffer_alignment()?;
         let sector_size = vcb.runtime.storage().filesystem_sector_size();
         let _sectors = sector_size
             .sectors_per_cluster(vcb.runtime.current_epoch().geometry().cluster_size())?;
         let sector_bytes =
             u16::try_from(sector_size.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
         let trace = vcb.trace;
-        let mounted_flag = u16::try_from(VPB_MOUNTED).map_err(|_| DriverError::InvalidParameter)?;
         let identity = vcb.runtime.identity();
         let [a, b, c, d, ..] = identity.uuid().bytes();
         let serial_number = VolumeSerialNumber::from_le_bytes([a, b, c, d]).as_u32();
         let volume_label = VpbLabel::encode(identity.label())?;
-        let device_object = unsafe {
-            // SAFETY: The device was just created by this driver and remains
-            // valid during mount initialization.
-            device.as_ptr().as_mut()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
-        let extension_pointer = NonNull::new(
-            device_object
-                .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>(),
-        )
-        .ok_or(DriverError::InvalidParameter)?;
+        let extension_slot = unsafe {
+            // SAFETY: The mount exclusively owns this newly created, unpublished device.
+            core::ptr::addr_of!((*device.as_ptr()).DeviceExtension)
+        };
+        let extension_storage = unsafe {
+            // SAFETY: IoCreateDevice initialized this stable pointer before returning the device.
+            extension_slot.read()
+        };
+        let extension_pointer =
+            NonNull::new(extension_storage.cast::<MountedVolumeDeviceExtension>())
+                .ok_or(DriverError::InvalidParameter)?;
         let storage = unsafe {
             // SAFETY: The pinned VCB outlives every reactor/dispatch lease on this extension.
             vcb.stream_context.storage_access()?
@@ -157,16 +157,32 @@ impl MountedVolumeDevice {
                 trace,
             )?;
         }
+        let header_slot = unsafe {
+            // SAFETY: The initialized header occupies this field at its final address.
+            core::ptr::addr_of!((*extension_pointer.as_ptr()).header)
+        };
+        let header = unsafe {
+            // SAFETY: The complete header is independently synchronized after final placement.
+            &*header_slot
+        };
         if let Err(error) = register_shutdown_notification(device) {
             unsafe {
                 // SAFETY: Shutdown registration failed before this device was
                 // published, so no actor continuation can still own the executor.
-                let target = extension.header.retire();
+                let target = header.retire();
                 drop(target);
             }
             return Err(error);
         }
-        extension.shutdown_registered.store(1, Ordering::Release);
+        let shutdown_slot = unsafe {
+            // SAFETY: Project the initialized atomic independently of the header and work item.
+            core::ptr::addr_of!((*extension_pointer.as_ptr()).shutdown_registered)
+        };
+        let shutdown_registered = unsafe {
+            // SAFETY: Registration ownership uses this disjoint atomic at its final address.
+            &*shutdown_slot
+        };
+        shutdown_registered.store(1, Ordering::Release);
         #[cfg(not(test))]
         let retirement_work_item = unsafe {
             // SAFETY: The new mounted device remains live and unpublished during allocation.
@@ -179,19 +195,52 @@ impl MountedVolumeDevice {
             unsafe {
                 // SAFETY: Work-item allocation failed before publication; no request can race
                 // executor teardown.
-                let target = extension.header.retire();
+                let target = header.retire();
                 drop(target);
             }
             return Err(DriverError::InsufficientResources);
         }
-        extension.retirement_work_item = retirement_work_item;
+        let retirement_slot = unsafe {
+            // SAFETY: Project the work-item slot independently of the header and atomic leases.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).retirement_work_item)
+        };
+        unsafe {
+            // SAFETY: The device remains unpublished and the work item cannot yet be queued.
+            retirement_slot.write(retirement_work_item);
+        }
 
+        let device_object = unsafe {
+            // SAFETY: Mount owns the unpublished device; this borrow ends before VPB publication.
+            &mut *device.as_ptr()
+        };
         device_object.Flags |= DO_DIRECT_IO;
         device_object.StackSize = stack_size;
         device_object.AlignmentRequirement = transfer_alignment.as_mask();
         device_object.SectorSize = sector_bytes;
 
-        device_object.Flags &= !DO_DEVICE_INITIALIZING;
+        if let Err(error) = VpbSpinLock::publish_mount(vpb, device, serial_number, volume_label) {
+            Self::unregister_shutdown_notification(device);
+            unsafe {
+                // SAFETY: Publication failed without changing the VPB. This mount still owns
+                // the unpublished device; retire joins any shutdown dispatch before VCB release.
+                let target = header.retire();
+                drop(target);
+            }
+            #[cfg(not(test))]
+            unsafe {
+                // SAFETY: This work item was allocated above and was never queued.
+                ffi::IoFreeWorkItem(retirement_work_item);
+            }
+            unsafe {
+                // SAFETY: Retirement joined the actor; the unqueued work item was freed above.
+                retirement_slot.write(core::ptr::null_mut());
+            }
+            return Err(error);
+        }
+        unsafe {
+            // SAFETY: Mount owns initialization; VPB publication completed and its lock is released.
+            (*device.as_ptr()).Flags &= !DO_DEVICE_INITIALIZING;
+        }
         Ok(())
     }
 
@@ -288,6 +337,18 @@ impl MountedVolumeDevice {
         })
     }
 
+    /// Prepares label bytes and checks the mounted association before ext4 mutation begins.
+    /// # Errors
+    /// Returns invalid parameter for a missing or foreign association or an unencodable label.
+    pub(crate) fn prepare_vpb_label_publication(
+        device: KernelDevice,
+        volume_label: ext4_core::Ext4VolumeLabel,
+    ) -> DriverResult<PreparedVpbLabelPublication> {
+        let label = VpbLabel::encode(volume_label)?;
+        VpbSpinLock::with_mounted(device, |_| ())?;
+        Ok(PreparedVpbLabelPublication { device, label })
+    }
+
     /// Retains the VPB's real device before a sector query leaves actor ownership.
     /// # Errors
     ///
@@ -295,7 +356,7 @@ impl MountedVolumeDevice {
     pub(crate) fn prepare_sector_query(
         device: KernelDevice,
     ) -> DriverResult<crate::kernel::storage::SectorSizeQuery> {
-        Self::with_vpb(device, |vpb| {
+        VpbSpinLock::with_mounted(device, |vpb| {
             #[expect(
                 unsafe_code,
                 reason = "the VPB lock protects the live real-device association during reference acquisition"
@@ -465,7 +526,7 @@ impl MountedVolumeDevice {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     pub(crate) fn complete_dismount(device: KernelDevice) {
-        let real_device = Self::with_vpb(device, |vpb| unsafe {
+        let real_device = VpbSpinLock::with_mounted(device, |vpb| unsafe {
             // SAFETY: The locked VPB retains its associated real device during this operation.
             KernelDevice::from_raw(vpb.RealDevice).ok_or(DriverError::InvalidParameter)
         })
@@ -486,7 +547,7 @@ impl MountedVolumeDevice {
     ///
     /// Returns an error when the mounted device or its VPB is absent.
     fn update_vpb_flags(device: KernelDevice, update: impl FnOnce(&mut u16)) -> DriverResult<()> {
-        Self::with_vpb(device, |vpb| update(&mut vpb.Flags))
+        VpbSpinLock::with_mounted(device, |vpb| update(&mut vpb.Flags))
     }
 
     /// Removes this mounted device from its VPB while holding the global VPB lock.
@@ -505,24 +566,166 @@ impl MountedVolumeDevice {
             u16::try_from(wdk_sys::VPB_DIRECT_WRITES_ALLOWED).unwrap_or_else(|_| {
                 KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
             });
-        Self::with_vpb(device, |vpb| {
-            if vpb.DeviceObject != device.as_ptr() {
-                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
-            }
+        VpbSpinLock::with_mounted(device, |vpb| {
             vpb.Flags &= !(mounted | locked | direct_writes);
             vpb.DeviceObject = core::ptr::null_mut();
-            let device_object = unsafe {
-                // SAFETY: The VPB lock is held and terminal teardown still owns the device.
-                device.as_ptr().as_mut()
+            let association = unsafe {
+                // SAFETY: The lock protects this association and teardown owns the live device.
+                core::ptr::addr_of_mut!((*device.as_ptr()).Vpb)
+            };
+            unsafe {
+                // SAFETY: Clear this mounted device's association before its VPB lock is released.
+                association.write(core::ptr::null_mut());
             }
-            .unwrap_or_else(|| {
-                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-            });
-            device_object.Vpb = core::ptr::null_mut();
         })
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
+}
 
+/// Thread-local ownership of the global VPB spin lock required by the
+/// [Windows VPB contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_vpb).
+/// All callbacks must be nonblocking and use nonpaged data; no VPB reference may escape the
+/// callback or survive lock release.
+struct VpbSpinLock {
+    /// IRQL to restore on the same thread that acquired the native lock.
+    #[cfg(not(test))]
+    irql: wdk_sys::KIRQL,
+    /// Host serialization follows the same lexical access boundary as the kernel lock.
+    #[cfg(test)]
+    _guard: MutexGuard<'static, ()>,
+    /// Native spin-lock/IRQL ownership cannot transfer between threads.
+    _thread: PhantomData<*mut ()>,
+}
+
+/// Host counterpart of the I/O Manager's single VPB lock, with no VPB storage authority.
+#[cfg(test)]
+static VPB_LOCK: Mutex<()> = Mutex::new(());
+
+impl VpbSpinLock {
+    /// Acquires before any VPB field or mounted association is accessed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "owns one native VPB lock acquisition and saved thread IRQL"
+        )
+    )]
+    fn acquire() -> Self {
+        #[cfg(not(test))]
+        {
+            let mut irql = 0;
+            unsafe {
+                // SAFETY: Writable KIRQL storage is passed to the I/O Manager; Drop balances
+                // acquisition on this thread before returning to the caller.
+                ffi::IoAcquireVpbSpinLock(core::ptr::addr_of_mut!(irql));
+            }
+            Self {
+                irql,
+                _thread: PhantomData,
+            }
+        }
+        #[cfg(test)]
+        Self {
+            _guard: VPB_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            _thread: PhantomData,
+        }
+    }
+
+    /// Publishes filesystem-owned fields without replacing the I/O Manager's real device,
+    /// reference count or mount-completion flag. Failure leaves both associations unchanged.
+    /// # Errors
+    /// Returns invalid parameter for an absent real device, device busy for an occupied VPB,
+    /// or device removed when PnP has begun withdrawing its storage.
+    #[expect(
+        unsafe_code,
+        reason = "the mount IRP retains the supplied VPB and unpublished device under the VPB lock"
+    )]
+    fn publish_mount(
+        supplied: KernelVpb,
+        device: KernelDevice,
+        serial_number: u32,
+        label: VpbLabel,
+    ) -> DriverResult<()> {
+        let _lock = Self::acquire();
+        let vpb = unsafe {
+            // SAFETY: The mount IRP retains this supplied VPB; the lock excludes other field access.
+            &mut *supplied.as_non_null().as_ptr()
+        };
+        if vpb.RealDevice.is_null() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let remove_pending = u16::try_from(wdk_sys::VPB_REMOVE_PENDING)
+            .map_err(|_| DriverError::InvalidParameter)?;
+        if vpb.Flags & remove_pending != 0 {
+            return Err(DriverError::DeviceRemoved);
+        }
+        if !vpb.DeviceObject.is_null() {
+            return Err(DriverError::DeviceBusy);
+        }
+        let association = unsafe {
+            // SAFETY: The mount owns the unpublished device and the lock protects its association.
+            core::ptr::addr_of_mut!((*device.as_ptr()).Vpb)
+        };
+        unsafe {
+            // SAFETY: The writable device field is published together with VPB.DeviceObject.
+            association.write(supplied.as_non_null().as_ptr());
+        }
+        vpb.SerialNumber = serial_number;
+        label.write_to(vpb);
+        vpb.DeviceObject = device.as_ptr();
+        Ok(())
+    }
+
+    /// Borrows only this device's live mounted VPB while holding the global lock.
+    /// # Errors
+    /// Returns invalid parameter for a missing VPB or an association owned by another device.
+    #[expect(
+        unsafe_code,
+        reason = "the caller retains the mounted device and VPB until its admitted operation drains"
+    )]
+    fn with_mounted<R>(
+        device: KernelDevice,
+        operation: impl FnOnce(&mut wdk_sys::VPB) -> R,
+    ) -> DriverResult<R> {
+        let _lock = Self::acquire();
+        let association = unsafe {
+            // SAFETY: Device rundown retains this object and the lock protects its VPB association.
+            core::ptr::addr_of!((*device.as_ptr()).Vpb)
+        };
+        let pointer = unsafe {
+            // SAFETY: This initialized association is read only while its global lock is held.
+            association.read()
+        };
+        let vpb = unsafe {
+            // SAFETY: The mounted device retains the associated VPB and the global lock excludes
+            // concurrent field access. The callback cannot retain this borrow.
+            pointer.as_mut()
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        if vpb.DeviceObject != device.as_ptr() {
+            return Err(DriverError::InvalidParameter);
+        }
+        Ok(operation(vpb))
+    }
+}
+
+impl Drop for VpbSpinLock {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "balances native lock acquisition on its original thread"
+        )
+    )]
+    fn drop(&mut self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This non-transferable guard owns the matching acquisition and saved IRQL.
+            ffi::IoReleaseVpbSpinLock(self.irql);
+        }
+    }
 }
 
 /// PASSIVE_LEVEL work-item callback that joins the retiring actor and deletes its device.
@@ -642,5 +845,217 @@ impl VpbLabel {
     fn write_to(self, vpb: &mut wdk_sys::VPB) {
         vpb.VolumeLabel = self.units;
         vpb.VolumeLabelLength = self.byte_len;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ext4_core::Ext4VolumeLabel;
+
+    /// # Errors
+    /// Returns fixture label or native scalar conversion errors.
+    /// # Panics
+    /// Panics if mount, label publication or detach changes I/O Manager-owned fields.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "this fixture retains native device and VPB allocations until detach"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions report protocol regressions after fallible fixture setup"
+    )]
+    fn vpb_mount_label_and_detach_preserve_io_manager_state() -> DriverResult<()> {
+        let mut real = wdk_sys::DEVICE_OBJECT::default();
+        let mut mounted = wdk_sys::DEVICE_OBJECT::default();
+        let persistent =
+            u16::try_from(wdk_sys::VPB_PERSISTENT).map_err(|_| DriverError::InvalidParameter)?;
+        let mut vpb = wdk_sys::VPB {
+            Type: 10,
+            Size: 96,
+            RealDevice: core::ptr::addr_of_mut!(real),
+            ReferenceCount: 3,
+            Flags: persistent,
+            ..Default::default()
+        };
+        let device = unsafe {
+            // SAFETY: The stack device remains live through this fixture's final detach.
+            KernelDevice::from_raw(core::ptr::addr_of_mut!(mounted))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let supplied = unsafe {
+            // SAFETY: The fixture keeps this VPB live until every access is finished.
+            KernelVpb::from_raw(core::ptr::addr_of_mut!(vpb))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let label = VpbLabel::encode(Ext4VolumeLabel::new(b"AB")?)?;
+        VpbSpinLock::publish_mount(supplied, device, 0x1234_5678, label)?;
+        assert_eq!(mounted.Vpb, core::ptr::addr_of_mut!(vpb));
+        assert_eq!(vpb.DeviceObject, device.as_ptr());
+        assert_eq!(vpb.RealDevice, core::ptr::addr_of_mut!(real));
+        assert_eq!((vpb.Type, vpb.Size, vpb.ReferenceCount), (10, 96, 3));
+        assert_eq!(vpb.Flags, persistent);
+        assert_eq!(vpb.SerialNumber, 0x1234_5678);
+        assert_eq!(vpb.VolumeLabelLength, 4);
+        assert_eq!(vpb.VolumeLabel.get(..3), Some([65, 66, 0].as_slice()));
+
+        // The I/O Manager marks the mount when its successful mount IRP completes.
+        VpbSpinLock::with_mounted(device, |vpb| {
+            vpb.Flags |= u16::try_from(wdk_sys::VPB_MOUNTED).unwrap_or_else(|_| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
+        })?;
+        let publication = MountedVolumeDevice::prepare_vpb_label_publication(
+            device,
+            Ext4VolumeLabel::new(b"Z")?,
+        )?;
+        assert_eq!(vpb.VolumeLabelLength, 4);
+        publication.publish();
+        VpbSpinLock::with_mounted(device, |vpb| {
+            assert!(matches!(
+                VPB_LOCK.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            assert_eq!(vpb.VolumeLabelLength, 2);
+            assert_eq!(vpb.VolumeLabel.first(), Some(&90));
+            assert!(vpb.VolumeLabel.iter().skip(1).all(|unit| *unit == 0));
+            assert_eq!(vpb.SerialNumber, 0x1234_5678);
+        })?;
+        MountedVolumeDevice::publish_volume_lock(device, true);
+        MountedVolumeDevice::publish_direct_writes_allowed(device);
+        MountedVolumeDevice::detach_vpb(device);
+        assert!(mounted.Vpb.is_null());
+        assert!(vpb.DeviceObject.is_null());
+        assert_eq!(vpb.RealDevice, core::ptr::addr_of_mut!(real));
+        assert_eq!((vpb.Type, vpb.Size, vpb.ReferenceCount), (10, 96, 3));
+        assert_eq!(vpb.Flags, persistent);
+        assert_eq!(
+            VpbSpinLock::with_mounted(device, |_| ()),
+            Err(DriverError::InvalidParameter)
+        );
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture label or native scalar conversion errors.
+    /// # Panics
+    /// Panics if mount failure publishes an association or loses existing VPB metadata.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the fixture owns live native storage throughout every mount attempt"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions report atomicity failures after fallible fixture setup"
+    )]
+    fn rejected_vpb_mount_leaves_both_associations_unchanged() -> DriverResult<()> {
+        let mut real = wdk_sys::DEVICE_OBJECT::default();
+        let mut mounted = wdk_sys::DEVICE_OBJECT::default();
+        let mut other = wdk_sys::DEVICE_OBJECT::default();
+        let mut vpb = wdk_sys::VPB::default();
+        let device = unsafe {
+            // SAFETY: This local device stays live across every publication attempt.
+            KernelDevice::from_raw(core::ptr::addr_of_mut!(mounted))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let supplied = unsafe {
+            // SAFETY: This local VPB stays live across every publication attempt.
+            KernelVpb::from_raw(core::ptr::addr_of_mut!(vpb))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let label = VpbLabel::encode(Ext4VolumeLabel::new(b"publish")?)?;
+        let removed = u16::try_from(wdk_sys::VPB_REMOVE_PENDING)
+            .map_err(|_| DriverError::InvalidParameter)?;
+        for (real_device, current, flags, expected) in [
+            (
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                0,
+                DriverError::InvalidParameter,
+            ),
+            (
+                core::ptr::addr_of_mut!(real),
+                core::ptr::addr_of_mut!(other),
+                0,
+                DriverError::DeviceBusy,
+            ),
+            (
+                core::ptr::addr_of_mut!(real),
+                core::ptr::null_mut(),
+                removed,
+                DriverError::DeviceRemoved,
+            ),
+        ] {
+            vpb.RealDevice = real_device;
+            vpb.DeviceObject = current;
+            vpb.Flags = flags;
+            vpb.SerialNumber = 7;
+            vpb.VolumeLabelLength = 6;
+            vpb.VolumeLabel = [42; 32];
+            vpb.ReferenceCount = 5;
+            assert_eq!(
+                VpbSpinLock::publish_mount(supplied, device, 99, label),
+                Err(expected)
+            );
+            assert!(mounted.Vpb.is_null());
+            assert_eq!(vpb.DeviceObject, current);
+            assert_eq!(vpb.RealDevice, real_device);
+            assert_eq!(vpb.Flags, flags);
+            assert_eq!(vpb.SerialNumber, 7);
+            assert_eq!(vpb.VolumeLabelLength, 6);
+            assert_eq!(vpb.VolumeLabel, [42; 32]);
+            assert_eq!(vpb.ReferenceCount, 5);
+        }
+        vpb.RealDevice = core::ptr::addr_of_mut!(real);
+        vpb.Flags = 0;
+        VpbSpinLock::publish_mount(supplied, device, 99, label)?;
+        assert_eq!(vpb.SerialNumber, 99);
+        MountedVolumeDevice::detach_vpb(device);
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture label construction errors.
+    /// # Panics
+    /// Panics if a foreign mounted association authorizes label or flag mutation.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the fixture retains the native objects named by its conflicting association"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions report authority regressions after fixture construction"
+    )]
+    fn foreign_vpb_association_rejects_mounted_publication() -> DriverResult<()> {
+        let mut mounted = wdk_sys::DEVICE_OBJECT::default();
+        let mut other = wdk_sys::DEVICE_OBJECT::default();
+        let mut vpb = wdk_sys::VPB {
+            DeviceObject: core::ptr::addr_of_mut!(other),
+            VolumeLabel: [17; 32],
+            VolumeLabelLength: 8,
+            Flags: 3,
+            ..Default::default()
+        };
+        mounted.Vpb = core::ptr::addr_of_mut!(vpb);
+        let device = unsafe {
+            // SAFETY: The device and both referenced objects remain live through this test.
+            KernelDevice::from_raw(core::ptr::addr_of_mut!(mounted))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        assert!(matches!(
+            MountedVolumeDevice::prepare_vpb_label_publication(device, Ext4VolumeLabel::new(b"Z")?),
+            Err(DriverError::InvalidParameter)
+        ));
+        assert_eq!(
+            MountedVolumeDevice::update_vpb_flags(device, |flags| *flags = 0),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(vpb.Flags, 3);
+        assert_eq!(vpb.VolumeLabel, [17; 32]);
+        assert_eq!(vpb.VolumeLabelLength, 8);
+        Ok(())
     }
 }

@@ -507,7 +507,7 @@ impl MountRequestOperation {
         match MountedVolumeDevice::initialize(
             device,
             vcb,
-            admission.vpb().as_non_null(),
+            admission.vpb(),
             admission.target_device(),
         ) {
             Ok(()) => Ok(IrpCompletion::EMPTY),
