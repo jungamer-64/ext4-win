@@ -576,17 +576,24 @@ impl ReceivedIrp {
                 // SAFETY: The active FILE_OBJECT retains its native stream and pinned Rust inbox.
                 ext4win_stream_mdl_queue(file_object)
             };
-            let Some(queue) = (unsafe {
-                // SAFETY: Native decoding returns only the node stream's retained pinned inbox.
-                queue
-                    .cast::<super::mdl_completion::MdlCompletionQueue>()
-                    .as_ref()
-            }) else {
+            let Some(queue) =
+                NonNull::new(queue.cast::<super::mdl_completion::MdlCompletionQueue>())
+            else {
                 return self.complete_result(Err(DriverError::InternalInvariantViolation));
             };
+            let file_object = NonNull::new(file_object).unwrap_or_else(|| {
+                crate::kernel::fatal::KernelWideInconsistency::file_object_lifecycle_corruption()
+                    .bugcheck()
+            });
             let status = match unsafe {
-                // SAFETY: The consuming dispatch owner transfers this unqueued IRP only on success.
-                queue.enqueue(self.target.irp, file_object, _completion)
+                // SAFETY: Dispatch retains this FILE_OBJECT and its exact inbox until publication
+                // acquires independent ownership, then consumes the unqueued IRP only on success.
+                super::mdl_completion::MdlCompletionQueue::enqueue(
+                    queue,
+                    self.target.irp,
+                    file_object,
+                    _completion,
+                )
             } {
                 Ok(()) => STATUS_PENDING,
                 Err(error) => error.ntstatus(),

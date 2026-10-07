@@ -12,7 +12,43 @@ use crate::{
 };
 use alloc::boxed::Box;
 use core::{cell::UnsafeCell, ffi::c_void, marker::PhantomPinned, pin::Pin, ptr::NonNull};
-use wdk_sys::{NTSTATUS, PFILE_OBJECT, PIRP};
+use wdk_sys::{FILE_OBJECT, NTSTATUS, PFILE_OBJECT, PIRP};
+
+/// An independently owned native reference pins the FILE_OBJECT and its stream-owned inbox.
+struct FileObjectReference {
+    /// Forgetting this value retains storage; releasing it may initiate CLOSE immediately.
+    file: NonNull<FILE_OBJECT>,
+}
+
+impl FileObjectReference {
+    /// Takes a reference before any consuming publication can release the incoming owner.
+    /// # Safety
+    /// The caller must retain this live FILE_OBJECT through native reference acquisition.
+    #[expect(
+        unsafe_code,
+        reason = "the caller's existing ownership retains the object until the new reference exists"
+    )]
+    unsafe fn acquire(file: NonNull<FILE_OBJECT>) -> Self {
+        unsafe {
+            // SAFETY: Existing ownership retains this exact object during the increment.
+            ffi::ObfReferenceObject(file.as_ptr().cast());
+        }
+        Self { file }
+    }
+}
+
+impl Drop for FileObjectReference {
+    #[expect(
+        unsafe_code,
+        reason = "the owning value consumes exactly its one acquired native object reference"
+    )]
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: This value owns one reference; no queue access may follow its final release.
+            ffi::ObfDereferenceObject(self.file.as_ptr().cast());
+        }
+    }
+}
 
 /// One worker cycle either has no authority or retains its FILE_OBJECT owner.
 enum WorkerCycle {
@@ -129,8 +165,9 @@ impl MdlCompletionQueue {
 
     /// Publishes unique completion authority; after success cancellation cannot skip chain return.
     /// # Safety
-    /// The caller owns this live unqueued IRP and retains `file` and this queue.
-    /// The call is at most DISPATCH_LEVEL. Success consumes IRP completion authority; failure does not.
+    /// The caller owns this live unqueued IRP; `file` must retain this exact queue through
+    /// publication-reference acquisition. The call is at most DISPATCH_LEVEL. Success consumes
+    /// IRP completion authority; failure does not. No caller may access the IRP after success.
     /// # Errors
     /// Returns invalid-parameter before publication if the notification has no MDL chain.
     #[expect(
@@ -140,7 +177,7 @@ impl MdlCompletionQueue {
     pub(in crate::irp) unsafe fn enqueue(
         queue: NonNull<Self>,
         irp: KernelIrp,
-        file: PFILE_OBJECT,
+        file: NonNull<FILE_OBJECT>,
         action: MdlCompletion,
     ) -> DriverResult<()> {
         let has_chain = unsafe {
@@ -150,7 +187,16 @@ impl MdlCompletionQueue {
         if !has_chain {
             return Err(DriverError::InvalidParameter);
         }
-        let scheduled = self.with_inbox(|inbox| {
+        let publication = unsafe {
+            // SAFETY: Dispatch still owns the unqueued IRP and retains its FILE_OBJECT here.
+            FileObjectReference::acquire(file)
+        };
+        let address = queue;
+        let queue = unsafe {
+            // SAFETY: The independent publication reference retains this stream's pinned inbox.
+            queue.as_ref()
+        };
+        let scheduled = queue.with_inbox(|inbox| {
             // A live driver-owned chain proves preparation succeeded. Losing its reserved worker
             // cannot return an ordinary error: chain release at elevated IRQL would then be abandoned.
             let work_item = inbox.work_item.unwrap_or_else(|| {
@@ -162,11 +208,11 @@ impl MdlCompletionQueue {
                 inbox.requests.push(irp, action);
             }
             if matches!(inbox.cycle, WorkerCycle::Idle) {
-                unsafe {
-                    // SAFETY: Dispatch retains file; this reference pins the stream until final callback access.
-                    ffi::ObfReferenceObject(file.cast());
-                }
-                inbox.cycle = WorkerCycle::Running(file);
+                let owner = unsafe {
+                    // SAFETY: Publication ownership retains file through this cycle acquisition.
+                    FileObjectReference::acquire(file)
+                };
+                inbox.cycle = WorkerCycle::Running(owner);
                 Some(work_item)
             } else {
                 None
@@ -179,10 +225,13 @@ impl MdlCompletionQueue {
                     work_item.as_ptr(),
                     Some(worker),
                     wdk_sys::_WORK_QUEUE_TYPE::DelayedWorkQueue,
-                    core::ptr::from_ref(self).cast_mut().cast(),
+                    address.as_ptr().cast(),
                 );
             }
         }
+        // A running worker may have consumed every IRP and released its own cycle reference.
+        // Release publication ownership only after every queue borrow and native queue call ends.
+        drop(publication);
         Ok(())
     }
 }
@@ -239,10 +288,8 @@ unsafe extern "C" fn worker(_device: wdk_sys::PDEVICE_OBJECT, context: *mut c_vo
         let (irp, action) = match next {
             Ok(next) => next,
             Err(owner) => {
-                unsafe {
-                    // SAFETY: No queue access follows; CLOSE may now destroy the stream and this inbox.
-                    ffi::ObfDereferenceObject(owner.cast());
-                }
+                // No queue access follows; releasing cycle ownership may initiate stream CLOSE.
+                drop(owner);
                 return;
             }
         };
