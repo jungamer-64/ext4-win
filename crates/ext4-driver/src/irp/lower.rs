@@ -515,7 +515,7 @@ unsafe impl Sync for CompletionRundownState {}
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 pub(crate) unsafe trait LowerCompletionRoute<O>:
-    Send + Sync + Sized + 'static
+    Copy + Send + Sync + Sized + 'static
 {
     /// Publishes one uniquely completion-owned envelope to its type-specific inbox.
     /// # Safety
@@ -525,7 +525,7 @@ pub(crate) unsafe trait LowerCompletionRoute<O>:
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn publish(&self, envelope: NonNull<LowerCompletionEnvelope<O, Self>>);
+    unsafe fn publish(self, envelope: NonNull<LowerCompletionEnvelope<O, Self>>);
 }
 
 /// Sole release authority for one ext4win-created private lower IRP and its attached MDLs.

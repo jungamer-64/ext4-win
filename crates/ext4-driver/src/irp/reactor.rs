@@ -3489,7 +3489,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn enqueue_storage(&self, envelope: NonNull<ReactorStorageEnvelope>) {
+    unsafe fn enqueue_storage(reactor: NonNull<Self>, envelope: NonNull<ReactorStorageEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
@@ -3602,7 +3602,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn enqueue_length(&self, envelope: NonNull<ReactorLengthEnvelope>) {
+    unsafe fn enqueue_length(reactor: NonNull<Self>, envelope: NonNull<ReactorLengthEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
@@ -3690,7 +3690,10 @@ impl CompletionReactor {
         unsafe_code,
         reason = "the work callback transfers one completed intrusive envelope under the reactor lock"
     )]
-    pub(super) unsafe fn enqueue_passive_completion(&self, envelope: NonNull<PassiveWorkEnvelope>) {
+    pub(super) unsafe fn enqueue_passive_completion(
+        reactor: NonNull<Self>,
+        envelope: NonNull<PassiveWorkEnvelope>,
+    ) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes work callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
@@ -3797,7 +3800,10 @@ impl CompletionReactor {
         unsafe_code,
         reason = "the FsRtl callback transfers one completed intrusive envelope under the reactor lock"
     )]
-    pub(super) unsafe fn enqueue_oplock_completion(&self, envelope: NonNull<OplockEnvelope>) {
+    pub(super) unsafe fn enqueue_oplock_completion(
+        reactor: NonNull<Self>,
+        envelope: NonNull<OplockEnvelope>,
+    ) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes callbacks and typed inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
