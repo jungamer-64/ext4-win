@@ -5,7 +5,9 @@ use core::ffi::c_void;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
-use ext4_core::{ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, NodeId, WindowsName};
+use ext4_core::{
+    ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, Ext4Owner, NodeId, WindowsName,
+};
 use wdk_sys::FILE_OBJECT;
 
 use crate::{
@@ -1726,7 +1728,8 @@ fn create_missing_node(
             Some(PendingFileDeletion::try_from_delete_on_close(&location)?)
         }
     };
-    let target = child_creation_target(parameters.target_requirement())?;
+    let parent_owner = mutation.load_directory(parent)?.security().owner();
+    let target = child_creation_target(parameters.target_requirement(), parent_owner)?;
     let mut creation = operations.begin_child_creation(mutation, parent, name, target)?;
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
@@ -1769,13 +1772,14 @@ fn create_missing_node(
 /// Returns an error when default metadata cannot be built.
 fn child_creation_target(
     requirement: CreateTargetRequirement,
+    parent_owner: Ext4Owner,
 ) -> DriverResult<ChildCreationTarget> {
     match requirement {
-        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
-            Ok(ChildCreationTarget::File(metadata::default_file_metadata()?))
-        }
+        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => Ok(
+            ChildCreationTarget::File(metadata::default_file_metadata(parent_owner)?),
+        ),
         CreateTargetRequirement::Directory => Ok(ChildCreationTarget::Directory(
-            metadata::default_directory_metadata()?,
+            metadata::default_directory_metadata(parent_owner)?,
         )),
     }
 }
@@ -2333,6 +2337,40 @@ mod tests {
     use crate::irp::ReceivedIrp;
 
     const TEST_FILE_OPEN_DISPOSITION_OPTIONS: wdk_sys::ULONG = 1 << 24;
+
+    /// # Panics
+    ///
+    /// Panics if child creation changes the supplied parent uid/gid or chooses a different mode
+    /// for the requested child kind.
+    #[test]
+    fn child_creation_inherits_parent_owner_with_default_permissions() {
+        for (uid, gid) in [
+            (0, 0),
+            (1000, 100),
+            (0x1234_5678, 0x8765_4321),
+            (u32::MAX, u32::MAX),
+        ] {
+            let parent_owner = Ext4Owner::new(
+                ext4_core::Ext4Uid::from_u32(uid),
+                ext4_core::Ext4Gid::from_u32(gid),
+            );
+            for requirement in [
+                CreateTargetRequirement::Any,
+                CreateTargetRequirement::NonDirectory,
+            ] {
+                assert!(matches!(
+                    child_creation_target(requirement, parent_owner),
+                    Ok(ChildCreationTarget::File(metadata))
+                        if metadata.owner() == parent_owner && metadata.permissions().as_u16() == 0o644
+                ));
+            }
+            assert!(matches!(
+                child_creation_target(CreateTargetRequirement::Directory, parent_owner),
+                Ok(ChildCreationTarget::Directory(metadata))
+                    if metadata.owner() == parent_owner && metadata.permissions().as_u16() == 0o755
+            ));
+        }
+    }
 
     /// # Panics
     ///
