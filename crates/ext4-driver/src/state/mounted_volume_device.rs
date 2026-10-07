@@ -53,23 +53,6 @@ pub(crate) struct PreparedVpbLabelPublication {
     label: VpbLabel,
 }
 
-impl PreparedVpbLabelPublication {
-    /// Publishes the already encoded label without allocation or ordinary failure.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn publish(self) {
-        let vpb = unsafe {
-            // SAFETY: The mounted device retains this VPB through every admitted operation, and
-            // the token is consumed on the sole reactor thread before device retirement.
-            self.vpb.as_ptr().as_mut()
-        }
-        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
-        self.label.write_to(vpb);
-    }
-}
-
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -163,13 +146,6 @@ impl MountedVolumeDevice {
         };
         extension.retirement_work_item = core::ptr::null_mut();
         extension.shutdown_registered = AtomicU8::new(0);
-        let vpb = unsafe {
-            // SAFETY: The VPB was supplied by the I/O Manager for this mount
-            // request and is writable during successful mount completion.
-            vpb.as_ptr().as_mut()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
-
         unsafe {
             // SAFETY: The extension is stable device-owned storage for this
             // just-created mounted volume device.
@@ -210,17 +186,10 @@ impl MountedVolumeDevice {
         }
         extension.retirement_work_item = retirement_work_item;
 
-        device_object.Vpb = vpb;
         device_object.Flags |= DO_DIRECT_IO;
         device_object.StackSize = stack_size;
         device_object.AlignmentRequirement = transfer_alignment.as_mask();
         device_object.SectorSize = sector_bytes;
-
-        vpb.SerialNumber = serial_number;
-        volume_label.write_to(vpb);
-        vpb.DeviceObject = device.as_ptr();
-        vpb.RealDevice = real_device.as_ptr();
-        vpb.Flags |= mounted_flag;
 
         device_object.Flags &= !DO_DEVICE_INITIALIZING;
         Ok(())
@@ -317,30 +286,6 @@ impl MountedVolumeDevice {
         NonNull::new(extension.retirement_work_item).unwrap_or_else(|| {
             KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
         })
-    }
-
-    /// Prevalidates the complete VPB volume-label publication before a mutation writes storage.
-    /// # Errors
-    ///
-    /// Returns an error when the mounted device or its VPB pointer is absent, or the ext4 label does
-    /// not fit in the VPB label field.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn prepare_vpb_label_publication(
-        device: KernelDevice,
-        volume_label: ext4_core::Ext4VolumeLabel,
-    ) -> DriverResult<PreparedVpbLabelPublication> {
-        let device_object = unsafe {
-            // SAFETY: `device` is a mounted volume device owned by this driver
-            // and is read only for its current VPB pointer.
-            device.as_ptr().as_ref()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
-        let vpb = NonNull::new(device_object.Vpb).ok_or(DriverError::InvalidParameter)?;
-        let label = VpbLabel::encode(volume_label)?;
-        Ok(PreparedVpbLabelPublication { vpb, label })
     }
 
     /// Retains the VPB's real device before a sector query leaves actor ownership.
@@ -578,45 +523,6 @@ impl MountedVolumeDevice {
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
-    /// Runs one nonblocking VPB access under the global VPB spin lock in production.
-    /// # Errors
-    ///
-    /// Returns an error when the mounted device or its VPB is absent.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn with_vpb<R>(
-        device: KernelDevice,
-        operation: impl FnOnce(&mut wdk_sys::VPB) -> R,
-    ) -> DriverResult<R> {
-        #[cfg(not(test))]
-        let mut irql = 0;
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: `irql` is writable stack storage paired with the release below.
-            ffi::IoAcquireVpbSpinLock(core::ptr::addr_of_mut!(irql));
-        }
-        let result = (|| {
-            let device = unsafe {
-                // SAFETY: The actor-owned mounted device remains live throughout this operation.
-                device.as_ptr().as_mut()
-            }
-            .ok_or(DriverError::InvalidParameter)?;
-            let vpb = unsafe {
-                // SAFETY: The VPB spin lock protects this mounted association in production.
-                device.Vpb.as_mut()
-            }
-            .ok_or(DriverError::InvalidParameter)?;
-            Ok(operation(vpb))
-        })();
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: This balances the immediately preceding successful VPB-lock acquisition.
-            ffi::IoReleaseVpbSpinLock(irql);
-        }
-        result
-    }
 }
 
 /// PASSIVE_LEVEL work-item callback that joins the retiring actor and deletes its device.
