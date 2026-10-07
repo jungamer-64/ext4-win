@@ -490,17 +490,7 @@ ext4win_stream_end_section_mutation(_In_ PEXT4WIN_STREAM_CONTEXT stream)
     return STATUS_SUCCESS;
 }
 
-static BOOLEAN
-ext4win_stream_acquire_fast_io_main(_In_ PFILE_OBJECT file, _In_ PEXT4WIN_STREAM_CONTEXT stream)
-{
-    PEXT4WIN_STREAM_CONTEXT observed;
-    ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
-    if (!ext4win_stream_fast_io_candidate(file, &observed) || (observed != stream)) {
-        ext4win_release_resource(&stream->MainResource);
-        return FALSE;
-    }
-    return TRUE;
-}
+#include "fast_io_transfer.h"
 
 static VOID
 ext4win_stream_refresh_fast_io_projection(_In_ PEXT4WIN_STREAM_CONTEXT stream)
@@ -1808,21 +1798,15 @@ ext4win_fast_io_read(
     PEXT4WIN_STREAM_CONTEXT stream;
     BOOLEAN handled;
 
-    if ((buffer == NULL) || !ext4win_fast_io_check_if_possible(
-            file_object,
-            file_offset,
-            length,
-            wait,
-            lock_key,
-            TRUE,
-            io_status,
-            device_object) ||
+    if ((buffer == NULL) || (io_status == NULL) || (file_offset == NULL) ||
+        !wait ||
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ);
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream, file_offset, length,
+            wait, lock_key, TRUE, io_status, device_object)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ);
         return FALSE;
     }
@@ -1860,22 +1844,16 @@ ext4win_fast_io_write(
     PEXT4WIN_STREAM_CONTEXT stream;
     BOOLEAN handled;
 
-    if ((buffer == NULL) || ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
-        !ext4win_fast_io_check_if_possible(
-            file_object,
-            file_offset,
-            length,
-            wait,
-            lock_key,
-            FALSE,
-            io_status,
-            device_object) ||
+    if ((buffer == NULL) || (io_status == NULL) || (file_offset == NULL) ||
+        !wait ||
+        ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream, file_offset, length,
+            wait, lock_key, FALSE, io_status, device_object)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
         return FALSE;
     }
@@ -2054,15 +2032,7 @@ ext4win_mdl_read(
     PEXT4WIN_STREAM_CONTEXT stream;
     BOOLEAN handled;
 
-    if ((mdl_chain == NULL) || !ext4win_fast_io_check_if_possible(
-            file_object,
-            file_offset,
-            length,
-            TRUE,
-            lock_key,
-            TRUE,
-            io_status,
-            device_object) ||
+    if ((mdl_chain == NULL) || (io_status == NULL) || (file_offset == NULL) ||
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
@@ -2071,7 +2041,8 @@ ext4win_mdl_read(
     if (!NT_SUCCESS(ext4win_prepare_mdl_completion(stream->RustState, file_object))) { return FALSE; }
     *mdl_chain = NULL;
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream, file_offset, length,
+            TRUE, lock_key, TRUE, io_status, device_object)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
         return FALSE;
     }
@@ -2144,16 +2115,8 @@ ext4win_prepare_mdl_write(
     PEXT4WIN_STREAM_CONTEXT stream;
     BOOLEAN handled;
 
-    if ((mdl_chain == NULL) || ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
-        !ext4win_fast_io_check_if_possible(
-            file_object,
-            file_offset,
-            length,
-            TRUE,
-            lock_key,
-            FALSE,
-            io_status,
-            device_object) ||
+    if ((mdl_chain == NULL) || (io_status == NULL) || (file_offset == NULL) ||
+        ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
         !ext4win_stream_fast_io_candidate(file_object, &stream)) {
         return FALSE;
     }
@@ -2162,7 +2125,8 @@ ext4win_prepare_mdl_write(
     if (!NT_SUCCESS(ext4win_prepare_mdl_completion(stream->RustState, file_object))) { return FALSE; }
     *mdl_chain = NULL;
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream, file_offset, length,
+            TRUE, lock_key, FALSE, io_status, device_object)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);
         return FALSE;
     }

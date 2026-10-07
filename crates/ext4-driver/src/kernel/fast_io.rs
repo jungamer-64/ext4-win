@@ -145,7 +145,9 @@ fn admitted_range(offset: i64, length: u32, eof: i64) -> Option<i64> {
     (offset >= 0 && offset.checked_add(length).is_some_and(|end| end <= eof)).then_some(length)
 }
 
-/// Windows callback selects Fast I/O before native locking and SEH-protected transfer.
+/// Observes current Fast I/O admission without reserving it.
+/// Native transfers evaluate this decision under the retained main resource, serializing EOF
+/// changes and conflicting lock grants with the Cache Manager call.
 /// # Safety
 /// The I/O Manager retains file, offset and status for this callback; no requestor buffer is borrowed.
 #[cfg(not(test))]

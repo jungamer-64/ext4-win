@@ -133,6 +133,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native executive resource APC contract",
         ),
         (
+            "fast-io-transfer",
+            "fast_io_transfer.tests.c",
+            "native Fast I/O transfer admission contract",
+        ),
+        (
             "section-mutation",
             "section_mutation.tests.c",
             "native section mutation notification contract",
