@@ -2453,8 +2453,9 @@ VOID NTAPI ext4win_stream_release_submissions(_In_ PVOID header)
 
 PVOID NTAPI ext4win_stream_mdl_queue(_In_ PFILE_OBJECT file)
 {
-    PEXT4WIN_STREAM_CONTEXT stream = (file == NULL) ? NULL : ext4win_stream_from_header(file->FsContext);
-    return ((stream != NULL) && (stream->Kind == 1)) ? stream->RustState : NULL;
+    PEXT4WIN_STREAM_CONTEXT stream;
+    if (!ext4win_stream_fast_io_stream(file, &stream)) { return NULL; }
+    return stream->RustState;
 }
 
 NTSTATUS NTAPI ext4win_complete_cache_mdl(_Inout_ PIRP irp, _In_ ULONG action)
