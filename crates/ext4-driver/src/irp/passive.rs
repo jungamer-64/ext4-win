@@ -355,7 +355,7 @@ impl PassiveWorkPreparationError {
 #[repr(C)]
 pub(super) struct PassiveWorkEnvelope {
     /// First-field node, linked only after native work is complete.
-    node: LIST_ENTRY,
+    node: core::cell::UnsafeCell<LIST_ENTRY>,
     /// Native queue storage owned until this envelope is finally destroyed.
     work_item: NonNull<wdk_sys::_IO_WORKITEM>,
     /// I/O Manager callback device, retained through the worker lifetime.

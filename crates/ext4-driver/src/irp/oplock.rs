@@ -560,7 +560,7 @@ impl PublishedOplockRequest {
 #[repr(C)]
 pub(super) struct OplockEnvelope {
     /// First-field intrusive node used only after wait completion.
-    node: LIST_ENTRY,
+    node: core::cell::UnsafeCell<LIST_ENTRY>,
     /// Reactor retained by `rundown` until inbox reclamation.
     reactor: NonNull<CompletionReactor>,
     /// Exact bounded slot generation that submitted this check.

@@ -984,7 +984,7 @@ pub(crate) struct CompletionReactor {
     /// Cancel-safe pending top-level IRP queue; must remain first.
     csq: wdk_sys::IO_CSQ,
     /// Spin lock shared by CSQ, completion-inbox, and active-cancel publication.
-    lock: wdk_sys::KSPIN_LOCK,
+    lock: UnsafeCell<wdk_sys::KSPIN_LOCK>,
     /// FIFO pending IRPs using `IRP.Tail.Overlay.ListEntry`.
     pending_head: UnsafeCell<LIST_ENTRY>,
     /// Completed lower envelopes using their first-field intrusive node.
@@ -1011,7 +1011,7 @@ pub(crate) struct CompletionReactor {
     #[cfg(not(test))]
     finalization_work: UnsafeCell<Option<Box<PassiveWorkEnvelope>>>,
     /// Auto-reset event signaled only when a concrete event is published.
-    wake_event: wdk_sys::KEVENT,
+    wake_event: UnsafeCell<wdk_sys::KEVENT>,
     /// Bitset of retry timer events published by DPC callbacks.
     retry_ready: AtomicU64,
     /// Shared delayed-close timer event published by its DPC callback.
