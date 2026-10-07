@@ -3,12 +3,22 @@
 #include <mountdev.h>
 #include <ntiologc.h>
 
+C_ASSERT(IOCTL_MOUNTDEV_QUERY_DEVICE_NAME == 0x004d0008);
+C_ASSERT(IOCTL_MOUNTMGR_QUERY_POINTS == 0x006d0008);
+C_ASSERT(IOCTL_MOUNTMGR_VOLUME_ARRIVAL_NOTIFICATION == 0x006d402c);
+C_ASSERT(sizeof(MOUNTMGR_MOUNT_POINT) == 24);
+C_ASSERT(FIELD_OFFSET(MOUNTMGR_MOUNT_POINT, DeviceNameOffset) == 16);
+C_ASSERT(FIELD_OFFSET(MOUNTMGR_MOUNT_POINT, DeviceNameLength) == 20);
+C_ASSERT(sizeof(MOUNTMGR_MOUNT_POINTS) == 32);
+C_ASSERT(FIELD_OFFSET(MOUNTDEV_NAME, Name) == 2);
+C_ASSERT(FIELD_OFFSET(MOUNTMGR_TARGET_NAME, DeviceName) == 2);
+
 /* All calls run on the discovery system thread. Rust retains the referenced
  * volume until the complete synchronous exchange returns. No partition-table
  * writes, interface registration on foreign PDOs, or synthetic identities occur.
  */
-static NTSTATUS
-volume_ioctl(
+NTSTATUS NTAPI
+ext4win_discovery_ioctl(
     PDEVICE_OBJECT device, ULONG code,
     PVOID input, ULONG input_length, PVOID output, ULONG output_length,
     PULONG_PTR transferred)
@@ -45,7 +55,7 @@ ext4win_query_volume_partition(
 {
     PARTITION_INFORMATION_EX partition = {0};
     ULONG_PTR transferred;
-    NTSTATUS status = volume_ioctl(
+    NTSTATUS status = ext4win_discovery_ioctl(
         device, IOCTL_DISK_GET_PARTITION_INFO_EX, NULL, 0,
         &partition, sizeof(partition), &transferred);
     if (!NT_SUCCESS(status)) { return status; }
@@ -65,7 +75,7 @@ ext4win_query_volume_sector_size(
 {
     DISK_GEOMETRY geometry = {0};
     ULONG_PTR transferred;
-    NTSTATUS status = volume_ioctl(
+    NTSTATUS status = ext4win_discovery_ioctl(
         device, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0,
         &geometry, sizeof(geometry), &transferred);
     if (!NT_SUCCESS(status)) { return status; }

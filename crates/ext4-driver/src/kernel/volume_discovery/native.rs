@@ -411,11 +411,8 @@ impl DiscoveryContext {
             STATUS_SUCCESS,
             OperationalOutcome::Selected,
         );
-        let status = unsafe {
-            // SAFETY: The same referenced volume supplied GPT and signature evidence. Acceptance
-            // is reconciled by native queries; shutdown joins this call before retiring the FSD.
-            ext4win_announce_volume(volume.device.as_ptr())
-        };
+        let status = crate::kernel::mount_manager::announce_volume_arrival(volume.device)
+            .map_or_else(|status| status, |()| STATUS_SUCCESS);
         self.trace
             .record_status(OperationalPath::DiscoveryAnnouncement, status);
         native_success(status)
@@ -566,8 +563,6 @@ unsafe extern "system" {
         buffer: *mut c_void,
         length: u32,
     ) -> NTSTATUS;
-    /// Reconciles existing registration before and after a Mount Manager arrival notification.
-    fn ext4win_announce_volume(device: wdk_sys::PDEVICE_OBJECT) -> NTSTATUS;
     /// Sends asynchronous discovery failure to the system error log.
     fn ext4win_report_volume_discovery_failure(owner: wdk_sys::PDEVICE_OBJECT, status: NTSTATUS);
 }

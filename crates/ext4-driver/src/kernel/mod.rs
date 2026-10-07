@@ -8,6 +8,7 @@ mod fast_io;
 pub(crate) mod fatal;
 pub(crate) mod ffi;
 pub(crate) mod file_information;
+mod mount_manager;
 pub(crate) mod operational_trace;
 pub(crate) mod status;
 pub(crate) mod storage;
