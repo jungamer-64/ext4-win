@@ -941,7 +941,11 @@ impl StreamContext {
     /// `irp` must identify the active `IRP_MJ_LOCK_CONTROL` request for this stream, and the caller
     /// must transfer terminal completion authority exactly once.
     #[cfg(not(test))]
-    pub(crate) unsafe fn process_file_lock(&self, irp: NonNull<wdk_sys::IRP>) -> NTSTATUS {
+    pub(crate) unsafe fn process_file_lock(
+        &self,
+        irp: NonNull<wdk_sys::IRP>,
+        completion: crate::irp::FileLockCompletion,
+    ) -> NTSTATUS {
         unsafe {
             // SAFETY: The caller supplies the consuming IRP capability documented above.
             ext4win_stream_process_file_lock(self.header.as_ptr(), irp.as_ptr())

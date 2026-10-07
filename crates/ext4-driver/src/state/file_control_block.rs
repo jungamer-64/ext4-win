@@ -171,7 +171,11 @@ impl FileControlBlock {
             reason = "the consuming dispatch target transfers its one live IRP to FsRtl"
         )
     )]
-    pub(crate) fn process_byte_range_lock(&self, target: DispatchTarget) -> wdk_sys::NTSTATUS {
+    pub(crate) fn process_byte_range_lock(
+        &self,
+        target: DispatchTarget,
+        #[cfg(not(test))] completion: crate::irp::FileLockCompletion,
+    ) -> wdk_sys::NTSTATUS {
         #[cfg(not(test))]
         {
             let raw_irp = target.into_raw_irp();
