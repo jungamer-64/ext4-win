@@ -1,8 +1,6 @@
 #include <ntifs.h>
 #include "executive_resource.h"
 #include "section_mutation.h"
-#include "storage_admission.h"
-#include "pnp_remove.h"
 #include "operational_trace.h"
 
 #define EXT4WIN_STREAM_POOL_TAG ((ULONG)0x53743445UL)
@@ -16,7 +14,9 @@
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
-extern VOID NTAPI ext4win_finish_mdl_completion(_Inout_ PIRP irp, _In_ NTSTATUS status);
+extern UCHAR NTAPI ext4win_storage_media_state(_In_ const VOID *state);
+extern UCHAR NTAPI ext4win_storage_close_phase(_In_ const VOID *state);
+extern NTSTATUS NTAPI ext4win_prepare_mdl_completion(_In_ const VOID *queue, _In_ PFILE_OBJECT file_object);
 
 /* This consuming call preserves buffered/direct/neither IOCTL semantics and lower cancellation. */
 _Must_inspect_result_
@@ -57,18 +57,32 @@ typedef struct _EXT4WIN_FAST_IO_QUERY_SNAPSHOT {
     BOOLEAN DeletePending;
 } EXT4WIN_FAST_IO_QUERY_SNAPSHOT, *PEXT4WIN_FAST_IO_QUERY_SNAPSHOT;
 
+typedef struct _EXT4WIN_FAST_IO_TRANSFER_OBSERVATION {
+    LONGLONG Eof;
+    ULONG Flags;
+    UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess;
+} EXT4WIN_FAST_IO_TRANSFER_OBSERVATION;
+
+extern BOOLEAN NTAPI ext4win_fast_io_admit(ULONG flags, UCHAR cached, UCHAR media, UCHAR close, UCHAR mutation);
+extern BOOLEAN NTAPI ext4win_fast_io_query_admit(ULONG flags, UCHAR read_access, UCHAR possible, UCHAR media, UCHAR mutation);
+extern BOOLEAN NTAPI ext4win_fast_io_check_if_possible(PFILE_OBJECT file, PLARGE_INTEGER offset,
+    ULONG length, BOOLEAN wait, ULONG key, BOOLEAN read, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device);
+extern VOID NTAPI ext4win_fast_io_basic_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot, PFILE_BASIC_INFORMATION output);
+extern VOID NTAPI ext4win_fast_io_standard_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot, PFILE_STANDARD_INFORMATION output);
+extern VOID NTAPI ext4win_fast_io_network_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot, PFILE_NETWORK_OPEN_INFORMATION output);
+C_ASSERT(sizeof(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION) == 24);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION, Cached) == 12);
+C_ASSERT(sizeof(EXT4WIN_FAST_IO_QUERY_SNAPSHOT) == 80);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_QUERY_SNAPSHOT, DeletePending) == 72);
+
 typedef struct _EXT4WIN_STREAM_CONTEXT {
     FSRTL_ADVANCED_FCB_HEADER Header;
     FAST_MUTEX HeaderMutex;
     ERESOURCE MainResource;
     ERESOURCE PagingIoResource;
     SECTION_OBJECT_POINTERS SectionObjects;
-    KSPIN_LOCK MdlCompletionLock;
-    LIST_ENTRY MdlCompletions;
-    /* Prepared before Cc can expose any MDL. Releases can therefore queue without allocation. */
-    PIO_WORKITEM MdlCompletionWorkItem;
-    PFILE_OBJECT MdlCompletionOwner;
-    enum { Ext4MdlCompletionIdle, Ext4MdlCompletionScheduled } MdlCompletionState;
+    /* Rust owns the domain-specific admission or completion allocation. */
+    PVOID RustState;
     /* Physical storage charge is not the header's logical section bound. */
     LONGLONG AllocationCharge;
     EXT4WIN_PUBLISHED_STREAM_METADATA PublishedMetadata;
@@ -78,7 +92,7 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     PDEVICE_OBJECT VolumeControlDevice;
     /* The VCB outlives all ledger-owned node streams, including mapped sections. */
     struct _EXT4WIN_STREAM_CONTEXT *VolumeStream;
-    EXT4WIN_STORAGE_ADMISSION StorageAdmission;
+    ERESOURCE Submissions;
     PFILE_LOCK ByteRangeLocks;
     PVOID AePushLock;
     REGHANDLE TraceRegistrationHandle;
@@ -189,7 +203,7 @@ static BOOLEAN
 ext4win_stream_storage_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
-    return (volume != NULL) && (ext4win_storage_removal_state(&volume->StorageAdmission) == 0);
+    return (volume != NULL) && (ext4win_storage_media_state(volume->RustState) == 0);
 }
 
 /* Cache/Fast I/O authority is independent from lower storage presence. */
@@ -198,7 +212,7 @@ ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
     return ext4win_stream_storage_available(stream)
-        && (ext4win_storage_close_state(&volume->StorageAdmission) == 0);
+        && (ext4win_storage_close_phase(volume->RustState) == 0);
 }
 
 static BOOLEAN
@@ -388,15 +402,15 @@ ext4win_stream_fast_io_candidate(
     _In_ PFILE_OBJECT file_object,
     _Outptr_ PEXT4WIN_STREAM_CONTEXT *stream_out)
 {
-    if (!ext4win_stream_fast_io_stream(file_object, stream_out) ||
-        !ext4win_stream_ordinary_io_available(*stream_out) ||
-        ((file_object->Flags & FO_NO_INTERMEDIATE_BUFFERING) != 0) ||
-        (file_object->PrivateCacheMap == NULL) ||
-        ((file_object->Flags & FO_CACHE_SUPPORTED) == 0) ||
-        (ext4win_section_mutation_state(&(*stream_out)->SectionMutation) != EXT4WIN_SECTION_MUTATION_IDLE)) {
-        return FALSE;
-    }
-    return TRUE;
+    PEXT4WIN_STREAM_CONTEXT stream;
+    PEXT4WIN_STREAM_CONTEXT volume;
+    if (!ext4win_stream_fast_io_stream(file_object, &stream)) { return FALSE; }
+    volume = stream->VolumeStream;
+    if (volume == NULL) { return FALSE; }
+    *stream_out = stream;
+    return ext4win_fast_io_admit(file_object->Flags, file_object->PrivateCacheMap != NULL,
+        ext4win_storage_media_state(volume->RustState), ext4win_storage_close_phase(volume->RustState),
+        (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation));
 }
 
 _Success_(return != FALSE)
@@ -477,10 +491,11 @@ ext4win_stream_end_section_mutation(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 }
 
 static BOOLEAN
-ext4win_stream_acquire_fast_io_main(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+ext4win_stream_acquire_fast_io_main(_In_ PFILE_OBJECT file, _In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
+    PEXT4WIN_STREAM_CONTEXT observed;
     ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
-    if (!ext4win_stream_storage_available(stream) || ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_IDLE) {
+    if (!ext4win_stream_fast_io_candidate(file, &observed) || (observed != stream)) {
         ext4win_release_resource(&stream->MainResource);
         return FALSE;
     }
@@ -526,6 +541,7 @@ ext4win_stream_create(
     _In_ LONGLONG allocation_charge,
     _In_opt_ const EXT4WIN_STREAM_METADATA *metadata,
     _In_ REGHANDLE trace_registration_handle,
+    _In_ PVOID rust_state,
     _Outptr_ PVOID *stream_header_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
@@ -539,7 +555,7 @@ ext4win_stream_create(
     *stream_header_out = NULL;
     RtlZeroMemory(&prepared_metadata, sizeof(prepared_metadata));
     metadata_valid = FALSE;
-    if ((kind != 1) && (kind != 2)) {
+    if ((rust_state == NULL) || ((kind != 1) && (kind != 2))) {
         return STATUS_INVALID_PARAMETER;
     }
     if ((metadata != NULL) &&
@@ -567,6 +583,7 @@ ext4win_stream_create(
     }
     RtlZeroMemory(stream, sizeof(*stream));
     stream->TraceRegistrationHandle = trace_registration_handle;
+    stream->RustState = rust_state;
 
     status = ExInitializeResourceLite(&stream->MainResource);
     if (!NT_SUCCESS(status)) {
@@ -594,7 +611,7 @@ ext4win_stream_create(
     }
 
     if (kind == 2) {
-        status = ExInitializeResourceLite(&stream->StorageAdmission.Submissions);
+        status = ExInitializeResourceLite(&stream->Submissions);
         if (!NT_SUCCESS(status)) {
             FsRtlFreeAePushLock(stream->AePushLock);
             (VOID)ExDeleteResourceLite(&stream->PagingIoResource);
@@ -605,9 +622,6 @@ ext4win_stream_create(
     }
 
     ExInitializeFastMutex(&stream->HeaderMutex);
-    KeInitializeSpinLock(&stream->MdlCompletionLock);
-    InitializeListHead(&stream->MdlCompletions);
-    stream->MdlCompletionState = Ext4MdlCompletionIdle;
     stream->Header.Resource = &stream->MainResource;
     stream->Header.PagingIoResource = &stream->PagingIoResource;
     stream->Header.AllocationSize.QuadPart = allocation_size;
@@ -1175,7 +1189,7 @@ ext4win_stream_cache_mdl(
     if (!NT_SUCCESS(status) || (length == 0)) {
         return status;
     }
-    status = ext4win_prepare_mdl_completion_worker(stream, file_object);
+    status = ext4win_prepare_mdl_completion(stream->RustState, file_object);
     if (!NT_SUCCESS(status)) { return status; }
     (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
     if (!ext4win_stream_ordinary_io_available(stream)) {
@@ -1640,23 +1654,21 @@ ext4win_acquire_fast_io_query_stream(
 {
     PEXT4WIN_STREAM_CONTEXT stream;
 
-    if (!ext4win_stream_fast_io_stream(file_object, &stream) ||
-        !ext4win_stream_storage_available(stream) ||
-        ((file_object->Flags & FO_NO_INTERMEDIATE_BUFFERING) != 0) ||
-        !file_object->ReadAccess ||
-        (stream->Header.IsFastIoPossible != FastIoIsPossible) ||
-        (ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_IDLE)) {
-        return FALSE;
-    }
+    if (!ext4win_stream_fast_io_stream(file_object, &stream) || (stream->VolumeStream == NULL)) { return FALSE; }
+    if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
+        stream->Header.IsFastIoPossible == FastIoIsPossible,
+        ext4win_storage_media_state(stream->VolumeStream->RustState),
+        (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation))) { return FALSE; }
     if (wait) {
         (VOID)ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
     }
     else if (!ext4win_acquire_resource_shared(&stream->MainResource, FALSE)) {
         return FALSE;
     }
-    if (!ext4win_stream_storage_available(stream) ||
-        (stream->Header.IsFastIoPossible != FastIoIsPossible) ||
-        (ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_IDLE)) {
+    if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
+        stream->Header.IsFastIoPossible == FastIoIsPossible,
+        ext4win_storage_media_state(stream->VolumeStream->RustState),
+        (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation))) {
         ext4win_release_resource(&stream->MainResource);
         return FALSE;
     }
@@ -1685,6 +1697,99 @@ ext4win_capture_fast_io_query_snapshot(
     }
     ExReleaseFastMutex(&stream->HeaderMutex);
     return valid;
+}
+
+/* Rust prepares a local record; the requestor copy is entirely contained by SEH. */
+static BOOLEAN NTAPI ext4win_fast_io_query_basic_info(PFILE_OBJECT file, BOOLEAN wait,
+    PFILE_BASIC_INFORMATION buffer, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
+    FILE_BASIC_INFORMATION prepared;
+    UNREFERENCED_PARAMETER(device);
+    if ((buffer == NULL) || (status == NULL)) { return FALSE; }
+    status->Status = STATUS_NOT_SUPPORTED;
+    status->Information = 0;
+    if (!ext4win_acquire_fast_io_query_stream(file, wait, &stream)) { return FALSE; }
+    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
+        ext4win_release_resource(&stream->MainResource);
+        return FALSE;
+    }
+    RtlZeroMemory(&prepared, sizeof(prepared));
+    ext4win_fast_io_basic_record(&snapshot, &prepared);
+    __try {
+        *buffer = prepared;
+        status->Status = STATUS_SUCCESS;
+        status->Information = sizeof(prepared);
+    }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+        status->Status = GetExceptionCode();
+        status->Information = 0;
+    }
+    ext4win_release_resource(&stream->MainResource);
+    return TRUE;
+}
+
+/* Rust prepares a local record; the requestor copy is entirely contained by SEH. */
+static BOOLEAN NTAPI ext4win_fast_io_query_standard_info(PFILE_OBJECT file, BOOLEAN wait,
+    PFILE_STANDARD_INFORMATION buffer, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
+    FILE_STANDARD_INFORMATION prepared;
+    UNREFERENCED_PARAMETER(device);
+    if ((buffer == NULL) || (status == NULL)) { return FALSE; }
+    status->Status = STATUS_NOT_SUPPORTED;
+    status->Information = 0;
+    if (!ext4win_acquire_fast_io_query_stream(file, wait, &stream)) { return FALSE; }
+    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
+        ext4win_release_resource(&stream->MainResource);
+        return FALSE;
+    }
+    RtlZeroMemory(&prepared, sizeof(prepared));
+    ext4win_fast_io_standard_record(&snapshot, &prepared);
+    __try {
+        *buffer = prepared;
+        status->Status = STATUS_SUCCESS;
+        status->Information = sizeof(prepared);
+    }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+        status->Status = GetExceptionCode();
+        status->Information = 0;
+    }
+    ext4win_release_resource(&stream->MainResource);
+    return TRUE;
+}
+
+/* Rust prepares a local record; the requestor copy is entirely contained by SEH. */
+static BOOLEAN NTAPI ext4win_fast_io_query_network_open_info(PFILE_OBJECT file, BOOLEAN wait,
+    PFILE_NETWORK_OPEN_INFORMATION buffer, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
+    FILE_NETWORK_OPEN_INFORMATION prepared;
+    UNREFERENCED_PARAMETER(device);
+    if ((buffer == NULL) || (status == NULL)) { return FALSE; }
+    status->Status = STATUS_NOT_SUPPORTED;
+    status->Information = 0;
+    if (!ext4win_acquire_fast_io_query_stream(file, wait, &stream)) { return FALSE; }
+    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
+        ext4win_release_resource(&stream->MainResource);
+        return FALSE;
+    }
+    RtlZeroMemory(&prepared, sizeof(prepared));
+    ext4win_fast_io_network_record(&snapshot, &prepared);
+    __try {
+        *buffer = prepared;
+        status->Status = STATUS_SUCCESS;
+        status->Information = sizeof(prepared);
+    }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+        status->Status = GetExceptionCode();
+        status->Information = 0;
+    }
+    ext4win_release_resource(&stream->MainResource);
+    return TRUE;
 }
 
 _Success_(return != FALSE && NT_SUCCESS(io_status->Status))
@@ -1717,7 +1822,7 @@ ext4win_fast_io_read(
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ);
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_READ);
         return FALSE;
     }
@@ -1770,7 +1875,7 @@ ext4win_fast_io_write(
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
         return FALSE;
     }
@@ -1994,10 +2099,10 @@ ext4win_mdl_read(
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
-    if (!NT_SUCCESS(ext4win_prepare_mdl_completion_worker(stream, file_object))) { return FALSE; }
+    if (!NT_SUCCESS(ext4win_prepare_mdl_completion(stream->RustState, file_object))) { return FALSE; }
     *mdl_chain = NULL;
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_READ);
         return FALSE;
     }
@@ -2085,10 +2190,10 @@ ext4win_prepare_mdl_write(
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
-    if (!NT_SUCCESS(ext4win_prepare_mdl_completion_worker(stream, file_object))) { return FALSE; }
+    if (!NT_SUCCESS(ext4win_prepare_mdl_completion(stream->RustState, file_object))) { return FALSE; }
     *mdl_chain = NULL;
     handled = FALSE;
-    if (!ext4win_stream_acquire_fast_io_main(stream)) {
+    if (!ext4win_stream_acquire_fast_io_main(file_object, stream)) {
         ext4win_trace_fallback(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);
         return FALSE;
     }
@@ -2285,17 +2390,7 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     NTSTATUS paging_status;
     NTSTATUS main_status;
     NTSTATUS storage_status;
-    KIRQL old_irql;
-    BOOLEAN mdl_idle;
-
-    if (stream == NULL) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    KeAcquireSpinLock(&stream->MdlCompletionLock, &old_irql);
-    mdl_idle = (stream->MdlCompletionState == Ext4MdlCompletionIdle) &&
-        (stream->MdlCompletionOwner == NULL) && IsListEmpty(&stream->MdlCompletions);
-    KeReleaseSpinLock(&stream->MdlCompletionLock, old_irql);
-    if (!mdl_idle) { return STATUS_DEVICE_BUSY; }
+    if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
     if ((stream->SectionObjects.DataSectionObject != NULL) ||
         (stream->SectionObjects.SharedCacheMap != NULL) ||
         (stream->SectionObjects.ImageSectionObject != NULL) ||
@@ -2304,10 +2399,6 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     }
 
     stream->Signature = 0;
-    if (stream->MdlCompletionWorkItem != NULL) {
-        IoFreeWorkItem(stream->MdlCompletionWorkItem);
-        stream->MdlCompletionWorkItem = NULL;
-    }
     stream->Owner = NULL;
     if (stream->OplockInitialized) {
         FsRtlUninitializeOplock(&stream->Header.Oplock);
@@ -2324,7 +2415,7 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
 
     storage_status = STATUS_SUCCESS;
     if (stream->Kind == 2) {
-        storage_status = ExDeleteResourceLite(&stream->StorageAdmission.Submissions);
+        storage_status = ExDeleteResourceLite(&stream->Submissions);
     }
     paging_status = STATUS_SUCCESS;
     if (stream->PagingResourceInitialized) {
@@ -2341,4 +2432,71 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
         return paging_status;
     }
     return NT_SUCCESS(storage_status) ? main_status : storage_status;
+}
+
+/* Resource-only boundaries: Rust owns admission and checks it while the shared scope is held. */
+_IRQL_requires_max_(APC_LEVEL)
+BOOLEAN NTAPI ext4win_stream_acquire_submissions(_In_ PVOID header, _In_ BOOLEAN exclusive)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    if ((stream == NULL) || (stream->Kind != 2)) { return FALSE; }
+    return exclusive ? ext4win_acquire_resource_exclusive(&stream->Submissions, TRUE)
+        : ext4win_acquire_resource_shared(&stream->Submissions, FALSE);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+VOID NTAPI ext4win_stream_release_submissions(_In_ PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    ext4win_release_resource(&stream->Submissions);
+}
+
+PVOID NTAPI ext4win_stream_mdl_queue(_In_ PFILE_OBJECT file)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = (file == NULL) ? NULL : ext4win_stream_from_header(file->FsContext);
+    return ((stream != NULL) && (stream->Kind == 1)) ? stream->RustState : NULL;
+}
+
+NTSTATUS NTAPI ext4win_complete_cache_mdl(_Inout_ PIRP irp, _In_ ULONG action)
+{
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    ULONG_PTR information;
+    return ext4win_cache_mdl_transfer(stack->FileObject, irp, action,
+        stack->Parameters.Read.ByteOffset, 0, 0, &information);
+}
+
+/* Fixed observation only; Rust decides whether this callback may select Fast I/O. */
+BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFER_OBSERVATION *output)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    PEXT4WIN_STREAM_CONTEXT volume;
+    if (!ext4win_stream_fast_io_stream(file, &stream) || (output == NULL)) { return FALSE; }
+    volume = stream->VolumeStream;
+    if (volume == NULL) { return FALSE; }
+    RtlZeroMemory(output, sizeof(*output));
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    output->Eof = stream->Header.FileSize.QuadPart;
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    output->Flags = file->Flags;
+    output->Cached = file->PrivateCacheMap != NULL;
+    output->Media = ext4win_storage_media_state(volume->RustState);
+    output->Close = ext4win_storage_close_phase(volume->RustState);
+    output->Mutation = (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation);
+    output->ReadAccess = file->ReadAccess;
+    output->WriteAccess = file->WriteAccess;
+    return TRUE;
+}
+
+BOOLEAN NTAPI ext4win_fast_io_check_locks(PFILE_OBJECT file, LONGLONG offset, LONGLONG length, ULONG key, BOOLEAN read)
+{
+    PEXT4WIN_STREAM_CONTEXT stream;
+    LARGE_INTEGER file_offset, native_length;
+    if (!ext4win_stream_fast_io_stream(file, &stream)) { return FALSE; }
+    file_offset.QuadPart = offset;
+    native_length.QuadPart = length;
+    if (!FsRtlOplockIsFastIoPossible(&stream->Header.Oplock)) { return FALSE; }
+    return read ? FsRtlFastCheckLockForRead(stream->ByteRangeLocks, &file_offset,
+        &native_length, key, file, PsGetCurrentProcess())
+        : FsRtlFastCheckLockForWrite(stream->ByteRangeLocks, &file_offset,
+        &native_length, key, file, PsGetCurrentProcess());
 }

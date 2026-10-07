@@ -47,8 +47,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/executive_resource.h");
     println!("cargo:rerun-if-changed=native/section_mutation.h");
     println!("cargo:rerun-if-changed=native/stream_metadata.h");
-    println!("cargo:rerun-if-changed=native/storage_admission.h");
-    println!("cargo:rerun-if-changed=native/pnp_remove.h");
     println!("cargo:rerun-if-changed=native/cache_mdl.h");
     println!("cargo:rerun-if-changed=native/cache_close.h");
     println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_SOURCE}");

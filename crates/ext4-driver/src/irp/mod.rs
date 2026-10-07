@@ -27,6 +27,7 @@ mod create;
 mod dispatch;
 mod finalization;
 mod lifecycle;
+pub(crate) mod mdl_completion;
 pub(crate) use finalization::{FinalizationOperation, FinalizationPool, FinalizationRequest};
 #[cfg(not(test))]
 mod notification;

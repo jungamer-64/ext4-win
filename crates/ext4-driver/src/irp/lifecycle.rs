@@ -572,14 +572,24 @@ impl ReceivedIrp {
         };
         #[cfg(not(test))]
         {
-            let status = unsafe {
-                // SAFETY: The native queue holds this original IRP until Cc returns its chain.
-                // A pending result consumes completion authority, even for synchronous dequeue.
-                ext4win_queue_mdl_completion(
-                    file_object,
-                    self.target.irp.as_ptr(),
-                    _completion.action(),
-                )
+            let queue = unsafe {
+                // SAFETY: The active FILE_OBJECT retains its native stream and pinned Rust inbox.
+                ext4win_stream_mdl_queue(file_object)
+            };
+            let Some(queue) = (unsafe {
+                // SAFETY: Native decoding returns only the node stream's retained pinned inbox.
+                queue
+                    .cast::<super::mdl_completion::MdlCompletionQueue>()
+                    .as_ref()
+            }) else {
+                return self.complete_result(Err(DriverError::InternalInvariantViolation));
+            };
+            let status = match unsafe {
+                // SAFETY: The consuming dispatch owner transfers this unqueued IRP only on success.
+                queue.enqueue(self.target.irp, file_object, _completion)
+            } {
+                Ok(()) => STATUS_PENDING,
+                Err(error) => error.ntstatus(),
             };
             if status == STATUS_PENDING {
                 return status;
@@ -727,42 +737,11 @@ impl ReceivedIrp {
     reason = "this native boundary consumes the original unqueued control IRP"
 )]
 unsafe extern "system" {
-    fn ext4win_queue_mdl_completion(
-        file_object: *mut wdk_sys::FILE_OBJECT,
-        irp: wdk_sys::PIRP,
-        action: MdlAction,
-    ) -> NTSTATUS;
+    fn ext4win_stream_mdl_queue(file: *mut wdk_sys::FILE_OBJECT) -> *mut c_void;
     fn ext4win_forward_original_irp(
         device: wdk_sys::PDEVICE_OBJECT,
         irp: wdk_sys::PIRP,
     ) -> NTSTATUS;
-}
-
-/// Completes exactly the IRP consumed by the native MDL completion queue at PASSIVE_LEVEL.
-/// # Safety
-///
-/// The native worker must own this live, unqueued-to-CSQ IRP after clearing its consumed chain.
-#[cfg(not(test))]
-#[expect(
-    unsafe_code,
-    reason = "the native MDL worker transfers unique terminal ownership to this completion-context boundary"
-)]
-#[unsafe(no_mangle)]
-unsafe extern "system" fn ext4win_finish_mdl_completion(irp: PIRP, status: NTSTATUS) {
-    let irp = unsafe {
-        // SAFETY: The native worker removed this unique IRP from its intrusive completion queue.
-        KernelIrp::from_raw(irp)
-    }
-    .unwrap_or_else(|| {
-        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-            .bugcheck()
-    });
-    let completion = if status >= STATUS_SUCCESS {
-        IrpCompletion::EMPTY
-    } else {
-        IrpCompletion::from_native_failure(status)
-    };
-    let _status = irp.complete(completion);
 }
 
 /// Prepared IRP ready to transfer into the cancel-safe queue.
@@ -1407,6 +1386,45 @@ impl KernelIrp {
         NonNull::new(irp).map(|irp| Self { irp })
     }
 
+    /// Marks pending before publication to either the CSQ or the non-cancellable terminal FIFO.
+    #[expect(
+        unsafe_code,
+        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+    )]
+    pub(super) fn mark_pending(self) {
+        let pending_bit = match u8::try_from(wdk_sys::SL_PENDING_RETURNED) {
+            Ok(bit) => bit,
+            Err(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        };
+        let mut raw_irp = self.irp;
+        let raw_irp = unsafe {
+            // SAFETY: Queue publication owns this not-yet-inserted IRP.
+            raw_irp.as_mut()
+        };
+        let overlay = unsafe {
+            // SAFETY: The I/O Manager initialized the current-stack tail overlay.
+            raw_irp.Tail.Overlay
+        };
+        let current_stack = unsafe {
+            // SAFETY: The current-stack pointer occupies this tail-overlay arm.
+            overlay
+                .__bindgen_anon_2
+                .__bindgen_anon_1
+                .CurrentStackLocation
+        };
+        let Some(stack) = (unsafe {
+            // SAFETY: Queue capture validated this current-stack pointer.
+            current_stack.as_mut()
+        }) else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        stack.Control |= pending_bit;
+    }
+
     /// Returns the raw IRP pointer.
     pub(super) fn as_ptr(self) -> PIRP {
         self.irp.as_ptr()
@@ -1644,7 +1662,7 @@ impl KernelIrp {
     }
 
     /// Completes the IRP through the I/O Manager.
-    fn complete(self, completion: IrpCompletion) -> NTSTATUS {
+    pub(super) fn complete(self, completion: IrpCompletion) -> NTSTATUS {
         self.write_status_block(completion);
         self.finish_completion(completion.status())
     }

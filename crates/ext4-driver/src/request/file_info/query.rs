@@ -670,44 +670,18 @@ fn pack_basic_information(
     output: &mut [u8],
     metadata: FileMetadata,
 ) -> DriverResult<IrpCompletion> {
-    let size = core::mem::size_of::<wdk_sys::FILE_BASIC_INFORMATION>();
-    let mut writer = fixed_record_writer(output, size)?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_BASIC_INFORMATION,
-            CreationTime
-        )),
-        windows_time_quad(metadata.times.created()),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_BASIC_INFORMATION,
-            LastAccessTime
-        )),
-        windows_time_quad(metadata.times.accessed()),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_BASIC_INFORMATION,
-            LastWriteTime
-        )),
-        windows_time_quad(metadata.times.modified()),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_BASIC_INFORMATION,
-            ChangeTime
-        )),
-        windows_time_quad(metadata.times.changed()),
-    )?;
-    writer.write_u32(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_BASIC_INFORMATION,
-            FileAttributes
-        )),
-        metadata.file_attributes,
-    )?;
-    IrpCompletion::from_usize(size)
+    IrpCompletion::from_usize(
+        crate::kernel::file_information::BasicInformation {
+            times: [
+                windows_time_quad(metadata.times.created()),
+                windows_time_quad(metadata.times.accessed()),
+                windows_time_quad(metadata.times.modified()),
+                windows_time_quad(metadata.times.changed()),
+            ],
+            attributes: metadata.file_attributes,
+        }
+        .write_basic(output)?,
+    )
 }
 
 /// Packs FILE_STANDARD_INFORMATION.
@@ -721,44 +695,14 @@ fn pack_standard_information(
     stream_sizes: crate::kernel::stream::StreamSizes,
 ) -> DriverResult<IrpCompletion> {
     let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
-    let size = core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>();
-    let mut writer = fixed_record_writer(output, size)?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_STANDARD_INFORMATION,
-            AllocationSize
-        )),
-        stream_sizes.allocation_charge(),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_STANDARD_INFORMATION,
-            EndOfFile
-        )),
-        stream_sizes.file_size(),
-    )?;
-    writer.write_u32(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_STANDARD_INFORMATION,
-            NumberOfLinks
-        )),
-        links.total_links,
-    )?;
-    writer.write_u8(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_STANDARD_INFORMATION,
-            DeletePending
-        )),
-        boolean(links.delete_pending),
-    )?;
-    writer.write_u8(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_STANDARD_INFORMATION,
-            Directory
-        )),
-        boolean(links.directory),
-    )?;
-    IrpCompletion::from_usize(size)
+    let record = crate::kernel::file_information::StandardInformation {
+        allocation: stream_sizes.allocation_charge(),
+        eof: stream_sizes.file_size(),
+        links: links.total_links,
+        delete_pending: links.delete_pending,
+        directory: links.directory,
+    };
+    IrpCompletion::from_usize(record.write(output)?)
 }
 
 /// Packs FILE_STANDARD_LINK_INFORMATION.
@@ -863,58 +807,22 @@ fn pack_network_open_information(
     metadata: FileMetadata,
     stream_sizes: crate::kernel::stream::StreamSizes,
 ) -> DriverResult<IrpCompletion> {
-    let size = core::mem::size_of::<wdk_sys::FILE_NETWORK_OPEN_INFORMATION>();
-    let mut writer = fixed_record_writer(output, size)?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
-            CreationTime
-        )),
-        windows_time_quad(metadata.times.created()),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
-            LastAccessTime
-        )),
-        windows_time_quad(metadata.times.accessed()),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
-            LastWriteTime
-        )),
-        windows_time_quad(metadata.times.modified()),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
-            ChangeTime
-        )),
-        windows_time_quad(metadata.times.changed()),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
-            AllocationSize
-        )),
-        stream_sizes.allocation_charge(),
-    )?;
-    writer.write_i64(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
-            EndOfFile
-        )),
-        stream_sizes.file_size(),
-    )?;
-    writer.write_u32(
-        WireOffset::new(core::mem::offset_of!(
-            wdk_sys::FILE_NETWORK_OPEN_INFORMATION,
-            FileAttributes
-        )),
-        metadata.file_attributes,
-    )?;
-    IrpCompletion::from_usize(size)
+    IrpCompletion::from_usize(
+        crate::kernel::file_information::BasicInformation {
+            times: [
+                windows_time_quad(metadata.times.created()),
+                windows_time_quad(metadata.times.accessed()),
+                windows_time_quad(metadata.times.modified()),
+                windows_time_quad(metadata.times.changed()),
+            ],
+            attributes: metadata.file_attributes,
+        }
+        .write_network(
+            output,
+            stream_sizes.allocation_charge(),
+            stream_sizes.file_size(),
+        )?,
+    )
 }
 
 /// Packs FILE_ATTRIBUTE_TAG_INFORMATION.

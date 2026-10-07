@@ -1684,7 +1684,7 @@ impl CompletionReactor {
         reservation: Option<OperationReservation>,
         class: ExecutionClass,
     ) {
-        mark_pending(pending.target.irp);
+        pending.target.irp.mark_pending();
         let irp = pending.publish();
         if let Some(reservation) = reservation {
             reservation.publish();
@@ -4686,41 +4686,6 @@ unsafe fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
             irp.published_queue_context_matches(core::ptr::null_mut(), false, Some(*class))
         },
     }
-}
-
-/// Marks pending before publication to either the CSQ or the non-cancellable terminal FIFO.
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-fn mark_pending(irp: KernelIrp) {
-    let pending_bit = match u8::try_from(wdk_sys::SL_PENDING_RETURNED) {
-        Ok(bit) => bit,
-        Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
-    };
-    let mut raw_irp = irp.irp;
-    let raw_irp = unsafe {
-        // SAFETY: Queue publication owns this not-yet-inserted IRP.
-        raw_irp.as_mut()
-    };
-    let overlay = unsafe {
-        // SAFETY: The I/O Manager initialized the current-stack tail overlay.
-        raw_irp.Tail.Overlay
-    };
-    let current_stack = unsafe {
-        // SAFETY: The current-stack pointer occupies this tail-overlay arm.
-        overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation
-    };
-    let Some(stack) = (unsafe {
-        // SAFETY: Queue capture validated this current-stack pointer.
-        current_stack.as_mut()
-    }) else {
-        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-    };
-    stack.Control |= pending_bit;
 }
 
 #[cfg(test)]
