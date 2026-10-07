@@ -1,16 +1,14 @@
 [package]
-name = "windows-host"
+name = "ext4ctl"
 version = "0.1.0"
 edition = "2024"
 license.workspace = true
 publish = false
 
 [dependencies]
-ext4-core = { path = "../../crates/ext4-core" }
 ext4-security = { path = "../../crates/ext4-security" }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys.workspace = true
+ext4-core = { path = "../../crates/ext4-core" }
+windows-host = { path = "../windows-host" }
 
 [lints]
 workspace = true

@@ -315,6 +315,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4ctl"
+version = "0.1.0"
+dependencies = [
+ "ext4-core",
+ "ext4-security",
+ "windows-host",
+]
+
+[[package]]
 name = "ext4win"
 version = "0.1.0"
 dependencies = [
@@ -921,6 +930,8 @@ dependencies = [
 name = "windows-host"
 version = "0.1.0"
 dependencies = [
+ "ext4-core",
+ "ext4-security",
  "windows-sys 0.61.2",
 ]
 

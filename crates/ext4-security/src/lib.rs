@@ -15,7 +15,9 @@ mod rights;
 pub use control::{CONTROL_REPLY_BYTES, MappingState, PublicationOutcome, Replacement};
 pub use creation::{ChildKind, child_security};
 pub use descriptor::{Components, Descriptor, MAX_DESCRIPTOR_BYTES};
-pub use identity::{GroupMapping, IdentityMap, MappingSnapshot, Sid, UserMapping};
+pub use identity::{
+    GroupMapping, IdentityMap, MappingSnapshot, Sid, UserMapping, parse_uuid, uuid_text,
+};
 pub use rights::{
     AccessDecision, BASE_RIGHTS, CONTROLLED_RIGHTS, EXECUTE_RIGHTS, MAXIMUM_ALLOWED,
     MAXIMUM_CANDIDATES, READ_RIGHTS, WRITE_RIGHTS, evaluate_access, mode_rights, rights_mode,

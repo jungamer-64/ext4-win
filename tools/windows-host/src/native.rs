@@ -1372,3 +1372,7 @@ mod tests {
 /// ETW consumer ownership and typed fixed-scalar event records.
 mod trace;
 pub use trace::{TraceEvent, TraceSession};
+
+/// Effective token identity and UUID-scoped administrator control.
+mod identity;
+pub use identity::*;

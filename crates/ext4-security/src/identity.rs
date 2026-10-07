@@ -70,6 +70,139 @@ impl Sid {
         Self::parse(&[1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0])
     }
 }
+impl core::fmt::Display for Sid {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let authority = self
+            .bytes()
+            .iter()
+            .skip(2)
+            .take(6)
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte));
+        write!(formatter, "S-1-{authority}")?;
+        for chunk in self
+            .bytes()
+            .get(8..)
+            .ok_or(core::fmt::Error)?
+            .as_chunks::<4>()
+            .0
+        {
+            let value = u32::from_le_bytes(*chunk);
+            write!(formatter, "-{value}")?;
+        }
+        Ok(())
+    }
+}
+impl core::str::FromStr for Sid {
+    type Err = Error;
+    fn from_str(text: &str) -> Result<Self, Error> {
+        let mut parts = text.split('-');
+        if parts.next() != Some("S") || parts.next() != Some("1") {
+            return Err(Error::InvalidEncoding);
+        }
+        let authority = parts
+            .next()
+            .ok_or(Error::InvalidEncoding)?
+            .parse::<u64>()
+            .map_err(|_| Error::InvalidEncoding)?;
+        if authority > 0x0000_ffff_ffff_ffff {
+            return Err(Error::InvalidEncoding);
+        }
+        let mut bytes = [0_u8; 68];
+        let header = bytes.get_mut(..8).ok_or(Error::InvalidEncoding)?;
+        for (target, source) in header
+            .iter_mut()
+            .skip(2)
+            .zip(authority.to_be_bytes().iter().skip(2))
+        {
+            *target = *source;
+        }
+        let mut count = 0_u8;
+        for (index, part) in parts.enumerate() {
+            if index >= 15 {
+                return Err(Error::InvalidEncoding);
+            }
+            let value = part.parse::<u32>().map_err(|_| Error::InvalidEncoding)?;
+            let offset = index
+                .checked_mul(4)
+                .and_then(|v| v.checked_add(8))
+                .ok_or(Error::InvalidEncoding)?;
+            let end = offset.checked_add(4).ok_or(Error::InvalidEncoding)?;
+            for (target, source) in bytes
+                .get_mut(offset..end)
+                .ok_or(Error::InvalidEncoding)?
+                .iter_mut()
+                .zip(value.to_le_bytes())
+            {
+                *target = source;
+            }
+            count = count.checked_add(1).ok_or(Error::InvalidEncoding)?;
+        }
+        *bytes.first_mut().ok_or(Error::InvalidEncoding)? = 1;
+        *bytes.get_mut(1).ok_or(Error::InvalidEncoding)? = count;
+        let length = usize::from(count)
+            .checked_mul(4)
+            .and_then(|v| v.checked_add(8))
+            .ok_or(Error::InvalidEncoding)?;
+        Self::parse(bytes.get(..length).ok_or(Error::InvalidEncoding)?)
+    }
+}
+
+/// Canonical lowercase RFC-style UUID spelling without native GUID byte-order conversion.
+/// # Panics
+/// The fixed alphabet is indexed only by masked four-bit values.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "both nibble expressions are confined to 0..16, exactly the fixed hexadecimal alphabet"
+)]
+pub fn uuid_text(uuid: FilesystemUuid) -> [u8; 36] {
+    let mut output = [b'-'; 36];
+    let digits = b"0123456789abcdef";
+    let source = uuid
+        .bytes()
+        .into_iter()
+        .flat_map(|byte| [byte >> 4, byte & 15]);
+    for ((_, target), nibble) in output
+        .iter_mut()
+        .enumerate()
+        .filter(|(index, _)| ![8, 13, 18, 23].contains(index))
+        .zip(source)
+    {
+        *target = digits[usize::from(nibble)];
+    }
+    output
+}
+/// Interprets the ext4 UUID's bytes directly, independently of Windows GUID fields.
+/// # Errors
+/// Rejects non-canonical shape, invalid digits and missing bytes.
+pub fn parse_uuid(text: &str) -> Result<FilesystemUuid, Error> {
+    if text.len() != 36 {
+        return Err(Error::InvalidEncoding);
+    }
+    let mut bytes = [0_u8; 16];
+    let mut digits = [0_u8; 32];
+    let mut target = digits.iter_mut();
+    for (index, byte) in text.bytes().enumerate() {
+        if [8, 13, 18, 23].contains(&index) {
+            if byte != b'-' {
+                return Err(Error::InvalidEncoding);
+            }
+        } else {
+            let value = match byte {
+                b'0'..=b'9' => byte.checked_sub(b'0'),
+                b'a'..=b'f' => byte.checked_sub(b'a').and_then(|v| v.checked_add(10)),
+                b'A'..=b'F' => byte.checked_sub(b'A').and_then(|v| v.checked_add(10)),
+                _ => None,
+            }
+            .ok_or(Error::InvalidEncoding)?;
+            *target.next().ok_or(Error::InvalidEncoding)? = value;
+        }
+    }
+    for (target, pair) in bytes.iter_mut().zip(digits.as_chunks::<2>().0) {
+        *target = (pair.first().copied().ok_or(Error::InvalidEncoding)? << 4)
+            | pair.get(1).copied().ok_or(Error::InvalidEncoding)?;
+    }
+    Ok(FilesystemUuid::from_bytes(bytes))
+}
 
 /// One Windows user bound to a filesystem user identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

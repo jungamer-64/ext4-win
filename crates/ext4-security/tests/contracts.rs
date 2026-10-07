@@ -152,3 +152,36 @@ fn specific_right_contract() {
     assert!(!MAXIMUM_CANDIDATES.contains(&0x80000));
     assert!(!MAXIMUM_CANDIDATES.contains(&0x1000000));
 }
+
+/// Text vectors preserve the on-disk UUID byte order and full SID authority width.
+/// # Errors
+/// Returns codec failure.
+/// # Panics
+/// Panics if the independent text vectors are changed.
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions report contract failures after fallible setup"
+)]
+#[test]
+fn identity_text_vectors() -> Result<(), Error> {
+    let uuid = parse_uuid("00112233-4455-6677-8899-aabbccddeeff")?;
+    assert_eq!(
+        uuid.bytes(),
+        [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff
+        ]
+    );
+    assert_eq!(&uuid_text(uuid), b"00112233-4455-6677-8899-aabbccddeeff");
+    let text = "S-1-281474976710655-0-4294967295";
+    let sid: Sid = text.parse()?;
+    assert_eq!(
+        sid.bytes(),
+        &[
+            1, 2, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 255, 255, 255, 255
+        ]
+    );
+    assert_eq!(sid.to_string(), text);
+    assert!("S-1-281474976710656-0".parse::<Sid>().is_err());
+    Ok(())
+}
