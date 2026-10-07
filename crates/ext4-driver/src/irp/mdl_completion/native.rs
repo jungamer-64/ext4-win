@@ -19,7 +19,7 @@ enum WorkerCycle {
     /// No callback can touch the inbox.
     Idle,
     /// One scheduled/running callback owns the retained file reference.
-    Running(PFILE_OBJECT),
+    Running(FileObjectReference),
 }
 
 /// Spin-lock-protected FIFO and its preallocated native execution resource.
@@ -138,7 +138,7 @@ impl MdlCompletionQueue {
         reason = "FIFO publication transfers the original IRP and a referenced worker-cycle owner"
     )]
     pub(in crate::irp) unsafe fn enqueue(
-        &self,
+        queue: NonNull<Self>,
         irp: KernelIrp,
         file: PFILE_OBJECT,
         action: MdlCompletion,
