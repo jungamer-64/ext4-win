@@ -1255,7 +1255,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
-            destination.write(0);
+            destination.write(UnsafeCell::new(0));
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
@@ -1311,7 +1311,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
-            destination.write(wdk_sys::KEVENT::default());
+            destination.write(UnsafeCell::new(wdk_sys::KEVENT::default()));
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
@@ -1557,7 +1557,7 @@ impl CompletionReactor {
         {
             unsafe {
                 // SAFETY: Stable reactor-owned spin-lock storage.
-                ffi::KeInitializeSpinLock(core::ptr::addr_of_mut!(reactor.lock));
+                ffi::KeInitializeSpinLock(reactor.lock.get());
             }
             let status = unsafe {
                 // SAFETY: First-field CSQ and callbacks share this stable reactor lifetime.
@@ -1577,7 +1577,7 @@ impl CompletionReactor {
             unsafe {
                 // SAFETY: Stable event storage initialized before thread publication.
                 ffi::KeInitializeEvent(
-                    core::ptr::addr_of_mut!(reactor.wake_event),
+                    reactor.wake_event.get(),
                     wdk_sys::_EVENT_TYPE::SynchronizationEvent,
                     0,
                 );
@@ -1694,7 +1694,7 @@ impl CompletionReactor {
             #[cfg(not(test))]
             let old_irql = unsafe {
                 // SAFETY: The initialized reactor lock protects the terminal FIFO.
-                ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+                ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
             };
             let entry = unsafe {
                 // SAFETY: Pending ownership retains this live IRP and its unlinked node.
@@ -1710,7 +1710,7 @@ impl CompletionReactor {
             #[cfg(not(test))]
             unsafe {
                 // SAFETY: Releases the exact acquisition above.
-                ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+                ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
             }
             self.wake();
             return;
@@ -1745,7 +1745,7 @@ impl CompletionReactor {
         #[cfg(not(test))]
         unsafe {
             // SAFETY: Event lifetime covers admission through reactor-thread join.
-            let _previous = ffi::KeSetEvent(core::ptr::addr_of!(self.wake_event).cast_mut(), 0, 0);
+            let _previous = ffi::KeSetEvent(self.wake_event.get(), 0, 0);
         }
     }
 
@@ -1952,7 +1952,7 @@ impl CompletionReactor {
         #[cfg(not(test))]
         let old_irql = unsafe {
             // SAFETY: Stable reactor lifetime retains its initialized queue lock.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: Native lock or isolated single-threaded fixture owns this terminal FIFO.
@@ -1961,7 +1961,7 @@ impl CompletionReactor {
         #[cfg(not(test))]
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         node.map_or(core::ptr::null_mut(), |node| unsafe {
             // SAFETY: This removed node belongs to one uniquely owned pending IRP.
@@ -2595,9 +2595,7 @@ impl CompletionReactor {
         let status = unsafe {
             // SAFETY: This thread is the sole waiter on the initialized auto-reset event.
             ffi::KeWaitForSingleObject(
-                core::ptr::addr_of!(self.wake_event)
-                    .cast_mut()
-                    .cast::<c_void>(),
+                self.wake_event.get().cast::<c_void>(),
                 wdk_sys::_KWAIT_REASON::Executive,
                 i8::try_from(wdk_sys::_MODE::KernelMode).unwrap_or(0),
                 0,
@@ -3494,7 +3492,7 @@ impl CompletionReactor {
     unsafe fn enqueue_storage(&self, envelope: NonNull<ReactorStorageEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3506,7 +3504,7 @@ impl CompletionReactor {
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         self.wake();
     }
@@ -3520,7 +3518,7 @@ impl CompletionReactor {
     fn pop_storage_completion(&self) -> Option<NonNull<ReactorStorageEnvelope>> {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion list access.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: The reactor lock is held for this initialized completion list.
@@ -3528,7 +3526,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         node.map(|node| unsafe {
             // SAFETY: The envelope's node is its first field.
@@ -3607,7 +3605,7 @@ impl CompletionReactor {
     unsafe fn enqueue_length(&self, envelope: NonNull<ReactorLengthEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3619,7 +3617,7 @@ impl CompletionReactor {
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         self.wake();
     }
@@ -3633,7 +3631,7 @@ impl CompletionReactor {
     fn pop_length_completion(&self) -> Option<NonNull<ReactorLengthEnvelope>> {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion list access.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: The reactor lock is held for this initialized completion list.
@@ -3641,7 +3639,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         node.map(|node| unsafe {
             // SAFETY: The envelope's node is its first field.
@@ -3695,7 +3693,7 @@ impl CompletionReactor {
     pub(super) unsafe fn enqueue_passive_completion(&self, envelope: NonNull<PassiveWorkEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes work callbacks and inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3707,7 +3705,7 @@ impl CompletionReactor {
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         self.wake();
     }
@@ -3721,7 +3719,7 @@ impl CompletionReactor {
     fn pop_passive_completion(&self) -> Option<NonNull<PassiveWorkEnvelope>> {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes passive-completion list access.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: The reactor lock is held for this initialized completion list.
@@ -3729,7 +3727,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         node.map(|node| unsafe {
             // SAFETY: The passive envelope's node is its first field.
@@ -3802,7 +3800,7 @@ impl CompletionReactor {
     pub(super) unsafe fn enqueue_oplock_completion(&self, envelope: NonNull<OplockEnvelope>) {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes callbacks and typed inbox removal.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: Completion owns this live envelope until its node is linked below.
@@ -3814,7 +3812,7 @@ impl CompletionReactor {
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         self.wake();
     }
@@ -3828,7 +3826,7 @@ impl CompletionReactor {
     fn pop_oplock_completion(&self) -> Option<NonNull<OplockEnvelope>> {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes oplock-completion list access.
-            ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(self.lock).cast_mut())
+            ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: The reactor lock is held for this initialized completion list.
@@ -3836,7 +3834,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
-            ffi::KeReleaseSpinLock(core::ptr::addr_of!(self.lock).cast_mut(), old_irql);
+            ffi::KeReleaseSpinLock(self.lock.get(), old_irql);
         }
         node.map(|node| unsafe {
             // SAFETY: The oplock envelope's node is its first field.
@@ -4429,7 +4427,7 @@ unsafe extern "C" fn csq_acquire_lock(csq: PIO_CSQ, irql: wdk_sys::PKIRQL) {
     };
     *irql = unsafe {
         // SAFETY: Stable reactor-owned lock.
-        ffi::KeAcquireSpinLockRaiseToDpc(core::ptr::addr_of!(reactor.lock).cast_mut())
+        ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
     };
 }
 
@@ -4451,7 +4449,7 @@ unsafe extern "C" fn csq_release_lock(csq: PIO_CSQ, irql: wdk_sys::KIRQL) {
     };
     unsafe {
         // SAFETY: Releases the matching CSQ acquisition.
-        ffi::KeReleaseSpinLock(core::ptr::addr_of!(reactor.lock).cast_mut(), irql);
+        ffi::KeReleaseSpinLock(reactor.lock.get(), irql);
     }
 }
 

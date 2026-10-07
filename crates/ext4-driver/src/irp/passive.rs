@@ -423,7 +423,7 @@ impl PassiveWorkEnvelope {
         })
         .ok_or(DriverError::InsufficientResources)?;
         match memory::boxed_try_map(lifetime, |lifetime| Self {
-            node: LIST_ENTRY::default(),
+            node: core::cell::UnsafeCell::new(LIST_ENTRY::default()),
             work_item,
             device,
             lifetime,
@@ -531,7 +531,7 @@ impl PassiveWorkEnvelope {
     }
     /// Node ownership transfers only after the native call has consumed its resource lease.
     pub(super) fn node_ptr(&self) -> *mut LIST_ENTRY {
-        core::ptr::addr_of!(self.node).cast_mut()
+        self.node.get()
     }
     /// Recovers stable storage after exclusive inbox removal.
     /// # Safety

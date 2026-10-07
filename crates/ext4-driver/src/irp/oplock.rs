@@ -611,7 +611,7 @@ impl OplockEnvelope {
         memory::boxed_try_map(
             (check, owned, suspended, rundown),
             |(check, owned, suspended, rundown)| Self {
-                node: LIST_ENTRY::default(),
+                node: core::cell::UnsafeCell::new(LIST_ENTRY::default()),
                 reactor,
                 identity,
                 rundown,
@@ -709,7 +709,7 @@ impl OplockEnvelope {
 
     /// Returns the embedded inbox node address.
     pub(super) fn node_ptr(&self) -> *mut LIST_ENTRY {
-        core::ptr::addr_of!(self.node).cast_mut()
+        self.node.get()
     }
 
     /// Recovers an envelope from its first-field intrusive node.

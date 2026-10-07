@@ -1017,13 +1017,14 @@ impl FileControlBlockLedgerLock {
     fn try_new() -> DriverResult<Self> {
         #[cfg(not(test))]
         {
-            let native =
-                memory::boxed_try_with(|| Ok(MaybeUninit::<wdk_sys::ERESOURCE>::uninit()))?;
+            let native = memory::boxed_try_with(|| {
+                Ok(UnsafeCell::new(MaybeUninit::<wdk_sys::ERESOURCE>::uninit()))
+            })?;
             let native = Box::into_pin(native);
             let status = unsafe {
                 // SAFETY: `native` is pinned at its final nonpaged address. The storage is not
                 // exposed or dropped as an initialized ERESOURCE unless initialization succeeds.
-                ffi::ExInitializeResourceLite(native.as_ref().get_ref().as_ptr().cast_mut())
+                ffi::ExInitializeResourceLite(native.as_ref().get_ref().get().cast())
             };
             if status < STATUS_SUCCESS {
                 return Err(DriverError::InsufficientResources);
@@ -1071,7 +1072,7 @@ impl FileControlBlockLedgerLock {
     /// Returns the initialized native resource pointer.
     #[cfg(not(test))]
     fn native_ptr(&self) -> *mut wdk_sys::ERESOURCE {
-        self.native.as_ref().get_ref().as_ptr().cast_mut()
+        self.native.as_ref().get_ref().get().cast()
     }
 }
 
