@@ -132,7 +132,7 @@ impl MdlCompletionQueue {
     /// The caller owns this live unqueued IRP and retains `file` and this queue.
     /// The call is at most DISPATCH_LEVEL. Success consumes IRP completion authority; failure does not.
     /// # Errors
-    /// Returns invalid-state before publication if no acquisition prepared the worker.
+    /// Returns invalid-parameter before publication if the notification has no MDL chain.
     #[expect(
         unsafe_code,
         reason = "FIFO publication transfers the original IRP and a referenced worker-cycle owner"
@@ -150,10 +150,12 @@ impl MdlCompletionQueue {
         if !has_chain {
             return Err(DriverError::InvalidParameter);
         }
-        let scheduled = self.with_inbox(|inbox| -> DriverResult<_> {
-            let work_item = inbox
-                .work_item
-                .ok_or(DriverError::InternalInvariantViolation)?;
+        let scheduled = self.with_inbox(|inbox| {
+            // A live driver-owned chain proves preparation succeeded. Losing its reserved worker
+            // cannot return an ordinary error: chain release at elevated IRQL would then be abandoned.
+            let work_item = inbox.work_item.unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
             irp.mark_pending();
             unsafe {
                 // SAFETY: This lock scope transfers the uniquely owned original request.
@@ -165,11 +167,11 @@ impl MdlCompletionQueue {
                     ffi::ObfReferenceObject(file.cast());
                 }
                 inbox.cycle = WorkerCycle::Running(file);
-                Ok(Some(work_item))
+                Some(work_item)
             } else {
-                Ok(None)
+                None
             }
-        })?;
+        });
         if let Some(work_item) = scheduled {
             unsafe {
                 // SAFETY: The cycle reference retains this pinned inbox until the callback releases it.
