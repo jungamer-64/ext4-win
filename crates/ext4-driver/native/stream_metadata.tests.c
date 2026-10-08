@@ -154,7 +154,7 @@ int main(void)
     stream.MainResource.readers = 1;
     cache_result = STATUS_UNSUCCESSFUL;
     publish(1, 8192, 8192, 4096, STATUS_SUCCESS);
-    publish(2, 8192, 8192, 8192, STATUS_SUCCESS);
+    publish(2, 8192, 8192, 12288, STATUS_SUCCESS);
     assert(reference_calls == 0 && cache_calls == 0 && stream.MainResource.readers == 1);
 
     /* Malformed input and stale epochs have no native commit or cache effect. */

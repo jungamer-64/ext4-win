@@ -32,7 +32,7 @@ ext4win_stream_publish_metadata(
     if ((stream == NULL) || (stream->Kind != 1) ||
         !ext4win_prepare_stream_metadata(metadata, &prepared_metadata) ||
         (allocation_size < 0) || (file_size < 0) ||
-        (allocation_charge < 0) || (allocation_charge > allocation_size) ||
+        (allocation_charge < 0) ||
         (valid_data_length != file_size) ||
         (file_size > allocation_size)) {
         return STATUS_INVALID_PARAMETER;

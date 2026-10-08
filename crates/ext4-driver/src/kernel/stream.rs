@@ -75,8 +75,9 @@ impl StreamSizes {
 
     /// Establishes the Windows stream-size tuple from one validated ext4 inode snapshot.
     ///
-    /// `AllocationSize` is the cluster-rounded section bound and therefore remains at least EOF
-    /// even when the ext4 allocation charge is smaller because the inode contains holes.
+    /// `AllocationSize` is the cluster-rounded EOF bound. Physical charge includes reservations
+    /// and metadata outside the visible stream, so it cannot drive section-size changes during
+    /// paging writeback. File-information queries use the independent charge field.
     /// # Errors
     ///
     /// Returns an arithmetic error when a size cannot be rounded or represented by Windows.
@@ -85,10 +86,7 @@ impl StreamSizes {
         allocation_charge: FileAllocationSize,
         cluster_size: ClusterSize,
     ) -> DriverResult<Self> {
-        let allocation_size = round_up_allocation(
-            core::cmp::max(file_size.bytes(), allocation_charge.bytes()),
-            cluster_size,
-        )?;
+        let allocation_size = round_up_allocation(file_size.bytes(), cluster_size)?;
         let file_size =
             i64::try_from(file_size.bytes()).map_err(|_| DriverError::InvalidParameter)?;
         Ok(Self {
@@ -2057,7 +2055,7 @@ mod tests {
         )?;
 
         assert_eq!(sizes.file_size(), 1_000);
-        assert_eq!(sizes.allocation_size, 131_072);
+        assert_eq!(sizes.allocation_size, 65_536);
         assert_eq!(sizes.allocation_charge(), 69_632);
         Ok(())
     }
@@ -2086,14 +2084,20 @@ mod tests {
             FileAllocationSize::from_bytes(0),
             cluster,
         )?;
-        let larger_section = StreamSizes::try_from_ext4(
+        let larger_charge = StreamSizes::try_from_ext4(
             FileSize::from_bytes(4_096),
+            FileAllocationSize::from_bytes(8_192),
+            cluster,
+        )?;
+        let larger_section = StreamSizes::try_from_ext4(
+            FileSize::from_bytes(8_192),
             FileAllocationSize::from_bytes(8_192),
             cluster,
         )?;
 
         assert_ne!(baseline, charge_only);
         assert!(baseline.same_cache_dimensions(charge_only));
+        assert!(baseline.same_cache_dimensions(larger_charge));
         assert!(!baseline.same_cache_dimensions(larger_section));
         Ok(())
     }
