@@ -107,6 +107,8 @@ pub(crate) enum CreateResolution {
     },
     /// A missing child requires parent-directory oplock authority before it can be staged.
     CheckNamespaceOplocks(NamespaceOplockPlan),
+    /// An existing claim is retained by the operation while its reset mutation commits.
+    ExistingMutation,
     /// A missing child was staged and every driver publication value was preallocated.
     Mutation(Box<PendingCreatePublication>),
 }
@@ -494,6 +496,7 @@ fn open_or_create(
             let mut owner = owner.authorize_existing(node, mutation)?;
             open_existing_node(
                 &mut owner,
+                create_ea,
                 disposition,
                 ExistingNodeTarget {
                     volume: mounted_volume,
@@ -548,11 +551,7 @@ fn open_or_create(
                 target,
                 stream_metadata,
             )?;
-            Ok(select_existing_open_gate(
-                pending,
-                pending_existing,
-                operations,
-            ))
+            select_existing_open_gate(pending, pending_existing, operations, mutation)
         }
         CreateTargetLookup::ReparseSymlink {
             point,
@@ -1192,6 +1191,48 @@ impl ExistingWriteOpenRequirement {
     }
 }
 
+/// Distinct Windows reset semantics for an existing stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExistingFileReset {
+    /// Preserve creation time and merge attributes.
+    Overwrite,
+    /// Reset creation time and replace attributes.
+    Supersede,
+}
+
+/// Intent fixed before native oplock and image gates; reset metadata stays owned across replay.
+#[derive(Debug)]
+enum ExistingCreateIntent {
+    /// Existing stream requires only handle attachment.
+    Open(CreateAction),
+    /// Existing regular stream requires a journaled reset before attachment.
+    Reset {
+        /// Attribute and timestamp behavior of this reset.
+        reset: ExistingFileReset,
+        /// Caller-supplied replacement metadata.
+        metadata: RequestedCreationMetadata,
+        /// Replacement Windows EA set.
+        ea: CreateEa,
+    },
+}
+
+impl ExistingCreateIntent {
+    /// Returns the result fixed by this semantic intent.
+    const fn action(&self) -> CreateAction {
+        match self {
+            Self::Open(action) => *action,
+            Self::Reset {
+                reset: ExistingFileReset::Overwrite,
+                ..
+            } => CreateAction::Overwritten,
+            Self::Reset {
+                reset: ExistingFileReset::Supersede,
+                ..
+            } => CreateAction::Superseded,
+        }
+    }
+}
+
 /// Fully allocated existing-node open retained while an image-section check runs outside the actor.
 #[derive(Debug)]
 pub(crate) struct PendingExistingCreateOpen {
@@ -1209,8 +1250,8 @@ pub(crate) struct PendingExistingCreateOpen {
     handle: Box<OpenedHandle>,
     /// Optional prevalidated delete-on-close publication.
     pending_deletion: Option<PendingFileDeletion>,
-    /// Windows create information returned after successful attachment.
-    action: CreateAction,
+    /// Existing-open or journaled-reset contract fixed before native work.
+    intent: ExistingCreateIntent,
     /// Whether native image-section exclusion is required for this exact claim.
     write_open: ExistingWriteOpenRequirement,
     /// Create-specific oplock conflict state sealed before image exclusion or attachment.
@@ -1228,7 +1269,7 @@ impl PendingExistingCreateOpen {
         stream_metadata: CommittedNodeStreamMetadata,
         policy: CreateHandlePolicy,
         pending_deletion: Option<PendingFileDeletion>,
-        action: CreateAction,
+        intent: ExistingCreateIntent,
     ) -> DriverResult<Self> {
         let ExistingNodeTarget {
             volume,
@@ -1266,7 +1307,11 @@ impl PendingExistingCreateOpen {
         )?;
         let write_open = match node {
             NodeId::File(_) => ExistingWriteOpenRequirement::for_regular_file(
-                policy.regular_file_write_access(),
+                if matches!(intent, ExistingCreateIntent::Reset { .. }) {
+                    RegularFileWriteAccess::Positional
+                } else {
+                    policy.regular_file_write_access()
+                },
                 admission.residency(),
             ),
             NodeId::Directory(_) | NodeId::Symlink(_) => ExistingWriteOpenRequirement::NotRequired,
@@ -1287,7 +1332,7 @@ impl PendingExistingCreateOpen {
             policy,
             handle,
             pending_deletion,
-            action,
+            intent,
             write_open,
             oplock,
         })
@@ -1365,28 +1410,84 @@ impl PendingExistingCreateOpen {
         }
     }
 
+    /// Validates the retained image gate before staging or consuming attachment authority.
+    /// # Errors
+    /// Returns an invariant failure when the worker result does not belong to this claim.
+    fn validate_gate(&self, gate: Option<&PreparedStreamWriteOpen>) -> DriverResult<()> {
+        match (self.write_open, gate) {
+            (ExistingWriteOpenRequirement::NotRequired, None) => Ok(()),
+            (ExistingWriteOpenRequirement::FlushImageSection, Some(gate))
+                if gate.authorizes(self.claim.file_control_block(), self.node) =>
+            {
+                Ok(())
+            }
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
 
+    /// Consumes a completed open, or a reset whose metadata is durably published.
+    fn complete(
+        mut self,
+        gate: Option<&PreparedStreamWriteOpen>,
+        operations: &mut MountedVolumeAccess<'_>,
+    ) -> CreateCompletion {
+        if self.validate_gate(gate).is_err() {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        }
+        let action = self.intent.action();
+        let oplock = core::mem::replace(&mut self.oplock, ExistingCreateOplockState::Ready);
+        let completion = match oplock {
+            ExistingCreateOplockState::Ready => CreateCompletion::Handle(action),
+            ExistingCreateOplockState::BreakInProgress => {
+                CreateCompletion::OplockBreakInProgress(action)
+            }
+            ExistingCreateOplockState::Reserved(reservation) => {
+                reservation.publish();
+                CreateCompletion::Handle(action)
+            }
+            ExistingCreateOplockState::Check(_) | ExistingCreateOplockState::Reserve(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        };
+        let (fcb, file_object) = self.claim.consume();
+        publish_node_stream_raw(
+            file_object,
+            fcb,
+            self.handle,
+            self.policy.file_object_flags(),
+        );
+        if let Some(deletion) = self.pending_deletion {
+            operations.set_file_delete_pending(fcb, deletion);
+        }
+        completion
+    }
 }
 
-/// Selects the one remaining native gate or publishes an already sealed existing-node claim.
+/// Selects the remaining native gate or stages a reset after every gate is sealed.
+/// # Errors
+/// Returns gate validation or reset mutation failures before any handle publication.
 fn select_existing_open_gate(
     pending: PendingExistingCreateOpen,
     pending_existing: &mut Option<PendingExistingCreateOpen>,
     operations: &mut MountedVolumeAccess<'_>,
-) -> CreateResolution {
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<CreateResolution> {
     if let Some((fcb, policy)) = pending.oplock_check_target() {
         *pending_existing = Some(pending);
-        return CreateResolution::CheckOplock { fcb, policy };
+        return Ok(CreateResolution::CheckOplock { fcb, policy });
     }
     if let Some((fcb, open_count)) = pending.oplock_reservation_target() {
         *pending_existing = Some(pending);
-        return CreateResolution::ReserveOplock { fcb, open_count };
+        return Ok(CreateResolution::ReserveOplock { fcb, open_count });
     }
     if let Some((fcb, node)) = pending.write_open_target() {
         *pending_existing = Some(pending);
-        return CreateResolution::PrepareWriteOpen { fcb, node };
+        return Ok(CreateResolution::PrepareWriteOpen { fcb, node });
     }
-    CreateResolution::Complete(pending.publish(None, operations))
+    *pending_existing = Some(pending);
+    finish_existing_create(pending_existing, None, operations, mutation)
 }
 
 /// Resumes an existing-node create after its native write-open gate completed.
@@ -1397,7 +1498,7 @@ fn select_existing_open_gate(
 fn resume_existing_open<'a>(
     mut request: PendingIrpLease<'a>,
     operations: &mut MountedVolumeAccess<'_>,
-    read: &mut impl CommittedReadPass,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
     pending_existing: &mut Option<PendingExistingCreateOpen>,
     prepared_write_open: Option<&PreparedStreamWriteOpen>,
     identity: &'a ext4_security::IdentityMap,
@@ -1428,7 +1529,7 @@ fn resume_existing_open<'a>(
     }
     operations.authorize_create()?;
     operations.ensure_node_openable(pending.node)?;
-    revalidate_existing_open(pending, read)?;
+    revalidate_existing_open(pending, mutation)?;
     let owner = CreateCompletionOwner {
         creator,
         identity,
@@ -1437,7 +1538,7 @@ fn resume_existing_open<'a>(
         metadata,
         device,
     };
-    let owner = owner.authorize_existing(pending.node, read)?;
+    let owner = owner.authorize_existing(pending.node, mutation)?;
     let current_policy =
         CreateHandlePolicy::from_authorized(parameters, owner.granted_access(), device)?;
     if current_policy != pending.policy {
@@ -1456,18 +1557,13 @@ fn resume_existing_open<'a>(
     }
     if let Some(deletion) = pending.pending_deletion.as_ref() {
         crate::request::file_info::validate_pending_deletion(
-            read,
+            mutation,
             pending.node,
             deletion.target_ref(),
             crate::request::file_info::DeleteReadonlyPolicy::Enforce,
         )?;
     }
-    let pending = pending_existing
-        .take()
-        .ok_or(DriverError::InternalInvariantViolation)?;
-    Ok(CreateResolution::Complete(
-        pending.publish(prepared_write_open, operations),
-    ))
+    finish_existing_create(pending_existing, prepared_write_open, operations, mutation)
 }
 
 /// Revalidates the exact namespace identity and reparse interpretation without allocating.
@@ -1505,67 +1601,137 @@ fn revalidate_existing_open(
     Ok(())
 }
 
+/// Stages a reset while the operation keeps sole rollback and oplock-backout ownership.
+/// # Errors
+/// Returns gate, read-only, EA, allocation, or ext4 mutation failures before handle publication.
+fn finish_existing_create(
+    pending: &mut Option<PendingExistingCreateOpen>,
+    gate: Option<&PreparedStreamWriteOpen>,
+    operations: &mut MountedVolumeAccess<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<CreateResolution> {
+    let open = pending
+        .as_ref()
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    open.validate_gate(gate)?;
+    if let ExistingCreateIntent::Reset {
+        reset,
+        metadata,
+        ea,
+    } = &open.intent
+    {
+        let NodeId::File(id) = open.node else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let current = mutation.load_node_metadata(open.node)?;
+        if current.windows_attributes().bits() & wdk_sys::FILE_ATTRIBUTE_READONLY != 0
+            || current.security().permissions().as_u16() & 0o222 == 0
+        {
+            return Err(DriverError::AccessDenied);
+        }
+        let file = mutation.file(id)?;
+        mutation.truncate_file(file, ext4_core::FileSize::from_bytes(0))?;
+        ea.replace_existing(open.node, mutation)?;
+        let mut metadata = *metadata;
+        if *reset == ExistingFileReset::Overwrite {
+            metadata.attributes |= current.windows_attributes().bits();
+        }
+        metadata.apply(open.node, mutation)?;
+        if *reset == ExistingFileReset::Supersede {
+            let node = mutation.node(open.node)?;
+            let times = mutation.staged_node_metadata(open.node)?.times();
+            mutation.set_times(
+                node,
+                ext4_core::Ext4Times::new(
+                    times.accessed(),
+                    times.modified(),
+                    times.changed(),
+                    times.modified(),
+                ),
+            )?;
+        }
+        return Ok(CreateResolution::ExistingMutation);
+    }
+    let open = pending
+        .take()
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    Ok(CreateResolution::Complete(open.complete(gate, operations)))
+}
+
+/// Publishes the operation-owned existing claim after its reset commit is durable.
+pub(crate) fn publish_existing_mutation(
+    pending: &mut Option<PendingExistingCreateOpen>,
+    gate: Option<&PreparedStreamWriteOpen>,
+    operations: &mut MountedVolumeAccess<'_>,
+) -> CreateCompletion {
+    let Some(open) = pending.take() else {
+        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+            .bugcheck();
+    };
+    if !matches!(open.intent, ExistingCreateIntent::Reset { .. }) {
+        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+            .bugcheck();
+    }
+    open.complete(gate, operations)
+}
+
 /// Opens an existing path according to the requested disposition and options.
 /// # Errors
 ///
 /// Returns an error when existing-node options conflict, create-only disposition collides, share
-/// access fails, or an incomplete destructive disposition is requested.
+/// access fails, or the target cannot satisfy the requested disposition.
 fn open_existing_node(
     request: &mut AuthorizedCreateCompletionOwner<'_>,
+    create_ea: CreateEa,
     disposition: CreateDisposition,
     target: ExistingNodeTarget,
     operations: &mut MountedVolumeAccess<'_>,
-    read: &mut impl CommittedReadPass,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
     pending_existing: &mut Option<PendingExistingCreateOpen>,
 ) -> DriverResult<CreateResolution> {
     let node = target.node;
     let parameters = request.parameters();
+    validate_existing_node_options(node, parameters.target_requirement())?;
+    let intent = match disposition {
+        CreateDisposition::Create => return Err(DriverError::ObjectNameCollision),
+        CreateDisposition::Open | CreateDisposition::OpenIf => {
+            ExistingCreateIntent::Open(CreateAction::Opened)
+        }
+        CreateDisposition::Overwrite
+        | CreateDisposition::OverwriteIf
+        | CreateDisposition::Supersede => {
+            match node {
+                NodeId::File(_) => {}
+                NodeId::Directory(directory) => return Err(destructive_directory_error(directory)),
+                NodeId::Symlink(_) => return Err(DriverError::NotSupported),
+            }
+            ExistingCreateIntent::Reset {
+                reset: if disposition == CreateDisposition::Supersede {
+                    ExistingFileReset::Supersede
+                } else {
+                    ExistingFileReset::Overwrite
+                },
+                metadata: request.owner.metadata,
+                ea: create_ea,
+            }
+        }
+    };
     let policy = CreateHandlePolicy::from_authorized(
         parameters,
         request.granted_access(),
         request.device(),
     )?;
-    match disposition {
-        CreateDisposition::Open | CreateDisposition::OpenIf => {
-            validate_existing_node_options(node, parameters.target_requirement())?;
-            let pending = prepare_create_deletion(policy, node, &target.location, read)?;
-            let stream_metadata = CommittedNodeStreamMetadata::new(
-                NodeStreamMetadata::try_from_snapshot(
-                    read.load_node_metadata(node)?,
-                    operations.volume_geometry().cluster_size(),
-                )?,
-                operations.current_epoch_sequence(),
-            );
-            let pending = PendingExistingCreateOpen::prepare(
-                request,
-                target,
-                stream_metadata,
-                policy,
-                pending,
-                CreateAction::Opened,
-            )?;
-            Ok(select_existing_open_gate(
-                pending,
-                pending_existing,
-                operations,
-            ))
-        }
-        CreateDisposition::Create => Err(DriverError::ObjectNameCollision),
-        CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
-            validate_existing_node_options(node, parameters.target_requirement())?;
-            match node {
-                NodeId::Directory(directory) => Err(destructive_directory_error(directory)),
-                NodeId::File(_) | NodeId::Symlink(_) => Err(DriverError::NotSupported),
-            }
-        }
-        CreateDisposition::Supersede => {
-            validate_existing_node_options(node, parameters.target_requirement())?;
-            match node {
-                NodeId::Directory(directory) => Err(destructive_directory_error(directory)),
-                NodeId::File(_) | NodeId::Symlink(_) => Err(DriverError::NotSupported),
-            }
-        }
-    }
+    let deletion = prepare_create_deletion(policy, node, &target.location, mutation)?;
+    let stream = CommittedNodeStreamMetadata::new(
+        NodeStreamMetadata::try_from_snapshot(
+            mutation.load_node_metadata(node)?,
+            operations.volume_geometry().cluster_size(),
+        )?,
+        operations.current_epoch_sequence(),
+    );
+    let pending =
+        PendingExistingCreateOpen::prepare(request, target, stream, policy, deletion, intent)?;
+    select_existing_open_gate(pending, pending_existing, operations, mutation)
 }
 
 /// Prepares and validates create-time delete-pending before FILE_OBJECT attachment.
@@ -1677,7 +1843,7 @@ fn open_target_directory(
         stream_metadata,
         policy,
         None,
-        action,
+        ExistingCreateIntent::Open(action),
     )
 }
 

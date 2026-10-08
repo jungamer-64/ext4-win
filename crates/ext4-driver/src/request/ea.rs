@@ -166,6 +166,22 @@ impl CreateEa {
         })
     }
 
+    /// Replaces the Windows EA set atomically with this create-time list.
+    /// # Errors
+    /// Returns persisted EA decoding, xattr conversion, or mutation failures.
+    pub(crate) fn replace_existing(
+        &self,
+        node: ext4_core::NodeId,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+    ) -> DriverResult<()> {
+        let current = load_windows_eas(mutation, node)?;
+        let target = mutation.node(node)?;
+        for entry in current.iter() {
+            mutation.remove_xattr(target, &xattr_name_from_ea_name(&entry.name)?)?;
+        }
+        apply_set_ea_entries(mutation, node, self.entries.as_slice())
+    }
+
     /// Returns whether this create supplied no extended attributes.
     pub(crate) fn is_empty(&self) -> bool {
         self.entries.is_empty()

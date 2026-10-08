@@ -246,6 +246,10 @@ pub(crate) enum CreateAction {
     Opened,
     /// A missing object was created.
     Created,
+    /// An existing stream was overwritten while retaining its creation metadata.
+    Overwritten,
+    /// An existing stream and its creation metadata were superseded.
+    Superseded,
     /// `SL_OPEN_TARGET_DIRECTORY` opened the parent and the named target exists.
     TargetExists,
     /// `SL_OPEN_TARGET_DIRECTORY` opened the parent and the named target is absent.
@@ -258,6 +262,8 @@ impl CreateAction {
         match self {
             Self::Opened => wdk_sys::FILE_OPENED,
             Self::Created => wdk_sys::FILE_CREATED,
+            Self::Overwritten => wdk_sys::FILE_OVERWRITTEN,
+            Self::Superseded => wdk_sys::FILE_SUPERSEDED,
             Self::TargetExists => wdk_sys::FILE_EXISTS,
             Self::TargetDoesNotExist => wdk_sys::FILE_DOES_NOT_EXIST,
         }

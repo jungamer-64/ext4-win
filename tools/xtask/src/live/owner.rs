@@ -586,6 +586,34 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         operation,
         windows_host::close_file(file).map_err(Into::into),
     )?;
+    println!("live filesystem I/O: verify existing-file reset and creation attributes");
+    let reset_path = root.join("reset.bin");
+    let reset = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .attributes(0x02)
+        .open(&reset_path)?;
+    windows_host::close_file(reset)?;
+    if fs::metadata(&reset_path)?.file_attributes() & 0x02 == 0 {
+        return Err(io::Error::other("create attributes were not applied").into());
+    }
+    for create_if_missing in [false, true] {
+        fs::write(&reset_path, b"existing payload")?;
+        let reset = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(create_if_missing)
+            .open(&reset_path)?;
+        let verification = if reset.metadata()?.len() == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::other("overwrite did not reset EOF").into())
+        };
+        combine_verification_and_cleanup(
+            verification,
+            windows_host::close_file(reset).map_err(Into::into),
+        )?;
+    }
     println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
     let descriptor = windows_host::file_security(&alpha)?;

@@ -3057,6 +3057,8 @@ enum TopLevelCompletion {
 enum PendingDriverPublication {
     /// Create must acquire its FCB/share claim before the first write.
     Create(Box<crate::request::create::PendingCreatePublication>),
+    /// Existing-create reset retains its sole claim in the logical operation across all retries.
+    ExistingCreate,
     /// Write position was fully validated and prepared by resolve.
     Write(crate::request::file_info::PreparedWritePublication),
     /// Set-information driver state was fully allocated by resolve.
@@ -3088,7 +3090,8 @@ impl PreparedDriverPublication {
     )> {
         match &self.effect {
             PreparedDriverEffect::Create(publication) => publication.oplock_reservation_target(),
-            PreparedDriverEffect::Write(_)
+            PreparedDriverEffect::ExistingCreate
+            | PreparedDriverEffect::Write(_)
             | PreparedDriverEffect::SetFile(_)
             | PreparedDriverEffect::Cleanup(_)
             | PreparedDriverEffect::VolumeLabel(_)
@@ -3112,7 +3115,8 @@ impl PreparedDriverPublication {
     fn abort(self, owned: &OwnedIrp) -> DriverResult<()> {
         match self.effect {
             PreparedDriverEffect::Create(publication) => (*publication).abort(owned),
-            PreparedDriverEffect::Write(_)
+            PreparedDriverEffect::ExistingCreate
+            | PreparedDriverEffect::Write(_)
             | PreparedDriverEffect::SetFile(_)
             | PreparedDriverEffect::Cleanup(_)
             | PreparedDriverEffect::VolumeLabel(_)
@@ -3126,6 +3130,8 @@ impl PreparedDriverPublication {
 enum PreparedDriverEffect {
     /// Fully claimed create handle state.
     Create(Box<crate::request::create::PreparedCreatePublication>),
+    /// Durable reset publication consumes the operation-owned existing claim.
+    ExistingCreate,
     /// Checked write cursor and completion.
     Write(crate::request::file_info::PreparedWritePublication),
     /// Set-information publication.
@@ -3153,6 +3159,7 @@ impl PendingDriverPublication {
                 let publication = (*publication).prepare()?;
                 PreparedDriverEffect::Create(memory::boxed_try_with(move || Ok(publication))?)
             }
+            Self::ExistingCreate => PreparedDriverEffect::ExistingCreate,
             Self::Write(publication) => PreparedDriverEffect::Write(publication),
             Self::SetFile(publication) => PreparedDriverEffect::SetFile(publication),
             Self::Cleanup(publication) => PreparedDriverEffect::Cleanup(publication),
@@ -3168,11 +3175,16 @@ impl PendingDriverPublication {
 
 impl PreparedDriverEffect {
     /// Applies only moves and prevalidated pointer/state updates after commit durability.
-    fn publish(self, operations: &mut crate::state::MountedVolumeAccess<'_>) -> TopLevelCompletion {
+    fn publish(
+        self,
+        operations: &mut crate::state::MountedVolumeAccess<'_>,
+        existing: impl FnOnce(&mut crate::state::MountedVolumeAccess<'_>) -> CreateCompletion,
+    ) -> TopLevelCompletion {
         match self {
             Self::Create(publication) => {
                 TopLevelCompletion::Create((*publication).publish(operations))
             }
+            Self::ExistingCreate => TopLevelCompletion::Create(existing(operations)),
             Self::Write(publication) => TopLevelCompletion::Normal(publication.publish()),
             Self::SetFile(publication) => {
                 publication.publish(operations);
@@ -3951,6 +3963,11 @@ impl MutationRequestOperation {
                     crate::request::create::CreateResolution::CheckNamespaceOplocks(plan) => {
                         Ok(DriverResolveDisposition::CheckNamespaceOplocks { plan })
                     }
+                    crate::request::create::CreateResolution::ExistingMutation => {
+                        Ok(DriverResolveDisposition::Mutation(
+                            PendingDriverPublication::ExistingCreate,
+                        ))
+                    }
                     crate::request::create::CreateResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
                             PendingDriverPublication::Create(publication),
@@ -4477,7 +4494,13 @@ impl MutationRequestOperation {
                     return self.restart_resolution(owned, None, None, operations);
                 }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
-                    if self.pending_existing_create.is_some() || self.write_open.is_some() {
+                    let claim_valid = match &prepared {
+                        PendingDriverPublication::ExistingCreate => {
+                            self.pending_existing_create.is_some()
+                        }
+                        _ => self.pending_existing_create.is_none() && self.write_open.is_none(),
+                    };
+                    if !claim_valid {
                         return MutationStep::Transition(
                             self.complete_error(owned, DriverError::InternalInvariantViolation),
                         );
@@ -5745,7 +5768,14 @@ impl InfalliblePublication for MutationRequestOperation {
                     stream_metadata,
                 );
                 let (pending, stream_projection) = publication.into_parts();
-                let completion = effect.publish(access);
+                let completion = effect.publish(access, |access| {
+                    crate::request::create::publish_existing_mutation(
+                        &mut self.pending_existing_create,
+                        self.write_open.as_ref(),
+                        access,
+                    )
+                });
+                drop(self.write_open.take());
                 drop(size_changes);
                 drop(deletion);
                 drop(self.oplock_mutation.take());

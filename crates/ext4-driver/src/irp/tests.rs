@@ -991,6 +991,7 @@ fn create_stack_preserves_access_share_options_and_ea_length() {
                     KernelFileObject::from_raw(file_object.as_ptr())
                 }
             );
+            assert_eq!(create.file_attributes(), 0x20);
             let parameters = create.parameters();
             assert_eq!(parameters.desired_access().as_raw(), desired_access);
             assert_eq!(parameters.disposition(), CreateDisposition::OpenIf);
@@ -2901,4 +2902,12 @@ fn exclusive_open_permission_is_independent_of_returned_handle_rights() {
             assert_eq!(parameters.existing_operation_required_access(), 0);
         }
     }
+}
+
+/// # Panics
+/// Fails if Windows reset completions lose their specification-defined result values.
+#[test]
+fn destructive_create_actions_use_native_information_values() {
+    assert_eq!(super::CreateAction::Overwritten.as_ulong(), 3);
+    assert_eq!(super::CreateAction::Superseded.as_ulong(), 0);
 }
