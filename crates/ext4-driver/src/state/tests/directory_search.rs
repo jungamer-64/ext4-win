@@ -45,8 +45,8 @@ fn directory_wildcard_pattern_matches_long_windows_names() {
         return;
     };
 
-    assert!(pattern.matches(&matched));
-    assert!(!pattern.matches(&rejected));
+    assert_eq!(pattern.matches(&matched), Ok(true));
+    assert_eq!(pattern.matches(&rejected), Ok(false));
 }
 
 /// # Panics
@@ -110,14 +110,14 @@ fn initial_search_expression_survives_restart_and_later_requests() {
         cursor.restart();
         search.publish_after_copy(cursor, || Ok(()))?;
         assert_eq!(search.cursor(), DirectoryScanCursor::start());
-        assert!(!original.get().matches(&rejected));
-        assert!(!later.get().matches(&rejected));
+        assert_eq!(original.get().matches(&rejected), Ok(false));
+        assert_eq!(later.get().matches(&rejected), Ok(false));
         assert!(
             !search
                 .expression()?
                 .ok_or(DriverError::InternalInvariantViolation)?
                 .get()
-                .matches(&rejected)
+                .matches(&rejected)?
         );
         assert!(search.completed());
         Ok(())
@@ -146,4 +146,36 @@ fn directory_publication_requires_successful_copy() {
     assert_eq!(search.publish_after_copy(next, || Ok(())), Ok(()));
     assert_eq!(search.cursor(), next);
     assert!(search.completed());
+}
+
+/// # Panics
+/// Fails if DOS wildcard expressions are rejected or lose their Windows meaning.
+#[test]
+fn directory_dos_expressions_match_native_vectors() {
+    let result = (|| -> DriverResult<()> {
+        for (expression, name, expected) in [
+            ("a>.txt", "a.txt", true),
+            ("a>.txt", "ab.txt", true),
+            ("a>.txt", "abc.txt", false),
+            ("a\"", "a", true),
+            ("a\"", "a.", true),
+            ("<.txt", "a.b.txt", true),
+            ("<.txt", "a.b.dat", false),
+        ] {
+            let mut units = DriverVec::new();
+            for unit in expression.encode_utf16() {
+                units
+                    .try_push_owned(unit)
+                    .map_err(|failure| failure.into_parts().0)?;
+            }
+            let pattern = DirectoryPattern::from_prepared(&PreparedDirectoryPattern::Name(units))?;
+            let name = name.encode_utf16().collect::<alloc::vec::Vec<_>>();
+            assert_eq!(
+                pattern.matches(&WindowsName::from_utf16(&name)?),
+                Ok(expected)
+            );
+        }
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
 }

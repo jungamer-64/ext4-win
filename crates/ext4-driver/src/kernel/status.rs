@@ -44,6 +44,15 @@ pub(crate) enum DriverError {
     RegistryFailure(NTSTATUS),
     /// Cache Manager or Memory Manager rejected an operation with this exact status.
     CacheManagerFailure(NTSTATUS),
+    /// Windows filename expression evaluation failed before cursor publication.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "only kernel FsRtl allocation exceptions produce this native failure"
+        )
+    )]
+    NameExpressionFailure(NTSTATUS),
     /// The storage sector query failed with an exact native status; no filesystem mutation occurred.
     SectorQueryFailure(NTSTATUS),
     /// FsRtl rejected or cancelled an oplock-conflicting operation with this exact status.
@@ -143,6 +152,7 @@ impl DriverError {
             Self::SecurityCheckFailed(status)
             | Self::PrivilegeRecordingFailed(status)
             | Self::CacheManagerFailure(status)
+            | Self::NameExpressionFailure(status)
             | Self::SectorQueryFailure(status)
             | Self::OplockFailure(status)
             | Self::RegistryFailure(status) => status,

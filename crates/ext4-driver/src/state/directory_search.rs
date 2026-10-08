@@ -104,10 +104,12 @@ impl DirectoryPattern {
         if is_all_directory_pattern(units) {
             return Ok(Self::All);
         }
-        if units
-            .iter()
-            .any(|unit| matches!(*unit, UTF16_ASTERISK | UTF16_QUESTION_MARK | 0x0022 | 0x003C | 0x003E))
-        {
+        if units.iter().any(|unit| {
+            matches!(
+                *unit,
+                UTF16_ASTERISK | UTF16_QUESTION_MARK | 0x0022 | 0x003C | 0x003E
+            )
+        }) {
             return DirectoryWildcardPattern::from_utf16(units).map(Self::Wildcard);
         }
         WindowsName::from_utf16(units)
@@ -139,12 +141,16 @@ impl DirectoryWildcardPattern {
     /// # Errors
     /// Returns invalid-name for separators, NUL, or malformed UTF-16, or allocation failure.
     fn from_utf16(units: &[u16]) -> DriverResult<Self> {
-        if units.iter().any(|unit| matches!(*unit, 0 | 0x002F | 0x003A | 0x005C | 0x007C))
+        if units
+            .iter()
+            .any(|unit| matches!(*unit, 0 | 0x002F | 0x003A | 0x005C | 0x007C))
             || core::char::decode_utf16(units.iter().copied()).any(|item| item.is_err())
         {
             return Err(DriverError::from(ext4_core::Error::InvalidName));
         }
-        Ok(Self { units: DriverVec::try_copied_from_slice(units)? })
+        Ok(Self {
+            units: DriverVec::try_copied_from_slice(units)?,
+        })
     }
 
     /// Evaluates the complete Windows expression at the native boundary.

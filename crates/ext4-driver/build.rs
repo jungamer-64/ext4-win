@@ -43,6 +43,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     const STREAM_CONTEXT_SOURCE: &str = "native/stream_context.c";
     const OPERATIONAL_TRACE_SOURCE: &str = "native/operational_trace.c";
     const VOLUME_DISCOVERY_SOURCE: &str = "native/volume_discovery.c";
+    const NAME_EXPRESSION_SOURCE: &str = "native/name_expression.c";
 
     println!("cargo:rerun-if-changed={IDENTITY_SOURCE}");
     println!("cargo:rerun-if-changed={IDENTITY_REGISTRY_SOURCE}");
@@ -60,6 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_SOURCE}");
     println!("cargo:rerun-if-changed=native/operational_trace.h");
     println!("cargo:rerun-if-changed={VOLUME_DISCOVERY_SOURCE}");
+    println!("cargo:rerun-if-changed={NAME_EXPRESSION_SOURCE}");
     println!("cargo:rerun-if-changed={LIFECYCLE_CONTROL_CONTRACT}");
     println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_CONTRACT}");
     println!("cargo:rerun-if-env-changed={ARTIFACT_ID_ENVIRONMENT}");
@@ -113,7 +115,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .file(SECURITY_CAPTURE_SOURCE)
         .file(STREAM_CONTEXT_SOURCE)
         .file(OPERATIONAL_TRACE_SOURCE)
-        .file(VOLUME_DISCOVERY_SOURCE);
+        .file(VOLUME_DISCOVERY_SOURCE)
+        .file(NAME_EXPRESSION_SOURCE);
 
     if is_msvc_frontend {
         native.flag("/kernel").flag("/W4").flag("/WX");

@@ -199,10 +199,32 @@ impl WindowsEaName {
     /// Validates and stores a Windows EA name.
     /// # Errors
     ///
-    /// Returns an error when the EA name is empty, contains NUL, uses the reserved ext4win prefix,
+    /// Returns an error when the EA name is empty, contains Windows-prohibited characters, uses the reserved ext4win prefix,
     /// or exceeds the one-byte FILE_FULL_EA_INFORMATION name length.
     fn new(name: &[u8]) -> DriverResult<Self> {
-        if name.is_empty() || name.contains(&0) {
+        if name.is_empty()
+            || name.iter().any(|byte| {
+                *byte < 0x20
+                    || matches!(
+                        *byte,
+                        b'\\'
+                            | b'/'
+                            | b':'
+                            | b'*'
+                            | b'?'
+                            | b'"'
+                            | b'<'
+                            | b'>'
+                            | b'|'
+                            | b','
+                            | b'+'
+                            | b'='
+                            | b'['
+                            | b']'
+                            | b';'
+                    )
+            })
+        {
             return Err(DriverError::InvalidEaName);
         }
         if name.starts_with(RESERVED_EA_NAME_PREFIX) {
@@ -1262,6 +1284,12 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn invalid_ea_names_are_rejected() {
+        for byte in (0..0x20).chain(b"\\/:*?\"<>|,+=[];".iter().copied()) {
+            assert_eq!(
+                WindowsEaName::new(&[b'a', byte, b'b']),
+                Err(DriverError::InvalidEaName)
+            );
+        }
         assert_eq!(WindowsEaName::new(b""), Err(DriverError::InvalidEaName));
         assert_eq!(
             WindowsEaName::new(b"has\0nul"),
