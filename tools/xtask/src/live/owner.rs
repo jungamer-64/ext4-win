@@ -604,16 +604,20 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
             .truncate(true)
             .create(create_if_missing)
             .open(&reset_path)?;
-        let verification = if reset.metadata()?.len() == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::other("overwrite did not reset EOF").into())
-        };
+        let verification = (|| {
+            if reset.metadata()?.len() == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::other("overwrite did not reset EOF").into())
+            }
+        })();
         combine_verification_and_cleanup(
             verification,
             windows_host::close_file(reset).map_err(Into::into),
         )?;
     }
+    println!("live filesystem I/O: verify handle-local timestamp suppression");
+    windows_host::verify_timestamp_suppression(&reset_path)?;
     println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
     let descriptor = windows_host::file_security(&alpha)?;

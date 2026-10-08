@@ -62,6 +62,7 @@ fn basic_attributes_zero_preserves_existing_attributes() {
     let update = super::set_basic_attributes(metadata, 0);
     assert!(update.is_ok());
     if let Ok(update) = update {
-        assert!(update.is_empty());
+        assert_eq!(update.security(), None);
+        assert_eq!(update.overlay(), None);
     }
 }

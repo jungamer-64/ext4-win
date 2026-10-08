@@ -3934,7 +3934,25 @@ impl MutationRequestOperation {
         operations: &mut crate::state::MountedVolumeAccess<'_>,
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<DriverResolveDisposition> {
-        match request {
+        let preservation = match request {
+            PreparedMutationRequest::DataWrite(
+                crate::request::file_info::RegularFileDataAuthority::Handle,
+            )
+            | PreparedMutationRequest::Security(_)
+            | PreparedMutationRequest::Other(
+                MutationRequestKind::SetInformation
+                | MutationRequestKind::SetEa
+                | MutationRequestKind::SetReparsePoint
+                | MutationRequestKind::DeleteReparsePoint
+                | MutationRequestKind::EnableVerity,
+            ) => crate::request::file_info::PreservedHandleTimes::capture(
+                owned.request(),
+                request.kind() == MutationRequestKind::SetInformation,
+                mutation,
+            )?,
+            _ => None,
+        };
+        let result: DriverResult<DriverResolveDisposition> = match request {
             PreparedMutationRequest::Create { mapping, creator } => {
                 match crate::request::create::execute(
                     owned.request(),
@@ -4124,7 +4142,14 @@ impl MutationRequestOperation {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
+        };
+        let result = result?;
+        if matches!(result, DriverResolveDisposition::Mutation(_))
+            && let Some(preservation) = preservation
+        {
+            preservation.restore(mutation)?;
         }
+        Ok(result)
     }
 
     /// Reacquires the latest immutable epoch while retaining the original FIFO ticket.

@@ -854,6 +854,116 @@ pub fn volume_at_mount(path: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::other("invalid volume name"))
 }
 
+/// Exercises explicit basic times, handle-local suppression, independent handles, and resumption.
+/// # Errors
+/// Returns native set/write/query/flush failures, timestamp disagreement, or explicit close failure.
+pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
+    const FIXED_TIME: i64 = 125_911_584_000_000_000;
+    let file = FileHandle::open(path, 0x4000_0080, 0)?;
+    let result = (|| {
+        let explicit = FILE_BASIC_INFO {
+            CreationTime: FIXED_TIME,
+            LastAccessTime: FIXED_TIME,
+            LastWriteTime: FIXED_TIME,
+            ChangeTime: FIXED_TIME,
+            FileAttributes: 0,
+        };
+        set_basic_information(&file, &explicit)?;
+        let suppressed = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: -1,
+            LastWriteTime: -1,
+            ChangeTime: -1,
+            FileAttributes: 0,
+        };
+        set_basic_information(&file, &suppressed)?;
+        write_and_flush_byte(&file)?;
+        let retained = file_information_query(&file, 4, 40, 0)?;
+        for offset in [8, 16, 24] {
+            if i64::from_le_bytes(field(&retained, offset)?) != FIXED_TIME {
+                return Err(io::Error::other("suppressed handle changed a timestamp"));
+            }
+        }
+        let other = FileHandle::open(path, 0x4000_0080, 0)?;
+        let changed = (|| {
+            write_and_flush_byte(&other)?;
+            let observed = file_information_query(&other, 4, 40, 0)?;
+            if i64::from_le_bytes(field(&observed, 16)?) == FIXED_TIME {
+                return Err(io::Error::other(
+                    "suppression leaked to an independent handle",
+                ));
+            }
+            Ok(())
+        })();
+        completed(changed, other.close())?;
+        set_basic_information(&file, &explicit)?;
+        let resumed = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: -2,
+            LastWriteTime: -2,
+            ChangeTime: -2,
+            FileAttributes: 0,
+        };
+        set_basic_information(&file, &resumed)?;
+        write_and_flush_byte(&file)?;
+        let observed = file_information_query(&file, 4, 40, 0)?;
+        if i64::from_le_bytes(field(&observed, 16)?) == FIXED_TIME {
+            return Err(io::Error::other(
+                "resumed handle did not update its write timestamp",
+            ));
+        }
+        Ok(())
+    })();
+    completed(result, file.close())
+}
+
+/// Sets one fixed basic-information record on a retained synchronous handle.
+/// # Errors
+/// Returns native set-information failures.
+fn set_basic_information(file: &FileHandle, info: &FILE_BASIC_INFO) -> io::Result<()> {
+    let raw = file.raw()?;
+    let size = u32::try_from(core::mem::size_of::<FILE_BASIC_INFO>()).map_err(io::Error::other)?;
+    let success = unsafe {
+        // SAFETY: The handle and fully initialized fixed record remain live throughout this
+        // synchronous call; Windows copies the input without retaining it.
+        SetFileInformationByHandle(raw, FileBasicInfo, core::ptr::from_ref(info).cast(), size)
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Writes one byte at the handle cursor and observes durable cached-write completion.
+/// # Errors
+/// Returns short-write, native write or flush failures.
+fn write_and_flush_byte(file: &FileHandle) -> io::Result<()> {
+    let raw = file.raw()?;
+    let byte = [0xAC_u8];
+    let mut written = 0;
+    let success = unsafe {
+        // SAFETY: This synchronous handle retains the one-byte input and fixed output until
+        // WriteFile completes; no overlapped operation or deferred pointer is supplied.
+        WriteFile(raw, byte.as_ptr(), 1, &mut written, ptr::null_mut())
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if written != 1 {
+        return Err(io::Error::other("native timestamp fixture short write"));
+    }
+    let flushed = unsafe {
+        // SAFETY: This borrowed handle remains live through synchronous flush completion.
+        FlushFileBuffers(raw)
+    };
+    if flushed == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Exercises metadata-only, zero-access and data handle lifetimes, aggregate information, and
 /// complete and truncated root-relative name records against the supplied fixture facts.
 /// # Errors
@@ -1332,6 +1442,28 @@ mod tests {
         })();
         assert!(result.is_ok(), "{result:?}");
     }
+    /// # Panics
+    /// Panics if independent Windows timestamp observations disagree with the handle contract.
+    #[test]
+    fn native_timestamp_suppression_is_handle_local() {
+        let result = (|| {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("ext4win-times-{}-{nonce}.bin", std::process::id()));
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            close_file(file)?;
+            let result = verify_timestamp_suppression(&path);
+            completed(result, std::fs::remove_file(&path))
+        })();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     /// Checks real attribute-only volume queries, exact service absence and native GUID encoding.
     /// # Errors
     /// Returns host observation or field decoding failures.

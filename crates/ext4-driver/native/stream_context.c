@@ -63,6 +63,7 @@ typedef struct _EXT4WIN_FAST_IO_TRANSFER_OBSERVATION {
     UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess;
 } EXT4WIN_FAST_IO_TRANSFER_OBSERVATION;
 
+extern UCHAR NTAPI ext4win_handle_allows_cached_write(_In_opt_ const VOID *context);
 extern BOOLEAN NTAPI ext4win_fast_io_admit(ULONG flags, UCHAR cached, UCHAR media, UCHAR close, UCHAR mutation);
 extern BOOLEAN NTAPI ext4win_fast_io_query_admit(ULONG flags, UCHAR read_access, UCHAR possible, UCHAR media, UCHAR mutation);
 extern BOOLEAN NTAPI ext4win_fast_io_check_if_possible(PFILE_OBJECT file, PLARGE_INTEGER offset,
@@ -1827,7 +1828,8 @@ ext4win_fast_io_write(
     if ((buffer == NULL) || (io_status == NULL) || (file_offset == NULL) ||
         !wait ||
         ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
-        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        !ext4win_stream_fast_io_candidate(file_object, &stream) ||
+        !ext4win_handle_allows_cached_write(file_object->FsContext2)) {
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_WRITE);
@@ -2097,7 +2099,8 @@ ext4win_prepare_mdl_write(
 
     if ((mdl_chain == NULL) || (io_status == NULL) || (file_offset == NULL) ||
         ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
-        !ext4win_stream_fast_io_candidate(file_object, &stream)) {
+        !ext4win_stream_fast_io_candidate(file_object, &stream) ||
+        !ext4win_handle_allows_cached_write(file_object->FsContext2)) {
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_FAST_IO_MDL_WRITE);

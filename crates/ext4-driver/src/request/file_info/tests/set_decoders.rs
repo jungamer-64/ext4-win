@@ -142,3 +142,46 @@ fn fixed_set_information_decoders_are_field_checked_and_length_bounded() {
         assert_eq!(result, Some(DriverError::BufferTooSmall));
     }
 }
+
+/// # Panics
+/// Panics if sentinel decoding loses independent handle policy or changes kept metadata values.
+#[test]
+fn basic_timestamp_sentinels_keep_values_and_select_handle_policy() {
+    use crate::state::{AutomaticTimeUpdate, HandleTimestampPolicy};
+    let info = wdk_sys::FILE_BASIC_INFORMATION {
+        CreationTime: LARGE_INTEGER { QuadPart: 0 },
+        LastAccessTime: LARGE_INTEGER { QuadPart: 0 },
+        LastWriteTime: LARGE_INTEGER { QuadPart: -1 },
+        ChangeTime: LARGE_INTEGER { QuadPart: -2 },
+        FileAttributes: 0,
+    };
+    let update = super::BasicTimeUpdates::decode(info);
+    assert!(update.is_ok());
+    let Ok(update) = update else {
+        return;
+    };
+    let before = HandleTimestampPolicy {
+        accessed: AutomaticTimeUpdate::Suppressed,
+        modified: AutomaticTimeUpdate::Enabled,
+        changed: AutomaticTimeUpdate::Suppressed,
+    };
+    assert_eq!(
+        update.policy(before),
+        HandleTimestampPolicy {
+            accessed: AutomaticTimeUpdate::Suppressed,
+            modified: AutomaticTimeUpdate::Suppressed,
+            changed: AutomaticTimeUpdate::Enabled,
+        }
+    );
+    let time = Ext4Timestamp::from_unix_seconds(10);
+    let current = Ext4Times::new(time, time, time, time);
+    assert_eq!(update.times(current), current);
+    assert_eq!(
+        super::BasicTimeUpdate::Set(time).automatic(AutomaticTimeUpdate::Suppressed),
+        AutomaticTimeUpdate::Suppressed
+    );
+    assert_eq!(
+        super::BasicTimeUpdate::decode(LARGE_INTEGER { QuadPart: -3 }),
+        Err(DriverError::InvalidParameter)
+    );
+}

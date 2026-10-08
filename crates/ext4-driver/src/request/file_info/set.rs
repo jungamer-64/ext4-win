@@ -8,8 +8,12 @@ enum SetFilePlan {
     Complete,
     /// Apply timestamps and overlay attributes to one node.
     Basic {
-        /// Caller update copied from the IRP buffer.
-        info: wdk_sys::FILE_BASIC_INFORMATION,
+        /// Validated timestamp assignments and handle-local update selections.
+        times: BasicTimeUpdates,
+        /// Caller attribute selection.
+        attributes: u32,
+        /// Exact CCB publication prepared while the IRP retains it.
+        publication: PreparedHandleTimestampPublication,
         /// Target ext4 node.
         node: NodeId,
     },
@@ -98,6 +102,8 @@ pub(crate) enum SetFileResolution {
 pub(crate) enum SetFilePublication {
     /// No driver-visible state changes after commit.
     None,
+    /// Handle-local automatic timestamp policy paired with committed basic metadata.
+    Timestamps(PreparedHandleTimestampPublication),
     /// Ordered namespace notifications for a committed hard-link mutation.
     HardLink(Box<HardLinkDirectoryChanges>),
     /// Handle-location and notification moves for a committed rename.
@@ -170,6 +176,7 @@ impl SetFilePublication {
     pub(crate) fn publish(self, operations: &MountedVolumeAccess<'_>) {
         match self {
             Self::None => {}
+            Self::Timestamps(publication) => publication.publish(),
             Self::HardLink(changes) => (*changes).report(operations),
             Self::Rename {
                 location,
@@ -219,10 +226,22 @@ pub(super) fn set_file_information(
         let stack = current.set_file()?;
         let mut opened_file = OpenedObject::decode(file_object)?;
         let plan = match stack.information_class() {
-            SetFileInformationClass::Basic => SetFilePlan::Basic {
-                info: read_basic_information_input(active, stack.length())?,
-                node: opened_file.node(),
-            },
+            SetFileInformationClass::Basic => {
+                if opened_file.file_attributes_write_access() != FileAttributesWriteAccess::Granted
+                {
+                    return Err(DriverError::AccessDenied);
+                }
+                let info = read_basic_information_input(active, stack.length())?;
+                let times = BasicTimeUpdates::decode(info)?;
+                SetFilePlan::Basic {
+                    times,
+                    attributes: info.FileAttributes,
+                    publication: opened_file.prepare_timestamp_publication(
+                        times.policy(opened_file.timestamp_policy()),
+                    ),
+                    node: opened_file.node(),
+                }
+            }
             SetFileInformationClass::Position => {
                 set_position_information(active, stack, &mut opened_file)?;
                 SetFilePlan::Complete
@@ -293,7 +312,17 @@ pub(super) fn set_file_information(
         SetFilePlan::Complete => {
             return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
         }
-        SetFilePlan::Basic { info, node } => set_basic_information(info, node, mutation)?,
+        SetFilePlan::Basic {
+            times,
+            attributes,
+            publication,
+            node,
+        } => {
+            apply_basic_information(times, attributes, node, mutation)?;
+            return Ok(SetFileResolution::Mutation(SetFilePublication::Timestamps(
+                publication,
+            )));
+        }
         SetFilePlan::EndOfFile { file, size } => set_regular_file_size(mutation, file, size)?,
         SetFilePlan::Allocation { file, size } => {
             let current = regular_file_size(mutation, file)?;
@@ -427,6 +456,208 @@ pub(crate) fn set_creation_attributes(
         mutation.set_windows_overlay(node, overlay)?;
     }
     Ok(())
+}
+
+/// One validated Windows automatic timestamp update, independent of explicit assignment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BasicTimeUpdate {
+    /// Keep the current value and automatic-update policy.
+    Keep,
+    /// Keep the value and suppress subsequent I/O updates on this handle.
+    Suppress,
+    /// Keep the value and resume subsequent automatic updates.
+    Resume,
+    /// Assign an explicit timestamp without changing the handle's automatic-update policy.
+    Set(Ext4Timestamp),
+}
+
+impl BasicTimeUpdate {
+    /// Interprets the Windows sentinel domain before metadata staging.
+    /// # Errors
+    /// Returns invalid parameter for other negative values or an unrepresentable time.
+    fn decode(value: LARGE_INTEGER) -> DriverResult<Self> {
+        match large_integer_quad(value) {
+            0 => Ok(Self::Keep),
+            -1 => Ok(Self::Suppress),
+            -2 => Ok(Self::Resume),
+            value if value < 0 => Err(DriverError::InvalidParameter),
+            _ => Ok(Self::Set(windows_timestamp(value)?)),
+        }
+    }
+
+    /// Selects the metadata value independently of automatic-update policy.
+    const fn value(self, current: Ext4Timestamp) -> Ext4Timestamp {
+        match self {
+            Self::Set(time) => time,
+            Self::Keep | Self::Suppress | Self::Resume => current,
+        }
+    }
+
+    /// Selects the successor policy independently of explicit metadata assignment.
+    const fn automatic(self, current: AutomaticTimeUpdate) -> AutomaticTimeUpdate {
+        match self {
+            Self::Suppress => AutomaticTimeUpdate::Suppressed,
+            Self::Resume => AutomaticTimeUpdate::Enabled,
+            Self::Keep | Self::Set(_) => current,
+        }
+    }
+}
+
+/// Timestamp assignments and automatic-update selections validated together before staging.
+#[derive(Clone, Copy, Debug)]
+struct BasicTimeUpdates {
+    /// Creation is explicitly assigned or kept; it has no automatic I/O update policy.
+    created: Option<Ext4Timestamp>,
+    /// Last-access value and policy.
+    accessed: BasicTimeUpdate,
+    /// Last-write value and policy.
+    modified: BasicTimeUpdate,
+    /// Change-time value and policy.
+    changed: BasicTimeUpdate,
+}
+
+impl BasicTimeUpdates {
+    /// Decodes every field before any core mutation.
+    /// # Errors
+    /// Returns invalid parameter for unsupported timestamp values.
+    fn decode(info: wdk_sys::FILE_BASIC_INFORMATION) -> DriverResult<Self> {
+        let created = match large_integer_quad(info.CreationTime) {
+            0 | -1 => None,
+            value if value < 0 => return Err(DriverError::InvalidParameter),
+            _ => Some(windows_timestamp(info.CreationTime)?),
+        };
+        Ok(Self {
+            created,
+            accessed: BasicTimeUpdate::decode(info.LastAccessTime)?,
+            modified: BasicTimeUpdate::decode(info.LastWriteTime)?,
+            changed: BasicTimeUpdate::decode(info.ChangeTime)?,
+        })
+    }
+
+    /// Retains zero/sentinel values across attribute changes in the same basic-information request.
+    fn times(self, current: Ext4Times) -> Ext4Times {
+        Ext4Times::new(
+            self.accessed.value(current.accessed()),
+            self.modified.value(current.modified()),
+            self.changed.value(current.changed()),
+            self.created.unwrap_or(current.created()),
+        )
+    }
+
+    /// Changes only fields explicitly selecting suppression or resumption.
+    const fn policy(self, current: HandleTimestampPolicy) -> HandleTimestampPolicy {
+        HandleTimestampPolicy {
+            accessed: self.accessed.automatic(current.accessed),
+            modified: self.modified.automatic(current.modified),
+            changed: self.changed.automatic(current.changed),
+        }
+    }
+}
+
+/// Converts a validated positive Windows absolute timestamp to the core seconds domain.
+/// # Errors
+/// Returns invalid parameter when Windows cannot represent this timestamp as Unix seconds.
+#[expect(
+    unsafe_code,
+    reason = "RtlTimeToSecondsSince1970 converts fixed local timestamp storage"
+)]
+fn windows_timestamp(mut value: LARGE_INTEGER) -> DriverResult<Ext4Timestamp> {
+    let mut seconds = 0;
+    let converted = unsafe {
+        // SAFETY: Both pointers refer to writable stack storage valid throughout the call.
+        crate::kernel::ffi::RtlTimeToSecondsSince1970(
+            core::ptr::addr_of_mut!(value),
+            core::ptr::addr_of_mut!(seconds),
+        )
+    };
+    if converted == 0 {
+        return Err(DriverError::InvalidParameter);
+    }
+    Ok(Ext4Timestamp::from_unix_seconds(seconds))
+}
+
+/// Applies attributes before final explicit timestamps so attribute setters cannot overwrite them.
+/// # Errors
+/// Returns invalid attributes or ext4 metadata staging failures.
+fn apply_basic_information(
+    update: BasicTimeUpdates,
+    attributes: u32,
+    node_id: NodeId,
+    transaction: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<()> {
+    let metadata = metadata_from_node(transaction, node_id)?;
+    let times = update.times(metadata.times);
+    let attributes = set_basic_attributes(metadata, attributes)?;
+    let node = transaction.node(node_id)?;
+    if let Some(security) = attributes.security() {
+        transaction.set_posix_security(node, security)?;
+    }
+    if let Some(overlay) = attributes.overlay() {
+        transaction.set_windows_overlay(node, overlay)?;
+    }
+    if times != transaction.staged_node_metadata(node_id)?.times() {
+        transaction.set_times(node, times)?;
+    }
+    Ok(())
+}
+
+/// Restart-local timestamp preservation for one ordinary handle mutation.
+#[derive(Debug)]
+pub(crate) struct PreservedHandleTimes {
+    /// Exact opened inode whose automatic changes may be suppressed.
+    node: NodeId,
+    /// Values in the epoch being mutated, before this request stages any changes.
+    before: Ext4Times,
+    /// Policy of the originating CCB; unrelated handles and paging I/O have independent authority.
+    policy: HandleTimestampPolicy,
+}
+
+impl PreservedHandleTimes {
+    /// Captures suppression only for ordinary I/O; basic-information assignments own their values.
+    /// # Errors
+    /// Returns request/context decoding or committed metadata read failures.
+    pub(crate) fn capture(
+        mut request: PendingIrpLease<'_>,
+        is_set_information: bool,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+    ) -> DriverResult<Option<Self>> {
+        let target = request.with_active(|active| {
+            let current = active.current_stack()?;
+            if is_set_information
+                && current.set_file()?.information_class() == SetFileInformationClass::Basic
+            {
+                return Ok(None);
+            }
+            let opened = OpenedObject::decode(current.file_object()?)?;
+            let policy = opened.timestamp_policy();
+            Ok::<_, DriverError>(
+                policy
+                    .requires_journaled_write()
+                    .then_some((opened.node(), policy)),
+            )
+        })?;
+        let Some((node, policy)) = target else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            node,
+            before: mutation.load_node_metadata(node)?.times(),
+            policy,
+        }))
+    }
+
+    /// Restores suppressed fields after automatic updates, before resolving the commit.
+    /// # Errors
+    /// Returns staged inode observation or timestamp staging failures.
+    pub(crate) fn restore(self, mutation: &mut DriverMutationPass<'_, '_, '_>) -> DriverResult<()> {
+        let after = mutation.staged_node_metadata(self.node)?.times();
+        let retained = self.policy.preserve(self.before, after);
+        if retained != after {
+            let node = mutation.node(self.node)?;
+            mutation.set_times(node, retained)?;
+        }
+        Ok(())
+    }
 }
 
 /// Raw Windows disposition layout selected by the information class.
@@ -1871,11 +2102,6 @@ impl BasicAttributeUpdate {
     /// Creates an attribute update from independent domain mutations.
     const fn new(security: Option<Ext4Security>, overlay: Option<WindowsOverlay>) -> Self {
         Self { security, overlay }
-    }
-
-    /// Returns whether this update has no domain mutations.
-    const fn is_empty(self) -> bool {
-        self.security.is_none() && self.overlay.is_none()
     }
 
     /// POSIX security update.

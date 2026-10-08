@@ -251,6 +251,7 @@ pub(crate) fn prepare_write_cache_plan(
         if matches!(selected, SelectedWriteStart::EndOfFile)
             || matches!(mode, DataTransferMode::Direct(_))
             || write_through
+            || opened.timestamp_policy().requires_journaled_write()
             || end > eof
         {
             return Ok(WriteCachePlan::PurgeBeforeDirect(PassiveWork::purge(

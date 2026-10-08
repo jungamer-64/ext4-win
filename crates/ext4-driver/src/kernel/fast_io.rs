@@ -218,7 +218,19 @@ unsafe extern "system" fn ext4win_fast_io_check_if_possible(
     ) || if read != 0 {
         observation.read_access == 0
     } else {
+        let context_address = unsafe {
+            // SAFETY: Successful native observation established a retained node FILE_OBJECT.
+            core::ptr::addr_of!((*file).FsContext2)
+        };
+        let context = unsafe {
+            // SAFETY: FsContext2 remains initialized while the I/O Manager retains this callback.
+            context_address.read()
+        };
         observation.write_access == 0
+            || unsafe {
+                // SAFETY: The retained node FILE_OBJECT keeps its driver-published CCB live.
+                crate::state::ext4win_handle_allows_cached_write(context) == 0
+            }
     } {
         return 0;
     }

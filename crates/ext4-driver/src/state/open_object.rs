@@ -894,6 +894,8 @@ pub(super) struct OpenedHandleState {
     directory_notification_name: UnsafeCell<DirectoryNotificationName>,
     /// FILE_OBJECT-local continuation for ordinary EA enumeration.
     ea_cursor: UnsafeCell<EaCursor>,
+    /// Per-handle automatic timestamps, atomically observed by native Fast I/O.
+    timestamps: HandleTimestampState,
 }
 
 impl OpenedHandleState {
@@ -914,6 +916,7 @@ impl OpenedHandleState {
             normalized_name_access,
             directory_notification_name: UnsafeCell::new(DirectoryNotificationName::Unregistered),
             ea_cursor: UnsafeCell::new(EaCursor::START),
+            timestamps: HandleTimestampState::new(),
         }
     }
 
@@ -1297,6 +1300,62 @@ impl PreparedOpenedLocationPublication {
 // from successful CREATE publication until the ordered CLOSE transition.
 unsafe impl Send for PreparedOpenedLocationPublication {}
 
+/// Exact CCB timestamp policy prepared before commit and published without allocation.
+#[derive(Debug)]
+pub(crate) struct PreparedHandleTimestampPublication {
+    /// CCB retained by the originating IRP and its ordered handle lane.
+    handle: NonNull<OpenedHandle>,
+    /// Complete successor policy.
+    policy: HandleTimestampPolicy,
+}
+
+impl PreparedHandleTimestampPublication {
+    /// Publishes the successor after metadata durability; native cached-write admission sees it atomically.
+    #[expect(
+        unsafe_code,
+        reason = "the IRP retains its stable CCB until this publication completes"
+    )]
+    pub(crate) fn publish(self) {
+        let handle = unsafe {
+            // SAFETY: The originating IRP and its handle lane retain this CCB through commit;
+            // CLOSE cannot consume it before the operation completes.
+            self.handle.as_ref()
+        };
+        handle.state.timestamps.publish(self.policy);
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "the publication moves within the reactor-owned operation retaining the CCB"
+)]
+// SAFETY: The originating IRP retains the stable CCB through ordered completion; publication
+// touches only atomic state and carries no thread-local borrow.
+unsafe impl Send for PreparedHandleTimestampPublication {}
+
+/// Observes native cached-write admission from the exact FILE_OBJECT-local CCB.
+/// # Safety
+/// A non-null context must be the live driver-published FsContext2 of a node FILE_OBJECT,
+/// retained by the I/O Manager for the entire native callback. No mutable CCB fields are borrowed.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the native callback retains its CCB and reads only its atomic policy"
+)]
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "system" fn ext4win_handle_allows_cached_write(
+    context: *const c_void,
+) -> u8 {
+    let Some(handle) = NonNull::new(context.cast_mut().cast::<OpenedHandle>()) else {
+        return 0;
+    };
+    let policy = unsafe {
+        // SAFETY: The callback retains this driver-created CCB; its policy is independently atomic.
+        handle.as_ref().state.timestamps.policy()
+    };
+    u8::from(!policy.requires_journaled_write())
+}
+
 /// Prevalidated FILE_OBJECT position update published after successful data I/O.
 #[derive(Debug)]
 pub(crate) enum PreparedFilePositionPublication {
@@ -1490,6 +1549,22 @@ impl<'owner> OpenedObject<'owner> {
     /// Returns data transfer buffering policy requested for this opened handle.
     pub(crate) fn data_transfer_mode(&self) -> DataTransferMode {
         self.handle().data_transfer_mode()
+    }
+
+    /// Observes the policy of this exact handle without changing any other handle on the inode.
+    pub(crate) fn timestamp_policy(&self) -> HandleTimestampPolicy {
+        self.handle().state.timestamps.policy()
+    }
+
+    /// Prepares one exact-handle policy update while the pending IRP retains its CCB.
+    pub(crate) fn prepare_timestamp_publication(
+        &self,
+        policy: HandleTimestampPolicy,
+    ) -> PreparedHandleTimestampPublication {
+        PreparedHandleTimestampPublication {
+            handle: self.handle,
+            policy,
+        }
     }
 
     /// Returns the synchronous FILE_OBJECT current position.
@@ -2145,6 +2220,11 @@ impl<'owner> OpenedRegularFile<'owner> {
     ) -> DriverResult<PreparedFilePositionPublication> {
         self.opened
             .prepare_current_file_position_update(kind, start, transferred)
+    }
+
+    /// Observes automatic timestamp policy for this exact regular-file handle.
+    pub(crate) fn timestamp_policy(&self) -> HandleTimestampPolicy {
+        self.opened.timestamp_policy()
     }
 
     /// Returns data transfer buffering policy requested for this regular-file handle.
