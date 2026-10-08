@@ -1365,57 +1365,7 @@ impl PendingExistingCreateOpen {
         }
     }
 
-    /// Publishes the provisional claim after validating the matching native gate, when required.
-    ///
-    /// Every recoverable validation and allocation has completed before this ownership-consuming
-    /// boundary. A mismatched gate or unfinished oplock state is reactor corruption, because a
-    /// returned error could no longer retain the atomic backout authority.
-    fn publish(
-        mut self,
-        gate: Option<&PreparedStreamWriteOpen>,
-        operations: &mut MountedVolumeAccess<'_>,
-    ) -> CreateCompletion {
-        match (self.write_open, gate) {
-            (ExistingWriteOpenRequirement::NotRequired, None) => {}
-            (ExistingWriteOpenRequirement::FlushImageSection, Some(gate))
-                if gate.authorizes(self.claim.file_control_block(), self.node) => {}
-            (ExistingWriteOpenRequirement::NotRequired, Some(_))
-            | (ExistingWriteOpenRequirement::FlushImageSection, None | Some(_)) => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
-                )
-                .bugcheck();
-            }
-        }
-        let oplock = core::mem::replace(&mut self.oplock, ExistingCreateOplockState::Ready);
-        let completion = match oplock {
-            ExistingCreateOplockState::Ready => CreateCompletion::Handle(self.action),
-            ExistingCreateOplockState::BreakInProgress => {
-                CreateCompletion::OplockBreakInProgress(self.action)
-            }
-            ExistingCreateOplockState::Reserved(reservation) => {
-                reservation.publish();
-                CreateCompletion::Handle(self.action)
-            }
-            ExistingCreateOplockState::Check(_) | ExistingCreateOplockState::Reserve(_) => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
-                )
-                .bugcheck();
-            }
-        };
-        let Self {
-            claim,
-            handle,
-            policy,
-            pending_deletion,
-            ..
-        } = self;
-        let (fcb, file_object) = claim.consume();
-        publish_node_stream_raw(file_object, fcb, handle, policy.file_object_flags());
-        if let Some(pending) = pending_deletion {
-            operations.set_file_delete_pending(fcb, pending);
-        }
-        completion
-    }
+
 }
 
 /// Selects the one remaining native gate or publishes an already sealed existing-node claim.
