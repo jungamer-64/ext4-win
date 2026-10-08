@@ -431,26 +431,6 @@ impl<'owner> UninitializedFileObject<'owner> {
         self.file_object.related_file_object()
     }
 
-    /// Returns the immutable create-time FILE_OBJECT.
-    pub(crate) fn as_ref(&self) -> &FILE_OBJECT {
-        self.file_object.as_ref()
-    }
-
-    /// Returns the unpublished create-time FILE_OBJECT at its unique attachment point.
-    ///
-    /// # Safety
-    /// The caller must own the sole successful-create attachment transition for this FILE_OBJECT.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) unsafe fn as_mut(&mut self) -> &mut FILE_OBJECT {
-        unsafe {
-            // SAFETY: This non-copy typestate is constructed only while FsContext/FsContext2 are
-            // both null, and successful create consumes its sole attachment point.
-            &mut *self.file_object.as_ptr()
-        }
-    }
 }
 
 /// Non-null VPB pointer supplied by the I/O Manager.

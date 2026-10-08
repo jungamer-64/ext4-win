@@ -2205,19 +2205,6 @@ impl<'owner> OpenedDirectory<'owner> {
         self.opened.notification_context()
     }
 
-    /// Borrows the search state while the owning request retains the exclusive handle lane.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn search_mut(&mut self) -> &mut DirectorySearch {
-        unsafe {
-            // SAFETY: `search` points into the live directory handle variant
-            // validated during decode. This type exposes no variant-changing
-            // operation.
-            self.search.as_mut()
-        }
-    }
 }
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.

@@ -507,19 +507,6 @@ impl ActiveFileObject<'_> {
         self.address
     }
 
-    /// Returns the WDK FILE_OBJECT for the lifetime of this active view.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn as_ref(&self) -> &wdk_sys::FILE_OBJECT {
-        unsafe {
-            // SAFETY: Construction is private to a lifetime-bound current-stack view whose IRP
-            // owner keeps the FILE_OBJECT alive.
-            &*self.address.as_ptr()
-        }
-    }
-
     /// Returns the raw pointer for native APIs whose call cannot outlive this view.
     pub(crate) const fn as_ptr(self) -> *mut wdk_sys::FILE_OBJECT {
         self.address.as_ptr()
