@@ -4,6 +4,7 @@
 #define assert(condition) do { if (!(condition)) { __builtin_trap(); } } while (0)
 #define _In_
 #define _Out_
+#define _Success_(condition)
 #define _Must_inspect_result_
 #define FALSE 0
 #define TRUE 1

@@ -4,6 +4,7 @@
 /* The transfer decision must observe EOF, byte-range locks and oplocks after
  * MainResource acquisition. Success retains the resource and its APC scope
  * through the Cc call; rejection releases both before returning to IRP fallback. */
+_Success_(return != FALSE)
 _Must_inspect_result_
 static BOOLEAN
 ext4win_stream_acquire_fast_io_main(
