@@ -854,6 +854,66 @@ pub fn volume_at_mount(path: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::other("invalid volume name"))
 }
 
+/// Verifies allocation reservation without EOF growth, release, and allocation below written EOF.
+/// The supplied fixture must be an empty regular file.
+/// # Errors
+/// Returns native allocation/write/query/flush failures, contract disagreement, or close failure.
+pub fn verify_allocation_control(path: &Path) -> io::Result<()> {
+    let file = FileHandle::open(path, 0x4000_0080, 0)?;
+    let result = (|| {
+        for bound in [32_768, 0] {
+            set_file_allocation(&file, bound)?;
+            let standard = file_information_query(&file, 5, 24, 0)?;
+            let allocation = i64::from_le_bytes(field(&standard, 0)?);
+            let eof = i64::from_le_bytes(field(&standard, 8)?);
+            if eof != 0 || allocation < bound || (bound == 0 && allocation != 0) {
+                return Err(io::Error::other(
+                    "allocation reservation changed EOF or failed to resize",
+                ));
+            }
+        }
+        write_and_flush_byte(&file)?;
+        set_file_allocation(&file, 0)?;
+        let standard = file_information_query(&file, 5, 24, 0)?;
+        if i64::from_le_bytes(field(&standard, 0)?) != 0
+            || i64::from_le_bytes(field(&standard, 8)?) != 0
+        {
+            return Err(io::Error::other(
+                "allocation below EOF did not truncate and release storage",
+            ));
+        }
+        Ok(())
+    })();
+    completed(result, file.close())
+}
+
+/// Sets the requested signed Windows byte allocation on one retained synchronous handle.
+/// # Errors
+/// Returns native set-information failures.
+fn set_file_allocation(file: &FileHandle, bound: i64) -> io::Result<()> {
+    let raw = file.raw()?;
+    let info = FILE_ALLOCATION_INFO {
+        AllocationSize: bound,
+    };
+    let size =
+        u32::try_from(core::mem::size_of::<FILE_ALLOCATION_INFO>()).map_err(io::Error::other)?;
+    let success = unsafe {
+        // SAFETY: The retained synchronous handle and fully initialized record remain live until
+        // Windows copies the allocation request; no pointer or callback is retained.
+        SetFileInformationByHandle(
+            raw,
+            FileAllocationInfo,
+            core::ptr::from_ref(&info).cast(),
+            size,
+        )
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// Exercises explicit basic times, handle-local suppression, independent handles, and resumption.
 /// # Errors
 /// Returns native set/write/query/flush failures, timestamp disagreement, or explicit close failure.
@@ -1445,7 +1505,7 @@ mod tests {
     /// # Panics
     /// Panics if independent Windows timestamp observations disagree with the handle contract.
     #[test]
-    fn native_timestamp_suppression_is_handle_local() {
+    fn native_file_allocation_and_timestamp_contracts() {
         let result = (|| {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1458,7 +1518,10 @@ mod tests {
                 .create_new(true)
                 .open(&path)?;
             close_file(file)?;
-            let result = verify_timestamp_suppression(&path);
+            let result = (|| {
+                verify_allocation_control(&path)?;
+                verify_timestamp_suppression(&path)
+            })();
             completed(result, std::fs::remove_file(&path))
         })();
         assert!(result.is_ok(), "{result:?}");

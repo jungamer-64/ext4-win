@@ -268,6 +268,79 @@ impl MutationResolvePass<'_, '_, '_> {
         Ok(())
     }
 
+    /// Sets block-rounded allocated storage while preserving EOF and existing visible payload.
+    /// The caller must first truncate EOF when requesting an allocation bound below it.
+    ///
+    /// # Errors
+    /// Returns invalid range below EOF, protected mutation, allocation, or extent staging failures.
+    pub fn set_file_allocation(
+        &mut self,
+        file: TransactionFile,
+        bound: FileAllocationSize,
+    ) -> Result<()> {
+        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
+        let inode = raw_inode.parse()?;
+        self.require_file_data_mutation(&inode)?;
+        if bound.bytes() < inode.size().bytes() {
+            return Err(Error::InvalidWriteRange);
+        }
+        self.mutation
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
+        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
+        self.retain_file_allocation(&mut tree, bound)?;
+        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
+        self.reserve_file_allocation(file, bound)
+    }
+
+    /// Releases extent tails beyond a block-rounded byte bound, preserving initialization state.
+    /// # Errors
+    /// Returns extent arithmetic, allocation-accounting, or fallible tree-copy failures.
+    fn retain_file_allocation(
+        &mut self,
+        tree: &mut MutableExtentTree,
+        bound: FileAllocationSize,
+    ) -> Result<()> {
+        let block_size = u64::from(self.mutation.volume.superblock.block_size().bytes());
+        let keep_blocks = round_up_div(bound.bytes(), block_size)?;
+        let extents = memory::copied_slice(tree.extents())?;
+        let mut updated = Vec::new();
+        for extent in extents {
+            let start = extent.logical_start().as_u64();
+            let end = extent.end_logical();
+            if start >= keep_blocks {
+                self.mutation.free_extent(extent, 0)?;
+            } else if end > keep_blocks {
+                let keep_len = u16::try_from(
+                    keep_blocks
+                        .checked_sub(start)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .map_err(|_| Error::ArithmeticOverflow)?;
+                self.mutation.free_extent(extent, keep_len)?;
+                let length = ExtentLength::new(keep_len)?;
+                let kept = match extent.initialization() {
+                    ExtentInitialization::Initialized => {
+                        Extent::initialized(extent.logical_start(), length, extent.physical_start())
+                    }
+                    ExtentInitialization::Uninitialized => Extent::uninitialized(
+                        extent.logical_start(),
+                        length,
+                        extent.physical_start(),
+                    ),
+                };
+                updated.try_push(kept)?;
+            } else {
+                updated.try_push(extent)?;
+            }
+        }
+        tree.replace_extents(updated)
+    }
+
     /// Stages zeroes for existing allocated blocks that become visible inside a sparse extension.
     /// # Errors
     ///
@@ -784,38 +857,7 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         let block_size_u64 = u64::from(self.mutation.volume.superblock.block_size().bytes());
         let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        let extents = memory::copied_slice(tree.extents())?;
-        let keep_blocks = round_up_div(new_size.bytes(), block_size_u64)?;
-        let mut updated = Vec::new();
-        for extent in extents {
-            let start = extent.logical_start().as_u64();
-            let end = extent.end_logical();
-            if start >= keep_blocks {
-                self.mutation.free_extent(extent, 0)?;
-            } else if end > keep_blocks {
-                let keep_len = u16::try_from(
-                    keep_blocks
-                        .checked_sub(start)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                )
-                .map_err(|_| Error::ArithmeticOverflow)?;
-                self.mutation.free_extent(extent, keep_len)?;
-                let length = ExtentLength::new(keep_len)?;
-                let kept = match extent.initialization() {
-                    ExtentInitialization::Initialized => {
-                        Extent::initialized(extent.logical_start(), length, extent.physical_start())
-                    }
-                    ExtentInitialization::Uninitialized => Extent::uninitialized(
-                        extent.logical_start(),
-                        length,
-                        extent.physical_start(),
-                    ),
-                };
-                updated.try_push(kept)?;
-            } else {
-                updated.try_push(extent)?;
-            }
-        }
+        self.retain_file_allocation(&mut tree, FileAllocationSize::from_bytes(new_size.bytes()))?;
         if new_size
             .bytes()
             .checked_rem(block_size_u64)
@@ -825,15 +867,14 @@ impl MutationResolvePass<'_, '_, '_> {
             if inode.protection().is_encrypted() {
                 self.zero_encrypted_truncated_tail(
                     &inode,
-                    updated.as_slice(),
+                    tree.extents(),
                     new_size,
                     block_size_u64,
                 )?;
             } else {
-                self.zero_truncated_tail(updated.as_slice(), new_size, block_size_u64)?;
+                self.zero_truncated_tail(tree.extents(), new_size, block_size_u64)?;
             }
         }
-        tree.replace_extents(updated)?;
         raw_inode.set_encoded_size(encoded_size)?;
         raw_inode.set_timestamps(
             self.now,

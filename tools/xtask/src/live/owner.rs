@@ -616,6 +616,8 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
             windows_host::close_file(reset).map_err(Into::into),
         )?;
     }
+    println!("live filesystem I/O: verify allocation reservation and release");
+    windows_host::verify_allocation_control(&reset_path)?;
     println!("live filesystem I/O: verify handle-local timestamp suppression");
     windows_host::verify_timestamp_suppression(&reset_path)?;
     println!("live filesystem I/O: verify file metadata");

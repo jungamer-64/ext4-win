@@ -24,12 +24,12 @@ enum SetFilePlan {
         /// Requested logical size.
         size: FileSize,
     },
-    /// Shrink allocation when the requested sparse-model size is below EOF.
+    /// Set physical allocation independently of EOF, truncating EOF when required.
     Allocation {
         /// Target regular file.
         file: FileNodeId,
-        /// Requested allocation bound.
-        size: FileSize,
+        /// Requested physical allocation bound.
+        size: FileAllocationSize,
     },
     /// Validate and publish one identity-bound delete-pending target.
     Disposition {
@@ -259,7 +259,9 @@ pub(super) fn set_file_information(
                 let regular_file = OpenedRegularFile::decode(file_object)?;
                 SetFilePlan::Allocation {
                     file: regular_file.id(),
-                    size: file_size_from_large_integer(allocation_size)?,
+                    size: FileAllocationSize::from_bytes(
+                        file_size_from_large_integer(allocation_size)?.bytes(),
+                    ),
                 }
             }
             SetFileInformationClass::Disposition => {
@@ -326,9 +328,11 @@ pub(super) fn set_file_information(
         SetFilePlan::EndOfFile { file, size } => set_regular_file_size(mutation, file, size)?,
         SetFilePlan::Allocation { file, size } => {
             let current = regular_file_size(mutation, file)?;
-            if size < current {
-                set_regular_file_size(mutation, file, size)?;
+            if size.bytes() < current.bytes() {
+                set_regular_file_size(mutation, file, FileSize::from_bytes(size.bytes()))?;
             }
+            let file = mutation.file(file)?;
+            mutation.set_file_allocation(file, size)?;
         }
         SetFilePlan::Disposition {
             fcb,

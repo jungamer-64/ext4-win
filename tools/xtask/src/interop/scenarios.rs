@@ -1132,6 +1132,25 @@ fn verify_regular_mutation_profile(
     drive_internal_core_mutation(image, |pass| {
         let (_, id) = mutation_root_file(pass, &source)?;
         let file = pass.file(id)?;
+        pass.set_file_allocation(file, ext4_core::FileAllocationSize::from_bytes(6144))
+    })?;
+    let resized = drive_internal_core_read(image, |pass| {
+        let root = pass.load_directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, &source)?;
+        let ext4_core::ChildLookup::Found(child) = child else {
+            return Err(ext4_core::Error::WrongInodeKind);
+        };
+        ext4_core::CommittedReadPass::load_node_metadata(pass, *child.node())
+    })?;
+    if resized.size().bytes() != 0 || resized.allocation_size().bytes() != 8192 {
+        return Err(
+            io::Error::other("allocation resize changed EOF or retained excess blocks").into(),
+        );
+    }
+    verify_internal_e2fsck_clean(linux, image, "resized unwritten allocation")?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(id)?;
         pass.extend_file(file, ext4_core::FileSize::from_bytes(8192))
     })?;
     debugfs_require_file(
