@@ -641,7 +641,7 @@ impl DirectoryQuery {
             self.cursor = *entry.next_cursor();
             return Ok(DirectorySelection::Skip);
         };
-        if !self.pattern.get().matches(&name) {
+        if !self.pattern.get().matches(&name)? {
             self.cursor = *entry.next_cursor();
             return Ok(DirectorySelection::Skip);
         }
