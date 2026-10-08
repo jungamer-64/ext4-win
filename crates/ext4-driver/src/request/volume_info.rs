@@ -168,7 +168,7 @@ impl CompletionOperation for VolumeQueryOperation {
 unsafe impl Send for VolumeQueryOperation {}
 
 /// Filesystem name exposed through `FileFsAttributeInformation`.
-const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034, 0x0057, 0x0049, 0x004E];
+const FILE_SYSTEM_NAME: &[u16] = &[0x0045, 0x0058, 0x0054, 0x0034];
 
 /// Packs committed classes or captures a referenced-device query before actor suspension.
 /// # Errors
@@ -800,12 +800,12 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when the advertised filesystem capabilities omit hard-link creation.
+    /// Panics when the filesystem name, buffer boundaries or hard-link capability differ.
     #[test]
-    fn attribute_information_advertises_hard_links() {
+    fn attribute_information_reports_ext4_and_hard_links() {
         let mut buffer = vec![0xA5; 128];
         let written = pack_attribute_information(buffer.as_mut_slice());
-        assert!(written.is_ok());
+        assert_eq!(written, IrpCompletion::from_usize(20));
         let attributes = LittleEndianInput::new(buffer.as_slice()).read_u32(WireOffset::new(
             core::mem::offset_of!(wdk_sys::FILE_FS_ATTRIBUTE_INFORMATION, FileSystemAttributes),
         ));
@@ -813,17 +813,32 @@ mod tests {
         if let Ok(attributes) = attributes {
             assert_ne!(attributes & wdk_sys::FILE_SUPPORTS_HARD_LINKS, 0);
         }
-        let required =
-            core::mem::offset_of!(wdk_sys::FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName)
-                .checked_add(core::mem::size_of_val(super::FILE_SYSTEM_NAME));
-        assert!(required.is_some());
-        let Some(required) = required else {
-            return;
-        };
-        let prefix = buffer.get(..required);
-        let tail = buffer.get(required..);
+        assert_eq!(
+            LittleEndianInput::new(buffer.as_slice()).read_u32(WireOffset::new(8)),
+            Ok(8)
+        );
+        assert_eq!(
+            buffer.get(12..20),
+            Some([b'E', 0, b'X', 0, b'T', 0, b'4', 0].as_slice())
+        );
+        let prefix = buffer.get(..20);
+        let tail = buffer.get(20..);
         assert!(prefix.is_some_and(|bytes| bytes.iter().all(|byte| *byte != 0xA5)));
         assert!(tail.is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0xA5)));
+
+        let mut exact = [0xA5; 20];
+        assert_eq!(
+            pack_attribute_information(&mut exact),
+            IrpCompletion::from_usize(20)
+        );
+        assert_eq!(buffer.get(..20), Some(exact.as_slice()));
+
+        let mut short = [0xA5; 19];
+        assert_eq!(
+            pack_attribute_information(&mut short),
+            Err(DriverError::BufferTooSmall)
+        );
+        assert_eq!(short, [0xA5; 19]);
     }
 
     /// Builds a FILE_FS_LABEL_INFORMATION byte image from label bytes.

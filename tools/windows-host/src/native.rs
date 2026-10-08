@@ -883,7 +883,7 @@ pub fn verify_metadata(path: &Path, relative_name: &str, eof: u64) -> io::Result
         };
         let result = if queried == 0 {
             Err(io::Error::last_os_error())
-        } else if decode(&filesystem) != "EXT4WIN" || maximum != 255 {
+        } else if decode(&filesystem) != "EXT4" || maximum != 255 {
             Err(io::Error::other(
                 "volume identity from metadata handle differs",
             ))
