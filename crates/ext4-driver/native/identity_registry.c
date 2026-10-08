@@ -64,6 +64,7 @@ NTSTATUS ext4win_identity_enumerate(HANDLE root, ULONG index, PWCHAR uuid)
 NTSTATUS ext4win_identity_read(HANDLE root, const WCHAR *uuid,
     PVOID buffer, ULONG capacity, PULONG length)
 {
+    const ULONG header_length = (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data);
     HANDLE key = NULL;
     UNICODE_STRING name = {72, 72, (PWCHAR)uuid};
     UNICODE_STRING value;
@@ -72,7 +73,7 @@ NTSTATUS ext4win_identity_read(HANDLE root, const WCHAR *uuid,
     NTSTATUS status;
     PAGED_CODE();
     *length = 0;
-    if (capacity < FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data)) { return STATUS_INVALID_BUFFER_SIZE; }
+    if (capacity < header_length) { return STATUS_INVALID_BUFFER_SIZE; }
     status = identity_key(root, &name, KEY_QUERY_VALUE, FALSE, &key);
     if (!NT_SUCCESS(status)) { return status; }
     RtlInitUnicodeString(&value, L"Table");
@@ -80,7 +81,7 @@ NTSTATUS ext4win_identity_read(HANDLE root, const WCHAR *uuid,
                              buffer, capacity, &required);
     if (NT_SUCCESS(status)) {
         if (information->Type != REG_BINARY ||
-            information->DataLength > capacity - FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data)) {
+            information->DataLength > capacity - header_length) {
             status = STATUS_DATA_ERROR;
         } else {
             *length = information->DataLength;
