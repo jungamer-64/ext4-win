@@ -97,13 +97,19 @@ fn prepared_directory_pattern_uses_owned_utf16_units() {
 #[test]
 fn initial_search_expression_survives_restart_and_later_requests() {
     let result = (|| -> DriverResult<()> {
-        let mut search = DirectorySearch::new();
+        let search = DirectorySearch::new();
         let selected = WindowsName::from_utf16(&[u16::from(b'a')])?;
         let rejected = WindowsName::from_utf16(&[u16::from(b'b')])?;
         let original = search.capture_pattern(DirectoryPattern::Exact(selected))?;
+        let mut cursor = search.cursor();
+        cursor.seek_ordinal(37);
+        search.publish_after_copy(cursor, || Ok(()))?;
+        assert_eq!(search.cursor().ordinal(), 37);
         let later = search.capture_pattern(DirectoryPattern::All)?;
-        search.cursor.seek_ordinal(37);
-        search.cursor.restart();
+        let mut cursor = search.cursor();
+        cursor.restart();
+        search.publish_after_copy(cursor, || Ok(()))?;
+        assert_eq!(search.cursor(), DirectoryScanCursor::start());
         assert!(!original.get().matches(&rejected));
         assert!(!later.get().matches(&rejected));
         assert!(
@@ -113,7 +119,7 @@ fn initial_search_expression_survives_restart_and_later_requests() {
                 .get()
                 .matches(&rejected)
         );
-        assert!(!search.completed);
+        assert!(search.completed());
         Ok(())
     })();
     assert_eq!(result, Ok(()));
@@ -123,7 +129,7 @@ fn initial_search_expression_survives_restart_and_later_requests() {
 /// Fails if unsuccessful output publication consumes records or marks an initial query complete.
 #[test]
 fn directory_publication_requires_successful_copy() {
-    let mut search = DirectorySearch::new();
+    let search = DirectorySearch::new();
     let mut next = DirectoryScanCursor::start();
     next.seek_ordinal(128);
     for failure in [
@@ -134,10 +140,10 @@ fn directory_publication_requires_successful_copy() {
             search.publish_after_copy(next, || Err(failure)),
             Err(failure)
         );
-        assert_eq!(search.cursor, DirectoryScanCursor::start());
-        assert!(!search.completed);
+        assert_eq!(search.cursor(), DirectoryScanCursor::start());
+        assert!(!search.completed());
     }
     assert_eq!(search.publish_after_copy(next, || Ok(())), Ok(()));
-    assert_eq!(search.cursor, next);
-    assert!(search.completed);
+    assert_eq!(search.cursor(), next);
+    assert!(search.completed());
 }

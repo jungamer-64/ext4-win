@@ -14,6 +14,18 @@ pub(crate) struct ActiveIrp<'owner> {
 }
 
 impl ActiveIrp<'_> {
+    /// Copies the requestor mode retained unchanged through dispatch and capture.
+    #[expect(
+        unsafe_code,
+        reason = "the active owner retains this initialized dispatch field"
+    )]
+    pub(super) fn requestor_mode(&self) -> wdk_sys::KPROCESSOR_MODE {
+        unsafe {
+            // SAFETY: The active owner retains this dispatch-stable scalar without borrowing IRP
+            // fields that the I/O Manager can mutate during cancellation.
+            (*self.irp.as_ptr()).RequestorMode
+        }
+    }
     /// Returns the typed device object boundary.
     pub(crate) const fn device(&self) -> KernelDevice {
         self.device
@@ -26,8 +38,9 @@ impl ActiveIrp<'_> {
     )]
     pub(crate) fn data_io_kind(&self) -> DataIoKind {
         let flags = unsafe {
-            // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
-            self.irp.as_ref().Flags
+            // SAFETY: The active owner retains this initialized, dispatch-stable field. No
+            // reference is created to cancellation fields that the I/O Manager can mutate.
+            (*self.irp.as_ptr()).Flags
         };
         if flags & wdk_sys::IRP_PAGING_IO == 0 {
             DataIoKind::Handle
@@ -41,18 +54,11 @@ impl ActiveIrp<'_> {
     ///
     /// Returns an error when the requestor mode, create security context, or access state is
     /// malformed.
-    #[expect(
-        unsafe_code,
-        reason = "the active IRP owner retains the requestor mode and create security context for this bounded borrow"
-    )]
     pub(crate) fn create_access_state(
         &mut self,
         policy: CreateAccessCheck,
     ) -> DriverResult<CreateAccessState<'_>> {
-        let requestor_mode = unsafe {
-            // SAFETY: This active view keeps the IRP live for the returned owner-bound state view.
-            self.irp.as_ref().RequestorMode
-        };
+        let requestor_mode = self.requestor_mode();
         self.current_stack()?
             .create_access_state(requestor_mode, policy)
     }
@@ -226,26 +232,8 @@ impl ActiveIrp<'_> {
     /// # Errors
     ///
     /// Returns an error when the current stack pointer is null.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
     pub(crate) fn current_stack(&self) -> Result<CurrentIrpStackLocation<'_>, DriverError> {
-        let irp = unsafe {
-            // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
-            self.irp.as_ref()
-        };
-        let tail_overlay = unsafe {
-            // SAFETY: CurrentStackLocation is stored through the active IRP tail overlay.
-            irp.Tail.Overlay
-        };
-        let current_stack = unsafe {
-            // SAFETY: The list overlay contains the active current stack pointer.
-            tail_overlay
-                .__bindgen_anon_2
-                .__bindgen_anon_1
-                .CurrentStackLocation
-        };
+        let current_stack = KernelIrp { irp: self.irp }.current_stack_address();
         CurrentIrpStackLocation::from_active(current_stack)
     }
 
@@ -258,13 +246,15 @@ impl ActiveIrp<'_> {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn associated_system_buffer(&self) -> Result<NonNull<u8>, DriverError> {
-        let irp = unsafe {
-            // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
-            self.irp.as_ref()
+        let associated = unsafe {
+            // SAFETY: The active owner retains this dispatch-stable associated-IRP storage. The
+            // narrow borrow excludes the independently mutable cancellation and driver slots.
+            &(*self.irp.as_ptr()).AssociatedIrp
         };
         let system_buffer = unsafe {
-            // SAFETY: SystemBuffer is the active AssociatedIrp arm for buffered requests.
-            irp.AssociatedIrp.SystemBuffer
+            // SAFETY: The active owner retains this buffered request's initialized SystemBuffer
+            // pointer. Cancellation does not modify this associated-IRP arm.
+            associated.SystemBuffer
         };
         NonNull::new(system_buffer)
             .map(NonNull::cast)
@@ -284,11 +274,11 @@ impl ActiveIrp<'_> {
             return Ok(system_buffer);
         }
 
-        let irp = unsafe {
+        let mdl = unsafe {
             // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
-            self.irp.as_ref()
+            (*self.irp.as_ptr()).MdlAddress
         };
-        let Some(mdl) = NonNull::new(irp.MdlAddress) else {
+        let Some(mdl) = NonNull::new(mdl) else {
             return Err(DriverError::InvalidParameter);
         };
         mdl_data_buffer_address(mdl, length)
@@ -518,9 +508,13 @@ impl ActiveFileObject<'_> {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     pub(crate) fn related_file_object(self) -> Option<Self> {
+        let related = unsafe {
+            // SAFETY: The active create retains this initialized related-object pointer field.
+            (*self.as_ptr()).RelatedFileObject
+        };
         unsafe {
             // SAFETY: The active create IRP retains its related FILE_OBJECT for this owner borrow.
-            KernelFileObject::from_raw(self.as_ref().RelatedFileObject)
+            KernelFileObject::from_raw(related)
         }
         .map(|address| Self {
             address,
@@ -1377,6 +1371,46 @@ pub(super) struct KernelIrp {
 }
 
 impl KernelIrp {
+    /// Computes only the driver-context array address using the WDK-generated field layout.
+    #[expect(
+        unsafe_code,
+        reason = "the owning IRP contract retains this in-bounds native field"
+    )]
+    pub(super) fn driver_context_slots(self) -> NonNull<[*mut c_void; 4]> {
+        unsafe {
+            // SAFETY: The retained IRP allocation covers its entire generated layout. This offset
+            // selects only DriverContext, preserving provenance without borrowing any union arm.
+            self.irp.byte_add(core::mem::offset_of!(
+                wdk_sys::IRP,
+                Tail.Overlay.__bindgen_anon_1.__bindgen_anon_1.DriverContext
+            ))
+        }
+        .cast()
+    }
+
+    /// Reads only the initialized current-stack pointer from a retained request.
+    #[expect(
+        unsafe_code,
+        reason = "the owning IRP contract retains its initialized stack-pointer field"
+    )]
+    fn current_stack_address(self) -> PIO_STACK_LOCATION {
+        let slot = unsafe {
+            // SAFETY: The generated offset is inside this retained IRP allocation; no unrelated
+            // tail fields are read or borrowed while projecting the pointer slot.
+            self.irp.byte_add(core::mem::offset_of!(
+                wdk_sys::IRP,
+                Tail.Overlay
+                    .__bindgen_anon_2
+                    .__bindgen_anon_1
+                    .CurrentStackLocation
+            ))
+        }
+        .cast::<PIO_STACK_LOCATION>();
+        unsafe {
+            // SAFETY: Dispatch initialized this stable pointer before transferring IRP ownership.
+            slot.as_ptr().read()
+        }
+    }
     /// Converts a raw WDK IRP pointer into the private non-null boundary type.
     /// # Safety
     ///
@@ -1403,30 +1437,15 @@ impl KernelIrp {
                     .bugcheck()
             }
         };
-        let mut raw_irp = self.irp;
-        let raw_irp = unsafe {
-            // SAFETY: Queue publication owns this not-yet-inserted IRP.
-            raw_irp.as_mut()
-        };
-        let overlay = unsafe {
-            // SAFETY: The I/O Manager initialized the current-stack tail overlay.
-            raw_irp.Tail.Overlay
-        };
-        let current_stack = unsafe {
-            // SAFETY: The current-stack pointer occupies this tail-overlay arm.
-            overlay
-                .__bindgen_anon_2
-                .__bindgen_anon_1
-                .CurrentStackLocation
-        };
-        let Some(stack) = (unsafe {
-            // SAFETY: Queue capture validated this current-stack pointer.
-            current_stack.as_mut()
-        }) else {
+        let current_stack = self.current_stack_address();
+        let Some(stack) = NonNull::new(current_stack) else {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                 .bugcheck();
         };
-        stack.Control |= pending_bit;
+        unsafe {
+            // SAFETY: Queue publication uniquely owns the pending bit in the live stack location.
+            (*stack.as_ptr()).Control |= pending_bit;
+        }
     }
 
     /// Returns the raw IRP pointer.
@@ -1440,21 +1459,12 @@ impl KernelIrp {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     pub(super) fn publish_queue_context(self, context: QueueContextOwnership) {
-        let mut irp = self.irp;
-        let irp = unsafe {
-            // SAFETY: Queue preparation retains unique dispatch ownership before CSQ insertion.
-            irp.as_mut()
+        let mut slots = self.driver_context_slots();
+        let driver_context = unsafe {
+            // SAFETY: Before CSQ insertion, queue preparation uniquely owns these driver slots.
+            // This borrow excludes unrelated IRP fields and independent tail list linkage.
+            slots.as_mut()
         };
-        let overlay = unsafe {
-            // SAFETY: Queue metadata and list linkage both use the IRP tail overlay.
-            &mut irp.Tail.Overlay
-        };
-        let driver_storage = unsafe {
-            // SAFETY: The first nested union arm is reserved for driver-owned context slots;
-            // list linkage lives in the independent `overlay.__bindgen_anon_2` field.
-            &mut overlay.__bindgen_anon_1.__bindgen_anon_1
-        };
-        let driver_context = &mut driver_storage.DriverContext;
         if !driver_context[0].is_null() {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
@@ -1474,20 +1484,12 @@ impl KernelIrp {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     pub(super) fn take_queue_context(self) -> QueueContextOwnership {
-        let mut irp = self.irp;
-        let irp = unsafe {
-            // SAFETY: The caller has exclusive IRP ownership after atomic CSQ removal.
-            irp.as_mut()
+        let mut slots = self.driver_context_slots();
+        let driver_context = unsafe {
+            // SAFETY: Atomic CSQ removal transferred these driver slots to the completion owner;
+            // active cancellation has not yet been installed. Other IRP fields remain unborrowed.
+            slots.as_mut()
         };
-        let overlay = unsafe {
-            // SAFETY: Exclusive CSQ removal permits mutable access to the IRP tail overlay.
-            &mut irp.Tail.Overlay
-        };
-        let driver_storage = unsafe {
-            // SAFETY: Queue publication selected the first nested union arm for driver context.
-            &mut overlay.__bindgen_anon_1.__bindgen_anon_1
-        };
-        let driver_context = &mut driver_storage.DriverContext;
         let Some(context) = NonNull::new(driver_context[0]) else {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
@@ -1528,19 +1530,12 @@ impl KernelIrp {
         ordinary_cleanup_only: bool,
         execution: Option<super::scheduler::ExecutionClass>,
     ) -> bool {
-        let irp = unsafe {
-            // SAFETY: The caller's CSQ lock contract keeps the queued IRP and context live.
-            self.irp.as_ref()
+        let slots = self.driver_context_slots().cast::<*mut c_void>();
+        let context = unsafe {
+            // SAFETY: The caller's CSQ lock retains this published context slot and allocation.
+            slots.as_ptr().read()
         };
-        let overlay = unsafe {
-            // SAFETY: Queue publication selected the IRP tail overlay.
-            &irp.Tail.Overlay
-        };
-        let driver_storage = unsafe {
-            // SAFETY: Queue publication selected the first nested union arm for driver context.
-            &overlay.__bindgen_anon_1.__bindgen_anon_1
-        };
-        let Some(context) = NonNull::new(driver_storage.DriverContext[0]) else {
+        let Some(context) = NonNull::new(context) else {
             crate::kernel::fatal::KernelWideInconsistency::async_executor_state_corruption()
                 .bugcheck();
         };
@@ -1579,13 +1574,13 @@ impl KernelIrp {
         reason = "the actor backlog retains this status-prepared IRP until notification transfers ownership"
     )]
     pub(super) fn prepared_status(self) -> NTSTATUS {
-        let irp = unsafe {
-            // SAFETY: Prepared-completion ownership retains this live IRP through notification.
-            self.irp.as_ref()
+        let status_block = unsafe {
+            // SAFETY: Prepared completion retains sole ownership of this initialized status block.
+            &(*self.irp.as_ptr()).IoStatus
         };
         unsafe {
-            // SAFETY: The sole prepared-completion owner initialized the status union arm.
-            irp.IoStatus.__bindgen_anon_1.Status
+            // SAFETY: Prepared completion retains this IRP and initialized its terminal status arm.
+            status_block.__bindgen_anon_1.Status
         }
     }
 
@@ -1603,14 +1598,13 @@ impl KernelIrp {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn write_status_and_information(self, status: NTSTATUS, information: wdk_sys::ULONG_PTR) {
-        let mut irp = self.irp;
-        let irp = unsafe {
-            // SAFETY: `KernelIrp` is constructed only from a non-null raw IRP
-            // pointer, and the unique completion path owns terminal-field writes.
-            irp.as_mut()
+        let status_block = unsafe {
+            // SAFETY: The unique completion path owns this live IRP's terminal status block.
+            // The narrow borrow leaves Cancel and every independently mutated field unborrowed.
+            &mut (*self.irp.as_ptr()).IoStatus
         };
-        irp.IoStatus.__bindgen_anon_1.Status = status;
-        irp.IoStatus.Information = information;
+        status_block.__bindgen_anon_1.Status = status;
+        status_block.Information = information;
     }
 
     /// Installs a Rust-owned create reparse allocation into the IRP tail overlay.
@@ -1619,13 +1613,19 @@ impl KernelIrp {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn install_create_symlink_reparse_buffer(self, buffer: CreateSymlinkReparseBuffer) {
-        let mut irp = self.irp;
-        let irp = unsafe {
-            // SAFETY: `KernelIrp` retains the non-null active IRP, and unique
-            // completion authority permits mutation of its terminal fields.
-            irp.as_mut()
-        };
-        irp.Tail.Overlay.AuxiliaryBuffer = buffer.into_raw();
+        let slot = unsafe {
+            // SAFETY: The generated auxiliary-buffer slot offset is inside this retained IRP;
+            // projecting it does not borrow the tail union or its independent driver slots.
+            self.irp.byte_add(core::mem::offset_of!(
+                wdk_sys::IRP,
+                Tail.Overlay.AuxiliaryBuffer
+            ))
+        }
+        .cast::<*mut wdk_sys::CHAR>();
+        unsafe {
+            // SAFETY: Unique create completion owns this auxiliary-buffer slot in the live IRP.
+            slot.as_ptr().write(buffer.into_raw());
+        }
     }
 
     /// Invokes the I/O Manager after the unique owner wrote all terminal IRP fields.

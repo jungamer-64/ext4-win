@@ -92,19 +92,12 @@ impl CompletionFifo {
     reason = "the narrow slot boundary decodes each WDK union arm independently"
 )]
 unsafe fn driver_slots(irp: &mut KernelIrp) -> &mut [*mut c_void; 4] {
-    let irp = unsafe {
-        // SAFETY: The completion owner retains and exclusively borrows this original IRP.
-        &mut *irp.as_ptr()
-    };
-    let overlay = unsafe {
-        // SAFETY: Driver-context ownership selects the initialized tail overlay.
-        &mut irp.Tail.Overlay
-    };
-    let storage = unsafe {
-        // SAFETY: These slots occupy the driver-owned nested union arm.
-        &mut overlay.__bindgen_anon_1.__bindgen_anon_1
-    };
-    &mut storage.DriverContext
+    let slots = irp.driver_context_slots();
+    unsafe {
+        // SAFETY: The caller retains and uniquely owns these initialized driver slots. This
+        // reference does not include Cancel or the independent stack/list overlay fields.
+        &mut *slots.as_ptr()
+    }
 }
 
 #[cfg(test)]

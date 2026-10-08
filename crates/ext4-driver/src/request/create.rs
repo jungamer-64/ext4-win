@@ -8,6 +8,7 @@ use core::ptr::NonNull;
 use ext4_core::{
     ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, Ext4Security, NodeId, WindowsName,
 };
+#[cfg(test)]
 use wdk_sys::FILE_OBJECT;
 
 use crate::{
@@ -567,7 +568,7 @@ impl CreateTargetSpecifier {
     ) -> DriverResult<Self> {
         match interpretation {
             CreateNameInterpretation::Path => {
-                let name = CreatePathName::decode(file_object.as_ref())?;
+                let name = CreatePathName::decode(file_object.name_utf16()?)?;
                 if name.is_direct_volume_open() && file_object.related_file_object().is_none() {
                     validate_volume_open_create(disposition)?;
                     return Ok(Self::Volume);
@@ -578,7 +579,7 @@ impl CreateTargetSpecifier {
             CreateNameInterpretation::FileReference => {
                 validate_file_reference_create(disposition)?;
                 Ok(Self::FileReference(CreateFileReference::decode(
-                    file_object.as_ref(),
+                    file_object.name_bytes()?,
                 )?))
             }
         }
@@ -762,11 +763,6 @@ impl CreateFileObjectFlags {
         }
         Self { raw }
     }
-
-    /// Applies the selected flags to the FILE_OBJECT being opened.
-    fn apply_to(self, file_object: &mut FILE_OBJECT) {
-        file_object.Flags |= self.raw;
-    }
 }
 
 /// File reference decoded from FILE_OPEN_BY_FILE_ID input.
@@ -777,26 +773,16 @@ struct CreateFileReference {
 }
 
 impl CreateFileReference {
-    /// Decodes an 8-byte Windows file reference from FILE_OBJECT::FileName.
+    /// Decodes an 8-byte Windows file reference captured from the create name.
     /// # Errors
     ///
-    /// Returns an error when the FILE_OBJECT name is absent, malformed, or uses an unsupported
+    /// Returns an error when the create name is absent, malformed, or uses an unsupported
     /// object-id/prefixed file-reference form.
-    #[expect(
-        unsafe_code,
-        reason = "the I/O Manager owns the checked binary UNICODE_STRING for this active create"
-    )]
-    fn decode(file_object: &FILE_OBJECT) -> DriverResult<Self> {
-        let name = file_object.FileName;
-        let byte_len = usize::from(name.Length);
-        if byte_len == 0 || name.Buffer.is_null() {
+    fn decode(bytes: &[u8]) -> DriverResult<Self> {
+        let byte_len = bytes.len();
+        if byte_len == 0 {
             return Err(DriverError::InvalidParameter);
         }
-        let bytes = unsafe {
-            // SAFETY: UNICODE_STRING Length is a byte length and Buffer is non-null for the
-            // requested binary file-reference payload.
-            core::slice::from_raw_parts(name.Buffer.cast::<u8>(), byte_len)
-        };
         match byte_len {
             8 => Self::from_wire_file_reference(
                 <[u8; 8]>::try_from(bytes).map_err(|_| DriverError::InvalidParameter)?,
@@ -844,31 +830,18 @@ struct CreatePathName {
 }
 
 impl CreatePathName {
-    /// Decodes the FILE_OBJECT name into a rooted component sequence.
+    /// Decodes the captured create name into a rooted component sequence.
     /// # Errors
     ///
-    /// Returns an error when the raw UNICODE_STRING is malformed, contains an empty path component,
-    /// or contains a component not representable in the Windows namespace domain.
-    #[expect(
-        unsafe_code,
-        reason = "the I/O Manager owns the checked UTF-16 UNICODE_STRING for this active create"
-    )]
-    fn decode(file_object: &FILE_OBJECT) -> DriverResult<Self> {
-        let name = file_object.FileName;
-        if name.Length == 0 {
+    /// Returns an error when the name contains an empty path component or a component not
+    /// representable in the Windows namespace domain.
+    fn decode(units: &[u16]) -> DriverResult<Self> {
+        if units.is_empty() {
             return Ok(Self {
                 rooting: CreateNameRooting::Relative,
                 components: DriverVec::new(),
             });
         }
-        if !name.Length.is_multiple_of(2) || name.Buffer.is_null() {
-            return Err(DriverError::InvalidParameter);
-        }
-        let units = unsafe {
-            // SAFETY: UNICODE_STRING Length is byte length; the odd-length and null
-            // buffer cases were rejected above.
-            core::slice::from_raw_parts(name.Buffer, usize::from(name.Length / 2))
-        };
         let (rooting, components) = Self::split_rooting(units);
         Ok(Self {
             rooting,
@@ -2337,14 +2310,16 @@ fn publish_node_stream_raw(
     let sections = fcb.stream_section_objects().unwrap_or_else(|_| {
         crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck()
     });
-    let file_object = unsafe {
-        // SAFETY: Successful create owns the sole publication transition for this FILE_OBJECT.
-        &mut *file_object.as_ptr()
-    };
-    file_object_flags.apply_to(file_object);
-    file_object.FsContext = fcb.stream_header().as_ptr();
-    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
-    file_object.SectionObjectPointer = sections.as_ptr();
+    unsafe {
+        // SAFETY: Successful create transfers the prepared stream and CCB at its sole attachment
+        // transition; the open claim retains their storage until terminal close.
+        file_object.publish_stream_contexts(
+            fcb.stream_header().as_ptr(),
+            Box::into_raw(handle).cast::<c_void>(),
+            sections.as_ptr(),
+            file_object_flags.raw,
+        );
+    }
 }
 
 /// Publishes the mounted volume's header-based stream and one per-handle CCB.
@@ -2353,7 +2328,7 @@ fn publish_node_stream_raw(
     reason = "successful volume create exclusively publishes one advanced header and prepared CCB"
 )]
 fn publish_volume_stream(
-    mut file_object: UninitializedFileObject<'_>,
+    file_object: UninitializedFileObject<'_>,
     volume: NonNull<VolumeControlBlock>,
     handle: Box<OpenedVolumeHandle>,
     file_object_flags: CreateFileObjectFlags,
@@ -2365,15 +2340,16 @@ fn publish_volume_stream(
     let sections = volume.stream_section_objects().unwrap_or_else(|_| {
         crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption().bugcheck()
     });
-    let file_object = unsafe {
-        // SAFETY: This is the sole successful-create publication for the FILE_OBJECT.
-        file_object.as_mut()
-    };
-    file_object_flags.apply_to(file_object);
-    file_object.Flags |= wdk_sys::FO_VOLUME_OPEN;
-    file_object.FsContext = volume.stream_header().as_ptr();
-    file_object.FsContext2 = Box::into_raw(handle).cast::<c_void>();
-    file_object.SectionObjectPointer = sections.as_ptr();
+    unsafe {
+        // SAFETY: This sole successful volume create transfers the prepared CCB to FILE_OBJECT;
+        // the open retains its mounted header and section storage through close.
+        file_object.kernel_file_object().publish_stream_contexts(
+            volume.stream_header().as_ptr(),
+            Box::into_raw(handle).cast::<c_void>(),
+            sections.as_ptr(),
+            file_object_flags.raw | wdk_sys::FO_VOLUME_OPEN,
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2551,34 +2527,6 @@ mod tests {
         received.with_active(|active| Ok(active.current_stack()?.create()?.parameters()))
     }
 
-    fn file_object_with_name(units: &mut [u16]) -> FILE_OBJECT {
-        let Ok(byte_len) = u16::try_from(core::mem::size_of_val(units)) else {
-            return FILE_OBJECT::default();
-        };
-        FILE_OBJECT {
-            FileName: wdk_sys::UNICODE_STRING {
-                Length: byte_len,
-                MaximumLength: byte_len,
-                Buffer: units.as_mut_ptr(),
-            },
-            ..FILE_OBJECT::default()
-        }
-    }
-
-    fn file_object_with_name_bytes(bytes: &mut [u8]) -> FILE_OBJECT {
-        let Ok(byte_len) = u16::try_from(bytes.len()) else {
-            return FILE_OBJECT::default();
-        };
-        FILE_OBJECT {
-            FileName: wdk_sys::UNICODE_STRING {
-                Length: byte_len,
-                MaximumLength: byte_len,
-                Buffer: bytes.as_mut_ptr().cast::<u16>(),
-            },
-            ..FILE_OBJECT::default()
-        }
-    }
-
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
@@ -2617,25 +2565,6 @@ mod tests {
 
             assert_eq!(flags.raw, wdk_sys::FO_SYNCHRONOUS_IO);
         }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn create_file_object_flags_apply_preserves_existing_flags() {
-        let existing = wdk_sys::FO_HANDLE_CREATED;
-        let mut file_object = FILE_OBJECT {
-            Flags: existing,
-            ..FILE_OBJECT::default()
-        };
-
-        CreateFileObjectFlags {
-            raw: wdk_sys::FO_SYNCHRONOUS_IO,
-        }
-        .apply_to(&mut file_object);
-
-        assert_eq!(file_object.Flags, existing | wdk_sys::FO_SYNCHRONOUS_IO);
     }
 
     /// # Panics
@@ -2682,11 +2611,10 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_file_reference_decodes_eight_byte_file_index() {
-        let mut reference = u64::from(3_u32).to_le_bytes();
-        let file_object = file_object_with_name_bytes(&mut reference);
+        let reference = u64::from(3_u32).to_le_bytes();
 
         assert_eq!(
-            CreateFileReference::decode(&file_object).map(CreateFileReference::file_index),
+            CreateFileReference::decode(&reference).map(CreateFileReference::file_index),
             Ok(3)
         );
     }
@@ -2696,24 +2624,21 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_file_reference_rejects_invalid_or_unsupported_wire_forms() {
-        let mut zero = 0_u64.to_le_bytes();
-        let zero_file_object = file_object_with_name_bytes(&mut zero);
+        let zero = 0_u64.to_le_bytes();
         assert_eq!(
-            CreateFileReference::decode(&zero_file_object),
+            CreateFileReference::decode(&zero),
             Err(DriverError::InvalidParameter)
         );
 
-        let mut too_large = (u64::from(u32::MAX) + 1).to_le_bytes();
-        let too_large_file_object = file_object_with_name_bytes(&mut too_large);
+        let too_large = (u64::from(u32::MAX) + 1).to_le_bytes();
         assert_eq!(
-            CreateFileReference::decode(&too_large_file_object),
+            CreateFileReference::decode(&too_large),
             Err(DriverError::InvalidParameter)
         );
 
-        let mut object_id = [0_u8; 16];
-        let object_id_file_object = file_object_with_name_bytes(&mut object_id);
+        let object_id = [0_u8; 16];
         assert_eq!(
-            CreateFileReference::decode(&object_id_file_object),
+            CreateFileReference::decode(&object_id),
             Err(DriverError::NotSupported)
         );
     }
@@ -2762,7 +2687,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_path_name_decodes_absolute_relative_and_empty_names() {
-        let mut absolute_units = [
+        let absolute_units = [
             UTF16_BACKSLASH,
             UTF16_BACKSLASH,
             u16::from(b'd'),
@@ -2771,8 +2696,7 @@ mod tests {
             UTF16_BACKSLASH,
             u16::from(b'f'),
         ];
-        let absolute_file = file_object_with_name(&mut absolute_units);
-        let absolute = CreatePathName::decode(&absolute_file);
+        let absolute = CreatePathName::decode(&absolute_units);
         assert!(absolute.is_ok());
         if let Ok(absolute) = absolute {
             assert_eq!(absolute.rooting(), CreateNameRooting::Absolute);
@@ -2809,9 +2733,8 @@ mod tests {
             );
         }
 
-        let mut relative_units = [u16::from(b'c'), u16::from(b'h'), u16::from(b'i')];
-        let relative_file = file_object_with_name(&mut relative_units);
-        let relative = CreatePathName::decode(&relative_file);
+        let relative_units = [u16::from(b'c'), u16::from(b'h'), u16::from(b'i')];
+        let relative = CreatePathName::decode(&relative_units);
         assert!(relative.is_ok());
         if let Ok(relative) = relative {
             assert_eq!(relative.rooting(), CreateNameRooting::Relative);
@@ -2833,8 +2756,7 @@ mod tests {
             );
         }
 
-        let empty_file = FILE_OBJECT::default();
-        let empty = CreatePathName::decode(&empty_file);
+        let empty = CreatePathName::decode(&[]);
         assert!(empty.is_ok());
         if let Ok(empty) = empty {
             assert_eq!(empty.rooting(), CreateNameRooting::Relative);
@@ -2842,9 +2764,8 @@ mod tests {
             assert!(empty.is_direct_volume_open());
         }
 
-        let mut root_units = [UTF16_BACKSLASH];
-        let root_file = file_object_with_name(&mut root_units);
-        let root = CreatePathName::decode(&root_file);
+        let root_units = [UTF16_BACKSLASH];
+        let root = CreatePathName::decode(&root_units);
         assert!(root.is_ok());
         if let Ok(root) = root {
             assert_eq!(root.rooting(), CreateNameRooting::Absolute);
@@ -2858,15 +2779,14 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn create_path_name_rejects_empty_inner_components() {
-        let mut units = [
+        let units = [
             u16::from(b'd'),
             UTF16_BACKSLASH,
             UTF16_BACKSLASH,
             u16::from(b'f'),
         ];
-        let file_object = file_object_with_name(&mut units);
         assert_eq!(
-            CreatePathName::decode(&file_object),
+            CreatePathName::decode(&units),
             Err(DriverError::from(ext4_core::Error::InvalidName))
         );
     }
@@ -2877,7 +2797,7 @@ mod tests {
     /// component in the original create name.
     #[test]
     fn create_path_components_retain_component_specific_unparsed_suffixes() {
-        let mut units = [
+        let units = [
             u16::from(b'a'),
             UTF16_BACKSLASH,
             u16::from(b'b'),
@@ -2885,8 +2805,7 @@ mod tests {
             u16::from(b'c'),
             UTF16_BACKSLASH,
         ];
-        let file_object = file_object_with_name(&mut units);
-        let path = CreatePathName::decode(&file_object);
+        let path = CreatePathName::decode(&units);
         assert!(path.is_ok());
         let Ok(path) = path else {
             return;

@@ -259,13 +259,13 @@ pub(crate) unsafe extern "C" fn ext4win_complete_file_lock(
     if identity.as_ptr() != irp {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     }
-    let irp = unsafe {
-        // SAFETY: Equality with the retained non-null identity proves this live terminal IRP.
-        identity.irp.as_ref()
+    let status_block = unsafe {
+        // SAFETY: Equality with the retained identity proves this live completed status block.
+        &(*identity.as_ptr()).IoStatus
     };
     let status = unsafe {
         // SAFETY: FsRtl initialized the terminal NTSTATUS arm before invoking completion.
-        irp.IoStatus.__bindgen_anon_1.Status
+        status_block.__bindgen_anon_1.Status
     };
     // Queueing is allocation-free and invokes no upper driver on the FsRtl/actor stack.
     permit.queue(identity, status);

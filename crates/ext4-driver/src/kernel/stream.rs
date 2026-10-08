@@ -343,11 +343,11 @@ impl StorageRemovalPublisher {
     ) -> NTSTATUS {
         #[cfg(not(test))]
         {
-            let request = unsafe {
-                // SAFETY: The PnP owner exclusively borrows this original request.
-                &mut *irp.as_ptr()
+            let status_block = unsafe {
+                // SAFETY: The PnP owner owns only this status block before lower forwarding.
+                &mut (*irp.as_ptr()).IoStatus
             };
-            request.IoStatus.__bindgen_anon_1.Status = wdk_sys::STATUS_SUCCESS;
+            status_block.__bindgen_anon_1.Status = wdk_sys::STATUS_SUCCESS;
             if unsafe {
                 // SAFETY: Dispatch retains both devices and this original IRP until lower completion.
                 wdk_sys::ntddk::IoForwardIrpSynchronously(lower.as_ptr(), irp.as_ptr())
@@ -358,13 +358,13 @@ impl StorageRemovalPublisher {
         }
         #[cfg(test)]
         let _lower = lower;
-        let reply = unsafe {
-            // SAFETY: The caller retains the completed lower reply.
-            irp.as_ref()
+        let status_block = unsafe {
+            // SAFETY: The caller retains this completed lower reply's stable status block.
+            &(*irp.as_ptr()).IoStatus
         };
         let status = unsafe {
             // SAFETY: Lower completion initialized the status union arm.
-            reply.IoStatus.__bindgen_anon_1.Status
+            status_block.__bindgen_anon_1.Status
         };
         if status >= wdk_sys::STATUS_SUCCESS {
             self.access.state().cancel_query();

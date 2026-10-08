@@ -1269,17 +1269,33 @@ fn prepare_private_irp(
     };
     let irp = NonNull::new(irp).ok_or(DriverError::InsufficientResources)?;
     let authority = LowerIrpReleaseAuthority::new(irp);
-    let irp_ref = unsafe {
-        // SAFETY: Freshly allocated private IRP is exclusively owned by `authority`.
-        &mut *authority.as_ptr()
+    unsafe {
+        // SAFETY: The private pre-submit owner initializes this requestor-mode field.
+        (*authority.as_ptr()).RequestorMode = kernel_mode;
+    }
+    unsafe {
+        // SAFETY: The private pre-submit owner initializes these request flags.
+        (*authority.as_ptr()).Flags = operation.irp_flags();
+    }
+    unsafe {
+        // SAFETY: No lower stack owns this private IRP's MDL slot before submission.
+        (*authority.as_ptr()).MdlAddress = core::ptr::null_mut();
+    }
+    unsafe {
+        // SAFETY: The private pre-submit owner initializes this buffer slot.
+        (*authority.as_ptr()).UserBuffer = core::ptr::null_mut();
+    }
+    let associated = unsafe {
+        // SAFETY: The private pre-submit owner initializes only this associated-buffer union.
+        &mut (*authority.as_ptr()).AssociatedIrp
     };
-    irp_ref.RequestorMode = kernel_mode;
-    irp_ref.Flags = operation.irp_flags();
-    irp_ref.MdlAddress = core::ptr::null_mut();
-    irp_ref.UserBuffer = core::ptr::null_mut();
-    irp_ref.AssociatedIrp.SystemBuffer = core::ptr::null_mut();
-    irp_ref.IoStatus.__bindgen_anon_1.Status = wdk_sys::STATUS_PENDING;
-    irp_ref.IoStatus.Information = 0;
+    associated.SystemBuffer = core::ptr::null_mut();
+    let status = unsafe {
+        // SAFETY: The private pre-submit owner exclusively initializes only this status block.
+        &mut (*authority.as_ptr()).IoStatus
+    };
+    status.__bindgen_anon_1.Status = wdk_sys::STATUS_PENDING;
+    status.Information = 0;
     let stack = unsafe {
         // SAFETY: Positive target stack depth provides one unused private stack location.
         ffi::IoGetNextIrpStackLocation(authority.as_ptr())
@@ -1333,7 +1349,11 @@ fn prepare_private_irp(
             transfer_method
         } {
             LowerTransferMethod::Buffered => {
-                irp_ref.AssociatedIrp.SystemBuffer = transfer.as_void_ptr();
+                let associated = unsafe {
+                    // SAFETY: This pre-submit owner exclusively publishes its associated buffer.
+                    &mut (*authority.as_ptr()).AssociatedIrp
+                };
+                associated.SystemBuffer = transfer.as_void_ptr();
             }
             LowerTransferMethod::Direct => {
                 let mdl = unsafe {
@@ -1354,7 +1374,10 @@ fn prepare_private_irp(
                 }
             }
             LowerTransferMethod::Neither => {
-                irp_ref.UserBuffer = transfer.as_void_ptr();
+                unsafe {
+                    // SAFETY: This pre-submit owner publishes its retained neither-I/O transfer.
+                    (*authority.as_ptr()).UserBuffer = transfer.as_void_ptr();
+                }
             }
         }
     }
@@ -1371,12 +1394,10 @@ fn prepare_private_irp(
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe fn release_private_irp(irp: PIRP) {
-    let irp_ref = unsafe {
-        // SAFETY: The caller holds the sole release authority.
-        &mut *irp
+    let mut mdl = unsafe {
+        // SAFETY: Sole release authority detaches this MDL slot after lower and cancel use ended.
+        core::mem::replace(&mut (*irp).MdlAddress, core::ptr::null_mut())
     };
-    let mut mdl = irp_ref.MdlAddress;
-    irp_ref.MdlAddress = core::ptr::null_mut();
     while let Some(current) = NonNull::new(mdl) {
         let current_ref = unsafe {
             // SAFETY: The MDL remains linked to the uniquely owned private IRP.
@@ -1396,8 +1417,15 @@ unsafe fn release_private_irp(irp: PIRP) {
         }
         mdl = next;
     }
-    irp_ref.AssociatedIrp.SystemBuffer = core::ptr::null_mut();
-    irp_ref.UserBuffer = core::ptr::null_mut();
+    let associated = unsafe {
+        // SAFETY: Sole release authority owns this associated buffer after lower use ends.
+        &mut (*irp).AssociatedIrp
+    };
+    associated.SystemBuffer = core::ptr::null_mut();
+    unsafe {
+        // SAFETY: Sole release authority clears this driver-owned user-buffer slot.
+        (*irp).UserBuffer = core::ptr::null_mut();
+    }
     unsafe {
         // SAFETY: Completion processing is stopped or submission never occurred.
         ffi::IoFreeIrp(irp);
@@ -1430,15 +1458,16 @@ unsafe extern "C" fn lower_request_completed<O: Send + 'static, R: LowerCompleti
     let Some(irp_address) = NonNull::new(irp) else {
         KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck();
     };
-    let irp_ref = unsafe {
-        // SAFETY: The lower stack terminally completed this private IRP before callback entry.
-        irp_address.as_ref()
+    let status_block = unsafe {
+        // SAFETY: The retained lower IRP's terminal status block is stable during this callback;
+        // concurrent IoCancelIrp accesses only fields outside this narrow borrow.
+        &(*irp_address.as_ptr()).IoStatus
     };
     let status = unsafe {
         // SAFETY: NTSTATUS is the active terminal IoStatus union arm.
-        irp_ref.IoStatus.__bindgen_anon_1.Status
+        status_block.__bindgen_anon_1.Status
     };
-    let information = match usize::try_from(irp_ref.IoStatus.Information) {
+    let information = match usize::try_from(status_block.Information) {
         Ok(information) => information,
         Err(_) => usize::MAX,
     };

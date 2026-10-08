@@ -2637,12 +2637,11 @@ impl FileControlBlockLedger {
         volume: NonNull<VolumeControlBlock>,
         target: DeferredStreamTarget,
     ) -> DriverResult<(NonNull<FileControlBlock>, NodeId)> {
-        let object = file_object.as_ref();
-        if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
+        if file_object.flags() & wdk_sys::FO_VOLUME_OPEN != 0 {
             return Err(DriverError::ObjectTypeMismatch);
         }
         let header =
-            NonNull::new(object.FsContext.cast::<c_void>()).ok_or(DriverError::InvalidParameter)?;
+            NonNull::new(file_object.stream_header()).ok_or(DriverError::InvalidParameter)?;
         let fcb = unsafe {
             // SAFETY: The active IRP retains its FILE_OBJECT while the caller-held ledger resource
             // prevents concurrent removal of the decoded stream owner.
@@ -2667,7 +2666,7 @@ impl FileControlBlockLedger {
             // SAFETY: The active FILE_OBJECT and retained table member own this section identity.
             StreamContext::decode_section_objects(header)?
         };
-        if object.SectionObjectPointer != sections.as_ptr()
+        if file_object.section_objects() != sections.as_ptr()
             || sections != stream.stream_section_objects()?
         {
             KernelWideInconsistency::file_object_context_corruption().bugcheck();

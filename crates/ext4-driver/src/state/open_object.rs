@@ -1080,7 +1080,7 @@ pub(super) enum OpenedHandleKind {
     /// Directory handle retaining its search expression and published continuation.
     Directory {
         /// Stable, separately allocated directory search state.
-        search: Box<UnsafeCell<DirectorySearch>>,
+        search: Box<DirectorySearch>,
     },
     /// Symlink handle.
     Symlink,
@@ -1136,7 +1136,7 @@ impl OpenedHandle {
                 write_access: regular_file_write_access,
             },
             NodeId::Directory(_) => OpenedHandleKind::Directory {
-                search: memory::boxed_try_with(|| Ok(UnsafeCell::new(DirectorySearch::new())))?,
+                search: memory::boxed_try_with(|| Ok(DirectorySearch::new()))?,
             },
             NodeId::Symlink(_) => OpenedHandleKind::Symlink,
         };
@@ -1247,7 +1247,7 @@ impl OpenedHandle {
     /// Returns the stable interior search-state address for directory handles.
     fn directory_search(&self) -> Option<NonNull<DirectorySearch>> {
         match &self.kind {
-            OpenedHandleKind::Directory { search } => NonNull::new(search.as_ref().get()),
+            OpenedHandleKind::Directory { search } => Some(NonNull::from(search.as_ref())),
             OpenedHandleKind::File { .. } | OpenedHandleKind::Symlink => None,
         }
     }
@@ -1342,12 +1342,11 @@ impl<'owner> OpenedObject<'owner> {
         reason = "the active FILE_OBJECT retains the driver-published native header and CCB"
     )]
     pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
-        let object = file_object.as_ref();
-        if object.Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
+        if file_object.flags() & wdk_sys::FO_VOLUME_OPEN != 0 {
             return Err(DriverError::ObjectTypeMismatch);
         }
-        let header = NonNull::new(object.FsContext.cast::<c_void>());
-        let handle = NonNull::new(object.FsContext2.cast::<OpenedHandle>());
+        let header = NonNull::new(file_object.stream_header());
+        let handle = NonNull::new(file_object.handle_context().cast::<OpenedHandle>());
         let (header, handle) = match (header, handle) {
             (Some(header), Some(handle)) => (header, handle),
             (None, None) => return Err(DriverError::InvalidParameter),
@@ -1364,7 +1363,7 @@ impl<'owner> OpenedObject<'owner> {
             // SAFETY: The same FILE_OBJECT lease retains the header's embedded section storage.
             StreamContext::decode_section_objects(header)?
         };
-        if object.SectionObjectPointer != sections.as_ptr() {
+        if file_object.section_objects() != sections.as_ptr() {
             KernelWideInconsistency::file_object_context_corruption().bugcheck();
         }
         let opened = Self {
@@ -1497,19 +1496,11 @@ impl<'owner> OpenedObject<'owner> {
     /// # Errors
     ///
     /// Returns an error when the handle is asynchronous or its raw position is negative.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
     pub(crate) fn current_file_position(&self) -> DriverResult<FileOffset> {
         if !self.has_synchronous_file_position() {
             return Err(DriverError::InvalidParameter);
         }
-        let file_object = self.file_object.as_ref();
-        let position = unsafe {
-            // SAFETY: ext4win consistently uses the QuadPart LARGE_INTEGER arm.
-            file_object.CurrentByteOffset.QuadPart
-        };
+        let position = self.file_object.current_byte_offset();
         Ok(FileOffset::from_bytes(
             u64::try_from(position).map_err(|_| DriverError::InvalidParameter)?,
         ))
@@ -1565,8 +1556,7 @@ impl<'owner> OpenedObject<'owner> {
 
     /// Returns whether this FILE_OBJECT owns a synchronized current-position field.
     fn has_synchronous_file_position(&self) -> bool {
-        let file_object = self.file_object.as_ref();
-        file_object.Flags & wdk_sys::FO_SYNCHRONOUS_IO != 0
+        self.file_object.flags() & wdk_sys::FO_SYNCHRONOUS_IO != 0
     }
 
     /// Writes a preselected position after signed-range validation.
@@ -1607,19 +1597,29 @@ impl<'owner> OpenedObject<'owner> {
         reason = "the consumed opened capability owns the unique CLOSE context-detachment transition"
     )]
     pub(crate) fn take_node_contexts(self) -> (NonNull<FileControlBlock>, NonNull<OpenedHandle>) {
-        let object = unsafe {
-            // SAFETY: This consumed opened capability represents the unique CLOSE transition.
-            &mut *self.file_object.as_ptr()
+        let header = unsafe {
+            // SAFETY: The consumed CLOSE capability owns only this stream-header detachment slot.
+            core::mem::replace(
+                &mut (*self.file_object.as_ptr()).FsContext,
+                core::ptr::null_mut(),
+            )
         };
-        let header = NonNull::new(core::mem::replace(
-            &mut object.FsContext,
-            core::ptr::null_mut(),
-        ));
-        let sections = core::mem::replace(&mut object.SectionObjectPointer, core::ptr::null_mut());
-        let handle = NonNull::new(
-            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
-                .cast::<OpenedHandle>(),
-        );
+        let header = NonNull::new(header);
+        let sections = unsafe {
+            // SAFETY: The same terminal close uniquely detaches its section-storage projection.
+            core::mem::replace(
+                &mut (*self.file_object.as_ptr()).SectionObjectPointer,
+                core::ptr::null_mut(),
+            )
+        };
+        let handle = unsafe {
+            // SAFETY: Terminal close uniquely takes release ownership from this CCB slot.
+            core::mem::replace(
+                &mut (*self.file_object.as_ptr()).FsContext2,
+                core::ptr::null_mut(),
+            )
+        };
+        let handle = NonNull::new(handle.cast::<OpenedHandle>());
         let fcb = unsafe {
             // SAFETY: Decode validated the ledger-owned FCB for this consumed FILE_OBJECT.
             self.fcb.as_ref()
@@ -1715,7 +1715,7 @@ impl<'owner> OpenedFileObject<'owner> {
     ///
     /// Returns an error when the selected context pair is absent or inconsistent.
     pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
-        if file_object.as_ref().Flags & wdk_sys::FO_VOLUME_OPEN != 0 {
+        if file_object.flags() & wdk_sys::FO_VOLUME_OPEN != 0 {
             OpenedVolume::decode(file_object).map(Self::Volume)
         } else {
             OpenedObject::decode(file_object).map(Self::Node)
@@ -1857,7 +1857,7 @@ impl<'owner> OpenedVolume<'owner> {
         reason = "the active FILE_OBJECT retains its immutable native volume control route until CLOSE"
     )]
     pub(crate) fn control_device(&self) -> DriverResult<KernelDevice> {
-        let header = NonNull::new(self.file_object.as_ref().FsContext)
+        let header = NonNull::new(self.file_object.stream_header())
             .ok_or(DriverError::InternalInvariantViolation)?;
         unsafe {
             // SAFETY: Decode validated this header. FILE_OBJECT retains it and its mount target.
@@ -1873,12 +1873,11 @@ impl<'owner> OpenedVolume<'owner> {
         reason = "the active volume FILE_OBJECT retains its driver-published native header and owner"
     )]
     pub(crate) fn decode(file_object: ActiveFileObject<'owner>) -> DriverResult<Self> {
-        let object = file_object.as_ref();
-        if object.Flags & wdk_sys::FO_VOLUME_OPEN == 0 {
+        if file_object.flags() & wdk_sys::FO_VOLUME_OPEN == 0 {
             return Err(DriverError::ObjectTypeMismatch);
         }
-        let header = NonNull::new(object.FsContext.cast::<c_void>());
-        let handle = NonNull::new(object.FsContext2.cast::<OpenedVolumeHandle>());
+        let header = NonNull::new(file_object.stream_header());
+        let handle = NonNull::new(file_object.handle_context().cast::<OpenedVolumeHandle>());
         let (header, handle) = match (header, handle) {
             (Some(header), Some(handle)) => (header, handle),
             (None, None) => return Err(DriverError::InvalidParameter),
@@ -1895,7 +1894,7 @@ impl<'owner> OpenedVolume<'owner> {
             // SAFETY: The same FILE_OBJECT lease retains the header's embedded section storage.
             StreamContext::decode_section_objects(header)?
         };
-        if object.SectionObjectPointer != sections.as_ptr() {
+        if file_object.section_objects() != sections.as_ptr() {
             KernelWideInconsistency::file_object_context_corruption().bugcheck();
         }
         Ok(Self {
@@ -1941,18 +1940,11 @@ impl<'owner> OpenedVolume<'owner> {
     /// # Errors
     ///
     /// Returns invalid-parameter if external state supplied a negative position.
-    #[expect(
-        unsafe_code,
-        reason = "the active FILE_OBJECT retains its initialized LARGE_INTEGER position arm"
-    )]
     pub(crate) fn current_file_position(&self) -> DriverResult<FileOffset> {
-        if self.file_object.as_ref().Flags & wdk_sys::FO_SYNCHRONOUS_IO == 0 {
+        if self.file_object.flags() & wdk_sys::FO_SYNCHRONOUS_IO == 0 {
             return Err(DriverError::InvalidParameter);
         }
-        let position = unsafe {
-            // SAFETY: Windows initializes CurrentByteOffset and the driver uses its QuadPart arm.
-            self.file_object.as_ref().CurrentByteOffset.QuadPart
-        };
+        let position = self.file_object.current_byte_offset();
         let bytes = u64::try_from(position).map_err(|_| DriverError::InvalidParameter)?;
         Ok(FileOffset::from_bytes(bytes))
     }
@@ -1966,7 +1958,7 @@ impl<'owner> OpenedVolume<'owner> {
         start: FileOffset,
         transferred: usize,
     ) -> DriverResult<PreparedFilePositionPublication> {
-        if self.file_object.as_ref().Flags & wdk_sys::FO_SYNCHRONOUS_IO == 0 {
+        if self.file_object.flags() & wdk_sys::FO_SYNCHRONOUS_IO == 0 {
             return Ok(PreparedFilePositionPublication::Unchanged);
         }
         let position = start.checked_add_len(transferred)?;
@@ -2024,19 +2016,29 @@ impl<'owner> OpenedVolume<'owner> {
     pub(crate) fn take_volume_contexts(
         self,
     ) -> (NonNull<VolumeControlBlock>, NonNull<OpenedVolumeHandle>) {
-        let object = unsafe {
-            // SAFETY: This consumed opened capability represents the unique CLOSE transition.
-            &mut *self.file_object.as_ptr()
+        let header = unsafe {
+            // SAFETY: The consumed volume CLOSE capability owns this stream-header slot.
+            core::mem::replace(
+                &mut (*self.file_object.as_ptr()).FsContext,
+                core::ptr::null_mut(),
+            )
         };
-        let header = NonNull::new(core::mem::replace(
-            &mut object.FsContext,
-            core::ptr::null_mut(),
-        ));
-        let sections = core::mem::replace(&mut object.SectionObjectPointer, core::ptr::null_mut());
-        let handle = NonNull::new(
-            core::mem::replace(&mut object.FsContext2, core::ptr::null_mut())
-                .cast::<OpenedVolumeHandle>(),
-        );
+        let header = NonNull::new(header);
+        let sections = unsafe {
+            // SAFETY: Terminal volume close uniquely detaches its section-storage projection.
+            core::mem::replace(
+                &mut (*self.file_object.as_ptr()).SectionObjectPointer,
+                core::ptr::null_mut(),
+            )
+        };
+        let handle = unsafe {
+            // SAFETY: Terminal volume close uniquely takes release ownership from this CCB slot.
+            core::mem::replace(
+                &mut (*self.file_object.as_ptr()).FsContext2,
+                core::ptr::null_mut(),
+            )
+        };
+        let handle = NonNull::new(handle.cast::<OpenedVolumeHandle>());
         let volume = unsafe {
             // SAFETY: Decode validated the mounted VCB for this consumed FILE_OBJECT.
             self.volume.as_ref()
@@ -2205,6 +2207,19 @@ impl<'owner> OpenedDirectory<'owner> {
         self.opened.notification_context()
     }
 
+    /// Returns shared search state; cursor publication and first-pattern capture retain no mutable
+    /// references into the CCB, including when this FILE_OBJECT is decoded more than once.
+    #[expect(
+        unsafe_code,
+        reason = "the active FILE_OBJECT retains the shared directory search allocation"
+    )]
+    pub(crate) fn search(&self) -> &DirectorySearch {
+        unsafe {
+            // SAFETY: Decode validated this live directory allocation. Its mutable fields use
+            // Cell/OnceCell, and every access remains on the owning device reactor.
+            self.search.as_ref()
+        }
+    }
 }
 
 /// Releases one FILE_OBJECT reference to a VCB-owned FCB.

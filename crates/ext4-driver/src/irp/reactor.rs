@@ -4731,11 +4731,13 @@ unsafe fn remove_entry_list(entry: PLIST_ENTRY) {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe fn irp_list_entry(irp: PIRP) -> Option<PLIST_ENTRY> {
-    let mut irp = NonNull::new(irp)?;
-    Some(unsafe {
-        // SAFETY: CSQ queue ownership keeps the IRP live and exclusively linked.
-        core::ptr::addr_of_mut!(irp.as_mut().Tail.Overlay.__bindgen_anon_2.ListEntry)
-    })
+    let irp = NonNull::new(irp)?;
+    let entry = unsafe {
+        // SAFETY: CSQ ownership retains this IRP allocation and its in-bounds list entry. The
+        // projection creates no reference to fields independently accessed by cancellation.
+        irp.byte_add(IRP_LIST_ENTRY_OFFSET)
+    };
+    Some(entry.cast().as_ptr())
 }
 
 /// Byte offset of `IRP.Tail.Overlay.ListEntry`.

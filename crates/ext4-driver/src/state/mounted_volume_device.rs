@@ -209,14 +209,22 @@ impl MountedVolumeDevice {
             retirement_slot.write(retirement_work_item);
         }
 
-        let device_object = unsafe {
-            // SAFETY: Mount owns the unpublished device; this borrow ends before VPB publication.
-            &mut *device.as_ptr()
-        };
-        device_object.Flags |= DO_DIRECT_IO;
-        device_object.StackSize = stack_size;
-        device_object.AlignmentRequirement = transfer_alignment.as_mask();
-        device_object.SectorSize = sector_bytes;
+        unsafe {
+            // SAFETY: Mount owns transfer-flag initialization before VPB publication.
+            (*device.as_ptr()).Flags |= DO_DIRECT_IO;
+        }
+        unsafe {
+            // SAFETY: Mount alone initializes this unpublished device's lower stack depth.
+            (*device.as_ptr()).StackSize = stack_size;
+        }
+        unsafe {
+            // SAFETY: Mount alone initializes this unpublished device's transfer alignment.
+            (*device.as_ptr()).AlignmentRequirement = transfer_alignment.as_mask();
+        }
+        unsafe {
+            // SAFETY: Mount alone initializes this unpublished device's transfer sector size.
+            (*device.as_ptr()).SectorSize = sector_bytes;
+        }
 
         if let Err(error) = VpbSpinLock::publish_mount(vpb, device, serial_number, volume_label) {
             Self::unregister_shutdown_notification(device);
@@ -261,17 +269,10 @@ impl MountedVolumeDevice {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     unsafe fn release(device: KernelDevice) {
-        let device_object = unsafe {
-            // SAFETY: The retirement work item retains this mounted device during teardown.
-            device.as_ptr().as_ref()
-        }
-        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        let extension = device.extension_address();
         let extension = unsafe {
             // SAFETY: The common extension kind was decoded as mounted before this call.
-            device_object
-                .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>()
-                .as_ref()
+            extension.cast::<MountedVolumeDeviceExtension>().as_ref()
         }
         .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
         let target = unsafe {
@@ -319,17 +320,10 @@ impl MountedVolumeDevice {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn retirement_work_item(device: KernelDevice) -> NonNull<wdk_sys::_IO_WORKITEM> {
-        let device_object = unsafe {
-            // SAFETY: The caller retains the mounted device and its extension.
-            device.as_ptr().as_ref()
-        }
-        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        let extension = device.extension_address();
         let extension = unsafe {
             // SAFETY: Retirement is emitted only by a mounted-volume actor.
-            device_object
-                .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>()
-                .as_ref()
+            extension.cast::<MountedVolumeDeviceExtension>().as_ref()
         }
         .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
         NonNull::new(extension.retirement_work_item).unwrap_or_else(|| {
@@ -410,15 +404,10 @@ impl MountedVolumeDevice {
         reason = "the mounted lifecycle owner retains the device and initialized extension through shutdown release"
     )]
     pub(crate) fn unregister_shutdown_notification(device: KernelDevice) {
-        let device_object = unsafe {
-            // SAFETY: The mounted lifecycle owner retains this live DEVICE_OBJECT.
-            &*device.as_ptr()
-        };
+        let extension = device.extension_address();
         let extension = unsafe {
             // SAFETY: The live mounted device owns its initialized extension throughout this call.
-            &*device_object
-                .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>()
+            &*extension.cast::<MountedVolumeDeviceExtension>()
         };
         if extension.shutdown_registered.swap(0, Ordering::AcqRel) == 0 {
             return;
@@ -445,15 +434,10 @@ impl MountedVolumeDevice {
         minor: crate::irp::PnpMinor,
     ) -> wdk_sys::NTSTATUS {
         let device = received.device();
-        let device_object = unsafe {
-            // SAFETY: The received IRP retains this driver's mounted DEVICE_OBJECT.
-            &*device.as_ptr()
-        };
+        let extension = device.extension_address();
         let extension = unsafe {
             // SAFETY: Dispatch classified this driver's live mounted-volume device.
-            &*device_object
-                .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>()
+            &*extension.cast::<MountedVolumeDeviceExtension>()
         };
         match extension
             .header
@@ -494,15 +478,10 @@ impl MountedVolumeDevice {
         lower: KernelDevice,
     ) -> wdk_sys::NTSTATUS {
         let device = received.device();
-        let device_object = unsafe {
-            // SAFETY: The received IRP retains this driver's mounted DEVICE_OBJECT.
-            &*device.as_ptr()
-        };
+        let extension = device.extension_address();
         let extension = unsafe {
             // SAFETY: Dispatch classified the driver's live mounted-volume extension.
-            &*device_object
-                .DeviceExtension
-                .cast::<MountedVolumeDeviceExtension>()
+            &*extension.cast::<MountedVolumeDeviceExtension>()
         };
         match extension
             .header

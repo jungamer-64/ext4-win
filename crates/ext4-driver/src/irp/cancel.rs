@@ -7,6 +7,8 @@ use core::ptr::NonNull;
 #[cfg(not(test))]
 use wdk_sys::{PDEVICE_OBJECT, PIRP};
 
+#[cfg(not(test))]
+use super::KernelIrp;
 use crate::kernel::fatal::KernelWideInconsistency;
 #[cfg(not(test))]
 use crate::kernel::ffi;
@@ -122,7 +124,7 @@ impl ActiveCancellation {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     pub(crate) unsafe fn install(irp: PIRP, envelope: NonNull<ActiveCancelEnvelope>) -> Self {
-        let Some(mut irp_address) = NonNull::new(irp) else {
+        let Some(irp_address) = NonNull::new(irp) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
         let mut old_irql = 0;
@@ -130,16 +132,22 @@ impl ActiveCancellation {
             // SAFETY: Standard cancel-routine installation is serialized by the global cancel lock.
             ffi::IoAcquireCancelSpinLock(core::ptr::addr_of_mut!(old_irql));
         }
-        let irp_ref = unsafe {
-            // SAFETY: Exclusive IRP ownership and the cancel lock permit context publication.
-            irp_address.as_mut()
+        let context = unsafe {
+            // SAFETY: The live IRP and cancel lock retain the active driver context slot.
+            active_cancel_context(irp_address)
         };
-        let context = active_cancel_context(irp_ref);
+        let context = unsafe {
+            // SAFETY: The cancel lock and exclusive installation own only this context slot.
+            &mut *context
+        };
         if !context.is_null() {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         *context = envelope.as_ptr().cast::<c_void>();
-        let cancelled = irp_ref.Cancel != 0;
+        let cancelled = unsafe {
+            // SAFETY: The global cancel lock excludes mutation of this live cancel flag.
+            (*irp).Cancel != 0
+        };
         if !cancelled {
             let previous = unsafe {
                 // SAFETY: The cancel spin lock is held and no earlier active routine exists.
@@ -183,11 +191,14 @@ impl Drop for ActiveCancellation {
             // SAFETY: The cancel spin lock excludes routine selection while authority is removed.
             ffi::IoSetCancelRoutine(self.irp.as_ptr(), None)
         };
-        let irp = unsafe {
-            // SAFETY: Terminal ownership and the cancel spin lock permit context removal.
-            self.irp.as_mut()
+        let context = unsafe {
+            // SAFETY: Terminal ownership and the cancel lock retain this context slot.
+            active_cancel_context(self.irp)
         };
-        let context = active_cancel_context(irp);
+        let context = unsafe {
+            // SAFETY: The cancel spin lock grants sole access to the active context slot.
+            &mut *context
+        };
         if !core::ptr::eq(
             (*context).cast_const(),
             self.envelope.as_ptr().cast_const().cast(),
@@ -211,21 +222,22 @@ impl Drop for ActiveCancellation {
 unsafe impl Send for ActiveCancellation {}
 
 /// Returns the driver-owned active-cancel context slot.
+/// # Safety
+/// The pointer must identify a live IRP whose driver-context union arm has been initialized.
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-fn active_cancel_context(irp: &mut wdk_sys::IRP) -> &mut *mut c_void {
-    let overlay = unsafe {
-        // SAFETY: `DriverContext` and list linkage occupy independent tail-overlay fields.
-        &mut irp.Tail.Overlay
-    };
-    let driver_storage = unsafe {
-        // SAFETY: This is the bindgen arm containing the four documented DriverContext slots.
-        &mut overlay.__bindgen_anon_1.__bindgen_anon_1
-    };
-    &mut driver_storage.DriverContext[1]
+unsafe fn active_cancel_context(irp: NonNull<wdk_sys::IRP>) -> *mut *mut c_void {
+    let slots = KernelIrp { irp }
+        .driver_context_slots()
+        .cast::<*mut c_void>();
+    unsafe {
+        // SAFETY: The caller retains this initialized arm; computing the slot address creates no
+        // reference to independently accessed cancellation, completion or queue-linkage fields.
+        slots.add(1).as_ptr()
+    }
 }
 
 /// Native top-level cancel routine: publish one event and release the cancel spin lock immediately.
@@ -241,20 +253,13 @@ unsafe extern "C" fn active_irp_cancelled(_device: PDEVICE_OBJECT, irp: PIRP) {
     let Some(irp_address) = NonNull::new(irp) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
-    let irp_ref = unsafe {
-        // SAFETY: The I/O Manager invokes the routine with the IRP and cancel spin lock held.
-        irp_address.as_ref()
+    let context = unsafe {
+        // SAFETY: Installed cancellation retains the live IRP and initialized driver slots.
+        active_cancel_context(irp_address)
     };
-    let context = {
-        let overlay = unsafe {
-            // SAFETY: Active cancellation retains the driver-context arm until token removal.
-            &irp_ref.Tail.Overlay
-        };
-        let driver_storage = unsafe {
-            // SAFETY: This is the bindgen arm containing the four DriverContext slots.
-            &overlay.__bindgen_anon_1.__bindgen_anon_1
-        };
-        driver_storage.DriverContext[1]
+    let context = unsafe {
+        // SAFETY: The I/O Manager-held cancel spin lock retains the published envelope pointer.
+        context.read()
     };
     let Some(envelope) = NonNull::new(context.cast::<ActiveCancelEnvelope>()) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -264,9 +269,13 @@ unsafe extern "C" fn active_irp_cancelled(_device: PDEVICE_OBJECT, irp: PIRP) {
         envelope.as_ref()
     }
     .publish();
+    let cancel_irql = unsafe {
+        // SAFETY: The I/O Manager initialized this field and holds the cancel lock through entry.
+        (*irp).CancelIrql
+    };
     unsafe {
-        // SAFETY: Cancel routines must release the I/O Manager-held lock using this IRP's IRQL.
-        ffi::IoReleaseCancelSpinLock(irp_ref.CancelIrql);
+        // SAFETY: Cancel routines release the I/O Manager-held lock using its initialized IRQL.
+        ffi::IoReleaseCancelSpinLock(cancel_irql);
     }
 }
 

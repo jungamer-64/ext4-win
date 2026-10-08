@@ -211,7 +211,7 @@ pub(crate) fn prepare_write_cache_plan(
         }
         let file_cache = access.acquire_file_object_cache_lease(file_object)?;
         let end = range.start().checked_add_len(range.length())?.bytes();
-        let write_through = file_object.as_ref().Flags & wdk_sys::FO_WRITE_THROUGH != 0;
+        let write_through = file_object.flags() & wdk_sys::FO_WRITE_THROUGH != 0;
         if matches!(selected, SelectedWriteStart::EndOfFile)
             || matches!(mode, DataTransferMode::Direct(_))
             || write_through
@@ -517,7 +517,7 @@ pub(crate) fn prepare_raw_volume_transfer(
             opened.raw_target(),
             start,
             publication,
-            file_object.as_ref().Flags & wdk_sys::FO_WRITE_THROUGH != 0,
+            file_object.flags() & wdk_sys::FO_WRITE_THROUGH != 0,
         ))
     })?;
     let permit = access.authorize_raw_volume_io(target, kind)?;

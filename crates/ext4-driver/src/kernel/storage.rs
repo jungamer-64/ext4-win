@@ -191,14 +191,18 @@ impl LowerStorageDevice {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     pub fn from_device(device: KernelDevice, length: DeviceLength) -> DriverResult<Self> {
-        let object = unsafe {
-            // SAFETY: The mounted lower device is live and read only for immutable geometry.
-            device.as_ptr().as_ref()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
+        let alignment_requirement = unsafe {
+            // SAFETY: The mounted lower device retains this stable transfer constraint; the
+            // scalar read leaves independently mutable native queue and lifecycle fields alone.
+            (*device.as_ptr()).AlignmentRequirement
+        };
+        let flags = unsafe {
+            // SAFETY: Mounted lower-device admission retains its established transfer flags.
+            (*device.as_ptr()).Flags
+        };
         let sector_size = device.transfer_sector_size()?;
-        let alignment_mask = usize::try_from(object.AlignmentRequirement)
-            .map_err(|_| DriverError::InvalidParameter)?;
+        let alignment_mask =
+            usize::try_from(alignment_requirement).map_err(|_| DriverError::InvalidParameter)?;
         let buffer_alignment = alignment_mask
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
@@ -210,7 +214,7 @@ impl LowerStorageDevice {
             length,
             sector_size,
             buffer_alignment,
-            transfer_method: LowerTransferMethod::from_device_flags(object.Flags)?,
+            transfer_method: LowerTransferMethod::from_device_flags(flags)?,
         })
     }
 

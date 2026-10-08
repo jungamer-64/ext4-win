@@ -319,15 +319,11 @@ impl DeviceExtensionHeader {
         reason = "the dispatch or lifecycle owner retains this device extension"
     )]
     pub(super) unsafe fn from_device<'device>(device: KernelDevice) -> DriverResult<&'device Self> {
-        let object = unsafe {
-            // SAFETY: The caller retains the driver-owned device for the returned borrow.
-            device.as_ptr().as_ref()
-        }
-        .ok_or(DriverError::InternalInvariantViolation)?;
+        let extension = device.extension_address();
         unsafe {
             // SAFETY: Every driver-owned device starts with this initialized header; retirement
             // destroys only the MaybeUninit actor slot, not the tag or closed dispatch gate.
-            object.DeviceExtension.cast::<Self>().as_ref()
+            extension.cast::<Self>().as_ref()
         }
         .ok_or(DriverError::InternalInvariantViolation)
     }
@@ -487,17 +483,8 @@ impl ControlDeviceExtension {
         trace: OperationalTrace,
         catalog: crate::identity::IdentityCatalog,
     ) -> Result<(), wdk_sys::NTSTATUS> {
-        let device_object = unsafe {
-            // SAFETY: `device` is the newly created control device object.
-            device.as_ptr().as_ref()
-        }
-        .ok_or(DriverError::InvalidParameter.ntstatus())?;
-        let extension = NonNull::new(
-            device_object
-                .DeviceExtension
-                .cast::<ControlDeviceExtension>(),
-        )
-        .ok_or(DriverError::InvalidParameter.ntstatus())?;
+        let extension = NonNull::new(device.extension_address().cast::<ControlDeviceExtension>())
+            .ok_or(DriverError::InvalidParameter.ntstatus())?;
         let lifecycle = unsafe {
             // SAFETY: This raw field projection does not borrow the uninitialized extension.
             core::ptr::addr_of_mut!((*extension.as_ptr()).lifecycle)
@@ -576,17 +563,10 @@ impl ControlDeviceExtension {
         if driver_device_kind(device)? != DriverDeviceKind::Control {
             return Err(DriverError::InvalidDeviceRequest);
         }
-        let device_object = unsafe {
-            // SAFETY: The caller retains this checked control device through the returned borrow.
-            device.as_ptr().as_ref()
-        }
-        .ok_or(DriverError::InvalidParameter)?;
+        let extension = device.extension_address();
         unsafe {
             // SAFETY: The decoded control kind selects the exact extension layout.
-            device_object
-                .DeviceExtension
-                .cast::<ControlDeviceExtension>()
-                .as_ref()
+            extension.cast::<ControlDeviceExtension>().as_ref()
         }
         .ok_or(DriverError::InvalidParameter)
     }
@@ -753,13 +733,11 @@ impl ControlDevice {
                 .cast::<crate::kernel::volume_discovery::VolumeDiscovery>())
                 .activate();
         }
-        let device_object = unsafe {
+        unsafe {
             // SAFETY: Registration state now represents every lifecycle fact that dispatch can
             // observe once this final publication flag is cleared.
-            device.as_ptr().as_mut()
+            (*device.as_ptr()).Flags &= !DO_DEVICE_INITIALIZING;
         }
-        .unwrap_or_else(|| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
-        device_object.Flags &= !DO_DEVICE_INITIALIZING;
         Ok(Self)
     }
 

@@ -414,10 +414,7 @@ impl CapturedRequestorInput {
         {
             let length = wdk_sys::ULONG::try_from(length.as_usize())
                 .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?;
-            let requestor_mode = unsafe {
-                // SAFETY: Dispatch retains the received IRP until capture returns.
-                target.irp.as_ref().RequestorMode
-            };
+            let requestor_mode = target.requestor_mode();
             let mut snapshot = core::ptr::null_mut();
             let mut captured_length = 0;
             let status = unsafe {
@@ -1358,9 +1355,9 @@ impl CapturedRequestorOutput {
         {
             let length = wdk_sys::ULONG::try_from(capacity)
                 .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?;
-            let irp = unsafe {
+            let user_buffer = unsafe {
                 // SAFETY: Dispatch retains the live IRP through queue-time capture.
-                target.irp.as_ref()
+                (*target.irp.as_ptr()).UserBuffer
             };
             let mut native = core::ptr::null_mut();
             let status = unsafe {
@@ -1368,9 +1365,9 @@ impl CapturedRequestorOutput {
                 // that writable prefix in requestor context and transfers an opaque owner.
                 ffi::ext4win_capture_requestor_output(
                     core::ptr::addr_of_mut!(native),
-                    irp.UserBuffer,
+                    user_buffer,
                     length,
-                    irp.RequestorMode,
+                    target.requestor_mode(),
                 )
             };
             ensure_native_success(status)?;
@@ -1490,10 +1487,6 @@ impl CapturedSetSecurityDescriptor {
     ) -> Result<Self, IrpCompletion> {
         #[cfg(not(test))]
         {
-            let irp = unsafe {
-                // SAFETY: Dispatch retains the received IRP until capture returns.
-                target.irp.as_ref()
-            };
             let mut snapshot = core::ptr::null_mut();
             let mut captured_length = 0;
             let status = unsafe {
@@ -1501,7 +1494,7 @@ impl CapturedSetSecurityDescriptor {
                 // naturally aligned owned allocation, then validates that immutable snapshot.
                 ffi::ext4win_capture_set_security_descriptor(
                     source.as_ptr().cast(),
-                    irp.RequestorMode,
+                    target.requestor_mode(),
                     selection.required_information(),
                     SET_SECURITY_DESCRIPTOR_MAXIMUM,
                     core::ptr::addr_of_mut!(snapshot),

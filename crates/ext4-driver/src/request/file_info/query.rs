@@ -787,15 +787,8 @@ fn pack_position_information(output: &mut [u8], position: i64) -> DriverResult<I
 }
 
 /// Observes the Windows position field without granting synchronous read/write cursor authority.
-#[expect(
-    unsafe_code,
-    reason = "the active IRP retains the FILE_OBJECT during this bounded LARGE_INTEGER observation"
-)]
 fn information_position(file_object: ActiveFileObject<'_>) -> i64 {
-    unsafe {
-        // SAFETY: The active FILE_OBJECT is live; Windows and ext4win use the QuadPart union arm.
-        file_object.as_ref().CurrentByteOffset.QuadPart
-    }
+    file_object.current_byte_offset()
 }
 
 /// Packs FILE_NETWORK_OPEN_INFORMATION.

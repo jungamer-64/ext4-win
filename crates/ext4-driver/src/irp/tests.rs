@@ -95,6 +95,60 @@ fn irp_status(irp: &wdk_sys::IRP) -> wdk_sys::NTSTATUS {
     }
 }
 
+/// # Panics
+/// Fails if terminal status publication interferes with independent I/O Manager cancellation.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "joined threads access disjoint fields of one retained local IRP"
+)]
+fn completion_status_coexists_with_independent_cancel_writes() {
+    use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+    use std::sync::Barrier;
+
+    let mut irp = wdk_sys::IRP::default();
+    let pointer = AtomicPtr::new(core::ptr::addr_of_mut!(irp));
+    let kernel_irp = unsafe {
+        // SAFETY: This local IRP stays live and unmoved until the scoped writer joins. The test
+        // owns terminal fields; the other thread owns only the Cancel flag, like IoCancelIrp.
+        KernelIrp::from_raw(pointer.load(Ordering::Relaxed))
+    };
+    let Some(kernel_irp) = kernel_irp else {
+        return;
+    };
+    let information = InformationLength::from_usize(37);
+    assert!(information.is_ok());
+    let Ok(information) = information else {
+        return;
+    };
+    let started = Barrier::new(2);
+    let finished = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            started.wait();
+            loop {
+                unsafe {
+                    // SAFETY: The scoped thread is the sole writer of this retained Cancel byte.
+                    // Status publication borrows only IoStatus; no whole-IRP reference is live.
+                    (*pointer.load(Ordering::Relaxed)).Cancel = 1;
+                }
+                if finished.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        });
+        started.wait();
+        for _ in 0..1024 {
+            kernel_irp.write_status_block(IrpCompletion::with_information(information));
+        }
+        finished.store(true, Ordering::Release);
+        assert!(writer.join().is_ok());
+    });
+    assert_eq!(irp_status(&irp), wdk_sys::STATUS_SUCCESS);
+    assert_eq!(irp.IoStatus.Information, 37);
+    assert_eq!(irp.Cancel, 1);
+}
+
 /// Builds a lifetime-bound stack view from one live unit-test fixture.
 /// # Errors
 ///

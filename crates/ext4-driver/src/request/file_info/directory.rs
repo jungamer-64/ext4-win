@@ -576,8 +576,8 @@ impl DirectoryQuery {
         mut request: PendingIrpLease<'_>,
     ) -> DriverResult<(Self, DirectoryNodeId)> {
         let existing = request.with_active(|active| {
-            let mut opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
-            opened.search_mut().expression()
+            let opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
+            opened.search().expression()
         })?;
         let prepared = request.prepared_query_directory()?;
         let stack = prepared.stack();
@@ -587,16 +587,16 @@ impl DirectoryQuery {
             None
         };
         let (pattern, directory, cursor, initial) = request.with_active(|active| {
-            let mut opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
+            let opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
             let directory = opened.id();
-            let search = opened.search_mut();
-            let initial = !search.completed;
+            let search = opened.search();
+            let initial = !search.completed();
             let pattern = match existing {
                 Some(pattern) => pattern,
                 None => search
                     .capture_pattern(pattern.ok_or(DriverError::InternalInvariantViolation)?)?,
             };
-            let mut cursor = search.cursor;
+            let mut cursor = search.cursor();
             if initial {
                 cursor.restart();
             } else {
@@ -761,13 +761,13 @@ impl DirectoryQuery {
         request.with_active(|active| {
             let cursor = exhausted.unwrap_or(self.cursor);
             if self.information == 0 {
-                let mut opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
-                return opened.search_mut().publish_after_copy(cursor, || Ok(()));
+                let opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
+                return opened.search().publish_after_copy(cursor, || Ok(()));
             }
             let (mut output, file_object) =
                 active.requestor_output_with_file_object(self.length)?;
-            let mut opened = OpenedDirectory::decode(file_object)?;
-            opened.search_mut().publish_after_copy(cursor, || {
+            let opened = OpenedDirectory::decode(file_object)?;
+            opened.search().publish_after_copy(cursor, || {
                 output.copy_from(
                     0,
                     self.packed

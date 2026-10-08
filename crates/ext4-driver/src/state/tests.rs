@@ -5,7 +5,9 @@ use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::ptr::NonNull;
 
-use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset, NodeId};
+use ext4_core::{
+    ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset, NodeId, WindowsName,
+};
 
 use crate::irp::{
     ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
@@ -17,9 +19,9 @@ use crate::kernel::status::DriverError;
 use super::{
     CleanCloseTerminal, CleanupStart, CloseReleasePlan, ControlDeviceLifecycle, ControlDevicePhase,
     DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind, DirectoryChange,
-    DirectoryChangeAction, DriverDeviceKind, FileControlBlock, FileControlBlockLedger,
-    FileControlBlockOpenState, FileObjectCloseKind, HandleAdmissionState, HandleDeletion,
-    KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
+    DirectoryChangeAction, DirectoryPattern, DriverDeviceKind, FileControlBlock,
+    FileControlBlockLedger, FileControlBlockOpenState, FileObjectCloseKind, HandleAdmissionState,
+    HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
     NativeResidencyRecheck, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
     OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
     OpenedVolumeHandle, RawExtentPolicy, RawVolumeAccess, RawVolumeIoPermit,
@@ -882,7 +884,7 @@ fn unopened_object_without_contexts_is_invalid_parameter() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
-fn typed_opened_directory_exposes_cursor_without_option() {
+fn decoded_directory_views_share_publication_without_exclusive_references() {
     let volume = NonNull::<VolumeControlBlock>::dangling();
     let fixture = test_file_control_block(volume, NodeId::Directory(DirectoryNodeId::ROOT));
     let fcb = &fixture.0;
@@ -895,11 +897,144 @@ fn typed_opened_directory_exposes_cursor_without_option() {
         core::ptr::addr_of_mut!(handle).cast(),
     );
     let result = with_active_file_object(&mut file, |file_object| {
-        let mut directory = OpenedDirectory::decode(file_object)?;
+        let directory = OpenedDirectory::decode(file_object)?;
+        let second = OpenedDirectory::decode(file_object)?;
+        let first_search = directory.search();
+        let second_search = second.search();
         assert_eq!(directory.id(), DirectoryNodeId::ROOT);
-        assert_eq!(directory.search_mut().cursor.ordinal(), 0);
-        directory.search_mut().cursor.seek_ordinal(7);
-        assert_eq!(directory.search_mut().cursor.ordinal(), 7);
+        assert_eq!(first_search.cursor().ordinal(), 0);
+        let original = first_search.capture_pattern(DirectoryPattern::All)?;
+        let later =
+            second_search.capture_pattern(DirectoryPattern::Exact(WindowsName::from_utf16(&[
+                u16::from(b'a'),
+            ])?))?;
+        assert_eq!(original.get(), later.get());
+        let mut cursor = first_search.cursor();
+        cursor.seek_ordinal(7);
+        assert_eq!(
+            second_search.publish_after_copy(cursor, || Err(DriverError::BufferOverflow)),
+            Err(DriverError::BufferOverflow),
+        );
+        assert_eq!(first_search.cursor().ordinal(), 0);
+        assert!(!first_search.completed());
+        second_search.publish_after_copy(cursor, || Ok(()))?;
+        assert_eq!(first_search.cursor().ordinal(), 7);
+        assert!(first_search.completed());
+        Ok(())
+    });
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if create publication loses OS flags or observations borrow mutable native fields.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the local create record retains its prepared header and CCB"
+)]
+fn file_object_publication_preserves_flags_and_observations_are_values() {
+    let fixture = test_file_control_block(
+        NonNull::<VolumeControlBlock>::dangling(),
+        NodeId::Directory(DirectoryNodeId::ROOT),
+    );
+    let fcb = &fixture.0;
+    let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+    else {
+        return;
+    };
+    let handle_pointer = core::ptr::from_mut(&mut handle).cast();
+    let mut file = wdk_sys::FILE_OBJECT {
+        Flags: wdk_sys::FO_HANDLE_CREATED,
+        ..wdk_sys::FILE_OBJECT::default()
+    };
+    let result = with_active_file_object(&mut file, |view| {
+        let original_flags = view.flags();
+        let create = UninitializedFileObject::decode(view)?;
+        let sections = fcb.stream_section_objects()?;
+        unsafe {
+            // SAFETY: This test owns the sole attachment of its live local FILE_OBJECT; the real
+            // stream header, section storage and CCB remain live until all observations finish.
+            create.kernel_file_object().publish_stream_contexts(
+                fcb.stream_header().as_ptr(),
+                handle_pointer,
+                sections.as_ptr(),
+                wdk_sys::FO_SYNCHRONOUS_IO,
+            );
+        }
+        assert_eq!(original_flags, wdk_sys::FO_HANDLE_CREATED);
+        assert_eq!(view.flags(), original_flags | wdk_sys::FO_SYNCHRONOUS_IO);
+        assert_eq!(view.stream_header(), fcb.stream_header().as_ptr());
+        assert_eq!(view.handle_context(), handle_pointer);
+        assert_eq!(view.section_objects(), sections.as_ptr());
+        view.mark_cleanup_complete();
+        let position = view.current_byte_offset();
+        view.write_current_byte_offset(4096);
+        assert_eq!(position, 0);
+        assert_eq!(view.current_byte_offset(), 4096);
+        assert!(view.cleanup_complete());
+        assert_eq!(original_flags, wdk_sys::FO_HANDLE_CREATED);
+        Ok(())
+    });
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if the owner-bound create-name boundary accepts an inconsistent UTF-16 descriptor.
+#[test]
+fn create_name_borrows_validate_descriptor_length_and_alignment() {
+    let mut units = [u16::from(b'a'), u16::from(b'b')];
+    let descriptor = wdk_sys::UNICODE_STRING {
+        Length: 4,
+        MaximumLength: 4,
+        Buffer: units.as_mut_ptr(),
+    };
+    let mut file = wdk_sys::FILE_OBJECT {
+        FileName: descriptor,
+        ..wdk_sys::FILE_OBJECT::default()
+    };
+    let result = with_active_file_object(&mut file, |view| {
+        let create = UninitializedFileObject::decode(view)?;
+        assert_eq!(create.name_utf16()?, &[u16::from(b'a'), u16::from(b'b')]);
+        assert_eq!(create.name_bytes()?.len(), 4);
+        Ok(())
+    });
+    assert_eq!(result, Ok(()));
+    for invalid in [
+        wdk_sys::UNICODE_STRING {
+            Length: 3,
+            ..descriptor
+        },
+        wdk_sys::UNICODE_STRING {
+            MaximumLength: 2,
+            ..descriptor
+        },
+        wdk_sys::UNICODE_STRING {
+            Buffer: core::ptr::null_mut(),
+            ..descriptor
+        },
+        wdk_sys::UNICODE_STRING {
+            Length: 2,
+            MaximumLength: 2,
+            Buffer: units
+                .as_mut_ptr()
+                .cast::<u8>()
+                .wrapping_add(1)
+                .cast::<u16>(),
+        },
+    ] {
+        file.FileName = invalid;
+        let result = with_active_file_object(&mut file, |view| {
+            UninitializedFileObject::decode(view)?
+                .name_utf16()
+                .map(|_| ())
+        });
+        assert_eq!(result, Err(DriverError::InvalidParameter));
+    }
+    file.FileName = wdk_sys::UNICODE_STRING::default();
+    let result = with_active_file_object(&mut file, |view| {
+        let create = UninitializedFileObject::decode(view)?;
+        assert!(create.name_utf16()?.is_empty());
+        assert!(create.name_bytes()?.is_empty());
         Ok(())
     });
     assert_eq!(result, Ok(()));

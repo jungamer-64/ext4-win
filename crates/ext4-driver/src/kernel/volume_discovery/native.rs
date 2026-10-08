@@ -94,11 +94,9 @@ impl VolumeDiscovery {
                 0,
             );
         }
-        let device = unsafe {
-            // SAFETY: The control extension owns the newly created live device throughout start.
-            owner.as_ptr().as_ref()
-        }
-        .ok_or(wdk_sys::STATUS_INVALID_PARAMETER)?;
+        let driver = owner
+            .driver_object()
+            .ok_or(wdk_sys::STATUS_INVALID_PARAMETER)?;
         let address = core::ptr::from_ref(context).cast_mut().cast::<c_void>();
         let mut registration = core::ptr::null_mut();
         trace.record(
@@ -115,7 +113,7 @@ impl VolumeDiscovery {
                 core::ptr::from_ref(VolumeInterfaceClass::Hidden.guid())
                     .cast_mut()
                     .cast(),
-                device.DriverObject,
+                driver,
                 Some(interface_change),
                 address,
                 &raw mut registration,
@@ -355,13 +353,12 @@ impl DiscoveryContext {
         if sector < 512 || !sector.is_power_of_two() || sector > 65_536 {
             return Err(wdk_sys::STATUS_NOT_SUPPORTED);
         }
-        let device = unsafe {
-            // SAFETY: FILE_OBJECT retains this device during the entire probe.
-            volume.device.as_ptr().as_ref()
-        }
-        .ok_or(wdk_sys::STATUS_NO_SUCH_DEVICE)?;
-        let alignment = device
-            .AlignmentRequirement
+        let alignment_requirement = unsafe {
+            // SAFETY: The probe's FILE_OBJECT retains this stable device transfer constraint;
+            // no reference is formed to independently mutable native device fields.
+            (*volume.device.as_ptr()).AlignmentRequirement
+        };
+        let alignment = alignment_requirement
             .checked_add(1)
             .ok_or(wdk_sys::STATUS_INVALID_BUFFER_SIZE)?
             .max(sector);

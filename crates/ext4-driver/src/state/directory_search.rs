@@ -3,25 +3,26 @@
 use crate::irp::PreparedDirectoryPattern;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
+use core::cell::{Cell, OnceCell};
 use ext4_core::{DirectoryScanCursor, WindowsName};
 
 /// The first expression is captured once, even across restart and failed output copies.
 #[derive(Debug)]
 pub(crate) struct DirectorySearch {
     /// Last continuation published after a successful requestor copy.
-    pub(crate) cursor: DirectoryScanCursor,
-    /// None means the first request has not yet captured its expression.
-    pattern: Option<DriverShared<DirectoryPattern>>,
+    cursor: Cell<DirectoryScanCursor>,
+    /// Unset until the first request captures its expression.
+    pattern: OnceCell<DriverShared<DirectoryPattern>>,
     /// Distinguishes initial no-match/overflow semantics from subsequent queries.
-    pub(crate) completed: bool,
+    completed: Cell<bool>,
 }
 impl DirectorySearch {
     /// Creates a handle that has neither captured a pattern nor consumed an entry.
     pub(crate) const fn new() -> Self {
         Self {
-            cursor: DirectoryScanCursor::start(),
-            pattern: None,
-            completed: false,
+            cursor: Cell::new(DirectoryScanCursor::start()),
+            pattern: OnceCell::new(),
+            completed: Cell::new(false),
         }
     }
     /// Publishes one request's continuation only after its output copy succeeds.
@@ -29,14 +30,24 @@ impl DirectorySearch {
     /// # Errors
     /// A failed or cancelled copy leaves the previous publication unchanged.
     pub(crate) fn publish_after_copy(
-        &mut self,
+        &self,
         cursor: DirectoryScanCursor,
         copy: impl FnOnce() -> DriverResult<()>,
     ) -> DriverResult<()> {
         copy()?;
-        self.cursor = cursor;
-        self.completed = true;
+        self.cursor.set(cursor);
+        self.completed.set(true);
         Ok(())
+    }
+
+    /// Returns the continuation last published by a completed output copy.
+    pub(crate) fn cursor(&self) -> DirectoryScanCursor {
+        self.cursor.get()
+    }
+
+    /// Returns whether a query has published its result for this handle.
+    pub(crate) fn completed(&self) -> bool {
+        self.completed.get()
     }
 
     /// Leases the original expression without parsing later caller input.
@@ -44,7 +55,7 @@ impl DirectorySearch {
     /// Returns reference-budget exhaustion without changing the search.
     pub(crate) fn expression(&self) -> DriverResult<Option<DriverSharedLease<DirectoryPattern>>> {
         self.pattern
-            .as_ref()
+            .get()
             .map(DriverShared::try_acquire)
             .transpose()
     }
@@ -53,14 +64,16 @@ impl DirectorySearch {
     /// # Errors
     /// Returns allocation or reference-budget exhaustion.
     pub(crate) fn capture_pattern(
-        &mut self,
+        &self,
         input: DirectoryPattern,
     ) -> DriverResult<DriverSharedLease<DirectoryPattern>> {
-        if self.pattern.is_none() {
-            self.pattern = Some(DriverShared::try_new(input)?);
+        if self.pattern.get().is_none() {
+            self.pattern
+                .set(DriverShared::try_new(input)?)
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
         }
         self.pattern
-            .as_ref()
+            .get()
             .ok_or(DriverError::InternalInvariantViolation)?
             .try_acquire()
     }

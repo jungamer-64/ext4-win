@@ -832,13 +832,13 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
     if irp != delegated.irp().as_ptr() {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     }
-    let irp = unsafe {
-        // SAFETY: Equality with the delegated non-null identity was established above.
-        &*irp
+    let status_block = unsafe {
+        // SAFETY: Equality with the retained delegated IRP proves this live completed status block.
+        &(*irp).IoStatus
     };
     let status = unsafe {
         // SAFETY: FsRtl completed the status arm before invoking this completion callback.
-        irp.IoStatus.__bindgen_anon_1.Status
+        status_block.__bindgen_anon_1.Status
     };
     if !envelope.callback.mark_completed(status) {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
