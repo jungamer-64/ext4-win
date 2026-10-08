@@ -429,36 +429,6 @@ pub(crate) fn set_creation_attributes(
     Ok(())
 }
 
-/// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
-/// # Errors
-///
-/// Returns an error when the input structure is truncated, timestamps or attributes are invalid, or
-/// the resulting ext4 metadata transaction fails.
-fn set_basic_information(
-    info: wdk_sys::FILE_BASIC_INFORMATION,
-    node_id: NodeId,
-    transaction: &mut DriverMutationPass<'_, '_, '_>,
-) -> DriverResult<()> {
-    let metadata = metadata_from_node(transaction, node_id)?;
-    let times = set_basic_times(metadata.times, info)?;
-    let attributes = set_basic_attributes(metadata, info.FileAttributes)?;
-    if times == metadata.times && attributes.is_empty() {
-        return Ok(());
-    }
-
-    let node = transaction.node(node_id)?;
-    if times != metadata.times {
-        transaction.set_times(node, times)?;
-    }
-    if let Some(security) = attributes.security() {
-        transaction.set_posix_security(node, security)?;
-    }
-    if let Some(overlay) = attributes.overlay() {
-        transaction.set_windows_overlay(node, overlay)?;
-    }
-    Ok(())
-}
-
 /// Raw Windows disposition layout selected by the information class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DispositionInputFormat {
@@ -1875,60 +1845,6 @@ fn input_range(bytes: &[u8], offset: usize, length: usize) -> DriverResult<&[u8]
     wire_range(offset, length)?.read_from(bytes)
 }
 
-/// Builds a complete ext4 timestamp set from FILE_BASIC_INFORMATION.
-/// # Errors
-///
-/// Returns an error when any supplied Windows timestamp is negative, unsupported, or cannot be
-/// converted to Unix seconds.
-fn set_basic_times(
-    current: Ext4Times,
-    info: wdk_sys::FILE_BASIC_INFORMATION,
-) -> DriverResult<Ext4Times> {
-    Ok(Ext4Times::new(
-        windows_time_field(info.LastAccessTime, current.accessed())?,
-        windows_time_field(info.LastWriteTime, current.modified())?,
-        windows_time_field(info.ChangeTime, current.changed())?,
-        windows_time_field(info.CreationTime, current.created())?,
-    ))
-}
-
-/// Selects one timestamp field, preserving the current value for sentinel inputs.
-/// # Errors
-///
-/// Returns an error when `value` is a negative non-sentinel timestamp or Windows cannot convert it
-/// to Unix seconds.
-#[expect(
-    unsafe_code,
-    reason = "Windows time conversion crosses the audited RtlTimeToSecondsSince1970 ABI"
-)]
-fn windows_time_field(value: LARGE_INTEGER, current: Ext4Timestamp) -> DriverResult<Ext4Timestamp> {
-    let quad = large_integer_quad(value);
-    if quad == WINDOWS_TIME_UNCHANGED || quad == WINDOWS_TIME_PRESERVE {
-        return Ok(current);
-    }
-    if quad < 0 {
-        return Err(DriverError::InvalidParameter);
-    }
-    let mut time = value;
-    let mut seconds: wdk_sys::ULONG = 0;
-    let converted = unsafe {
-        // SAFETY: Both pointers reference writable stack storage valid for the
-        // duration of the conversion call.
-        crate::kernel::ffi::RtlTimeToSecondsSince1970(
-            core::ptr::addr_of_mut!(time),
-            core::ptr::addr_of_mut!(seconds),
-        )
-    };
-    if converted == 0 {
-        return Err(DriverError::InvalidParameter);
-    }
-    Ok(Ext4Timestamp::from_unix_seconds(seconds))
-}
-
-/// Windows FILE_BASIC_INFORMATION sentinel for preserving a timestamp.
-const WINDOWS_TIME_UNCHANGED: i64 = 0;
-/// Additional Windows sentinel used by callers to preserve timestamp state.
-const WINDOWS_TIME_PRESERVE: i64 = -1;
 /// POSIX write bits that make Windows READONLY false.
 const POSIX_WRITE_BITS: u16 = 0o222;
 /// Owner write bit restored when Windows READONLY is cleared.
