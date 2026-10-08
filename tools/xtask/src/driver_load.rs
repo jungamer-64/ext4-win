@@ -3,8 +3,8 @@
 mod owner;
 #[cfg(windows)]
 pub(crate) use owner::{
-    check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload, start_session,
-    verify_hosted_driver_load,
+    check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload, restart_session,
+    start_session, verify_hosted_driver_load,
 };
 
 #[cfg(not(windows))]

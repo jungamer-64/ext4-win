@@ -81,7 +81,9 @@ fn random_files(image: &Path) -> io::Result<()> {
         file.sync_all()?;
         let mut writer = io::BufWriter::new(File::create(&requests)?);
         writeln!(writer, "mkdir /live-ci/random-io")?;
-        writeln!(writer, "set_inode_field /live-ci/random-io mode 040777")?;
+        writeln!(writer, "set_inode_field /live-ci/random-io mode 040755")?;
+        writeln!(writer, "set_inode_field /live-ci/random-io uid 1000")?;
+        writeln!(writer, "set_inode_field /live-ci/random-io gid 100")?;
         for (name, count, source) in [
             ("files", 8192, &regular),
             ("single", 1, &single),
@@ -90,8 +92,10 @@ fn random_files(image: &Path) -> io::Result<()> {
             writeln!(writer, "mkdir /live-ci/random-io/{name}")?;
             writeln!(
                 writer,
-                "set_inode_field /live-ci/random-io/{name} mode 040777"
+                "set_inode_field /live-ci/random-io/{name} mode 040755"
             )?;
+            writeln!(writer, "set_inode_field /live-ci/random-io/{name} uid 1000")?;
+            writeln!(writer, "set_inode_field /live-ci/random-io/{name} gid 100")?;
             let source = source
                 .to_str()
                 .ok_or_else(|| io::Error::other("non-UTF-8 fixture path"))?;
@@ -105,7 +109,15 @@ fn random_files(image: &Path) -> io::Result<()> {
                 )?;
                 writeln!(
                     writer,
-                    "set_inode_field /live-ci/random-io/{name}/file-{index:05} mode 0100666"
+                    "set_inode_field /live-ci/random-io/{name}/file-{index:05} mode 0100644"
+                )?;
+                writeln!(
+                    writer,
+                    "set_inode_field /live-ci/random-io/{name}/file-{index:05} uid 1000"
+                )?;
+                writeln!(
+                    writer,
+                    "set_inode_field /live-ci/random-io/{name}/file-{index:05} gid 100"
                 )?;
             }
         }

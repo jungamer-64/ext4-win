@@ -67,6 +67,8 @@ struct LiveState {
     wsl: WslAttachment,
     /// Nested driver lifecycle progress.
     driver: DriverStage,
+    /// Disposable ext4 UUID retained before identity-table effects, for query-based cleanup.
+    identity: Option<[u8; 16]>,
 }
 
 /// Monotonic acquisition of storage identity, independent of current attachment state.
@@ -430,15 +432,21 @@ fn format_storage(
         "debugfs",
         "-w",
         "-R",
-        "set_inode_field /live-ci mode 040777",
+        "set_inode_field /live-ci mode 040755",
         &partition,
     ])?;
+    for field in [
+        "set_inode_field /live-ci uid 1000",
+        "set_inode_field /live-ci gid 100",
+    ] {
+        wsl_words(&["--exec", "debugfs", "-w", "-R", field, &partition])?;
+    }
     let stat = wsl_words(&["--exec", "debugfs", "-R", "stat /live-ci", &partition])?;
     if !stat
         .split_whitespace()
         .collect::<Vec<_>>()
         .array_windows::<2>()
-        .any(|words| matches!(words, ["Mode:", "0777"]))
+        .any(|words| matches!(words, ["Mode:", "0755"]))
     {
         return Err(
             io::Error::other("test directory lacks explicit POSIX write permission").into(),
@@ -562,7 +570,6 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
     let root = mount.join("live-ci");
     let alpha = root.join("alpha.bin");
     let beta = root.join("beta.bin");
-    let link = root.join("beta-link.bin");
     let payload: Vec<_> = (0_usize..8192)
         .map(|index| u8::try_from(index % 251).map_err(io::Error::other))
         .collect::<io::Result<_>>()?;
@@ -581,30 +588,53 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
     )?;
     println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
+    let descriptor = windows_host::file_security(&alpha)?;
+    let expected = ext4_core::Ext4Security::new(
+        ext4_core::Ext4Owner::new(
+            ext4_core::Ext4Uid::from_u32(1000),
+            ext4_core::Ext4Gid::from_u32(100),
+        ),
+        ext4_core::Ext4Permissions::new(0o644)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?,
+    );
+    let actual = ext4_security::Descriptor::decode(
+        &descriptor,
+        &fixture_identity()?,
+        ext4_security::Components::ALL,
+        expected,
+    )
+    .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    if actual != expected {
+        return Err(io::Error::other(
+            "created inode owner/group/mode differs from effective identity",
+        )
+        .into());
+    }
+    windows_host::set_file_dacl(&alpha, &descriptor)?;
+    if windows_host::file_security(&alpha)? != descriptor {
+        return Err(
+            io::Error::other("native security descriptor round trip changed metadata").into(),
+        );
+    }
     println!("live filesystem I/O: read back payload");
     if fs::read(&alpha)? != payload {
         return Err(io::Error::other("live readback differs from payload").into());
     }
-    println!("live filesystem I/O: rename payload file");
-    fs::rename(&alpha, &beta)?;
-    println!("live filesystem I/O: create hard link");
-    fs::hard_link(&beta, &link)?;
-    println!("live filesystem I/O: enumerate hard-link names");
-    let names = windows_host::pattern_files(&root.join("beta*"))?;
-    if names.len() != 2
-        || !names.contains(&OsString::from("beta.bin"))
-        || !names.contains(&OsString::from("beta-link.bin"))
-    {
-        return Err(
-            io::Error::other("patterned enumeration did not return both hard-link names").into(),
-        );
+    println!("live filesystem I/O: verify explicit namespace-delete refusal");
+    match fs::rename(&alpha, &beta) {
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+        Err(error) => return Err(error.into()),
+        Ok(()) => {
+            return Err(io::Error::other("inode rwx unexpectedly granted namespace DELETE").into());
+        }
     }
+    exercise_identity_update(session, &alpha)?;
     println!("live filesystem I/O: open durability handle");
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(0x8000_0000)
-        .open(&beta)?;
+        .open(&alpha)?;
     println!("live filesystem I/O: flush payload");
     let operation = file.sync_all().map_err(Into::into);
     println!("live filesystem I/O: close durability handle");
@@ -656,6 +686,112 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
     session.publish(Phase::Observed(Operation::FilesystemIo))?;
     println!("live filesystem I/O: PASS");
     Ok(payload)
+}
+
+/// Replaces once after authoritative generation observation; acknowledgement failure is never retried.
+/// # Errors
+/// Returns uncertain query/effect, generation exhaustion or non-applied publication failure.
+fn replace_identity(
+    session: &mut Session<LiveState>,
+    uuid: ext4_core::FilesystemUuid,
+    map: ext4_security::IdentityMap,
+) -> TaskResult<()> {
+    let current = windows_host::query_identity(uuid)?;
+    if current.outcome == ext4_security::PublicationOutcome::Unknown
+        || current.saved_generation != current.active.generation
+    {
+        return Err(io::Error::other(
+            "identity publication requires reconciliation before replacement",
+        )
+        .into());
+    }
+    let generation = current
+        .active
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("identity generation exhausted"))?;
+    let replacement = ext4_security::Replacement::new(
+        current.active.generation,
+        ext4_security::MappingSnapshot {
+            uuid,
+            generation,
+            map,
+        },
+    )
+    .map_err(|error| io::Error::other(format!("{error:?}")))?;
+    session.state_mut().identity = Some(uuid.bytes());
+    session.publish(Phase::Intent(Operation::IdentityMapping))?;
+    let result = windows_host::replace_identity(replacement)?;
+    if result.outcome != ext4_security::PublicationOutcome::Applied
+        || result.active.generation != generation
+    {
+        return Err(
+            io::Error::other("identity replacement did not apply its durable successor").into(),
+        );
+    }
+    session.publish(Phase::Observed(Operation::IdentityMapping))
+}
+/// Builds the explicit disposable fixture's user and primary-group bindings.
+/// # Errors
+/// Returns native effective-token or mapping validation failure.
+fn fixture_identity() -> TaskResult<ext4_security::IdentityMap> {
+    let effective = windows_host::effective_identity()?;
+    Ok(ext4_security::IdentityMap::new(
+        vec![ext4_security::UserMapping {
+            sid: effective.user,
+            uid: ext4_core::Ext4Uid::from_u32(1000),
+        }],
+        vec![ext4_security::GroupMapping {
+            sid: effective.primary_group,
+            gid: ext4_core::Ext4Gid::from_u32(100),
+        }],
+    )
+    .map_err(|error| io::Error::other(format!("{error:?}")))?)
+}
+/// Configures the owned UUID after mounting, exercising live slot publication.
+/// # Errors
+/// Returns volume identification, configuration or native communication failure.
+fn configure_identity(session: &mut Session<LiveState>) -> TaskResult<()> {
+    let uuid = windows_host::volume_identity(
+        session
+            .state()
+            .volume()
+            .ok_or_else(|| io::Error::other("identity configuration lacks an owned volume"))?,
+    )?;
+    replace_identity(session, uuid, fixture_identity()?)
+}
+/// New opens observe mapping removal while an existing handle retains its acquired write authority.
+/// # Errors
+/// Returns unexpected admission, data effects, close or replacement failures.
+fn exercise_identity_update(session: &mut Session<LiveState>, path: &Path) -> TaskResult<()> {
+    let uuid = ext4_core::FilesystemUuid::from_bytes(
+        session
+            .state()
+            .identity
+            .ok_or_else(|| io::Error::other("identity update lacks UUID authority"))?,
+    );
+    let mut retained = OpenOptions::new().write(true).open(path)?;
+    let operation = (|| {
+        replace_identity(session, uuid, ext4_security::IdentityMap::empty())?;
+        match OpenOptions::new().write(true).open(path) {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error.into()),
+            Ok(file) => {
+                windows_host::close_file(file)?;
+                return Err(io::Error::other(
+                    "new open retained revoked identity write permission",
+                )
+                .into());
+            }
+        }
+        retained.write_all(&[0])?;
+        retained.sync_all()?;
+        replace_identity(session, uuid, fixture_identity()?)
+    })();
+    combine_verification_and_cleanup(
+        operation,
+        windows_host::close_file(retained).map_err(Into::into),
+    )
 }
 
 /// Reconciles native mounted state before issuing a clean dismount; failed acknowledgements are queried.
@@ -754,6 +890,7 @@ fn exercise_driver(
     run_checked(command, "live Driver Verifier activation")?;
     observe_verifier(session)?;
     let mount = mount_namespace(session)?;
+    configure_identity(session)?;
     let payload = exercise_io(session, &mount)?;
     if matches!(workload, LiveWorkload::RandomIo) {
         session.publish(Phase::Intent(Operation::FilesystemIo))?;
@@ -768,10 +905,32 @@ fn exercise_driver(
     remove_namespace(session)?;
     attachment(session, false)?;
     wait_removed(session)?;
+    session.publish(Phase::Intent(Operation::StopDriver))?;
+    driver_load::restart_session(root, session.id())?;
+    session.publish(Phase::Observed(Operation::StartDriver))?;
     attachment(session, true)?;
     let mount = mount_namespace(session)?;
-    if fs::read(mount.join("live-ci/beta-link.bin"))? != payload {
+    if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
         return Err(io::Error::other("hot-attached volume lost durable content").into());
+    }
+    let uuid = ext4_core::FilesystemUuid::from_bytes(
+        session
+            .state()
+            .identity
+            .ok_or_else(|| io::Error::other("reattachment lost ext4 identity"))?,
+    );
+    let restored = windows_host::query_identity(uuid)?;
+    if restored.saved_generation != restored.active.generation
+        || restored
+            .active
+            .map
+            .creator(
+                windows_host::effective_identity()?.user,
+                windows_host::effective_identity()?.primary_group,
+            )
+            .is_err()
+    {
+        return Err(io::Error::other("reattachment lost durable identity mapping").into());
     }
     storage::validate(&scope)?;
     observe_verifier(session)?;
@@ -819,6 +978,17 @@ fn cleanup(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
         session.publish(Phase::Intent(Operation::RemoveVhdx))?;
         fs::remove_file(vhdx(session))?;
         session.publish(Phase::Observed(Operation::RemoveVhdx))?;
+    }
+    if let Some(uuid) = session.state().identity
+        && windows_host::service_state("ext4win")? == Some(4)
+    {
+        let uuid = ext4_core::FilesystemUuid::from_bytes(uuid);
+        let observed = windows_host::query_identity(uuid)?;
+        if !observed.active.map.users().is_empty() || !observed.active.map.groups().is_empty() {
+            replace_identity(session, uuid, ext4_security::IdentityMap::empty())?;
+        }
+        session.state_mut().identity = None;
+        session.publish(Phase::Observed(Operation::IdentityMapping))?;
     }
     let driver_directory = root
         .join("target/driver-load-sessions")
@@ -877,6 +1047,7 @@ fn run_live_session(root: &Path, workload: LiveWorkload) -> TaskResult<()> {
         storage: StorageIdentity::Unobserved,
         wsl: WslAttachment::Detached,
         driver: DriverStage::Unstarted,
+        identity: None,
     };
     let mut session = Session::create(root, "live-vhdx-sessions", id, state)?;
     let trace = windows_host::TraceSession::start(

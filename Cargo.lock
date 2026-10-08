@@ -1069,6 +1069,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "ext4-core",
+ "ext4-security",
  "serde",
  "serde_json",
  "sha2",

@@ -467,6 +467,41 @@ pub(crate) fn start_session(
     Ok(())
 }
 
+/// Restarts the bound installed service after its disposable volumes have drained.
+/// # Errors
+/// Returns identity mismatch, an unresolved prior lifecycle state, retirement, stop or start failure.
+pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
+    let mut session = recovered(root, id)?;
+    bind_service(&mut session, true)?;
+    if windows_host::service_state("ext4win")? != Some(4) {
+        return Err(io::Error::other(
+            "restart requires an observed Running service; reconcile prior lifecycle intent first",
+        )
+        .into());
+    }
+    session.publish(Phase::Intent(Operation::PrepareUnload))?;
+    let mut request = Command::new(std::env::current_exe()?);
+    request.arg("prepare-driver-unload").arg(id.as_str());
+    let outcome = windows::bounded(request, Duration::from_secs(30))?;
+    if matches!(outcome, CommandOutcome::Uncertain { .. }) {
+        session.publish(Phase::Deferred(Operation::PrepareUnload))?;
+    }
+    let output = String::from_utf8(windows::checked_outcome(
+        outcome,
+        "identity restoration driver retirement",
+    )?)?;
+    if !matches!(output.lines().last(), Some("Retired" | "EndpointAbsent")) {
+        return Err(io::Error::other("invalid retirement acknowledgement").into());
+    }
+    session.publish(Phase::Observed(Operation::PrepareUnload))?;
+    scm(&mut session, Operation::StopDriver, "stop")?;
+    wait_state(1, Duration::from_secs(60))?;
+    session.publish(Phase::Observed(Operation::StopDriver))?;
+    scm(&mut session, Operation::StartDriver, "start")?;
+    wait_state(4, Duration::from_secs(15))?;
+    session.publish(Phase::Observed(Operation::StartDriver))
+}
+
 /// Acquires package identity only while a durable install intent authorizes reconciliation.
 /// # Errors
 /// Returns absent/ambiguous packages, byte mismatches or wrong service paths.

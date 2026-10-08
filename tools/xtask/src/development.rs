@@ -70,6 +70,22 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
             ),
             "native ETW host contract gate",
         )?;
+        run_checked(
+            cargo_command(
+                root,
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "windows-host",
+                    "native::identity::access_tests::native_explicit_privileges_contract",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                ],
+            ),
+            "native explicit security privilege contract",
+        )?;
         println!("native Windows host contracts: PASS");
         Ok(())
     }
@@ -127,6 +143,11 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
 #[cfg(windows)]
 fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
+        (
+            "identity-persistence",
+            "identity_persistence.tests.c",
+            "native identity persistence failure contract",
+        ),
         (
             "executive-resource",
             "executive_resource.tests.c",

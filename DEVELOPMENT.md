@@ -80,6 +80,54 @@ filesystem oracle. Native Windows handles, directory queries and ETW belong
 to `windows-host`. Hyper-V and certificate-store management commands return
 external observations; Rust owns identity checks, sequencing and recovery.
 
+## Volume identity administration
+
+`cargo run -p ext4ctl -- volumes` lists mounted ext4 UUIDs and Windows volume paths.
+`whoami` reports the effective token's user and primary-group SIDs, including thread impersonation.
+The secured control endpoint accepts only Administrators and SYSTEM; run identity administration
+from an elevated shell. UID and GID values are explicit filesystem identities, with no UID 0 bypass.
+
+```console
+cargo run -p ext4ctl -- whoami
+cargo run -p ext4ctl -- identity show <volume-path-or-ext4-uuid>
+cargo run -p ext4ctl -- identity replace <volume-path-or-ext4-uuid> --user <account-or-SID> <UID> --group <account-or-SID> <GID>
+cargo run -p ext4ctl -- identity clear <volume-path-or-ext4-uuid>
+```
+
+Repeat `--user` and `--group` for additional principals. Replacement contains the entire table;
+clear durably replaces it with an empty table. Both SID and numeric ID must be unique within each
+identity domain. Synthetic UNIX SIDs identify otherwise unmapped inode metadata and cannot alias
+another configured numeric identity. New inode creation requires explicit mappings for both
+effective token principals; existing inodes use their owner/group/other mode permissions.
+New files use 0644 and directories 0755. Parent setgid selects the inherited GID and propagates
+setgid to child directories.
+
+Configuration is keyed by ext4 UUID, shared by mounts of that UUID, and stored as the `Table`
+REG_BINARY value under the service's `Parameters\IdentityMappings\<UUID>` key. The driver validates
+saved tables before mount publication. Invalid saved records prevent driver initialization.
+Each open, traversal, security query or security mutation pins one table. Replacement affects
+subsequent operations; existing handles retain their previously granted rights. Data read/write
+uses that retained authority without reading the table or registry.
+
+`show` reports saved and applied generations, the last native status, and the commit phase.
+Replacement checks the observed generation, prepares storage, saves and flushes the whole value,
+then publishes the UUID's successor. NotSaved means no table effect was accepted;
+SavedNotApplied distinguishes a durable successor awaiting publication; Unknown requires query
+reconciliation. A query reads and flushes uncertain storage before publishing a validated result.
+A communication failure or cancellation is not evidence that replacement failed to persist.
+Query first and inspect the complete table and generations before deciding on another replacement.
+The CLI does not automatically retry an unacknowledged write or a generation conflict.
+
+Mode controls data, EA and mutable attribute rights through specific-right ACEs. Read attributes,
+READ_CONTROL and SYNCHRONIZE are common base rights. Maximum access checks individual rights with
+the same native subject, excluding implicit exploration of WRITE_OWNER, ACCESS_SYSTEM_SECURITY
+and namespace deletion. Explicit ownership/security privilege requests are checked by Windows.
+POSIX rwx does not grant DELETE; applications requesting it can receive access denied.
+Security queries support variable SID lengths and report the required size for short buffers.
+Security mutations accept only the owner/group/mode projection; arbitrary Windows ACLs are rejected.
+Native token oracles run in portable Windows tests; the elevated `verify-windows-host` gate also
+checks explicit ownership and security privileges.
+
 ## Ext4 durability and interoperability
 
 `verify-journal-interop` treats e2fsprogs as an independent oracle rather than

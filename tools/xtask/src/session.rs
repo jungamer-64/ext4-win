@@ -98,6 +98,8 @@ pub(crate) enum Operation {
     MountNamespace,
     /// Mount Manager namespace withdrawal.
     RemoveNamespace,
+    /// Whole identity-table replacement on the owned disposable ext4 UUID.
+    IdentityMapping,
     /// Observable file-system workload.
     FilesystemIo,
     /// Driver Verifier activation.
