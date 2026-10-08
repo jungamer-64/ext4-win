@@ -35,6 +35,8 @@ use super::scheduler::SlotId;
 /// One captured native call whose resource lease owns every identity through worker completion.
 #[derive(Debug)]
 pub(crate) enum PassiveWork {
+    /// Retained UUID update or reconciliation, owned through worker completion.
+    Identity(alloc::boxed::Box<crate::identity::IdentityWork>),
     /// Read sector geometry without blocking the actor or retaining its mounted-state borrow.
     SectorSize {
         /// Borrowed native admission; the suspended mounted operation and worker rundown
@@ -128,6 +130,8 @@ pub(crate) enum PassiveWork {
 /// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// Fully prepared response after persistence and publication finish.
+    Identity(alloc::vec::Vec<u8>),
     /// Native sector observation, including its exact failure status.
     SectorSize(DriverResult<crate::kernel::storage::SectorSizeInformation>),
     /// MDL chain acquisition and observed byte count.
@@ -247,6 +251,7 @@ impl PassiveWork {
     /// Executes the sole native call selected before the actor suspended.
     pub(super) fn execute(self) -> PassiveWorkCompletion {
         match self {
+            Self::Identity(work) => PassiveWorkCompletion::Identity((*work).execute()),
             Self::SectorSize {
                 query,
                 logical,
@@ -303,6 +308,7 @@ impl PassiveWork {
     /// Preserves the selected operation kind when worker preparation fails before queueing.
     pub(super) fn failed(self, error: DriverError) -> PassiveWorkCompletion {
         match self {
+            Self::Identity(work) => PassiveWorkCompletion::Identity((*work).failed(error)),
             Self::SectorSize { .. } => PassiveWorkCompletion::SectorSize(Err(error)),
             Self::Mdl { .. } => PassiveWorkCompletion::Mdl(Err(error)),
             Self::Read { .. } => PassiveWorkCompletion::Read(Err(error)),

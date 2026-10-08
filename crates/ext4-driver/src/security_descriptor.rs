@@ -6,6 +6,13 @@ use crate::kernel::status::{DriverError, DriverResult};
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SecurityDescriptorRef<'a> {
     /// Complete self-relative image retained by its descriptor owner.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "native SeAccessCheck is unavailable in the user-mode driver test executable"
+        )
+    )]
     bytes: &'a [u8],
 }
 
@@ -26,44 +33,17 @@ impl<'a> SecurityDescriptorRef<'a> {
     }
 
     /// Returns the borrowed address only for native input parameters.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "the user-mode driver tests cannot call the kernel Security Reference Monitor"
+        )
+    )]
     pub(crate) fn as_ptr(self) -> wdk_sys::PSECURITY_DESCRIPTOR {
         self.bytes.as_ptr().cast_mut().cast()
     }
 }
-
-/// Serialized `SECURITY_DESCRIPTOR_RELATIVE` header length.
-pub(crate) const SECURITY_DESCRIPTOR_RELATIVE_BYTES: usize = 20;
-/// Serialized SID bytes before the first sub-authority.
-pub(crate) const SID_PREFIX_BYTES: usize = 8;
-/// Serialized ACL header length.
-pub(crate) const ACL_HEADER_BYTES: usize = 8;
-/// Serialized ACCESS_ALLOWED_ACE bytes before its SID.
-pub(crate) const ACCESS_ALLOWED_ACE_PREFIX_BYTES: usize = 8;
-/// Serialized Linux UID/GID SID length (`S-1-22-{1,2}-id`).
-const LINUX_IDENTITY_SID_BYTES: usize = SID_PREFIX_BYTES + 2 * core::mem::size_of::<u32>();
-/// Serialized world SID length (`S-1-1-0`).
-const EVERYONE_SID_BYTES: usize = SID_PREFIX_BYTES + core::mem::size_of::<u32>();
-/// Exact canonical DACL length for owner, group, and world permission classes.
-const POSIX_DACL_BYTES: usize = ACL_HEADER_BYTES
-    + ACCESS_ALLOWED_ACE_PREFIX_BYTES
-    + LINUX_IDENTITY_SID_BYTES
-    + ACCESS_ALLOWED_ACE_PREFIX_BYTES
-    + LINUX_IDENTITY_SID_BYTES
-    + ACCESS_ALLOWED_ACE_PREFIX_BYTES
-    + EVERYONE_SID_BYTES;
-/// Header plus one serialized Linux identity SID.
-const SINGLE_IDENTITY_DESCRIPTOR_BYTES: usize =
-    SECURITY_DESCRIPTOR_RELATIVE_BYTES + LINUX_IDENTITY_SID_BYTES;
-/// Header plus both serialized Linux identity SIDs.
-const BOTH_IDENTITIES_DESCRIPTOR_BYTES: usize =
-    SINGLE_IDENTITY_DESCRIPTOR_BYTES + LINUX_IDENTITY_SID_BYTES;
-/// Header plus the canonical POSIX DACL.
-const DACL_DESCRIPTOR_BYTES: usize = SECURITY_DESCRIPTOR_RELATIVE_BYTES + POSIX_DACL_BYTES;
-/// Header, one Linux identity SID, and the canonical POSIX DACL.
-const IDENTITY_AND_DACL_DESCRIPTOR_BYTES: usize = DACL_DESCRIPTOR_BYTES + LINUX_IDENTITY_SID_BYTES;
-/// Header, both Linux identity SIDs, and the canonical POSIX DACL.
-const COMPLETE_DESCRIPTOR_BYTES: usize =
-    IDENTITY_AND_DACL_DESCRIPTOR_BYTES + LINUX_IDENTITY_SID_BYTES;
 
 /// Selection state for one self-relative security descriptor component.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,15 +69,6 @@ pub(crate) struct SecuritySelection {
 }
 
 impl SecuritySelection {
-    /// Selects every component represented by the ext4 owner/mode security model.
-    pub(crate) const fn complete() -> Self {
-        Self::from_components(
-            SecurityComponentSelection::Selected,
-            SecurityComponentSelection::Selected,
-            SecurityComponentSelection::Selected,
-        )
-    }
-
     /// Builds a security selection from already-decoded component states.
     pub(crate) const fn from_components(
         owner: SecurityComponentSelection,
@@ -133,21 +104,6 @@ impl SecuritySelection {
         ))
     }
 
-    /// Returns owner SID selection.
-    pub(crate) const fn owner(self) -> SecurityComponentSelection {
-        self.owner
-    }
-
-    /// Returns group SID selection.
-    pub(crate) const fn group(self) -> SecurityComponentSelection {
-        self.group
-    }
-
-    /// Returns DACL selection.
-    pub(crate) const fn dacl(self) -> SecurityComponentSelection {
-        self.dacl
-    }
-
     /// Reconstructs the validated `SECURITY_INFORMATION` mask for native validation.
     pub(crate) const fn required_information(self) -> wdk_sys::SECURITY_INFORMATION {
         let mut information = 0;
@@ -162,7 +118,6 @@ impl SecuritySelection {
         }
         information
     }
-
 }
 
 /// Converts one security bit into component selection.
@@ -179,41 +134,7 @@ const fn security_component(
 
 #[cfg(test)]
 mod tests {
-    use super::{SecurityComponentSelection, SecuritySelection};
-
-    /// # Panics
-    ///
-    /// Panics when descriptor layout planning diverges from the fixed Windows encoding.
-    #[test]
-    fn query_descriptor_lengths_are_exact_for_every_component_combination() {
-        let omitted = SecurityComponentSelection::Omitted;
-        let selected = SecurityComponentSelection::Selected;
-
-        assert_eq!(
-            SecuritySelection::from_components(omitted, omitted, omitted).query_descriptor_length(),
-            20
-        );
-        assert_eq!(
-            SecuritySelection::from_components(selected, omitted, omitted)
-                .query_descriptor_length(),
-            36
-        );
-        assert_eq!(
-            SecuritySelection::from_components(omitted, selected, omitted)
-                .query_descriptor_length(),
-            36
-        );
-        assert_eq!(
-            SecuritySelection::from_components(omitted, omitted, selected)
-                .query_descriptor_length(),
-            96
-        );
-        assert_eq!(
-            SecuritySelection::from_components(selected, selected, selected)
-                .query_descriptor_length(),
-            128
-        );
-    }
+    use super::SecuritySelection;
 
     /// # Panics
     ///

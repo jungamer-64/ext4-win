@@ -50,7 +50,32 @@ impl MappingState {
     /// # Errors
     /// Propagates bounded allocation and table encoding failures.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
-        let record = self.active.encode()?;
+        Ok(MappingReply::prepare(&self.active)?.complete(
+            self.outcome,
+            self.status,
+            self.saved_generation,
+        ))
+    }
+    /// Decodes a complete observed state without collapsing commit phases into an error string.
+    /// # Errors
+    /// Rejects malformed headers, phases or inconsistent applied generations.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        decode_state(bytes)
+    }
+}
+
+/// Reply storage prepared before persistence; completion only changes fixed status fields.
+#[derive(Debug)]
+pub struct MappingReply {
+    /// Complete wire record with reserved status header.
+    bytes: Vec<u8>,
+}
+impl MappingReply {
+    /// Captures the immutable active table and allocates the entire reply before an effect.
+    /// # Errors
+    /// Returns allocation or record-size failure.
+    pub fn prepare(active: &MappingSnapshot) -> Result<Self, Error> {
+        let record = active.encode()?;
         let mut bytes = Vec::new();
         reserve(
             &mut bytes,
@@ -59,61 +84,80 @@ impl MappingState {
                 .ok_or(Error::RecordTooLarge)?,
         )?;
         bytes.extend_from_slice(b"E4IS\x01\0\0\0");
-        bytes.extend_from_slice(&self.outcome.tag().to_le_bytes());
-        bytes.extend_from_slice(&self.status.to_le_bytes());
-        bytes.extend_from_slice(&self.saved_generation.to_le_bytes());
-        bytes.extend_from_slice(&self.active.generation.to_le_bytes());
+        bytes.extend_from_slice(&[0; 16]);
+        bytes.extend_from_slice(&active.generation.to_le_bytes());
         bytes.extend_from_slice(&record);
-        Ok(bytes)
+        Ok(Self { bytes })
     }
-    /// Decodes a complete observed state without collapsing commit phases into an error string.
-    /// # Errors
-    /// Rejects malformed headers, phases or inconsistent applied generations.
-    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.get(..8) != Some(b"E4IS\x01\0\0\0") {
-            return Err(Error::InvalidEncoding);
-        }
-        let outcome = match crate::u32_at(bytes, 8)? {
-            0 => PublicationOutcome::NotSaved,
-            1 => PublicationOutcome::SavedNotApplied,
-            2 => PublicationOutcome::Applied,
-            3 => PublicationOutcome::Unknown,
-            4 => PublicationOutcome::Conflict,
-            _ => return Err(Error::InvalidEncoding),
-        };
-        let status = i32::from_le_bytes(
-            bytes
-                .get(12..16)
-                .ok_or(Error::InvalidEncoding)?
-                .try_into()
-                .map_err(|_| Error::InvalidEncoding)?,
-        );
-        let saved_generation = scalar64(bytes, 16)?;
-        let generation = scalar64(bytes, 24)?;
-        let active = MappingSnapshot::decode(
-            bytes
-                .get(CONTROL_REPLY_BYTES..)
-                .ok_or(Error::InvalidEncoding)?,
-        )?;
-        if active.generation != generation {
-            return Err(Error::InvalidEncoding);
-        }
-        Ok(Self {
-            outcome,
-            status,
-            saved_generation,
-            active,
-        })
+    /// Exact native output admission charge for this prepared table.
+    pub fn required_length(&self) -> usize {
+        self.bytes.len()
     }
+    /// Completes a preallocated reply without allocation or fallible encoding after persistence.
+    pub fn complete(mut self, outcome: PublicationOutcome, status: i32, saved: u64) -> Vec<u8> {
+        let fields = outcome
+            .tag()
+            .to_le_bytes()
+            .into_iter()
+            .chain(status.to_le_bytes())
+            .chain(saved.to_le_bytes());
+        for (target, value) in self.bytes.iter_mut().skip(8).zip(fields) {
+            *target = value;
+        }
+        self.bytes
+    }
+}
+/// Parses one complete control observation.
+/// # Errors
+/// Rejects malformed headers, phases or inconsistent applied generations.
+fn decode_state(bytes: &[u8]) -> Result<MappingState, Error> {
+    if bytes.get(..8) != Some(b"E4IS\x01\0\0\0") {
+        return Err(Error::InvalidEncoding);
+    }
+    let outcome = match crate::u32_at(bytes, 8)? {
+        0 => PublicationOutcome::NotSaved,
+        1 => PublicationOutcome::SavedNotApplied,
+        2 => PublicationOutcome::Applied,
+        3 => PublicationOutcome::Unknown,
+        4 => PublicationOutcome::Conflict,
+        _ => return Err(Error::InvalidEncoding),
+    };
+    let status = i32::from_le_bytes(
+        bytes
+            .get(12..16)
+            .ok_or(Error::InvalidEncoding)?
+            .try_into()
+            .map_err(|_| Error::InvalidEncoding)?,
+    );
+    let saved_generation = scalar64(bytes, 16)?;
+    let generation = scalar64(bytes, 24)?;
+    let active = MappingSnapshot::decode(
+        bytes
+            .get(CONTROL_REPLY_BYTES..)
+            .ok_or(Error::InvalidEncoding)?,
+    )?;
+    if active.generation != generation
+        || saved_generation < generation
+        || (outcome == PublicationOutcome::Applied && saved_generation != generation)
+        || (outcome == PublicationOutcome::SavedNotApplied && saved_generation == generation)
+    {
+        return Err(Error::InvalidEncoding);
+    }
+    Ok(MappingState {
+        outcome,
+        status,
+        saved_generation,
+        active,
+    })
 }
 
 /// Prepared full-table replacement; expected generation is a compare-and-swap requirement.
 #[derive(Debug, Eq, PartialEq)]
 pub struct Replacement {
     /// Observed active generation the administrator intends to replace.
-    pub expected_generation: u64,
+    expected_generation: u64,
     /// Complete validated successor with generation exactly expected + 1.
-    pub next: MappingSnapshot,
+    next: MappingSnapshot,
 }
 impl Replacement {
     /// Establishes monotonic generation before any persistent effect.
@@ -127,6 +171,18 @@ impl Replacement {
             expected_generation,
             next,
         })
+    }
+    /// Generation whose authority must still hold when the driver reserves this UUID.
+    pub const fn expected_generation(&self) -> u64 {
+        self.expected_generation
+    }
+    /// Borrows the validated immutable successor for pre-effect reply construction.
+    pub const fn next(&self) -> &MappingSnapshot {
+        &self.next
+    }
+    /// Consumes replacement preparation into its sole successor publication owner.
+    pub fn into_next(self) -> MappingSnapshot {
+        self.next
     }
     /// Encodes the successor record; its generation also encodes the CAS expectation.
     /// # Errors

@@ -572,6 +572,12 @@ pub(crate) struct MountedVolumeAccess<'volume> {
 }
 
 impl MountedVolumeAccess<'_> {
+    /// Pins the UUID identity table only for metadata/security operation admission.
+    /// # Errors
+    /// Returns finite reference-budget exhaustion.
+    pub(crate) fn identity_snapshot(&self) -> DriverResult<crate::identity::IdentitySnapshot> {
+        self.volume.runtime.identity.get().capture()
+    }
     /// Lends the cache to one synchronous pass while retaining independent driver authorities.
     /// The sole reactor actor cannot admit another pass while this closure runs. The owner is
     /// restored before any returned scheduler transition is acted upon; no cache borrow can

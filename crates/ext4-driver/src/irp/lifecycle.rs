@@ -859,6 +859,12 @@ impl<'a> PendingIrpLease<'a> {
         operation(&mut active)
     }
 
+    /// Transfers the captured administrative command to its sole operation owner.
+    /// # Errors
+    /// Rejects a request with another captured kind or a consumed command.
+    pub(crate) fn take_identity(&mut self) -> DriverResult<crate::identity::IdentityCommand> {
+        self.owner.context.take_identity()
+    }
     /// Borrows the read payload captured before queue insertion.
     /// # Errors
     ///

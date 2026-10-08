@@ -21,7 +21,6 @@ use super::{
     WriteStartingPoint,
 };
 use crate::kernel::status::DriverError;
-use crate::security_descriptor::SecurityComponentSelection;
 use crate::state::{KernelDevice, KernelFileObject, WriteCommitment};
 
 /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
@@ -1621,16 +1620,8 @@ fn query_security_stack_preserves_file_object_information_and_length() {
                 }
             );
             assert_eq!(
-                query.selection().owner(),
-                SecurityComponentSelection::Selected
-            );
-            assert_eq!(
-                query.selection().group(),
-                SecurityComponentSelection::Omitted
-            );
-            assert_eq!(
-                query.selection().dacl(),
-                SecurityComponentSelection::Selected
+                query.selection().required_information(),
+                wdk_sys::OWNER_SECURITY_INFORMATION | wdk_sys::DACL_SECURITY_INFORMATION
             );
             assert_eq!(query.length().as_usize(), 256);
         }
@@ -1812,14 +1803,9 @@ fn set_security_stack_preserves_file_object_information_and_descriptor() {
                 }
             );
             assert_eq!(
-                set.selection().owner(),
-                SecurityComponentSelection::Selected
+                set.selection().required_information(),
+                wdk_sys::OWNER_SECURITY_INFORMATION | wdk_sys::GROUP_SECURITY_INFORMATION
             );
-            assert_eq!(
-                set.selection().group(),
-                SecurityComponentSelection::Selected
-            );
-            assert_eq!(set.selection().dacl(), SecurityComponentSelection::Omitted);
             assert_eq!(set.security_descriptor_source(), descriptor);
         }
     }
@@ -2056,7 +2042,10 @@ fn forced_user_access_does_not_reuse_kernel_grants() -> Result<(), DriverError> 
         ),
         ext4_core::Ext4Permissions::new(0)?,
     );
-    let descriptor = crate::request::security::CreateSecurityDescriptor::from_security(security)?;
+    let descriptor = crate::request::security::CreateSecurityDescriptor::from_security(
+        security,
+        &ext4_security::IdentityMap::empty(),
+    )?;
     let requested = super::DesiredAccess::from_raw(wdk_sys::GENERIC_WRITE);
     for policy in [
         CreateAccessCheck::HonorRequestorMode,

@@ -40,6 +40,8 @@ pub(crate) enum DriverError {
     SecurityCheckFailed(NTSTATUS),
     /// Privileges used by a successful check could not be recorded in the create access state.
     PrivilegeRecordingFailed(NTSTATUS),
+    /// Identity registry access failed with this exact native status.
+    RegistryFailure(NTSTATUS),
     /// Cache Manager or Memory Manager rejected an operation with this exact status.
     CacheManagerFailure(NTSTATUS),
     /// The storage sector query failed with an exact native status; no filesystem mutation occurred.
@@ -142,7 +144,8 @@ impl DriverError {
             | Self::PrivilegeRecordingFailed(status)
             | Self::CacheManagerFailure(status)
             | Self::SectorQueryFailure(status)
-            | Self::OplockFailure(status) => status,
+            | Self::OplockFailure(status)
+            | Self::RegistryFailure(status) => status,
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),
             Self::DeviceBusy => ntstatus(0xC000_009E),
@@ -250,6 +253,20 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::ClusterReferenceConflict
         | Error::JournalCorrupt
         | Error::ChecksumMismatch => STATUS_FILE_CORRUPT_ERROR,
+    }
+}
+
+/// Preserves physical allocation failure and rejects invalid portable representations.
+impl From<ext4_security::Error> for DriverError {
+    fn from(error: ext4_security::Error) -> Self {
+        match error {
+            ext4_security::Error::AllocationFailed => Self::InsufficientResources,
+            ext4_security::Error::UnmappedIdentity => Self::AccessDenied,
+            ext4_security::Error::UnrepresentableDescriptor => Self::NotSupported,
+            ext4_security::Error::InvalidEncoding
+            | ext4_security::Error::DuplicateIdentity
+            | ext4_security::Error::RecordTooLarge => Self::InvalidParameter,
+        }
     }
 }
 

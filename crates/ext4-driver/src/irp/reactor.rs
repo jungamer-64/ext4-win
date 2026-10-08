@@ -367,7 +367,11 @@ impl CompletionEvent {
 /// Operation payload valid only for the file-system control device.
 pub(crate) trait ControlDeviceOperation: fmt::Debug + Send + 'static {
     /// Consumes one control-device event without any mounted-volume authority.
-    fn advance_control(self: Box<Self>, event: OperationEvent) -> OperationTransition;
+    fn advance_control(
+        self: Box<Self>,
+        event: OperationEvent,
+        catalog: &mut crate::identity::IdentityCatalog,
+    ) -> OperationTransition;
 
     /// Records a lower-storage failure owned by the control-device operation.
     fn record_control_storage_failure(&mut self, failure: StorageFailureClass);
@@ -880,7 +884,7 @@ unsafe impl Sync for DelayedCloseTimerEnvelope {}
 #[derive(Debug)]
 pub(crate) enum ReactorTarget {
     /// File-system control device; no mounted state exists.
-    ControlDevice,
+    ControlDevice(crate::identity::IdentityCatalog),
     /// Mounted device whose VCB can be entered only on the sole actor thread.
     MountedVolume(MountedVolumeBinding),
 }
@@ -896,7 +900,7 @@ impl ReactorTarget {
         &mut self,
     ) -> DriverResult<Option<crate::kernel::stream::StorageSubmissionLease>> {
         match self {
-            Self::ControlDevice => Ok(None),
+            Self::ControlDevice(_) => Ok(None),
             Self::MountedVolume(binding) => binding
                 .with_access(|access| access.acquire_storage_submission())
                 .map(Some),
@@ -907,7 +911,7 @@ impl ReactorTarget {
     #[cfg(not(test))]
     fn observe_storage_removal(&mut self) -> Option<VolumeRetirement> {
         match self {
-            Self::ControlDevice => None,
+            Self::ControlDevice(_) => None,
             Self::MountedVolume(binding) => {
                 binding.with_access(|access| access.observe_storage_removal())
             }
@@ -918,7 +922,7 @@ impl ReactorTarget {
     #[cfg(not(test))]
     fn recheck_terminal_retirement(&mut self) -> VolumeRetirement {
         match self {
-            Self::ControlDevice => VolumeRetirement::Retained,
+            Self::ControlDevice(_) => VolumeRetirement::Retained,
             Self::MountedVolume(binding) => {
                 binding.with_access(|access| access.recheck_terminal_retirement())
             }
@@ -926,9 +930,17 @@ impl ReactorTarget {
     }
     /// Confirms that an operation belongs to the control-device shell.
     pub(crate) fn require_control_device(&self) {
-        if !matches!(self, Self::ControlDevice) {
+        if !matches!(self, Self::ControlDevice(_)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
+    }
+
+    /// Borrows only control-actor catalog authority during one non-suspending callback.
+    pub(crate) fn control_catalog(&mut self) -> &mut crate::identity::IdentityCatalog {
+        let Self::ControlDevice(catalog) = self else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        catalog
     }
 
     /// Enters the non-cloneable mounted binding for one non-suspending operation callback.
@@ -946,7 +958,7 @@ impl ReactorTarget {
     #[cfg(not(test))]
     fn delayed_close_pending(&mut self) -> bool {
         match self {
-            Self::ControlDevice => false,
+            Self::ControlDevice(_) => false,
             Self::MountedVolume(binding) => {
                 binding.with_access(|access| access.delayed_close_pending())
             }
@@ -2375,7 +2387,7 @@ impl CompletionReactor {
                 // SAFETY: Join and rundown closure grant terminal exclusive shell access.
                 &mut *reactor.target.get()
             },
-            ReactorTarget::ControlDevice,
+            ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
         );
         unsafe {
             // SAFETY: Rust-owned fields are released exactly once before extension bytes vanish.
@@ -4839,7 +4851,7 @@ mod tests {
             CompletionReactor::initialize_at(
                 storage.as_mut_ptr(),
                 device,
-                super::ReactorTarget::ControlDevice,
+                super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
                 OperationalTrace::host_test(),
             )
         };
@@ -4993,7 +5005,8 @@ mod tests {
         failure: StorageFailureClass,
         event: CompletionEvent,
     ) -> OperationTransition {
-        let mut target = super::ReactorTarget::ControlDevice;
+        let mut target =
+            super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty());
         operation.record_storage_failure(failure, &mut target);
         operation.advance(event, &mut target)
     }
@@ -5048,6 +5061,9 @@ mod tests {
                     return;
                 };
                 match completion {
+                    crate::irp::PassiveWorkCompletion::Identity(bytes) => {
+                        let _bytes = bytes;
+                    }
                     crate::irp::PassiveWorkCompletion::SectorSize(result) => {
                         let _result = result;
                     }
@@ -5200,7 +5216,8 @@ mod tests {
         let admitted = AdmittedOperation::new(test_operation!(), cleanup);
         let (operation, admission) = admitted.into_parts();
         assert_eq!(admission, cleanup);
-        let mut target = super::ReactorTarget::ControlDevice;
+        let mut target =
+            super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty());
         assert!(matches!(
             operation.advance(CompletionEvent::Core(OperationEvent::Admitted), &mut target),
             OperationTransition::Retired
@@ -5230,7 +5247,7 @@ mod tests {
             CompletionReactor::initialize_at(
                 storage.as_mut_ptr(),
                 device,
-                super::ReactorTarget::ControlDevice,
+                super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
                 OperationalTrace::host_test(),
             )
         };
@@ -5302,7 +5319,7 @@ mod tests {
             // SAFETY: The preceding transition quiesced the reactor at this stable address.
             CompletionReactor::release_quiesced_at(storage.as_mut_ptr())
         };
-        assert!(matches!(target, super::ReactorTarget::ControlDevice));
+        assert!(matches!(target, super::ReactorTarget::ControlDevice(_)));
     }
 
     /// # Panics

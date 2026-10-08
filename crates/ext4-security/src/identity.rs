@@ -221,6 +221,8 @@ pub struct GroupMapping {
     pub gid: Ext4Gid,
 }
 /// Immutable bidirectional identity table with one authority per identity domain.
+/// Synthetic UNIX SID namespaces are reserved for their corresponding numeric identity, so an
+/// unmapped inode's display SID cannot alias another mapped owner or break descriptor round trips.
 #[derive(Debug, Eq, PartialEq)]
 pub struct IdentityMap {
     /// Unique user identities.
@@ -241,6 +243,14 @@ impl IdentityMap {
     /// Rejects duplicate SIDs/numeric IDs or a record beyond the byte budget.
     pub fn new(users: Vec<UserMapping>, groups: Vec<GroupMapping>) -> Result<Self, Error> {
         for (index, entry) in users.iter().enumerate() {
+            if entry
+                .sid
+                .unix_identity(1)
+                .is_some_and(|id| id != entry.uid.as_u32())
+                || entry.sid.unix_identity(2).is_some()
+            {
+                return Err(Error::DuplicateIdentity);
+            }
             if users
                 .iter()
                 .take(index)
@@ -250,6 +260,14 @@ impl IdentityMap {
             }
         }
         for (index, entry) in groups.iter().enumerate() {
+            if entry
+                .sid
+                .unix_identity(2)
+                .is_some_and(|id| id != entry.gid.as_u32())
+                || entry.sid.unix_identity(1).is_some()
+            {
+                return Err(Error::DuplicateIdentity);
+            }
             if groups
                 .iter()
                 .take(index)
@@ -298,7 +316,11 @@ impl IdentityMap {
             .iter()
             .find(|entry| entry.sid == sid)
             .map(|entry| entry.uid)
-            .or_else(|| sid.unix_identity(1).map(Ext4Uid::from_u32))
+            .or_else(|| {
+                sid.unix_identity(1)
+                    .filter(|id| self.users.iter().all(|entry| entry.uid.as_u32() != *id))
+                    .map(Ext4Uid::from_u32)
+            })
             .ok_or(Error::UnmappedIdentity)
     }
     /// Interprets a group SID, including unmapped inode GID presentation.
@@ -309,7 +331,11 @@ impl IdentityMap {
             .iter()
             .find(|entry| entry.sid == sid)
             .map(|entry| entry.gid)
-            .or_else(|| sid.unix_identity(2).map(Ext4Gid::from_u32))
+            .or_else(|| {
+                sid.unix_identity(2)
+                    .filter(|id| self.groups.iter().all(|entry| entry.gid.as_u32() != *id))
+                    .map(Ext4Gid::from_u32)
+            })
             .ok_or(Error::UnmappedIdentity)
     }
     /// Captures creation identity only from explicitly configured effective token principals.

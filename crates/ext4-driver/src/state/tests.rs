@@ -58,7 +58,7 @@ fn retired_device_header_rejects_actor_access_and_retains_its_tag() -> Result<()
             storage.as_mut_ptr(),
             DeviceExtensionKind::CONTROL,
             device,
-            super::ReactorTarget::ControlDevice,
+            super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
             crate::kernel::operational_trace::OperationalTrace::host_test(),
         )?;
     }
@@ -71,7 +71,7 @@ fn retired_device_header_rejects_actor_access_and_retains_its_tag() -> Result<()
         // SAFETY: This fixture owns the sole retirement call and no actor borrow is live.
         header.retire()
     };
-    assert!(matches!(target, super::ReactorTarget::ControlDevice));
+    assert!(matches!(target, super::ReactorTarget::ControlDevice(_)));
     assert_eq!(
         DriverDeviceKind::decode(header.kind),
         Ok(DriverDeviceKind::Control)

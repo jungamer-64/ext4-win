@@ -1,6 +1,8 @@
 //! Create-request access, sharing, disposition, and option contracts.
 
 use super::*;
+#[cfg(not(test))]
+use crate::memory::DriverVec;
 
 /// Decoded create/open parameters.
 #[derive(Clone, Copy, Debug)]
@@ -404,6 +406,66 @@ impl GrantedAccess {
 }
 
 impl CreateAccessState<'_> {
+    /// Maps the effective captured token's user and primary group before preparing a new inode.
+    /// # Errors
+    /// Rejects unmapped principals and preserves token-query/resource failures.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the native token boundary returns bounded copied SIDs from the retained subject"
+        )
+    )]
+    pub(crate) fn creator_identity(
+        &mut self,
+        map: &ext4_security::IdentityMap,
+    ) -> DriverResult<ext4_core::Ext4Owner> {
+        #[cfg(not(test))]
+        {
+            let mut user = [0_u8; 68];
+            let mut group = [0_u8; 68];
+            let mut user_len = 0;
+            let mut group_len = 0;
+            let subject = unsafe {
+                // SAFETY: This create IRP retains ACCESS_STATE through the complete call.
+                core::ptr::addr_of_mut!((*self.access_state.as_ptr()).SubjectSecurityContext)
+            };
+            let status = unsafe {
+                // SAFETY: The ACCESS_STATE subject is retained by this IRP and output arrays are writable.
+                ffi::ext4win_creator_sids(
+                    subject,
+                    user.as_mut_ptr(),
+                    core::ptr::addr_of_mut!(user_len),
+                    group.as_mut_ptr(),
+                    core::ptr::addr_of_mut!(group_len),
+                )
+            };
+            if status < 0 {
+                return Err(DriverError::SecurityCheckFailed(status));
+            }
+            let user_len =
+                usize::try_from(user_len).map_err(|_| DriverError::InternalInvariantViolation)?;
+            let group_len =
+                usize::try_from(group_len).map_err(|_| DriverError::InternalInvariantViolation)?;
+            Ok(map.creator(
+                ext4_security::Sid::parse(
+                    user.get(..user_len)
+                        .ok_or(DriverError::InternalInvariantViolation)?,
+                )?,
+                ext4_security::Sid::parse(
+                    group
+                        .get(..group_len)
+                        .ok_or(DriverError::InternalInvariantViolation)?,
+                )?,
+            )?)
+        }
+        #[cfg(test)]
+        {
+            let _map = map;
+            Err(DriverError::NotSupported)
+        }
+    }
+
     /// Returns whether path traversal must be checked directory by directory.
     #[expect(
         unsafe_code,
@@ -433,7 +495,7 @@ impl CreateAccessState<'_> {
         let kernel_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
             .map_err(|_| DriverError::InternalInvariantViolation)?;
         if self.access_mode == kernel_mode {
-            let granted = unrestricted_file_access(requested.as_raw());
+            let granted = trusted_kernel_access(requested.as_raw());
             let state = unsafe {
                 // SAFETY: The active create is the sole ACCESS_STATE executor; no native call
                 // overlaps this field update.
@@ -497,36 +559,6 @@ impl CreateAccessState<'_> {
         self.check(descriptor, required, 0).map(|_| ())
     }
 
-    /// Authorizes creation in the containing directory, including privilege-only rights, before
-    /// recording the initial handle's rights. Parent creation permission cannot grant SACL access.
-    /// # Errors
-    ///
-    /// Returns the parent access-check or explicit privilege-check failure without granting a
-    /// handle. No ACCESS_STATE rights are published until both checks succeed.
-    #[expect(
-        unsafe_code,
-        reason = "the active create owner exclusively records newly-created handle authority"
-    )]
-    pub(crate) fn authorize_child_creation(
-        &mut self,
-        parent: SecurityDescriptorRef<'_>,
-        required: wdk_sys::ACCESS_MASK,
-        requested: DesiredAccess,
-    ) -> DriverResult<GrantedAccess> {
-        self.authorize_operation(parent, required)?;
-        self.authorize_operation(parent, requested.as_raw() & wdk_sys::ACCESS_SYSTEM_SECURITY)?;
-        let granted = unrestricted_file_access(requested.as_raw());
-        let state = unsafe {
-            // SAFETY: This owner-bound mutable view is the sole create executor touching ACCESS_STATE.
-            self.access_state.as_mut()
-        };
-        state.PreviouslyGrantedAccess = granted;
-        state.RemainingDesiredAccess = 0;
-        Ok(GrantedAccess::from_authorized(
-            state.PreviouslyGrantedAccess,
-        ))
-    }
-
     /// Performs one descriptor check while retaining all privilege cleanup responsibility.
     /// # Errors
     ///
@@ -553,67 +585,108 @@ impl CreateAccessState<'_> {
             // valid through both this preparation and the access check below.
             ffi::SeSetAccessStateGenericMapping(self.access_state.as_ptr(), mapping);
         }
-        let state = unsafe {
-            // SAFETY: The active create owner retains exclusive mutation authority for ACCESS_STATE.
-            self.access_state.as_mut()
-        };
-        let mut privileges: wdk_sys::PPRIVILEGE_SET = core::ptr::null_mut();
-        let mut granted = 0;
-        let mut access_status = wdk_sys::STATUS_ACCESS_DENIED;
-        unsafe {
-            // SAFETY: The subject context is embedded in the live ACCESS_STATE and remains locked
-            // only across this non-panicking SeAccessCheck call.
-            ffi::SeLockSubjectContext(core::ptr::addr_of_mut!(state.SubjectSecurityContext));
-        }
-        let allowed = unsafe {
-            // SAFETY: Every pointer names live storage for the duration of the call; the complete
-            // self-relative descriptor is owned by the create resolve pass.
-            ffi::SeAccessCheck(
-                descriptor.as_ptr(),
-                core::ptr::addr_of_mut!(state.SubjectSecurityContext),
-                1,
-                desired,
-                previously_granted,
-                core::ptr::addr_of_mut!(privileges),
-                mapping,
-                self.access_mode,
-                core::ptr::addr_of_mut!(granted),
-                core::ptr::addr_of_mut!(access_status),
-            )
+        // Reserve privilege ownership before locking the subject or evaluating authority.
+        let mut privilege_sets = DriverVec::try_with_capacity(
+            ext4_security::MAXIMUM_CANDIDATES
+                .len()
+                .checked_add(1)
+                .ok_or(DriverError::InvalidBufferSize)?,
+        )?;
+        let context = unsafe {
+            // SAFETY: The live IRP retains this owner-bound ACCESS_STATE throughout all checks.
+            core::ptr::addr_of_mut!((*self.access_state.as_ptr()).SubjectSecurityContext)
         };
         unsafe {
-            // SAFETY: This exactly balances the immediately preceding subject-context lock.
-            ffi::SeUnlockSubjectContext(core::ptr::addr_of_mut!(state.SubjectSecurityContext));
+            // SAFETY: Context belongs to the retained ACCESS_STATE; all probes share this lock.
+            ffi::SeLockSubjectContext(context);
         }
-
-        let append_status = if allowed != 0 && !privileges.is_null() {
-            Some(unsafe {
-                // SAFETY: SeAccessCheck returned this privilege set and the active ACCESS_STATE is
-                // the required destination for audit/close semantics.
-                ffi::SeAppendPrivileges(self.access_state.as_ptr(), privileges)
-            })
-        } else {
-            None
-        };
-        if !privileges.is_null() {
+        let result =
+            ext4_security::evaluate_access(desired, previously_granted, |wanted, previous| {
+                let mut privileges: wdk_sys::PPRIVILEGE_SET = core::ptr::null_mut();
+                let mut granted = 0;
+                let mut status = wdk_sys::STATUS_ACCESS_DENIED;
+                let allowed = unsafe {
+                    // SAFETY: Every pointer names live storage; wanted contains no MAXIMUM_ALLOWED.
+                    // The same descriptor, mapping and locked subject are retained for every probe.
+                    ffi::SeAccessCheck(
+                        descriptor.as_ptr(),
+                        context,
+                        1,
+                        wanted,
+                        previous,
+                        core::ptr::addr_of_mut!(privileges),
+                        mapping,
+                        self.access_mode,
+                        core::ptr::addr_of_mut!(granted),
+                        core::ptr::addr_of_mut!(status),
+                    )
+                };
+                if !privileges.is_null() {
+                    if allowed != 0 {
+                        if let Err(error) = privilege_sets.push_reserved_owned(privileges) {
+                            unsafe {
+                                // SAFETY: The failed insertion leaves this returned allocation owned here.
+                                ffi::SeFreePrivileges(privileges);
+                            }
+                            return Err(error.into_parts().0);
+                        }
+                    } else {
+                        unsafe {
+                            // SAFETY: Failed checks cannot transfer privilege ownership to the handle.
+                            ffi::SeFreePrivileges(privileges);
+                        }
+                    }
+                }
+                if allowed != 0 {
+                    if wanted & !(granted | previous) != 0 {
+                        return Err(DriverError::InternalInvariantViolation);
+                    }
+                    return Ok(ext4_security::AccessDecision::Granted(granted));
+                }
+                if status == wdk_sys::STATUS_ACCESS_DENIED
+                    || status == wdk_sys::STATUS_PRIVILEGE_NOT_HELD
+                {
+                    Ok(ext4_security::AccessDecision::Denied(status))
+                } else {
+                    // Token, resource and monitor failures are not ordinary missing candidate rights.
+                    Err(DriverError::SecurityCheckFailed(if status < 0 {
+                        status
+                    } else {
+                        wdk_sys::STATUS_INTERNAL_ERROR
+                    }))
+                }
+            });
+        unsafe {
+            // SAFETY: Balances the single lock after all required and exploratory checks finish.
+            ffi::SeUnlockSubjectContext(context);
+        }
+        let mut append_failure = None;
+        for privileges in privilege_sets.iter().copied() {
+            if matches!(result, Ok(ext4_security::AccessDecision::Granted(_)))
+                && append_failure.is_none()
+            {
+                let status = unsafe {
+                    // SAFETY: This returned privilege set remains owned until the balanced free.
+                    ffi::SeAppendPrivileges(self.access_state.as_ptr(), privileges)
+                };
+                if status < 0 {
+                    append_failure = Some(DriverError::PrivilegeRecordingFailed(status));
+                }
+            }
             unsafe {
-                // SAFETY: SeAccessCheck transferred this allocation to the caller exactly once.
+                // SAFETY: Every successful insertion transfers one allocation to this cleanup loop.
                 ffi::SeFreePrivileges(privileges);
             }
         }
-        if let Some(status) = append_status
-            && status < 0
-        {
-            return Err(DriverError::PrivilegeRecordingFailed(status));
+        if let Some(error) = append_failure {
+            return Err(error);
         }
-        if allowed == 0 {
-            return Err(DriverError::SecurityCheckFailed(if access_status < 0 {
-                access_status
-            } else {
-                wdk_sys::STATUS_ACCESS_DENIED
-            }));
+        match result? {
+            ext4_security::AccessDecision::Granted(mask) => Ok(mask),
+            ext4_security::AccessDecision::Denied(status) => {
+                Err(DriverError::SecurityCheckFailed(status))
+            }
         }
-        Ok(granted)
     }
 
     /// Kernel token checks cannot run in the user-mode unit-test process.
@@ -628,6 +701,16 @@ impl CreateAccessState<'_> {
         _previously_granted: wdk_sys::ACCESS_MASK,
     ) -> DriverResult<wdk_sys::ACCESS_MASK> {
         Err(DriverError::NotSupported)
+    }
+}
+
+/// Expands maximum rights only for a trusted kernel-mode bypass.
+const fn trusted_kernel_access(raw: wdk_sys::ACCESS_MASK) -> wdk_sys::ACCESS_MASK {
+    let mapped = map_file_generic_access(raw);
+    if mapped & wdk_sys::MAXIMUM_ALLOWED != 0 {
+        (mapped & !wdk_sys::MAXIMUM_ALLOWED) | wdk_sys::FILE_ALL_ACCESS
+    } else {
+        mapped
     }
 }
 

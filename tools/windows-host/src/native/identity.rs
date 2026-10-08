@@ -388,8 +388,8 @@ pub fn replace_identity(replacement: Replacement) -> Result<MappingState, Identi
     });
     let close = file.close();
     let state = result.map_err(|source| IdentityControlError::Unacknowledged {
-        uuid: replacement.next.uuid,
-        expected_generation: replacement.expected_generation,
+        uuid: replacement.next().uuid,
+        expected_generation: replacement.expected_generation(),
         source,
     })?;
     match close {
@@ -397,3 +397,9 @@ pub fn replace_identity(replacement: Replacement) -> Result<MappingState, Identi
         Err(source) => Err(IdentityControlError::Release { state, source }),
     }
 }
+
+mod file_security;
+pub use file_security::{file_security, set_file_dacl};
+
+#[cfg(test)]
+mod access_tests;

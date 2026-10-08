@@ -10,6 +10,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod identity;
 mod irp;
 mod kernel;
 /// Generated control-device identity shared with the host lifecycle owner.
@@ -65,7 +66,7 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 #[cfg_attr(not(test), unsafe(export_name = "DriverEntry"))]
 pub unsafe extern "system" fn driver_entry(
     driver: PDRIVER_OBJECT,
-    _registry_path: PCUNICODE_STRING,
+    registry_path: PCUNICODE_STRING,
 ) -> NTSTATUS {
     let Some(driver_object) = (unsafe {
         // SAFETY: The kernel contract for DriverEntry provides a valid pointer
@@ -89,7 +90,14 @@ pub unsafe extern "system" fn driver_entry(
         STATUS_SUCCESS,
         OperationalOutcome::Selected,
     );
-    let _control_device = match state::ControlDevice::create(driver, trace) {
+    let catalog = match unsafe {
+        // SAFETY: The Windows loader retains this counted service path through DriverEntry.
+        identity::IdentityCatalog::load(registry_path)
+    } {
+        Ok(catalog) => catalog,
+        Err(error) => return error.ntstatus(),
+    };
+    let _control_device = match state::ControlDevice::create(driver, trace, catalog) {
         Ok(control_device) => control_device,
         Err(status) => {
             trace.record_status(OperationalPath::DriverInitialization, status);

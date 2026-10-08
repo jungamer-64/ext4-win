@@ -70,6 +70,15 @@ impl FileSystemControlStack {
 }
 
 impl DeviceControlStack {
+    /// Returns the buffered input extent retained by the I/O Manager.
+    pub(crate) const fn input_buffer_length(self) -> IrpBufferLength {
+        self.input_buffer_length
+    }
+    /// Returns the buffered output extent retained by the pending IRP.
+    pub(crate) const fn output_buffer_length(self) -> IrpBufferLength {
+        self.output_buffer_length
+    }
+
     /// Returns whether this request carries no input or output payload.
     pub(crate) const fn is_payload_free(self) -> bool {
         self.input_buffer_length.is_empty() && self.output_buffer_length.is_empty()

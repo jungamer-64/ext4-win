@@ -603,6 +603,22 @@ impl QueueContextOwnership {
         }
     }
 
+    /// Moves the sealed command to its sole control operation.
+    /// # Errors
+    /// Rejects another request kind or a command already consumed.
+    pub(super) fn take_identity(&mut self) -> DriverResult<crate::identity::IdentityCommand> {
+        let Self::Captured(context) = self else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        match &mut context.prepared {
+            PreparedRequest::IdentityControl(command) => {
+                let owned = core::mem::replace(command, crate::identity::IdentityCommand::Consumed);
+                owned.uuid()?;
+                Ok(owned)
+            }
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
     /// Borrows the read contract captured before queue insertion.
     /// # Errors
     ///
@@ -876,6 +892,8 @@ impl QueueContext {
 /// Complete set of requests accepted by the asynchronous device lane.
 #[derive(Debug)]
 pub(crate) enum PreparedRequest {
+    /// Owned validated administrator identity command.
+    IdentityControl(crate::identity::IdentityCommand),
     /// Cache Manager page acquisition; release notifications bypass this cancellable lane.
     Mdl(super::MdlTransfer),
     /// Create/open request.
@@ -943,6 +961,33 @@ impl PreparedRequest {
     ) -> Result<(Self, QueueCancellationKey), IrpCompletion> {
         let generic_key = || QueueCancellationKey::from_stack(stack);
         match major {
+            DispatchMajor::DeviceControl => {
+                let control = stack.device_control().map_err(IrpCompletion::from_error)?;
+                let length = control.input_buffer_length().as_usize();
+                if length > ext4_security::MAX_MAPPING_BYTES {
+                    return Err(IrpCompletion::from_error(DriverError::InvalidBufferSize));
+                }
+                let input = target
+                    .buffered_input(control.input_buffer_length())
+                    .map_err(IrpCompletion::from_error)?;
+                let command = match control.io_control_code() {
+                    ext4_security::QUERY_IDENTITY_IOCTL => crate::identity::IdentityCommand::Query(
+                        ext4_core::FilesystemUuid::from_bytes(
+                            input.as_slice().try_into().map_err(|_| {
+                                IrpCompletion::from_error(DriverError::InvalidParameter)
+                            })?,
+                        ),
+                    ),
+                    ext4_security::REPLACE_IDENTITY_IOCTL => {
+                        crate::identity::IdentityCommand::Replace(
+                            ext4_security::Replacement::decode(input.as_slice())
+                                .map_err(|error| IrpCompletion::from_error(error.into()))?,
+                        )
+                    }
+                    _ => return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest)),
+                };
+                Ok((Self::IdentityControl(command), QueueCancellationKey::Device))
+            }
             DispatchMajor::Create => Ok((Self::Create, generic_key())),
             DispatchMajor::Read => Ok((
                 match stack.mdl_action(false).map_err(IrpCompletion::from_error)? {
@@ -1047,12 +1092,11 @@ impl PreparedRequest {
             DispatchMajor::SetEa => Ok((Self::SetEa, generic_key())),
             DispatchMajor::QuerySecurity => {
                 let query = stack.query_security().map_err(IrpCompletion::from_error)?;
-                let required = query.selection().query_descriptor_length();
-                if query.length().as_usize() < required {
-                    return Err(IrpCompletion::buffer_overflow(required)
-                        .unwrap_or_else(IrpCompletion::from_error));
-                }
-                let output = CapturedRequestorOutput::capture(target, required)?;
+                let capacity = query
+                    .length()
+                    .as_usize()
+                    .min(ext4_security::MAX_DESCRIPTOR_BYTES);
+                let output = CapturedRequestorOutput::capture(target, capacity)?;
                 Ok((
                     Self::QuerySecurity {
                         selection: query.selection(),
@@ -1092,10 +1136,7 @@ impl PreparedRequest {
             DispatchMajor::PlugAndPlay if stack.pnp_minor() == super::PnpMinor::QueryRemove => {
                 Ok((Self::QueryRemove, QueueCancellationKey::Device))
             }
-            DispatchMajor::Close
-            | DispatchMajor::Cleanup
-            | DispatchMajor::DeviceControl
-            | DispatchMajor::PlugAndPlay => {
+            DispatchMajor::Close | DispatchMajor::Cleanup | DispatchMajor::PlugAndPlay => {
                 Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
             }
         }
@@ -1268,7 +1309,7 @@ fn capture_retrieval_pointers(
 #[derive(Debug)]
 pub(crate) struct CapturedRequestorOutput {
     /// Exact writable prefix fixed in requestor context.
-    capacity: NonZeroUsize,
+    capacity: usize,
     /// Unique native ownership; no pointer is exposed to consumers.
     #[cfg(not(test))]
     state: RequestorOutputState,
@@ -1278,6 +1319,8 @@ pub(crate) struct CapturedRequestorOutput {
 #[cfg(not(test))]
 #[derive(Debug)]
 enum RequestorOutputState {
+    /// Size probe owns no native pages.
+    Empty,
     /// Native owner of locked pages and their system mapping.
     Pending(NonNull<c_void>),
     /// Publication has released the native owner.
@@ -1304,11 +1347,16 @@ impl CapturedRequestorOutput {
         )
     )]
     fn capture(target: &ActiveIrp<'_>, capacity: usize) -> Result<Self, IrpCompletion> {
-        let capacity = NonZeroUsize::new(capacity)
-            .ok_or_else(|| IrpCompletion::from_error(DriverError::InvalidParameter))?;
+        if capacity == 0 {
+            return Ok(Self {
+                capacity,
+                #[cfg(not(test))]
+                state: RequestorOutputState::Empty,
+            });
+        }
         #[cfg(not(test))]
         {
-            let length = wdk_sys::ULONG::try_from(capacity.get())
+            let length = wdk_sys::ULONG::try_from(capacity)
                 .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?;
             let irp = unsafe {
                 // SAFETY: Dispatch retains the live IRP through queue-time capture.
@@ -1343,7 +1391,7 @@ impl CapturedRequestorOutput {
 
     /// Capacity of the locked prefix, independent of the requestor's larger declared buffer.
     pub(crate) const fn capacity(&self) -> usize {
-        self.capacity.get()
+        self.capacity
     }
 
     /// Publishes initialized owned bytes and releases native page ownership before returning.
@@ -1357,7 +1405,7 @@ impl CapturedRequestorOutput {
         )
     )]
     pub(crate) fn copy_from_owned(&mut self, source: &[u8]) -> DriverResult<()> {
-        if source.len() > self.capacity.get() {
+        if source.len() > self.capacity {
             return Err(DriverError::InternalInvariantViolation);
         }
         #[cfg(not(test))]

@@ -262,6 +262,7 @@ impl MountRequestOperation {
         admission: MountAdmission,
         devices: MountedStorage,
         transition: MountTransition,
+        catalog: &mut crate::identity::IdentityCatalog,
     ) -> OperationTransition {
         match transition {
             MountTransition::SubmitLower { request, suspended } => {
@@ -300,7 +301,7 @@ impl MountRequestOperation {
             }
             MountTransition::Complete(Ok(completed)) => Self::complete(
                 owned,
-                Self::publish_mount(admission, devices, completed, self.trace),
+                Self::publish_mount(admission, devices, completed, self.trace, catalog),
             ),
             MountTransition::Complete(Err(Error::InvalidMagic | Error::InvalidSuperblock)) => {
                 Self::complete(owned, Err(DriverError::UnrecognizedVolume))
@@ -416,6 +417,7 @@ impl MountRequestOperation {
         mut self: Box<Self>,
         context: ExclusiveExternalProbeContext,
         transition: ExternalJournalProbeTransition,
+        catalog: &mut crate::identity::IdentityCatalog,
     ) -> OperationTransition {
         match transition {
             ExternalJournalProbeTransition::SubmitLower { request, suspended } => {
@@ -437,7 +439,13 @@ impl MountRequestOperation {
                     .devices
                     .with_external(context.external, context.lease);
                 let transition = context.mount.attach_external_journal(validated);
-                self.drive_mount(context.owned, context.admission, devices, transition)
+                self.drive_mount(
+                    context.owned,
+                    context.admission,
+                    devices,
+                    transition,
+                    catalog,
+                )
             }
             ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Mismatch)) => {
                 Self::complete(
@@ -465,13 +473,14 @@ impl MountRequestOperation {
         devices: MountedStorage,
         completed: Box<ext4_core::CompletedMount>,
         trace: OperationalTrace,
+        catalog: &mut crate::identity::IdentityCatalog,
     ) -> DriverResult<IrpCompletion> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
         let Some(driver_object) = admission.file_system_device().driver_object() else {
             return Err(DriverError::InvalidParameter);
         };
         let mut vcb = memory::boxed_try_with(move || {
-            VolumeControlBlock::from_completed_mount(*completed, devices, trace)
+            VolumeControlBlock::from_completed_mount(*completed, devices, trace, catalog)
         })?;
         vcb.initialize_directory_change_notifier()?;
         let vcb = Box::into_pin(vcb);
@@ -524,7 +533,11 @@ impl MountRequestOperation {
 }
 
 impl ControlDeviceOperation for MountRequestOperation {
-    fn advance_control(mut self: Box<Self>, event: OperationEvent) -> OperationTransition {
+    fn advance_control(
+        mut self: Box<Self>,
+        event: OperationEvent,
+        catalog: &mut crate::identity::IdentityCatalog,
+    ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, MountRequestState::Terminal);
         match state {
             MountRequestState::QueryLength { owned, admission } => match event {
@@ -551,7 +564,7 @@ impl ControlDeviceOperation for MountRequestOperation {
                         Err(error) => return Self::complete(owned, Err(error)),
                     };
                     let transition = mount.advance(OperationEvent::Admitted);
-                    self.drive_mount(owned, admission, devices, transition)
+                    self.drive_mount(owned, admission, devices, transition, catalog)
                 }
                 OperationEvent::DeviceLengthCompleted(Err(error)) => {
                     Self::complete(owned, Err(DriverError::from(error)))
@@ -576,7 +589,7 @@ impl ControlDeviceOperation for MountRequestOperation {
                 mount,
             } => {
                 let transition = mount.advance(event);
-                self.drive_mount(owned, admission, devices, transition)
+                self.drive_mount(owned, admission, devices, transition, catalog)
             }
             MountRequestState::DiscoveringCandidateLength { context } => match event {
                 OperationEvent::DeviceLengthCompleted(Ok(length)) => {
@@ -650,6 +663,7 @@ impl ControlDeviceOperation for MountRequestOperation {
                             lease,
                         },
                         transition,
+                        catalog,
                     )
                 }
                 OperationEvent::DeviceLengthCompleted(Err(error)) => {
@@ -662,7 +676,7 @@ impl ControlDeviceOperation for MountRequestOperation {
             },
             MountRequestState::ProbingExclusiveJournal { context, probe } => {
                 let transition = probe.advance(event);
-                self.drive_exclusive_external_probe(context, transition)
+                self.drive_exclusive_external_probe(context, transition, catalog)
             }
             MountRequestState::Terminal => OperationTransition::Retired,
         }
@@ -678,7 +692,7 @@ impl CompletionOperation for MountRequestOperation {
         target: &mut ReactorTarget,
     ) -> OperationTransition {
         target.require_control_device();
-        self.advance_control(event.into_core())
+        self.advance_control(event.into_core(), target.control_catalog())
     }
 
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {
@@ -715,6 +729,8 @@ pub(crate) enum ReadRequestKind {
 /// Read request after data-stream authority has been fixed at actor admission.
 #[derive(Debug)]
 enum PreparedReadRequest {
+    /// Descriptor query pins one immutable UUID mapping before metadata reads can suspend.
+    Security(crate::identity::IdentitySnapshot),
     /// Regular-file data read with handle or paging stream authority.
     Data(crate::request::file_info::RegularFileDataAuthority),
     /// Non-data read class whose existing handle/device authority remains sufficient.
@@ -734,6 +750,8 @@ impl PreparedReadRequest {
         if kind == ReadRequestKind::Read {
             crate::request::file_info::prepare_regular_file_data_authority(owned.request(), access)
                 .map(Self::Data)
+        } else if kind == ReadRequestKind::QuerySecurity {
+            access.identity_snapshot().map(Self::Security)
         } else {
             Ok(Self::Other(kind))
         }
@@ -835,7 +853,9 @@ impl ReadRequestOperation {
                         .map(Some)
                 })
             }
-            PreparedReadRequest::Data(_) | PreparedReadRequest::Other(_) => Ok(None),
+            PreparedReadRequest::Data(_)
+            | PreparedReadRequest::Other(_)
+            | PreparedReadRequest::Security(_) => Ok(None),
         }
     }
 
@@ -923,8 +943,8 @@ impl ReadRequestOperation {
             PreparedReadRequest::Other(ReadRequestKind::QueryEa) => {
                 crate::request::ea::query(owned.request(), read)
             }
-            PreparedReadRequest::Other(ReadRequestKind::QuerySecurity) => {
-                crate::request::security::query(owned.request(), read)
+            PreparedReadRequest::Security(mapping) => {
+                crate::request::security::query(owned.request(), read, &mapping.get().map)
             }
             PreparedReadRequest::Other(ReadRequestKind::GetRetrievalPointers) => {
                 let mut request = owned.request();
@@ -936,7 +956,7 @@ impl ReadRequestOperation {
                 crate::request::file_system_control::authorize_path_handle(&mut request, access)?;
                 crate::request::reparse::get_reparse_point(request, read)
             }
-            PreparedReadRequest::Other(ReadRequestKind::Read) => {
+            PreparedReadRequest::Other(ReadRequestKind::Read | ReadRequestKind::QuerySecurity) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
@@ -1558,6 +1578,8 @@ unsafe impl Send for RawVolumeOperation {}
 /// Synchronous request kinds that require no lower-storage state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
+    /// Mounted ext4 UUID independent of a Windows volume path.
+    QueryVolumeIdentity,
     /// Fscrypt key-status query from the committed epoch snapshot.
     GetEncryptionKeyStatus,
 }
@@ -1616,6 +1638,24 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
         };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
+                ImmediateRequestKind::QueryVolumeIdentity => {
+                    owned.request().with_active(|active| {
+                        let stack = active.current_stack()?.file_system_control()?;
+                        if !stack.input_buffer_length().is_empty() {
+                            return Err(DriverError::InvalidParameter);
+                        }
+                        let mut output =
+                            active.buffered_output(stack.output_buffer_length().prefix(16)?)?;
+                        output
+                            .as_mut_slice()
+                            .iter_mut()
+                            .zip(access.volume_identity().uuid().bytes())
+                            .for_each(|(target, value)| *target = value);
+                        Ok(IrpCompletion::with_information(
+                            crate::irp::InformationLength::from_usize(16)?,
+                        ))
+                    })
+                }
                 ImmediateRequestKind::GetEncryptionKeyStatus => (|| {
                     let mut request = owned.request();
                     crate::request::file_system_control::authorize_path_handle(
@@ -2928,6 +2968,15 @@ pub(crate) enum MutationRequestKind {
 /// Mutation request after any paging stream lifetime authority has been captured.
 #[derive(Debug)]
 enum PreparedMutationRequest {
+    /// Logical create pins mapping and effective creator principals before any replay.
+    Create {
+        /// Immutable mapping observed by traverse, existing open and prepared child security.
+        mapping: crate::identity::IdentitySnapshot,
+        /// Explicit creator mapping may be absent for an existing-object open.
+        creator: crate::identity::CreationIdentity,
+    },
+    /// Owner/mode mutation pins the same mapping for every replay and reverse conversion.
+    Security(crate::identity::IdentitySnapshot),
     /// Regular-file data write with handle or paging stream authority.
     DataWrite(crate::request::file_info::RegularFileDataAuthority),
     /// Non-data mutation class whose existing lifecycle authority remains sufficient.
@@ -2944,11 +2993,37 @@ impl PreparedMutationRequest {
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Self> {
-        if kind == MutationRequestKind::Write {
-            crate::request::file_info::prepare_regular_file_data_authority(owned.request(), access)
+        match kind {
+            MutationRequestKind::Write => {
+                crate::request::file_info::prepare_regular_file_data_authority(
+                    owned.request(),
+                    access,
+                )
                 .map(Self::DataWrite)
-        } else {
-            Ok(Self::Other(kind))
+            }
+            MutationRequestKind::SetSecurity => access.identity_snapshot().map(Self::Security),
+            MutationRequestKind::Create => {
+                let mapping = access.identity_snapshot()?;
+                let creator = owned.request().with_active(|active| {
+                    let policy = active
+                        .current_stack()?
+                        .create()?
+                        .parameters()
+                        .access_check();
+                    match active
+                        .create_access_state(policy)?
+                        .creator_identity(&mapping.get().map)
+                    {
+                        Ok(owner) => Ok(crate::identity::CreationIdentity::Mapped(owner)),
+                        Err(DriverError::AccessDenied) => {
+                            Ok(crate::identity::CreationIdentity::Unmapped)
+                        }
+                        Err(error) => Err(error),
+                    }
+                })?;
+                Ok(Self::Create { mapping, creator })
+            }
+            _ => Ok(Self::Other(kind)),
         }
     }
 
@@ -2956,6 +3031,8 @@ impl PreparedMutationRequest {
     const fn kind(&self) -> MutationRequestKind {
         match self {
             Self::DataWrite(_) => MutationRequestKind::Write,
+            Self::Create { .. } => MutationRequestKind::Create,
+            Self::Security(_) => MutationRequestKind::SetSecurity,
             Self::Other(kind) => *kind,
         }
     }
@@ -3628,6 +3705,8 @@ impl MutationRequestOperation {
                         .length()
                         .is_empty()
             }
+            PreparedMutationRequest::Create { .. } => false,
+            PreparedMutationRequest::Security(_) => true,
             PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
                 owned.request().with_active(|active| {
                     let class = active.current_stack()?.set_file()?.information_class();
@@ -3636,19 +3715,21 @@ impl MutationRequestOperation {
             }
             PreparedMutationRequest::Other(
                 MutationRequestKind::SetEa
-                | MutationRequestKind::SetSecurity
                 | MutationRequestKind::SetReparsePoint
                 | MutationRequestKind::DeleteReparsePoint
                 | MutationRequestKind::EnableVerity,
             ) => true,
             PreparedMutationRequest::Other(
-                MutationRequestKind::Create
-                | MutationRequestKind::SetVolumeInformation
+                MutationRequestKind::SetVolumeInformation
                 | MutationRequestKind::AddEncryptionKey
                 | MutationRequestKind::RemoveEncryptionKey,
             ) => false,
             PreparedMutationRequest::Other(MutationRequestKind::CleanupDeletion) => false,
-            PreparedMutationRequest::Other(MutationRequestKind::Write) => {
+            PreparedMutationRequest::Other(
+                MutationRequestKind::Write
+                | MutationRequestKind::Create
+                | MutationRequestKind::SetSecurity,
+            ) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
@@ -3842,7 +3923,7 @@ impl MutationRequestOperation {
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<DriverResolveDisposition> {
         match request {
-            PreparedMutationRequest::Other(MutationRequestKind::Create) => {
+            PreparedMutationRequest::Create { mapping, creator } => {
                 match crate::request::create::execute(
                     owned.request(),
                     operations,
@@ -3850,6 +3931,10 @@ impl MutationRequestOperation {
                     state.pending_existing_create,
                     state.write_open,
                     state.namespace_oplocks,
+                    crate::identity::CreationContext {
+                        mapping: &mapping.get().map,
+                        creator: *creator,
+                    },
                 )? {
                     crate::request::create::CreateResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Create(completion)),
@@ -3916,8 +4001,9 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::SetSecurity) => {
-                let completion = crate::request::security::set(owned.request(), mutation)?;
+            PreparedMutationRequest::Security(mapping) => {
+                let completion =
+                    crate::request::security::set(owned.request(), mutation, &mapping.get().map)?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
                 ))
@@ -4013,7 +4099,11 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Cleanup(publication),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::Write) => {
+            PreparedMutationRequest::Other(
+                MutationRequestKind::Write
+                | MutationRequestKind::Create
+                | MutationRequestKind::SetSecurity,
+            ) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }

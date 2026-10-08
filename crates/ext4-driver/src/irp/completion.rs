@@ -113,6 +113,16 @@ impl IrpCompletion {
         }
     }
 
+    /// Returns the required security descriptor size with native insufficient-buffer status.
+    /// # Errors
+    /// Returns an information-field conversion failure before publication.
+    pub(crate) fn buffer_too_small(required: usize) -> DriverResult<Self> {
+        Ok(Self {
+            status: DriverError::BufferTooSmall.ntstatus(),
+            information: InformationLength::from_usize(required)?,
+        })
+    }
+
     /// Builds a buffer-overflow result that preserves the operation-specific information length.
     /// # Errors
     ///

@@ -911,6 +911,17 @@ fn mapped_mdl_address(
 pub(crate) struct IrpBufferLength(pub(super) usize);
 
 impl IrpBufferLength {
+    /// Narrows a declared extent to a completely covered publication prefix.
+    /// # Errors
+    /// Rejects a prefix larger than the I/O-manager-declared buffer.
+    pub(crate) fn prefix(self, bytes: usize) -> DriverResult<Self> {
+        if bytes > self.0 {
+            Err(DriverError::BufferTooSmall)
+        } else {
+            Ok(Self(bytes))
+        }
+    }
+
     /// Decodes a WDK `ULONG` byte count into the driver length domain.
     /// # Errors
     ///

@@ -51,6 +51,9 @@ pub enum AccessDecision {
 
 /// Composes explicit requirements and maximum exploration without changing caller authority.
 ///
+/// Class-priority denies require ordered ordinary checks: a native maximum scan unions denials
+/// from every matching class and would remove owner rights when the owner also belongs to the
+/// inode group. `check` must never receive MAXIMUM_ALLOWED.
 /// `check` must evaluate every invocation against the same locked subject and descriptor. It
 /// owns native privilege storage; successful composition does not itself publish handle rights.
 /// `previous` is already-authorized access, or zero for forced user-mode evaluation.

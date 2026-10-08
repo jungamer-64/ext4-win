@@ -12,7 +12,9 @@ mod creation;
 mod descriptor;
 mod identity;
 mod rights;
-pub use control::{CONTROL_REPLY_BYTES, MappingState, PublicationOutcome, Replacement};
+pub use control::{
+    CONTROL_REPLY_BYTES, MappingReply, MappingState, PublicationOutcome, Replacement,
+};
 pub use creation::{ChildKind, child_security};
 pub use descriptor::{Components, Descriptor, MAX_DESCRIPTOR_BYTES};
 pub use identity::{
@@ -30,7 +32,7 @@ pub const QUERY_IDENTITY_IOCTL: u32 = 0x0008_6004;
 /// Buffered administrator table replacement; requires a writable control-device handle.
 pub const REPLACE_IDENTITY_IOCTL: u32 = 0x0008_a008;
 /// Buffered mounted-volume query returning the core-validated filesystem UUID.
-pub const QUERY_VOLUME_IDENTITY_FSCTL: u32 = 0x0009_2400;
+pub const QUERY_VOLUME_IDENTITY_FSCTL: u32 = 0x0009_2410;
 
 /// Machine-readable failure of the portable identity and descriptor boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

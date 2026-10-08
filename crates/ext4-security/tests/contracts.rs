@@ -109,7 +109,7 @@ fn bounded_identity_codec() -> Result<(), Error> {
         outcome: PublicationOutcome::SavedNotApplied,
         status: -7,
         saved_generation: 8,
-        active: replacement.next,
+        active: replacement.into_next(),
     };
     assert_eq!(MappingState::decode(&state.encode()?)?, state);
     Ok(())
@@ -183,5 +183,40 @@ fn identity_text_vectors() -> Result<(), Error> {
     );
     assert_eq!(sid.to_string(), text);
     assert!("S-1-281474976710656-0".parse::<Sid>().is_err());
+    Ok(())
+}
+
+/// # Errors
+/// Returns SID construction failure.
+/// # Panics
+/// Panics if a mapping aliases a synthetic presentation identity.
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify bijection while fallible SID setup propagates"
+)]
+#[test]
+fn synthetic_identity_remains_bijective() -> Result<(), Error> {
+    assert_eq!(
+        IdentityMap::new(
+            vec![UserMapping {
+                sid: Sid::unix(1, 2000)?,
+                uid: Ext4Uid::from_u32(1000)
+            }],
+            vec![]
+        ),
+        Err(Error::DuplicateIdentity)
+    );
+    let map = map()?;
+    assert_eq!(map.uid(Sid::unix(1, 1000)?), Err(Error::UnmappedIdentity));
+    let unmapped = Ext4Owner::new(Ext4Uid::from_u32(2000), Ext4Gid::from_u32(200));
+    let security = Ext4Security::new(
+        unmapped,
+        Ext4Permissions::new(0o640).map_err(|_| Error::InvalidEncoding)?,
+    );
+    let descriptor = Descriptor::encode(security, &map, Components::ALL)?;
+    assert_eq!(
+        Descriptor::decode(descriptor.bytes(), &map, Components::ALL, security)?,
+        security
+    );
     Ok(())
 }

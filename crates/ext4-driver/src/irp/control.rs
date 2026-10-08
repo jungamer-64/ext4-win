@@ -181,6 +181,8 @@ pub(super) const MOUNT_VOLUME_MINOR_FUNCTION: u32 = 1;
 /// Decoded user FSCTL code selected by the caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum FsControlCode {
+    /// Returns the mounted ext4 filesystem UUID.
+    QueryVolumeIdentity,
     /// Windows `FSCTL_REQUEST_OPLOCK_LEVEL_1`.
     RequestOplockLevel1,
     /// Windows `FSCTL_REQUEST_OPLOCK_LEVEL_2`.
@@ -243,6 +245,7 @@ impl FsControlCode {
     /// Returns an error when `value` is not one of the supported Windows or ext4win FSCTL codes.
     pub(super) fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
         match value {
+            ext4_security::QUERY_VOLUME_IDENTITY_FSCTL => Ok(Self::QueryVolumeIdentity),
             FSCTL_REQUEST_OPLOCK_LEVEL_1 => Ok(Self::RequestOplockLevel1),
             FSCTL_REQUEST_OPLOCK_LEVEL_2 => Ok(Self::RequestOplockLevel2),
             FSCTL_REQUEST_BATCH_OPLOCK => Ok(Self::RequestBatchOplock),
@@ -307,7 +310,8 @@ impl FsControlCode {
             | Self::OplockBreakNotify
             | Self::OplockBreakAckNoLevel2 => Ok(OplockControlAction::BreakContinuation),
             Self::RequestOplock => Ok(structured_oplock_action(structured_input)),
-            Self::LockVolume
+            Self::QueryVolumeIdentity
+            | Self::LockVolume
             | Self::UnlockVolume
             | Self::DismountVolume
             | Self::IsVolumeMounted

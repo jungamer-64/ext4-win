@@ -310,6 +310,8 @@ enum VisibilityGateState {
 /// mutation coordination.
 #[derive(Debug)]
 pub(crate) struct VolumeRuntime {
+    /// UUID-specific identity publication independent of inode epochs.
+    pub(super) identity: crate::identity::IdentityBinding,
     /// Raw metadata reuse owned by this volume and borrowed only by the sole reactor actor.
     pub(super) metadata_cache: ext4_core::MetadataCache,
     /// Immutable feature, geometry, and device identity.
@@ -338,11 +340,17 @@ impl VolumeRuntime {
     ///
     /// Returns an error when the initial epoch registry or mount-scoped CNG providers cannot be
     /// allocated and initialized.
-    pub(crate) fn try_new(mount: CompletedMount, storage: MountedStorage) -> DriverResult<Self> {
+    pub(crate) fn try_new(
+        mount: CompletedMount,
+        storage: MountedStorage,
+        catalog: &mut crate::identity::IdentityCatalog,
+    ) -> DriverResult<Self> {
         let (profile, epoch, coordinator) = mount.into_parts();
+        let identity = catalog.binding(epoch.identity().uuid())?;
         let crypto = CngProvider::try_open()?;
         let metadata_cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
         Ok(Self {
+            identity,
             metadata_cache,
             profile,
             epochs: EpochRegistry::try_new(epoch)?,

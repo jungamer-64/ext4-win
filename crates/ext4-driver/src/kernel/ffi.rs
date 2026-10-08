@@ -190,6 +190,15 @@ pub(crate) use wdk_sys::ntddk::{
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe extern "system" {
+    /// Copies effective user/primary-group SIDs while retaining and locking the captured subject.
+    pub(crate) fn ext4win_creator_sids(
+        subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
+        user: *mut u8,
+        user_length: *mut u32,
+        group: *mut u8,
+        group_length: *mut u32,
+    ) -> wdk_sys::NTSTATUS;
+
     /// Copies the fixed signed VCN from the current FSCTL's Type3 buffer under SEH.
     pub(crate) fn ext4win_capture_starting_vcn(
         irp: wdk_sys::PIRP,
@@ -245,4 +254,39 @@ unsafe extern "system" {
 
     /// Releases one purpose-specific requestor-input capture.
     pub(crate) fn ext4win_release_captured_requestor_input(snapshot: wdk_sys::PVOID);
+    /// Opens the service-owned persistent identity root at PASSIVE_LEVEL.
+    pub(crate) fn ext4win_identity_open_root(
+        service: wdk_sys::PCUNICODE_STRING,
+        output: *mut wdk_sys::HANDLE,
+    ) -> wdk_sys::NTSTATUS;
+    /// Enumerates one canonical UUID subkey into 36 UTF-16 units.
+    pub(crate) fn ext4win_identity_enumerate(
+        root: wdk_sys::HANDLE,
+        index: u32,
+        uuid: *mut u16,
+    ) -> wdk_sys::NTSTATUS;
+    /// Reads one complete bounded binary table into pool-aligned owned storage.
+    pub(crate) fn ext4win_identity_read(
+        root: wdk_sys::HANDLE,
+        uuid: *const u16,
+        buffer: wdk_sys::PVOID,
+        capacity: u32,
+        length: *mut u32,
+    ) -> wdk_sys::NTSTATUS;
+    /// Saves and flushes a whole table, retaining the accepted-effect phase on failure.
+    pub(crate) fn ext4win_identity_save(
+        root: wdk_sys::HANDLE,
+        uuid: *const u16,
+        record: *const u8,
+        length: u32,
+        phase: *mut u32,
+    ) -> wdk_sys::NTSTATUS;
+    /// Establishes durability of a record observed during reconciliation.
+    pub(crate) fn ext4win_identity_flush(
+        root: wdk_sys::HANDLE,
+        uuid: *const u16,
+    ) -> wdk_sys::NTSTATUS;
+    /// Releases the kernel-only root after all worker and catalog ownership drains.
+    pub(crate) fn ext4win_identity_close(root: wdk_sys::HANDLE);
+
 }

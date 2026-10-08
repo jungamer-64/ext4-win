@@ -482,7 +482,11 @@ impl ControlDeviceExtension {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn initialize(device: KernelDevice, trace: OperationalTrace) -> Result<(), wdk_sys::NTSTATUS> {
+    fn initialize(
+        device: KernelDevice,
+        trace: OperationalTrace,
+        catalog: crate::identity::IdentityCatalog,
+    ) -> Result<(), wdk_sys::NTSTATUS> {
         let device_object = unsafe {
             // SAFETY: `device` is the newly created control device object.
             device.as_ptr().as_ref()
@@ -517,7 +521,7 @@ impl ControlDeviceExtension {
                 header,
                 DeviceExtensionKind::CONTROL,
                 device,
-                ReactorTarget::ControlDevice,
+                ReactorTarget::ControlDevice(catalog),
                 trace,
             )
         };
@@ -536,7 +540,7 @@ impl ControlDeviceExtension {
                         unsafe {
                             // SAFETY: No publication occurred; discovery rollback joined its observers.
                             let target = header.retire();
-                            if !matches!(target, ReactorTarget::ControlDevice) {
+                            if !matches!(target, ReactorTarget::ControlDevice(_)) {
                                 KernelWideInconsistency::completion_reactor_state_corruption()
                                     .bugcheck();
                             }
@@ -619,7 +623,7 @@ impl ControlDeviceExtension {
             // SAFETY: The unpublished device cannot receive dispatch and owns this live reactor.
             extension.header.retire()
         };
-        if !matches!(target, ReactorTarget::ControlDevice) {
+        if !matches!(target, ReactorTarget::ControlDevice(_)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
     }
@@ -642,6 +646,7 @@ impl ControlDevice {
     pub(crate) fn create(
         driver: PDRIVER_OBJECT,
         trace: OperationalTrace,
+        catalog: crate::identity::IdentityCatalog,
     ) -> Result<Self, wdk_sys::NTSTATUS> {
         let extension_size =
             wdk_sys::ULONG::try_from(core::mem::size_of::<ControlDeviceExtension>())
@@ -687,7 +692,7 @@ impl ControlDevice {
         }) else {
             return Err(DriverError::InternalInvariantViolation.ntstatus());
         };
-        if let Err(status) = ControlDeviceExtension::initialize(device, trace) {
+        if let Err(status) = ControlDeviceExtension::initialize(device, trace, catalog) {
             unsafe {
                 // SAFETY: Extension initialization failed before any device publication.
                 ffi::IoDeleteDevice(device.as_ptr());
@@ -799,7 +804,7 @@ impl ControlDevice {
             // SAFETY: This request owns retirement and holds no reactor lease. The IOCTL's
             // FILE_OBJECT keeps extension storage alive while intake and actor callbacks drain.
             let target = extension.header.retire();
-            if !matches!(target, ReactorTarget::ControlDevice) {
+            if !matches!(target, ReactorTarget::ControlDevice(_)) {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
         }

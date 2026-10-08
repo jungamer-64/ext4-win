@@ -2836,13 +2836,14 @@ impl VolumeControlBlock {
         mount: CompletedMount,
         storage: MountedStorage,
         trace: OperationalTrace,
+        catalog: &mut crate::identity::IdentityCatalog,
     ) -> DriverResult<Self> {
         Ok(Self {
             trace,
             directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
             file_control_blocks: FileControlBlockLedger::try_new()?,
             volume_control: VolumeControlPlane::mounted(),
-            runtime: VolumeRuntime::try_new(mount, storage)?,
+            runtime: VolumeRuntime::try_new(mount, storage, catalog)?,
             stream_context: StreamContext::try_new_volume(StreamSizes::EMPTY, trace)?,
             _pin: PhantomPinned,
         })

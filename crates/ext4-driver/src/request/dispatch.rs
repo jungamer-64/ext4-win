@@ -584,6 +584,23 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
             Err(error) => received.complete_result(Err(error)),
         };
     }
+    if request == ImmediateDispatch::ControlDeviceRequest {
+        let identity = received.with_active(|active| {
+            active.current_stack()?.device_control().map(|stack| {
+                matches!(
+                    stack.io_control_code(),
+                    ext4_security::QUERY_IDENTITY_IOCTL | ext4_security::REPLACE_IDENTITY_IOCTL
+                )
+            })
+        });
+        match identity {
+            Ok(true) => {
+                return crate::state::queue_device_request(received, DispatchMajor::DeviceControl);
+            }
+            Err(error) => return received.complete_result(Err(error)),
+            Ok(false) => {}
+        }
+    }
     let result = match request {
         ImmediateDispatch::OpenControl
         | ImmediateDispatch::CleanupControl
@@ -665,6 +682,7 @@ pub(crate) fn admit_owned(
     }
 
     enum Admission {
+        IdentityControl,
         QueryRemove,
         Cleanup,
         Close,
@@ -687,6 +705,7 @@ pub(crate) fn admit_owned(
     }
 
     let admission = match owned.actor_request() {
+        ActorRequest::Captured(PreparedRequest::IdentityControl(_)) => Admission::IdentityControl,
         ActorRequest::Captured(PreparedRequest::Mdl(action)) => Admission::Mdl(*action),
         ActorRequest::Captured(PreparedRequest::Read(_)) => Admission::Read(ReadRequestKind::Read),
         ActorRequest::Captured(PreparedRequest::QueryInformation) => {
@@ -753,6 +772,9 @@ pub(crate) fn admit_owned(
                     Admission::Unsupported
                 }
                 super::file_system_control::FsControlAdmission::User(code) => match code {
+                    crate::irp::FsControlCode::QueryVolumeIdentity => {
+                        Admission::Immediate(ImmediateRequestKind::QueryVolumeIdentity)
+                    }
                     crate::irp::FsControlCode::RequestOplockLevel1
                     | crate::irp::FsControlCode::RequestOplockLevel2
                     | crate::irp::FsControlCode::RequestBatchOplock
@@ -830,7 +852,9 @@ pub(crate) fn admit_owned(
     };
     let handle_class = match &admission {
         Admission::Mdl(_) => HandleRequestClass::Ordinary,
-        Admission::Mount(_) | Admission::QueryRemove => HandleRequestClass::Device,
+        Admission::IdentityControl | Admission::Mount(_) | Admission::QueryRemove => {
+            HandleRequestClass::Device
+        }
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
             HandleRequestClass::Paging
         }
@@ -941,6 +965,9 @@ pub(crate) fn admit_owned(
 
     let operation =
         match admission {
+            Admission::IdentityControl => {
+                super::identity_control::admit(owned, target.control_catalog())
+            }
             Admission::QueryRemove => {
                 target.with_mounted_access(|_| super::operation::query_remove(owned))
             }

@@ -6,7 +6,7 @@ use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
 use ext4_core::{
-    ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, Ext4Owner, NodeId, WindowsName,
+    ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, Ext4Security, NodeId, WindowsName,
 };
 use wdk_sys::FILE_OBJECT;
 
@@ -22,7 +22,6 @@ use crate::{
     memory::{self, DriverVec},
     request::{
         ea::CreateEa,
-        metadata,
         reparse::{NodeSymlinkReparsePoint, UnparsedPathLength},
         security::CreateSecurityDescriptor,
     },
@@ -46,14 +45,17 @@ const UTF16_BACKSLASH: u16 = 0x005C;
 /// # Errors
 ///
 /// Returns an error when create stack decoding or ext4 open/create handling rejects the request.
-pub(crate) fn execute(
-    request: PendingIrpLease<'_>,
+pub(crate) fn execute<'a>(
+    request: PendingIrpLease<'a>,
     operations: &mut MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     pending_existing: &mut Option<PendingExistingCreateOpen>,
     prepared_write_open: Option<&PreparedStreamWriteOpen>,
     namespace_oplocks: Option<NamespaceOplockPlan>,
+    creation: crate::identity::CreationContext<'a>,
 ) -> DriverResult<CreateResolution> {
+    let identity = creation.mapping;
+    let creator = creation.creator;
     if pending_existing.is_some() {
         return resume_existing_open(
             request,
@@ -61,11 +63,13 @@ pub(crate) fn execute(
             mutation,
             pending_existing,
             prepared_write_open,
+            identity,
+            creator,
         );
     }
     let mounted_volume = operations.file_object_owner();
     open_or_create(
-        PreparedCreateRequest::decode(request, mounted_volume)?,
+        PreparedCreateRequest::decode(request, mounted_volume, identity, creator)?,
         mounted_volume,
         operations,
         mutation,
@@ -120,6 +124,10 @@ struct PreparedCreateRequest<'a> {
 /// Completion authority retained after pointer-bearing create input decoding.
 #[derive(Debug)]
 struct CreateCompletionOwner<'a> {
+    /// Immutable identity table pinned by the logical create operation across every replay.
+    identity: &'a ext4_security::IdentityMap,
+    /// Effective creator identity fixed at logical operation admission.
+    creator: crate::identity::CreationIdentity,
     /// Pending IRP lease retaining every create-time pointer through terminal completion.
     request: PendingIrpLease<'a>,
     /// Owned semantic create parameters decoded before suspension.
@@ -131,10 +139,21 @@ struct CreateCompletionOwner<'a> {
 /// Create completion authority paired with rights proven for the exact opened object.
 #[derive(Debug)]
 struct AuthorizedCreateCompletionOwner<'a> {
+    /// Security of a child whose initial handle was checked before inode staging.
+    target: AuthorizedTarget,
     /// Sole FILE_OBJECT attachment and IRP completion authority.
     owner: CreateCompletionOwner<'a>,
     /// Concrete handle rights returned by the Security Reference Monitor boundary.
     granted_access: GrantedAccess,
+}
+
+/// Distinguishes existing-object authority from checked prepared child security.
+#[derive(Debug)]
+enum AuthorizedTarget {
+    /// No new inode is being prepared.
+    Existing,
+    /// Exact security used both for authorization and inode construction.
+    Child(Ext4Security),
 }
 
 impl<'a> PreparedCreateRequest<'a> {
@@ -146,6 +165,8 @@ impl<'a> PreparedCreateRequest<'a> {
     fn decode(
         mut request: PendingIrpLease<'a>,
         mounted_volume: NonNull<VolumeControlBlock>,
+        identity: &'a ext4_security::IdentityMap,
+        creator: crate::identity::CreationIdentity,
     ) -> Result<Self, crate::kernel::status::DriverError> {
         let (device, parameters, target, create_ea) = request.with_active(|active| {
             let current = active.current_stack()?;
@@ -169,6 +190,8 @@ impl<'a> PreparedCreateRequest<'a> {
         })?;
         Ok(Self {
             owner: CreateCompletionOwner {
+                identity,
+                creator,
                 request,
                 parameters,
                 device,
@@ -236,7 +259,8 @@ impl<'a> CreateCompletionOwner<'a> {
         if !required {
             return Ok(());
         }
-        let descriptor = CreateSecurityDescriptor::for_node(read, NodeId::Directory(directory))?;
+        let descriptor =
+            CreateSecurityDescriptor::for_node(read, NodeId::Directory(directory), self.identity)?;
         self.with_access_state(|state| {
             state.authorize_operation(descriptor.as_native(), wdk_sys::FILE_TRAVERSE)
         })
@@ -251,7 +275,7 @@ impl<'a> CreateCompletionOwner<'a> {
         node: NodeId,
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
-        let descriptor = CreateSecurityDescriptor::for_node(read, node)?;
+        let descriptor = CreateSecurityDescriptor::for_node(read, node, self.identity)?;
         let required = self.parameters.existing_operation_required_access();
         let requested = self.parameters.desired_access();
         let granted_access = self.with_access_state(|state| {
@@ -259,6 +283,7 @@ impl<'a> CreateCompletionOwner<'a> {
             state.authorize_requested(descriptor.as_native(), requested)
         })?;
         Ok(AuthorizedCreateCompletionOwner {
+            target: AuthorizedTarget::Existing,
             owner: self,
             granted_access,
         })
@@ -275,18 +300,29 @@ impl<'a> CreateCompletionOwner<'a> {
         requirement: CreateTargetRequirement,
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
-        let descriptor = CreateSecurityDescriptor::for_node(read, NodeId::Directory(parent))?;
-        let required = match requirement {
-            CreateTargetRequirement::Directory => wdk_sys::FILE_ADD_SUBDIRECTORY,
+        let parent_security = super::security::security_from_node(read, NodeId::Directory(parent))?;
+        let kind = match requirement {
+            CreateTargetRequirement::Directory => ext4_security::ChildKind::Directory,
             CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
-                wdk_sys::FILE_ADD_FILE
+                ext4_security::ChildKind::File
             }
+        };
+        let identity = self.identity;
+        let creator = self.creator.require()?;
+        let security = ext4_security::child_security(creator, parent_security, kind)?;
+        let parent_descriptor = CreateSecurityDescriptor::from_security(parent_security, identity)?;
+        let child_descriptor = CreateSecurityDescriptor::from_security(security, identity)?;
+        let required = match kind {
+            ext4_security::ChildKind::Directory => wdk_sys::FILE_ADD_SUBDIRECTORY,
+            ext4_security::ChildKind::File => wdk_sys::FILE_ADD_FILE,
         };
         let requested = self.parameters.desired_access();
         let granted_access = self.with_access_state(|state| {
-            state.authorize_child_creation(descriptor.as_native(), required, requested)
+            state.authorize_operation(parent_descriptor.as_native(), required)?;
+            state.authorize_requested(child_descriptor.as_native(), requested)
         })?;
         Ok(AuthorizedCreateCompletionOwner {
+            target: AuthorizedTarget::Child(security),
             owner: self,
             granted_access,
         })
@@ -304,12 +340,14 @@ impl<'a> CreateCompletionOwner<'a> {
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
         let directory_descriptor =
-            CreateSecurityDescriptor::for_node(read, NodeId::Directory(directory))?;
+            CreateSecurityDescriptor::for_node(read, NodeId::Directory(directory), self.identity)?;
         let target_descriptor = match target {
             TargetDirectoryLeaf::Missing => None,
-            TargetDirectoryLeaf::Existing(node) => {
-                Some(CreateSecurityDescriptor::for_node(read, node)?)
-            }
+            TargetDirectoryLeaf::Existing(node) => Some(CreateSecurityDescriptor::for_node(
+                read,
+                node,
+                self.identity,
+            )?),
         };
         let requested = self.parameters.desired_access();
         let granted_access = self.with_access_state(|state| {
@@ -330,6 +368,7 @@ impl<'a> CreateCompletionOwner<'a> {
             state.authorize_requested(directory_descriptor.as_native(), requested)
         })?;
         Ok(AuthorizedCreateCompletionOwner {
+            target: AuthorizedTarget::Existing,
             owner: self,
             granted_access,
         })
@@ -1390,12 +1429,14 @@ fn select_existing_open_gate(
 ///
 /// Returns security, namespace, reparse, or exact-gate validation failures. A stale namespace or
 /// reparse projection returns the private retry status so operation ownership can restart cleanly.
-fn resume_existing_open(
-    mut request: PendingIrpLease<'_>,
+fn resume_existing_open<'a>(
+    mut request: PendingIrpLease<'a>,
     operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
     pending_existing: &mut Option<PendingExistingCreateOpen>,
     prepared_write_open: Option<&PreparedStreamWriteOpen>,
+    identity: &'a ext4_security::IdentityMap,
+    creator: crate::identity::CreationIdentity,
 ) -> DriverResult<CreateResolution> {
     let pending = pending_existing
         .as_ref()
@@ -1420,6 +1461,8 @@ fn resume_existing_open(
     operations.ensure_node_openable(pending.node)?;
     revalidate_existing_open(pending, read)?;
     let owner = CreateCompletionOwner {
+        creator,
+        identity,
         request,
         parameters,
         device,
@@ -1728,8 +1771,10 @@ fn create_missing_node(
             Some(PendingFileDeletion::try_from_delete_on_close(&location)?)
         }
     };
-    let parent_owner = mutation.load_directory(parent)?.security().owner();
-    let target = child_creation_target(parameters.target_requirement(), parent_owner)?;
+    let AuthorizedTarget::Child(security) = request.target else {
+        return Err(DriverError::InternalInvariantViolation);
+    };
+    let target = child_creation_target(parameters.target_requirement(), security);
     let mut creation = operations.begin_child_creation(mutation, parent, name, target)?;
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
@@ -1767,20 +1812,20 @@ fn create_missing_node(
 }
 
 /// Maps create options to the concrete child kind used for missing-name creation.
-/// # Errors
-///
-/// Returns an error when default metadata cannot be built.
 fn child_creation_target(
     requirement: CreateTargetRequirement,
-    parent_owner: Ext4Owner,
-) -> DriverResult<ChildCreationTarget> {
+    security: Ext4Security,
+) -> ChildCreationTarget {
     match requirement {
-        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => Ok(
-            ChildCreationTarget::File(metadata::default_file_metadata(parent_owner)?),
+        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
+            ChildCreationTarget::File(ext4_core::NewFileMetadata::new(
+                security.owner(),
+                security.permissions(),
+            ))
+        }
+        CreateTargetRequirement::Directory => ChildCreationTarget::Directory(
+            ext4_core::NewDirectoryMetadata::new(security.owner(), security.permissions()),
         ),
-        CreateTargetRequirement::Directory => Ok(ChildCreationTarget::Directory(
-            metadata::default_directory_metadata(parent_owner)?,
-        )),
     }
 }
 
@@ -2338,38 +2383,26 @@ mod tests {
 
     const TEST_FILE_OPEN_DISPOSITION_OPTIONS: wdk_sys::ULONG = 1 << 24;
 
+    /// # Errors
+    /// Returns invalid fixture mode.
     /// # Panics
-    ///
-    /// Panics if child creation changes the supplied parent uid/gid or chooses a different mode
-    /// for the requested child kind.
+    /// Panics if child metadata does not retain its prepared token-derived security.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify the prepared metadata while fixture setup propagates invalid mode"
+    )]
     #[test]
-    fn child_creation_inherits_parent_owner_with_default_permissions() {
-        for (uid, gid) in [
-            (0, 0),
-            (1000, 100),
-            (0x1234_5678, 0x8765_4321),
-            (u32::MAX, u32::MAX),
-        ] {
-            let parent_owner = Ext4Owner::new(
-                ext4_core::Ext4Uid::from_u32(uid),
-                ext4_core::Ext4Gid::from_u32(gid),
-            );
-            for requirement in [
-                CreateTargetRequirement::Any,
-                CreateTargetRequirement::NonDirectory,
-            ] {
-                assert!(matches!(
-                    child_creation_target(requirement, parent_owner),
-                    Ok(ChildCreationTarget::File(metadata))
-                        if metadata.owner() == parent_owner && metadata.permissions().as_u16() == 0o644
-                ));
-            }
-            assert!(matches!(
-                child_creation_target(CreateTargetRequirement::Directory, parent_owner),
-                Ok(ChildCreationTarget::Directory(metadata))
-                    if metadata.owner() == parent_owner && metadata.permissions().as_u16() == 0o755
-            ));
-        }
+    fn child_creation_uses_prepared_security() -> DriverResult<()> {
+        let creator = ext4_core::Ext4Owner::new(
+            ext4_core::Ext4Uid::from_u32(1000),
+            ext4_core::Ext4Gid::from_u32(100),
+        );
+        let security =
+            ext4_core::Ext4Security::new(creator, ext4_core::Ext4Permissions::new(0o2755)?);
+        assert!(
+            matches!(child_creation_target(CreateTargetRequirement::Directory, security), ChildCreationTarget::Directory(metadata) if metadata.owner() == creator && metadata.permissions().as_u16() == 0o2755)
+        );
+        Ok(())
     }
 
     /// # Panics
