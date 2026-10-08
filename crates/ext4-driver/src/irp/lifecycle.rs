@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// Cache policy requested by this IRP independently of its FILE_OBJECT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DataCachePolicy {
+    /// The handle's intermediate-buffering policy may select Cc.
+    Handle,
+    /// This operation must bypass intermediate buffering.
+    NonCached,
+}
+
+impl DataCachePolicy {
+    /// Decodes the request-local Windows cache flag.
+    pub(crate) const fn from_flags(flags: u32) -> Self {
+        if flags & wdk_sys::IRP_NOCACHE != 0 {
+            Self::NonCached
+        } else {
+            Self::Handle
+        }
+    }
+}
+
 /// Lifetime-bound view of an IRP held by one completion owner.
 #[derive(Debug)]
 pub(crate) struct ActiveIrp<'owner> {
@@ -29,6 +49,19 @@ impl ActiveIrp<'_> {
     /// Returns the typed device object boundary.
     pub(crate) const fn device(&self) -> KernelDevice {
         self.device
+    }
+
+    /// Captures the request-local cache policy before queue admission.
+    #[expect(
+        unsafe_code,
+        reason = "the active IRP owner retains its immutable dispatch flags"
+    )]
+    pub(super) fn data_cache_policy(&self) -> DataCachePolicy {
+        let flags = unsafe {
+            // SAFETY: The active owner retains initialized dispatch flags; cancellation fields are not borrowed.
+            (*self.irp.as_ptr()).Flags
+        };
+        DataCachePolicy::from_flags(flags)
     }
 
     /// Returns whether this request is normal handle I/O or paging I/O.

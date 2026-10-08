@@ -1,10 +1,47 @@
 //! Cached, direct, and windowed file-data transfer protocols.
 
 use super::*;
-use crate::{irp::PassiveWork, state::DataTransferMode};
+use crate::{
+    irp::{DataCachePolicy, PassiveWork},
+    state::{DataTransferMode, KernelDevice, NoIntermediateTransfer},
+};
 
 /// Maximum requestor data bytes copied through driver-owned memory at one time.
 const MAX_DATA_TRANSFER_WINDOW_BYTES: usize = 65_536;
+
+/// Selects the operation's buffering contract without changing its handle policy.
+/// # Errors
+/// Returns invalid geometry when a request-local noncached operation cannot be represented.
+fn transfer_mode(
+    mode: DataTransferMode,
+    cache: DataCachePolicy,
+    device: KernelDevice,
+) -> DriverResult<DataTransferMode> {
+    match (mode, cache) {
+        (DataTransferMode::Cached, DataCachePolicy::NonCached) => Ok(DataTransferMode::Direct(
+            NoIntermediateTransfer::from_device(device)?,
+        )),
+        _ => Ok(mode),
+    }
+}
+
+/// Bounds an ordinary read and distinguishes EOF from a zero-length request.
+/// # Errors
+/// Returns end-of-file when a nonempty ordinary read begins at or beyond EOF.
+fn ordinary_read_length(start: FileOffset, requested: usize, eof: u64) -> DriverResult<usize> {
+    if requested != 0 && start.bytes() >= eof {
+        return Err(DriverError::EndOfFile);
+    }
+    Ok(paging_write_length(start, requested, eof))
+}
+
+/// Paging transfer padding has no authority to extend the file's logical EOF.
+fn paging_write_length(start: FileOffset, requested: usize, eof: u64) -> usize {
+    core::cmp::min(
+        requested,
+        usize::try_from(eof.saturating_sub(start.bytes())).unwrap_or(usize::MAX),
+    )
+}
 
 /// Data-stream authority selected before an operation can outlive current FILE_OBJECT decoding.
 #[derive(Debug)]
@@ -89,6 +126,7 @@ pub(crate) fn prepare_read_cache_plan(
         return Ok(ReadCachePlan::Direct);
     }
     let stack = request.prepared_read()?.stack();
+    let cache_policy = request.prepared_read()?.cache_policy();
     let output = request.prepared_read()?.output_address();
     request.with_active(|active| {
         if active.data_io_kind() != DataIoKind::Handle {
@@ -101,7 +139,8 @@ pub(crate) fn prepare_read_cache_plan(
             stack.length().as_usize(),
         )?;
         let file_cache = access.acquire_file_object_cache_lease(file_object)?;
-        if matches!(opened.data_transfer_mode(), DataTransferMode::Direct(_)) {
+        let mode = transfer_mode(opened.data_transfer_mode(), cache_policy, active.device())?;
+        if matches!(mode, DataTransferMode::Direct(_)) {
             return Ok(ReadCachePlan::PurgeBeforeDirect(PassiveWork::purge(
                 file_cache.into_stream(),
             )));
@@ -119,11 +158,7 @@ pub(crate) fn prepare_read_cache_plan(
         }
         let eof = u64::try_from(opened.file_control_block().stream_sizes()?.file_size())
             .map_err(|_| DriverError::InternalInvariantViolation)?;
-        let available = eof.saturating_sub(range.start().bytes());
-        let requested = core::cmp::min(
-            range.length(),
-            usize::try_from(available).unwrap_or(usize::MAX),
-        );
+        let requested = ordinary_read_length(range.start(), range.length(), eof)?;
         let offset =
             i64::try_from(range.start().bytes()).map_err(|_| DriverError::InvalidParameter)?;
         Ok(ReadCachePlan::Cached {
@@ -174,6 +209,7 @@ pub(crate) fn prepare_write_cache_plan(
         return Ok(WriteCachePlan::Direct);
     }
     let prepared = request.prepared_write()?;
+    let cache_policy = prepared.cache_policy();
     let stack = prepared.stack();
     let input = prepared.input_address();
     request.with_active(|active| {
@@ -195,7 +231,7 @@ pub(crate) fn prepare_write_cache_plan(
             SelectedWriteStart::EndOfFile => FileOffset::from_bytes(eof),
         };
         let range = ResolvedFileRange::new(start, stack.length().as_usize())?;
-        let mode = opened.data_transfer_mode();
+        let mode = transfer_mode(opened.data_transfer_mode(), cache_policy, active.device())?;
         mode.validate_range(range.start().bytes(), range.length())?;
         if !stack.length().is_empty() {
             mode.validate_buffer(input.ok_or(DriverError::InternalInvariantViolation)?)?;
@@ -780,6 +816,7 @@ fn read_regular_file_direct(
     authority: &RegularFileDataAuthority,
 ) -> DriverResult<IrpCompletion> {
     let stack = request.prepared_read()?.stack();
+    let cache_policy = request.prepared_read()?.cache_policy();
     let output_address = request.prepared_read()?.output_address();
     let Some((file_id, range)) = request.with_active(|active| {
         let kind = active.data_io_kind();
@@ -794,7 +831,11 @@ fn read_regular_file_direct(
                     resolve_read_start(&opened_file, kind, stack.starting_point())?,
                     stack.length().as_usize(),
                 )?;
-                let data_transfer_mode = opened_file.data_transfer_mode();
+                let data_transfer_mode = transfer_mode(
+                    opened_file.data_transfer_mode(),
+                    cache_policy,
+                    active.device(),
+                )?;
                 data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
                 if stack.length().is_empty() {
                     opened_file.update_current_file_position(kind, range.start(), 0)?;
@@ -838,6 +879,9 @@ fn read_regular_file_direct(
     };
 
     let file = read.load_file(file_id)?;
+    if matches!(authority, RegularFileDataAuthority::Handle) {
+        ordinary_read_length(range.start(), range.length(), file.size().bytes())?;
+    }
     let total = NonZeroUsize::new(range.length()).ok_or(DriverError::InternalInvariantViolation)?;
     let mut windows = DataTransferWindows::new(total);
     let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
@@ -886,6 +930,7 @@ fn write_regular_file_windowed(
     authority: &RegularFileDataAuthority,
 ) -> DriverResult<WriteResolution> {
     let stack = request.prepared_write()?.stack();
+    let cache_policy = request.prepared_write()?.cache_policy();
     let input_address = request.prepared_write()?.input_address();
     let (file_id, anchor, data_transfer_mode) = request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
@@ -903,7 +948,11 @@ fn write_regular_file_windowed(
                 Ok::<_, DriverError>((
                     opened_file.id(),
                     anchor,
-                    Some(opened_file.data_transfer_mode()),
+                    Some(transfer_mode(
+                        opened_file.data_transfer_mode(),
+                        cache_policy,
+                        active.device(),
+                    )?),
                 ))
             }
             RegularFileDataAuthority::Paging(paging) => {
@@ -923,10 +972,16 @@ fn write_regular_file_windowed(
         }
     })?;
 
-    let range = ResolvedFileRange::new(
-        resolve_write_start(mutation, file_id, anchor)?,
-        stack.length().as_usize(),
-    )?;
+    let start = resolve_write_start(mutation, file_id, anchor)?;
+    let length = match authority {
+        RegularFileDataAuthority::Handle => stack.length().as_usize(),
+        RegularFileDataAuthority::Paging(_) => paging_write_length(
+            start,
+            stack.length().as_usize(),
+            regular_file_end(mutation, file_id)?.bytes(),
+        ),
+    };
+    let range = ResolvedFileRange::new(start, length)?;
     request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
         match authority {
@@ -938,7 +993,7 @@ fn write_regular_file_windowed(
                 let data_transfer_mode =
                     data_transfer_mode.ok_or(DriverError::InternalInvariantViolation)?;
                 data_transfer_mode.validate_range(range.start().bytes(), range.length())?;
-                if stack.length().is_empty() {
+                if range.length() == 0 {
                     return Ok(());
                 }
                 data_transfer_mode.validate_buffer(
@@ -966,7 +1021,7 @@ fn write_regular_file_windowed(
         }
         Ok(())
     })?;
-    if stack.length().is_empty() {
+    if range.length() == 0 {
         if let RegularFileDataAuthority::Handle = authority {
             request.with_active(|active| {
                 let file_object = active.current_stack()?.file_object()?;
@@ -978,8 +1033,8 @@ fn write_regular_file_windowed(
     }
 
     let bytes_written = {
-        let total = NonZeroUsize::new(stack.length().as_usize())
-            .ok_or(DriverError::InternalInvariantViolation)?;
+        let total =
+            NonZeroUsize::new(range.length()).ok_or(DriverError::InternalInvariantViolation)?;
         let mut windows = DataTransferWindows::new(total);
         let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
         let file = mutation.file(file_id)?;

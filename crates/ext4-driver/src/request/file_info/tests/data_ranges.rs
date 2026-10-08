@@ -145,3 +145,41 @@ fn resolved_file_range_rejects_signed_end_overflow() {
         Some(DriverError::InvalidParameter)
     );
 }
+
+/// # Panics
+/// Fails if nonempty ordinary EOF reads become successful zero-byte operations.
+#[test]
+fn ordinary_read_lengths_preserve_eof_and_short_read_status() {
+    for (offset, length, eof, expected) in [
+        (10, 1, 10, Err(DriverError::EndOfFile)),
+        (11, 1, 10, Err(DriverError::EndOfFile)),
+        (0, 1, 0, Err(DriverError::EndOfFile)),
+        (11, 0, 10, Ok(0)),
+        (9, 8, 10, Ok(1)),
+        (1, 3, 10, Ok(3)),
+    ] {
+        assert_eq!(
+            super::ordinary_read_length(FileOffset::from_bytes(offset), length, eof),
+            expected
+        );
+    }
+}
+
+/// # Panics
+/// Fails if paging padding acquires authority to extend logical EOF.
+#[test]
+fn paging_write_lengths_exclude_bytes_outside_eof() {
+    for (offset, length, eof, expected) in [
+        (0, 4096, 100, 100),
+        (4096, 4096, 5000, 904),
+        (5000, 4096, 5000, 0),
+        (8192, 4096, 5000, 0),
+        (0, 4096, 8192, 4096),
+        (0, 0, 100, 0),
+    ] {
+        assert_eq!(
+            super::paging_write_length(FileOffset::from_bytes(offset), length, eof),
+            expected
+        );
+    }
+}

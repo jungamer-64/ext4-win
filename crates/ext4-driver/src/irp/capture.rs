@@ -92,6 +92,8 @@ pub(crate) struct PreparedQueryEa {
 pub(crate) struct PreparedRead {
     /// Handle or paging origin sealed before the IRP can leave requestor context.
     kind: DataIoKind,
+    /// Operation-local cache policy sealed before leaving requestor context.
+    cache_policy: super::DataCachePolicy,
     /// Scalar read parameters copied from the requestor's stack location.
     stack: ReadStack,
     /// Exact system-mapped output range kept live by the pending IRP.
@@ -108,10 +110,12 @@ impl PreparedRead {
         stack: super::CurrentIrpStackLocation<'_>,
     ) -> Result<Self, IrpCompletion> {
         let kind = target.data_io_kind();
+        let cache_policy = target.data_cache_policy();
         let stack = stack.read().map_err(IrpCompletion::from_error)?;
         let output = CapturedReadOutput::capture(target, stack.length())?;
         Ok(Self {
             kind,
+            cache_policy,
             stack,
             output,
         })
@@ -120,6 +124,11 @@ impl PreparedRead {
     /// Returns the request origin sealed at capture.
     pub(crate) const fn kind(&self) -> DataIoKind {
         self.kind
+    }
+
+    /// Returns the request's sealed intermediate-buffering policy.
+    pub(crate) const fn cache_policy(&self) -> super::DataCachePolicy {
+        self.cache_policy
     }
 
     /// Returns the immutable scalar read parameters.
@@ -245,6 +254,8 @@ impl CapturedReadOutput {
 pub(crate) struct PreparedWrite {
     /// Handle or paging origin sealed before the IRP can leave requestor context.
     kind: DataIoKind,
+    /// Operation-local cache policy sealed before leaving requestor context.
+    cache_policy: super::DataCachePolicy,
     /// Scalar write parameters copied from the requestor's stack location.
     stack: WriteStack,
     /// Exact system-mapped input range kept live by the pending IRP.
@@ -261,14 +272,25 @@ impl PreparedWrite {
         stack: super::CurrentIrpStackLocation<'_>,
     ) -> Result<Self, IrpCompletion> {
         let kind = target.data_io_kind();
+        let cache_policy = target.data_cache_policy();
         let stack = stack.write().map_err(IrpCompletion::from_error)?;
         let input = CapturedWriteInput::capture(target, stack.length())?;
-        Ok(Self { kind, stack, input })
+        Ok(Self {
+            kind,
+            cache_policy,
+            stack,
+            input,
+        })
     }
 
     /// Returns the request origin sealed at capture.
     pub(crate) const fn kind(&self) -> DataIoKind {
         self.kind
+    }
+
+    /// Returns the request's sealed intermediate-buffering policy.
+    pub(crate) const fn cache_policy(&self) -> super::DataCachePolicy {
+        self.cache_policy
     }
 
     /// Returns the immutable scalar write parameters.
@@ -1826,7 +1848,10 @@ mod tests {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
         let mut output = [0xAA_u8; 32];
-        let mut irp = wdk_sys::IRP::default();
+        let mut irp = wdk_sys::IRP {
+            Flags: wdk_sys::IRP_NOCACHE,
+            ..wdk_sys::IRP::default()
+        };
         irp.AssociatedIrp.SystemBuffer = output.as_mut_ptr().cast::<c_void>();
         let mut stack = wdk_sys::IO_STACK_LOCATION {
             MajorFunction: u8::try_from(wdk_sys::IRP_MJ_READ).unwrap_or_default(),
@@ -1858,9 +1883,15 @@ mod tests {
                     stack.Parameters.Read.Length
                 };
                 assert_eq!(rewritten_length, 1);
+                irp.Flags = 0;
+                assert_eq!(irp.Flags, 0);
                 let prepared = context.read_mut();
                 assert!(prepared.is_ok());
                 if let Ok(prepared) = prepared {
+                    assert_eq!(
+                        prepared.cache_policy(),
+                        crate::irp::DataCachePolicy::NonCached
+                    );
                     assert_eq!(prepared.stack().length().as_usize(), output.len());
                     assert_eq!(
                         prepared.stack().key(),
@@ -1885,7 +1916,10 @@ mod tests {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
         let mut input = [0xAA_u8; 32];
-        let mut irp = wdk_sys::IRP::default();
+        let mut irp = wdk_sys::IRP {
+            Flags: wdk_sys::IRP_NOCACHE,
+            ..wdk_sys::IRP::default()
+        };
         irp.AssociatedIrp.SystemBuffer = input.as_mut_ptr().cast::<c_void>();
         let mut stack = wdk_sys::IO_STACK_LOCATION {
             MajorFunction: u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default(),
@@ -1918,9 +1952,15 @@ mod tests {
                     stack.Parameters.Write.Length
                 };
                 assert_eq!(rewritten_length, 1);
+                irp.Flags = 0;
+                assert_eq!(irp.Flags, 0);
                 let prepared = context.write();
                 assert!(prepared.is_ok());
                 if let Ok(prepared) = prepared {
+                    assert_eq!(
+                        prepared.cache_policy(),
+                        crate::irp::DataCachePolicy::NonCached
+                    );
                     assert_eq!(prepared.stack().length().as_usize(), input.len());
                     assert_eq!(
                         prepared.stack().starting_point(),
