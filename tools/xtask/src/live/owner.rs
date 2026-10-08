@@ -598,11 +598,37 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         return Err(io::Error::other("create attributes were not applied").into());
     }
     for create_if_missing in [false, true] {
-        fs::write(&reset_path, b"existing payload")?;
+        let mut payload_handle = OpenOptions::new().write(true).open(&reset_path)?;
+        let write = payload_handle
+            .write_all(b"existing payload")
+            .map_err(Into::into);
+        combine_verification_and_cleanup(
+            write,
+            windows_host::close_file(payload_handle).map_err(Into::into),
+        )?;
+        match OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(create_if_missing)
+            .open(&reset_path)
+        {
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(error) => return Err(error.into()),
+            Ok(handle) => {
+                windows_host::close_file(handle)?;
+                return Err(
+                    io::Error::other("overwrite ignored the existing HIDDEN attribute").into(),
+                );
+            }
+        }
+        if fs::read(&reset_path)? != b"existing payload" {
+            return Err(io::Error::other("refused overwrite changed the existing payload").into());
+        }
         let reset = OpenOptions::new()
             .write(true)
             .truncate(true)
             .create(create_if_missing)
+            .attributes(0x02)
             .open(&reset_path)?;
         let verification = (|| {
             if reset.metadata()?.len() == 0 {

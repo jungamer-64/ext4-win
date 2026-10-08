@@ -1200,6 +1200,23 @@ enum ExistingFileReset {
     Supersede,
 }
 
+impl ExistingFileReset {
+    /// Requires explicit HIDDEN/SYSTEM acknowledgement before a destructive reset and selects
+    /// whether the remaining attributes are merged or replaced.
+    /// # Errors
+    /// Returns access denied when a protected existing attribute is absent from the request.
+    fn attributes(self, current: u32, requested: u32) -> DriverResult<u32> {
+        let protected = current & (wdk_sys::FILE_ATTRIBUTE_HIDDEN | wdk_sys::FILE_ATTRIBUTE_SYSTEM);
+        if protected & !requested != 0 {
+            return Err(DriverError::AccessDenied);
+        }
+        Ok(match self {
+            Self::Overwrite => current | requested,
+            Self::Supersede => requested,
+        })
+    }
+}
+
 /// Intent fixed before native oplock and image gates; reset metadata stays owned across replay.
 #[derive(Debug)]
 enum ExistingCreateIntent {
@@ -1629,13 +1646,12 @@ fn finish_existing_create(
         {
             return Err(DriverError::AccessDenied);
         }
+        let mut metadata = *metadata;
+        metadata.attributes =
+            reset.attributes(current.windows_attributes().bits(), metadata.attributes)?;
         let file = mutation.file(id)?;
         mutation.truncate_file(file, ext4_core::FileSize::from_bytes(0))?;
         ea.replace_existing(open.node, mutation)?;
-        let mut metadata = *metadata;
-        if *reset == ExistingFileReset::Overwrite {
-            metadata.attributes |= current.windows_attributes().bits();
-        }
         metadata.apply(open.node, mutation)?;
         if *reset == ExistingFileReset::Supersede {
             let node = mutation.node(open.node)?;
@@ -3111,6 +3127,31 @@ mod tests {
         assert_eq!(
             decoded.ok().and_then(Result::err),
             Some(DriverError::InvalidParameter)
+        );
+    }
+    /// # Panics
+    /// Panics if reset attributes disagree with independently observed Windows protection and merge semantics.
+    #[test]
+    fn reset_attributes_require_protected_bits_and_select_replacement_semantics() {
+        let current = wdk_sys::FILE_ATTRIBUTE_ARCHIVE | wdk_sys::FILE_ATTRIBUTE_HIDDEN;
+        assert_eq!(
+            ExistingFileReset::Overwrite.attributes(current, wdk_sys::FILE_ATTRIBUTE_NORMAL),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            ExistingFileReset::Supersede.attributes(
+                wdk_sys::FILE_ATTRIBUTE_HIDDEN | wdk_sys::FILE_ATTRIBUTE_SYSTEM,
+                wdk_sys::FILE_ATTRIBUTE_HIDDEN
+            ),
+            Err(DriverError::AccessDenied)
+        );
+        assert_eq!(
+            ExistingFileReset::Overwrite.attributes(current, wdk_sys::FILE_ATTRIBUTE_HIDDEN),
+            Ok(current)
+        );
+        assert_eq!(
+            ExistingFileReset::Supersede.attributes(current, wdk_sys::FILE_ATTRIBUTE_HIDDEN),
+            Ok(wdk_sys::FILE_ATTRIBUTE_HIDDEN)
         );
     }
 }
