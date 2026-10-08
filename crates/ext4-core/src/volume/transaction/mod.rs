@@ -731,13 +731,13 @@ impl MutationResolvePass<'_, '_, '_> {
         self.mutation.node_metadata_snapshot(&record)
     }
 
-    /// Selects any supported inode for POSIX metadata mutation.
+    /// Selects a staged or committed inode for POSIX metadata mutation.
     ///
     /// # Errors
     /// Returns an error when the inode cannot be read or carries mutation
     /// semantics outside the write domain.
     pub fn node(&mut self, id: NodeId) -> Result<TransactionNode> {
-        let inode = self.mutation.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
         let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (NodeId::File(_), InodeKind::File)
@@ -747,12 +747,12 @@ impl MutationResolvePass<'_, '_, '_> {
         }
     }
 
-    /// Selects a regular file for mutation.
+    /// Selects a staged or committed regular file for mutation.
     ///
     /// # Errors
     /// Returns an error when the inode is not a regular file or cannot be read.
     pub fn file(&mut self, id: FileNodeId) -> Result<TransactionFile> {
-        let inode = self.mutation.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
         if inode.kind() != InodeKind::File {
             return Err(Error::WrongInodeKind);
         }
@@ -764,7 +764,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the inode is not a directory or cannot be read.
     pub fn directory(&mut self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
-        let inode = self.mutation.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
         if inode.kind() != InodeKind::Directory {
             return Err(Error::WrongInodeKind);
         }
@@ -777,7 +777,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when the inode is not a symbolic link or carries
     /// mutation semantics outside the write domain.
     pub fn symlink(&mut self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
-        let inode = self.mutation.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
         if inode.kind() != InodeKind::Symlink {
             return Err(Error::WrongInodeKind);
         }
@@ -790,7 +790,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the typed identity does not match the inode or names a directory.
     pub fn hard_link_source(&mut self, id: HardLinkNodeId) -> Result<TransactionHardLinkSource> {
-        let inode = self.mutation.volume.read_inode_record(id.inode())?;
+        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
         let _metadata = inode.metadata_mutation()?;
         match (id, inode.kind()) {
             (HardLinkNodeId::File(_), InodeKind::File)
