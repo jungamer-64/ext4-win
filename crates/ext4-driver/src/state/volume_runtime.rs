@@ -343,7 +343,7 @@ impl VolumeRuntime {
     pub(crate) fn try_new(
         mount: CompletedMount,
         storage: MountedStorage,
-        catalog: &mut crate::identity::IdentityCatalog,
+        catalog: &mut crate::identity::IdentityDirectory,
     ) -> DriverResult<Self> {
         let (profile, epoch, coordinator) = mount.into_parts();
         let identity = catalog.binding(epoch.identity().uuid())?;

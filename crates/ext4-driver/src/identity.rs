@@ -73,7 +73,7 @@ impl IdentitySlot {
     /// Allocates all snapshot storage before a mount or replacement can publish it.
     /// # Errors
     /// Returns a recoverable pool allocation failure.
-    pub(crate) fn new(snapshot: MappingSnapshot) -> DriverResult<Self> {
+    fn new(snapshot: MappingSnapshot) -> DriverResult<Self> {
         let saved = snapshot.generation;
         Ok(Self {
             #[cfg(not(test))]
@@ -136,7 +136,7 @@ impl IdentitySlot {
     /// Captures independent persistence and application facts together with immutable ownership.
     /// # Errors
     /// Returns finite reference-budget exhaustion.
-    pub(crate) fn observe(&self) -> DriverResult<IdentityObservation> {
+    fn observe(&self) -> DriverResult<IdentityObservation> {
         self.locked(|state| {
             Ok(IdentityObservation {
                 active: state.active.try_acquire()?,
@@ -147,7 +147,7 @@ impl IdentitySlot {
         })
     }
     /// Publishes a preallocated durable successor; old owners drop outside the critical section.
-    pub(crate) fn publish(&self, next: DriverShared<MappingSnapshot>) {
+    fn publish(&self, next: DriverShared<MappingSnapshot>) {
         let old = self.locked(|state| {
             state.saved = next.get().generation;
             state.outcome = PublicationOutcome::Applied;
@@ -157,7 +157,7 @@ impl IdentitySlot {
         drop(old);
     }
     /// Retains a failed effect phase for reconciliation through the control endpoint.
-    pub(crate) fn record_failure(&self, outcome: PublicationOutcome, status: i32) {
+    fn record_failure(&self, outcome: PublicationOutcome, status: i32) {
         self.locked(|state| {
             state.outcome = outcome;
             state.status = status;
@@ -198,26 +198,40 @@ struct CatalogEntry {
     /// Shared publication slot retained through mounted-device and worker drain.
     slot: DriverShared<IdentitySlot>,
 }
-/// Control-actor-owned UUID directory; membership changes never run on ordinary data I/O.
+/// UUID slot registration authority; mounts can acquire snapshots without registry or replacement authority.
+#[derive(Debug)]
+pub(crate) struct IdentityDirectory {
+    /// Control-actor-owned unique membership.
+    entries: DriverVec<CatalogEntry>,
+}
+/// Administrator control authority owns persistence independently of mount registration.
 #[derive(Debug)]
 pub(crate) struct IdentityCatalog {
-    /// Unique slot for each known filesystem UUID.
-    entries: DriverVec<CatalogEntry>,
+    /// Registration can be borrowed without exposing the service's registry authority.
+    directory: IdentityDirectory,
     /// Narrow service registry authority retained by catalog and submitted workers.
     registry: Option<DriverShared<RegistryStore>>,
 }
 impl IdentityCatalog {
-    /// Constructs an empty directory before persisted records are loaded.
+    /// Constructs the unpublished empty catalog.
     pub(crate) const fn empty() -> Self {
         Self {
-            entries: DriverVec::new(),
+            directory: IdentityDirectory {
+                entries: DriverVec::new(),
+            },
             registry: None,
         }
     }
+    /// Narrows a control actor borrow to UUID registration alone.
+    pub(crate) const fn directory_mut(&mut self) -> &mut IdentityDirectory {
+        &mut self.directory
+    }
+}
+impl IdentityDirectory {
     /// Installs a validated startup record before any mount can observe it.
     /// # Errors
     /// Rejects duplicate UUIDs and physical allocation failure.
-    pub(crate) fn restore(&mut self, snapshot: MappingSnapshot) -> DriverResult<()> {
+    fn restore(&mut self, snapshot: MappingSnapshot) -> DriverResult<()> {
         if self.entries.iter().any(|entry| entry.uuid == snapshot.uuid) {
             return Err(DriverError::InvalidParameter);
         }
@@ -300,7 +314,7 @@ impl IdentityCatalog {
                 if snapshot.uuid != uuid || snapshot.generation == 0 {
                     return Err(DriverError::InvalidParameter);
                 }
-                catalog.restore(snapshot)?;
+                catalog.directory.restore(snapshot)?;
             }
             index = index.checked_add(1).ok_or(DriverError::InvalidBufferSize)?;
         }
@@ -316,11 +330,11 @@ impl IdentityCatalog {
         capacity: usize,
     ) -> DriverResult<PreparedIdentityAction> {
         let uuid = command.uuid()?;
-        let binding = self.binding(uuid)?;
+        let binding = self.directory.binding(uuid)?;
         let reservation = match UpdateReservation::acquire(binding) {
             Ok(reservation) => reservation,
             Err(DriverError::DeviceBusy) if matches!(command, IdentityCommand::Query(_)) => {
-                let observation = self.binding(uuid)?.get().observe()?;
+                let observation = self.directory.binding(uuid)?.get().observe()?;
                 let reply = MappingReply::prepare(observation.active.get())?;
                 if capacity < reply.required_length() {
                     return Err(DriverError::BufferTooSmall);
@@ -611,11 +625,11 @@ mod tests {
     fn publication_pins_old_generations_and_preserves_commit_facts() -> DriverResult<()> {
         let uuid = FilesystemUuid::from_bytes([7; 16]);
         let mut catalog = IdentityCatalog::empty();
-        let binding = catalog.binding(uuid)?;
+        let binding = catalog.directory.binding(uuid)?;
         let old = binding.get().capture()?;
         let reservation = UpdateReservation::acquire(binding)?;
         assert!(matches!(
-            UpdateReservation::acquire(catalog.binding(uuid)?),
+            UpdateReservation::acquire(catalog.directory.binding(uuid)?),
             Err(DriverError::DeviceBusy)
         ));
         let next = DriverShared::try_new(MappingSnapshot {
@@ -625,9 +639,18 @@ mod tests {
         })?;
         reservation.binding.get().publish(next);
         assert_eq!(old.get().generation, 0);
-        assert_eq!(catalog.binding(uuid)?.get().capture()?.get().generation, 1);
+        assert_eq!(
+            catalog
+                .directory
+                .binding(uuid)?
+                .get()
+                .capture()?
+                .get()
+                .generation,
+            1
+        );
         drop(reservation);
-        let binding = catalog.binding(uuid)?;
+        let binding = catalog.directory.binding(uuid)?;
         binding.get().record_failure(
             PublicationOutcome::Unknown,
             DriverError::RegistryFailure(-123).ntstatus(),
@@ -697,7 +720,7 @@ mod tests {
             return Err(DriverError::InternalInvariantViolation);
         };
         drop(work);
-        let binding = catalog.binding(uuid)?;
+        let binding = catalog.directory.binding(uuid)?;
         let reservation = UpdateReservation::acquire(binding)?;
         assert_eq!(reservation.binding.get().capture()?.get().generation, 0);
         reservation.binding.get().locked(|state| {

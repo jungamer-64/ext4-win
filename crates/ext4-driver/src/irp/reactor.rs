@@ -370,7 +370,7 @@ pub(crate) trait ControlDeviceOperation: fmt::Debug + Send + 'static {
     fn advance_control(
         self: Box<Self>,
         event: OperationEvent,
-        catalog: &mut crate::identity::IdentityCatalog,
+        catalog: &mut crate::identity::IdentityDirectory,
     ) -> OperationTransition;
 
     /// Records a lower-storage failure owned by the control-device operation.

@@ -262,7 +262,7 @@ impl MountRequestOperation {
         admission: MountAdmission,
         devices: MountedStorage,
         transition: MountTransition,
-        catalog: &mut crate::identity::IdentityCatalog,
+        catalog: &mut crate::identity::IdentityDirectory,
     ) -> OperationTransition {
         match transition {
             MountTransition::SubmitLower { request, suspended } => {
@@ -417,7 +417,7 @@ impl MountRequestOperation {
         mut self: Box<Self>,
         context: ExclusiveExternalProbeContext,
         transition: ExternalJournalProbeTransition,
-        catalog: &mut crate::identity::IdentityCatalog,
+        catalog: &mut crate::identity::IdentityDirectory,
     ) -> OperationTransition {
         match transition {
             ExternalJournalProbeTransition::SubmitLower { request, suspended } => {
@@ -473,7 +473,7 @@ impl MountRequestOperation {
         devices: MountedStorage,
         completed: Box<ext4_core::CompletedMount>,
         trace: OperationalTrace,
-        catalog: &mut crate::identity::IdentityCatalog,
+        catalog: &mut crate::identity::IdentityDirectory,
     ) -> DriverResult<IrpCompletion> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
         let Some(driver_object) = admission.file_system_device().driver_object() else {
@@ -536,7 +536,7 @@ impl ControlDeviceOperation for MountRequestOperation {
     fn advance_control(
         mut self: Box<Self>,
         event: OperationEvent,
-        catalog: &mut crate::identity::IdentityCatalog,
+        catalog: &mut crate::identity::IdentityDirectory,
     ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, MountRequestState::Terminal);
         match state {
@@ -692,7 +692,7 @@ impl CompletionOperation for MountRequestOperation {
         target: &mut ReactorTarget,
     ) -> OperationTransition {
         target.require_control_device();
-        self.advance_control(event.into_core(), target.control_catalog())
+        self.advance_control(event.into_core(), target.control_catalog().directory_mut())
     }
 
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {

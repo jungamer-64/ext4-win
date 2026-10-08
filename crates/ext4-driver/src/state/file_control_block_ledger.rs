@@ -2836,7 +2836,7 @@ impl VolumeControlBlock {
         mount: CompletedMount,
         storage: MountedStorage,
         trace: OperationalTrace,
-        catalog: &mut crate::identity::IdentityCatalog,
+        catalog: &mut crate::identity::IdentityDirectory,
     ) -> DriverResult<Self> {
         Ok(Self {
             trace,
