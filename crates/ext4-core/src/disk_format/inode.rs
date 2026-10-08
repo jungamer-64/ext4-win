@@ -86,6 +86,20 @@ impl FileOffset {
         self.0
     }
 
+    /// Converts a file byte coordinate to its containing logical extent block.
+    /// # Errors
+    /// Returns an error when the logical block number exceeds the ext4 extent domain.
+    pub(crate) fn logical_block(
+        self,
+        block_size: BlockSize,
+    ) -> Result<crate::disk_format::extent::LogicalBlock> {
+        crate::disk_format::extent::LogicalBlock::try_from(
+            self.bytes()
+                .checked_div(u64::from(block_size.bytes()))
+                .ok_or(Error::InvalidSuperblock)?,
+        )
+    }
+
     /// Adds a byte length to this offset.
     ///
     /// # Errors

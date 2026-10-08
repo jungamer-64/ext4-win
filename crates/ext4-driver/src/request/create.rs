@@ -111,6 +111,37 @@ pub(crate) enum CreateResolution {
     Mutation(Box<PendingCreatePublication>),
 }
 
+/// Owned create-only metadata; ordinary opens leave these external fields uninterpreted.
+#[derive(Clone, Copy, Debug)]
+struct RequestedCreationMetadata {
+    /// Initial Windows attributes supplied by the caller.
+    attributes: u32,
+    /// Initial allocation bound in the signed Windows byte domain.
+    allocation: i64,
+}
+
+impl RequestedCreationMetadata {
+    /// Validates and applies metadata only after a target has been selected for creation.
+    /// # Errors
+    /// Returns invalid allocation, unsupported attributes, or ext4 mutation failures.
+    fn apply(
+        self,
+        node: NodeId,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+    ) -> DriverResult<()> {
+        let allocation =
+            u64::try_from(self.allocation).map_err(|_| DriverError::InvalidParameter)?;
+        if let NodeId::File(file) = node {
+            let file = mutation.file(file)?;
+            mutation.reserve_file_allocation(
+                file,
+                ext4_core::FileAllocationSize::from_bytes(allocation),
+            )?;
+        }
+        crate::request::file_info::set_creation_attributes(mutation, node, self.attributes)
+    }
+}
+
 /// Create request whose pointer-bearing inputs have all become owned domain values.
 #[derive(Debug)]
 struct PreparedCreateRequest<'a> {
@@ -133,6 +164,8 @@ struct CreateCompletionOwner<'a> {
     request: PendingIrpLease<'a>,
     /// Owned semantic create parameters decoded before suspension.
     parameters: CreateParameters,
+    /// Create-only fields captured independently of ordinary-open policy.
+    metadata: RequestedCreationMetadata,
     /// Mounted device receiving the create.
     device: KernelDevice,
 }
@@ -169,7 +202,7 @@ impl<'a> PreparedCreateRequest<'a> {
         identity: &'a ext4_security::IdentityMap,
         creator: crate::identity::CreationIdentity,
     ) -> Result<Self, crate::kernel::status::DriverError> {
-        let (device, parameters, target, create_ea) = request.with_active(|active| {
+        let (device, parameters, metadata, target, create_ea) = request.with_active(|active| {
             let current = active.current_stack()?;
             let file_object = current.file_object()?;
             let stack = current.create()?;
@@ -180,6 +213,10 @@ impl<'a> PreparedCreateRequest<'a> {
             Ok::<_, DriverError>((
                 device,
                 parameters,
+                RequestedCreationMetadata {
+                    attributes: stack.file_attributes(),
+                    allocation: active.create_allocation_size(),
+                },
                 CreateTargetSpecifier::decode(
                     &file_object,
                     mounted_volume,
@@ -195,6 +232,7 @@ impl<'a> PreparedCreateRequest<'a> {
                 creator,
                 request,
                 parameters,
+                metadata,
                 device,
             },
             target,
@@ -279,7 +317,11 @@ impl<'a> CreateCompletionOwner<'a> {
         let descriptor = CreateSecurityDescriptor::for_node(read, node, self.identity)?;
         let required = self.parameters.existing_operation_required_access();
         let requested = self.parameters.desired_access();
+        let exclusive = self.parameters.require_writable_exclusive();
         let granted_access = self.with_access_state(|state| {
+            if exclusive {
+                state.authorize_operation(descriptor.as_native(), wdk_sys::FILE_WRITE_DATA)?;
+            }
             state.authorize_operation(descriptor.as_native(), required)?;
             state.authorize_requested(descriptor.as_native(), requested)
         })?;
@@ -1414,7 +1456,7 @@ fn resume_existing_open<'a>(
     let pending = pending_existing
         .as_ref()
         .ok_or(DriverError::InternalInvariantViolation)?;
-    let (device, parameters, file_object) = request.with_active(|active| {
+    let (device, parameters, metadata, file_object) = request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
         let stack = current.create()?;
@@ -1424,6 +1466,10 @@ fn resume_existing_open<'a>(
         Ok::<_, DriverError>((
             active.device(),
             parameters,
+            RequestedCreationMetadata {
+                attributes: stack.file_attributes(),
+                allocation: active.create_allocation_size(),
+            },
             file_object.kernel_file_object(),
         ))
     })?;
@@ -1438,6 +1484,7 @@ fn resume_existing_open<'a>(
         identity,
         request,
         parameters,
+        metadata,
         device,
     };
     let owner = owner.authorize_existing(pending.node, read)?;
@@ -1764,6 +1811,7 @@ fn create_missing_node(
         )
     })?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
+    request.owner.metadata.apply(node, mutation)?;
     let staged_stream = StagedNodeStreamMetadata::try_from_staged_snapshot(
         mutation.staged_node_metadata(node)?,
         operations.volume_geometry().cluster_size(),

@@ -1098,6 +1098,54 @@ fn verify_regular_mutation_profile(
     drive_internal_core_mutation(image, |pass| {
         let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
         let file = pass.create_file(root, &source, mutation_file_metadata()?)?;
+        let staged = pass.file(file.id())?;
+        pass.reserve_file_allocation(staged, ext4_core::FileAllocationSize::from_bytes(20_480))?;
+        let node = pass.node(ext4_core::NodeId::File(file.id()))?;
+        pass.set_xattr(
+            node,
+            mutation_xattr_name()?,
+            ext4_core::XattrValue::new(b"created-value")?,
+        )
+    })?;
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/source.bin",
+        &[],
+        1,
+        "preallocated-empty",
+    )?;
+    debugfs_require_xattr(
+        linux,
+        case_root,
+        image,
+        "/source.bin",
+        b"created-value",
+        "staged-child-metadata",
+    )?;
+    let allocation = debugfs_block_sequence(linux, &linux.tool_path(image)?, "blocks /source.bin")?;
+    if allocation.len() != 5 {
+        return Err(io::Error::other("empty file allocation bound was not reserved").into());
+    }
+    verify_internal_e2fsck_clean(linux, image, "preallocated empty file")?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(id)?;
+        pass.extend_file(file, ext4_core::FileSize::from_bytes(8192))
+    })?;
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/source.bin",
+        &[0; 8192],
+        1,
+        "preallocated-zero-extension",
+    )?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(id)?;
         pass.write_file_range(file, ext4_core::FileOffset::ZERO, &initial)
     })?;
 

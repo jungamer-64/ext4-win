@@ -2870,3 +2870,35 @@ fn pnp_minors_decode_without_a_file_object() {
         assert_eq!(expected.initializes_success(), seeds_success);
     }
 }
+
+/// # Panics
+/// Fails if exclusive read admission loses FILE_DISALLOW_EXCLUSIVE while share accounting changes.
+#[test]
+fn exclusive_open_permission_is_independent_of_returned_handle_rights() {
+    for (options, share, required) in [
+        (0, 0, false),
+        (wdk_sys::FILE_DISALLOW_EXCLUSIVE, 0, true),
+        (
+            wdk_sys::FILE_DISALLOW_EXCLUSIVE,
+            wdk_sys::FILE_SHARE_READ,
+            false,
+        ),
+    ] {
+        let parameters = super::CreateParameters::decode(
+            wdk_sys::FILE_READ_DATA,
+            (super::FILE_OPEN_DISPOSITION << super::CREATE_DISPOSITION_SHIFT) | options,
+            u16::try_from(share).unwrap_or_default(),
+            super::IrpBufferLength(0),
+            0,
+        );
+        assert!(parameters.is_ok());
+        if let Ok(parameters) = parameters {
+            assert_eq!(parameters.require_writable_exclusive(), required);
+            assert_eq!(
+                parameters.desired_access().as_raw(),
+                wdk_sys::FILE_READ_DATA
+            );
+            assert_eq!(parameters.existing_operation_required_access(), 0);
+        }
+    }
+}

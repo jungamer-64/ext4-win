@@ -404,6 +404,31 @@ fn set_position_information(
     opened_file.set_current_file_position(position)
 }
 
+/// Applies Windows creation attributes to the exact staged child.
+/// # Errors
+/// Returns unsupported attributes, contradictory node flags, or ext4 metadata mutation failure.
+pub(crate) fn set_creation_attributes(
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+    node: NodeId,
+    attributes: u32,
+) -> DriverResult<()> {
+    let metadata = FileMetadata::from(mutation.staged_node_metadata(node)?);
+    let attributes = if matches!(node, NodeId::File(_)) {
+        attributes | Ext4WindowsAttributes::ARCHIVE
+    } else {
+        attributes
+    };
+    let update = set_basic_attributes(metadata, attributes)?;
+    let node = mutation.node(node)?;
+    if let Some(security) = update.security() {
+        mutation.set_posix_security(node, security)?;
+    }
+    if let Some(overlay) = update.overlay() {
+        mutation.set_windows_overlay(node, overlay)?;
+    }
+    Ok(())
+}
+
 /// Applies FILE_BASIC_INFORMATION timestamps and overlay attributes.
 /// # Errors
 ///

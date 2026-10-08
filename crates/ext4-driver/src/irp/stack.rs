@@ -93,6 +93,8 @@ impl DeviceControlStack {
 /// Decoded create/open stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CreateStack {
+    /// Caller-supplied initial file attributes, interpreted only when creating or replacing.
+    pub(super) file_attributes: u32,
     /// Decoded create parameters.
     pub(super) parameters: CreateParameters,
 }
@@ -101,6 +103,10 @@ impl CreateStack {
     /// Returns the decoded create parameters.
     pub(crate) const fn parameters(self) -> CreateParameters {
         self.parameters
+    }
+    /// Returns creation attributes without applying them to an ordinary existing open.
+    pub(crate) const fn file_attributes(self) -> u32 {
+        self.file_attributes
     }
 }
 

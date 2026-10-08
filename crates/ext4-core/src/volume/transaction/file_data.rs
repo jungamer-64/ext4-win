@@ -231,6 +231,61 @@ impl MutationResolvePass<'_, '_, '_> {
         Ok(())
     }
 
+    /// Reserves initialized zero-filled storage through an allocation bound without changing EOF.
+    /// Existing payload blocks retain their contents. New blocks are initialized before the
+    /// allocation becomes durable, including blocks outside EOF that a later extension can expose.
+    ///
+    /// # Errors
+    /// Returns unsupported mutation for protected or unwritten streams, invalid range for an
+    /// unrepresentable bound, and storage, allocation, encryption, or extent serialization failures.
+    pub fn reserve_file_allocation(
+        &mut self,
+        file: TransactionFile,
+        bound: FileAllocationSize,
+    ) -> Result<()> {
+        if bound.bytes() == 0 {
+            return Ok(());
+        }
+        self.mutation
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
+        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
+        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
+        let inode = raw_inode.parse()?;
+        self.require_file_data_mutation(&inode)?;
+        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        let width = u64::from(self.mutation.volume.superblock.block_size().bytes());
+        let zeros = memory::repeated_vec(
+            0_u8,
+            usize::try_from(width).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        let mut offset = FileOffset::ZERO;
+        while offset.bytes() < bound.bytes() {
+            let logical = offset.logical_block(self.mutation.volume.superblock.block_size())?;
+            if matches!(tree.map_logical(logical), BlockMapping::Hole) {
+                if inode.protection().is_encrypted() {
+                    self.stage_encrypted_inode_stream_write(
+                        &inode,
+                        &mut tree,
+                        offset.bytes(),
+                        &zeros,
+                    )?;
+                } else {
+                    self.stage_inode_stream_write(&mut tree, offset.bytes(), &zeros)?;
+                }
+            }
+            offset = offset.checked_add_len(zeros.len())?;
+        }
+        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+        self.mutation.replace_live_inode(inode_index, raw_inode)?;
+        Ok(())
+    }
+
     /// Stages zeroes for existing allocated blocks that become visible inside a sparse extension.
     /// # Errors
     ///

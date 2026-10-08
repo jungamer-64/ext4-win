@@ -51,6 +51,26 @@ impl ActiveIrp<'_> {
         self.device
     }
 
+    /// Copies the initial allocation request from the create-only IRP overlay.
+    #[expect(
+        unsafe_code,
+        reason = "the active create owner retains the immutable allocation overlay"
+    )]
+    pub(crate) fn create_allocation_size(&self) -> i64 {
+        let overlay = unsafe {
+            // SAFETY: The create IRP owner retains this dispatch-stable overlay; no reference spans cancellation fields.
+            (*self.irp.as_ptr()).Overlay
+        };
+        let size = unsafe {
+            // SAFETY: This accessor is selected only for IRP_MJ_CREATE, whose allocation union arm is active.
+            overlay.AllocationSize
+        };
+        unsafe {
+            // SAFETY: QuadPart is the signed LARGE_INTEGER representation of this copied allocation request.
+            size.QuadPart
+        }
+    }
+
     /// Captures the request-local cache policy before queue admission.
     #[expect(
         unsafe_code,

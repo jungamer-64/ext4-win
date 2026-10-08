@@ -235,6 +235,7 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
             security_context.as_ref()
         };
         Ok(CreateStack {
+            file_attributes: u32::from(create.FileAttributes),
             parameters: CreateParameters::decode(
                 security_context.DesiredAccess,
                 create.Options,

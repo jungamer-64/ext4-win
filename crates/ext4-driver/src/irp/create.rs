@@ -39,6 +39,8 @@ pub(crate) struct CreateParameters {
     target_selection: CreateTargetSelection,
     /// Create flags whose semantics this filesystem does not implement.
     unsupported_flags: UnsupportedCreateFlags,
+    /// Whether excluding readers additionally requires native write permission.
+    require_writable_exclusive: bool,
 }
 
 impl CreateParameters {
@@ -81,7 +83,14 @@ impl CreateParameters {
             },
             target_selection: CreateTargetSelection::from_stack_flags(stack_flags),
             unsupported_flags: UnsupportedCreateFlags::from_stack_flags(stack_flags),
+            require_writable_exclusive: options & wdk_sys::FILE_DISALLOW_EXCLUSIVE != 0
+                && share_access.as_ulong() & wdk_sys::FILE_SHARE_READ == 0,
         })
+    }
+
+    /// Reports the admission check required by FILE_DISALLOW_EXCLUSIVE.
+    pub(crate) const fn require_writable_exclusive(self) -> bool {
+        self.require_writable_exclusive
     }
 
     /// Returns the desired access mask.
@@ -1137,14 +1146,14 @@ const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_OPEN_BY_FILE_ID
     | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
     | wdk_sys::FILE_OPEN_REQUIRING_OPLOCK
-    | wdk_sys::FILE_RESERVE_OPFILTER;
+    | wdk_sys::FILE_RESERVE_OPFILTER
+    | wdk_sys::FILE_DISALLOW_EXCLUSIVE;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
     | wdk_sys::FILE_NO_EA_KNOWLEDGE
     | wdk_sys::FILE_RANDOM_ACCESS
     | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT
     | wdk_sys::FILE_NO_COMPRESSION
-    | wdk_sys::FILE_DISALLOW_EXCLUSIVE
     | wdk_sys::FILE_OPEN_NO_RECALL
     | wdk_sys::FILE_OPEN_FOR_FREE_SPACE_QUERY;
 /// Create options accepted by this FSD boundary.
