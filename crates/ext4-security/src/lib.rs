@@ -3,6 +3,7 @@
 //! Inode ownership and mode remain authoritative. Identity tables only interpret those facts at
 //! the Windows boundary. A table belongs to one filesystem UUID and one publication generation.
 #![no_std]
+#![feature(vec_push_within_capacity)]
 #![forbid(unsafe_code)]
 
 extern crate alloc;

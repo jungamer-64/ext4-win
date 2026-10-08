@@ -466,15 +466,19 @@ impl MappingSnapshot {
             let sid = Sid::parse(bytes.get(offset..end).ok_or(Error::InvalidEncoding)?)?;
             offset = end;
             if index < users_count {
-                users.push(UserMapping {
-                    uid: Ext4Uid::from_u32(id),
-                    sid,
-                });
+                users
+                    .push_within_capacity(UserMapping {
+                        uid: Ext4Uid::from_u32(id),
+                        sid,
+                    })
+                    .map_err(|_| Error::InvalidEncoding)?;
             } else {
-                groups.push(GroupMapping {
-                    gid: Ext4Gid::from_u32(id),
-                    sid,
-                });
+                groups
+                    .push_within_capacity(GroupMapping {
+                        gid: Ext4Gid::from_u32(id),
+                        sid,
+                    })
+                    .map_err(|_| Error::InvalidEncoding)?;
             }
         }
         if offset != bytes.len() {
