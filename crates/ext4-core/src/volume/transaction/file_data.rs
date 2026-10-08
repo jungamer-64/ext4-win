@@ -201,9 +201,6 @@ impl MutationResolvePass<'_, '_, '_> {
                 self.stage_initialized_overwrite(&inode, plan, bytes)?
             }
             FileWritePlan::AllocationChange(mut tree) => {
-                if tree.contains_uninitialized() {
-                    return Err(Error::UnsupportedInodeMutation);
-                }
                 if offset.bytes() > inode.size().bytes() {
                     self.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)?;
                 }
@@ -231,13 +228,12 @@ impl MutationResolvePass<'_, '_, '_> {
         Ok(())
     }
 
-    /// Reserves initialized zero-filled storage through an allocation bound without changing EOF.
-    /// Existing payload blocks retain their contents. New blocks are initialized before the
-    /// allocation becomes durable, including blocks outside EOF that a later extension can expose.
+    /// Reserves zero-readable unwritten extents through an allocation bound without changing EOF.
+    /// Existing payload blocks retain their contents. A later write initializes only its blocks
+    /// and commits their full zero-based contents before publishing initialized extent metadata.
     ///
     /// # Errors
-    /// Returns unsupported mutation for protected or unwritten streams, invalid range for an
-    /// unrepresentable bound, and storage, allocation, encryption, or extent serialization failures.
+    /// Returns protected mutation, unrepresentable range, allocation, or extent serialization failures.
     pub fn reserve_file_allocation(
         &mut self,
         file: TransactionFile,
@@ -256,30 +252,16 @@ impl MutationResolvePass<'_, '_, '_> {
         let inode = raw_inode.parse()?;
         self.require_file_data_mutation(&inode)?;
         let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        if tree.contains_uninitialized() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
-        let width = u64::from(self.mutation.volume.superblock.block_size().bytes());
-        let zeros = memory::repeated_vec(
-            0_u8,
-            usize::try_from(width).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
+        let block_size = self.mutation.volume.superblock.block_size();
+        let width = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let mut offset = FileOffset::ZERO;
         while offset.bytes() < bound.bytes() {
-            let logical = offset.logical_block(self.mutation.volume.superblock.block_size())?;
+            let logical = offset.logical_block(block_size)?;
             if matches!(tree.map_logical(logical), BlockMapping::Hole) {
-                if inode.protection().is_encrypted() {
-                    self.stage_encrypted_inode_stream_write(
-                        &inode,
-                        &mut tree,
-                        offset.bytes(),
-                        &zeros,
-                    )?;
-                } else {
-                    self.stage_inode_stream_write(&mut tree, offset.bytes(), &zeros)?;
-                }
+                let physical = self.physical_block_for_hole(&tree, logical)?;
+                tree.insert_uninitialized(logical, physical)?;
             }
-            offset = offset.checked_add_len(zeros.len())?;
+            offset = offset.checked_add_len(width)?;
         }
         self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
@@ -315,6 +297,9 @@ impl MutationResolvePass<'_, '_, '_> {
         };
 
         for extent in tree.extents().iter().copied() {
+            if extent.initialization() == ExtentInitialization::Uninitialized {
+                continue;
+            }
             let extent_start = extent
                 .logical_start()
                 .as_u64()
@@ -464,8 +449,7 @@ impl MutationResolvePass<'_, '_, '_> {
             if probe > u64::from(u32::MAX) {
                 break;
             }
-            let BlockMapping::Physical(physical) = tree.map_logical(LogicalBlock::try_from(probe)?)
-            else {
+            let Some(physical) = tree.allocated_block(LogicalBlock::try_from(probe)?)? else {
                 continue;
             };
             let cluster = self.mutation.volume.superblock.cluster_of_block(physical)?;
@@ -588,8 +572,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Stages a write into an inode extent stream without applying EOF limits.
     /// # Errors
     ///
-    /// Returns an error when logical range arithmetic fails, the stream contains uninitialized
-    /// extents, allocation fails, or a staged write slice cannot be represented.
+    /// Returns an error when logical range arithmetic fails, allocation fails, or a staged write slice cannot be represented.
     fn stage_inode_stream_write(
         &mut self,
         tree: &mut MutableExtentTree,
@@ -647,10 +630,14 @@ impl MutationResolvePass<'_, '_, '_> {
                         )?,
                     })?;
                 }
-                BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
-                BlockMapping::Hole => {
-                    let physical = self.physical_block_for_hole(tree, logical_block)?;
-                    tree.insert_or_extend_initialized(logical_block, physical)?;
+                BlockMapping::Uninitialized | BlockMapping::Hole => {
+                    let physical = if tree.allocated_block(logical_block)?.is_some() {
+                        tree.initialize_block(logical_block)?
+                    } else {
+                        let physical = self.physical_block_for_hole(tree, logical_block)?;
+                        tree.insert_or_extend_initialized(logical_block, physical)?;
+                        physical
+                    };
                     let mut block = memory::repeated_vec(0_u8, block_size)?;
                     let start = usize::try_from(in_block).map_err(|_| Error::ArithmeticOverflow)?;
                     let block_end = start.checked_add(chunk).ok_or(Error::ArithmeticOverflow)?;
@@ -678,7 +665,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     ///
     /// Returns an error when the inode has no mounted contents key, range arithmetic fails, the
-    /// stream contains uninitialized extents, allocation fails, or encryption fails.
+    /// allocation fails, or encryption fails.
     fn stage_encrypted_inode_stream_write(
         &mut self,
         inode: &Inode,
@@ -726,7 +713,10 @@ impl MutationResolvePass<'_, '_, '_> {
                 BlockMapping::Physical(physical) => {
                     (physical, EncryptedBlockBase::ExistingPlaintext)
                 }
-                BlockMapping::Uninitialized => return Err(Error::UnsupportedInodeMutation),
+                BlockMapping::Uninitialized => (
+                    tree.initialize_block(logical_block)?,
+                    EncryptedBlockBase::ZeroedPlaintext,
+                ),
                 BlockMapping::Hole => {
                     let physical = self.physical_block_for_hole(tree, logical_block)?;
                     tree.insert_or_extend_initialized(logical_block, physical)?;
@@ -794,9 +784,6 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         let block_size_u64 = u64::from(self.mutation.volume.superblock.block_size().bytes());
         let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        if tree.contains_uninitialized() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
         let extents = memory::copied_slice(tree.extents())?;
         let keep_blocks = round_up_div(new_size.bytes(), block_size_u64)?;
         let mut updated = Vec::new();
@@ -813,11 +800,18 @@ impl MutationResolvePass<'_, '_, '_> {
                 )
                 .map_err(|_| Error::ArithmeticOverflow)?;
                 self.mutation.free_extent(extent, keep_len)?;
-                updated.try_push(Extent::initialized(
-                    extent.logical_start(),
-                    ExtentLength::new(keep_len)?,
-                    extent.physical_start(),
-                ))?;
+                let length = ExtentLength::new(keep_len)?;
+                let kept = match extent.initialization() {
+                    ExtentInitialization::Initialized => {
+                        Extent::initialized(extent.logical_start(), length, extent.physical_start())
+                    }
+                    ExtentInitialization::Uninitialized => Extent::uninitialized(
+                        extent.logical_start(),
+                        length,
+                        extent.physical_start(),
+                    ),
+                };
+                updated.try_push(kept)?;
             } else {
                 updated.try_push(extent)?;
             }

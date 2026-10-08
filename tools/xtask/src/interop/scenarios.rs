@@ -1146,6 +1146,44 @@ fn verify_regular_mutation_profile(
     drive_internal_core_mutation(image, |pass| {
         let (_, id) = mutation_root_file(pass, &source)?;
         let file = pass.file(id)?;
+        pass.write_file_range(file, ext4_core::FileOffset::from_bytes(31), b"abc")
+    })?;
+    let mut expected = vec![0_u8; 8192];
+    copy_exact_bytes(
+        expected
+            .get_mut(31..34)
+            .ok_or_else(|| io::Error::other("reserved partial-write fixture range"))?,
+        b"abc",
+    )?;
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/source.bin",
+        &expected,
+        1,
+        "reserved-partial-write",
+    )?;
+    verify_internal_e2fsck_clean(linux, image, "partial reserved extent initialization")?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(id)?;
+        pass.truncate_file(file, ext4_core::FileSize::from_bytes(4097))
+    })?;
+    expected.truncate(4097);
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/source.bin",
+        &expected,
+        1,
+        "reserved-truncation",
+    )?;
+    verify_internal_e2fsck_clean(linux, image, "reserved extent truncation")?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(id)?;
         pass.write_file_range(file, ext4_core::FileOffset::ZERO, &initial)
     })?;
 
@@ -1311,6 +1349,7 @@ fn verify_bigalloc_mutation_profile(
     drive_internal_core_mutation(image, |pass| {
         let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
         let file = pass.create_file(root, &alpha, mutation_file_metadata()?)?;
+        pass.reserve_file_allocation(file, ext4_core::FileAllocationSize::from_bytes(20_480))?;
         pass.write_file_range(file, ext4_core::FileOffset::ZERO, &alpha_content)
     })?;
     drive_internal_core_mutation(image, |pass| {

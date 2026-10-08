@@ -326,6 +326,25 @@ impl Extent {
             .saturating_add(self.len.as_u64())
     }
 
+    /// Converts a covered logical coordinate to its allocated physical coordinate.
+    /// # Errors
+    /// Returns invalid-extent-tree for an uncovered coordinate or physical overflow.
+    fn physical_at(self, logical: LogicalBlock) -> Result<BlockAddress> {
+        if logical.as_u64() >= self.end_logical() {
+            return Err(Error::InvalidExtentTree);
+        }
+        let delta = logical
+            .as_u64()
+            .checked_sub(self.logical_start.as_u64())
+            .ok_or(Error::InvalidExtentTree)?;
+        Ok(BlockAddress::new(
+            self.physical_start
+                .get()
+                .checked_add(delta)
+                .ok_or(Error::InvalidExtentTree)?,
+        ))
+    }
+
     /// Maps a logical block if it falls inside this extent.
     #[must_use]
     pub fn map_logical(self, logical_block: LogicalBlock) -> BlockMapping {
@@ -481,6 +500,92 @@ impl MutableExtentTree {
             physical_block,
         ))?;
         normalize_extents(&mut self.extents)
+    }
+
+    /// Observes allocated storage independently of its zero-read initialization state.
+    /// # Errors
+    /// Returns invalid-extent-tree for a physical-coordinate overflow.
+    pub(crate) fn allocated_block(&self, logical: LogicalBlock) -> Result<Option<BlockAddress>> {
+        let Some(extent) = self.extents.iter().find(|extent| {
+            logical.as_u64() >= extent.logical_start.as_u64()
+                && logical.as_u64() < extent.end_logical()
+        }) else {
+            return Ok(None);
+        };
+        extent.physical_at(logical).map(Some)
+    }
+
+    /// Reserves one zero-readable block without claiming initialized disk contents.
+    /// # Errors
+    /// Returns allocation or extent overlap failures.
+    pub(crate) fn insert_uninitialized(
+        &mut self,
+        logical: LogicalBlock,
+        physical: BlockAddress,
+    ) -> Result<()> {
+        self.extents.try_push(Extent::uninitialized(
+            logical,
+            ExtentLength::new(1)?,
+            physical,
+        ))?;
+        normalize_extents(&mut self.extents)
+    }
+
+    /// Splits an unwritten run to initialize exactly one block. The owning transaction stages
+    /// a complete initialized block before publishing this tree; failure discards the staged tree.
+    /// # Errors
+    /// Returns an invalid mapping, coordinate overflow, or allocation/normalization failure.
+    pub(crate) fn initialize_block(&mut self, logical: LogicalBlock) -> Result<BlockAddress> {
+        let extent = self
+            .extents
+            .iter()
+            .find(|extent| {
+                extent.initialization == ExtentInitialization::Uninitialized
+                    && logical.as_u64() >= extent.logical_start.as_u64()
+                    && logical.as_u64() < extent.end_logical()
+            })
+            .copied()
+            .ok_or(Error::InvalidExtentTree)?;
+        let physical = extent.physical_at(logical)?;
+        let prefix = logical
+            .as_u64()
+            .checked_sub(extent.logical_start.as_u64())
+            .ok_or(Error::InvalidExtentTree)?;
+        let suffix = extent
+            .len
+            .as_u64()
+            .checked_sub(prefix)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(Error::InvalidExtentTree)?;
+        let mut replacement = memory::copied_slice(&self.extents)?;
+        replacement.retain(|candidate| *candidate != extent);
+        if prefix != 0 {
+            replacement.try_push(Extent::uninitialized(
+                extent.logical_start,
+                ExtentLength::new(u16::try_from(prefix).map_err(|_| Error::ArithmeticOverflow)?)?,
+                extent.physical_start,
+            ))?;
+        }
+        replacement.try_push(Extent::initialized(
+            logical,
+            ExtentLength::new(1)?,
+            physical,
+        ))?;
+        if suffix != 0 {
+            let next = LogicalBlock::try_from(
+                logical
+                    .as_u64()
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )?;
+            replacement.try_push(Extent::uninitialized(
+                next,
+                ExtentLength::new(u16::try_from(suffix).map_err(|_| Error::ArithmeticOverflow)?)?,
+                extent.physical_at(next)?,
+            ))?;
+        }
+        self.replace_extents(replacement)?;
+        Ok(physical)
     }
 
     /// External extent metadata blocks currently reserved for this tree.
@@ -1357,5 +1462,44 @@ mod tests {
             ExtentLength::new(EXTENT_LEN_INITIALIZED_MAX.saturating_add(1)),
             Err(Error::InvalidExtentTree)
         );
+    }
+    /// # Panics
+    /// Fails if initializing one reserved block exposes adjacent unwritten storage.
+    #[test]
+    fn reserved_block_initialization_preserves_zero_read_neighbors() {
+        let result = (|| -> crate::Result<()> {
+            let extent = super::Extent::uninitialized(
+                super::LogicalBlock::from_u32(7),
+                ExtentLength::new(4)?,
+                super::BlockAddress::new(100),
+            );
+            let mut tree = super::MutableExtentTree::from_extents(alloc::vec![extent])?;
+            assert_eq!(
+                tree.initialize_block(super::LogicalBlock::from_u32(9))?,
+                super::BlockAddress::new(102)
+            );
+            for (logical, physical, initialized) in [
+                (7, 100, false),
+                (8, 101, false),
+                (9, 102, true),
+                (10, 103, false),
+            ] {
+                let logical = super::LogicalBlock::from_u32(logical);
+                assert_eq!(
+                    tree.allocated_block(logical)?,
+                    Some(super::BlockAddress::new(physical))
+                );
+                assert_eq!(
+                    tree.map_logical(logical),
+                    if initialized {
+                        super::BlockMapping::Physical(super::BlockAddress::new(physical))
+                    } else {
+                        super::BlockMapping::Uninitialized
+                    }
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
     }
 }

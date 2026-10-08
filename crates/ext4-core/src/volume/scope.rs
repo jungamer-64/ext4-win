@@ -15,8 +15,8 @@ pub(super) use crate::disk_format::dir::{
 };
 pub(super) use crate::disk_format::directory_hash::{DirectoryHash, DirectoryHashScheme};
 pub(super) use crate::disk_format::extent::{
-    BlockMapping, Extent, ExtentBlockRun, ExtentLength, ExtentMappingCursor, ExtentTreeContext,
-    LogicalBlock, MutableExtentTree, SerializedExtentTree,
+    BlockMapping, Extent, ExtentBlockRun, ExtentInitialization, ExtentLength, ExtentMappingCursor,
+    ExtentTreeContext, LogicalBlock, MutableExtentTree, SerializedExtentTree,
 };
 pub(super) use crate::disk_format::group::{AllocationBitmapInitialization, BlockGroupDescriptor};
 pub(super) use crate::disk_format::inode::{
