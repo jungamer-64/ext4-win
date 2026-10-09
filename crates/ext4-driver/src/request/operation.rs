@@ -793,10 +793,8 @@ enum ReadOperationState {
         /// Operation-owned storage transcript.
         read: EpochReadOperation,
     },
-    /// Cached read is executing outside the actor and retains its publication range.
+    /// The cached-read worker owns the IRP; the actor retains only its publication range.
     Cached {
-        /// Unique top-level completion authority retaining the output mapping.
-        owned: OwnedIrp,
         /// Validated start for synchronous position publication.
         start: ext4_core::FileOffset,
         /// Maximum Cache Manager transfer selected before submission.
@@ -1081,12 +1079,11 @@ impl MountedVolumeOperation for ReadRequestOperation {
         };
         let (mut owned, read, event, cache_prepared) = match (state, event) {
             (
-                ReadOperationState::Cached {
+                ReadOperationState::Cached { start, requested },
+                CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Read {
                     mut owned,
-                    start,
-                    requested,
-                },
-                CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Read(result)),
+                    result,
+                }),
             ) => {
                 if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
                     return self.restart_cache_plan(owned, access);
@@ -1139,17 +1136,19 @@ impl MountedVolumeOperation for ReadRequestOperation {
             };
             match plan {
                 crate::request::file_info::ReadCachePlan::Cached {
-                    work,
+                    file_object,
+                    offset,
                     start,
                     requested,
                 } => {
-                    self.state = ReadOperationState::Cached {
-                        owned,
-                        start,
-                        requested,
-                    };
+                    self.state = ReadOperationState::Cached { start, requested };
                     return OperationTransition::SubmitPassiveWork {
-                        work,
+                        work: crate::irp::PassiveWork::Read {
+                            file_object,
+                            owned,
+                            offset,
+                            length: requested,
+                        },
                         suspended: self,
                     };
                 }
@@ -3444,10 +3443,8 @@ enum MutationOperationState {
         /// Exact continuation entered only after successful oplock admission.
         resume: OplockResume,
     },
-    /// A within-EOF cached write is executing outside the actor.
+    /// The cached-write worker owns the IRP until it returns its acceptance result.
     CacheWriting {
-        /// Unique top-level completion authority retaining the input mapping.
-        owned: OwnedIrp,
         /// Cursor and successful byte count fixed before Cache Manager acceptance.
         publication: crate::request::file_info::PreparedWritePublication,
     },
@@ -5004,8 +5001,8 @@ impl MutationRequestOperation {
                 let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
                 match (state, completion) {
                     (
-                        MutationOperationState::CacheWriting { owned, publication },
-                        crate::irp::PassiveWorkCompletion::Write(result),
+                        MutationOperationState::CacheWriting { publication },
+                        crate::irp::PassiveWorkCompletion::Write { owned, result },
                     ) => {
                         if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
                             return self.restart_resolution(owned, None, None, access);
@@ -5284,12 +5281,21 @@ impl MutationRequestOperation {
                         }
                     };
                     match plan {
-                        crate::request::file_info::WriteCachePlan::Cached { work, publication } => {
-                            self.state =
-                                MutationOperationState::CacheWriting { owned, publication };
+                        crate::request::file_info::WriteCachePlan::Cached {
+                            file_object,
+                            offset,
+                            length,
+                            publication,
+                        } => {
+                            self.state = MutationOperationState::CacheWriting { publication };
                             return MutationStep::Transition(
                                 OperationTransition::SubmitPassiveWork {
-                                    work,
+                                    work: crate::irp::PassiveWork::Write {
+                                        file_object,
+                                        owned,
+                                        offset,
+                                        length,
+                                    },
                                     suspended: self,
                                 },
                             );

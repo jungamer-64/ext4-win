@@ -917,7 +917,109 @@ pub(crate) struct PendingIrpLease<'a> {
     owner: &'a mut OwnedIrp,
 }
 
+/// Writable captured prefix retained by the IRP's completion-owner borrow.
+/// Construction seals the read direction and capacity; no Rust reference borrows requestor bytes.
+#[derive(Debug)]
+pub(crate) struct CacheReadTransfer<'owner> {
+    /// Exact FILE_OBJECT retained by the borrowing IRP.
+    file_object: KernelFileObject,
+    /// Exclusive capture borrow prevents completion and competing driver output access.
+    prepared: &'owner mut PreparedRead,
+    /// Prefix bounded by the capture's original extent.
+    length: IrpBufferLength,
+}
+
+impl CacheReadTransfer<'_> {
+    /// Returns the FILE_OBJECT identity for native stream matching.
+    pub(crate) const fn file_object(&self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object.as_non_null()
+    }
+
+    /// Returns the checked prefix length.
+    pub(crate) const fn length(&self) -> usize {
+        self.length.as_usize()
+    }
+
+    /// Exposes the opaque writable mapping only while this transfer retains its IRP.
+    pub(crate) fn address(&self) -> Option<NonNull<u8>> {
+        self.prepared.output_address()
+    }
+}
+
+/// Readable captured prefix retained by the IRP's completion-owner borrow.
+/// Construction seals the write direction and capacity; no Rust reference borrows requestor bytes.
+#[derive(Debug)]
+pub(crate) struct CacheWriteTransfer<'owner> {
+    /// Exact FILE_OBJECT retained by the borrowing IRP.
+    file_object: KernelFileObject,
+    /// Capture borrow prevents completion while native code reads the opaque input.
+    prepared: &'owner PreparedWrite,
+    /// Prefix bounded by the capture's original extent.
+    length: IrpBufferLength,
+}
+
+impl CacheWriteTransfer<'_> {
+    /// Returns the FILE_OBJECT identity for native stream matching.
+    pub(crate) const fn file_object(&self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object.as_non_null()
+    }
+
+    /// Returns the checked prefix length.
+    pub(crate) const fn length(&self) -> usize {
+        self.length.as_usize()
+    }
+
+    /// Exposes the opaque readable mapping only while this transfer retains its IRP.
+    pub(crate) fn address(&self) -> Option<NonNull<u8>> {
+        self.prepared.input_address()
+    }
+}
+
 impl<'a> PendingIrpLease<'a> {
+    /// Borrows a captured read prefix for one synchronous native cache call.
+    /// # Errors
+    /// Rejects another request kind, an excess prefix or an absent FILE_OBJECT before native access.
+    pub(crate) fn cache_read_transfer(
+        mut self,
+        length: usize,
+    ) -> DriverResult<CacheReadTransfer<'a>> {
+        let length = self.prepared_read()?.stack().length().prefix(length)?;
+        let file_object = self.with_active(|active| {
+            active
+                .current_stack()?
+                .file_object()
+                .map(ActiveFileObject::address)
+        })?;
+        let prepared = self.owner.context.read_mut()?;
+        Ok(CacheReadTransfer {
+            file_object,
+            prepared,
+            length,
+        })
+    }
+
+    /// Borrows a captured write prefix for one synchronous native cache call.
+    /// # Errors
+    /// Rejects another request kind, an excess prefix or an absent FILE_OBJECT before native access.
+    pub(crate) fn cache_write_transfer(
+        mut self,
+        length: usize,
+    ) -> DriverResult<CacheWriteTransfer<'a>> {
+        let length = self.prepared_write()?.stack().length().prefix(length)?;
+        let file_object = self.with_active(|active| {
+            active
+                .current_stack()?
+                .file_object()
+                .map(ActiveFileObject::address)
+        })?;
+        let prepared = self.owner.context.write()?;
+        Ok(CacheWriteTransfer {
+            file_object,
+            prepared,
+            length,
+        })
+    }
+
     /// Executes one non-suspending operation against a lifetime-bound active IRP view.
     pub(crate) fn with_active<R>(
         &mut self,
@@ -1353,9 +1455,9 @@ impl OwnedIrp {
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-// SAFETY: After CSQ removal, this unique completion authority moves only between the sole reactor
-// thread and an ext4win-owned lower completion envelope. No requestor-context access occurs while
-// the lower stack owns that envelope.
+// SAFETY: After CSQ removal, this unique completion authority moves between the reactor and
+// driver-owned completion or cache-worker envelopes. Capture converts requestor-context inputs
+// before queueing; cache workers borrow only captured system mappings while retaining this owner.
 unsafe impl Send for OwnedIrp {}
 
 /// Unique terminal IRP notification after all request-owned resources have been released.

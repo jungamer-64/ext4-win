@@ -1834,6 +1834,127 @@ mod tests {
         }
     }
 
+    /// # Errors
+    /// Returns fixture capture or allocation failure.
+    /// # Panics
+    /// Panics if a native cache transfer escapes its captured direction, capacity or FILE_OBJECT.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "exclusive stack fixtures retain every device, FILE_OBJECT, IRP and mapped byte through completion"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture errors propagate while assertions verify native transfer admission"
+    )]
+    fn cache_transfers_borrow_the_captured_prefix_and_file_object()
+    -> Result<(), crate::kernel::status::DriverError> {
+        use crate::irp::{OwnedIrp, PendingIrp};
+        use crate::kernel::status::DriverError;
+        for major in [DispatchMajor::Read, DispatchMajor::Write] {
+            for capacity in [0_u32, 8] {
+                let mut device = wdk_sys::DEVICE_OBJECT::default();
+                let mut file = wdk_sys::FILE_OBJECT::default();
+                let mut bytes = [0_u8; 8];
+                let address = core::ptr::NonNull::new(bytes.as_mut_ptr());
+                let mut irp = wdk_sys::IRP::default();
+                irp.AssociatedIrp.SystemBuffer = bytes.as_mut_ptr().cast();
+                let mut stack = wdk_sys::IO_STACK_LOCATION {
+                    FileObject: core::ptr::from_mut(&mut file),
+                    MajorFunction: u8::try_from(major.table_index())
+                        .map_err(|_| DriverError::InvalidParameter)?,
+                    ..Default::default()
+                };
+                match major {
+                    DispatchMajor::Read => {
+                        stack.Parameters.Read =
+                            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
+                                Length: capacity,
+                                ..Default::default()
+                            }
+                    }
+                    DispatchMajor::Write => {
+                        stack.Parameters.Write =
+                            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+                                Length: capacity,
+                                ..Default::default()
+                            }
+                    }
+                    _ => return Err(DriverError::InternalInvariantViolation),
+                }
+                let mut received = build_target(&mut device, &mut irp, &mut stack)
+                    .ok_or(DriverError::InvalidParameter)?;
+                let device = received.device();
+                let context = capture_context(&mut received, major)
+                    .map_err(|completion| DriverError::CacheManagerFailure(completion.status()))?;
+                let raw = PendingIrp::from_received(received, context).publish();
+                let mut owned = unsafe {
+                    // SAFETY: The fixture exclusively removes the just-published IRP and retains
+                    // all of its backing objects until the returned owner is completed below.
+                    OwnedIrp::from_queued_raw(device, raw)
+                };
+                let capacity =
+                    usize::try_from(capacity).map_err(|_| DriverError::InvalidParameter)?;
+                if major == DispatchMajor::Read {
+                    assert_eq!(
+                        owned.request().cache_write_transfer(0).err(),
+                        Some(DriverError::InternalInvariantViolation)
+                    );
+                    assert_eq!(
+                        owned
+                            .request()
+                            .cache_read_transfer(capacity.saturating_add(1))
+                            .err(),
+                        Some(DriverError::BufferTooSmall)
+                    );
+                    let transfer = owned.request().cache_read_transfer(capacity)?;
+                    assert_eq!(transfer.length(), capacity);
+                    assert_eq!(
+                        transfer.file_object().as_ptr(),
+                        core::ptr::from_mut(&mut file)
+                    );
+                    assert_eq!(
+                        transfer.address(),
+                        if capacity == 0 { None } else { address }
+                    );
+                } else {
+                    assert_eq!(
+                        owned.request().cache_read_transfer(0).err(),
+                        Some(DriverError::InternalInvariantViolation)
+                    );
+                    assert_eq!(
+                        owned
+                            .request()
+                            .cache_write_transfer(capacity.saturating_add(1))
+                            .err(),
+                        Some(DriverError::BufferTooSmall)
+                    );
+                    let transfer = owned.request().cache_write_transfer(capacity)?;
+                    assert_eq!(transfer.length(), capacity);
+                    assert_eq!(
+                        transfer.file_object().as_ptr(),
+                        core::ptr::from_mut(&mut file)
+                    );
+                    assert_eq!(
+                        transfer.address(),
+                        if capacity == 0 { None } else { address }
+                    );
+                }
+                stack.FileObject = core::ptr::null_mut();
+                assert!(stack.FileObject.is_null());
+                let error = if major == DispatchMajor::Read {
+                    owned.request().cache_read_transfer(0).err()
+                } else {
+                    owned.request().cache_write_transfer(0).err()
+                };
+                assert_eq!(error, Some(DriverError::InvalidParameter));
+                let completion = owned.prepare_result(Ok(IrpCompletion::EMPTY));
+                assert_eq!(completion.notify(), wdk_sys::STATUS_SUCCESS);
+            }
+        }
+        Ok(())
+    }
+
     /// # Panics
     ///
     /// Panics when queued read capture retains the mutable caller mapping or re-reads stack state.

@@ -3170,17 +3170,9 @@ impl CompletionReactor {
                 return;
             }
         };
-        let prepared = match PassiveWorkEnvelope::try_new(
-            self.device,
-            NonNull::from(self),
-            identity,
-            work,
-            suspended,
-            rundown,
-        ) {
+        let prepared = match PassiveWorkEnvelope::prepare_request(self.device, rundown) {
             Ok(prepared) => prepared,
-            Err(failure) => {
-                let (error, work, suspended) = failure.into_parts();
+            Err(error) => {
                 self.set_ready_operation_event(
                     index,
                     suspended,
@@ -3189,13 +3181,10 @@ impl CompletionReactor {
                 return;
             }
         };
+        let prepared = prepared.bind(NonNull::from(self), identity, work, suspended);
         if self.cancellation_is_pending(index) {
-            let (_work, suspended) = PassiveWorkEnvelope::cancel_before_queue(prepared);
-            self.set_ready_operation_event(
-                index,
-                suspended,
-                CompletionEvent::Core(OperationEvent::CancelRequested),
-            );
+            let (work, suspended) = PassiveWorkEnvelope::cancel_before_queue(prepared);
+            self.set_ready_operation_event(index, suspended, work.cancel_before_execution());
             return;
         }
         if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
@@ -5078,12 +5067,18 @@ mod tests {
                     crate::irp::PassiveWorkCompletion::SectorSize(result) => {
                         let _result = result;
                     }
-                    crate::irp::PassiveWorkCompletion::Read(result)
-                    | crate::irp::PassiveWorkCompletion::Mdl(result) => {
+                    crate::irp::PassiveWorkCompletion::Read { owned, result } => {
+                        let _owned = owned;
                         let _result = result;
                     }
-                    crate::irp::PassiveWorkCompletion::Write(result)
-                    | crate::irp::PassiveWorkCompletion::Flush(result)
+                    crate::irp::PassiveWorkCompletion::Write { owned, result } => {
+                        let _owned = owned;
+                        let _result = result;
+                    }
+                    crate::irp::PassiveWorkCompletion::Mdl(result) => {
+                        let _result = result;
+                    }
+                    crate::irp::PassiveWorkCompletion::Flush(result)
                     | crate::irp::PassiveWorkCompletion::CloseWriteback(result)
                     | crate::irp::PassiveWorkCompletion::Purge(result)
                     | crate::irp::PassiveWorkCompletion::CleanupOplock(result)

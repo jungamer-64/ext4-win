@@ -60,21 +60,21 @@ pub(crate) enum PassiveWork {
     Read {
         /// Stream retained independently from the handle CCB.
         file_object: FileObjectCacheLease,
+        /// Sole completion owner retains the captured output through worker execution.
+        owned: super::OwnedIrp,
         /// Signed Windows byte offset validated before worker submission.
         offset: i64,
         /// Maximum transfer byte count.
         length: usize,
-        /// Writable system mapping retained by the suspended IRP.
-        output: Option<NonNull<u8>>,
     },
     /// Accept one within-EOF write into Cache Manager.
     Write {
         /// Stream retained independently from the handle CCB.
         file_object: FileObjectCacheLease,
+        /// Sole completion owner retains the captured input through worker execution.
+        owned: super::OwnedIrp,
         /// Signed Windows byte offset validated before worker submission.
         offset: i64,
-        /// Readable system mapping retained by the suspended IRP.
-        input: Option<NonNull<u8>>,
         /// Exact accepted byte count on success.
         length: usize,
     },
@@ -137,9 +137,19 @@ pub(crate) enum PassiveWorkCompletion {
     /// MDL chain acquisition and observed byte count.
     Mdl(DriverResult<usize>),
     /// Cached read status and observed transfer byte count.
-    Read(DriverResult<usize>),
+    Read {
+        /// Completion authority returned only after native buffer access ends.
+        owned: super::OwnedIrp,
+        /// Exact transfer outcome, including preparation failure before native access.
+        result: DriverResult<usize>,
+    },
     /// Cached write acceptance status.
-    Write(DriverResult<()>),
+    Write {
+        /// Completion authority returned only after native buffer access ends.
+        owned: super::OwnedIrp,
+        /// Acceptance outcome; failure does not publish a successful byte count.
+        result: DriverResult<()>,
+    },
     /// Dirty-page flush status.
     Flush(DriverResult<()>),
     /// Terminal writeback status, including pinned/mapped-page conflicts.
@@ -239,16 +249,22 @@ impl PassiveWork {
             } => PassiveWorkCompletion::Mdl(file_object.mdl(irp, action)),
             Self::Read {
                 file_object,
+                mut owned,
                 offset,
                 length,
-                output,
-            } => PassiveWorkCompletion::Read(file_object.read(offset, length, output)),
+            } => {
+                let result = file_object.read(owned.request(), offset, length);
+                PassiveWorkCompletion::Read { owned, result }
+            }
             Self::Write {
                 file_object,
+                mut owned,
                 offset,
-                input,
                 length,
-            } => PassiveWorkCompletion::Write(file_object.write(offset, input, length)),
+            } => {
+                let result = file_object.write(owned.request(), offset, length);
+                PassiveWorkCompletion::Write { owned, result }
+            }
             Self::Flush { stream } => PassiveWorkCompletion::Flush(stream.flush()),
             Self::CloseWriteback { stream } => {
                 PassiveWorkCompletion::CloseWriteback(stream.close_writeback())
@@ -281,8 +297,14 @@ impl PassiveWork {
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).failed(error)),
             Self::SectorSize { .. } => PassiveWorkCompletion::SectorSize(Err(error)),
             Self::Mdl { .. } => PassiveWorkCompletion::Mdl(Err(error)),
-            Self::Read { .. } => PassiveWorkCompletion::Read(Err(error)),
-            Self::Write { .. } => PassiveWorkCompletion::Write(Err(error)),
+            Self::Read { owned, .. } => PassiveWorkCompletion::Read {
+                owned,
+                result: Err(error),
+            },
+            Self::Write { owned, .. } => PassiveWorkCompletion::Write {
+                owned,
+                result: Err(error),
+            },
             Self::Flush { .. } => PassiveWorkCompletion::Flush(Err(error)),
             Self::CloseWriteback { .. } => PassiveWorkCompletion::CloseWriteback(Err(error)),
             Self::Purge { .. } => PassiveWorkCompletion::Purge(Err(error)),
@@ -296,35 +318,30 @@ impl PassiveWork {
             Self::Uninitialize { .. } => PassiveWorkCompletion::Uninitialize(Err(error)),
         }
     }
+
+    /// Returns cache-transfer IRP ownership on cancellation before native submission.
+    /// Other work leaves IRP ownership in its suspended operation and resumes that cancel path.
+    #[cfg(not(test))]
+    pub(super) fn cancel_before_execution(self) -> super::reactor::CompletionEvent {
+        match self {
+            work @ (Self::Read { .. } | Self::Write { .. }) => {
+                super::reactor::CompletionEvent::PassiveCompleted(
+                    work.failed(DriverError::from(ext4_core::Error::OperationCancelled)),
+                )
+            }
+            _ => super::reactor::CompletionEvent::Core(ext4_core::OperationEvent::CancelRequested),
+        }
+    }
 }
 
 #[expect(
     unsafe_code,
     reason = "suspended IRPs, stream leases and referenced devices retain every captured mapping and identity through native work"
 )]
-// SAFETY: IRP mappings belong to the unique suspended operation, stream leases retain Cc/MM
-// identities, and sector queries own a device reference. One work envelope consumes the call
-// before the operation can resume or release any input resource.
+// SAFETY: Cached transfers own their captured IRP; other IRP work is retained by the suspended
+// operation in the same envelope. Stream leases retain Cc/MM identities, and sector queries own
+// a device reference. Native access ends before either completion owner can resume or release.
 unsafe impl Send for PassiveWork {}
-
-/// Preparation failure that returns the unique suspended operation to the reactor.
-#[cfg(not(test))]
-pub(super) struct PassiveWorkPreparationError {
-    /// Exact allocation or rundown failure.
-    error: DriverError,
-    /// Operation that never crossed the worker effect boundary.
-    suspended: Box<dyn CompletionOperation>,
-    /// Prepared native call that never crossed the worker effect boundary.
-    work: PassiveWork,
-}
-
-#[cfg(not(test))]
-impl PassiveWorkPreparationError {
-    /// Recovers the failure and unique operation authority.
-    pub(super) fn into_parts(self) -> (DriverError, PassiveWork, Box<dyn CompletionOperation>) {
-        (self.error, self.work, self.suspended)
-    }
-}
 
 /// Stable native worker storage. Dormant reserves exist before device admission is published.
 #[cfg(not(test))]
@@ -448,25 +465,14 @@ impl PassiveWorkEnvelope {
         self
     }
 
-    /// Prepares ordinary native work while preserving ownership on pre-effect failure.
+    /// Reserves ordinary worker storage before transferring request or operation ownership.
     /// # Errors
-    /// Returns allocation failure together with the unconsumed work and operation.
-    pub(super) fn try_new(
+    /// Returns allocation failure without accepting a request or submitting native work.
+    pub(super) fn prepare_request(
         device: KernelDevice,
-        reactor: NonNull<CompletionReactor>,
-        identity: SlotId,
-        work: PassiveWork,
-        suspended: Box<dyn CompletionOperation>,
         rundown: CompletionRundownLease,
-    ) -> Result<Box<Self>, PassiveWorkPreparationError> {
-        match Self::allocate(device, PassiveLifetime::Request(rundown)) {
-            Ok(envelope) => Ok(envelope.bind(reactor, identity, work, suspended)),
-            Err(error) => Err(PassiveWorkPreparationError {
-                error,
-                suspended,
-                work,
-            }),
-        }
+    ) -> DriverResult<Box<Self>> {
+        Self::allocate(device, PassiveLifetime::Request(rundown))
     }
 
     /// Consumes ordinary work before submission; finalization reserves are non-cancellable.

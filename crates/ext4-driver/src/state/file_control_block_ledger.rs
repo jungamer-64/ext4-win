@@ -872,6 +872,46 @@ impl FileObjectCacheLease {
         self.stream
     }
 
+    /// Copies a bounded captured read prefix while borrowing its sole completion owner.
+    /// # Errors
+    /// Rejects another request kind, an excess prefix or a different FILE_OBJECT before native
+    /// access, and otherwise returns the exact Cache Manager outcome.
+    pub(crate) fn read(
+        &self,
+        request: crate::irp::PendingIrpLease<'_>,
+        offset: i64,
+        length: usize,
+    ) -> DriverResult<usize> {
+        let transfer = request.cache_read_transfer(length)?;
+        if transfer.file_object() != self.file_object.as_non_null() {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        self.stream
+            .stream()
+            .stream_context
+            .cached_read(offset, transfer)
+    }
+
+    /// Accepts a bounded captured write prefix while borrowing its sole completion owner.
+    /// # Errors
+    /// Rejects another request kind, an excess prefix or a different FILE_OBJECT before native
+    /// access, and otherwise returns the exact Cache Manager outcome.
+    pub(crate) fn write(
+        &self,
+        request: crate::irp::PendingIrpLease<'_>,
+        offset: i64,
+        length: usize,
+    ) -> DriverResult<()> {
+        let transfer = request.cache_write_transfer(length)?;
+        if transfer.file_object() != self.file_object.as_non_null() {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        self.stream
+            .stream()
+            .stream_context
+            .cached_write(offset, transfer)
+    }
+
     /// Releases this FILE_OBJECT's private cache map.
     /// # Errors
     ///

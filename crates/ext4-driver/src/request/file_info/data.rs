@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     irp::{DataCachePolicy, PassiveWork},
-    state::{DataTransferMode, KernelDevice, NoIntermediateTransfer},
+    state::{DataTransferMode, FileObjectCacheLease, KernelDevice, NoIntermediateTransfer},
 };
 
 /// Maximum requestor data bytes copied through driver-owned memory at one time.
@@ -64,8 +64,10 @@ impl RegularFileDataAuthority {
 pub(crate) enum ReadCachePlan {
     /// Cached bytes will complete the request after worker return.
     Cached {
-        /// Sole Cc operation executed outside the actor.
-        work: PassiveWork,
+        /// Retained stream selected before transferring the IRP to its worker.
+        file_object: FileObjectCacheLease,
+        /// Signed range start passed to the Cache Manager.
+        offset: i64,
         /// Range start used for synchronous cursor publication.
         start: FileOffset,
         /// Maximum worker transfer validated before submission.
@@ -82,8 +84,12 @@ pub(crate) enum ReadCachePlan {
 pub(crate) enum WriteCachePlan {
     /// A within-EOF write will complete when Cache Manager accepts every byte.
     Cached {
-        /// Sole cache call executed outside the actor.
-        work: PassiveWork,
+        /// Retained stream selected before transferring the IRP to its worker.
+        file_object: FileObjectCacheLease,
+        /// Signed range start passed to the Cache Manager.
+        offset: i64,
+        /// Exact validated transfer prefix.
+        length: usize,
         /// Infallible cursor and byte-count publication prepared before cache acceptance.
         publication: PreparedWritePublication,
     },
@@ -127,7 +133,6 @@ pub(crate) fn prepare_read_cache_plan(
     }
     let stack = request.prepared_read()?.stack();
     let cache_policy = request.prepared_read()?.cache_policy();
-    let output = request.prepared_read()?.output_address();
     request.with_active(|active| {
         if active.data_io_kind() != DataIoKind::Handle {
             return Err(DriverError::InternalInvariantViolation);
@@ -162,7 +167,8 @@ pub(crate) fn prepare_read_cache_plan(
         let offset =
             i64::try_from(range.start().bytes()).map_err(|_| DriverError::InvalidParameter)?;
         Ok(ReadCachePlan::Cached {
-            work: PassiveWork::read(file_cache, offset, requested, output),
+            file_object: file_cache,
+            offset,
             start: range.start(),
             requested,
         })
@@ -267,7 +273,9 @@ pub(crate) fn prepare_write_cache_plan(
             range.length(),
         )?;
         Ok(WriteCachePlan::Cached {
-            work: PassiveWork::write(file_cache, offset, input, range.length()),
+            file_object: file_cache,
+            offset,
+            length: range.length(),
             publication: PreparedWritePublication {
                 completion,
                 position,

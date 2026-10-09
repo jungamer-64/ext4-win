@@ -1130,33 +1130,31 @@ impl StreamContext {
     }
 
     /// Copies cached bytes into one system-addressable IRP buffer.
-    /// # Safety
-    /// The caller must retain this stream, the matching FILE_OBJECT and the IRP through return.
-    /// For a nonempty transfer, output must cover `length` writable bytes without aliasing any
-    /// Rust reference. The IRP cannot complete or expose competing driver access during this call.
     /// # Errors
     ///
     /// Returns the exact Cache Manager status or an input representation failure.
-    pub(crate) unsafe fn cached_read(
+    pub(crate) fn cached_read(
         &self,
-        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
         _offset: i64,
-        length: usize,
-        _output: Option<NonNull<u8>>,
+        transfer: crate::irp::CacheReadTransfer<'_>,
     ) -> DriverResult<usize> {
+        let length = transfer.length();
         if length == 0 {
             return Ok(0);
         }
         let _length = u32::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?;
-        let _output = _output.ok_or(DriverError::InternalInvariantViolation)?;
+        let _output = transfer
+            .address()
+            .ok_or(DriverError::InternalInvariantViolation)?;
         #[cfg(not(test))]
         {
             let mut information = 0_usize;
             let status = unsafe {
-                // SAFETY: The active IRP owns a writable system mapping of at least `length` bytes.
+                // SAFETY: The sealed transfer borrows its completion owner, bounds this writable
+                // mapping, and retains the FILE_OBJECT through synchronous native return.
                 ext4win_stream_cache_read(
                     self.header.as_ptr(),
-                    _file_object.as_ptr(),
+                    transfer.file_object().as_ptr(),
                     _offset,
                     _length,
                     _output.as_ptr().cast(),
@@ -1173,32 +1171,30 @@ impl StreamContext {
     /// Accepts one within-EOF write into the FILE_OBJECT cache map.
     /// Passive work retains all identities while Cc admission waits outside filesystem resources.
     /// It joins deferred callbacks before returning; storage and EOF are revalidated before copy.
-    /// # Safety
-    /// The caller must retain this stream, the matching FILE_OBJECT and the IRP through return.
-    /// For a nonempty transfer, input must cover `length` readable bytes in a system mapping.
-    /// The IRP cannot complete or expose competing driver access during this call.
     /// # Errors
     ///
     /// Returns the exact Cache Manager status or an input representation failure.
-    pub(crate) unsafe fn cached_write(
+    pub(crate) fn cached_write(
         &self,
-        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
         _offset: i64,
-        _input: Option<NonNull<u8>>,
-        length: usize,
+        transfer: crate::irp::CacheWriteTransfer<'_>,
     ) -> DriverResult<()> {
+        let length = transfer.length();
         if length == 0 {
             return Ok(());
         }
         let _length = u32::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?;
-        let _input = _input.ok_or(DriverError::InternalInvariantViolation)?;
+        let _input = transfer
+            .address()
+            .ok_or(DriverError::InternalInvariantViolation)?;
         #[cfg(not(test))]
         {
             let status = unsafe {
-                // SAFETY: The active IRP owns a readable system mapping of at least `length` bytes.
+                // SAFETY: The sealed transfer borrows its completion owner, bounds this readable
+                // mapping, and retains the FILE_OBJECT through synchronous native return.
                 ext4win_stream_cache_write(
                     self.header.as_ptr(),
-                    _file_object.as_ptr(),
+                    transfer.file_object().as_ptr(),
                     _offset,
                     _length,
                     _input.as_ptr().cast(),
