@@ -2835,15 +2835,16 @@ impl VolumeControlBlock {
         unsafe_code,
         reason = "Pin and private construction establish the native VCB owner lifetime"
     )]
-    pub(crate) fn bind_stream_owner(self: Pin<&Self>) -> DriverResult<()> {
+    pub(super) fn bind_stream_owner(
+        self: Pin<&Self>,
+        control_device: KernelDevice,
+    ) -> DriverResult<()> {
         let vcb = self.get_ref();
         unsafe {
             // SAFETY: `PhantomPinned` prevents safe relocation and the stream is destroyed before
             // the enclosing pinned VCB allocation is released.
-            vcb.stream_context.bind_volume_owner(
-                NonNull::from(vcb).cast::<c_void>(),
-                vcb.runtime.storage().filesystem_control_device(),
-            )
+            vcb.stream_context
+                .bind_volume_owner(NonNull::from(vcb).cast::<c_void>(), control_device)
         }
     }
 
@@ -2866,7 +2867,7 @@ impl VolumeControlBlock {
     /// # Errors
     ///
     /// Returns an error when FsRtl cannot allocate the notifier synchronization state.
-    pub(crate) fn initialize_directory_change_notifier(&mut self) -> DriverResult<()> {
+    pub(super) fn initialize_directory_change_notifier(&mut self) -> DriverResult<()> {
         self.directory_change_notifier.initialize()
     }
 
@@ -2897,31 +2898,23 @@ impl VolumeControlBlock {
         share_access: ShareAccess,
         oplock_policy: OplockCreatePolicy,
     ) -> DriverResult<ExistingFileControlBlockAdmission> {
-        let volume_ptr = volume.as_ptr();
-        let file_control_blocks = unsafe {
-            // SAFETY: `volume_ptr` identifies the live, stable mounted VCB. `addr_of!` projects
-            // the ledger address without creating a reference to the transaction-owned volume.
-            core::ptr::addr_of!((*volume_ptr).file_control_blocks)
+        let owner = unsafe {
+            // SAFETY: Actor admission retains this immutable mounted stream owner. Ledger
+            // mutations use its independent synchronization; actor state is a separate allocation.
+            volume.as_ref()
         };
-        let file_control_blocks = unsafe {
-            // SAFETY: The mounted VCB pointer is stable for request processing. Raw field
-            // projection borrows only the independently synchronized ledger and never creates a
-            // shared reference spanning the transaction-owned `volume` field.
-            &*file_control_blocks
-        };
-        file_control_blocks.open_existing(ExistingFileControlBlockOpen {
-            volume,
-            trace: unsafe {
-                // SAFETY: Actor admission retains this stable mounted VCB through the call.
-                volume.as_ref().trace
-            },
-            stream,
-            file_object,
-            desired_access,
-            operation_access: existing_operation_access,
-            share_access,
-            oplock_policy,
-        })
+        owner
+            .file_control_blocks
+            .open_existing(ExistingFileControlBlockOpen {
+                volume,
+                trace: owner.trace,
+                stream,
+                file_object,
+                desired_access,
+                operation_access: existing_operation_access,
+                share_access,
+                oplock_policy,
+            })
     }
 }
 /// Driver publication values prepared for a child staged in an ephemeral mutation pass.

@@ -36,7 +36,7 @@ use crate::state::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MountedVolumeAccess,
     MountedVolumeDevice, MountedVolumeDeviceExtension, MutationActivityLease, PendingCheckpoint,
     PreparedVolumeStateTransition, RawVolumeOperationKind, RawVolumeTarget,
-    StreamProjectionOutcome, VolumeControlBlock,
+    StreamProjectionOutcome,
 };
 
 /// Faults the mounted mutation authority only for real Cc/MM failures, not ordinary conflicts or
@@ -479,12 +479,9 @@ impl MountRequestOperation {
         let Some(driver_object) = admission.file_system_device().driver_object() else {
             return Err(DriverError::InvalidParameter);
         };
-        let mut vcb = memory::boxed_try_with(move || {
-            VolumeControlBlock::from_completed_mount(*completed, devices, trace, catalog)
-        })?;
-        vcb.initialize_directory_change_notifier()?;
-        let vcb = Box::into_pin(vcb);
-        vcb.as_ref().bind_stream_owner()?;
+        let binding = crate::state::MountedVolumeBinding::from_completed_mount(
+            *completed, devices, trace, catalog,
+        )?;
 
         let extension_size =
             wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>())
@@ -515,7 +512,7 @@ impl MountRequestOperation {
         };
         match MountedVolumeDevice::initialize(
             device,
-            vcb,
+            binding,
             admission.vpb(),
             admission.target_device(),
         ) {

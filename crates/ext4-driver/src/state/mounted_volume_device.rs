@@ -77,7 +77,7 @@ impl MountedVolumeDevice {
     )]
     pub(crate) fn initialize(
         device: KernelDevice,
-        vcb: Pin<Box<VolumeControlBlock>>,
+        binding: MountedVolumeBinding,
         vpb: KernelVpb,
         target_device: KernelDevice,
     ) -> DriverResult<()> {
@@ -87,13 +87,19 @@ impl MountedVolumeDevice {
             .checked_add(1)
             .ok_or(DriverError::InvalidParameter)?;
         let transfer_alignment = target_device.transfer_buffer_alignment()?;
-        let sector_size = vcb.runtime.storage().filesystem_sector_size();
-        let _sectors = sector_size
-            .sectors_per_cluster(vcb.runtime.current_epoch().geometry().cluster_size())?;
+        let sector_size = binding.actor.runtime.storage().filesystem_sector_size();
+        let _sectors = sector_size.sectors_per_cluster(
+            binding
+                .actor
+                .runtime
+                .current_epoch()
+                .geometry()
+                .cluster_size(),
+        )?;
         let sector_bytes =
             u16::try_from(sector_size.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
-        let trace = vcb.trace;
-        let identity = vcb.runtime.identity();
+        let trace = binding.volume().trace;
+        let identity = binding.actor.runtime.identity();
         let serial_number = VolumeSerialNumber::from_uuid(identity.uuid()).as_u32();
         let volume_label = VpbLabel::encode(identity.label())?;
         let extension_slot = unsafe {
@@ -109,13 +115,16 @@ impl MountedVolumeDevice {
                 .ok_or(DriverError::InvalidParameter)?;
         let storage = unsafe {
             // SAFETY: The pinned VCB outlives every reactor/dispatch lease on this extension.
-            vcb.stream_context.storage_access()?
+            binding.volume().stream_context.storage_access()?
         };
         let removal = unsafe {
             // SAFETY: This mount installs the sole PnP publisher under device dispatch rundown.
-            vcb.stream_context.storage_removal_publisher()?
+            binding
+                .volume()
+                .stream_context
+                .storage_removal_publisher()?
         };
-        let lower = vcb.runtime.storage().filesystem_control_device();
+        let lower = binding.actor.runtime.storage().filesystem_control_device();
         let storage_slot = unsafe {
             // SAFETY: The unborrowed extension allocation has the exact mounted-extension layout.
             core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).storage)
@@ -153,7 +162,7 @@ impl MountedVolumeDevice {
                 core::ptr::addr_of_mut!(extension.header),
                 DeviceExtensionKind::MOUNTED_VOLUME,
                 device,
-                ReactorTarget::MountedVolume(MountedVolumeBinding::new(vcb)),
+                ReactorTarget::MountedVolume(binding),
                 trace,
             )?;
         }
@@ -283,10 +292,9 @@ impl MountedVolumeDevice {
         let ReactorTarget::MountedVolume(binding) = target else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        let vcb = binding.into_volume();
         Self::unregister_shutdown_notification(device);
         Self::detach_vpb(device);
-        drop(vcb);
+        drop(binding);
     }
 
     /// Queues the preallocated work item that retires this device after its actor returns.

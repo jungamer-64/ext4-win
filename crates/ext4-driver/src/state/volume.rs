@@ -3,7 +3,9 @@
 use super::*;
 
 #[derive(Debug)]
-/// Volume control block stored in a mounted volume device extension.
+/// Shared mounted-volume stream owner at a pinned heap address.
+/// Native owner pointers borrow this allocation through shared references. Epoch and lifecycle
+/// mutation belongs to the separate reactor-owned fields of [`MountedVolumeBinding`].
 pub(crate) struct VolumeControlBlock {
     /// Write-only operational event capability inherited from the driver registration owner.
     pub(super) trace: OperationalTrace,
@@ -522,6 +524,13 @@ impl MountedVolumeRef {
 pub(crate) struct MountedVolumeBinding {
     /// Shared heap-stable stream, notification and FCB ownership; destroyed before runtime storage.
     volume: Pin<Box<VolumeControlBlock>>,
+    /// Exclusive state allocation, independent of the native shared-owner pointer graph.
+    pub(super) actor: Box<MountedVolumeActorState>,
+}
+
+/// Mutable volume authority carried only by the owning reactor, never by native stream pointers.
+#[derive(Debug)]
+pub(super) struct MountedVolumeActorState {
     /// Actor-owned volume lifecycle and direct-open share accounting.
     pub(super) volume_control: VolumeControlPlane,
     /// Actor-owned epochs, mutation coordination and retained lower storage.
@@ -529,6 +538,44 @@ pub(crate) struct MountedVolumeBinding {
 }
 
 impl MountedVolumeBinding {
+    /// Builds the shared stream owner and the reactor's independent mutable state after recovery.
+    /// # Errors
+    /// Returns allocation, provider, notification or native stream initialization failure before publication.
+    pub(crate) fn from_completed_mount(
+        mount: CompletedMount,
+        storage: MountedStorage,
+        trace: OperationalTrace,
+        catalog: &mut crate::identity::IdentityDirectory,
+    ) -> DriverResult<Self> {
+        let runtime = VolumeRuntime::try_new(mount, storage, catalog)?;
+        let actor = memory::boxed_try_with(|| {
+            Ok(MountedVolumeActorState {
+                volume_control: VolumeControlPlane::mounted(),
+                runtime,
+            })
+        })?;
+        let mut volume = memory::boxed_try_with(|| {
+            Ok(VolumeControlBlock {
+                trace,
+                directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
+                file_control_blocks: FileControlBlockLedger::try_new()?,
+                stream_context: StreamContext::try_new_volume(StreamSizes::EMPTY, trace)?,
+                _pin: PhantomPinned,
+            })
+        })?;
+        volume.initialize_directory_change_notifier()?;
+        let volume = Box::into_pin(volume);
+        volume
+            .as_ref()
+            .bind_stream_owner(actor.runtime.storage().filesystem_control_device())?;
+        Ok(Self { volume, actor })
+    }
+
+    /// Borrows the shared stream owner without granting actor-state mutation.
+    pub(super) fn volume(&self) -> &VolumeControlBlock {
+        self.volume.as_ref().get_ref()
+    }
+
     /// Runs one non-suspending reactor transition with lifetime-bound mounted access.
     pub(crate) fn with_access<R>(
         &mut self,
@@ -536,8 +583,8 @@ impl MountedVolumeBinding {
     ) -> R {
         transition(&mut MountedVolumeAccess {
             volume: self.volume.as_ref().get_ref(),
-            volume_control: &mut self.volume_control,
-            runtime: &mut self.runtime,
+            volume_control: &mut self.actor.volume_control,
+            runtime: &mut self.actor.runtime,
         })
     }
 }
@@ -547,7 +594,8 @@ impl MountedVolumeBinding {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 // SAFETY: The binding moves once into the device reactor. Only that reactor's sole actor thread
-// calls `with_access`, and teardown recovers the Box only after the actor and completions drain.
+// calls `with_access`, and teardown releases shared resources before runtime storage after all
+// actor operations and callbacks drain.
 unsafe impl Send for MountedVolumeBinding {}
 
 /// Lifetime-bound mounted VCB access available only inside one reactor callback.
@@ -565,7 +613,7 @@ impl MountedVolumeAccess<'_> {
     /// # Errors
     /// Returns finite reference-budget exhaustion.
     pub(crate) fn identity_snapshot(&self) -> DriverResult<crate::identity::IdentitySnapshot> {
-        self.volume.runtime.identity.get().capture()
+        self.runtime.identity.get().capture()
     }
     /// Lends the cache to one synchronous pass while retaining independent driver authorities.
     /// The sole reactor actor cannot admit another pass while this closure runs. The owner is
@@ -575,9 +623,9 @@ impl MountedVolumeAccess<'_> {
         &mut self,
         operation: impl FnOnce(&mut ext4_core::MetadataCache, &mut Self) -> T,
     ) -> T {
-        let mut cache = core::mem::take(&mut self.volume.runtime.metadata_cache);
+        let mut cache = core::mem::take(&mut self.runtime.metadata_cache);
         let result = operation(&mut cache, self);
-        self.volume.runtime.metadata_cache = cache;
+        self.runtime.metadata_cache = cache;
         result
     }
     /// Closes new-create admission before waiting for already admitted mutations to drain.
@@ -592,7 +640,7 @@ impl MountedVolumeAccess<'_> {
         &self,
     ) -> DriverResult<crate::kernel::stream::QueryRemovalPreparation> {
         self.authorize_durability()?;
-        self.volume.volume_control.authorize_query_removal()?;
+        self.volume_control.authorize_query_removal()?;
         unsafe {
             // SAFETY: The suspended operation and reactor rundown retain this VCB and native gate.
             self.volume.stream_context.prepare_query_removal()
@@ -605,7 +653,7 @@ impl MountedVolumeAccess<'_> {
     /// published an open while query removal was draining.
     pub(crate) fn authorize_query_removal(&self) -> DriverResult<()> {
         self.authorize_durability()?;
-        self.volume.volume_control.authorize_query_removal()
+        self.volume_control.authorize_query_removal()
     }
 
     /// Retains every cache stream after pre-query mutations have drained.
@@ -664,14 +712,14 @@ impl MountedVolumeAccess<'_> {
     #[cfg(not(test))]
     pub(crate) fn observe_storage_removal(&mut self) -> Option<VolumeRetirement> {
         if self.authorize_storage().is_ok()
-            || self.volume.volume_control.state == MountedVolumeState::Retiring
+            || self.volume_control.state == MountedVolumeState::Retiring
         {
             return None;
         }
-        if self.volume.volume_control.state != MountedVolumeState::StorageRemoved {
-            self.volume.volume_control.state = MountedVolumeState::StorageRemoved;
-            self.volume.runtime.record_durability_unknown();
-            self.volume.runtime.record_read_unreliable();
+        if self.volume_control.state != MountedVolumeState::StorageRemoved {
+            self.volume_control.state = MountedVolumeState::StorageRemoved;
+            self.runtime.record_durability_unknown();
+            self.runtime.record_read_unreliable();
             self.volume.directory_change_notifier.cleanup_all();
         }
         Some(self.begin_retirement())
@@ -762,13 +810,13 @@ impl VolumeCloseOutcome {
 
 impl MountedVolumeAccess<'_> {
     /// Returns the stable raw identity stored in FCB and open-handle lifetime records.
-    pub(crate) fn file_object_owner(&mut self) -> NonNull<VolumeControlBlock> {
-        NonNull::from(&mut *self.volume)
+    pub(crate) fn file_object_owner(&self) -> NonNull<VolumeControlBlock> {
+        NonNull::from(self.volume)
     }
 
     /// Checks that a lifetime record belongs to this device-local mounted binding.
     pub(crate) fn owns_volume(&self, candidate: NonNull<VolumeControlBlock>) -> bool {
-        NonNull::from(&*self.volume) == candidate
+        NonNull::from(self.volume) == candidate
     }
 
     /// Records one direct-volume FILE_OBJECT share claim.
@@ -781,7 +829,7 @@ impl MountedVolumeAccess<'_> {
         desired_access: GrantedAccess,
         share_access: ShareAccess,
     ) -> DriverResult<()> {
-        let control = &mut self.volume.volume_control;
+        let control = &mut self.volume_control;
         control.state.authorize_create()?;
         let next_count = control
             .volume_file_objects
@@ -799,7 +847,7 @@ impl MountedVolumeAccess<'_> {
         &mut self,
         file_object: KernelFileObject,
     ) -> VolumeHandleCleanup {
-        let control = &mut self.volume.volume_control;
+        let control = &mut self.volume_control;
         control.handles.cleanup(file_object);
         let (state, effect) = control.state.cleanup(file_object);
         control.state = state;
@@ -813,7 +861,7 @@ impl MountedVolumeAccess<'_> {
         release_plan: CloseReleasePlan,
     ) -> VolumeCloseOutcome {
         let cleanup = {
-            let control = &mut self.volume.volume_control;
+            let control = &mut self.volume_control;
             let cleanup = match release_plan {
                 CloseReleasePlan::CleanedHandle => VolumeHandleCleanup::Released,
                 CloseReleasePlan::CancelledOpen => {
@@ -846,7 +894,7 @@ impl MountedVolumeAccess<'_> {
     /// retirement. Ordinary mounted operation does not acquire the stream ledger for this check.
     #[cfg(not(test))]
     pub(crate) fn recheck_terminal_retirement(&mut self) -> VolumeRetirement {
-        if self.volume.volume_control.state.permits_retirement() {
+        if self.volume_control.state.permits_retirement() {
             self.begin_retirement()
         } else {
             VolumeRetirement::Retained
@@ -883,7 +931,7 @@ impl MountedVolumeAccess<'_> {
             return VolumeRetirement::Retained;
         }
         let namespace_empty = self.volume.file_control_blocks.is_empty();
-        let control = &mut self.volume.volume_control;
+        let control = &mut self.volume_control;
         let (state, retirement) = control
             .state
             .retire_if_unreferenced(namespace_empty, control.volume_file_objects);
@@ -901,15 +949,15 @@ impl MountedVolumeAccess<'_> {
         owner: KernelFileObject,
     ) -> DriverResult<PreparedVolumeLock> {
         self.authorize_durability()?;
-        let next_state = self.volume.volume_control.state.begin_lock(owner)?;
-        if self.volume.volume_control.handles.active_handle_count() != 1 {
+        let next_state = self.volume_control.state.begin_lock(owner)?;
+        if self.volume_control.handles.active_handle_count() != 1 {
             return Err(DriverError::AccessDenied);
         }
         let cache_drain = self
             .volume
             .file_control_blocks
             .prepare_volume_lock_cache_drain()?;
-        self.volume.volume_control.state = next_state;
+        self.volume_control.state = next_state;
         Ok(PreparedVolumeLock {
             transition: PreparedVolumeStateTransition {
                 kind: PreparedVolumeStateTransitionKind::Lock { owner },
@@ -936,7 +984,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns not-locked when this FILE_OBJECT is not the current lock owner.
     pub(crate) fn unlock_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
-        let control = &mut self.volume.volume_control;
+        let control = &mut self.volume_control;
         control.state = control.state.unlock(owner)?;
         Ok(())
     }
@@ -954,14 +1002,13 @@ impl MountedVolumeAccess<'_> {
         self.authorize_durability()?;
         let state = match terminal {
             CleanCloseTerminal::Dismount => self
-                .volume
                 .volume_control
                 .state
                 .begin_dismount(owner.ok_or(DriverError::InvalidParameter)?)?,
-            CleanCloseTerminal::Shutdown => self.volume.volume_control.state.begin_shutdown()?,
+            CleanCloseTerminal::Shutdown => self.volume_control.state.begin_shutdown()?,
         };
         self.storage_access().begin_close_writeback()?;
-        self.volume.volume_control.state = state;
+        self.volume_control.state = state;
         Ok(PreparedVolumeStateTransition {
             kind: PreparedVolumeStateTransitionKind::CleanClose { terminal },
         })
@@ -992,7 +1039,7 @@ impl MountedVolumeAccess<'_> {
         transition: PreparedVolumeStateTransition,
     ) -> DriverResult<()> {
         self.authorize_storage()?;
-        let control = &mut self.volume.volume_control;
+        let control = &mut self.volume_control;
         match transition.kind {
             PreparedVolumeStateTransitionKind::Lock { owner } => {
                 control.state = control.state.finish_lock(owner).unwrap_or_else(|| {
@@ -1018,7 +1065,7 @@ impl MountedVolumeAccess<'_> {
             return;
         }
         let storage = self.storage_access();
-        let control = &mut self.volume.volume_control;
+        let control = &mut self.volume_control;
         control.state = match transition.kind {
             PreparedVolumeStateTransitionKind::Lock { owner } => control.state.abort_lock(owner),
             PreparedVolumeStateTransitionKind::CleanClose { terminal } => {
@@ -1035,7 +1082,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns volume dismounted after a successful forced dismount.
     pub(crate) fn ensure_mounted(&self) -> DriverResult<()> {
         self.authorize_storage()?;
-        self.volume.volume_control.state.ensure_mounted()
+        self.volume_control.state.ensure_mounted()
     }
 
     /// Authorizes creation of a new FILE_OBJECT against the current volume state.
@@ -1044,7 +1091,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns access denied while locked or volume dismounted after terminal dismount.
     pub(crate) fn authorize_create(&self) -> DriverResult<()> {
         self.storage_access().authorize_create()?;
-        self.volume.volume_control.state.authorize_create()
+        self.volume_control.state.authorize_create()
     }
 
     /// Authorizes one ordinary handle operation against the current volume state.
@@ -1054,10 +1101,7 @@ impl MountedVolumeAccess<'_> {
     /// terminal logical dismount.
     pub(crate) fn authorize_handle(&self, file_object: KernelFileObject) -> DriverResult<()> {
         self.authorize_storage()?;
-        self.volume
-            .volume_control
-            .state
-            .authorize_handle(file_object)
+        self.volume_control.state.authorize_handle(file_object)
     }
 
     /// Retains one regular-file stream for paging I/O without consulting handle-local CCB state.
@@ -1072,7 +1116,7 @@ impl MountedVolumeAccess<'_> {
         self.storage_access().authorize_paging()?;
         self.volume
             .file_control_blocks
-            .acquire_paging_stream_lease(file_object, NonNull::from(&*self.volume))
+            .acquire_paging_stream_lease(file_object, NonNull::from(self.volume))
     }
 
     /// Retains one node stream while FsRtl owns a pending oplock-break IRP.
@@ -1086,7 +1130,7 @@ impl MountedVolumeAccess<'_> {
     ) -> DriverResult<OplockStreamLease> {
         self.volume
             .file_control_blocks
-            .acquire_oplock_stream_lease(file_object, NonNull::from(&*self.volume))
+            .acquire_oplock_stream_lease(file_object, NonNull::from(self.volume))
     }
 
     /// Acquires the mutation grant barrier and FsRtl check lease for one node FILE_OBJECT.
@@ -1099,7 +1143,7 @@ impl MountedVolumeAccess<'_> {
     ) -> DriverResult<(OplockMutationLease, OplockStreamLease)> {
         self.volume
             .file_control_blocks
-            .acquire_oplock_mutation(file_object, NonNull::from(&*self.volume))
+            .acquire_oplock_mutation(file_object, NonNull::from(self.volume))
     }
 
     /// Reserves one parent-directory node and retains its resident stream for an FsRtl check.
@@ -1159,7 +1203,7 @@ impl MountedVolumeAccess<'_> {
     ) -> DriverResult<FileObjectCacheLease> {
         self.volume
             .file_control_blocks
-            .acquire_file_object_cache_lease(file_object, NonNull::from(&*self.volume))
+            .acquire_file_object_cache_lease(file_object, NonNull::from(self.volume))
     }
 
     /// Preallocates native gates for every live regular-file cache-map size changed by one mutation.
@@ -1233,8 +1277,7 @@ impl MountedVolumeAccess<'_> {
         if !self.owns_volume(target.volume()) {
             return Err(DriverError::InvalidDeviceRequest);
         }
-        self.volume
-            .volume_control
+        self.volume_control
             .state
             .authorize_raw(target.owner(), kind)?;
         let (access, extent) = target.authority();
@@ -1259,10 +1302,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns an ownership or lifecycle error when the handle cannot control its raw extent.
     pub(crate) fn authorize_raw_extent_change(&self, owner: KernelFileObject) -> DriverResult<()> {
-        self.volume
-            .volume_control
-            .state
-            .authorize_raw_extent_change(owner)
+        self.volume_control.state.authorize_raw_extent_change(owner)
     }
 
     /// Selects a direct-volume flush without reusing a logically dismounted ext4 epoch.
@@ -1276,7 +1316,7 @@ impl MountedVolumeAccess<'_> {
         if !self.owns_volume(target.volume()) {
             return Err(DriverError::InvalidDeviceRequest);
         }
-        let state = self.volume.volume_control.state;
+        let state = self.volume_control.state;
         if matches!(state, MountedVolumeState::Dismounted { .. }) {
             state.authorize_raw(target.owner(), RawVolumeOperationKind::Read)?;
             target
@@ -1298,7 +1338,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns the same terminal failure status as future mutation attempts.
     pub(crate) fn authorize_durability(&self) -> DriverResult<()> {
         self.authorize_storage()?;
-        self.volume.runtime.authorize_durability()
+        self.runtime.authorize_durability()
     }
 
     /// Rejects namespace traversal through an inode that is delete-pending.
@@ -1351,12 +1391,12 @@ impl MountedVolumeAccess<'_> {
 
     /// Immutable mounted profile required to construct core operation state machines.
     pub(crate) fn mounted_profile(&self) -> &MountedProfile {
-        self.volume.runtime.profile()
+        self.runtime.profile()
     }
 
     /// Validated lower-device route for one core storage request.
     pub(crate) fn storage_route(&self) -> MountedStorageRoute {
-        self.volume.runtime.storage()
+        self.runtime.storage()
     }
 
     /// Allocates operation-local cryptographic state from the mounted providers.
@@ -1364,7 +1404,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns an error when CNG operation state cannot be allocated or initialized.
     pub(crate) fn new_crypto_operation(&self) -> DriverResult<CngOperation> {
-        self.volume.runtime.crypto().try_new_operation()
+        self.runtime.crypto().try_new_operation()
     }
 
     /// Acquires one immutable committed epoch lease.
@@ -1373,7 +1413,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns an error when reads are no longer reliable or the bounded lease registry is full.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
         self.authorize_storage()?;
-        self.volume.runtime.acquire_epoch()
+        self.runtime.acquire_epoch()
     }
 
     /// Allocates one mutation ticket and active-mutation lifetime lease.
@@ -1383,7 +1423,7 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn admit_mutation(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
         self.authorize_storage()?;
         self.storage_access().authorize_paging()?;
-        self.volume.runtime.admit_mutation()
+        self.runtime.admit_mutation()
     }
 
     /// Resolves one ephemeral core pass against the current mutation coordinator snapshot.
@@ -1395,7 +1435,7 @@ impl MountedVolumeAccess<'_> {
         pass: MutationResolvePass<'_, '_, '_>,
         ticket: u64,
     ) -> Result<ResolvedMutation, ext4_core::Error> {
-        pass.resolve(ticket, self.volume.runtime.coordinator())
+        pass.resolve(ticket, self.runtime.coordinator())
     }
 
     /// Revalidates one resolved mutation under its granted resource intent.
@@ -1407,7 +1447,7 @@ impl MountedVolumeAccess<'_> {
         resolved: ResolvedMutation,
         intent: MutationLease,
     ) -> Result<ReservedMutation, ext4_core::Error> {
-        resolved.reserve(self.volume.runtime.coordinator(), intent)
+        resolved.reserve(self.runtime.coordinator(), intent)
     }
 
     /// Prepares a commit from the coordinator and current immutable epoch authorities.
@@ -1419,9 +1459,7 @@ impl MountedVolumeAccess<'_> {
         reserved: ReservedMutation,
         commit: CommitLease,
     ) -> Result<CommitReadyMutation, ext4_core::Error> {
-        self.volume
-            .runtime
-            .prepare_mutation_commit(reserved, commit)
+        self.runtime.prepare_mutation_commit(reserved, commit)
     }
 
     /// Reserves both immutable epoch publication slots before the first lower write.
@@ -1430,7 +1468,7 @@ impl MountedVolumeAccess<'_> {
     /// Returns an error when mutation is no longer authorized or stable storage cannot be
     /// allocated.
     pub(crate) fn reserve_epoch_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
-        self.volume.runtime.reserve_epoch_publication()
+        self.runtime.reserve_epoch_publication()
     }
 
     /// Grants the serialized commit lane when its runtime preconditions are satisfied.
@@ -1441,19 +1479,19 @@ impl MountedVolumeAccess<'_> {
     #[cfg(not(test))]
     pub(crate) fn acquire_commit(&mut self, ticket: u64) -> DriverResult<Option<CommitLease>> {
         self.authorize_storage()?;
-        self.volume.runtime.acquire_commit(ticket)
+        self.runtime.acquire_commit(ticket)
     }
 
     /// Returns an unused pre-write commit grant to the runtime.
     #[cfg(not(test))]
     pub(crate) fn abandon_commit(&mut self, ticket: u64) {
-        self.volume.runtime.abandon_commit(ticket);
+        self.runtime.abandon_commit(ticket);
     }
 
     /// Grants the short durable-visibility publication lane.
     #[cfg(not(test))]
     pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> Option<VisibilityLease> {
-        self.volume.runtime.try_grant_visibility(ticket)
+        self.runtime.try_grant_visibility(ticket)
     }
 
     /// Grants the detached checkpoint lane for one visible epoch.
@@ -1462,13 +1500,13 @@ impl MountedVolumeAccess<'_> {
         &mut self,
         epoch: ext4_core::EpochSequence,
     ) -> Option<ext4_core::CheckpointLease> {
-        self.volume.runtime.try_grant_checkpoint(epoch)
+        self.runtime.try_grant_checkpoint(epoch)
     }
 
     /// Reports whether no mutation or checkpoint owns journal space.
     #[cfg(not(test))]
     pub(crate) fn journal_is_clean(&self) -> bool {
-        self.volume.runtime.journal_is_clean()
+        self.runtime.journal_is_clean()
     }
 
     /// Publishes the durable epoch and its prevalidated stream metadata in one reactor turn.
@@ -1484,12 +1522,9 @@ impl MountedVolumeAccess<'_> {
         checkpoint_slot: EpochPublicationSlot,
         stream_metadata: PreparedStreamMetadataPublications,
     ) -> DurablePublicationOutcome {
-        let checkpoint = self.volume.runtime.publish_durable(
-            mutation,
-            visibility,
-            durable_slot,
-            checkpoint_slot,
-        );
+        let checkpoint =
+            self.runtime
+                .publish_durable(mutation, visibility, durable_slot, checkpoint_slot);
         let epoch = checkpoint.epoch();
         let stream_projection = self
             .volume
@@ -1508,24 +1543,23 @@ impl MountedVolumeAccess<'_> {
         publication: EpochPublicationSlot,
         epoch: ext4_core::EpochSequence,
     ) {
-        self.volume
-            .runtime
+        self.runtime
             .publish_checkpoint(durability, publication, epoch);
     }
 
     /// Records a confirmed durable abort as a read-only transition.
     pub(crate) fn record_durable_abort(&mut self) {
-        self.volume.runtime.record_durable_abort();
+        self.runtime.record_durable_abort();
     }
 
     /// Records an unknown write or flush outcome requiring replay.
     pub(crate) fn record_durability_unknown(&mut self) {
-        self.volume.runtime.record_durability_unknown();
+        self.runtime.record_durability_unknown();
     }
 
     /// Records that committed reads can no longer be trusted.
     pub(crate) fn record_read_unreliable(&mut self) {
-        self.volume.runtime.record_read_unreliable();
+        self.runtime.record_read_unreliable();
     }
 
     /// Records an exact post-commit Cc/MM publication failure and its aggregate stream progress.
@@ -1535,31 +1569,28 @@ impl MountedVolumeAccess<'_> {
         published_streams: usize,
         unexamined_updates: usize,
     ) {
-        self.volume.runtime.record_publication_failure(
-            status,
-            published_streams,
-            unexamined_updates,
-        );
+        self.runtime
+            .record_publication_failure(status, published_streams, unexamined_updates);
     }
 
     /// Records an exact Cache Manager dirty-page writeback failure.
     pub(crate) fn record_cache_writeback_failure(&mut self, status: wdk_sys::NTSTATUS) {
-        self.volume.runtime.record_cache_writeback_failure(status);
+        self.runtime.record_cache_writeback_failure(status);
     }
 
     /// Current committed volume identity.
     pub(crate) fn volume_identity(&self) -> VolumeIdentity {
-        self.volume.runtime.identity()
+        self.runtime.identity()
     }
 
     /// Current committed allocation geometry.
     pub(crate) fn volume_geometry(&self) -> VolumeGeometry {
-        self.volume.runtime.current_epoch().geometry()
+        self.runtime.current_epoch().geometry()
     }
 
     /// Returns the committed epoch that owns non-suspending metadata observations.
     pub(crate) fn current_epoch_sequence(&self) -> ext4_core::EpochSequence {
-        self.volume.runtime.current_epoch().sequence()
+        self.runtime.current_epoch().sequence()
     }
 
     /// Checks whether resolve still observes the epoch paired with the current coordinator.
@@ -1568,7 +1599,7 @@ impl MountedVolumeAccess<'_> {
     /// newer resource versions. Creates can also attach a FILE_OBJECT without mutation intents.
     /// Both therefore restart after an epoch change before the next non-suspending resolve pass.
     pub(crate) fn is_current_epoch(&self, epoch: &EpochLease) -> bool {
-        epoch.epoch().sequence() == self.volume.runtime.current_epoch().sequence()
+        epoch.epoch().sequence() == self.runtime.current_epoch().sequence()
     }
 
     /// Current committed fscrypt key presence.
@@ -1576,17 +1607,13 @@ impl MountedVolumeAccess<'_> {
         &self,
         identifier: FscryptKeyIdentifier,
     ) -> FscryptKeyPresence {
-        self.volume.runtime.fscrypt_key_presence(identifier)
+        self.runtime.fscrypt_key_presence(identifier)
     }
 
     /// Stages a missing child in the current ephemeral mutation resolve pass.
     /// # Errors
     ///
     /// Returns an error when the parent cannot be loaded or child creation cannot be staged.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
     pub(crate) fn begin_child_creation(
         &self,
         transaction: &mut MutationResolvePass<'_, '_, '_>,
@@ -1594,16 +1621,8 @@ impl MountedVolumeAccess<'_> {
         name: &Ext4Name,
         target: ChildCreationTarget,
     ) -> DriverResult<PendingChildCreation> {
-        let owner = MountedVolumeRef::new(NonNull::from(&*self.volume));
-        let file_control_blocks = unsafe {
-            // SAFETY: `owner` stays live for the lease lifetime, so projecting the disjoint ledger
-            // field produces a stable raw address.
-            core::ptr::addr_of!((*owner.as_non_null().as_ptr()).file_control_blocks)
-        };
-        let file_control_blocks = unsafe {
-            // SAFETY: The projected ledger is independently synchronized and VCB-owned.
-            &*file_control_blocks
-        };
+        let owner = MountedVolumeRef::new(NonNull::from(self.volume));
+        let file_control_blocks = &self.volume.file_control_blocks;
         let parent = transaction.directory(parent)?;
         let node = match target {
             ChildCreationTarget::File(metadata) => {

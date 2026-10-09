@@ -86,10 +86,10 @@ pub(crate) use open_object::*;
 use open_object::{FileDeletionCause, FileDeletionState};
 #[cfg(test)]
 use open_object::{OpenedHandleKind, OpenedHandleState, select_close_release_plan};
+use volume::MountedVolumeRef;
 #[cfg(test)]
 use volume::MountedVolumeState;
 pub(crate) use volume::*;
-use volume::{MountedVolumeRef, VolumeControlPlane};
 pub(crate) use volume_runtime::{
     EpochLease, EpochPublicationSlot, EpochPublicationSlots, MutationActivityLease,
     PendingCheckpoint, VolumeRuntime,
