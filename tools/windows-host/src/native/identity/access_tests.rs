@@ -250,10 +250,10 @@ fn native_owner_group_priority_and_maximum_rights() -> io::Result<()> {
     Ok(())
 }
 
-/// Enables exactly one privilege on a private duplicated token.
+/// Selects enabled state for exactly one privilege on a private duplicated token.
 /// # Errors
 /// Returns lookup, adjustment or privilege-not-assigned failure.
-fn enable_privilege(token: &OwnedHandle, name: &str) -> io::Result<()> {
+fn set_privilege(token: &OwnedHandle, name: &str, enabled: bool) -> io::Result<()> {
     let name = wide(OsStr::new(name))?;
     let mut luid = windows_sys::Win32::Foundation::LUID::default();
     let found = unsafe {
@@ -267,7 +267,7 @@ fn enable_privilege(token: &OwnedHandle, name: &str) -> io::Result<()> {
         PrivilegeCount: 1,
         Privileges: [LUID_AND_ATTRIBUTES {
             Luid: luid,
-            Attributes: SE_PRIVILEGE_ENABLED,
+            Attributes: if enabled { SE_PRIVILEGE_ENABLED } else { 0 },
         }],
     };
     unsafe {
@@ -307,8 +307,8 @@ fn native_explicit_privileges_contract() -> io::Result<()> {
     let user = token_sid(&source, TokenUser)?;
     let group = token_sid(&source, TokenPrimaryGroup)?;
     let token = impersonation(&source)?;
-    enable_privilege(&token, "SeTakeOwnershipPrivilege")?;
-    enable_privilege(&token, "SeSecurityPrivilege")?;
+    set_privilege(&token, "SeTakeOwnershipPrivilege", true)?;
+    set_privilege(&token, "SeSecurityPrivilege", true)?;
     let image = descriptor(0o640, user, group, 2000)?;
     assert!(matches!(
         check(&image, &token, 0x80000)?,
@@ -324,5 +324,53 @@ fn native_explicit_privileges_contract() -> io::Result<()> {
     assert!(
         matches!(evaluate_access(MAXIMUM_ALLOWED | 0x1080000, 0, |right, _| check(&image, &token, right))?, AccessDecision::Granted(mask) if mask & 0x1080000 == 0x1080000)
     );
+    Ok(())
+}
+
+/// # Errors
+/// Requires an elevated token containing backup and restore privileges.
+/// # Panics
+/// Panics if native privilege evaluation treats a disabled privilege as operation authority.
+#[test]
+#[ignore = "requires an elevated Windows token with backup and restore privileges"]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "token errors propagate; assertions verify native privilege authority"
+)]
+fn native_backup_restore_privileges_contract() -> io::Result<()> {
+    let source = process_token()?;
+    let token = impersonation(&source)?;
+    for name in ["SeBackupPrivilege", "SeRestorePrivilege"] {
+        let mut luid = windows_sys::Win32::Foundation::LUID::default();
+        let wide_name = wide(OsStr::new(name))?;
+        if unsafe {
+            // SAFETY: The terminated name and exclusive output LUID remain live during lookup.
+            LookupPrivilegeValueW(ptr::null(), wide_name.as_ptr(), &mut luid)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        for enabled in [false, true] {
+            set_privilege(&token, name, enabled)?;
+            let mut required = PRIVILEGE_SET {
+                PrivilegeCount: 1,
+                Control: 1, // PRIVILEGE_SET_ALL_NECESSARY
+                Privilege: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: 0,
+                }],
+            };
+            let mut granted = 0;
+            if unsafe {
+                // SAFETY: A uniquely owned impersonation token and complete aligned privilege
+                // request remain live; native code initializes the exclusive decision output.
+                PrivilegeCheck(token.as_raw_handle(), &mut required, &mut granted)
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            assert_eq!(granted != 0, enabled);
+        }
+    }
     Ok(())
 }

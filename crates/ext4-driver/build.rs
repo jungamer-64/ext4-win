@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     const NAME_EXPRESSION_SOURCE: &str = "native/name_expression.c";
 
     println!("cargo:rerun-if-changed={IDENTITY_SOURCE}");
+    println!("cargo:rerun-if-changed=native/backup_restore.h");
     println!("cargo:rerun-if-changed={IDENTITY_REGISTRY_SOURCE}");
     println!("cargo:rerun-if-changed=native/identity_persistence.h");
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");

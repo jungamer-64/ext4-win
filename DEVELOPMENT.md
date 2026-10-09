@@ -123,6 +123,9 @@ READ_CONTROL and SYNCHRONIZE are common base rights. Maximum access checks indiv
 the same native subject, excluding implicit exploration of WRITE_OWNER, ACCESS_SYSTEM_SECURITY
 and namespace deletion. Explicit ownership/security privilege requests are checked by Windows.
 POSIX rwx does not grant DELETE; applications requesting it can receive access denied.
+Backup-intent opens evaluate enabled backup and restore privileges before remaining descriptor
+rights, and record privilege use before publishing handle authority. Ordinary opens do not
+receive these privilege grants.
 Security queries support variable SID lengths and report the required size for short buffers.
 Security mutations accept only the owner/group/mode projection; arbitrary Windows ACLs are rejected.
 Native token oracles run in portable Windows tests; the elevated `verify-windows-host` gate also

@@ -282,9 +282,12 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         if requestor_mode != kernel_mode && requestor_mode != user_mode {
             return Err(DriverError::InvalidParameter);
         }
+        let parameters = self.create()?.parameters();
         Ok(CreateAccessState {
             access_state,
             access_check: policy,
+            intent: parameters.intent(),
+            disposition: parameters.disposition(),
             access_mode: match policy {
                 CreateAccessCheck::HonorRequestorMode => requestor_mode,
                 CreateAccessCheck::ForceUserMode => user_mode,

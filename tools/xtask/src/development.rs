@@ -86,6 +86,22 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
             ),
             "native explicit security privilege contract",
         )?;
+        run_checked(
+            cargo_command(
+                root,
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "windows-host",
+                    "native::identity::access_tests::native_backup_restore_privileges_contract",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                ],
+            ),
+            "native backup and restore privilege authority",
+        )?;
         println!("native Windows host contracts: PASS");
         Ok(())
     }
@@ -143,6 +159,11 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
 #[cfg(windows)]
 fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
+        (
+            "backup-restore",
+            "backup_restore.tests.c",
+            "native backup and restore privilege contract",
+        ),
         (
             "identity-persistence",
             "identity_persistence.tests.c",

@@ -41,6 +41,8 @@ pub(crate) struct CreateParameters {
     unsupported_flags: UnsupportedCreateFlags,
     /// Whether excluding readers additionally requires native write permission.
     require_writable_exclusive: bool,
+    /// Native privilege protocol selected for the open.
+    intent: CreateIntent,
 }
 
 impl CreateParameters {
@@ -85,7 +87,13 @@ impl CreateParameters {
             unsupported_flags: UnsupportedCreateFlags::from_stack_flags(stack_flags),
             require_writable_exclusive: options & wdk_sys::FILE_DISALLOW_EXCLUSIVE != 0
                 && share_access.as_ulong() & wdk_sys::FILE_SHARE_READ == 0,
+            intent: CreateIntent::from_options(options),
         })
+    }
+
+    /// Returns the privilege protocol sealed with this create request.
+    pub(super) const fn intent(self) -> CreateIntent {
+        self.intent
     }
 
     /// Reports the admission check required by FILE_DISALLOW_EXCLUSIVE.
@@ -288,8 +296,32 @@ pub(crate) struct CreateAccessState<'owner> {
     pub(super) access_mode: wdk_sys::KPROCESSOR_MODE,
     /// Forced checks must not reuse rights cached during a trusted kernel-mode open.
     pub(super) access_check: CreateAccessCheck,
+    /// Backup/restore rights are established by the captured native subject, never POSIX mode.
+    pub(super) intent: CreateIntent,
+    /// Backup read privilege applies only to dispositions that can open an existing file.
+    pub(super) disposition: CreateDisposition,
     /// Prevents the state view from escaping its active completion-owner borrow.
     pub(super) owner: core::marker::PhantomData<&'owner mut wdk_sys::ACCESS_STATE>,
+}
+
+/// Privilege protocol for one create request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateIntent {
+    /// Ordinary descriptor evaluation.
+    Ordinary,
+    /// Evaluate enabled backup/restore privileges before the remaining descriptor rights.
+    BackupRestore,
+}
+
+impl CreateIntent {
+    /// Decodes the Windows option without granting any privilege.
+    const fn from_options(options: u32) -> Self {
+        if options & wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT != 0 {
+            Self::BackupRestore
+        } else {
+            Self::Ordinary
+        }
+    }
 }
 
 /// Virtual access used to preflight an existing-object create operation.
@@ -609,8 +641,26 @@ impl CreateAccessState<'_> {
             // SAFETY: Context belongs to the retained ACCESS_STATE; all probes share this lock.
             ffi::SeLockSubjectContext(context);
         }
-        let result =
-            ext4_security::evaluate_access(desired, previously_granted, |wanted, previous| {
+        let mut backup_privileges = wdk_sys::INITIAL_PRIVILEGE_SET::default();
+        let backup_granted = if self.intent == CreateIntent::BackupRestore {
+            unsafe {
+                // SAFETY: The same captured subject is locked for this create; local fixed
+                // privilege storage can hold both backup and restore usage records.
+                ffi::ext4win_backup_restore_access(
+                    context,
+                    self.access_mode,
+                    self.disposition.raw_disposition(),
+                    desired,
+                    &mut backup_privileges,
+                )
+            }
+        } else {
+            0
+        };
+        let result = ext4_security::evaluate_access(
+            desired,
+            previously_granted | backup_granted,
+            |wanted, previous| {
                 let mut privileges: wdk_sys::PPRIVILEGE_SET = core::ptr::null_mut();
                 let mut granted = 0;
                 let mut status = wdk_sys::STATUS_ACCESS_DENIED;
@@ -664,12 +714,28 @@ impl CreateAccessState<'_> {
                         wdk_sys::STATUS_INTERNAL_ERROR
                     }))
                 }
-            });
+            },
+        );
         unsafe {
             // SAFETY: Balances the single lock after all required and exploratory checks finish.
             ffi::SeUnlockSubjectContext(context);
         }
         let mut append_failure = None;
+        if backup_privileges.PrivilegeCount != 0
+            && matches!(result, Ok(ext4_security::AccessDecision::Granted(_)))
+        {
+            let status = unsafe {
+                // SAFETY: Native evaluation initialized the bounded privilege prefix, and
+                // INITIAL_PRIVILEGE_SET has the required variable PRIVILEGE_SET layout.
+                ffi::SeAppendPrivileges(
+                    self.access_state.as_ptr(),
+                    core::ptr::from_mut(&mut backup_privileges).cast(),
+                )
+            };
+            if status < 0 {
+                append_failure = Some(DriverError::PrivilegeRecordingFailed(status));
+            }
+        }
         for privileges in privilege_sets.iter().copied() {
             if matches!(result, Ok(ext4_security::AccessDecision::Granted(_)))
                 && append_failure.is_none()
@@ -793,6 +859,18 @@ pub(crate) enum CreateDisposition {
 }
 
 impl CreateDisposition {
+    /// Preserves the Windows disposition at the native privilege boundary.
+    #[cfg(not(test))]
+    const fn raw_disposition(self) -> u32 {
+        match self {
+            Self::Supersede => FILE_SUPERSEDE_DISPOSITION,
+            Self::Open => FILE_OPEN_DISPOSITION,
+            Self::Create => FILE_CREATE_DISPOSITION,
+            Self::OpenIf => FILE_OPEN_IF_DISPOSITION,
+            Self::Overwrite => FILE_OVERWRITE_DISPOSITION,
+            Self::OverwriteIf => FILE_OVERWRITE_IF_DISPOSITION,
+        }
+    }
     /// Decodes the disposition stored in Create.Options.
     /// # Errors
     ///
@@ -1147,12 +1225,12 @@ const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_COMPLETE_IF_OPLOCKED
     | wdk_sys::FILE_OPEN_REQUIRING_OPLOCK
     | wdk_sys::FILE_RESERVE_OPFILTER
-    | wdk_sys::FILE_DISALLOW_EXCLUSIVE;
+    | wdk_sys::FILE_DISALLOW_EXCLUSIVE
+    | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
     | wdk_sys::FILE_NO_EA_KNOWLEDGE
     | wdk_sys::FILE_RANDOM_ACCESS
-    | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT
     | wdk_sys::FILE_NO_COMPRESSION
     | wdk_sys::FILE_OPEN_NO_RECALL
     | wdk_sys::FILE_OPEN_FOR_FREE_SPACE_QUERY;

@@ -1000,6 +1000,7 @@ fn create_stack_preserves_access_share_options_and_ea_length() {
                 CreateTargetRequirement::NonDirectory
             );
             assert_eq!(parameters.write_commitment(), WriteCommitment::FlushThrough);
+            assert_eq!(parameters.intent(), super::CreateIntent::BackupRestore);
             assert_eq!(
                 parameters.transfer_buffering(),
                 CreateTransferBuffering::IntermediateAllowed
@@ -2116,6 +2117,8 @@ fn forced_user_access_does_not_reuse_kernel_grants() -> Result<(), DriverError> 
             ..wdk_sys::IO_SECURITY_CONTEXT::default()
         };
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        stack.FileObject = core::ptr::from_mut(&mut file);
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::from_mut(&mut context),
             ..Default::default()
@@ -2124,6 +2127,8 @@ fn forced_user_access_does_not_reuse_kernel_grants() -> Result<(), DriverError> 
             .map_err(|_| DriverError::InternalInvariantViolation)?;
         let current = current_stack_fixture(&mut stack)?;
         let mut state = current.create_access_state(kernel_mode, policy)?;
+        assert_eq!(state.intent, super::CreateIntent::Ordinary);
+        assert_eq!(state.disposition, CreateDisposition::Supersede);
         let result = state.authorize_requested(descriptor.as_native(), requested);
         match policy {
             CreateAccessCheck::HonorRequestorMode => {

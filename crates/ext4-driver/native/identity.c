@@ -1,4 +1,17 @@
 #include <ntifs.h>
+#include "backup_restore.h"
+
+ACCESS_MASK NTAPI
+ext4win_backup_restore_access(
+    PSECURITY_SUBJECT_CONTEXT subject,
+    KPROCESSOR_MODE mode,
+    ULONG disposition,
+    ACCESS_MASK desired,
+    PINITIAL_PRIVILEGE_SET used)
+{
+    PAGED_CODE();
+    return ext4win_privileged_create_access(subject, mode, disposition, desired, used);
+}
 
 /* Token information is owned here; only complete copied SIDs cross into Rust. */
 NTSTATUS

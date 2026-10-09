@@ -190,6 +190,14 @@ pub(crate) use wdk_sys::ntddk::{
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe extern "system" {
+    /// Evaluates only enabled backup/restore privileges against an already locked native subject.
+    pub(crate) fn ext4win_backup_restore_access(
+        subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
+        mode: wdk_sys::KPROCESSOR_MODE,
+        disposition: u32,
+        desired: u32,
+        privileges: *mut wdk_sys::INITIAL_PRIVILEGE_SET,
+    ) -> u32;
     /// Copies effective user/primary-group SIDs while retaining and locking the captured subject.
     pub(crate) fn ext4win_creator_sids(
         subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
