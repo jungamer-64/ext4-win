@@ -909,17 +909,18 @@ pub(super) fn mdl_data_buffer_address(
     mdl: NonNull<wdk_sys::MDL>,
     length: IrpBufferLength,
 ) -> Result<NonNull<u8>, DriverError> {
-    let mdl_ref = unsafe {
+    let byte_count = unsafe {
         // SAFETY: The IRP's MdlAddress is non-null and retained by the I/O Manager until the
         // completion owner completes this IRP.
-        mdl.as_ref()
+        // No reference spans fields that mapping may update.
+        (*mdl.as_ptr()).ByteCount
     };
-    let mdl_len = usize::try_from(mdl_ref.ByteCount).map_err(|_| DriverError::InvalidParameter)?;
+    let mdl_len = usize::try_from(byte_count).map_err(|_| DriverError::InvalidParameter)?;
     if length.as_usize() > mdl_len {
         return Err(DriverError::InvalidParameter);
     }
 
-    let address = mapped_mdl_address(mdl, mdl_ref)?;
+    let address = mapped_mdl_address(mdl)?;
     Ok(address.cast())
 }
 
@@ -931,14 +932,21 @@ pub(super) fn mdl_data_buffer_address(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-fn mapped_mdl_address(
-    mdl: NonNull<wdk_sys::MDL>,
-    mdl_ref: &wdk_sys::MDL,
-) -> Result<NonNull<c_void>, DriverError> {
-    let flags = u32::from(u16::from_ne_bytes(mdl_ref.MdlFlags.to_ne_bytes()));
+fn mapped_mdl_address(mdl: NonNull<wdk_sys::MDL>) -> Result<NonNull<c_void>, DriverError> {
+    let flags = unsafe {
+        // SAFETY: The active IRP retains this initialized MDL. Copy only its mapping flags before
+        // MmMapLockedPagesSpecifyCache may update the descriptor.
+        (*mdl.as_ptr()).MdlFlags
+    };
+    let flags = u32::from(u16::from_ne_bytes(flags.to_ne_bytes()));
     let mapped_flags = wdk_sys::MDL_MAPPED_TO_SYSTEM_VA | wdk_sys::MDL_SOURCE_IS_NONPAGED_POOL;
     if flags & mapped_flags != 0 {
-        return NonNull::new(mdl_ref.MappedSystemVa).ok_or(DriverError::InvalidParameter);
+        let address = unsafe {
+            // SAFETY: The mapping flags establish the initialized system address; the active
+            // IRP retains the mapping and no reference to the mutable descriptor is formed.
+            (*mdl.as_ptr()).MappedSystemVa
+        };
+        return NonNull::new(address).ok_or(DriverError::InvalidParameter);
     }
 
     let kernel_mode = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
@@ -948,7 +956,8 @@ fn mapped_mdl_address(
         | wdk_sys::MdlMappingNoExecute;
     let address = unsafe {
         // SAFETY: The MDL belongs to the active IRP and describes locked pages
-        // supplied by the I/O Manager for direct I/O.
+        // supplied by the I/O Manager for direct I/O. No Rust reference to the MDL is live while
+        // this native call updates its mapping fields.
         crate::kernel::ffi::MmMapLockedPagesSpecifyCache(
             mdl.as_ptr(),
             kernel_mode,
