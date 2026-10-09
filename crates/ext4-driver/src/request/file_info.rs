@@ -16,8 +16,8 @@ use crate::irp::{
     ActiveFileObject, ActiveIrp, CreateDeletion, DataIoKind, DirectoryChangeFilter,
     DirectoryCursorPosition, DirectoryEntryEmission, DirectoryInformationClass,
     DirectoryWatchScope, FileAttributesWriteAccess, IrpBufferLength, IrpCompletion,
-    NamespaceOplockPlan, NamespaceParentOplockEffect, OwnedIrp, PendingIrpLease,
-    QueryFileInformationClass, ReadStartingPoint, RegularFileWriteAccess, SetFileInformationClass,
+    NamespaceOplockPlan, NamespaceParent, NamespaceParentOplockEffect, OwnedIrp, PendingIrpLease,
+    QueryFileInformationClass, ReadStartingPoint, RegularFileWriteAccess, SetFileOperation,
     SetFileStack, WriteStartingPoint,
 };
 use crate::kernel::status::{DriverError, DriverResult};

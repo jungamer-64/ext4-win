@@ -17,7 +17,7 @@ use super::{
     FileSystemControlMinorFunction, FsControlCode, InformationLength, IrpBufferLength,
     IrpCompletion, KernelIrp, OplockControlAction, OplockCreatePolicy, OwnedIrp,
     QueryFileInformationClass, QueryVolumeInformationClass, ReadStartingPoint, ReceivedIrp,
-    RegularFileWriteAccess, SetFileInformationClass, SetVolumeInformationClass, ShareAccess,
+    RegularFileWriteAccess, SetFileOperation, SetVolumeInformationClass, ShareAccess,
     WriteStartingPoint,
 };
 use crate::kernel::status::DriverError;
@@ -2249,7 +2249,7 @@ fn set_file_stack_decodes_position_information() {
         let set = current.set_file();
         assert!(set.is_ok());
         if let Ok(set) = set {
-            assert_eq!(set.information_class(), SetFileInformationClass::Position);
+            assert_eq!(set.operation(), SetFileOperation::Position);
         }
     }
 }
@@ -2388,7 +2388,7 @@ fn set_file_stack_preserves_file_object_length_and_class() {
                 }
             );
             assert_eq!(set.length().as_usize(), 40);
-            assert_eq!(set.information_class(), SetFileInformationClass::Basic);
+            assert_eq!(set.operation(), SetFileOperation::Basic);
         }
     }
 }
@@ -2397,15 +2397,79 @@ fn set_file_stack_preserves_file_object_length_and_class() {
 ///
 /// Panics when hard-link information classes return to the invalid-class boundary.
 #[test]
-fn set_file_class_decodes_legacy_and_extended_hard_links() {
-    assert_eq!(
-        SetFileInformationClass::from_raw(wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformation,),
-        Ok(SetFileInformationClass::Link)
-    );
-    assert_eq!(
-        SetFileInformationClass::from_raw(wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformationEx,),
-        Ok(SetFileInformationClass::LinkEx)
-    );
+fn set_file_stack_retains_eof_protocol_and_namespace_parent() {
+    let mut file = wdk_sys::FILE_OBJECT::default();
+    let mut parent = wdk_sys::FILE_OBJECT::default();
+    for (class, advance, expected) in [
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation,
+            0,
+            SetFileOperation::Resize,
+        ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation,
+            1,
+            SetFileOperation::AdvanceValidDataLength,
+        ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformation,
+            0,
+            SetFileOperation::Link(super::NamespaceParent::SourceDirectory),
+        ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformationEx,
+            0,
+            SetFileOperation::LinkEx(super::NamespaceParent::SourceDirectory),
+        ),
+    ] {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::from_mut(&mut file),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
+            Length: 40, __bindgen_padding_0: 0, FileInformationClass: class, FileObject: core::ptr::null_mut(),
+            __bindgen_anon_1: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1 {
+                __bindgen_anon_1: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1__bindgen_ty_1 { ReplaceIfExists: 0, AdvanceOnly: advance },
+            },
+        };
+        let current = current_stack_fixture(&mut stack);
+        assert!(current.is_ok());
+        if let Ok(current) = current {
+            assert_eq!(
+                current.set_file().map(super::SetFileStack::operation),
+                Ok(expected)
+            );
+        }
+    }
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        FileObject: core::ptr::from_mut(&mut file),
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
+        Length: 40,
+        __bindgen_padding_0: 0,
+        FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation,
+        FileObject: core::ptr::from_mut(&mut parent),
+        __bindgen_anon_1:
+            wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+    };
+    let current = current_stack_fixture(&mut stack);
+    assert!(current.is_ok());
+    if let Ok(current) = current {
+        let operation = current.set_file().map(super::SetFileStack::operation);
+        assert!(operation.is_ok());
+        assert!(matches!(
+            operation,
+            Ok(SetFileOperation::Rename(
+                super::NamespaceParent::TargetDirectory(_)
+            ))
+        ));
+        if let Ok(SetFileOperation::Rename(super::NamespaceParent::TargetDirectory(view))) =
+            operation
+        {
+            assert_eq!(view.as_ptr(), core::ptr::from_mut(&mut parent));
+        }
+    }
 }
 
 /// # Panics

@@ -139,11 +139,48 @@ pub(crate) struct QueryFileStack {
 
 /// Decoded set-file-information stack parameters.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct SetFileStack {
+pub(crate) struct SetFileStack<'owner> {
     /// Input buffer length.
     pub(super) length: IrpBufferLength,
-    /// Requested file information class.
-    pub(super) information_class: SetFileInformationClass,
+    /// Mutation semantics, including Windows-resolved destination authority.
+    pub(super) operation: SetFileOperation<'owner>,
+}
+
+/// Parent selected by the I/O Manager for a rename or hard-link request.
+/// The pending set-information IRP retains a supplied target FILE_OBJECT until completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NamespaceParent<'owner> {
+    /// A simple new name uses the source link's directory.
+    SourceDirectory,
+    /// The I/O Manager has opened the exact destination parent on this volume.
+    TargetDirectory(ActiveFileObject<'owner>),
+}
+
+/// Complete semantic operation decoded from a Windows set-information stack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SetFileOperation<'owner> {
+    /// Explicit metadata and handle-local timestamp policy.
+    Basic,
+    /// Handle position assignment.
+    Position,
+    /// Explicit logical EOF change.
+    Resize,
+    /// Cache Manager notification that only advances on-disk valid-data length.
+    AdvanceValidDataLength,
+    /// Physical allocation and optional EOF reduction.
+    Allocation,
+    /// Boolean namespace deletion state.
+    Disposition,
+    /// Flag-based namespace deletion state.
+    DispositionEx,
+    /// Boolean hard-link replacement with resolved parent authority.
+    Link(NamespaceParent<'owner>),
+    /// Flag-based hard-link replacement with resolved parent authority.
+    LinkEx(NamespaceParent<'owner>),
+    /// Boolean rename replacement with resolved parent authority.
+    Rename(NamespaceParent<'owner>),
+    /// Flag-based rename replacement with resolved parent authority.
+    RenameEx(NamespaceParent<'owner>),
 }
 
 /// Decoded query-directory stack parameters.
@@ -403,15 +440,15 @@ impl QueryFileStack {
     }
 }
 
-impl SetFileStack {
+impl<'owner> SetFileStack<'owner> {
     /// Returns the input buffer length.
     pub(crate) const fn length(self) -> IrpBufferLength {
         self.length
     }
 
-    /// Returns the requested file information class.
-    pub(crate) const fn information_class(self) -> SetFileInformationClass {
-        self.information_class
+    /// Returns complete operation semantics without reinterpreting the native stack.
+    pub(crate) const fn operation(self) -> SetFileOperation<'owner> {
+        self.operation
     }
 }
 

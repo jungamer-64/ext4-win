@@ -3721,8 +3721,12 @@ impl MutationRequestOperation {
             PreparedMutationRequest::Security(_) => true,
             PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
                 owned.request().with_active(|active| {
-                    let class = active.current_stack()?.set_file()?.information_class();
-                    Ok::<_, DriverError>(class != crate::irp::SetFileInformationClass::Position)
+                    let class = active.current_stack()?.set_file()?.operation();
+                    Ok::<_, DriverError>(!matches!(
+                        class,
+                        crate::irp::SetFileOperation::Position
+                            | crate::irp::SetFileOperation::AdvanceValidDataLength
+                    ))
                 })?
             }
             PreparedMutationRequest::Other(

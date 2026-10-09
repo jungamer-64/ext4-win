@@ -381,7 +381,7 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) fn set_file(self) -> Result<SetFileStack, DriverError> {
+    pub(crate) fn set_file(self) -> Result<SetFileStack<'owner>, DriverError> {
         let stack = unsafe {
             // SAFETY: `stack` is non-null and belongs to the active IRP stack
             // for the current dispatch callback.
@@ -393,9 +393,60 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
             stack.Parameters.SetFile
         };
         self.kernel_file_object()?;
+        let parent = || -> DriverResult<NamespaceParent<'owner>> {
+            if set.FileObject.is_null() {
+                return Ok(NamespaceParent::SourceDirectory);
+            }
+            let target = unsafe {
+                // SAFETY: The I/O Manager retains SetFile.FileObject through this pending IRP.
+                KernelFileObject::from_raw(set.FileObject)
+            }
+            .ok_or(DriverError::InvalidParameter)?;
+            Ok(NamespaceParent::TargetDirectory(ActiveFileObject {
+                address: target,
+                owner: core::marker::PhantomData,
+            }))
+        };
+        let operation = match set.FileInformationClass {
+            wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => SetFileOperation::Basic,
+            wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => SetFileOperation::Position,
+            wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => {
+                let advance_only = unsafe {
+                    // SAFETY: End-of-file operations initialize the AdvanceOnly union arm.
+                    set.__bindgen_anon_1.__bindgen_anon_1.AdvanceOnly
+                };
+                if advance_only != 0 {
+                    SetFileOperation::AdvanceValidDataLength
+                } else {
+                    SetFileOperation::Resize
+                }
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAllocationInformation => {
+                SetFileOperation::Allocation
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation => {
+                SetFileOperation::Disposition
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformationEx => {
+                SetFileOperation::DispositionEx
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformation => {
+                SetFileOperation::Link(parent()?)
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformationEx => {
+                SetFileOperation::LinkEx(parent()?)
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation => {
+                SetFileOperation::Rename(parent()?)
+            }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformationEx => {
+                SetFileOperation::RenameEx(parent()?)
+            }
+            _ => return Err(DriverError::InvalidInfoClass),
+        };
         Ok(SetFileStack {
             length: IrpBufferLength::from_ulong(set.Length)?,
-            information_class: SetFileInformationClass::from_raw(set.FileInformationClass)?,
+            operation,
         })
     }
 

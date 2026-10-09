@@ -107,6 +107,8 @@ pub(crate) enum DriverError {
     ObjectPathNotFound,
     /// Create target kind does not satisfy the requested file/directory constraint.
     ObjectTypeMismatch,
+    /// Namespace destination belongs to another mounted volume.
+    NotSameDevice,
     /// A non-directory create target resolved to a directory.
     FileIsDirectory,
     /// A directory create target resolved to a non-directory.
@@ -181,6 +183,7 @@ impl DriverError {
             Self::ObjectNameNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
             Self::ObjectPathNotFound => STATUS_OBJECT_PATH_NOT_FOUND,
             Self::ObjectTypeMismatch => STATUS_OBJECT_TYPE_MISMATCH,
+            Self::NotSameDevice => ntstatus(0xC000_00D4),
             Self::FileIsDirectory => ntstatus(0xC000_00BA),
             Self::NotADirectory => ntstatus(0xC000_0103),
             Self::ShareAccessConflict => ntstatus(0xC000_0043),

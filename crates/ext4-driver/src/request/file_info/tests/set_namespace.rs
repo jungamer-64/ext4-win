@@ -1,7 +1,7 @@
 use super::*;
 use crate::irp::ReceivedIrp;
 use crate::request::file_info::test_support::*;
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 
 fn namespace_information_input(units: &[u16]) -> Option<alloc::vec::Vec<u8>> {
     let name_bytes = units.len().checked_mul(core::mem::size_of::<u16>())?;
@@ -175,20 +175,17 @@ fn hard_link_destinations_preserve_parent_oplock_effects() {
 fn namespace_target_distinguishes_opened_parent_from_volume_root() {
     let truncated = [0_u8; core::mem::size_of::<wdk_sys::FILE_LINK_INFORMATION>() - 1];
     assert_eq!(
-        super::NamespaceTargetPath::decode(&truncated, DirectoryNodeId::ROOT),
+        super::NamespaceTargetPath::decode(&truncated, DirectoryNodeId::ROOT, None),
         Err(DriverError::InfoLengthMismatch)
     );
 
     let relative = namespace_information_input(&[u16::from(b'a')]);
     assert!(relative.is_some());
     if let Some(relative) = relative {
-        let decoded = super::NamespaceTargetPath::decode(&relative, DirectoryNodeId::ROOT);
+        let decoded = super::NamespaceTargetPath::decode(&relative, DirectoryNodeId::ROOT, None);
         assert!(decoded.is_ok());
         if let Ok(decoded) = decoded {
-            assert_eq!(
-                decoded.base(),
-                super::NamespaceTargetBase::OpenedParent(DirectoryNodeId::ROOT)
-            );
+            assert_eq!(decoded.parent(), DirectoryNodeId::ROOT);
             assert!(decoded.parents().is_empty());
         }
     }
@@ -203,10 +200,10 @@ fn namespace_target_distinguishes_opened_parent_from_volume_root() {
     ]);
     assert!(absolute.is_some());
     if let Some(absolute) = absolute {
-        let decoded = super::NamespaceTargetPath::decode(&absolute, DirectoryNodeId::ROOT);
+        let decoded = super::NamespaceTargetPath::decode(&absolute, DirectoryNodeId::ROOT, None);
         assert!(decoded.is_ok());
         if let Ok(decoded) = decoded {
-            assert_eq!(decoded.base(), super::NamespaceTargetBase::VolumeRoot);
+            assert_eq!(decoded.parent(), DirectoryNodeId::ROOT);
             assert_eq!(decoded.parents().len(), 1);
         }
     }
@@ -216,7 +213,7 @@ fn namespace_target_distinguishes_opened_parent_from_volume_root() {
     assert!(relative_path.is_some());
     if let Some(relative_path) = relative_path {
         assert_eq!(
-            super::NamespaceTargetPath::decode(&relative_path, DirectoryNodeId::ROOT),
+            super::NamespaceTargetPath::decode(&relative_path, DirectoryNodeId::ROOT, None),
             Err(DriverError::InvalidParameter)
         );
     }
@@ -226,7 +223,7 @@ fn namespace_target_distinguishes_opened_parent_from_volume_root() {
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]
-fn rename_root_directory_field_is_not_supported() {
+fn root_directory_requires_the_io_manager_resolved_parent() {
     let mut input = [0_u8; super::FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET + 8];
     let Some(root_directory) = input.get_mut(
         super::FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET
@@ -239,10 +236,45 @@ fn rename_root_directory_field_is_not_supported() {
     };
     *first_byte = 1;
 
-    assert_eq!(
-        super::reject_root_directory(&input),
-        Err(DriverError::NotSupported)
-    );
+    assert_eq!(super::has_root_directory(&input), Ok(true));
+}
+
+/// # Panics
+/// Panics if a captured DOS/NT prefix overrides the Windows-resolved parent or root-handle state.
+#[test]
+fn resolved_namespace_parent_uses_only_the_destination_leaf() {
+    for name in ["\\??\\X:\\outside\\target", "relative\\target", "target"] {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        let input = namespace_information_input(&units);
+        assert!(input.is_some());
+        if let Some(mut input) = input {
+            let root = input.get_mut(super::FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET);
+            assert!(root.is_some());
+            if let Some(root) = root {
+                *root = 1;
+            }
+            assert_eq!(
+                super::NamespaceTargetPath::decode(&input, DirectoryNodeId::ROOT, None),
+                Err(DriverError::InvalidParameter)
+            );
+            let decoded = super::NamespaceTargetPath::decode(
+                &input,
+                DirectoryNodeId::ROOT,
+                Some(DirectoryNodeId::ROOT),
+            );
+            assert!(decoded.is_ok());
+            if let Ok(decoded) = decoded {
+                assert_eq!(decoded.parent(), DirectoryNodeId::ROOT);
+                assert!(decoded.parents().is_empty());
+                let expected =
+                    WindowsName::from_utf16(&"target".encode_utf16().collect::<Vec<_>>());
+                assert!(expected.is_ok());
+                if let Ok(expected) = expected {
+                    assert_eq!(decoded.target_name(), &expected);
+                }
+            }
+        }
+    }
 }
 /// # Panics
 ///
@@ -324,6 +356,7 @@ fn rename_replace_flag_decode_boundary_selects_replace_collision() {
             super::NamespaceTargetPath::decode(
                 active.buffered_input(stack.length())?.as_slice(),
                 ext4_core::DirectoryNodeId::ROOT,
+                None,
             )
         });
         assert!(parsed.is_ok());
@@ -332,10 +365,7 @@ fn rename_replace_flag_decode_boundary_selects_replace_collision() {
                 super::RenameInformationFormat::ReplaceIfExistsByte.target_collision(&input),
                 Ok(ext4_core::RenameTargetCollision::Replace)
             );
-            assert_eq!(
-                parsed.base(),
-                super::NamespaceTargetBase::OpenedParent(ext4_core::DirectoryNodeId::ROOT,)
-            );
+            assert_eq!(parsed.parent(), ext4_core::DirectoryNodeId::ROOT);
         }
     }
 }

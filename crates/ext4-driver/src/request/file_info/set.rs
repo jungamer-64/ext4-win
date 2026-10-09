@@ -147,8 +147,8 @@ impl PendingDispositionDeletion {
             let file_object = current.file_object()?;
             let stack = current.set_file()?;
             if !matches!(
-                stack.information_class(),
-                SetFileInformationClass::Disposition | SetFileInformationClass::DispositionEx
+                stack.operation(),
+                SetFileOperation::Disposition | SetFileOperation::DispositionEx
             ) {
                 return Err(DriverError::InternalInvariantViolation);
             }
@@ -225,8 +225,8 @@ pub(super) fn set_file_information(
         let file_object = current.file_object()?;
         let stack = current.set_file()?;
         let mut opened_file = OpenedObject::decode(file_object)?;
-        let plan = match stack.information_class() {
-            SetFileInformationClass::Basic => {
+        let plan = match stack.operation() {
+            SetFileOperation::Basic => {
                 if opened_file.file_attributes_write_access() != FileAttributesWriteAccess::Granted
                 {
                     return Err(DriverError::AccessDenied);
@@ -242,11 +242,11 @@ pub(super) fn set_file_information(
                     node: opened_file.node(),
                 }
             }
-            SetFileInformationClass::Position => {
+            SetFileOperation::Position => {
                 set_position_information(active, stack, &mut opened_file)?;
                 SetFilePlan::Complete
             }
-            SetFileInformationClass::EndOfFile => {
+            SetFileOperation::Resize => {
                 let end_of_file = read_end_of_file_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
                 SetFilePlan::EndOfFile {
@@ -254,7 +254,18 @@ pub(super) fn set_file_information(
                     size: file_size_from_large_integer(end_of_file)?,
                 }
             }
-            SetFileInformationClass::Allocation => {
+            SetFileOperation::AdvanceValidDataLength => {
+                let end =
+                    file_size_from_large_integer(read_end_of_file_input(active, stack.length())?)?;
+                let regular_file = OpenedRegularFile::decode(file_object)?;
+                // Sparse holes are initialized zeroes: committed VDL always equals logical EOF.
+                // This notification cannot shrink either value or extend the logical file.
+                if end > regular_file_size(mutation, regular_file.id())? {
+                    return Err(DriverError::InvalidParameter);
+                }
+                SetFilePlan::Complete
+            }
+            SetFileOperation::Allocation => {
                 let allocation_size = read_allocation_size_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
                 SetFilePlan::Allocation {
@@ -264,46 +275,50 @@ pub(super) fn set_file_information(
                     ),
                 }
             }
-            SetFileInformationClass::Disposition => {
+            SetFileOperation::Disposition => {
                 disposition_plan(active, stack, &opened_file, DispositionInputFormat::Legacy)?
             }
-            SetFileInformationClass::DispositionEx => disposition_plan(
+            SetFileOperation::DispositionEx => disposition_plan(
                 active,
                 stack,
                 &opened_file,
                 DispositionInputFormat::Extended,
             )?,
-            SetFileInformationClass::Link => SetFilePlan::Link {
+            SetFileOperation::Link(parent) => SetFilePlan::Link {
                 mutation: HardLinkMutation::decode(
                     active,
                     stack,
                     &opened_file,
                     HardLinkInformationFormat::ReplaceIfExistsByte,
+                    parent,
                 )?,
             },
-            SetFileInformationClass::LinkEx => SetFilePlan::Link {
+            SetFileOperation::LinkEx(parent) => SetFilePlan::Link {
                 mutation: HardLinkMutation::decode(
                     active,
                     stack,
                     &opened_file,
                     HardLinkInformationFormat::Flags,
+                    parent,
                 )?,
             },
-            SetFileInformationClass::Rename => SetFilePlan::Rename {
+            SetFileOperation::Rename(parent) => SetFilePlan::Rename {
                 mutation: RenameMutation::decode(
                     active,
                     stack,
                     &opened_file,
                     RenameInformationFormat::ReplaceIfExistsByte,
+                    parent,
                 )?,
                 file_object: opened_file.file_object(),
             },
-            SetFileInformationClass::RenameEx => SetFilePlan::Rename {
+            SetFileOperation::RenameEx(parent) => SetFilePlan::Rename {
                 mutation: RenameMutation::decode(
                     active,
                     stack,
                     &opened_file,
                     RenameInformationFormat::Flags,
+                    parent,
                 )?,
                 file_object: opened_file.file_object(),
             },
@@ -627,9 +642,7 @@ impl PreservedHandleTimes {
     ) -> DriverResult<Option<Self>> {
         let target = request.with_active(|active| {
             let current = active.current_stack()?;
-            if is_set_information
-                && current.set_file()?.information_class() == SetFileInformationClass::Basic
-            {
+            if is_set_information && current.set_file()?.operation() == SetFileOperation::Basic {
                 return Ok(None);
             }
             let opened = OpenedObject::decode(current.file_object()?)?;
@@ -937,6 +950,7 @@ impl HardLinkMutation {
         stack: SetFileStack,
         opened_file: &OpenedObject<'_>,
         format: HardLinkInformationFormat,
+        parent: NamespaceParent<'_>,
     ) -> DriverResult<Self> {
         if opened_file.delete_pending() {
             return Err(DriverError::AccessDenied);
@@ -950,7 +964,11 @@ impl HardLinkMutation {
         };
         let input = active.buffered_input(stack.length())?;
         let target_collision = format.target_collision(input.as_slice())?;
-        let target = NamespaceTargetPath::decode(input.as_slice(), source_parent)?;
+        let target = NamespaceTargetPath::decode(
+            input.as_slice(),
+            source_parent,
+            namespace_target_parent(parent, opened_file)?,
+        )?;
         Ok(Self {
             source,
             target,
@@ -1253,6 +1271,7 @@ impl RenameMutation {
         stack: SetFileStack,
         opened_file: &OpenedObject<'_>,
         format: RenameInformationFormat,
+        parent: NamespaceParent<'_>,
     ) -> DriverResult<Self> {
         if opened_file.delete_pending() {
             return Err(DriverError::DeletePending);
@@ -1266,7 +1285,11 @@ impl RenameMutation {
         };
         let input = active.buffered_input(stack.length())?;
         let target_collision = format.target_collision(input.as_slice())?;
-        let target = NamespaceTargetPath::decode(input.as_slice(), source_parent)?;
+        let target = NamespaceTargetPath::decode(
+            input.as_slice(),
+            source_parent,
+            namespace_target_parent(parent, opened_file)?,
+        )?;
         Ok(Self {
             source_parent,
             source_name,
@@ -1772,31 +1795,47 @@ fn decode_extended_disposition_record(bytes: &[u8]) -> DriverResult<u32> {
 #[derive(Debug, Eq, PartialEq)]
 struct NamespaceTargetPath {
     /// Directory from which the path starts.
-    base: NamespaceTargetBase,
-    /// Non-empty path below `base`.
+    parent: DirectoryNodeId,
+    /// Non-empty path below the selected parent.
     path: NonEmptyWindowsPath,
 }
 
-/// Starting directory selected by Windows namespace-target path syntax.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NamespaceTargetBase {
-    /// A single relative name starts in the source link's current parent.
-    OpenedParent(DirectoryNodeId),
-    /// A leading backslash starts at the mounted volume root.
-    VolumeRoot,
+/// Converts Windows-resolved parent authority before a mutation can suspend.
+/// # Errors
+/// Rejects non-directory destinations and cross-volume operations.
+fn namespace_target_parent(
+    parent: NamespaceParent<'_>,
+    source: &OpenedObject<'_>,
+) -> DriverResult<Option<DirectoryNodeId>> {
+    match parent {
+        NamespaceParent::SourceDirectory => Ok(None),
+        NamespaceParent::TargetDirectory(file_object) => {
+            let target = OpenedDirectory::decode(file_object)?;
+            if target.volume() != source.volume() {
+                return Err(DriverError::NotSameDevice);
+            }
+            Ok(Some(target.id()))
+        }
+    }
 }
 
 impl NamespaceTargetPath {
     /// Decodes the common FILE_RENAME_INFORMATION / FILE_LINK_INFORMATION path layout.
     /// # Errors
     ///
-    /// Returns an error when the input is truncated, carries an unsupported root handle, has an
-    /// invalid name length, or encodes a relative multi-component path.
-    fn decode(bytes: &[u8], opened_parent: DirectoryNodeId) -> DriverResult<Self> {
+    /// Returns an error for a truncated input, a root handle without its I/O Manager parent,
+    /// an invalid leaf, or a relative multi-component path without a resolved destination.
+    fn decode(
+        bytes: &[u8],
+        opened_parent: DirectoryNodeId,
+        target_parent: Option<DirectoryNodeId>,
+    ) -> DriverResult<Self> {
         if bytes.len() < core::mem::size_of::<wdk_sys::FILE_LINK_INFORMATION>() {
             return Err(DriverError::InfoLengthMismatch);
         }
-        reject_root_directory(bytes)?;
+        if target_parent.is_none() && has_root_directory(bytes)? {
+            return Err(DriverError::InvalidParameter);
+        }
         let name_length = usize::try_from(
             LittleEndianInput::new(bytes)
                 .read_u32(wire_offset(FILE_NAMESPACE_NAME_LENGTH_OFFSET))?,
@@ -1807,28 +1846,36 @@ impl NamespaceTargetPath {
         }
         let name_bytes = input_range(bytes, FILE_NAMESPACE_NAME_OFFSET, name_length)?;
         let units = utf16_units_from_le_bytes(name_bytes)?;
-        let (base, path_units) = match units.as_slice().split_first() {
-            Some((first, rest)) if *first == UTF16_BACKSLASH => {
-                (NamespaceTargetBase::VolumeRoot, rest)
-            }
+        // SetFile.FileObject already identifies the final destination parent. Its basename is
+        // authoritative even when the captured name still includes a DOS/NT path prefix.
+        if let Some(parent) = target_parent {
+            let leaf = units
+                .as_slice()
+                .rsplit(|unit| *unit == UTF16_BACKSLASH)
+                .next()
+                .ok_or(DriverError::InvalidParameter)?;
+            return Ok(Self {
+                parent,
+                path: NonEmptyWindowsPath::from_utf16_path(leaf)?,
+            });
+        }
+        let (parent, path_units) = match units.as_slice().split_first() {
+            Some((first, rest)) if *first == UTF16_BACKSLASH => (DirectoryNodeId::ROOT, rest),
             Some(_) if units.as_slice().contains(&UTF16_BACKSLASH) => {
                 return Err(DriverError::InvalidParameter);
             }
-            Some(_) => (
-                NamespaceTargetBase::OpenedParent(opened_parent),
-                units.as_slice(),
-            ),
+            Some(_) => (opened_parent, units.as_slice()),
             None => return Err(DriverError::InvalidParameter),
         };
         Ok(Self {
-            base,
+            parent,
             path: NonEmptyWindowsPath::from_utf16_path(path_units)?,
         })
     }
 
     /// Returns the directory from which resolution starts.
-    const fn base(&self) -> NamespaceTargetBase {
-        self.base
+    const fn parent(&self) -> DirectoryNodeId {
+        self.parent
     }
 
     /// Returns parent components before the target name.
@@ -1992,23 +2039,18 @@ const SUPPORTED_RENAME_EX_FLAGS: wdk_sys::ULONG =
 /// UTF-16 backslash separator.
 pub(super) const UTF16_BACKSLASH: u16 = 0x005C;
 
-/// Rejects namespace-information payloads carrying an unsupported root handle.
+/// Observes whether Windows supplied a root handle requiring a resolved target parent.
 /// # Errors
 ///
-/// Returns an error when the root-directory handle field is present and nonzero.
-fn reject_root_directory(bytes: &[u8]) -> DriverResult<()> {
-    if input_range(
+/// Returns an error when the root-directory handle field is truncated.
+fn has_root_directory(bytes: &[u8]) -> DriverResult<bool> {
+    Ok(input_range(
         bytes,
         FILE_NAMESPACE_ROOT_DIRECTORY_OFFSET,
         core::mem::size_of::<wdk_sys::HANDLE>(),
     )?
     .iter()
-    .any(|byte| *byte != 0)
-    {
-        Err(DriverError::NotSupported)
-    } else {
-        Ok(())
-    }
+    .any(|byte| *byte != 0))
 }
 
 /// Decodes little-endian UTF-16 units from a byte buffer.
@@ -2040,10 +2082,7 @@ fn resolve_namespace_target(
     read: &mut impl CommittedReadPass,
     target: &NamespaceTargetPath,
 ) -> DriverResult<(DirectoryNodeId, Ext4Name)> {
-    let mut parent_id = match target.base() {
-        NamespaceTargetBase::OpenedParent(parent) => parent,
-        NamespaceTargetBase::VolumeRoot => DirectoryNodeId::ROOT,
-    };
+    let mut parent_id = target.parent();
     for component in target.parents() {
         let parent = read
             .load_directory(parent_id)
