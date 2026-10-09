@@ -532,8 +532,10 @@ unsafe impl Send for ReusableHash {}
 struct GeneratedKey<'object> {
     /// CNG key identity.
     handle: NonNull<c_void>,
-    /// Mutable object-buffer lease retained through `BCryptDestroyKey`.
-    object: &'object mut [u8],
+    /// Opaque object storage accessible by CNG until `BCryptDestroyKey`.
+    object: NonNull<[u8]>,
+    /// Prevents backing storage reuse without reborrowing the bytes retained by CNG.
+    lifetime: core::marker::PhantomData<&'object mut [u8]>,
 }
 
 impl GeneratedKey<'_> {
