@@ -141,30 +141,6 @@ impl ActiveIrp<'_> {
             .ok_or(DriverError::InternalInvariantViolation)
     }
 
-    /// Returns METHOD_BUFFERED input bytes tied to this active owner borrow.
-    /// # Errors
-    ///
-    /// Returns an error when the associated system buffer is null.
-    pub(crate) fn buffered_input(
-        &self,
-        length: IrpBufferLength,
-    ) -> Result<BufferedInput<'_>, DriverError> {
-        BufferedInput::from_active(self.associated_system_buffer()?, length.as_usize())
-    }
-
-    /// Returns METHOD_BUFFERED output bytes tied to this active owner borrow.
-    ///
-    /// The complete output range is initialized to zero before it can become a Rust byte slice.
-    /// # Errors
-    ///
-    /// Returns an error when the associated system buffer is null.
-    pub(crate) fn buffered_output(
-        &mut self,
-        length: IrpBufferLength,
-    ) -> Result<BufferedOutput<'_>, DriverError> {
-        BufferedOutput::from_active(self.associated_system_buffer()?, length.as_usize())
-    }
-
     /// Publishes only filesystem-owned FILE_ALL_INFORMATION fields from initialized driver
     /// storage. Access, mode, and alignment belong to the upstream query owner and are neither
     /// read nor overwritten. No Rust reference is formed to the raw output buffer.
