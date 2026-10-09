@@ -59,6 +59,8 @@ pub(crate) fn copy_exact<T: Copy>(destination: &mut [T], source: &[T]) -> Driver
 pub(crate) struct InPlaceInitialization<T> {
     /// Initialized destination uniquely owned until publication.
     destination: NonNull<T>,
+    /// Mutable access must preserve the exact `T`, including every retained reference lifetime.
+    invariant: PhantomData<core::cell::Cell<T>>,
     /// True while guard drop must roll the value back.
     rollback: bool,
 }
@@ -77,6 +79,7 @@ impl<T> InPlaceInitialization<T> {
     pub(crate) unsafe fn assume_init(destination: NonNull<T>) -> Self {
         Self {
             destination,
+            invariant: PhantomData,
             rollback: true,
         }
     }
