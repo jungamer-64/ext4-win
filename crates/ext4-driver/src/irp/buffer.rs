@@ -23,17 +23,107 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     pub(crate) fn mdl_action(self, write: bool) -> DriverResult<Option<MdlAction>> {
         MdlAction::decode(self.raw_minor_function(), write)
     }
-    /// Binds a raw stack location to an active IRP owner borrow.
+    /// Decodes the initialized input and writable output extents of system-buffer requests.
     /// # Errors
-    ///
-    /// Returns an error when `stack` is null.
-    pub(super) fn from_active(stack: PIO_STACK_LOCATION) -> Result<Self, DriverError> {
-        let Some(stack) = NonNull::new(stack) else {
-            return Err(DriverError::InvalidParameter);
+    /// Rejects operations without a supported system-buffer contract, direct/neither control
+    /// methods, and lengths outside the Rust slice domain.
+    #[expect(
+        unsafe_code,
+        reason = "the active owner retains the current stack and its operation-specific buffer extents"
+    )]
+    pub(super) fn buffered_lengths(self) -> DriverResult<BufferedSystemBufferLengths> {
+        let stack = unsafe {
+            // SAFETY: Construction borrows the active IRP owner for this stack view's lifetime.
+            self.stack.as_ref()
         };
-        Ok(Self {
-            stack,
-            owner: core::marker::PhantomData,
+        let (input, output) = match u32::from(stack.MajorFunction) {
+            wdk_sys::IRP_MJ_CREATE => {
+                let input = unsafe {
+                    // SAFETY: The I/O Manager copies the create EA list into this input extent.
+                    stack.Parameters.Create.EaLength
+                };
+                (input, 0)
+            }
+            wdk_sys::IRP_MJ_DEVICE_CONTROL => {
+                let code = unsafe {
+                    // SAFETY: This major initializes the device-control code in this union arm.
+                    stack.Parameters.DeviceIoControl.IoControlCode
+                };
+                if code & 3 != 0 {
+                    return Err(DriverError::InvalidDeviceRequest);
+                }
+                let input = unsafe {
+                    // SAFETY: METHOD_BUFFERED initializes this input prefix in SystemBuffer.
+                    stack.Parameters.DeviceIoControl.InputBufferLength
+                };
+                let output = unsafe {
+                    // SAFETY: The same control method reserves this writable output extent.
+                    stack.Parameters.DeviceIoControl.OutputBufferLength
+                };
+                (input, output)
+            }
+            wdk_sys::IRP_MJ_FILE_SYSTEM_CONTROL => {
+                if self.file_system_control_minor() != FileSystemControlMinorFunction::UserFsRequest
+                {
+                    return Err(DriverError::InvalidDeviceRequest);
+                }
+                let code = unsafe {
+                    // SAFETY: This minor initializes the filesystem-control code in this arm.
+                    stack.Parameters.FileSystemControl.FsControlCode
+                };
+                if code & 3 != 0 {
+                    return Err(DriverError::InvalidDeviceRequest);
+                }
+                let input = unsafe {
+                    // SAFETY: METHOD_BUFFERED initializes this input prefix in SystemBuffer.
+                    stack.Parameters.FileSystemControl.InputBufferLength
+                };
+                let output = unsafe {
+                    // SAFETY: The same control method reserves this writable output extent.
+                    stack.Parameters.FileSystemControl.OutputBufferLength
+                };
+                (input, output)
+            }
+            wdk_sys::IRP_MJ_SET_INFORMATION => {
+                let input = unsafe {
+                    // SAFETY: Set-information requests initialize this system-buffer input extent.
+                    stack.Parameters.SetFile.Length
+                };
+                (input, 0)
+            }
+            wdk_sys::IRP_MJ_SET_VOLUME_INFORMATION => {
+                let input = unsafe {
+                    // SAFETY: Set-volume requests initialize this system-buffer input extent.
+                    stack.Parameters.SetVolume.Length
+                };
+                (input, 0)
+            }
+            wdk_sys::IRP_MJ_SET_EA => {
+                let input = unsafe {
+                    // SAFETY: Set-EA requests initialize this system-buffer input extent.
+                    stack.Parameters.SetEa.Length
+                };
+                (input, 0)
+            }
+            wdk_sys::IRP_MJ_QUERY_INFORMATION => {
+                let output = unsafe {
+                    // SAFETY: Query-information requests reserve this system-buffer output extent.
+                    stack.Parameters.QueryFile.Length
+                };
+                (0, output)
+            }
+            wdk_sys::IRP_MJ_QUERY_VOLUME_INFORMATION => {
+                let output = unsafe {
+                    // SAFETY: Query-volume requests reserve this system-buffer output extent.
+                    stack.Parameters.QueryVolume.Length
+                };
+                (0, output)
+            }
+            _ => return Err(DriverError::InvalidDeviceRequest),
+        };
+        Ok(BufferedSystemBufferLengths {
+            initialized_input: IrpBufferLength::from_ulong(input)?,
+            writable_output: IrpBufferLength::from_ulong(output)?,
         })
     }
 
@@ -779,6 +869,15 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
             key: ByteRangeLockKey::from_ulong(write.Key),
         })
     }
+}
+
+/// Native system-buffer input initialization and output capacity are independent extents.
+#[derive(Debug)]
+pub(super) struct BufferedSystemBufferLengths {
+    /// Prefix copied from the requestor before dispatch.
+    pub(super) initialized_input: IrpBufferLength,
+    /// Output capacity reserved by the I/O Manager, potentially uninitialized.
+    pub(super) writable_output: IrpBufferLength,
 }
 
 /// Returns an IRP MDL data buffer address as kernel memory.

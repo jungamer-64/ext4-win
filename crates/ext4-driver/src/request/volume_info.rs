@@ -121,8 +121,8 @@ impl MountedVolumeOperation for VolumeQueryOperation {
                     let mut request = owned.request();
                     super::file_system_control::authorize_path_handle(&mut request, access)?;
                     request.with_active(|active| {
-                        let mut output = active.buffered_output(length)?;
-                        pack_sector_size_information(&information, output.as_mut_slice())
+                        let output = active.buffered_output(length)?;
+                        pack_sector_size_information(&information, output)
                     })
                 });
                 (owned, result)
@@ -204,8 +204,7 @@ fn prepare_query(
     request
         .with_active(|active| {
             let length = stack.length();
-            let mut buffer = active.buffered_output(length)?;
-            let output = buffer.as_mut_slice();
+            let output = active.buffered_output(length)?;
             let identity = operations.volume_identity();
             let geometry = operations.volume_geometry();
             match stack.information_class() {
@@ -250,7 +249,7 @@ pub(crate) fn set(
         let label = match stack.information_class() {
             SetVolumeInformationClass::Label => {
                 let input = active.buffered_input(stack.length())?;
-                volume_label_from_file_fs_label(input.as_slice())?
+                volume_label_from_file_fs_label(input)?
             }
         };
         Ok::<_, DriverError>((active.device(), label))

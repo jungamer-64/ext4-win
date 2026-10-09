@@ -169,20 +169,38 @@ fn current_stack_fixture(
 #[test]
 fn buffered_output_initializes_only_its_declared_range_before_borrow() {
     let mut storage = [0xA5_u8; 17];
-    let address = NonNull::new(storage.as_mut_ptr());
-    assert!(address.is_some());
-    let Some(address) = address else {
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        MajorFunction: u8::try_from(wdk_sys::IRP_MJ_QUERY_INFORMATION).unwrap_or(u8::MAX),
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    stack.Parameters.QueryFile.Length = 13;
+    let mut irp = wdk_sys::IRP::default();
+    irp.AssociatedIrp.SystemBuffer = storage.as_mut_ptr().cast();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+    let received = received_irp_fixture(&mut device, &mut irp);
+    assert!(received.is_ok());
+    let Ok(mut received) = received else {
         return;
     };
-    {
-        let output = super::BufferedOutput::from_active(address, 13);
-        assert!(output.is_ok());
-        let Ok(mut output) = output else {
+    received.with_active(|active| {
+        let length = IrpBufferLength::from_ulong(13);
+        assert!(length.is_ok());
+        let Ok(length) = length else {
             return;
         };
-        assert!(output.as_mut_slice().iter().all(|byte| *byte == 0));
-        output.as_mut_slice().fill(0x3C);
-    }
+        let output = active.buffered_output(length);
+        assert!(output.is_ok());
+        let Ok(output) = output else {
+            return;
+        };
+        assert!(output.iter().all(|byte| *byte == 0));
+        output.fill(0x3C);
+    });
     assert!(
         storage
             .get(..13)
@@ -193,6 +211,215 @@ fn buffered_output_initializes_only_its_declared_range_before_borrow() {
             .get(13..)
             .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0xA5))
     );
+}
+
+/// # Errors
+/// Returns fixture decoding or native length-conversion failures.
+/// # Panics
+/// Fails if the create EA prefix is rejected or exposed as writable output.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify the create-specific captured EA buffer contract"
+)]
+fn buffered_create_borrows_the_captured_ea_input() -> Result<(), DriverError> {
+    let mut storage = [0_u8, 0, 0, 0, 0, 1, 1, 0, b'a', 0, b'v'];
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        MajorFunction: u8::try_from(wdk_sys::IRP_MJ_CREATE)
+            .map_err(|_| DriverError::InvalidParameter)?,
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    stack.Parameters.Create.EaLength = 11;
+    let mut irp = wdk_sys::IRP::default();
+    irp.AssociatedIrp.SystemBuffer = storage.as_mut_ptr().cast();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+    let mut received = received_irp_fixture(&mut device, &mut irp)?;
+    received.with_active(|active| -> Result<(), DriverError> {
+        assert_eq!(
+            active.buffered_input(IrpBufferLength::from_ulong(11)?)?,
+            &[0, 0, 0, 0, 0, 1, 1, 0, b'a', 0, b'v']
+        );
+        assert_eq!(
+            active.buffered_output(IrpBufferLength::from_ulong(1)?),
+            Err(DriverError::BufferTooSmall)
+        );
+        Ok(())
+    })
+}
+
+/// # Errors
+/// Returns fixture decoding or native length-conversion failures.
+/// # Panics
+/// Fails if output capacity is treated as initialized input, an excess prefix changes memory,
+/// or a valid output prefix writes beyond its declared range.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify the native buffer contract while fixture failures remain fallible"
+)]
+fn buffered_control_keeps_input_initialization_and_output_capacity_distinct()
+-> Result<(), DriverError> {
+    let mut storage = [0xA5_u8; 17];
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        MajorFunction: u8::try_from(wdk_sys::IRP_MJ_DEVICE_CONTROL)
+            .map_err(|_| DriverError::InvalidParameter)?,
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    stack.Parameters.DeviceIoControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
+        OutputBufferLength: 13,
+        __bindgen_padding_0: 0,
+        InputBufferLength: 4,
+        __bindgen_padding_1: 0,
+        IoControlCode: ext4_security::QUERY_IDENTITY_IOCTL,
+        Type3InputBuffer: core::ptr::null_mut(),
+    };
+    let mut irp = wdk_sys::IRP::default();
+    irp.AssociatedIrp.SystemBuffer = storage.as_mut_ptr().cast();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+    let mut received = received_irp_fixture(&mut device, &mut irp)?;
+    received.with_active(|active| -> Result<(), DriverError> {
+        assert_eq!(
+            active.buffered_input(IrpBufferLength::from_ulong(4)?)?,
+            &[0xA5; 4]
+        );
+        assert_eq!(
+            active.buffered_input(IrpBufferLength::from_ulong(5)?),
+            Err(DriverError::BufferTooSmall)
+        );
+        assert_eq!(
+            active.buffered_output(IrpBufferLength::from_ulong(14)?),
+            Err(DriverError::BufferTooSmall)
+        );
+        let output = active.buffered_output(IrpBufferLength::from_ulong(8)?)?;
+        assert_eq!(output, &[0; 8]);
+        output.fill(0x3C);
+        Ok(())
+    })?;
+    assert_eq!(storage.get(..8), Some([0x3C; 8].as_slice()));
+    assert_eq!(storage.get(8..), Some([0xA5; 9].as_slice()));
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture decoding or native length-conversion failures.
+/// # Panics
+/// Fails if an empty prefix requires an allocation or a nonempty prefix accepts a null buffer.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify null/empty normalization at the actual IRP boundary"
+)]
+fn buffered_prefixes_normalize_empty_and_reject_nonempty_null_storage() -> Result<(), DriverError> {
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        MajorFunction: u8::try_from(wdk_sys::IRP_MJ_DEVICE_CONTROL)
+            .map_err(|_| DriverError::InvalidParameter)?,
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    stack.Parameters.DeviceIoControl.IoControlCode = ext4_security::QUERY_IDENTITY_IOCTL;
+    stack.Parameters.DeviceIoControl.InputBufferLength = 1;
+    stack.Parameters.DeviceIoControl.OutputBufferLength = 1;
+    let mut irp = wdk_sys::IRP::default();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+    let mut received = received_irp_fixture(&mut device, &mut irp)?;
+    received.with_active(|active| -> Result<(), DriverError> {
+        assert!(
+            active
+                .buffered_input(IrpBufferLength::from_ulong(0)?)?
+                .is_empty()
+        );
+        assert!(
+            active
+                .buffered_output(IrpBufferLength::from_ulong(0)?)?
+                .is_empty()
+        );
+        assert_eq!(
+            active.buffered_input(IrpBufferLength::from_ulong(1)?),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            active.buffered_output(IrpBufferLength::from_ulong(1)?),
+            Err(DriverError::InvalidParameter)
+        );
+        Ok(())
+    })
+}
+
+/// # Errors
+/// Returns fixture decoding or native length-conversion failures.
+/// # Panics
+/// Fails if direct/neither transfers or a mount overlay can become system-buffer Rust slices.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify that distinct native buffer ownership protocols stay opaque"
+)]
+fn buffered_access_rejects_other_native_buffer_protocols() -> Result<(), DriverError> {
+    for method in [2, 3] {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            MajorFunction: u8::try_from(wdk_sys::IRP_MJ_DEVICE_CONTROL)
+                .map_err(|_| DriverError::InvalidParameter)?,
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        stack.Parameters.DeviceIoControl.IoControlCode =
+            (ext4_security::QUERY_IDENTITY_IOCTL & !3) | method;
+        stack.Parameters.DeviceIoControl.InputBufferLength = 1;
+        stack.Parameters.DeviceIoControl.OutputBufferLength = 1;
+        let mut irp = wdk_sys::IRP::default();
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+        let mut received = received_irp_fixture(&mut device, &mut irp)?;
+        received.with_active(|active| -> Result<(), DriverError> {
+            assert_eq!(
+                active.buffered_input(IrpBufferLength::from_ulong(1)?),
+                Err(DriverError::InvalidDeviceRequest)
+            );
+            assert_eq!(
+                active.buffered_output(IrpBufferLength::from_ulong(1)?),
+                Err(DriverError::InvalidDeviceRequest)
+            );
+            Ok(())
+        })?;
+    }
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        MajorFunction: u8::try_from(wdk_sys::IRP_MJ_FILE_SYSTEM_CONTROL)
+            .map_err(|_| DriverError::InvalidParameter)?,
+        MinorFunction: MOUNT_VOLUME_MINOR,
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    let mut irp = wdk_sys::IRP::default();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+    let mut received = received_irp_fixture(&mut device, &mut irp)?;
+    received.with_active(|active| -> Result<(), DriverError> {
+        assert_eq!(
+            active.buffered_output(IrpBufferLength::from_ulong(1)?),
+            Err(DriverError::InvalidDeviceRequest)
+        );
+        Ok(())
+    })
 }
 
 /// # Panics

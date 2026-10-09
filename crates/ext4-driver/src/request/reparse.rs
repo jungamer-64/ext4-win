@@ -157,8 +157,8 @@ pub(crate) fn get_reparse_point(
     };
     let data = load_node_reparse_data(read, node)?;
     let written = request.with_active(|active| {
-        let mut output = active.buffered_output(length)?;
-        data.pack_fsctl(output.as_mut_slice())
+        let output = active.buffered_output(length)?;
+        data.pack_fsctl(output)
     })?;
     IrpCompletion::from_usize(written)
 }
@@ -178,7 +178,7 @@ pub(crate) fn set_reparse_point(
             let file_object = current.file_object()?;
             let stack = current.file_system_control()?;
             let input = active.buffered_input(stack.input_buffer_length())?;
-            let reparse_point = parse_symlink_reparse_buffer(input.as_slice())?;
+            let reparse_point = parse_symlink_reparse_buffer(input)?;
             let opened = OpenedObject::decode(file_object)?;
             let node = opened.node();
             validate_mutable_reparse_node(opened.location(), node)?;
@@ -204,7 +204,7 @@ pub(crate) fn delete_reparse_point(
             let file_object = current.file_object()?;
             let stack = current.file_system_control()?;
             let input = active.buffered_input(stack.input_buffer_length())?;
-            parse_delete_reparse_buffer(input.as_slice())?;
+            parse_delete_reparse_buffer(input)?;
             let opened = OpenedObject::decode(file_object)?;
             let node = opened.node();
             validate_mutable_reparse_node(opened.location(), node)?;

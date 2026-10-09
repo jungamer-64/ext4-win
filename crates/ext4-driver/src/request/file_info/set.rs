@@ -955,9 +955,9 @@ impl HardLinkMutation {
             OpenedLocation::FileReference => return Err(DriverError::NotSupported),
         };
         let input = active.buffered_input(stack.length())?;
-        let target_collision = format.target_collision(input.as_slice())?;
+        let target_collision = format.target_collision(input)?;
         let target = NamespaceTargetPath::decode(
-            input.as_slice(),
+            input,
             source_parent,
             namespace_target_parent(parent, opened_file)?,
         )?;
@@ -1276,9 +1276,9 @@ impl RenameMutation {
             OpenedLocation::FileReference => return Err(DriverError::NotSupported),
         };
         let input = active.buffered_input(stack.length())?;
-        let target_collision = format.target_collision(input.as_slice())?;
+        let target_collision = format.target_collision(input)?;
         let target = NamespaceTargetPath::decode(
-            input.as_slice(),
+            input,
             source_parent,
             namespace_target_parent(parent, opened_file)?,
         )?;
@@ -1565,7 +1565,7 @@ fn decode_file_information_input<T>(
     decode: impl FnOnce(&[u8]) -> DriverResult<T>,
 ) -> DriverResult<T> {
     let input = active.buffered_input(length)?;
-    decode(input.as_slice())
+    decode(input)
 }
 
 /// Decodes one complete fixed-size record from checked little-endian fields.

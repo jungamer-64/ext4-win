@@ -991,15 +991,13 @@ impl PreparedRequest {
                     .map_err(IrpCompletion::from_error)?;
                 let command = match control.io_control_code() {
                     ext4_security::QUERY_IDENTITY_IOCTL => crate::identity::IdentityCommand::Query(
-                        ext4_core::FilesystemUuid::from_bytes(
-                            input.as_slice().try_into().map_err(|_| {
-                                IrpCompletion::from_error(DriverError::InvalidParameter)
-                            })?,
-                        ),
+                        ext4_core::FilesystemUuid::from_bytes(input.try_into().map_err(|_| {
+                            IrpCompletion::from_error(DriverError::InvalidParameter)
+                        })?),
                     ),
                     ext4_security::REPLACE_IDENTITY_IOCTL => {
                         crate::identity::IdentityCommand::Replace(
-                            ext4_security::Replacement::decode(input.as_slice())
+                            ext4_security::Replacement::decode(input)
                                 .map_err(|error| IrpCompletion::from_error(error.into()))?,
                         )
                     }

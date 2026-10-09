@@ -141,6 +141,60 @@ impl ActiveIrp<'_> {
             .ok_or(DriverError::InternalInvariantViolation)
     }
 
+    /// Borrows an initialized system-buffer input prefix under this completion owner.
+    /// # Errors
+    /// Rejects a request without a buffered input contract, an excess prefix, or a null nonempty
+    /// system buffer. An empty prefix requires no buffer allocation.
+    #[expect(
+        unsafe_code,
+        reason = "the IRP owner borrow retains the checked initialized input for the returned slice"
+    )]
+    pub(crate) fn buffered_input(&self, length: IrpBufferLength) -> DriverResult<&[u8]> {
+        self.current_stack()?
+            .buffered_lengths()?
+            .initialized_input
+            .prefix(length.as_usize())?;
+        if length.is_empty() {
+            return Ok(&[]);
+        }
+        let address = self.associated_system_buffer()?;
+        Ok(unsafe {
+            // SAFETY: The operation-specific stack extent bounds this initialized input prefix.
+            // SystemBuffer is an I/O Manager allocation, not a requestor mapping. Borrowing self
+            // retains the IRP and excludes mutable output access or completion until the slice ends.
+            core::slice::from_raw_parts(address.as_ptr(), length.as_usize())
+        })
+    }
+
+    /// Initializes and exclusively borrows a writable system-buffer output prefix.
+    /// # Errors
+    /// Rejects a request without a buffered output contract, an excess prefix, or a null nonempty
+    /// system buffer before initialization. An empty prefix requires no buffer allocation.
+    #[expect(
+        unsafe_code,
+        reason = "the exclusive IRP owner borrow retains the checked initialized output slice"
+    )]
+    pub(crate) fn buffered_output(&mut self, length: IrpBufferLength) -> DriverResult<&mut [u8]> {
+        self.current_stack()?
+            .buffered_lengths()?
+            .writable_output
+            .prefix(length.as_usize())?;
+        if length.is_empty() {
+            return Ok(&mut []);
+        }
+        let address = self.associated_system_buffer()?;
+        unsafe {
+            // SAFETY: The checked prefix fits the I/O Manager's writable allocation. The mutable
+            // owner borrow excludes every input/output slice; initialize before forming a reference.
+            address.as_ptr().write_bytes(0, length.as_usize());
+        }
+        Ok(unsafe {
+            // SAFETY: All bytes in the checked range are initialized above. This exclusive owner
+            // borrow retains the allocation and excludes other slices and IRP completion.
+            core::slice::from_raw_parts_mut(address.as_ptr(), length.as_usize())
+        })
+    }
+
     /// Publishes only filesystem-owned FILE_ALL_INFORMATION fields from initialized driver
     /// storage. Access, mode, and alignment belong to the upstream query owner and are neither
     /// read nor overwritten. No Rust reference is formed to the raw output buffer.
@@ -262,8 +316,12 @@ impl ActiveIrp<'_> {
     ///
     /// Returns an error when the current stack pointer is null.
     pub(crate) fn current_stack(&self) -> Result<CurrentIrpStackLocation<'_>, DriverError> {
-        let current_stack = KernelIrp { irp: self.irp }.current_stack_address();
-        CurrentIrpStackLocation::from_active(current_stack)
+        let stack = NonNull::new(KernelIrp { irp: self.irp }.current_stack_address())
+            .ok_or(DriverError::InvalidParameter)?;
+        Ok(CurrentIrpStackLocation {
+            stack,
+            owner: core::marker::PhantomData,
+        })
     }
 
     /// Returns the buffered I/O system-buffer address.

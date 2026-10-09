@@ -74,8 +74,8 @@ fn reply(mut owned: OwnedIrp, bytes: Vec<u8>) -> OperationTransition {
             .device_control()?
             .output_buffer_length()
             .prefix(bytes.len())?;
-        let mut output = active.buffered_output(extent)?;
-        crate::memory::copy_exact(output.as_mut_slice(), &bytes)?;
+        let output = active.buffered_output(extent)?;
+        crate::memory::copy_exact(output, &bytes)?;
         Ok(IrpCompletion::with_information(
             crate::irp::InformationLength::from_usize(bytes.len())?,
         ))

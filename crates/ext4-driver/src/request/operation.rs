@@ -1646,10 +1646,9 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
                         if !stack.input_buffer_length().is_empty() {
                             return Err(DriverError::InvalidParameter);
                         }
-                        let mut output =
+                        let output =
                             active.buffered_output(stack.output_buffer_length().prefix(16)?)?;
                         output
-                            .as_mut_slice()
                             .iter_mut()
                             .zip(access.volume_identity().uuid().bytes())
                             .for_each(|(target, value)| *target = value);

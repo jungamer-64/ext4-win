@@ -321,6 +321,7 @@ fn rename_replace_flag_decode_boundary_selects_replace_collision() {
 
     let mut file_object = wdk_sys::FILE_OBJECT::default();
     let mut stack = wdk_sys::IO_STACK_LOCATION {
+        MajorFunction: u8::try_from(wdk_sys::IRP_MJ_SET_INFORMATION).unwrap_or(u8::MAX),
         FileObject: core::ptr::addr_of_mut!(file_object),
         ..wdk_sys::IO_STACK_LOCATION::default()
     };
@@ -354,7 +355,7 @@ fn rename_replace_flag_decode_boundary_selects_replace_collision() {
         let parsed = target.with_active(|active| {
             let stack = active.current_stack()?.set_file()?;
             super::NamespaceTargetPath::decode(
-                active.buffered_input(stack.length())?.as_slice(),
+                active.buffered_input(stack.length())?,
                 ext4_core::DirectoryNodeId::ROOT,
                 None,
             )

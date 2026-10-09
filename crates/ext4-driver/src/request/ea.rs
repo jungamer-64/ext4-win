@@ -162,7 +162,7 @@ impl CreateEa {
         }
         let input = target.buffered_input(length)?;
         Ok(Self {
-            entries: parse_full_ea_list(input.as_slice())?,
+            entries: parse_full_ea_list(input)?,
         })
     }
 

@@ -146,7 +146,7 @@ pub(crate) fn oplock_control(target: &mut ActiveIrp<'_>) -> DriverResult<OplockC
             control.fs_control_code().oplock_action(&[])?
         } else {
             let input = target.buffered_input(control.input_buffer_length())?;
-            control.fs_control_code().oplock_action(input.as_slice())?
+            control.fs_control_code().oplock_action(input)?
         }
     } else {
         control.fs_control_code().oplock_action(&[])?

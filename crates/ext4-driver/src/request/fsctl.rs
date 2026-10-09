@@ -170,8 +170,8 @@ pub(crate) fn remove_encryption_key(
         let _volume = mounted_vcb(active)?;
         let _removed = mutation.remove_fscrypt_key(payload.identifier())?;
 
-        let mut output = output_buffer(active, stack, FSCRYPT_REMOVE_KEY_BYTES)?;
-        write_remove_key_output(output.as_mut_slice())?;
+        let output = output_buffer(active, stack, FSCRYPT_REMOVE_KEY_BYTES)?;
+        write_remove_key_output(output)?;
         completion_for_length(FSCRYPT_REMOVE_KEY_BYTES)
     })
 }
@@ -196,8 +196,8 @@ pub(crate) fn get_encryption_key_status(
         }
         let presence = operations.fscrypt_key_presence(payload.identifier());
 
-        let mut output = output_buffer(active, stack, FSCRYPT_GET_KEY_STATUS_BYTES)?;
-        write_key_status_output(output.as_mut_slice(), presence)?;
+        let output = output_buffer(active, stack, FSCRYPT_GET_KEY_STATUS_BYTES)?;
+        write_key_status_output(output, presence)?;
         completion_for_length(FSCRYPT_GET_KEY_STATUS_BYTES)
     })
 }
@@ -493,7 +493,7 @@ fn read_input(
 ) -> DriverResult<DriverVec<u8>> {
     let length = stack.input_buffer_length();
     let input = active.buffered_input(length)?;
-    DriverVec::try_copied_from_slice(input.as_slice())
+    DriverVec::try_copied_from_slice(input)
 }
 
 /// Returns a mounted VCB from a path-scoped FSCTL stack.
@@ -513,7 +513,7 @@ fn output_buffer<'active>(
     active: &'active mut ActiveIrp<'_>,
     stack: FileSystemControlStack,
     len: usize,
-) -> DriverResult<crate::irp::BufferedOutput<'active>> {
+) -> DriverResult<&'active mut [u8]> {
     let output_len = stack.output_buffer_length();
     if output_len.as_usize() < len {
         return Err(DriverError::BufferTooSmall);

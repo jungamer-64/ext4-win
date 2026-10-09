@@ -175,10 +175,7 @@ pub(super) fn query_file_information(
             completion,
         } => {
             request.with_active(|active| {
-                memory::copy_exact(
-                    active.buffered_output(length)?.as_mut_slice(),
-                    output.as_slice(),
-                )?;
+                memory::copy_exact(active.buffered_output(length)?, output.as_slice())?;
                 Ok::<_, DriverError>(())
             })?;
             return Ok(completion);
@@ -193,8 +190,8 @@ pub(super) fn query_file_information(
         } => {
             let name = volume_relative_name(read, node, &location)?;
             return request.with_active(|active| {
-                let mut buffer = active.buffered_output(length)?;
-                pack_name_information(buffer.as_mut_slice(), name.as_slice())?.completion()
+                let buffer = active.buffered_output(length)?;
+                pack_name_information(buffer, name.as_slice())?.completion()
             });
         }
         QueryFilePlan::All {
@@ -230,34 +227,27 @@ pub(super) fn query_file_information(
     if information_class == QueryFileInformationClass::Ea {
         let size = crate::request::ea::information_size(read, node)?;
         return request.with_active(|active| {
-            let mut buffer = active.buffered_output(length)?;
-            pack_ea_information(buffer.as_mut_slice(), size)
+            let buffer = active.buffered_output(length)?;
+            pack_ea_information(buffer, size)
         });
     }
     let metadata = metadata_from_node(read, node)?;
     request.with_active(|active| {
-        let mut buffer = active.buffered_output(length)?;
+        let buffer = active.buffered_output(length)?;
         match information_class {
-            QueryFileInformationClass::Basic => {
-                pack_basic_information(buffer.as_mut_slice(), metadata)
+            QueryFileInformationClass::Basic => pack_basic_information(buffer, metadata),
+            QueryFileInformationClass::Standard => {
+                pack_standard_information(buffer, metadata, delete_pending, stream_sizes)
             }
-            QueryFileInformationClass::Standard => pack_standard_information(
-                buffer.as_mut_slice(),
-                metadata,
-                delete_pending,
-                stream_sizes,
-            ),
             QueryFileInformationClass::StandardLink => {
-                pack_standard_link_information(buffer.as_mut_slice(), metadata, delete_pending)
+                pack_standard_link_information(buffer, metadata, delete_pending)
             }
-            QueryFileInformationClass::Internal => {
-                pack_internal_information(buffer.as_mut_slice(), metadata)
-            }
+            QueryFileInformationClass::Internal => pack_internal_information(buffer, metadata),
             QueryFileInformationClass::NetworkOpen => {
-                pack_network_open_information(buffer.as_mut_slice(), metadata, stream_sizes)
+                pack_network_open_information(buffer, metadata, stream_sizes)
             }
             QueryFileInformationClass::AttributeTag => {
-                pack_attribute_tag_information(buffer.as_mut_slice(), metadata)
+                pack_attribute_tag_information(buffer, metadata)
             }
             QueryFileInformationClass::Position
             | QueryFileInformationClass::All
@@ -296,9 +286,8 @@ fn query_hard_link_information(
     let mut packed = DriverVec::try_repeated_copy(0_u8, length.as_usize())?;
     let result = pack_hard_link_information(packed.as_mut_slice(), &links)?;
     request.with_active(|active| {
-        let mut output = active.buffered_output(length)?;
+        let output = active.buffered_output(length)?;
         let destination = output
-            .as_mut_slice()
             .get_mut(..result.information())
             .ok_or(DriverError::InternalInvariantViolation)?;
         let source = packed
