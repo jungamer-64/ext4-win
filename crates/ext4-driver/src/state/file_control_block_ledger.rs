@@ -872,42 +872,6 @@ impl FileObjectCacheLease {
         self.stream
     }
 
-    /// Reads cached bytes into the pre-captured system mapping.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager or representation failure.
-    pub(crate) fn read(
-        &self,
-        offset: i64,
-        length: usize,
-        output: Option<NonNull<u8>>,
-    ) -> DriverResult<usize> {
-        self.stream.stream().stream_context.cached_read(
-            self.file_object.as_non_null(),
-            offset,
-            length,
-            output,
-        )
-    }
-
-    /// Accepts a within-EOF write from the pre-captured system mapping.
-    /// # Errors
-    ///
-    /// Returns the exact Cache Manager or representation failure.
-    pub(crate) fn write(
-        &self,
-        offset: i64,
-        input: Option<NonNull<u8>>,
-        length: usize,
-    ) -> DriverResult<()> {
-        self.stream.stream().stream_context.cached_write(
-            self.file_object.as_non_null(),
-            offset,
-            input,
-            length,
-        )
-    }
-
     /// Releases this FILE_OBJECT's private cache map.
     /// # Errors
     ///

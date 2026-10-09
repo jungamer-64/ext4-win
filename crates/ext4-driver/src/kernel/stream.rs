@@ -1130,10 +1130,14 @@ impl StreamContext {
     }
 
     /// Copies cached bytes into one system-addressable IRP buffer.
+    /// # Safety
+    /// The caller must retain this stream, the matching FILE_OBJECT and the IRP through return.
+    /// For a nonempty transfer, output must cover `length` writable bytes without aliasing any
+    /// Rust reference. The IRP cannot complete or expose competing driver access during this call.
     /// # Errors
     ///
     /// Returns the exact Cache Manager status or an input representation failure.
-    pub(crate) fn cached_read(
+    pub(crate) unsafe fn cached_read(
         &self,
         _file_object: NonNull<wdk_sys::FILE_OBJECT>,
         _offset: i64,
@@ -1169,10 +1173,14 @@ impl StreamContext {
     /// Accepts one within-EOF write into the FILE_OBJECT cache map.
     /// Passive work retains all identities while Cc admission waits outside filesystem resources.
     /// It joins deferred callbacks before returning; storage and EOF are revalidated before copy.
+    /// # Safety
+    /// The caller must retain this stream, the matching FILE_OBJECT and the IRP through return.
+    /// For a nonempty transfer, input must cover `length` readable bytes in a system mapping.
+    /// The IRP cannot complete or expose competing driver access during this call.
     /// # Errors
     ///
     /// Returns the exact Cache Manager status or an input representation failure.
-    pub(crate) fn cached_write(
+    pub(crate) unsafe fn cached_write(
         &self,
         _file_object: NonNull<wdk_sys::FILE_OBJECT>,
         _offset: i64,

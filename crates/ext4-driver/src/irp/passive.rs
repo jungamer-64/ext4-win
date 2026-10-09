@@ -183,36 +183,6 @@ impl PassiveWork {
             action,
         }
     }
-    /// Builds one cached read after range, mapping, and stream lease capture.
-    pub(crate) const fn read(
-        file_object: FileObjectCacheLease,
-        offset: i64,
-        length: usize,
-        output: Option<NonNull<u8>>,
-    ) -> Self {
-        Self::Read {
-            file_object,
-            offset,
-            length,
-            output,
-        }
-    }
-
-    /// Builds one within-EOF cached write after range, mapping, and stream lease capture.
-    pub(crate) const fn write(
-        file_object: FileObjectCacheLease,
-        offset: i64,
-        input: Option<NonNull<u8>>,
-        length: usize,
-    ) -> Self {
-        Self::Write {
-            file_object,
-            offset,
-            input,
-            length,
-        }
-    }
-
     /// Builds one stream flush.
     pub(crate) const fn flush(stream: StreamCacheLease) -> Self {
         Self::Flush { stream }
