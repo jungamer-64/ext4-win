@@ -10,10 +10,11 @@ pub(crate) struct VolumeSerialNumber {
 }
 
 impl VolumeSerialNumber {
-    /// Builds a serial number from little-endian UUID bytes.
-    pub(crate) const fn from_le_bytes(bytes: [u8; 4]) -> Self {
+    /// Derives the Windows serial from the first four bytes of the filesystem UUID.
+    pub(crate) const fn from_uuid(uuid: ext4_core::FilesystemUuid) -> Self {
+        let [a, b, c, d, ..] = uuid.bytes();
         Self {
-            value: u32::from_le_bytes(bytes),
+            value: u32::from_le_bytes([a, b, c, d]),
         }
     }
 
@@ -93,8 +94,7 @@ impl MountedVolumeDevice {
             u16::try_from(sector_size.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
         let trace = vcb.trace;
         let identity = vcb.runtime.identity();
-        let [a, b, c, d, ..] = identity.uuid().bytes();
-        let serial_number = VolumeSerialNumber::from_le_bytes([a, b, c, d]).as_u32();
+        let serial_number = VolumeSerialNumber::from_uuid(identity.uuid()).as_u32();
         let volume_label = VpbLabel::encode(identity.label())?;
         let extension_slot = unsafe {
             // SAFETY: The mount exclusively owns this newly created, unpublished device.

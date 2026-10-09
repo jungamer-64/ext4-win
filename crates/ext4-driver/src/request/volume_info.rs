@@ -1,7 +1,7 @@
 //! Volume information query and mutation boundary.
 
 use alloc::boxed::Box;
-use ext4_core::{Ext4VolumeLabel, OperationEvent, VolumeGeometry, VolumeIdentity};
+use ext4_core::{Ext4VolumeLabel, OperationEvent, VolumeGeometry};
 use wdk_sys::{
     FILE_CASE_PRESERVED_NAMES, FILE_CASE_SENSITIVE_SEARCH, FILE_FS_ATTRIBUTE_INFORMATION,
     FILE_FS_DEVICE_INFORMATION, FILE_FS_FULL_SIZE_INFORMATION, FILE_FS_LABEL_INFORMATION,
@@ -209,7 +209,11 @@ fn prepare_query(
             let identity = operations.volume_identity();
             let geometry = operations.volume_geometry();
             match stack.information_class() {
-                QueryVolumeInformationClass::Volume => pack_volume_information(identity, output),
+                QueryVolumeInformationClass::Volume => pack_volume_information(
+                    VolumeSerialNumber::from_uuid(identity.uuid()),
+                    identity.label(),
+                    output,
+                ),
                 QueryVolumeInformationClass::Size => {
                     pack_size_information(geometry, sector, output)
                 }
@@ -324,12 +328,10 @@ fn volume_label_from_file_fs_label(input: &[u8]) -> DriverResult<Ext4VolumeLabel
 ///
 /// Returns an error when the UTF-16 label byte count overflows or the output buffer is too small.
 fn pack_volume_information(
-    identity: VolumeIdentity,
+    serial_number: VolumeSerialNumber,
+    label: Ext4VolumeLabel,
     output: &mut [u8],
 ) -> DriverResult<IrpCompletion> {
-    let label = identity.label();
-    let [a, b, c, d, ..] = identity.uuid().bytes();
-    let serial_number = VolumeSerialNumber::from_le_bytes([a, b, c, d]);
     let label_bytes = label.bytes();
     let header = core::mem::offset_of!(FILE_FS_VOLUME_INFORMATION, VolumeLabel);
     let label_len = label_bytes
@@ -650,7 +652,61 @@ mod tests {
     use super::{
         pack_attribute_information, pack_device_information, volume_label_from_file_fs_label,
     };
-    use ext4_core::Ext4VolumeLabel;
+    use ext4_core::{Ext4VolumeLabel, FilesystemUuid};
+
+    /// # Errors
+    /// Returns malformed fixture labels or bounded serialization failures.
+    /// # Panics
+    /// Panics if partial volume-label output loses its header, byte count or full required length.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture construction propagates; assertions check the Windows record contract"
+    )]
+    fn volume_information_returns_fixed_fields_and_label_prefixes() -> Result<(), DriverError> {
+        let label = Ext4VolumeLabel::new(b"EXT4LAB")?;
+        let serial = crate::state::VolumeSerialNumber::from_uuid(FilesystemUuid::from_bytes([
+            0x78, 0x56, 0x34, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ]));
+        let mut complete = [0xA5; 40];
+        assert_eq!(
+            super::pack_volume_information(serial, label, &mut complete)?,
+            IrpCompletion::from_usize(32)?
+        );
+        let fields = LittleEndianInput::new(&complete);
+        assert_eq!(fields.read_u32(WireOffset::new(8))?, 0x12345678);
+        assert_eq!(fields.read_u32(WireOffset::new(12))?, 14);
+        assert_eq!(
+            complete.get(18..32),
+            Some(
+                [
+                    b'E', 0, b'X', 0, b'T', 0, b'4', 0, b'L', 0, b'A', 0, b'B', 0
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(complete.get(32..), Some([0xA5; 8].as_slice()));
+        for length in [24, 25, 31, 32] {
+            let mut output = vec![0xA5; length];
+            let expected = if length < 32 {
+                IrpCompletion::buffer_overflow(length)?
+            } else {
+                IrpCompletion::from_usize(32)?
+            };
+            assert_eq!(
+                super::pack_volume_information(serial, label, &mut output)?,
+                expected
+            );
+            assert_eq!(complete.get(..length), Some(output.as_slice()));
+        }
+        let mut missing_header = [0xA5; 23];
+        assert_eq!(
+            super::pack_volume_information(serial, label, &mut missing_header),
+            Err(DriverError::InfoLengthMismatch)
+        );
+        assert_eq!(missing_header, [0xA5; 23]);
+        Ok(())
+    }
 
     /// # Errors
     /// Returns invalid fixture geometry or bounded output errors.
