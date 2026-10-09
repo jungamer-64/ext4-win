@@ -668,9 +668,11 @@ pub(crate) fn admit_owned(
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum HandleRequestClass {
         Device,
+        /// Cc retains the stream; its notification must not wait behind a Cc-calling handle request.
+        CacheNotification,
         Ordinary,
         Paging,
-        FlushBuffers,
+        PostCleanup(PostCleanupRequest),
         Cleanup,
         Close,
     }
@@ -728,7 +730,18 @@ pub(crate) fn admit_owned(
             Admission::Mutation(MutationRequestKind::Write)
         }
         ActorRequest::Captured(PreparedRequest::SetInformation) => {
-            Admission::Mutation(MutationRequestKind::SetInformation)
+            let admission = owned.request().with_active(|active| {
+                Ok(match active.current_stack()?.set_file()?.operation() {
+                    crate::irp::SetFileOperation::AdvanceValidDataLength => {
+                        Admission::Immediate(ImmediateRequestKind::AdvanceValidDataLength)
+                    }
+                    _ => Admission::Mutation(MutationRequestKind::SetInformation),
+                })
+            });
+            match admission {
+                Ok(admission) => admission,
+                Err(error) => return Err(AdmitOperationError::new(error, owned)),
+            }
         }
         ActorRequest::Captured(PreparedRequest::SetEa) => {
             Admission::Mutation(MutationRequestKind::SetEa)
@@ -869,7 +882,10 @@ pub(crate) fn admit_owned(
         }
         Admission::Cleanup => HandleRequestClass::Cleanup,
         Admission::Mutation(_) => HandleRequestClass::Ordinary,
-        Admission::Flush => HandleRequestClass::FlushBuffers,
+        Admission::Flush => HandleRequestClass::PostCleanup(PostCleanupRequest::FlushBuffers),
+        Admission::Immediate(ImmediateRequestKind::AdvanceValidDataLength) => {
+            HandleRequestClass::CacheNotification
+        }
         Admission::VolumeClose(super::operation::VolumeCloseRequest::Shutdown) => {
             HandleRequestClass::Device
         }
@@ -887,7 +903,9 @@ pub(crate) fn admit_owned(
 
     let (operation_admission, lifecycle_publication) = if matches!(
         handle_class,
-        HandleRequestClass::Device | HandleRequestClass::Paging
+        HandleRequestClass::Device
+            | HandleRequestClass::Paging
+            | HandleRequestClass::CacheNotification
     ) {
         (OperationAdmission::Device, LifecyclePublication::None)
     } else {
@@ -921,9 +939,8 @@ pub(crate) fn admit_owned(
                             LifecyclePublication::None,
                         )
                     }
-                    HandleRequestClass::FlushBuffers => {
-                        let lane = match post_cleanup_lane(state, PostCleanupRequest::FlushBuffers)
-                        {
+                    HandleRequestClass::PostCleanup(request) => {
+                        let lane = match post_cleanup_lane(state, request) {
                             Ok(lane) => lane,
                             Err(error) => return Err(AdmitOperationError::new(error, owned)),
                         };
@@ -955,7 +972,9 @@ pub(crate) fn admit_owned(
                         },
                         LifecyclePublication::Close(prepared),
                     ),
-                    HandleRequestClass::Device | HandleRequestClass::Paging => {
+                    HandleRequestClass::Device
+                    | HandleRequestClass::Paging
+                    | HandleRequestClass::CacheNotification => {
                         (OperationAdmission::Device, LifecyclePublication::None)
                     }
                 }

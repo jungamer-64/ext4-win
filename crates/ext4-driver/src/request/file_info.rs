@@ -43,6 +43,7 @@ use query::{
     FileMetadata, FileMetadataKind, FileMetadataReparsePoint, metadata_from_node,
     query_file_information, reparse_tag, windows_time,
 };
+pub(crate) use set::advance_valid_data_length;
 use set::{UTF16_BACKSLASH, regular_file_size, set_file_information};
 
 mod data;

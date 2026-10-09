@@ -3,6 +3,23 @@ use crate::request::file_info::test_support::*;
 use alloc::vec;
 
 /// # Panics
+/// Panics if a VDL notification attempts a resize or accepts initialization beyond EOF.
+#[test]
+fn valid_data_notifications_acknowledge_initialized_ranges_without_resize() {
+    let eof = FileSize::from_bytes(8192);
+    for end in [0, 4096, 8192] {
+        assert_eq!(
+            super::valid_data_notification(FileSize::from_bytes(end), eof),
+            Ok(IrpCompletion::EMPTY)
+        );
+    }
+    assert_eq!(
+        super::valid_data_notification(FileSize::from_bytes(8193), eof),
+        Err(DriverError::InvalidParameter)
+    );
+}
+
+/// # Panics
 ///
 /// Panics when fixed set-information records accept truncated or incorrectly packed fields.
 #[test]

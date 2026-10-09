@@ -255,15 +255,7 @@ pub(super) fn set_file_information(
                 }
             }
             SetFileOperation::AdvanceValidDataLength => {
-                let end =
-                    file_size_from_large_integer(read_end_of_file_input(active, stack.length())?)?;
-                let regular_file = OpenedRegularFile::decode(file_object)?;
-                // Sparse holes are initialized zeroes: committed VDL always equals logical EOF.
-                // This notification cannot shrink either value or extend the logical file.
-                if end > regular_file_size(mutation, regular_file.id())? {
-                    return Err(DriverError::InvalidParameter);
-                }
-                SetFilePlan::Complete
+                return Err(DriverError::InvalidDeviceRequest);
             }
             SetFileOperation::Allocation => {
                 let allocation_size = read_allocation_size_input(active, stack.length())?;
@@ -1810,6 +1802,9 @@ fn namespace_target_parent(
     match parent {
         NamespaceParent::SourceDirectory => Ok(None),
         NamespaceParent::TargetDirectory(file_object) => {
+            if !file_object.address().shares_volume(source.file_object()) {
+                return Err(DriverError::NotSameDevice);
+            }
             let target = OpenedDirectory::decode(file_object)?;
             if target.volume() != source.volume() {
                 return Err(DriverError::NotSameDevice);
@@ -1817,6 +1812,40 @@ fn namespace_target_parent(
             Ok(Some(target.id()))
         }
     }
+}
+
+/// Consumes a Cache Manager VDL notification without mutating the logical file or journal.
+/// Sparse holes are initialized zeroes, so committed VDL equals EOF. This notification remains
+/// legal after CLEANUP and enters no handle lane or main resource that its Cc caller could hold.
+/// # Errors
+/// Rejects a malformed notification, a non-file target, or an announced bound beyond EOF.
+pub(crate) fn advance_valid_data_length(
+    mut request: PendingIrpLease<'_>,
+) -> DriverResult<IrpCompletion> {
+    request.with_active(|active| {
+        let current = active.current_stack()?;
+        let stack = current.set_file()?;
+        if stack.operation() != SetFileOperation::AdvanceValidDataLength {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        let opened = OpenedRegularFile::decode(current.file_object()?)?;
+        let announced =
+            file_size_from_large_integer(read_end_of_file_input(active, stack.length())?)?;
+        let sizes = opened.file_control_block().stream_sizes()?;
+        let eof = u64::try_from(sizes.file_size())
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        valid_data_notification(announced, FileSize::from_bytes(eof))
+    })
+}
+
+/// A fully initialized stream accepts only VDL notifications within its committed EOF.
+/// # Errors
+/// Rejects an announcement that would claim initialization beyond the logical file.
+fn valid_data_notification(announced: FileSize, eof: FileSize) -> DriverResult<IrpCompletion> {
+    if announced > eof {
+        return Err(DriverError::InvalidParameter);
+    }
+    Ok(IrpCompletion::EMPTY)
 }
 
 impl NamespaceTargetPath {

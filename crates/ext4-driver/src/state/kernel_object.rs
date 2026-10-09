@@ -365,6 +365,23 @@ impl KernelFileObject {
         self.file_object
     }
 
+    /// Requires one non-null I/O Manager VPB before another FILE_OBJECT's driver contexts are read.
+    #[expect(
+        unsafe_code,
+        reason = "retained file objects expose their initialized OS-owned volume associations"
+    )]
+    pub(crate) fn shares_volume(self, other: Self) -> bool {
+        let source = unsafe {
+            // SAFETY: The owning IRP retains this FILE_OBJECT and its initialized VPB field.
+            (*self.as_ptr()).Vpb
+        };
+        let destination = unsafe {
+            // SAFETY: The same set-information IRP retains the target parent FILE_OBJECT.
+            (*other.as_ptr()).Vpb
+        };
+        !source.is_null() && source == destination
+    }
+
     /// Publishes the prepared filesystem contexts through the unique successful-create boundary.
     /// # Safety
     /// The caller must own the sole attachment transition of this live FILE_OBJECT. The prepared

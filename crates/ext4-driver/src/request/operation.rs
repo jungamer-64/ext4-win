@@ -1578,6 +1578,8 @@ unsafe impl Send for RawVolumeOperation {}
 /// Synchronous request kinds that require no lower-storage state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
+    /// Cc notification of already initialized data, including after handle cleanup.
+    AdvanceValidDataLength,
     /// Mounted ext4 UUID independent of a Windows volume path.
     QueryVolumeIdentity,
     /// Fscrypt key-status query from the committed epoch snapshot.
@@ -1638,6 +1640,9 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
         };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
+                ImmediateRequestKind::AdvanceValidDataLength => {
+                    crate::request::file_info::advance_valid_data_length(owned.request())
+                }
                 ImmediateRequestKind::QueryVolumeIdentity => {
                     owned.request().with_active(|active| {
                         let stack = active.current_stack()?.file_system_control()?;

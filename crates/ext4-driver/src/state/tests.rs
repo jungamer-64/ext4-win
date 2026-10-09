@@ -31,6 +31,52 @@ use super::{
 };
 
 /// # Errors
+/// Returns a null fixture identity before any context decoding.
+/// # Panics
+/// Panics if an unmounted or different-volume FILE_OBJECT gains namespace-target admission.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "stack-owned file objects and VPBs remain live through each scalar observation"
+)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture construction propagates; assertions check native volume identity"
+)]
+fn namespace_file_objects_require_the_same_mounted_vpb() -> Result<(), DriverError> {
+    let mut first_vpb = wdk_sys::VPB::default();
+    let mut second_vpb = wdk_sys::VPB::default();
+    let first = core::ptr::from_mut(&mut first_vpb);
+    let second = core::ptr::from_mut(&mut second_vpb);
+    for (source_vpb, target_vpb, expected) in [
+        (core::ptr::null_mut(), core::ptr::null_mut(), false),
+        (first, second, false),
+        (first, first, true),
+    ] {
+        let mut source = wdk_sys::FILE_OBJECT {
+            Vpb: source_vpb,
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        let mut target = wdk_sys::FILE_OBJECT {
+            Vpb: target_vpb,
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        let source_identity = unsafe {
+            // SAFETY: The stack allocation outlives every use of this opaque file identity.
+            KernelFileObject::from_raw(core::ptr::from_mut(&mut source))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        let target_identity = unsafe {
+            // SAFETY: The target allocation is equally retained and initialized.
+            KernelFileObject::from_raw(core::ptr::from_mut(&mut target))
+        }
+        .ok_or(DriverError::InvalidParameter)?;
+        assert_eq!(source_identity.shares_volume(target_identity), expected);
+    }
+    Ok(())
+}
+
+/// # Errors
 ///
 /// Returns fixture-construction failure rather than pretending retirement was exercised.
 /// # Panics
