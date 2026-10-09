@@ -1167,6 +1167,8 @@ impl StreamContext {
     }
 
     /// Accepts one within-EOF write into the FILE_OBJECT cache map.
+    /// Passive work retains all identities while Cc admission waits outside filesystem resources.
+    /// It joins deferred callbacks before returning; storage and EOF are revalidated before copy.
     /// # Errors
     ///
     /// Returns the exact Cache Manager status or an input representation failure.

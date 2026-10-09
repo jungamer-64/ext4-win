@@ -160,6 +160,11 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
 fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
         (
+            "cache-write-admission",
+            "cache_write_admission.tests.c",
+            "native Cache Manager write admission and callback lifetime contract",
+        ),
+        (
             "backup-restore",
             "backup_restore.tests.c",
             "native backup and restore privilege contract",

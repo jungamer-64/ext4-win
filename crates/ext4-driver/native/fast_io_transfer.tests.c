@@ -31,6 +31,7 @@ enum acquisition_change {
     CONFLICTING_LOCK,
     OPLOCK_GRANTED,
     ADMISSION_CLOSED,
+    WRITE_THROTTLED,
     STREAM_REPLACED
 };
 
@@ -42,6 +43,17 @@ static IO_STATUS_BLOCK status;
 static enum acquisition_change change;
 static unsigned acquisitions, releases, checks;
 static BOOLEAN expected_read;
+static BOOLEAN write_admitted;
+static unsigned write_checks;
+
+static BOOLEAN CcCanIWrite(PFILE_OBJECT observed_file, ULONG length, BOOLEAN wait, BOOLEAN retrying)
+{
+    assert(observed_file == &file && length == 32 && !wait);
+    assert(retrying == (write_checks != 0));
+    assert(stream.MainResource.held == (retrying ? 1U : 0U));
+    write_checks++;
+    return write_admitted;
+}
 
 static BOOLEAN ext4win_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait)
 {
@@ -54,6 +66,7 @@ static BOOLEAN ext4win_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait
         case CONFLICTING_LOCK: stream.unlocked = FALSE; break;
         case OPLOCK_GRANTED: stream.oplock_possible = FALSE; break;
         case ADMISSION_CLOSED: stream.eligible = FALSE; break;
+        case WRITE_THROTTLED: write_admitted = FALSE; break;
         case STREAM_REPLACED: file.stream = &replacement; break;
         case UNCHANGED: break;
     }
@@ -104,6 +117,8 @@ static void reset(void)
     file.stream = &stream;
     offset.QuadPart = 64;
     acquisitions = releases = checks = 0;
+    write_admitted = TRUE;
+    write_checks = 0;
 }
 
 int main(void)
@@ -120,7 +135,7 @@ int main(void)
             admitted = ext4win_stream_acquire_fast_io_main(&file, candidate, &offset,
                 32, TRUE, 0x1234, expected_read, &status, &device);
             assert(acquisitions == 1);
-            if (scenario == UNCHANGED) {
+            if (scenario == UNCHANGED || (scenario == WRITE_THROTTLED && expected_read)) {
                 assert(admitted && stream.MainResource.held == 1 && releases == 0);
                 /* Cc sees the same retained scope as the admission decision. */
                 assert(checks == 1);
@@ -137,5 +152,11 @@ int main(void)
             32, FALSE, 0x1234, expected_read, &status, &device));
         assert(acquisitions == 0 && releases == 0 && checks == 0);
     }
+    reset();
+    expected_read = FALSE;
+    write_admitted = FALSE;
+    assert(!ext4win_stream_acquire_fast_io_main(&file, &stream, &offset,
+        32, TRUE, 0x1234, FALSE, &status, &device));
+    assert(write_checks == 1 && acquisitions == 0 && releases == 0 && checks == 0);
     return 0;
 }

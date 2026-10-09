@@ -11,6 +11,7 @@
          : EXCEPTION_CONTINUE_SEARCH)
 #include "cache_mdl.h"
 #include "cache_close.h"
+#include "cache_write_admission.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
@@ -1071,7 +1072,7 @@ ext4win_stream_cache_read(
     return status;
 }
 
-_IRQL_requires_max_(APC_LEVEL)
+_IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
@@ -1086,6 +1087,7 @@ ext4win_stream_cache_write(
     LARGE_INTEGER file_offset;
     LONGLONG current_file_size;
     NTSTATUS status;
+    EXT4WIN_CACHE_WRITE_ADMISSION admission = EXT4WIN_CACHE_WRITE_FIRST;
 
     if (!ext4win_stream_matches_file_object(stream, file_object) ||
         (offset < 0) || ((length != 0) && (buffer == NULL))) {
@@ -1098,11 +1100,17 @@ ext4win_stream_cache_write(
         return status;
     }
 
+retry_admission:
+    ext4win_cache_wait_for_write(file_object, length, &admission);
     file_offset.QuadPart = offset;
     (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
     if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
         return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
+    }
+    if (!ext4win_cache_try_write(file_object, length, FALSE, &admission)) {
+        ext4win_release_resource(&stream->MainResource);
+        goto retry_admission;
     }
     ExAcquireFastMutex(&stream->HeaderMutex);
     current_file_size = stream->Header.FileSize.QuadPart;
@@ -1144,6 +1152,7 @@ ext4win_stream_cache_mdl(
     ULONG length;
     LONGLONG eof;
     NTSTATUS status;
+    EXT4WIN_CACHE_WRITE_ADMISSION admission = EXT4WIN_CACHE_WRITE_FIRST;
 
     if (!ext4win_stream_matches_file_object(stream, file_object) ||
         (irp == NULL) || (information_out == NULL) || ((action != 0) && (action != 2))) {
@@ -1160,12 +1169,18 @@ ext4win_stream_cache_mdl(
     if (!NT_SUCCESS(status) || (length == 0)) {
         return status;
     }
+retry_admission:
+    if (action == 2) { ext4win_cache_wait_for_write(file_object, length, &admission); }
     status = ext4win_prepare_mdl_completion(stream->RustState, file_object);
     if (!NT_SUCCESS(status)) { return status; }
     (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
     if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
         return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
+    }
+    if ((action == 2) && !ext4win_cache_try_write(file_object, length, FALSE, &admission)) {
+        ext4win_release_resource(&stream->MainResource);
+        goto retry_admission;
     }
     ExAcquireFastMutex(&stream->HeaderMutex);
     eof = stream->Header.FileSize.QuadPart;

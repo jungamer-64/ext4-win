@@ -21,9 +21,13 @@ ext4win_stream_acquire_fast_io_main(
     PEXT4WIN_STREAM_CONTEXT observed;
 
     if (!wait) { return FALSE; }
+    /* A throttled write falls back before acquiring MainResource. The queued
+     * passive IRP owns deferred admission and its callback lifetime. */
+    if (!read && !CcCanIWrite(file, length, FALSE, FALSE)) { return FALSE; }
     ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
     if (!ext4win_stream_fast_io_candidate(file, &observed) || (observed != stream) ||
-        !ext4win_fast_io_check_if_possible(file, offset, length, wait, key, read, status, device)) {
+        !ext4win_fast_io_check_if_possible(file, offset, length, wait, key, read, status, device) ||
+        (!read && !CcCanIWrite(file, length, FALSE, TRUE))) {
         ext4win_release_resource(&stream->MainResource);
         return FALSE;
     }
