@@ -6,9 +6,9 @@
  * to release dirty-page pressure. The non-alertable KernelMode wait keeps this
  * kernel stack resident until the sole Cc callback has signaled its event. */
 static VOID
-ext4win_cache_write_ready(PVOID context, PVOID unused)
+ext4win_cache_write_ready(PVOID context, PVOID file)
 {
-    UNREFERENCED_PARAMETER(unused);
+    UNREFERENCED_PARAMETER(file);
     (VOID)KeSetEvent((PKEVENT)context, IO_NO_INCREMENT, FALSE);
 }
 
@@ -36,7 +36,8 @@ ext4win_cache_wait_for_write(PFILE_OBJECT file, ULONG length, EXT4WIN_CACHE_WRIT
     while (!ext4win_cache_try_write(file, length, TRUE, admission)) {
         KEVENT ready;
         KeInitializeEvent(&ready, NotificationEvent, FALSE);
-        CcDeferWrite(file, ext4win_cache_write_ready, &ready, NULL, length,
+        /* Both Cc callback contexts must be non-null; the wait retains the file. */
+        CcDeferWrite(file, ext4win_cache_write_ready, &ready, file, length,
             *admission == EXT4WIN_CACHE_WRITE_DEFERRED);
         *admission = EXT4WIN_CACHE_WRITE_DEFERRED;
         /* An indefinite, non-alertable kernel event wait has only a successful

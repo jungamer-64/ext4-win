@@ -26,6 +26,7 @@ static BOOLEAN immediate;
 static BOOLEAN expected_wait = TRUE;
 static PCC_POST_DEFERRED_WRITE pending;
 static PVOID pending_context;
+static PVOID pending_file;
 
 static BOOLEAN CcCanIWrite(PFILE_OBJECT object, ULONG length, BOOLEAN wait, BOOLEAN retrying) {
     assert(object == &file && length == 4096 && wait == expected_wait);
@@ -44,13 +45,15 @@ static int KeSetEvent(PKEVENT event, int priority, BOOLEAN wait) {
 static VOID deliver(void) {
     PCC_POST_DEFERRED_WRITE callback = pending;
     PVOID context = pending_context;
-    pending = NULL; pending_context = NULL;
-    callback(context, NULL);
+    PVOID object = pending_file;
+    assert(context != NULL && object == &file);
+    pending = NULL; pending_context = NULL; pending_file = NULL;
+    callback(context, object);
 }
-static VOID CcDeferWrite(PFILE_OBJECT object, PCC_POST_DEFERRED_WRITE callback, PVOID context, PVOID unused, ULONG length, BOOLEAN retrying) {
-    assert(object == &file && length == 4096 && unused == NULL && pending == NULL);
+static VOID CcDeferWrite(PFILE_OBJECT object, PCC_POST_DEFERRED_WRITE callback, PVOID context, PVOID second_context, ULONG length, BOOLEAN retrying) {
+    assert(object == &file && length == 4096 && context != NULL && second_context == object && pending == NULL);
     assert(retrying == (deferred != 0));
-    deferred++; pending = callback; pending_context = context;
+    deferred++; pending = callback; pending_context = context; pending_file = second_context;
     if (immediate) { deliver(); }
 }
 static int KeWaitForSingleObject(PKEVENT event, int reason, int mode, BOOLEAN alertable, PVOID timeout) {
