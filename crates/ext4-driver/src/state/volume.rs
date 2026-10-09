@@ -13,10 +13,6 @@ pub(crate) struct VolumeControlBlock {
     /// Synchronized VCB-owned FCB identities and Windows share ledger. This field drops before
     /// the mounted volume because every FCB retains that volume as its data-plane owner.
     pub(super) file_control_blocks: FileControlBlockLedger,
-    /// Actor-owned volume lifecycle and direct-open share accounting.
-    pub(super) volume_control: VolumeControlPlane,
-    /// Mounted profile, committed epochs, and mutation coordination.
-    pub(super) runtime: VolumeRuntime,
     /// Header-based stream identity used by every direct volume FILE_OBJECT.
     pub(super) stream_context: StreamContext,
     /// Prevents the native direct-volume owner address from being invalidated by a safe move.
@@ -524,36 +520,25 @@ impl MountedVolumeRef {
 /// Non-cloneable mounted-volume authority owned only by the WDK reactor shell.
 #[derive(Debug)]
 pub(crate) struct MountedVolumeBinding {
-    /// Heap-stable VCB whose unique actor access is projected by [`Self::with_access`].
+    /// Shared heap-stable stream, notification and FCB ownership; destroyed before runtime storage.
     volume: Pin<Box<VolumeControlBlock>>,
+    /// Actor-owned volume lifecycle and direct-open share accounting.
+    pub(super) volume_control: VolumeControlPlane,
+    /// Actor-owned epochs, mutation coordination and retained lower storage.
+    pub(super) runtime: VolumeRuntime,
 }
 
 impl MountedVolumeBinding {
-    /// Takes sole reactor ownership of a completed mounted VCB.
-    pub(crate) const fn new(volume: Pin<Box<VolumeControlBlock>>) -> Self {
-        Self { volume }
-    }
-
     /// Runs one non-suspending reactor transition with lifetime-bound mounted access.
-    #[expect(
-        unsafe_code,
-        reason = "the sole reactor borrow mutates VCB fields without relocating the pinned VCB"
-    )]
     pub(crate) fn with_access<R>(
         &mut self,
         transition: impl FnOnce(&mut MountedVolumeAccess<'_>) -> R,
     ) -> R {
-        let volume = unsafe {
-            // SAFETY: The actor has unique access and this borrow does not move the VCB or any
-            // address-sensitive field before it ends.
-            self.volume.as_mut().get_unchecked_mut()
-        };
-        transition(&mut MountedVolumeAccess { volume })
-    }
-
-    /// Returns the VCB to terminal mounted-device teardown after reactor drain.
-    pub(crate) fn into_volume(self) -> Pin<Box<VolumeControlBlock>> {
-        self.volume
+        transition(&mut MountedVolumeAccess {
+            volume: self.volume.as_ref().get_ref(),
+            volume_control: &mut self.volume_control,
+            runtime: &mut self.runtime,
+        })
     }
 }
 
@@ -567,8 +552,12 @@ unsafe impl Send for MountedVolumeBinding {}
 
 /// Lifetime-bound mounted VCB access available only inside one reactor callback.
 pub(crate) struct MountedVolumeAccess<'volume> {
-    /// Unique VCB borrow that cannot cross a scheduler transition or lower submission.
-    volume: &'volume mut VolumeControlBlock,
+    /// Shared stream identity and independently synchronized native resources.
+    volume: &'volume VolumeControlBlock,
+    /// Exclusive lifecycle authority for this actor transition.
+    volume_control: &'volume mut VolumeControlPlane,
+    /// Exclusive epoch and mutation authority for this actor transition.
+    runtime: &'volume mut VolumeRuntime,
 }
 
 impl MountedVolumeAccess<'_> {

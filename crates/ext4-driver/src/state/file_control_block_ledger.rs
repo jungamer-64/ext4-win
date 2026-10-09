@@ -2827,27 +2827,6 @@ pub(crate) enum ChildCreationTarget {
 }
 
 impl VolumeControlBlock {
-    /// Builds a mounted VCB from a completed mount operation and validated lower devices.
-    /// # Errors
-    ///
-    /// Returns an error when driver-local mounted state cannot be allocated.
-    pub(crate) fn from_completed_mount(
-        mount: CompletedMount,
-        storage: MountedStorage,
-        trace: OperationalTrace,
-        catalog: &mut crate::identity::IdentityDirectory,
-    ) -> DriverResult<Self> {
-        Ok(Self {
-            trace,
-            directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
-            file_control_blocks: FileControlBlockLedger::try_new()?,
-            volume_control: VolumeControlPlane::mounted(),
-            runtime: VolumeRuntime::try_new(mount, storage, catalog)?,
-            stream_context: StreamContext::try_new_volume(StreamSizes::EMPTY, trace)?,
-            _pin: PhantomPinned,
-        })
-    }
-
     /// Binds the volume stream header after the VCB has been pinned at its final heap address.
     /// # Errors
     ///
