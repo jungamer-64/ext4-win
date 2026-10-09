@@ -213,7 +213,13 @@ fn prepare_query(
                 QueryVolumeInformationClass::Size => {
                     pack_size_information(geometry, sector, output)
                 }
-                QueryVolumeInformationClass::Device => pack_device_information(output),
+                QueryVolumeInformationClass::Device => pack_device_information(
+                    operations
+                        .storage_route()
+                        .filesystem_control_device()
+                        .volume_device_information(),
+                    output,
+                ),
                 QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
                 QueryVolumeInformationClass::FullSize => {
                     pack_full_size_information(geometry, sector, output)
@@ -333,13 +339,14 @@ fn pack_volume_information(
     let required = header
         .checked_add(label_len)
         .ok_or(DriverError::InvalidParameter)?;
-    if output.len() < required {
-        return Err(DriverError::BufferTooSmall);
+    // Windows requires the fixed header rounded to an eight-byte boundary.
+    if output.len() < header.next_multiple_of(8) {
+        return Err(DriverError::InfoLengthMismatch);
     }
-
+    let information = required.min(output.len());
     let output = output
-        .get_mut(..required)
-        .ok_or(DriverError::BufferTooSmall)?;
+        .get_mut(..information)
+        .ok_or(DriverError::InternalInvariantViolation)?;
     output.fill(0);
     let mut writer = LittleEndianOutput::new(output);
     writer.write_bytes(
@@ -373,16 +380,20 @@ fn pack_volume_information(
 
     let label_output = writer.range_mut(WireRange::span(
         WireOffset::new(header),
-        WireOffset::new(required),
+        WireOffset::new(information),
     )?)?;
-    let (chunks, remainder) = label_output.as_chunks_mut::<2>();
-    if !remainder.is_empty() {
-        return Err(DriverError::InvalidParameter);
+    for (destination, byte) in label_output.iter_mut().zip(
+        label_bytes
+            .iter()
+            .flat_map(|byte| u16::from(*byte).to_le_bytes()),
+    ) {
+        *destination = byte;
     }
-    for (chunk, byte) in chunks.iter_mut().zip(label_bytes.iter().copied()) {
-        memory::copy_exact(chunk, &u16::from(byte).to_le_bytes())?;
+    if information == required {
+        information_length(information)
+    } else {
+        IrpCompletion::buffer_overflow(information)
     }
-    information_length(required)
 }
 
 /// Packs `FILE_FS_SIZE_INFORMATION`.
@@ -434,7 +445,10 @@ fn pack_size_information(
 /// # Errors
 ///
 /// Returns an error when the output buffer is too small for `FILE_FS_DEVICE_INFORMATION`.
-fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
+fn pack_device_information(
+    device: FILE_FS_DEVICE_INFORMATION,
+    output: &mut [u8],
+) -> DriverResult<IrpCompletion> {
     let size = core::mem::size_of::<FILE_FS_DEVICE_INFORMATION>();
     let mut writer = fixed_record_writer(output, size)?;
     writer.write_u32(
@@ -442,14 +456,14 @@ fn pack_device_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
             FILE_FS_DEVICE_INFORMATION,
             DeviceType
         )),
-        wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM,
+        device.DeviceType,
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
             FILE_FS_DEVICE_INFORMATION,
             Characteristics
         )),
-        0,
+        device.Characteristics,
     )?;
     information_length(size)
 }
@@ -522,12 +536,13 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
     let required = header
         .checked_add(name_len)
         .ok_or(DriverError::InvalidParameter)?;
-    if output.len() < required {
-        return Err(DriverError::BufferTooSmall);
+    if output.len() < header {
+        return Err(DriverError::InfoLengthMismatch);
     }
+    let information = required.min(output.len());
     let output = output
-        .get_mut(..required)
-        .ok_or(DriverError::BufferTooSmall)?;
+        .get_mut(..information)
+        .ok_or(DriverError::InternalInvariantViolation)?;
     output.fill(0);
     let mut writer = LittleEndianOutput::new(output);
     writer.write_u32(
@@ -559,16 +574,19 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
 
     let name_output = writer.range_mut(WireRange::span(
         WireOffset::new(header),
-        WireOffset::new(required),
+        WireOffset::new(information),
     )?)?;
-    let (chunks, remainder) = name_output.as_chunks_mut::<2>();
-    if !remainder.is_empty() {
-        return Err(DriverError::InvalidParameter);
+    for (destination, byte) in name_output
+        .iter_mut()
+        .zip(FILE_SYSTEM_NAME.iter().flat_map(|unit| unit.to_le_bytes()))
+    {
+        *destination = byte;
     }
-    for (chunk, unit) in chunks.iter_mut().zip(FILE_SYSTEM_NAME.iter().copied()) {
-        memory::copy_exact(chunk, &unit.to_le_bytes())?;
+    if information == required {
+        information_length(information)
+    } else {
+        IrpCompletion::buffer_overflow(information)
     }
-    information_length(required)
 }
 
 /// Encodes the seven specification-defined ULONG fields without native padding or excess output.
@@ -612,7 +630,9 @@ fn information_length(value: usize) -> DriverResult<IrpCompletion> {
 ///
 /// Returns an error when `output` is smaller than `size`.
 fn fixed_record_writer(output: &mut [u8], size: usize) -> DriverResult<LittleEndianOutput<'_>> {
-    let record = output.get_mut(..size).ok_or(DriverError::BufferTooSmall)?;
+    let record = output
+        .get_mut(..size)
+        .ok_or(DriverError::InfoLengthMismatch)?;
     record.fill(0);
     Ok(LittleEndianOutput::new(record))
 }
@@ -782,18 +802,27 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn device_information_reports_disk_file_system_without_device_flags() {
+    fn device_information_preserves_underlying_media_characteristics() {
         let mut buffer = vec![0xA5; core::mem::size_of::<wdk_sys::FILE_FS_DEVICE_INFORMATION>()];
-        let written = pack_device_information(buffer.as_mut_slice());
+        let written = pack_device_information(
+            wdk_sys::FILE_FS_DEVICE_INFORMATION {
+                DeviceType: wdk_sys::FILE_DEVICE_DISK,
+                Characteristics: wdk_sys::FILE_REMOVABLE_MEDIA | wdk_sys::FILE_READ_ONLY_DEVICE,
+            },
+            buffer.as_mut_slice(),
+        );
         assert!(written.is_ok());
         if let Ok(written) = written {
             assert_eq!(IrpCompletion::from_usize(buffer.len()), Ok(written));
             let output = LittleEndianInput::new(buffer.as_slice());
             assert_eq!(
                 output.read_u32(WireOffset::new(0)),
-                Ok(wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM)
+                Ok(wdk_sys::FILE_DEVICE_DISK)
             );
-            assert_eq!(output.read_u32(WireOffset::new(4)), Ok(0));
+            assert_eq!(
+                output.read_u32(WireOffset::new(4)),
+                Ok(wdk_sys::FILE_REMOVABLE_MEDIA | wdk_sys::FILE_READ_ONLY_DEVICE)
+            );
             assert!(buffer.iter().all(|byte| *byte != 0xA5));
         }
     }
@@ -836,9 +865,21 @@ mod tests {
         let mut short = [0xA5; 19];
         assert_eq!(
             pack_attribute_information(&mut short),
-            Err(DriverError::BufferTooSmall)
+            IrpCompletion::buffer_overflow(19)
         );
-        assert_eq!(short, [0xA5; 19]);
+        assert_eq!(buffer.get(..19), Some(short.as_slice()));
+        let mut header_only = [0xA5; 12];
+        assert_eq!(
+            pack_attribute_information(&mut header_only),
+            IrpCompletion::buffer_overflow(12)
+        );
+        assert_eq!(buffer.get(..12), Some(header_only.as_slice()));
+        let mut missing_header = [0xA5; 11];
+        assert_eq!(
+            pack_attribute_information(&mut missing_header),
+            Err(DriverError::InfoLengthMismatch)
+        );
+        assert_eq!(missing_header, [0xA5; 11]);
     }
 
     /// Builds a FILE_FS_LABEL_INFORMATION byte image from label bytes.

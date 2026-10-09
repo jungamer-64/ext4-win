@@ -117,6 +117,26 @@ impl KernelDevice {
         };
         TransferSectorSize::from_bytes(u32::from(sector_size))
     }
+
+    /// Observes the underlying volume's device type and characteristics while its mount retains it.
+    #[expect(
+        unsafe_code,
+        reason = "the retained device exposes only initialized scalar properties"
+    )]
+    pub(crate) fn volume_device_information(self) -> wdk_sys::FILE_FS_DEVICE_INFORMATION {
+        let device_type = unsafe {
+            // SAFETY: The mounted storage route retains this device and its initialized type.
+            (*self.as_ptr()).DeviceType
+        };
+        let characteristics = unsafe {
+            // SAFETY: The same retained device owns this initialized scalar property.
+            (*self.as_ptr()).Characteristics
+        };
+        wdk_sys::FILE_FS_DEVICE_INFORMATION {
+            DeviceType: device_type,
+            Characteristics: characteristics,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
