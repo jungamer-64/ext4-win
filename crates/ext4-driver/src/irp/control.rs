@@ -558,55 +558,6 @@ impl QueryFileInformationClass {
     }
 }
 
-/// Decoded set-file information class.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SetFileInformationClass {
-    /// Windows `FileBasicInformation`.
-    Basic,
-    /// Windows `FilePositionInformation`.
-    Position,
-    /// Windows `FileEndOfFileInformation`.
-    EndOfFile,
-    /// Windows `FileAllocationInformation`.
-    Allocation,
-    /// Windows `FileDispositionInformation`.
-    Disposition,
-    /// Windows `FileDispositionInformationEx`.
-    DispositionEx,
-    /// Windows `FileLinkInformation`.
-    Link,
-    /// Windows `FileLinkInformationEx`.
-    LinkEx,
-    /// Windows `FileRenameInformation`.
-    Rename,
-    /// Windows `FileRenameInformationEx`.
-    RenameEx,
-}
-
-impl SetFileInformationClass {
-    /// Decodes a raw WDK file information class for file mutations.
-    /// # Errors
-    ///
-    /// Returns an error when the file information class is not implemented for file mutations.
-    pub(super) fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
-        match value {
-            wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
-            wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => Ok(Self::Position),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => Ok(Self::EndOfFile),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileAllocationInformation => Ok(Self::Allocation),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformation => Ok(Self::Disposition),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileDispositionInformationEx => {
-                Ok(Self::DispositionEx)
-            }
-            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformation => Ok(Self::Link),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformationEx => Ok(Self::LinkEx),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation => Ok(Self::Rename),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformationEx => Ok(Self::RenameEx),
-            _ => Err(DriverError::InvalidInfoClass),
-        }
-    }
-}
-
 /// Decoded query-directory information class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DirectoryInformationClass {
