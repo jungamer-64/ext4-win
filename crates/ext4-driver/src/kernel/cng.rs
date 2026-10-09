@@ -528,7 +528,8 @@ impl core::fmt::Debug for ReusableHash {
 // call/destroy executes on the sole PASSIVE_LEVEL reactor thread.
 unsafe impl Send for ReusableHash {}
 
-/// Generated symmetric key whose borrow prevents reuse of its caller-owned object buffer.
+/// Generated symmetric key retaining an exclusive lifetime lease on opaque native storage.
+/// No Rust reference to the object bytes is created while the native key can access them.
 struct GeneratedKey<'object> {
     /// CNG key identity.
     handle: NonNull<c_void>,
@@ -552,11 +553,18 @@ impl Drop for GeneratedKey<'_> {
     )]
     fn drop(&mut self) {
         let _status = unsafe {
-            // SAFETY: This value owns the sole destroy authority; its borrowed key-object buffer
-            // remains writable and live until this destructor finishes.
+            // SAFETY: This value owns the sole destroy authority; its lifetime lease keeps the
+            // opaque key-object allocation live without borrowing its bytes through Rust.
             BCryptDestroyKey(self.handle.as_ptr())
         };
-        self.object.fill(0);
+        unsafe {
+            // SAFETY: DestroyKey ended native access. The lifetime lease still retains the exact
+            // writable range, which has no competing Rust reference.
+            self.object
+                .as_ptr()
+                .cast::<u8>()
+                .write_bytes(0, self.object.len());
+        }
     }
 }
 
@@ -754,15 +762,17 @@ fn generate_key<'object>(
     object.fill(0);
     let object_bytes = u32::try_from(object.len()).map_err(|_| Error::ArithmeticOverflow)?;
     let secret_bytes = u32::try_from(secret.len()).map_err(|_| Error::ArithmeticOverflow)?;
+    // Establish the sole byte pointer before native retention; no reference reborrow follows it.
+    let object = NonNull::from(object);
     let mut raw = core::ptr::null_mut();
     let status = unsafe {
-        // SAFETY: `object` is an exclusively borrowed, address-stable nonpaged allocation prefix;
+        // SAFETY: `object` identifies the exclusive, address-stable nonpaged allocation prefix;
         // `secret` remains readable during this synchronous call. The returned key cannot outlive
         // the object borrow.
         BCryptGenerateSymmetricKey(
             execution.algorithm.as_raw(),
             core::ptr::addr_of_mut!(raw),
-            object.as_mut_ptr(),
+            object.as_ptr().cast::<u8>(),
             object_bytes,
             secret.as_ptr().cast_mut(),
             secret_bytes,
@@ -770,14 +780,26 @@ fn generate_key<'object>(
         )
     };
     if let Err(error) = cng_status_to_core(status) {
-        object.fill(0);
+        unsafe {
+            // SAFETY: Generation failed without returning a key; the caller's exclusive borrow
+            // retains these writable bytes through rollback.
+            object.as_ptr().cast::<u8>().write_bytes(0, object.len());
+        }
         return Err(error);
     }
     let Some(handle) = NonNull::new(raw) else {
-        object.fill(0);
+        unsafe {
+            // SAFETY: No native key was returned; the same exclusive allocation remains owned
+            // by the caller and may be cleared before reporting the provider invariant failure.
+            object.as_ptr().cast::<u8>().write_bytes(0, object.len());
+        }
         return Err(Error::CryptographicFailure);
     };
-    Ok(GeneratedKey { handle, object })
+    Ok(GeneratedKey {
+        handle,
+        object,
+        lifetime: core::marker::PhantomData,
+    })
 }
 
 /// Applies AES-256-XTS in place with the Linux little-endian data-unit tweak.
@@ -823,6 +845,9 @@ fn crypt_in_place(
     direction: CipherDirection,
 ) -> Ext4Result<()> {
     let buffer_bytes = u32::try_from(buffer.len()).map_err(|_| Error::ArithmeticOverflow)?;
+    // Both native parameters alias this one pointer; creating a second mutable reborrow would
+    // invalidate the first parameter's access to the same allocation.
+    let buffer_pointer = buffer.as_mut_ptr();
     let (iv_pointer, iv_bytes) = match initialization_vector {
         Some(iv) => (
             iv.as_mut_ptr(),
@@ -837,12 +862,12 @@ fn crypt_in_place(
             // exclusively writable, and `key` retains the backing object for the entire call.
             BCryptEncrypt(
                 key.as_raw(),
-                buffer.as_mut_ptr(),
+                buffer_pointer,
                 buffer_bytes,
                 core::ptr::null_mut(),
                 iv_pointer,
                 iv_bytes,
-                buffer.as_mut_ptr(),
+                buffer_pointer,
                 buffer_bytes,
                 core::ptr::addr_of_mut!(result_bytes),
                 0,
@@ -853,12 +878,12 @@ fn crypt_in_place(
             // exclusively writable, and `key` retains the backing object for the entire call.
             BCryptDecrypt(
                 key.as_raw(),
-                buffer.as_mut_ptr(),
+                buffer_pointer,
                 buffer_bytes,
                 core::ptr::null_mut(),
                 iv_pointer,
                 iv_bytes,
-                buffer.as_mut_ptr(),
+                buffer_pointer,
                 buffer_bytes,
                 core::ptr::addr_of_mut!(result_bytes),
                 0,
