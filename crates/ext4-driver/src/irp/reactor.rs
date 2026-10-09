@@ -4620,12 +4620,15 @@ unsafe fn reactor_from_csq<'reactor>(csq: PIO_CSQ) -> Option<&'reactor Completio
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe fn initialize_list_head(head: PLIST_ENTRY) {
-    let head = unsafe {
-        // SAFETY: Caller supplies writable stable list-head storage.
-        &mut *head
+    unsafe {
+        // SAFETY: Caller supplies writable stable storage; retaining the raw pointer keeps
+        // both self-links usable by later list operations without a whole-node reborrow.
+        (*head).Flink = head;
     };
-    head.Flink = core::ptr::from_mut(head);
-    head.Blink = core::ptr::from_mut(head);
+    unsafe {
+        // SAFETY: The same exclusive storage owns the backward self-link.
+        (*head).Blink = head;
+    }
 }
 
 /// Returns whether one initialized intrusive list is empty.
@@ -4675,22 +4678,26 @@ unsafe fn remove_head_list(head: PLIST_ENTRY) -> Option<NonNull<LIST_ENTRY>> {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
-    let head_ref = unsafe {
-        // SAFETY: Initialized list is held under its owning lock.
-        &mut *head
+    let previous = unsafe {
+        // SAFETY: The caller holds the initialized list's lock. Its tail may be the head itself.
+        (*head).Blink
     };
-    let previous = head_ref.Blink;
-    let entry_ref = unsafe {
-        // SAFETY: Entry is unlinked and exclusively supplied by its owner.
-        &mut *entry
+    unsafe {
+        // SAFETY: The caller exclusively supplies this unlinked node, distinct from the head.
+        (*entry).Flink = head;
     };
-    entry_ref.Flink = head;
-    entry_ref.Blink = previous;
+    unsafe {
+        // SAFETY: The same unlinked node owns its backward link.
+        (*entry).Blink = previous;
+    }
     unsafe {
         // SAFETY: Previous is the live tail of the same initialized list.
         (*previous).Flink = entry;
     }
-    head_ref.Blink = entry;
+    unsafe {
+        // SAFETY: The locked head remains writable even when `previous` aliases it.
+        (*head).Blink = entry;
+    }
 }
 
 /// Removes one entry from its initialized intrusive list.
@@ -4702,12 +4709,14 @@ unsafe fn insert_tail_list(head: PLIST_ENTRY, entry: PLIST_ENTRY) {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe fn remove_entry_list(entry: PLIST_ENTRY) {
-    let entry_ref = unsafe {
-        // SAFETY: Entry remains linked under its owning lock.
-        &mut *entry
+    let previous = unsafe {
+        // SAFETY: Entry remains linked under its owning lock; no node reference invalidates links.
+        (*entry).Blink
     };
-    let previous = entry_ref.Blink;
-    let next = entry_ref.Flink;
+    let next = unsafe {
+        // SAFETY: The same locked entry retains its initialized forward link.
+        (*entry).Flink
+    };
     unsafe {
         // SAFETY: Previous remains live in the same locked list.
         (*previous).Flink = next;
