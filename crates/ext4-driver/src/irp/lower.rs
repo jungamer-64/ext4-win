@@ -24,7 +24,7 @@ use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 #[cfg(not(test))]
 use crate::memory;
-use crate::memory::{DriverShared, DriverSharedLease, DriverSharedSlot};
+use crate::memory::{DriverShared, DriverSharedLease, DriverSharedSlot, NativeAllocation};
 #[cfg(not(test))]
 use crate::state::KernelDevice;
 
@@ -761,7 +761,12 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn reclaim_unsubmitted(mut envelope: Box<Self>) -> O {
+    fn reclaim_unsubmitted(envelope: NativeAllocation<Self>) -> O {
+        let mut envelope = unsafe {
+            // SAFETY: Registration failed, so no native callback retains this allocation.
+            // Consuming its owner restores the sole matching Box destruction authority.
+            Box::from_raw(envelope.into_raw().as_ptr())
+        };
         let suspended = unsafe {
             // SAFETY: Registration failure proves no callback can access the envelope payload.
             ManuallyDrop::take(&mut envelope.suspended)
@@ -1037,7 +1042,7 @@ pub struct PreparedLowerIrp<O, R: LowerCompletionRoute<O>> {
     /// Pre-submit IRP release authority.
     irp: LowerIrpReleaseAuthority,
     /// Nonpaged stable envelope passed as the sole completion context.
-    envelope: Box<LowerCompletionEnvelope<O, R>>,
+    envelope: NativeAllocation<LowerCompletionEnvelope<O, R>>,
 }
 
 #[cfg(not(test))]
@@ -1105,7 +1110,7 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
             completion_owner,
             target,
             irp: authority,
-            envelope,
+            envelope: NativeAllocation::from_box(envelope),
         })
     }
 
@@ -1114,9 +1119,9 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     /// The scheduler may reserve this identity in an unpublished active slot. It must remove the
     /// slot if [`Self::register_and_submit`] returns an error and may expose cancellation only
     /// after that method returns success.
-    pub fn cancellation_identity(&mut self) -> PublishedLowerRequest<O, R> {
+    pub fn cancellation_identity(&self) -> PublishedLowerRequest<O, R> {
         PublishedLowerRequest {
-            envelope: NonNull::from(self.envelope.as_mut()),
+            envelope: self.envelope.address(),
         }
     }
 
@@ -1129,8 +1134,8 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub fn register_and_submit(mut self) -> Result<(), LowerRegistrationError<O>> {
-        let envelope = NonNull::from(self.envelope.as_mut());
+    pub fn register_and_submit(self) -> Result<(), LowerRegistrationError<O>> {
+        let envelope = self.envelope.address();
         let status = unsafe {
             // SAFETY: The envelope is nonpaged and address-stable, and every callback outcome is
             // requested. The context is exactly the envelope head, never an operation field.
@@ -1162,7 +1167,7 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
         // This infallible move is followed immediately by the sole legal action: IoCallDriver.
         let registered = unsafe {
             // SAFETY: Registration succeeded and completion cannot run until IoCallDriver below.
-            self.into_registered(envelope)
+            self.into_registered()
         };
         registered.call_driver();
         Ok(())
@@ -1171,16 +1176,13 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     /// Irreversibly transfers envelope and IRP release ownership to completion.
     /// # Safety
     ///
-    /// Completion registration must have succeeded for `envelope_address`, which must identify
-    /// `self.envelope`; the caller must invoke the returned request immediately and exactly once.
+    /// Completion registration must have succeeded for this envelope; the caller must invoke
+    /// the returned request immediately and exactly once.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn into_registered(
-        self,
-        envelope_address: NonNull<LowerCompletionEnvelope<O, R>>,
-    ) -> RegisteredLowerRequest {
+    unsafe fn into_registered(self) -> RegisteredLowerRequest {
         let Self {
             completion_owner: _,
             target,
@@ -1188,15 +1190,11 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
             envelope,
         } = self;
         let irp_address = irp.irp;
-        let envelope_ref = unsafe {
-            // SAFETY: The address was obtained from the still-live boxed envelope above.
-            envelope_address.as_ref()
-        };
         unsafe {
             // SAFETY: Registration succeeded and the caller submits without intervening work.
-            envelope_ref.install_release_authority(irp);
+            envelope.get().install_release_authority(irp);
         }
-        let raw_envelope = Box::into_raw(envelope);
+        let raw_envelope = envelope.into_raw();
         let _completion_owned_envelope = raw_envelope;
         RegisteredLowerRequest {
             target,

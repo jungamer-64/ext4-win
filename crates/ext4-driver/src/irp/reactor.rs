@@ -3349,7 +3349,7 @@ impl CompletionReactor {
         let destination = LengthCompletionRoute {
             reactor: NonNull::from(self),
         };
-        let mut lower = match DeviceLengthProbe::prepare(
+        let lower = match DeviceLengthProbe::prepare(
             completion_owner,
             target,
             suspended,
@@ -3428,7 +3428,7 @@ impl CompletionReactor {
         let destination = StorageCompletionRoute {
             reactor: NonNull::from(self),
         };
-        let mut lower = match prepared.build_lower(destination, rundown) {
+        let lower = match prepared.build_lower(destination, rundown) {
             Ok(lower) => lower,
             Err(error) => {
                 let (error, command) = error.into_parts();

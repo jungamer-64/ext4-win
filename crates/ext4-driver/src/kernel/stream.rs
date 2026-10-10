@@ -23,6 +23,7 @@ use wdk_sys::{STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::operational_trace::OperationalTrace;
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::memory::NativeAllocation;
 
 /// Native stream owner domain encoded beside the advanced FCB header.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,7 +243,7 @@ enum StreamRuntime {
         completion: core::pin::Pin<Box<crate::irp::mdl_completion::MdlCompletionQueue>>,
     },
     /// The volume owns the sole shared admission authority.
-    Volume(Box<StorageAdmission>),
+    Volume(NativeAllocation<StorageAdmission>),
 }
 
 impl StreamRuntime {
@@ -259,7 +260,7 @@ impl StreamRuntime {
     fn as_ptr(&self) -> *mut c_void {
         match self {
             Self::Node { completion } => completion.as_ref().as_ptr(),
-            Self::Volume(admission) => core::ptr::from_ref(admission.as_ref()).cast_mut().cast(),
+            Self::Volume(admission) => admission.address().as_ptr().cast(),
         }
     }
 }
@@ -595,9 +596,9 @@ impl StreamContext {
     ) -> DriverResult<Self> {
         let runtime = match kind {
             StreamOwnerKind::Volume => {
-                StreamRuntime::Volume(crate::memory::boxed_try_with(|| {
-                    Ok(StorageAdmission::new())
-                })?)
+                StreamRuntime::Volume(NativeAllocation::from_box(crate::memory::boxed_try_with(
+                    || Ok(StorageAdmission::new()),
+                )?))
             }
             StreamOwnerKind::Node => StreamRuntime::Node {
                 #[cfg(not(test))]
@@ -713,7 +714,7 @@ impl StreamContext {
             return Err(DriverError::InternalInvariantViolation);
         };
         Ok(VolumeStorageAccess {
-            state: NonNull::from(state.as_ref()),
+            state: state.address(),
             #[cfg(not(test))]
             header: self.header,
         })
