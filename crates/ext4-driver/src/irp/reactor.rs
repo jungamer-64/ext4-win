@@ -3526,10 +3526,7 @@ impl CompletionReactor {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
-        let node = unsafe {
-            // SAFETY: Completion owns this live envelope until its node is linked below.
-            envelope.as_ref().node_ptr()
-        };
+        let node = ReactorStorageEnvelope::node_ptr(envelope);
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
             insert_tail_list(reactor.completion_head.get(), node);
@@ -3659,10 +3656,7 @@ impl CompletionReactor {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
-        let node = unsafe {
-            // SAFETY: Completion owns this live envelope until its node is linked below.
-            envelope.as_ref().node_ptr()
-        };
+        let node = ReactorLengthEnvelope::node_ptr(envelope);
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
             insert_tail_list(reactor.length_completion_head.get(), node);
@@ -3770,10 +3764,7 @@ impl CompletionReactor {
             // SAFETY: Stable reactor lock serializes work callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
-        let node = unsafe {
-            // SAFETY: Completion owns this live envelope until its node is linked below.
-            envelope.as_ref().node_ptr()
-        };
+        let node = PassiveWorkEnvelope::node_ptr(envelope);
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
             insert_tail_list(reactor.passive_completion_head.get(), node);
@@ -3900,10 +3891,7 @@ impl CompletionReactor {
             // SAFETY: Stable reactor lock serializes callbacks and typed inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
-        let node = unsafe {
-            // SAFETY: Completion owns this live envelope until its node is linked below.
-            envelope.as_ref().node_ptr()
-        };
+        let node = OplockEnvelope::node_ptr(envelope);
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
             insert_tail_list(reactor.oplock_completion_head.get(), node);

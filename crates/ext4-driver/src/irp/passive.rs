@@ -511,13 +511,14 @@ impl PassiveWorkEnvelope {
             );
         }
     }
-    /// Node ownership transfers only after the native call has consumed its resource lease.
-    pub(super) fn node_ptr(&self) -> *mut LIST_ENTRY {
-        self.node.get()
+    /// Projects the first-field inbox node while preserving access to the complete allocation.
+    pub(super) fn node_ptr(envelope: NonNull<Self>) -> *mut LIST_ENTRY {
+        envelope.as_ptr().cast()
     }
     /// Recovers stable storage after exclusive inbox removal.
     /// # Safety
-    /// The node must have been removed exactly once from this reactor's native-work inbox.
+    /// The node must have been removed exactly once from this reactor's native-work inbox and
+    /// retain complete-allocation provenance established by [`Self::node_ptr`].
     pub(super) unsafe fn from_node(node: NonNull<LIST_ENTRY>) -> NonNull<Self> {
         node.cast()
     }

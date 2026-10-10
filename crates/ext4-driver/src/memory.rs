@@ -18,6 +18,9 @@ use core::{
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 
+mod native_allocation;
+pub(crate) use native_allocation::NativeAllocation;
+
 /// Converts allocator failure into the driver error domain.
 #[inline]
 fn alloc_failed(_: AllocError) -> DriverError {

@@ -1,6 +1,7 @@
 //! Native Windows stream-header ownership boundary.
 
 use super::storage_admission::{ClosePhase, MediaState, StorageAdmission};
+#[cfg(not(test))]
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
@@ -242,7 +243,7 @@ enum StreamRuntime {
         #[cfg(not(test))]
         completion: core::pin::Pin<Box<crate::irp::mdl_completion::MdlCompletionQueue>>,
     },
-    /// The volume owns the sole shared admission authority.
+    /// Sole admission allocation owner, retained until the native stream is destroyed.
     Volume(NativeAllocation<StorageAdmission>),
 }
 
@@ -595,11 +596,9 @@ impl StreamContext {
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
         let runtime = match kind {
-            StreamOwnerKind::Volume => {
-                StreamRuntime::Volume(NativeAllocation::from_box(crate::memory::boxed_try_with(
-                    || Ok(StorageAdmission::new()),
-                )?))
-            }
+            StreamOwnerKind::Volume => StreamRuntime::Volume(NativeAllocation::from_box(
+                crate::memory::boxed_try_with(|| Ok(StorageAdmission::new()))?,
+            )),
             StreamOwnerKind::Node => StreamRuntime::Node {
                 #[cfg(not(test))]
                 completion: crate::irp::mdl_completion::MdlCompletionQueue::try_new()?,
@@ -614,6 +613,8 @@ impl StreamContext {
             let status = unsafe {
                 // SAFETY: Native code borrows the optional fixed input for this call, writes one
                 // opaque pointer on success, and owns every partial-allocation cleanup path.
+                // RustState retains the runtime's original allocation pointer; moving the runtime
+                // preserves that pointer, and StreamContext destroys the native header first.
                 ext4win_stream_create(
                     kind.native_tag(),
                     sizes.allocation_size,
@@ -1597,7 +1598,8 @@ pub(crate) fn fast_io_dispatch(
     reason = "the opaque native header uses internally synchronized resources and immutable owner identity after publication"
 )]
 // SAFETY: Native FsRtl/ERESOURCE/OPLOCK state supplies its own synchronization. Rust only reads the
-// immutable kind/header identity after the single construction-time owner binding.
+// immutable kind/header identity after the single construction-time owner binding. Runtime
+// storage keeps its original allocation pointer across owner moves and outlives native destruction.
 unsafe impl Send for StreamContext {}
 
 #[expect(

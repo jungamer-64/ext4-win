@@ -616,15 +616,16 @@ impl<O, R: LowerCompletionRoute<O>> LowerCompletionEnvelope<O, R> {
         }
     }
 
-    /// Intrusive node address for the completion inbox.
-    pub const fn node_ptr(&self) -> *mut wdk_sys::LIST_ENTRY {
-        self.node.get()
+    /// Projects the first-field inbox node without narrowing allocation provenance to that field.
+    pub const fn node_ptr(envelope: NonNull<Self>) -> *mut wdk_sys::LIST_ENTRY {
+        envelope.as_ptr().cast()
     }
 
     /// Recovers the envelope from its first-field intrusive node.
     /// # Safety
     ///
-    /// `node` must be the node of a live `LowerCompletionEnvelope<O, R>` allocated by this module.
+    /// `node` must be the node of a live `LowerCompletionEnvelope<O, R>` allocated by this module
+    /// and retain access to its complete allocation, as established by [`Self::node_ptr`].
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -1041,7 +1042,7 @@ pub struct PreparedLowerIrp<O, R: LowerCompletionRoute<O>> {
     target: KernelDevice,
     /// Pre-submit IRP release authority.
     irp: LowerIrpReleaseAuthority,
-    /// Nonpaged stable envelope passed as the sole completion context.
+    /// Sole allocation owner; cancellation and completion retain its original raw pointer.
     envelope: NativeAllocation<LowerCompletionEnvelope<O, R>>,
 }
 
@@ -1138,7 +1139,8 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
         let envelope = self.envelope.address();
         let status = unsafe {
             // SAFETY: The envelope is nonpaged and address-stable, and every callback outcome is
-            // requested. The context is exactly the envelope head, never an operation field.
+            // requested. Its original allocation pointer remains valid through owner transfers;
+            // the context is exactly the envelope head, never an operation field.
             ffi::IoSetCompletionRoutineEx(
                 self.completion_owner.as_ptr(),
                 self.irp.as_ptr(),
@@ -1492,6 +1494,7 @@ unsafe extern "C" fn lower_request_completed<O: Send + 'static, R: LowerCompleti
 
 #[cfg(test)]
 mod tests {
+    use alloc::boxed::Box;
     use core::ptr::NonNull;
     use core::sync::atomic::Ordering;
 
@@ -1723,7 +1726,7 @@ mod tests {
         let destination = TestCompletionRoute {
             inbox: NonNull::from(&mut inbox),
         };
-        let Ok(mut envelope) = memory::boxed_try_with(move || {
+        let Ok(envelope) = memory::boxed_try_with(move || {
             Ok(LowerCompletionEnvelope::new(
                 0x5A_u64,
                 transfer,
@@ -1733,8 +1736,9 @@ mod tests {
         }) else {
             return;
         };
-        let address = NonNull::from(envelope.as_mut());
-        let Some(node) = NonNull::new(envelope.node_ptr()) else {
+        let envelope = super::NativeAllocation::from_box(envelope);
+        let address = envelope.address();
+        let Some(node) = NonNull::new(TestEnvelope::node_ptr(address)) else {
             return;
         };
         let recovered = unsafe {
@@ -1744,17 +1748,20 @@ mod tests {
         assert_eq!(address, recovered);
 
         envelope
+            .get()
             .status
             .store(wdk_sys::STATUS_SUCCESS, Ordering::Relaxed);
-        envelope.information.store(16, Ordering::Relaxed);
+        envelope.get().information.store(16, Ordering::Relaxed);
         envelope
+            .get()
             .lifecycle
             .store(LOWER_COMPLETED_QUEUED, Ordering::Release);
+        let _completion_owned = envelope.into_raw();
         unsafe {
             // SAFETY: This publishes the one live envelope to the type-matched local inbox.
-            destination.publish(address);
+            destination.publish(recovered);
         }
-        let Some(published) = inbox else {
+        let Some(published) = inbox.take() else {
             return;
         };
         let cancellation = PublishedLowerRequest {
@@ -1762,9 +1769,14 @@ mod tests {
         };
         assert!(cancellation.identifies(address));
 
+        let reclaimed = unsafe {
+            // SAFETY: Publication transferred the sole allocation owner; the local inbox removed
+            // this completed envelope exactly once and no cancellation access remains.
+            Box::from_raw(published.as_ptr())
+        };
         let completed = unsafe {
-            // SAFETY: The local inbox owns this completed envelope exactly once.
-            LowerCompletionEnvelope::reclaim(envelope)
+            // SAFETY: Inbox removal ended callback access and restored sole envelope ownership.
+            LowerCompletionEnvelope::reclaim(reclaimed)
         };
         assert_eq!(completed.suspended, 0x5A);
         assert_eq!(completed.transfer.len(), 16);
@@ -1809,7 +1821,12 @@ mod tests {
         }) else {
             return;
         };
-        assert_eq!(LowerCompletionEnvelope::reclaim_unsubmitted(envelope), 41);
+        assert_eq!(
+            LowerCompletionEnvelope::reclaim_unsubmitted(super::NativeAllocation::from_box(
+                envelope
+            )),
+            41
+        );
         assert!(inbox.is_none());
 
         let build = LowerBuildError::from_unsubmitted(DriverError::InvalidParameter, 42_u64);

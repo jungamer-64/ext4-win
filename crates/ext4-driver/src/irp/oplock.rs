@@ -707,15 +707,16 @@ impl OplockEnvelope {
         OplockSubmission::Immediate { envelope, status }
     }
 
-    /// Returns the embedded inbox node address.
-    pub(super) fn node_ptr(&self) -> *mut LIST_ENTRY {
-        self.node.get()
+    /// Projects the first-field inbox node while preserving access to the complete allocation.
+    pub(super) fn node_ptr(envelope: NonNull<Self>) -> *mut LIST_ENTRY {
+        envelope.as_ptr().cast()
     }
 
     /// Recovers an envelope from its first-field intrusive node.
     /// # Safety
     ///
-    /// `node` must have been removed exactly once from the oplock-completion inbox.
+    /// `node` must have been removed exactly once from the oplock-completion inbox and retain
+    /// complete-allocation provenance established by [`Self::node_ptr`].
     pub(super) unsafe fn from_node(node: NonNull<LIST_ENTRY>) -> NonNull<Self> {
         node.cast()
     }
