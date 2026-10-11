@@ -181,7 +181,7 @@ pub(crate) use wdk_sys::ntddk::{
 
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
-    IoAcquireCancelSpinLock, IoReleaseCancelSpinLock, IoSetCancelRoutine,
+    IoAcquireCancelSpinLock, IoReleaseCancelSpinLock, IoSetCancelRoutine, SePrivilegeCheck,
 };
 
 #[cfg(not(test))]

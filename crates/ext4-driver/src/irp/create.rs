@@ -646,11 +646,10 @@ impl CreateAccessState<'_> {
             unsafe {
                 // SAFETY: The same captured subject is locked for this create; local fixed
                 // privilege storage can hold both backup and restore usage records.
-                ffi::ext4win_backup_restore_access(
+                check_create_privileges(
                     context,
                     self.access_mode,
-                    self.disposition.raw_disposition(),
-                    desired,
+                    CreatePrivilegeAccess::for_request(self.disposition, desired),
                     &mut backup_privileges,
                 )
             }
@@ -779,6 +778,157 @@ impl CreateAccessState<'_> {
     }
 }
 
+/// Specific rights requested from each enabled Windows create privilege.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CreatePrivilegeAccess {
+    /// Backup can satisfy read/traverse rights only when opening an existing object is possible.
+    backup: u32,
+    /// Restore can satisfy write, deletion and security rights for every disposition.
+    restore: u32,
+}
+
+impl CreatePrivilegeAccess {
+    /// Selects privilege rights without performing token checks or granting handle authority.
+    fn for_request(disposition: CreateDisposition, desired: u32) -> Self {
+        const BACKUP: u32 = wdk_sys::READ_CONTROL
+            | wdk_sys::ACCESS_SYSTEM_SECURITY
+            | wdk_sys::FILE_GENERIC_READ
+            | wdk_sys::FILE_TRAVERSE;
+        const RESTORE: u32 = wdk_sys::WRITE_DAC
+            | wdk_sys::WRITE_OWNER
+            | wdk_sys::ACCESS_SYSTEM_SECURITY
+            | wdk_sys::FILE_GENERIC_WRITE
+            | wdk_sys::DELETE;
+        let requested = |rights| {
+            if desired & wdk_sys::MAXIMUM_ALLOWED != 0 {
+                rights
+            } else {
+                desired & rights
+            }
+        };
+        Self {
+            backup: if matches!(
+                disposition,
+                CreateDisposition::Open
+                    | CreateDisposition::OpenIf
+                    | CreateDisposition::OverwriteIf
+            ) {
+                requested(BACKUP)
+            } else {
+                0
+            },
+            restore: requested(RESTORE),
+        }
+    }
+}
+
+/// Checks the locked subject and retains exact privilege-use records for later ACCESS_STATE publication.
+/// # Safety
+/// The create owner must retain and lock `subject` through both native checks at PASSIVE_LEVEL.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the create owner retains the locked native subject and local privilege records"
+)]
+unsafe fn check_create_privileges(
+    subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
+    mode: wdk_sys::KPROCESSOR_MODE,
+    requested: CreatePrivilegeAccess,
+    used: &mut wdk_sys::INITIAL_PRIVILEGE_SET,
+) -> u32 {
+    *used = wdk_sys::INITIAL_PRIVILEGE_SET::default();
+    used.Control = wdk_sys::PRIVILEGE_SET_ALL_NECESSARY;
+    let mut granted = 0;
+    for (privilege, rights) in [
+        (wdk_sys::SE_BACKUP_PRIVILEGE, requested.backup),
+        (wdk_sys::SE_RESTORE_PRIVILEGE, requested.restore),
+    ] {
+        if rights == 0 {
+            continue;
+        }
+        let mut required = wdk_sys::PRIVILEGE_SET {
+            PrivilegeCount: 1,
+            Control: wdk_sys::PRIVILEGE_SET_ALL_NECESSARY,
+            Privilege: [wdk_sys::LUID_AND_ATTRIBUTES {
+                Luid: wdk_sys::LUID {
+                    LowPart: privilege,
+                    HighPart: 0,
+                },
+                Attributes: 0,
+            }],
+        };
+        let enabled = unsafe {
+            // SAFETY: The caller retains the locked subject; required is exclusive local storage.
+            ffi::SePrivilegeCheck(&mut required, subject, mode)
+        };
+        if enabled != 0 {
+            let index = usize::try_from(used.PrivilegeCount).unwrap_or_else(|_| {
+                crate::kernel::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            });
+            let output = used.Privilege.get_mut(index).unwrap_or_else(|| {
+                crate::kernel::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            });
+            *output = required.Privilege.first().copied().unwrap_or_else(|| {
+                crate::kernel::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            });
+            used.PrivilegeCount = used.PrivilegeCount.checked_add(1).unwrap_or_else(|| {
+                crate::kernel::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+            });
+            granted |= rights;
+        }
+    }
+    granted
+}
+
+#[cfg(test)]
+mod privilege_tests {
+    use super::{CreateDisposition, CreatePrivilegeAccess};
+
+    /// # Panics
+    /// Fails if privilege planning grants unrequested rights or treats a create-only disposition as an open.
+    #[test]
+    fn privilege_rights_follow_disposition_and_explicit_requests() {
+        for disposition in [
+            CreateDisposition::Supersede,
+            CreateDisposition::Create,
+            CreateDisposition::Overwrite,
+        ] {
+            assert_eq!(
+                CreatePrivilegeAccess::for_request(disposition, 1),
+                CreatePrivilegeAccess {
+                    backup: 0,
+                    restore: 0
+                }
+            );
+        }
+        for disposition in [
+            CreateDisposition::Open,
+            CreateDisposition::OpenIf,
+            CreateDisposition::OverwriteIf,
+        ] {
+            assert_eq!(
+                CreatePrivilegeAccess::for_request(disposition, 1),
+                CreatePrivilegeAccess {
+                    backup: 1,
+                    restore: 0
+                }
+            );
+        }
+        assert_eq!(
+            CreatePrivilegeAccess::for_request(CreateDisposition::Create, 0x90000),
+            CreatePrivilegeAccess {
+                backup: 0,
+                restore: 0x90000
+            }
+        );
+        let maximum =
+            CreatePrivilegeAccess::for_request(CreateDisposition::Open, wdk_sys::MAXIMUM_ALLOWED);
+        assert_eq!(maximum.backup, 0x11200A9);
+        assert_eq!(maximum.restore, 0x11F0116);
+        assert_eq!(maximum.backup | maximum.restore, 0x11F01BF);
+    }
+}
+
 /// Expands maximum rights only for a trusted kernel-mode bypass.
 const fn trusted_kernel_access(raw: wdk_sys::ACCESS_MASK) -> wdk_sys::ACCESS_MASK {
     let mapped = map_file_generic_access(raw);
@@ -859,18 +1009,6 @@ pub(crate) enum CreateDisposition {
 }
 
 impl CreateDisposition {
-    /// Preserves the Windows disposition at the native privilege boundary.
-    #[cfg(not(test))]
-    const fn raw_disposition(self) -> u32 {
-        match self {
-            Self::Supersede => FILE_SUPERSEDE_DISPOSITION,
-            Self::Open => FILE_OPEN_DISPOSITION,
-            Self::Create => FILE_CREATE_DISPOSITION,
-            Self::OpenIf => FILE_OPEN_IF_DISPOSITION,
-            Self::Overwrite => FILE_OVERWRITE_DISPOSITION,
-            Self::OverwriteIf => FILE_OVERWRITE_IF_DISPOSITION,
-        }
-    }
     /// Decodes the disposition stored in Create.Options.
     /// # Errors
     ///
