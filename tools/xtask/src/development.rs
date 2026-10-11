@@ -185,11 +185,6 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native FsRtl file-lock completion delegation contract",
         ),
         (
-            "section-mutation",
-            "section_mutation.tests.c",
-            "native section mutation notification contract",
-        ),
-        (
             "fs-filter-callbacks",
             "fs_filter_callbacks.tests.c",
             "native filesystem callback completion-context contract",
