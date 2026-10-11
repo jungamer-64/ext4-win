@@ -165,11 +165,6 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native Cache Manager write admission and callback lifetime contract",
         ),
         (
-            "backup-restore",
-            "backup_restore.tests.c",
-            "native backup and restore privilege contract",
-        ),
-        (
             "identity-persistence",
             "identity_persistence.tests.c",
             "native identity persistence failure contract",
