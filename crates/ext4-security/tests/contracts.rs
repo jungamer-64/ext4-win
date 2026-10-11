@@ -86,6 +86,15 @@ fn bounded_identity_codec() -> Result<(), Error> {
         map: map()?,
     };
     let bytes = snapshot.encode()?;
+    assert_eq!(
+        bytes,
+        [
+            b'E', b'4', b'I', b'M', 1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+            3, 3, 3, 3, 3, 3, 3, 1, 0, 0, 0, 1, 0, 0, 0, 0xe8, 3, 0, 0, 28, 0, 0, 0, 1, 5, 0, 0, 0,
+            0, 0, 5, 21, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0xe8, 3, 0, 0, 100, 0, 0, 0,
+            16, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 0x21, 2, 0, 0,
+        ]
+    );
     assert_eq!(MappingSnapshot::decode(&bytes)?, snapshot);
     for length in 0..bytes.len() {
         assert!(

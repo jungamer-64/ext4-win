@@ -394,15 +394,24 @@ impl MappingSnapshot {
         }
         let mut bytes = Vec::new();
         reserve(&mut bytes, length)?;
-        bytes.extend_from_slice(b"E4IM\x01\0\0\0");
-        bytes.extend_from_slice(&self.generation.to_le_bytes());
-        bytes.extend_from_slice(&self.uuid.bytes());
+        // Encoding can consume only the reservation; no append may implicitly grow the buffer.
+        let mut append = |field: &[u8]| -> Result<(), Error> {
+            for byte in field {
+                bytes
+                    .push_within_capacity(*byte)
+                    .map_err(|_| Error::RecordTooLarge)?;
+            }
+            Ok(())
+        };
+        append(b"E4IM\x01\0\0\0")?;
+        append(&self.generation.to_le_bytes())?;
+        append(&self.uuid.bytes())?;
         for count in [self.map.users.len(), self.map.groups.len()] {
-            bytes.extend_from_slice(
+            append(
                 &u32::try_from(count)
                     .map_err(|_| Error::RecordTooLarge)?
                     .to_le_bytes(),
-            );
+            )?;
         }
         for (id, sid) in self
             .map
@@ -411,9 +420,9 @@ impl MappingSnapshot {
             .map(|e| (e.uid.as_u32(), e.sid))
             .chain(self.map.groups.iter().map(|e| (e.gid.as_u32(), e.sid)))
         {
-            bytes.extend_from_slice(&id.to_le_bytes());
-            bytes.extend_from_slice(&u32::from(sid.length).to_le_bytes());
-            bytes.extend_from_slice(sid.bytes());
+            append(&id.to_le_bytes())?;
+            append(&u32::from(sid.length).to_le_bytes())?;
+            append(sid.bytes())?;
         }
         Ok(bytes)
     }
