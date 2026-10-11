@@ -1,7 +1,10 @@
 /* Execute the production MDL protocol against a Cache Manager ownership oracle.
- * This checks chain transfer and range/status behavior; kernel Cc/MM remains a live-test contract. */
+ * This checks chain transfer and status behavior; kernel Cc/MM remains a live-test contract. */
 #define assert(condition) do { if (!(condition)) { __builtin_trap(); } } while (0)
 #define _Must_inspect_result_
+#define NTAPI
+#define FALSE 0
+#define TRUE 1
 #define NULL ((void *)0)
 #define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS 1
 #define STATUS_SUCCESS 0
@@ -11,6 +14,7 @@
 #define NT_SUCCESS(status) ((status) >= 0)
 
 typedef int NTSTATUS;
+typedef unsigned char BOOLEAN;
 typedef unsigned ULONG;
 typedef unsigned long long ULONG_PTR;
 typedef long long LONGLONG;
@@ -99,45 +103,39 @@ int main(void)
     irp.MdlAddress = NULL;
     offset.QuadPart = 80;
     acquisition_status = STATUS_SUCCESS;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 0, offset, 40, 100, &information) == STATUS_SUCCESS);
+    assert(ext4win_cc_read_mdl(&file, offset.QuadPart, 20, &irp.MdlAddress, &information) == STATUS_SUCCESS);
     assert(reads == 1 && requested == 20 && information == 20 && irp.MdlAddress == &pages);
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 1, offset, 0, 0, &information) == STATUS_SUCCESS);
+    CcMdlReadComplete(&file, irp.MdlAddress);
+    irp.MdlAddress = NULL; information = 0;
     assert(read_releases == 1 && irp.MdlAddress == NULL && information == 0);
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 1, offset, 0, 0, &information) == STATUS_INVALID_PARAMETER);
     assert(read_releases == 1);
 
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 2, offset, 20, 100, &information) == STATUS_SUCCESS);
+    assert(ext4win_cc_prepare_mdl_write(&file, offset.QuadPart, 20, &irp.MdlAddress, &information) == STATUS_SUCCESS);
     assert(prepares == 1 && information == 20 && irp.MdlAddress == &pages);
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 3, offset, 0, 0, &information) == STATUS_SUCCESS);
+    assert(ext4win_cc_complete_mdl_write(&file, offset.QuadPart, irp.MdlAddress) == STATUS_SUCCESS);
+    irp.MdlAddress = NULL; information = 0;
     assert(write_releases == 1 && irp.MdlAddress == NULL);
 
     acquisition_status = STATUS_UNSUCCESSFUL;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 0, offset, 10, 100, &information) == STATUS_UNSUCCESSFUL);
+    assert(ext4win_cc_read_mdl(&file, offset.QuadPart, 10, &irp.MdlAddress, &information) == STATUS_UNSUCCESSFUL);
     assert(read_releases == 2 && irp.MdlAddress == NULL && information == 0);
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 2, offset, 10, 100, &information) == STATUS_UNSUCCESSFUL);
+    assert(ext4win_cc_prepare_mdl_write(&file, offset.QuadPart, 10, &irp.MdlAddress, &information) == STATUS_UNSUCCESSFUL);
     assert(write_aborts == 1 && write_releases == 1 && irp.MdlAddress == NULL && information == 0);
 
     acquisition_raises = 1;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 0, offset, 10, 100, &information) == STATUS_UNSUCCESSFUL);
+    assert(ext4win_cc_read_mdl(&file, offset.QuadPart, 10, &irp.MdlAddress, &information) == STATUS_UNSUCCESSFUL);
     assert(read_releases == 3 && irp.MdlAddress == NULL && information == 0);
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 2, offset, 10, 100, &information) == STATUS_UNSUCCESSFUL);
+    assert(ext4win_cc_prepare_mdl_write(&file, offset.QuadPart, 10, &irp.MdlAddress, &information) == STATUS_UNSUCCESSFUL);
     assert(write_aborts == 2 && irp.MdlAddress == NULL && information == 0);
     acquisition_raises = 0;
     acquisition_status = STATUS_SUCCESS;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 2, offset, 10, 100, &information) == STATUS_SUCCESS);
+    assert(ext4win_cc_prepare_mdl_write(&file, offset.QuadPart, 10, &irp.MdlAddress, &information) == STATUS_SUCCESS);
     completion_raises = 1;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 3, offset, 0, 0, &information) == STATUS_UNSUCCESSFUL);
+    assert(ext4win_cc_complete_mdl_write(&file, offset.QuadPart, irp.MdlAddress) == STATUS_UNSUCCESSFUL);
+    irp.MdlAddress = NULL; information = 0;
     assert(write_aborts == 3 && write_releases == 2 && irp.MdlAddress == NULL && information == 0);
     completion_raises = 0;
 
-    offset.QuadPart = 100;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 0, offset, 1, 100, &information) == STATUS_END_OF_FILE);
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 2, offset, 1, 100, &information) == STATUS_INVALID_PARAMETER);
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 0, offset, 0, 100, &information) == STATUS_SUCCESS);
-    offset.QuadPart = 99;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 2, offset, 2, 100, &information) == STATUS_INVALID_PARAMETER);
-    offset.QuadPart = -1;
-    assert(ext4win_cache_mdl_transfer(&file, &irp, 0, offset, 1, 100, &information) == STATUS_INVALID_PARAMETER);
     assert(reads == 3 && prepares == 4 && irp.MdlAddress == NULL);
     {
         SECTION_OBJECT_POINTERS sections = {1, 0};

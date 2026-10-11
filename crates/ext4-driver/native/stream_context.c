@@ -1,6 +1,5 @@
 #include <ntifs.h>
 #include "executive_resource.h"
-#include "section_mutation.h"
 #include "operational_trace.h"
 
 #define EXT4WIN_STREAM_POOL_TAG ((ULONG)0x53743445UL)
@@ -11,10 +10,14 @@
          : EXCEPTION_CONTINUE_SEARCH)
 #include "cache_mdl.h"
 #include "cache_close.h"
-#include "cache_write_admission.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
+extern UCHAR NTAPI ext4win_section_phase(const VOID *state);
+extern BOOLEAN NTAPI ext4win_section_acquire_main(const VOID *state, PERESOURCE resource,
+    BOOLEAN exclusive, BOOLEAN wait, PBOOLEAN waited);
+extern BOOLEAN NTAPI ext4win_section_acquire_paging(const VOID *state, PERESOURCE resource,
+    BOOLEAN exclusive, BOOLEAN wait);
 extern UCHAR NTAPI ext4win_storage_media_state(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_close_phase(_In_ const VOID *state);
 extern NTSTATUS NTAPI ext4win_prepare_mdl_completion(_In_ const VOID *queue, _In_ PFILE_OBJECT file_object);
@@ -87,7 +90,7 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     PFILE_LOCK ByteRangeLocks;
     PVOID AePushLock;
     REGHANDLE TraceRegistrationHandle;
-    EXT4WIN_SECTION_MUTATION SectionMutation;
+    const VOID *SectionState;
     volatile LONG MetadataValid;
     volatile LONG DeletePending;
     ULONG Signature;
@@ -180,71 +183,6 @@ ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 }
 
 static BOOLEAN
-ext4win_stream_acquire_paging_after_section_mutation(
-    _In_ PEXT4WIN_STREAM_CONTEXT stream,
-    _In_ BOOLEAN exclusive,
-    _In_ BOOLEAN wait)
-{
-    for (;;) {
-        while (ext4win_section_mutation_state(&stream->SectionMutation) == EXT4WIN_SECTION_MUTATION_SEALED) {
-            if (!wait) {
-                return FALSE;
-            }
-            (VOID)KeWaitForSingleObject(
-                &stream->SectionMutation.Released,
-                Executive,
-                KernelMode,
-                FALSE,
-                NULL);
-        }
-        if (exclusive) {
-            if (wait) {
-                (VOID)ext4win_acquire_resource_exclusive(&stream->PagingIoResource, TRUE);
-            }
-            else if (!ext4win_acquire_resource_exclusive(&stream->PagingIoResource, FALSE)) {
-                return FALSE;
-            }
-        }
-        else {
-            if (wait) {
-                (VOID)ext4win_acquire_resource_shared(&stream->PagingIoResource, TRUE);
-            }
-            else if (!ext4win_acquire_resource_shared(&stream->PagingIoResource, FALSE)) {
-                return FALSE;
-            }
-        }
-        if (ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_SEALED) {
-            return TRUE;
-        }
-        ext4win_release_resource(&stream->PagingIoResource);
-        if (!wait) {
-            return FALSE;
-        }
-    }
-}
-
-static VOID
-ext4win_stream_acquire_main_after_sealed_section_mutation(
-    _In_ PEXT4WIN_STREAM_CONTEXT stream)
-{
-    for (;;) {
-        while (ext4win_section_mutation_state(&stream->SectionMutation) == EXT4WIN_SECTION_MUTATION_SEALED) {
-            (VOID)KeWaitForSingleObject(
-                &stream->SectionMutation.Released,
-                Executive,
-                KernelMode,
-                FALSE,
-                NULL);
-        }
-        ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
-        if (ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_SEALED) {
-            return;
-        }
-        ext4win_release_resource(&stream->MainResource);
-    }
-}
-
-static BOOLEAN
 NTAPI
 ext4win_acquire_for_lazy_write(
     _In_ PVOID context,
@@ -256,7 +194,7 @@ ext4win_acquire_for_lazy_write(
         return FALSE;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE);
-    if (!ext4win_stream_acquire_paging_after_section_mutation(stream, TRUE, wait)) {
+    if (!ext4win_section_acquire_paging(stream->SectionState, &stream->PagingIoResource, TRUE, wait)) {
         ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_CANT_WAIT);
         return FALSE;
     }
@@ -286,29 +224,7 @@ ext4win_acquire_for_read_ahead(
     if (stream == NULL) {
         return FALSE;
     }
-    for (;;) {
-        while (ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_IDLE) {
-            if (!wait) {
-                return FALSE;
-            }
-            (VOID)KeWaitForSingleObject(
-                &stream->SectionMutation.Released,
-                Executive,
-                KernelMode,
-                FALSE,
-                NULL);
-        }
-        if (!ext4win_acquire_resource_shared(&stream->MainResource, wait)) {
-            return FALSE;
-        }
-        if (ext4win_section_mutation_state(&stream->SectionMutation) == EXT4WIN_SECTION_MUTATION_IDLE) {
-            return TRUE;
-        }
-        ext4win_release_resource(&stream->MainResource);
-        if (!wait) {
-            return FALSE;
-        }
-    }
+    return ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, FALSE, wait, NULL);
 }
 
 static VOID
@@ -374,7 +290,7 @@ ext4win_stream_fast_io_candidate(
     *stream_out = stream;
     return ext4win_fast_io_admit(file_object->Flags, file_object->PrivateCacheMap != NULL,
         ext4win_storage_media_state(volume->RustState), ext4win_storage_close_phase(volume->RustState),
-        (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation));
+        (UCHAR)ext4win_section_phase(stream->SectionState));
 }
 
 _Success_(return != FALSE)
@@ -396,38 +312,6 @@ ext4win_stream_section_callback_stream(
     }
     *stream_out = stream;
     return TRUE;
-}
-
-static BOOLEAN
-ext4win_stream_acquire_main_after_section_mutation(
-    _In_ PEXT4WIN_STREAM_CONTEXT stream,
-    _In_ BOOLEAN exclusive)
-{
-    BOOLEAN waited;
-
-    waited = FALSE;
-    for (;;) {
-        while (ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_IDLE) {
-            waited = TRUE;
-            (VOID)KeWaitForSingleObject(
-                &stream->SectionMutation.Released,
-                Executive,
-                KernelMode,
-                FALSE,
-                NULL);
-        }
-        if (exclusive) {
-            ext4win_acquire_resource_exclusive(&stream->MainResource, TRUE);
-        }
-        else {
-            ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
-        }
-        if (ext4win_section_mutation_state(&stream->SectionMutation) == EXT4WIN_SECTION_MUTATION_IDLE) {
-            return waited;
-        }
-        waited = TRUE;
-        ext4win_release_resource(&stream->MainResource);
-    }
 }
 
 #include "fast_io_transfer.h"
@@ -472,6 +356,7 @@ ext4win_stream_create(
     _In_opt_ const EXT4WIN_PUBLISHED_STREAM_METADATA *metadata,
     _In_ REGHANDLE trace_registration_handle,
     _In_ PVOID rust_state,
+    _In_ const VOID *section_state,
     _Outptr_ PVOID *stream_header_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
@@ -483,7 +368,7 @@ ext4win_stream_create(
     }
     *stream_header_out = NULL;
     metadata_valid = FALSE;
-    if ((rust_state == NULL) || ((kind != 1) && (kind != 2))) {
+    if ((rust_state == NULL) || (section_state == NULL) || ((kind != 1) && (kind != 2))) {
         return STATUS_INVALID_PARAMETER;
     }
     if ((kind == 2) && (metadata != NULL)) {
@@ -508,6 +393,7 @@ ext4win_stream_create(
     RtlZeroMemory(stream, sizeof(*stream));
     stream->TraceRegistrationHandle = trace_registration_handle;
     stream->RustState = rust_state;
+    stream->SectionState = section_state;
 
     status = ExInitializeResourceLite(&stream->MainResource);
     if (!NT_SUCCESS(status)) {
@@ -524,7 +410,6 @@ ext4win_stream_create(
     }
     stream->PagingResourceInitialized = TRUE;
 
-    ext4win_section_mutation_initialize(&stream->SectionMutation);
 
     stream->AePushLock = FsRtlAllocateAePushLock(NonPagedPoolNx, EXT4WIN_STREAM_POOL_TAG);
     if (stream->AePushLock == NULL) {
@@ -910,7 +795,7 @@ ext4win_stream_cache_initialize(
     if (!ext4win_stream_ordinary_io_available(stream)) { return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED; }
 
     status = STATUS_SUCCESS;
-    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
     if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
         return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
@@ -942,135 +827,6 @@ _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
-ext4win_stream_cache_read(
-    _In_ PVOID stream_header,
-    _Inout_ PFILE_OBJECT file_object,
-    _In_ LONGLONG offset,
-    _In_ ULONG length,
-    _Out_writes_bytes_(length) PVOID buffer,
-    _Out_ ULONG_PTR *information_out)
-{
-    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-    IO_STATUS_BLOCK io_status;
-    LARGE_INTEGER file_offset;
-    LONGLONG current_file_size;
-    NTSTATUS status;
-
-    if (!ext4win_stream_matches_file_object(stream, file_object) ||
-        (offset < 0) || ((length != 0) && (buffer == NULL)) ||
-        (information_out == NULL)) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    *information_out = 0;
-    status = ext4win_stream_cache_initialize(stream_header, file_object);
-    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHED_READ);
-    if (!NT_SUCCESS(status) || (length == 0)) {
-        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_READ, status);
-        return status;
-    }
-
-    file_offset.QuadPart = offset;
-    io_status.Status = STATUS_SUCCESS;
-    io_status.Information = 0;
-    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
-    if (!ext4win_stream_ordinary_io_available(stream)) {
-        ext4win_release_resource(&stream->MainResource);
-        return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
-    }
-    ExAcquireFastMutex(&stream->HeaderMutex);
-    current_file_size = stream->Header.FileSize.QuadPart;
-    ExReleaseFastMutex(&stream->HeaderMutex);
-    __try {
-        if ((offset > current_file_size) ||
-            ((LONGLONG)length > (current_file_size - offset))) {
-            /* A size gate published after this read was planned; resolve against the new epoch. */
-            status = STATUS_RETRY;
-        }
-        else {
-            if (!CcCopyRead(file_object, &file_offset, length, TRUE, buffer, &io_status)) {
-                status = STATUS_CANT_WAIT;
-            }
-            else {
-                status = io_status.Status;
-                *information_out = io_status.Information;
-            }
-        }
-    }
-    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
-        status = GetExceptionCode();
-    }
-    ext4win_release_resource(&stream->MainResource);
-    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_READ, status);
-    return status;
-}
-
-_IRQL_requires_(PASSIVE_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-NTAPI
-ext4win_stream_cache_write(
-    _In_ PVOID stream_header,
-    _Inout_ PFILE_OBJECT file_object,
-    _In_ LONGLONG offset,
-    _In_ ULONG length,
-    _In_reads_bytes_(length) PVOID buffer)
-{
-    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-    LARGE_INTEGER file_offset;
-    LONGLONG current_file_size;
-    NTSTATUS status;
-    EXT4WIN_CACHE_WRITE_ADMISSION admission = EXT4WIN_CACHE_WRITE_FIRST;
-
-    if (!ext4win_stream_matches_file_object(stream, file_object) ||
-        (offset < 0) || ((length != 0) && (buffer == NULL))) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    status = ext4win_stream_cache_initialize(stream_header, file_object);
-    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHED_WRITE);
-    if (!NT_SUCCESS(status) || (length == 0)) {
-        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_WRITE, status);
-        return status;
-    }
-
-retry_admission:
-    ext4win_cache_wait_for_write(file_object, length, &admission);
-    file_offset.QuadPart = offset;
-    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
-    if (!ext4win_stream_ordinary_io_available(stream)) {
-        ext4win_release_resource(&stream->MainResource);
-        return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
-    }
-    if (!ext4win_cache_try_write(file_object, length, FALSE, &admission)) {
-        ext4win_release_resource(&stream->MainResource);
-        goto retry_admission;
-    }
-    ExAcquireFastMutex(&stream->HeaderMutex);
-    current_file_size = stream->Header.FileSize.QuadPart;
-    ExReleaseFastMutex(&stream->HeaderMutex);
-    __try {
-        if ((offset > current_file_size) ||
-            ((LONGLONG)length > (current_file_size - offset))) {
-            /* A size gate published after this write was planned; resolve against the new epoch. */
-            status = STATUS_RETRY;
-        }
-        else {
-            status = CcCopyWrite(file_object, &file_offset, length, TRUE, buffer)
-                ? STATUS_SUCCESS
-                : STATUS_CANT_WAIT;
-        }
-    }
-    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
-        status = GetExceptionCode();
-    }
-    ext4win_release_resource(&stream->MainResource);
-    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHED_WRITE, status);
-    return status;
-}
-
-_IRQL_requires_max_(APC_LEVEL)
-_Must_inspect_result_
-NTSTATUS
-NTAPI
 ext4win_stream_cache_flush(_In_ PVOID stream_header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
@@ -1089,7 +845,7 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
     status = STATUS_SUCCESS;
-    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, FALSE);
+    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, FALSE, TRUE, NULL);
     if (!ext4win_stream_storage_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
         return STATUS_DEVICE_REMOVED;
@@ -1117,7 +873,7 @@ ext4win_stream_cache_close_writeback(_In_ PVOID stream_header)
     NTSTATUS status = STATUS_SUCCESS;
     if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
     if (!ext4win_stream_storage_available(stream)) { return STATUS_DEVICE_REMOVED; }
-    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
     __try {
         if (!ext4win_stream_storage_available(stream)) { status = STATUS_DEVICE_REMOVED; }
         else {
@@ -1149,7 +905,7 @@ ext4win_stream_cache_coherency_flush_and_purge(_In_ PVOID stream_header)
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
     status = STATUS_SUCCESS;
-    waited = ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, &waited);
     if (!ext4win_stream_storage_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
         return STATUS_DEVICE_REMOVED;
@@ -1300,7 +1056,7 @@ ext4win_acquire_fast_io_query_stream(
     if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
-        (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation))) { return FALSE; }
+        (UCHAR)ext4win_section_phase(stream->SectionState))) { return FALSE; }
     if (wait) {
         (VOID)ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
     }
@@ -1310,7 +1066,7 @@ ext4win_acquire_fast_io_query_stream(
     if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
-        (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation))) {
+        (UCHAR)ext4win_section_phase(stream->SectionState))) {
         ext4win_release_resource(&stream->MainResource);
         return FALSE;
     }
@@ -1895,7 +1651,7 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     if ((stream->SectionObjects.DataSectionObject != NULL) ||
         (stream->SectionObjects.SharedCacheMap != NULL) ||
         (stream->SectionObjects.ImageSectionObject != NULL) ||
-        (ext4win_section_mutation_state(&stream->SectionMutation) != EXT4WIN_SECTION_MUTATION_IDLE)) {
+        (ext4win_section_phase(stream->SectionState) != 0)) {
         return STATUS_DEVICE_BUSY;
     }
 
@@ -1959,14 +1715,6 @@ PVOID NTAPI ext4win_stream_mdl_queue(_In_ PFILE_OBJECT file)
     return stream->RustState;
 }
 
-NTSTATUS NTAPI ext4win_complete_cache_mdl(_Inout_ PIRP irp, _In_ ULONG action)
-{
-    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
-    ULONG_PTR information;
-    return ext4win_cache_mdl_transfer(stack->FileObject, irp, action,
-        stack->Parameters.Read.ByteOffset, 0, 0, &information);
-}
-
 /* Fixed observation only; Rust decides whether this callback may select Fast I/O. */
 BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFER_OBSERVATION *output)
 {
@@ -1983,7 +1731,7 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     output->Cached = file->PrivateCacheMap != NULL;
     output->Media = ext4win_storage_media_state(volume->RustState);
     output->Close = ext4win_storage_close_phase(volume->RustState);
-    output->Mutation = (UCHAR)ext4win_section_mutation_state(&stream->SectionMutation);
+    output->Mutation = (UCHAR)ext4win_section_phase(stream->SectionState);
     output->ReadAccess = file->ReadAccess;
     output->WriteAccess = file->WriteAccess;
     return TRUE;
@@ -2001,4 +1749,82 @@ BOOLEAN NTAPI ext4win_fast_io_check_locks(PFILE_OBJECT file, LONGLONG offset, LO
         &native_length, key, file, PsGetCurrentProcess())
         : FsRtlFastCheckLockForWrite(stream->ByteRangeLocks, &file_offset,
         &native_length, key, file, PsGetCurrentProcess());
+}
+
+/* These borrows are valid only while the Rust stream/callback owner retains the header.
+ * Resource ownership and operation policy are established by Rust before Cc/MM calls. */
+PERESOURCE NTAPI ext4win_stream_main_resource(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    return stream == NULL ? NULL : &stream->MainResource;
+}
+PERESOURCE NTAPI ext4win_stream_paging_resource(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    return stream == NULL ? NULL : &stream->PagingIoResource;
+}
+const VOID * NTAPI ext4win_stream_storage_admission(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    PEXT4WIN_STREAM_CONTEXT volume;
+    if (stream == NULL) { return NULL; }
+    volume = stream->Kind == 2 ? stream : stream->VolumeStream;
+    return volume == NULL ? NULL : volume->RustState;
+}
+ULONG NTAPI ext4win_stream_section_residency(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    return (stream->SectionObjects.DataSectionObject != NULL ? 1UL : 0UL)
+        | (stream->SectionObjects.SharedCacheMap != NULL ? 2UL : 0UL)
+        | (stream->SectionObjects.ImageSectionObject != NULL ? 4UL : 0UL);
+}
+NTSTATUS NTAPI ext4win_mm_check_truncation(PVOID header, LONGLONG size, PBOOLEAN allowed)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    LARGE_INTEGER bound;
+    bound.QuadPart = size;
+    *allowed = FALSE;
+    __try { *allowed = MmCanFileBeTruncated(&stream->SectionObjects, &bound); }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
+    return STATUS_SUCCESS;
+}
+NTSTATUS NTAPI ext4win_mm_flush_image(PVOID header, MMFLUSH_TYPE operation, PBOOLEAN flushed)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    *flushed = FALSE;
+    __try { *flushed = MmFlushImageSection(&stream->SectionObjects, operation); }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
+    return STATUS_SUCCESS;
+}
+NTSTATUS NTAPI ext4win_cc_purge_sections(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    IO_STATUS_BLOCK status = {0};
+    __try { CcCoherencyFlushAndPurgeCache(&stream->SectionObjects, NULL, 0, &status, 0); }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
+    return status.Status;
+}
+
+/* Rust has retained MainResource and selected an in-EOF transfer. External mappings and
+ * Cc status exceptions remain wholly inside these synchronous native boundaries. */
+NTSTATUS NTAPI ext4win_cc_copy_read(PFILE_OBJECT file, LONGLONG position, ULONG length,
+    PVOID buffer, ULONG_PTR *information)
+{
+    LARGE_INTEGER offset;
+    IO_STATUS_BLOCK status = {0};
+    offset.QuadPart = position;
+    *information = 0;
+    __try {
+        if (!CcCopyRead(file, &offset, length, TRUE, buffer, &status)) { return STATUS_CANT_WAIT; }
+        *information = status.Information;
+        return status.Status;
+    }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
+}
+NTSTATUS NTAPI ext4win_cc_copy_write(PFILE_OBJECT file, LONGLONG position, ULONG length, PVOID buffer)
+{
+    LARGE_INTEGER offset;
+    offset.QuadPart = position;
+    __try { return CcCopyWrite(file, &offset, length, TRUE, buffer) ? STATUS_SUCCESS : STATUS_CANT_WAIT; }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
 }

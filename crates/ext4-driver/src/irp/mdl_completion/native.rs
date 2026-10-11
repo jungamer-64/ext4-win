@@ -12,7 +12,7 @@ use crate::{
 };
 use alloc::boxed::Box;
 use core::{cell::UnsafeCell, ffi::c_void, marker::PhantomPinned, pin::Pin, ptr::NonNull};
-use wdk_sys::{FILE_OBJECT, NTSTATUS, PFILE_OBJECT, PIRP};
+use wdk_sys::{FILE_OBJECT, NTSTATUS, PFILE_OBJECT};
 
 /// An independently owned native reference pins the FILE_OBJECT and its stream-owned inbox.
 struct FileObjectReference {
@@ -295,7 +295,7 @@ unsafe extern "C" fn worker(_device: wdk_sys::PDEVICE_OBJECT, context: *mut c_vo
         };
         let status = unsafe {
             // SAFETY: The worker exclusively owns the chain; native SEH consumes or aborts it.
-            ext4win_complete_cache_mdl(irp.as_ptr(), action.action())
+            complete_mdl_notification(&irp, action)
         };
         let completion = if status >= wdk_sys::STATUS_SUCCESS {
             IrpCompletion::EMPTY
@@ -343,5 +343,66 @@ unsafe impl Sync for MdlCompletionQueue {}
     reason = "native code only consumes Cc chains under the required SEH boundary"
 )]
 unsafe extern "system" {
-    fn ext4win_complete_cache_mdl(irp: PIRP, action: super::super::MdlAction) -> NTSTATUS;
+    fn ext4win_cc_complete_mdl_write(
+        file: PFILE_OBJECT,
+        offset: i64,
+        chain: wdk_sys::PMDL,
+    ) -> NTSTATUS;
+}
+
+/// Consumes a queued notification's chain once, after selecting its native release operation.
+/// # Safety
+/// The worker exclusively retains irp and its initialized completion stack at PASSIVE_LEVEL.
+#[expect(
+    unsafe_code,
+    reason = "worker ownership retains the IRP and native Cc chain through consuming completion"
+)]
+unsafe fn complete_mdl_notification(irp: &KernelIrp, action: MdlCompletion) -> NTSTATUS {
+    let stack = unsafe {
+        // SAFETY: The owning worker retains this IRP's initialized completion stack.
+        wdk_sys::ntddk::IoGetCurrentIrpStackLocation(irp.as_ptr())
+    };
+    let file = unsafe {
+        // SAFETY: The queued IRP retains its completion FILE_OBJECT.
+        (*stack).FileObject
+    };
+    let chain = unsafe {
+        // SAFETY: This worker exclusively owns the initialized chain field.
+        (*irp.as_ptr()).MdlAddress
+    };
+    if chain.is_null() {
+        return wdk_sys::STATUS_INVALID_PARAMETER;
+    }
+    let status = match action {
+        MdlCompletion::Read => {
+            unsafe {
+                // SAFETY: This notification owns the non-null Cc read chain and retained file.
+                wdk_sys::ntddk::CcMdlReadComplete(file, chain);
+            }
+            wdk_sys::STATUS_SUCCESS
+        }
+        MdlCompletion::Write => {
+            let parameters = unsafe {
+                // SAFETY: The owning IRP retains this initialized completion parameter union.
+                &(*stack).Parameters
+            };
+            let write = unsafe {
+                // SAFETY: The typed write-completion notification selects the initialized Write arm.
+                &parameters.Write
+            };
+            let offset = unsafe {
+                // SAFETY: Windows uses the initialized QuadPart offset arm in this completion stack.
+                write.ByteOffset.QuadPart
+            };
+            unsafe {
+                // SAFETY: Native SEH consumes or aborts this uniquely owned chain on every result.
+                ext4win_cc_complete_mdl_write(file, offset, chain)
+            }
+        }
+    };
+    unsafe {
+        // SAFETY: Chain ownership was consumed even when write completion returned an error.
+        (*irp.as_ptr()).MdlAddress = core::ptr::null_mut();
+    }
+    status
 }

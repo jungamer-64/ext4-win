@@ -15,7 +15,7 @@ ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
     if (!ext4win_stream_section_callback_stream(data->FileObject, &stream)) {
         return STATUS_SUCCESS;
     }
-    (VOID)ext4win_stream_acquire_main_after_section_mutation(stream, TRUE);
+    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
     if ((data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection)
         && !ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
@@ -54,7 +54,7 @@ ext4win_pre_acquire_mod_write(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOI
         return STATUS_INVALID_PARAMETER;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE);
-    if (!ext4win_stream_acquire_paging_after_section_mutation(stream, FALSE, TRUE)) {
+    if (!ext4win_section_acquire_paging(stream->SectionState, &stream->PagingIoResource, FALSE, TRUE)) {
         ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_CANT_WAIT);
         return STATUS_CANT_WAIT;
     }
@@ -96,7 +96,7 @@ ext4win_pre_acquire_cc_flush(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID
     if (!ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ext4win_stream_acquire_main_after_sealed_section_mutation(stream);
+    (VOID)ext4win_section_acquire_paging(stream->SectionState, &stream->MainResource, FALSE, TRUE);
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 

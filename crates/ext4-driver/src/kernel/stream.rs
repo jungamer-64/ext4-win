@@ -1,5 +1,8 @@
 //! Native Windows stream-header ownership boundary.
 
+#[cfg(not(test))]
+use super::section::SectionResource;
+use super::section::{SealedSectionMutation, SectionMutationOperation, SectionSynchronization};
 use super::storage_admission::{ClosePhase, MediaState, StorageAdmission};
 #[cfg(not(test))]
 use alloc::boxed::Box;
@@ -22,7 +25,7 @@ use wdk_sys::{STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
 
 #[cfg(not(test))]
 use crate::kernel::fatal::KernelWideInconsistency;
-use crate::kernel::operational_trace::OperationalTrace;
+use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::NativeAllocation;
 
@@ -210,6 +213,10 @@ fn round_up_allocation(bytes: u64, cluster_size: ClusterSize) -> DriverResult<u6
 
 /// Opaque native `FSRTL_ADVANCED_FCB_HEADER` plus its resources, sections, and oplock.
 pub(crate) struct StreamContext {
+    /// Payload-free trace capability retained by the driver-lifetime provider owner.
+    trace: OperationalTrace,
+    /// Sole section admission authority, retained by callbacks and unique mutation permits.
+    sections: crate::memory::DriverShared<SectionSynchronization>,
     /// Immutable ownership domain validated by the native boundary.
     runtime: StreamRuntime,
     /// Nonpaged allocation whose leading bytes are the advanced header.
@@ -595,6 +602,7 @@ impl StreamContext {
         metadata: Option<StreamMetadata>,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
+        let sections = SectionSynchronization::try_new()?;
         let runtime = match kind {
             StreamOwnerKind::Volume => StreamRuntime::Volume(NativeAllocation::from_box(
                 crate::memory::boxed_try_with(|| Ok(StorageAdmission::new()))?,
@@ -624,20 +632,27 @@ impl StreamContext {
                     metadata_pointer,
                     trace.handle(),
                     runtime.as_ptr(),
+                    core::ptr::from_ref(sections.get()).cast(),
                     core::ptr::addr_of_mut!(header),
                 )
             };
             native_status(status)?;
             let header = NonNull::new(header).ok_or(DriverError::InternalInvariantViolation)?;
-            Ok(Self { runtime, header })
+            Ok(Self {
+                trace,
+                sections,
+                runtime,
+                header,
+            })
         }
         #[cfg(test)]
         {
-            let _trace = trace;
             if (kind == StreamOwnerKind::Volume) && metadata.is_some() {
                 return Err(DriverError::InternalInvariantViolation);
             }
             Ok(Self {
+                trace,
+                sections,
                 runtime,
                 owner: AtomicPtr::new(core::ptr::null_mut()),
                 control_device: AtomicPtr::new(core::ptr::null_mut()),
@@ -1150,21 +1165,38 @@ impl StreamContext {
             .ok_or(DriverError::InternalInvariantViolation)?;
         #[cfg(not(test))]
         {
-            let mut information = 0_usize;
-            let status = unsafe {
-                // SAFETY: The sealed transfer borrows its completion owner, bounds this writable
-                // mapping, and retains the FILE_OBJECT through synchronous native return.
-                ext4win_stream_cache_read(
-                    self.header.as_ptr(),
-                    transfer.file_object().as_ptr(),
+            self.trace.record(
+                OperationalPath::CachedRead,
+                STATUS_SUCCESS,
+                OperationalOutcome::Selected,
+            );
+            let result = (|| {
+                self.initialize_cache(transfer.file_object())?;
+                let _main = self.main_resource()?.ordinary_shared(self.sections.get());
+                self.ensure_ordinary_io()?;
+                super::cache_transfer::validate_copy_range(
                     _offset,
                     _length,
-                    _output.as_ptr().cast(),
-                    core::ptr::addr_of_mut!(information),
-                )
-            };
-            cache_status(status)?;
-            Ok(information)
+                    self.sizes()?.file_size(),
+                )?;
+                let mut information = 0;
+                let status = unsafe {
+                    // SAFETY: The sealed transfer retains its writable mapping and file; Rust
+                    // selected the current in-EOF range under MainResource before the SEH call.
+                    ext4win_cc_copy_read(
+                        transfer.file_object().as_ptr(),
+                        _offset,
+                        _length,
+                        _output.as_ptr().cast(),
+                        &mut information,
+                    )
+                };
+                cache_status(status)?;
+                Ok(information)
+            })();
+            self.trace
+                .record_result(OperationalPath::CachedRead, &result);
+            result
         }
         #[cfg(test)]
         Err(DriverError::NotSupported)
@@ -1191,21 +1223,64 @@ impl StreamContext {
             .ok_or(DriverError::InternalInvariantViolation)?;
         #[cfg(not(test))]
         {
-            let status = unsafe {
-                // SAFETY: The sealed transfer borrows its completion owner, bounds this readable
-                // mapping, and retains the FILE_OBJECT through synchronous native return.
-                ext4win_stream_cache_write(
-                    self.header.as_ptr(),
-                    transfer.file_object().as_ptr(),
-                    _offset,
-                    _length,
-                    _input.as_ptr().cast(),
-                )
-            };
-            cache_status(status)
+            self.trace.record(
+                OperationalPath::CachedWrite,
+                STATUS_SUCCESS,
+                OperationalOutcome::Selected,
+            );
+            let result = (|| {
+                self.initialize_cache(transfer.file_object())?;
+                let mut admission = super::cache_transfer::WriteAdmission::new();
+                loop {
+                    unsafe {
+                        // SAFETY: The passive work owner retains file while backpressure waits outside resources.
+                        admission.wait(transfer.file_object().as_ptr(), _length);
+                    }
+                    let main = self.main_resource()?.ordinary_shared(self.sections.get());
+                    self.ensure_ordinary_io()?;
+                    if !unsafe {
+                        // SAFETY: The same retained request rechecks Cc without waiting under MainResource.
+                        admission.accepted(transfer.file_object().as_ptr(), _length, false)
+                    } {
+                        drop(main);
+                        continue;
+                    }
+                    super::cache_transfer::validate_copy_range(
+                        _offset,
+                        _length,
+                        self.sizes()?.file_size(),
+                    )?;
+                    let status = unsafe {
+                        // SAFETY: The sealed transfer retains its readable mapping and file; current EOF
+                        // cannot change under MainResource, and C owns expected SEH status capture.
+                        ext4win_cc_copy_write(
+                            transfer.file_object().as_ptr(),
+                            _offset,
+                            _length,
+                            _input.as_ptr().cast(),
+                        )
+                    };
+                    return cache_status(status);
+                }
+            })();
+            self.trace
+                .record_result(OperationalPath::CachedWrite, &result);
+            result
         }
         #[cfg(test)]
         Err(DriverError::NotSupported)
+    }
+
+    /// Establishes a private cache map before taking the ordinary transfer resource.
+    /// # Errors
+    /// Returns the exact native initialization or admission failure.
+    #[cfg(not(test))]
+    fn initialize_cache(&self, file: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResult<()> {
+        let status = unsafe {
+            // SAFETY: The cache lease retains this exact stream and FILE_OBJECT through Cc initialization.
+            ext4win_stream_cache_initialize(self.header.as_ptr(), file.as_ptr())
+        };
+        cache_status(status)
     }
 
     /// Executes an already captured MDL IRP without borrowing requestor byte memory.
@@ -1218,27 +1293,108 @@ impl StreamContext {
         &self,
         _file_object: NonNull<wdk_sys::FILE_OBJECT>,
         _irp: NonNull<wdk_sys::IRP>,
-        _action: crate::irp::MdlTransfer,
+        _transfer: crate::irp::MdlTransferRequest,
     ) -> DriverResult<usize> {
         #[cfg(not(test))]
         {
-            let mut information = 0;
+            self.ensure_storage()?;
+            let chain = unsafe {
+                // SAFETY: The suspended operation exclusively retains this IRP through native work.
+                core::ptr::addr_of_mut!((*_irp.as_ptr()).MdlAddress)
+            };
+            if !unsafe {
+                // SAFETY: The sole worker reads its initialized chain linkage before page acquisition.
+                chain.read()
+            }
+            .is_null()
+            {
+                return Err(DriverError::InvalidParameter);
+            }
+            self.initialize_cache(_file_object)?;
+            if _transfer.length() == 0 {
+                return Ok(0);
+            }
             let status = unsafe {
-                // SAFETY: The cache lease retains the stream and FILE_OBJECT. The suspended
-                // operation exclusively owns this IRP until the worker publishes its result.
-                ext4win_stream_cache_mdl(
-                    self.header.as_ptr(),
-                    _file_object.as_ptr(),
-                    _irp.as_ptr(),
-                    _action.action(),
-                    core::ptr::addr_of_mut!(information),
-                )
+                // SAFETY: The retained acquisition IRP owns file/stream lifetime before pages are exposed.
+                ext4win_prepare_mdl_completion(self.runtime.as_ptr(), _file_object.as_ptr())
             };
             cache_status(status)?;
-            Ok(information)
+            let mut admission = super::cache_transfer::WriteAdmission::new();
+            loop {
+                if _transfer.action() == crate::irp::MdlTransfer::Write {
+                    unsafe {
+                        // SAFETY: The passive owner retains file; no filesystem resource is held while waiting.
+                        admission.wait(_file_object.as_ptr(), _transfer.length());
+                    }
+                }
+                let _main = self.main_resource()?.ordinary_shared(self.sections.get());
+                self.ensure_ordinary_io()?;
+                if _transfer.action() == crate::irp::MdlTransfer::Write
+                    && !unsafe {
+                        // SAFETY: The same retained request rechecks admission without waiting under MainResource.
+                        admission.accepted(_file_object.as_ptr(), _transfer.length(), false)
+                    }
+                {
+                    drop(_main);
+                    continue;
+                }
+                let length =
+                    super::cache_transfer::bounded_length(_transfer, self.sizes()?.file_size())?;
+                if length == 0 {
+                    return Ok(0);
+                }
+                let offset = i64::try_from(_transfer.start().bytes())
+                    .map_err(|_| DriverError::InvalidParameter)?;
+                let mut information = 0;
+                let status = match _transfer.action() {
+                    crate::irp::MdlTransfer::Read => unsafe {
+                        // SAFETY: Current-EOF selection holds MainResource; C owns partial read-chain cleanup.
+                        ext4win_cc_read_mdl(
+                            _file_object.as_ptr(),
+                            offset,
+                            length,
+                            chain,
+                            &mut information,
+                        )
+                    },
+                    crate::irp::MdlTransfer::Write => unsafe {
+                        // SAFETY: Current-EOF selection holds MainResource; C owns partial write-chain abort.
+                        ext4win_cc_prepare_mdl_write(
+                            _file_object.as_ptr(),
+                            offset,
+                            length,
+                            chain,
+                            &mut information,
+                        )
+                    },
+                };
+                cache_status(status)?;
+                return Ok(information);
+            }
         }
         #[cfg(test)]
         Err(DriverError::NotSupported)
+    }
+
+    /// Rejects ordinary cache acquisition independently of lower media presence.
+    /// # Errors
+    /// Returns removal, terminal filesystem close or a missing bound volume invariant.
+    #[cfg(not(test))]
+    fn ensure_ordinary_io(&self) -> DriverResult<()> {
+        self.ensure_storage()?;
+        let address = unsafe {
+            // SAFETY: Bound stream lifetime retains the volume's sole admission allocation.
+            ext4win_stream_storage_admission(self.header.as_ptr())
+        };
+        let state = unsafe {
+            // SAFETY: Successful storage validation established this immutable, retained allocation identity.
+            &*address.cast::<StorageAdmission>()
+        };
+        if state.close() == ClosePhase::Open {
+            Ok(())
+        } else {
+            Err(DriverError::VolumeDismounted)
+        }
     }
 
     /// Flushes all dirty cached pages for this stream and observes the Cache Manager result.
@@ -1316,128 +1472,186 @@ impl StreamContext {
         }
     }
 
-    /// Flushes the cache and blocks new cache/section acquisition until a size commit publishes.
+    /// Acquires one operation-specific, uniquely owned section gate through committed publication.
     /// # Errors
-    ///
-    /// Returns the exact Cache Manager status or mapped-view truncation conflict.
-    pub(crate) fn begin_size_change(&self, new_file_size: i64) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live stream and the caller retains it through gate release.
-                ext4win_stream_begin_size_change(self.header.as_ptr(), new_file_size)
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            let _: i64 = new_file_size;
-            Ok(())
-        }
-    }
-
-    /// Releases one successfully acquired size-change cache/section gate.
-    /// # Errors
-    ///
-    /// Returns an invariant native status if no matching gate remains active.
-    pub(crate) fn end_size_change(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The matching successful begin call retained this same stream identity.
-                ext4win_stream_end_size_change(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
-    }
-
-    /// Flushes image/cache sections and blocks new section acquisition until deletion publishes.
-    /// # Errors
-    ///
-    /// Returns cannot-delete while an image or mapped data section cannot be removed. A flushed
-    /// shared cache map may finish its driver-owned delayed close after namespace publication.
-    pub(crate) fn begin_delete(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live stream and the caller retains it through gate release.
-                ext4win_stream_begin_delete(self.header.as_ptr())
-            };
-            if status == wdk_sys::STATUS_CANNOT_DELETE {
-                Err(DriverError::CannotDelete)
-            } else {
-                cache_status(status)
+    /// Returns invalid execution context, storage removal, mapped/image conflict or the exact Cc/MM failure.
+    pub(crate) fn prepare_section_mutation(
+        &self,
+        operation: SectionMutationOperation,
+    ) -> DriverResult<SealedSectionMutation> {
+        self.trace.record(
+            OperationalPath::MappedSection,
+            wdk_sys::STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
+        let result = (|| {
+            #[cfg(not(test))]
+            if unsafe {
+                // SAFETY: The current thread's scalar IRQL is observed before any blocking preparation.
+                wdk_sys::ntddk::KeGetCurrentIrql()
+            } != 0
+            {
+                return Err(DriverError::CacheManagerFailure(
+                    wdk_sys::STATUS_INVALID_DEVICE_STATE,
+                ));
             }
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
-    }
-
-    /// Releases one successfully acquired stream-deletion section gate.
-    /// # Errors
-    ///
-    /// Returns an invariant native status if no matching deletion gate remains active.
-    pub(crate) fn end_delete(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The matching successful begin call retained this same stream identity.
-                ext4win_stream_end_delete(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
-    }
-
-    /// Flushes an executable image and blocks new section acquisition through write-open publish.
-    /// # Errors
-    ///
-    /// Returns sharing-violation while an executable image cannot be removed, or the exact native
-    /// synchronization failure.
-    pub(crate) fn begin_write_open(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live stream and the caller retains it through gate release.
-                ext4win_stream_begin_write_open(self.header.as_ptr())
-            };
-            if status == wdk_sys::STATUS_SHARING_VIOLATION {
-                Err(DriverError::ShareAccessConflict)
-            } else {
-                cache_status(status)
+            let preparation = SectionSynchronization::begin(&self.sections)?;
+            #[cfg(not(test))]
+            {
+                let main = self.main_resource()?.exclusive();
+                self.ensure_storage()?;
+                match operation {
+                    SectionMutationOperation::Resize(sizes) => {
+                        if sizes.file_size() < self.sizes()?.file_size() {
+                            let mut allowed = 0;
+                            let status = unsafe {
+                                // SAFETY: MainResource and the owning stream retain section storage through SEH.
+                                ext4win_mm_check_truncation(
+                                    self.header.as_ptr(),
+                                    sizes.file_size(),
+                                    &mut allowed,
+                                )
+                            };
+                            cache_status(status)?;
+                            if allowed == 0 {
+                                return Err(DriverError::CacheManagerFailure(
+                                    wdk_sys::STATUS_USER_MAPPED_FILE,
+                                ));
+                            }
+                        }
+                        self.purge_preparing_sections(DriverError::CacheManagerFailure(
+                            wdk_sys::STATUS_USER_MAPPED_FILE,
+                        ))?;
+                    }
+                    SectionMutationOperation::Delete => {
+                        if !self.flush_image(wdk_sys::_MMFLUSH_TYPE::MmFlushForDelete)? {
+                            return Err(DriverError::CannotDelete);
+                        }
+                        self.purge_preparing_sections(DriverError::CannotDelete)?;
+                        if self.section_residency() & 5 != 0 {
+                            return Err(DriverError::CannotDelete);
+                        }
+                    }
+                    SectionMutationOperation::WriteOpen => {
+                        if !self.flush_image(wdk_sys::_MMFLUSH_TYPE::MmFlushForWrite)? {
+                            return Err(DriverError::ShareAccessConflict);
+                        }
+                    }
+                }
+                drop(main);
+                let _paging = self.paging_resource()?.exclusive();
+                preparation.seal()
             }
-        }
-        #[cfg(test)]
-        {
-            Ok(())
+            #[cfg(test)]
+            {
+                // Host stream publication uses the same unique admission/release state. Native
+                // section observations and Cc/MM rejection require the signed live-volume gate.
+                match operation {
+                    SectionMutationOperation::Resize(sizes) => {
+                        let _validated = sizes;
+                    }
+                    SectionMutationOperation::Delete | SectionMutationOperation::WriteOpen => {}
+                }
+                preparation.seal()
+            }
+        })();
+        self.trace
+            .record_result(OperationalPath::MappedSection, &result);
+        result
+    }
+
+    /// Borrows the exact native main resource from this retained opaque header.
+    /// # Errors
+    /// Returns an invariant violation for a malformed stream.
+    #[cfg(not(test))]
+    fn main_resource(&self) -> DriverResult<SectionResource<'_>> {
+        let pointer = unsafe {
+            // SAFETY: The owning stream borrow retains native resource storage.
+            ext4win_stream_main_resource(self.header.as_ptr())
+        };
+        unsafe {
+            // SAFETY: The resource borrow cannot outlive this stream borrow.
+            SectionResource::from_raw(pointer)
         }
     }
 
-    /// Releases one successfully acquired write-open section gate.
+    /// Borrows paging exclusion while draining callbacks before sealing mutation admission.
     /// # Errors
-    ///
-    /// Returns an invariant native status if no matching write-open gate remains active.
-    pub(crate) fn end_write_open(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The matching successful begin call retained this same stream identity.
-                ext4win_stream_end_write_open(self.header.as_ptr())
-            };
-            cache_status(status)
+    /// Returns an invariant violation for a malformed stream.
+    #[cfg(not(test))]
+    fn paging_resource(&self) -> DriverResult<SectionResource<'_>> {
+        let pointer = unsafe {
+            // SAFETY: This stream borrow retains the native paging resource.
+            ext4win_stream_paging_resource(self.header.as_ptr())
+        };
+        unsafe {
+            // SAFETY: Resource storage remains live through the returned stream-bound borrow.
+            SectionResource::from_raw(pointer)
         }
-        #[cfg(test)]
-        {
+    }
+
+    /// Revalidates lower storage under operation resource ownership.
+    /// # Errors
+    /// Returns removal or a missing bound volume invariant.
+    #[cfg(not(test))]
+    fn ensure_storage(&self) -> DriverResult<()> {
+        let state = NonNull::new(unsafe {
+            // SAFETY: Bound node/volume lifetime retains the sole volume admission allocation.
+            ext4win_stream_storage_admission(self.header.as_ptr())
+                .cast::<StorageAdmission>()
+                .cast_mut()
+        })
+        .ok_or(DriverError::InternalInvariantViolation)?;
+        let state = unsafe {
+            // SAFETY: The enclosing stream outlives every borrowed volume observation.
+            state.as_ref()
+        };
+        if state.media() == MediaState::Present {
             Ok(())
+        } else {
+            Err(DriverError::DeviceRemoved)
+        }
+    }
+
+    /// Copies native residency observations only while MainResource is retained.
+    #[cfg(not(test))]
+    fn section_residency(&self) -> u32 {
+        unsafe {
+            // SAFETY: Preparation holds MainResource and retains all native section storage.
+            ext4win_stream_section_residency(self.header.as_ptr())
+        }
+    }
+
+    /// Executes only the chosen native image-flush primitive under MainResource.
+    /// # Errors
+    /// Returns the native exception status before the operation is sealed.
+    #[cfg(not(test))]
+    fn flush_image(&self, operation: wdk_sys::MMFLUSH_TYPE) -> DriverResult<bool> {
+        let mut flushed = 0;
+        let status = unsafe {
+            // SAFETY: Preparation retains the stream and MainResource through the C SEH boundary.
+            ext4win_mm_flush_image(self.header.as_ptr(), operation, &mut flushed)
+        };
+        cache_status(status)?;
+        Ok(flushed != 0)
+    }
+
+    /// Applies operation-specific rejection to Cc's exact purge result.
+    /// # Errors
+    /// Returns the selected mapped-page conflict or the native failure status.
+    #[cfg(not(test))]
+    fn purge_preparing_sections(&self, conflict: DriverError) -> DriverResult<()> {
+        if self.section_residency() & 3 == 0 {
+            return Ok(());
+        }
+        let status = unsafe {
+            // SAFETY: Preparation retains MainResource and permits paging reentry through this SEH call.
+            ext4win_cc_purge_sections(self.header.as_ptr())
+        };
+        if status == wdk_sys::STATUS_CACHE_PAGE_LOCKED {
+            Err(conflict)
+        } else {
+            cache_status(status)
         }
     }
 
@@ -1616,6 +1830,9 @@ unsafe impl Sync for StreamContext {}
 )]
 impl Drop for StreamContext {
     fn drop(&mut self) {
+        if !self.sections.get().idle() {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
         let status = unsafe {
             // SAFETY: Drop has unique ownership after every FILE_OBJECT and stream lease drained.
             ext4win_stream_destroy(self.header.as_ptr())
@@ -1673,12 +1890,27 @@ fn cache_status(status: NTSTATUS) -> DriverResult<()> {
     reason = "these declarations expose the audited native advanced-FCB-header ownership boundary"
 )]
 unsafe extern "system" {
-    fn ext4win_stream_cache_mdl(
-        stream_header: wdk_sys::PVOID,
-        file_object: *mut wdk_sys::FILE_OBJECT,
-        irp: wdk_sys::PIRP,
-        action: crate::irp::MdlAction,
-        information_out: *mut usize,
+    fn ext4win_prepare_mdl_completion(
+        queue: *const c_void,
+        file: wdk_sys::PFILE_OBJECT,
+    ) -> NTSTATUS;
+    fn ext4win_cc_read_mdl(
+        file: wdk_sys::PFILE_OBJECT,
+        offset: i64,
+        length: u32,
+        chain: *mut wdk_sys::PMDL,
+        information: *mut usize,
+    ) -> NTSTATUS;
+    fn ext4win_cc_prepare_mdl_write(
+        file: wdk_sys::PFILE_OBJECT,
+        offset: i64,
+        length: u32,
+        chain: *mut wdk_sys::PMDL,
+        information: *mut usize,
+    ) -> NTSTATUS;
+    fn ext4win_stream_cache_initialize(
+        header: *mut c_void,
+        file: wdk_sys::PFILE_OBJECT,
     ) -> NTSTATUS;
     fn ext4win_stream_create(
         kind: wdk_sys::ULONG,
@@ -1689,6 +1921,7 @@ unsafe extern "system" {
         metadata: *const StreamMetadata,
         trace_registration_handle: u64,
         runtime: *mut c_void,
+        section_state: *const c_void,
         stream_header_out: *mut wdk_sys::PVOID,
     ) -> NTSTATUS;
 
@@ -1776,43 +2009,36 @@ unsafe extern "system" {
         pending: wdk_sys::BOOLEAN,
     ) -> NTSTATUS;
 
-    fn ext4win_stream_cache_read(
-        stream_header: wdk_sys::PVOID,
-        file_object: *mut wdk_sys::FILE_OBJECT,
+    fn ext4win_cc_copy_read(
+        file: wdk_sys::PFILE_OBJECT,
         offset: i64,
-        length: wdk_sys::ULONG,
-        buffer: wdk_sys::PVOID,
-        information_out: *mut usize,
+        length: u32,
+        buffer: *mut c_void,
+        information: *mut usize,
     ) -> NTSTATUS;
-
-    fn ext4win_stream_cache_write(
-        stream_header: wdk_sys::PVOID,
-        file_object: *mut wdk_sys::FILE_OBJECT,
+    fn ext4win_cc_copy_write(
+        file: wdk_sys::PFILE_OBJECT,
         offset: i64,
-        length: wdk_sys::ULONG,
-        buffer: wdk_sys::PVOID,
+        length: u32,
+        buffer: *mut c_void,
     ) -> NTSTATUS;
-
     fn ext4win_stream_cache_flush(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_cache_coherency_flush_and_purge(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_cache_drain_for_volume_lock(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
-    fn ext4win_stream_begin_size_change(
-        stream_header: wdk_sys::PVOID,
-        new_file_size: i64,
+    fn ext4win_stream_main_resource(header: *mut c_void) -> *mut wdk_sys::ERESOURCE;
+    fn ext4win_stream_paging_resource(header: *mut c_void) -> *mut wdk_sys::ERESOURCE;
+    fn ext4win_stream_storage_admission(header: *mut c_void) -> *const c_void;
+    fn ext4win_stream_section_residency(header: *mut c_void) -> u32;
+    fn ext4win_mm_check_truncation(header: *mut c_void, size: i64, allowed: *mut u8) -> NTSTATUS;
+    fn ext4win_mm_flush_image(
+        header: *mut c_void,
+        operation: wdk_sys::MMFLUSH_TYPE,
+        flushed: *mut u8,
     ) -> NTSTATUS;
-
-    fn ext4win_stream_end_size_change(stream_header: wdk_sys::PVOID) -> NTSTATUS;
-
-    fn ext4win_stream_begin_delete(stream_header: wdk_sys::PVOID) -> NTSTATUS;
-
-    fn ext4win_stream_end_delete(stream_header: wdk_sys::PVOID) -> NTSTATUS;
-
-    fn ext4win_stream_begin_write_open(stream_header: wdk_sys::PVOID) -> NTSTATUS;
-
-    fn ext4win_stream_end_write_open(stream_header: wdk_sys::PVOID) -> NTSTATUS;
+    fn ext4win_cc_purge_sections(header: *mut c_void) -> NTSTATUS;
 
     fn ext4win_stream_cache_uninitialize(
         stream_header: wdk_sys::PVOID,

@@ -54,7 +54,7 @@ pub(crate) enum PassiveWork {
         /// IRP retained by the suspended operation until worker return.
         irp: NonNull<wdk_sys::IRP>,
         /// Read access or preparation for a within-EOF write.
-        action: super::MdlTransfer,
+        transfer: super::MdlTransferRequest,
     },
     /// Read cached bytes into a system-addressable top-level IRP mapping.
     Read {
@@ -185,12 +185,12 @@ impl PassiveWork {
     pub(crate) fn mdl(
         file_object: FileObjectCacheLease,
         active: &super::ActiveIrp<'_>,
-        action: super::MdlTransfer,
+        transfer: super::MdlTransferRequest,
     ) -> Self {
         Self::Mdl {
             file_object,
             irp: active.irp,
-            action,
+            transfer,
         }
     }
     /// Builds one stream flush.
@@ -245,8 +245,8 @@ impl PassiveWork {
             Self::Mdl {
                 file_object,
                 irp,
-                action,
-            } => PassiveWorkCompletion::Mdl(file_object.mdl(irp, action)),
+                transfer,
+            } => PassiveWorkCompletion::Mdl(file_object.mdl(irp, transfer)),
             Self::Read {
                 file_object,
                 mut owned,

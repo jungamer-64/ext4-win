@@ -1,5 +1,6 @@
 //! Kernel boundary helpers and WDK-facing services.
 
+mod cache_transfer;
 pub(crate) mod cng;
 #[cfg(not(test))]
 pub(crate) mod device_interface;
@@ -11,6 +12,7 @@ pub(crate) mod file_information;
 mod mount_manager;
 pub(crate) mod name_expression;
 pub(crate) mod operational_trace;
+pub(crate) mod section;
 pub(crate) mod status;
 pub(crate) mod storage;
 mod storage_admission;

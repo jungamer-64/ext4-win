@@ -62,14 +62,44 @@ pub(crate) enum MdlTransfer {
     Write,
 }
 
-impl MdlTransfer {
-    /// Encodes the native page-acquisition action.
-    #[cfg(not(test))]
-    pub(crate) const fn action(self) -> MdlAction {
-        match self {
-            Self::Read => MdlAction::Read,
-            Self::Write => MdlAction::Write,
-        }
+/// Immutable MDL acquisition captured before native execution, independently of mutable IRP unions.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MdlTransferRequest {
+    /// Read-page or write-page acquisition protocol.
+    action: MdlTransfer,
+    /// Absolute logical offset whose conversion is checked before Cc sees it.
+    start: FileOffset,
+    /// Windows-representable request size.
+    length: u32,
+}
+impl MdlTransferRequest {
+    /// Establishes the complete captured range before any page ownership changes.
+    /// # Errors
+    /// Returns offset arithmetic or Windows count representation failure.
+    pub(crate) fn try_new(
+        action: MdlTransfer,
+        start: FileOffset,
+        length: usize,
+    ) -> DriverResult<Self> {
+        start.checked_add_len(length)?;
+        i64::try_from(start.bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        Ok(Self {
+            action,
+            start,
+            length: u32::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?,
+        })
+    }
+    /// Captured page acquisition protocol.
+    pub(crate) const fn action(self) -> MdlTransfer {
+        self.action
+    }
+    /// Absolute logical start captured at admission.
+    pub(crate) const fn start(self) -> FileOffset {
+        self.start
+    }
+    /// Windows byte count captured at admission.
+    pub(crate) const fn length(self) -> u32 {
+        self.length
     }
 }
 
@@ -80,17 +110,6 @@ pub(crate) enum MdlCompletion {
     Read,
     /// Consume a writable chain and mark its cache pages dirty.
     Write,
-}
-
-impl MdlCompletion {
-    /// Encodes the native consuming completion action.
-    #[cfg(not(test))]
-    pub(crate) const fn action(self) -> MdlAction {
-        match self {
-            Self::Read => MdlAction::ReadComplete,
-            Self::Write => MdlAction::WriteComplete,
-        }
-    }
 }
 
 #[cfg(test)]

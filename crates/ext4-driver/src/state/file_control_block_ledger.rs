@@ -519,11 +519,15 @@ impl StreamSizeChangeLease {
     ///
     /// Returns the exact cache failure or mapped-view truncation conflict.
     pub(crate) fn execute(self) -> DriverResult<PreparedStreamSizeChange> {
-        self.stream
+        let section = self
+            .stream
             .stream()
             .stream_context
-            .begin_size_change(self.target_sizes.file_size())?;
+            .prepare_section_mutation(crate::kernel::section::SectionMutationOperation::Resize(
+                self.target_sizes,
+            ))?;
         Ok(PreparedStreamSizeChange {
+            _section: section,
             stream: self.stream,
             node: self.node,
             target_sizes: self.target_sizes,
@@ -607,6 +611,8 @@ pub(crate) struct PreparedStreamSizeChanges {
 /// Successful native size-change gate retained through durable size publication.
 #[derive(Debug)]
 pub(crate) struct PreparedStreamSizeChange {
+    /// Unique section release authority drops before the stream retention lease.
+    _section: crate::kernel::section::SealedSectionMutation,
     /// Stream lease released only after the native gate is ended.
     stream: StreamCacheLease,
     /// Regular-file identity protected by this gate.
@@ -627,20 +633,6 @@ impl PreparedStreamSizeChange {
     }
 }
 
-impl Drop for PreparedStreamSizeChange {
-    fn drop(&mut self) {
-        if self
-            .stream
-            .stream()
-            .stream_context
-            .end_size_change()
-            .is_err()
-        {
-            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-        }
-    }
-}
-
 /// Exact regular-file stream retained before a namespace deletion calls Cc/MM.
 #[derive(Debug)]
 pub(crate) struct StreamDeletionLease {
@@ -657,8 +649,13 @@ impl StreamDeletionLease {
     /// Returns cannot-delete while an image or mapped data section remains, or the exact native
     /// flush failure. A coherent shared cache map remains under delayed-close ownership.
     pub(crate) fn execute(self) -> DriverResult<PreparedStreamDeletion> {
-        self.stream.stream().stream_context.begin_delete()?;
+        let section = self
+            .stream
+            .stream()
+            .stream_context
+            .prepare_section_mutation(crate::kernel::section::SectionMutationOperation::Delete)?;
         Ok(PreparedStreamDeletion {
+            _section: section,
             stream: self.stream,
             node: self.node,
         })
@@ -668,6 +665,8 @@ impl StreamDeletionLease {
 /// Successful stream-deletion gate retained through disposition publication or durable unlink.
 #[derive(Debug)]
 pub(crate) struct PreparedStreamDeletion {
+    /// Unique section release authority drops before the stream retention lease.
+    _section: crate::kernel::section::SealedSectionMutation,
     /// Stream lease released only after the native gate is ended.
     stream: StreamCacheLease,
     /// Exact inode whose cleanup deletion this gate authorizes.
@@ -686,14 +685,6 @@ impl PreparedStreamDeletion {
     }
 }
 
-impl Drop for PreparedStreamDeletion {
-    fn drop(&mut self) {
-        if self.stream.stream().stream_context.end_delete().is_err() {
-            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-        }
-    }
-}
-
 /// Resident regular-file stream retained before an existing write-open calls MM.
 #[derive(Debug)]
 pub(crate) struct StreamWriteOpenLease {
@@ -709,8 +700,15 @@ impl StreamWriteOpenLease {
     ///
     /// Returns sharing-violation while an image section remains, or the exact native failure.
     pub(crate) fn execute(self) -> DriverResult<PreparedStreamWriteOpen> {
-        self.stream.stream().stream_context.begin_write_open()?;
+        let section = self
+            .stream
+            .stream()
+            .stream_context
+            .prepare_section_mutation(
+                crate::kernel::section::SectionMutationOperation::WriteOpen,
+            )?;
         Ok(PreparedStreamWriteOpen {
+            _section: section,
             stream: self.stream,
             node: self.node,
         })
@@ -720,6 +718,8 @@ impl StreamWriteOpenLease {
 /// Successful write-open gate retained until the exact FILE_OBJECT/FCB claim is published.
 #[derive(Debug)]
 pub(crate) struct PreparedStreamWriteOpen {
+    /// Unique section release authority drops before the stream retention lease.
+    _section: crate::kernel::section::SealedSectionMutation,
     /// Stream lease released only after the native gate is ended.
     stream: StreamCacheLease,
     /// Exact regular-file inode authorized by the image-section check.
@@ -730,20 +730,6 @@ impl PreparedStreamWriteOpen {
     /// Returns whether this native gate authorizes the exact FCB/node pair.
     pub(crate) fn authorizes(&self, fcb: NonNull<FileControlBlock>, node: NodeId) -> bool {
         self.node == node && self.stream.retained.fcb == fcb
-    }
-}
-
-impl Drop for PreparedStreamWriteOpen {
-    fn drop(&mut self) {
-        if self
-            .stream
-            .stream()
-            .stream_context
-            .end_write_open()
-            .is_err()
-        {
-            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-        }
     }
 }
 
@@ -860,12 +846,13 @@ impl FileObjectCacheLease {
     pub(crate) fn mdl(
         &self,
         irp: NonNull<wdk_sys::IRP>,
-        action: crate::irp::MdlTransfer,
+        transfer: crate::irp::MdlTransferRequest,
     ) -> DriverResult<usize> {
-        self.stream
-            .stream()
-            .stream_context
-            .cached_mdl(self.file_object.as_non_null(), irp, action)
+        self.stream.stream().stream_context.cached_mdl(
+            self.file_object.as_non_null(),
+            irp,
+            transfer,
+        )
     }
     /// Attenuates this FILE_OBJECT authority to the shared stream cache only.
     pub(crate) fn into_stream(self) -> StreamCacheLease {

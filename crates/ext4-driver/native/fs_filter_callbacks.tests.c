@@ -53,6 +53,7 @@ typedef struct {
 } FS_FILTER_CALLBACKS;
 typedef struct {
     ERESOURCE MainResource, PagingIoResource;
+    const VOID *SectionState;
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 
 static EXT4WIN_STREAM_CONTEXT stream;
@@ -94,24 +95,22 @@ static BOOLEAN ext4win_stream_fast_io_stream(
 {
     return ext4win_stream_section_callback_stream(object, output);
 }
-static BOOLEAN ext4win_stream_acquire_main_after_section_mutation(
-    PEXT4WIN_STREAM_CONTEXT object, BOOLEAN exclusive)
+static BOOLEAN ext4win_section_acquire_main(const VOID *state, PERESOURCE resource,
+    BOOLEAN exclusive, BOOLEAN wait, BOOLEAN *waited)
 {
-    assert(object == &stream && exclusive && stream.MainResource.held == 0);
-    stream.MainResource.held++;
-    return FALSE;
+    (void)state;
+    assert(resource == &stream.MainResource && exclusive && wait && resource->held == 0);
+    resource->held++;
+    if (waited != NULL) { *waited = FALSE; }
+    return TRUE;
 }
-static void ext4win_stream_acquire_main_after_sealed_section_mutation(
-    PEXT4WIN_STREAM_CONTEXT object)
+static BOOLEAN ext4win_section_acquire_paging(const VOID *state, PERESOURCE resource,
+    BOOLEAN exclusive, BOOLEAN wait)
 {
-    (void)ext4win_stream_acquire_main_after_section_mutation(object, TRUE);
-}
-static BOOLEAN ext4win_stream_acquire_paging_after_section_mutation(
-    PEXT4WIN_STREAM_CONTEXT object, BOOLEAN exclusive, BOOLEAN wait)
-{
-    assert(object == &stream && !exclusive && wait && stream.PagingIoResource.held == 0);
-    if (!paging_available) { return FALSE; }
-    stream.PagingIoResource.held++;
+    (void)state;
+    assert(!exclusive && wait && resource->held == 0);
+    if (resource == &stream.PagingIoResource && !paging_available) { return FALSE; }
+    resource->held++;
     return TRUE;
 }
 static BOOLEAN ext4win_stream_ordinary_io_available(PEXT4WIN_STREAM_CONTEXT object)

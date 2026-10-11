@@ -15,6 +15,26 @@ mod contract {
 /// Driver-owned path identity recorded without file names, offsets, lengths, or payload bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OperationalPath {
+    /// Cached buffer transfer selected under stream admission.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "host stream builds omit native Cache Manager transfers"
+        )
+    )]
+    CachedRead,
+    /// Cached write after independent Cc backpressure admission.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "host stream builds omit native Cache Manager transfers"
+        )
+    )]
+    CachedWrite,
+    /// Image/cache preparation through section-mutation sealing.
+    MappedSection,
     /// DriverEntry after provider registration through successful device publication.
     DriverInitialization,
     /// Secure control device allocation before extension initialization.
@@ -55,6 +75,9 @@ impl OperationalPath {
     /// Returns the stable event identifier generated from the repository-owned trace contract.
     const fn event_id(self) -> u16 {
         match self {
+            Self::CachedRead => contract::TRACE_EVENT_CACHED_READ,
+            Self::CachedWrite => contract::TRACE_EVENT_CACHED_WRITE,
+            Self::MappedSection => contract::TRACE_EVENT_MAPPED_SECTION,
             Self::DriverInitialization => contract::TRACE_EVENT_DRIVER_INITIALIZATION,
             Self::ControlDeviceCreation => contract::TRACE_EVENT_CONTROL_DEVICE_CREATION,
             Self::ReactorInitialization => contract::TRACE_EVENT_REACTOR_INITIALIZATION,

@@ -154,7 +154,14 @@ impl MdlOperation {
                 start,
                 requested: length,
             };
-            Ok((PassiveWork::mdl(lease, active, self.action), cursor))
+            Ok((
+                PassiveWork::mdl(
+                    lease,
+                    active,
+                    crate::irp::MdlTransferRequest::try_new(self.action, start, length)?,
+                ),
+                cursor,
+            ))
         })
     }
 }

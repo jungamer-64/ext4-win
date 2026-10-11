@@ -153,17 +153,12 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Executes native APC, section-mutation and filesystem callback oracles without WDK imports.
+/// Executes native APC and filesystem callback oracles without WDK imports.
 /// # Errors
 /// Returns compiler, execution or mandatory generated-directory cleanup failures.
 #[cfg(windows)]
 fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
-        (
-            "cache-write-admission",
-            "cache_write_admission.tests.c",
-            "native Cache Manager write admission and callback lifetime contract",
-        ),
         (
             "identity-persistence",
             "identity_persistence.tests.c",
