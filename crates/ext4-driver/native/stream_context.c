@@ -14,6 +14,8 @@
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
 extern UCHAR NTAPI ext4win_section_phase(const VOID *state);
+extern BOOLEAN NTAPI ext4win_section_acquire_sync(const VOID *state, PERESOURCE resource,
+    FS_FILTER_SECTION_SYNC_TYPE sync_type);
 extern BOOLEAN NTAPI ext4win_section_acquire_main(const VOID *state, PERESOURCE resource,
     BOOLEAN exclusive, BOOLEAN wait, PBOOLEAN waited);
 extern BOOLEAN NTAPI ext4win_section_acquire_paging(const VOID *state, PERESOURCE resource,

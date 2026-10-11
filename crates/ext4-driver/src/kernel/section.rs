@@ -1,7 +1,9 @@
 //! Stream mutation ownership and callback admission. C only borrows the native resources.
 //!
 //! Preparation permits paging needed by Cc/MM. Sealing follows paging-resource drainage and
-//! excludes further paging until the unique permit is released. State publication and wakeup
+//! excludes further paging until the unique permit is released. Kernel section exclusion only
+//! acquires its resource and remains available for Cc reentry; it grants no paging or creation
+//! authority. State publication and wakeup
 //! share one transition lock, so an earlier release cannot signal a successor preparation.
 
 use super::status::{DriverError, DriverResult};
@@ -240,13 +242,25 @@ enum SectionAdmission {
     Ordinary,
     /// May reenter preparation until paging exclusion is sealed.
     Paging,
+    /// Kernel exclusion acquires only the resource; it neither creates sections nor admits I/O.
+    ResourceOnly,
 }
 impl SectionAdmission {
+    /// Windows kernel section exclusion must remain callable during Cc preparation/publication.
+    fn for_section_sync(sync_type: wdk_sys::FS_FILTER_SECTION_SYNC_TYPE) -> Self {
+        if sync_type == wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::SyncTypeOther {
+            Self::ResourceOnly
+        } else {
+            Self::Ordinary
+        }
+    }
+
     /// Tests the shared phase without owning any transition.
     fn accepts(self, phase: SectionPhase) -> bool {
         match self {
             Self::Ordinary => phase == SectionPhase::Idle,
             Self::Paging => phase != SectionPhase::Sealed,
+            Self::ResourceOnly => true,
         }
     }
 }
@@ -486,6 +500,44 @@ unsafe extern "system" fn ext4win_section_phase(state: *const SectionSynchroniza
     }
 }
 
+/// Acquires section synchronization without blocking kernel-only exclusion on mutation admission.
+/// # Safety
+/// The native callback retains state and resource through its paired same-thread release,
+/// supplies the Windows synchronization type, and runs at <= APC_LEVEL.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "native callback ownership encloses the resource/APC acquisition"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_section_acquire_sync(
+    state: *const SectionSynchronization,
+    resource: *mut wdk_sys::ERESOURCE,
+    sync_type: wdk_sys::FS_FILTER_SECTION_SYNC_TYPE,
+) -> u8 {
+    let state = unsafe {
+        // SAFETY: The native callback retains initialized state until paired release.
+        &*state
+    };
+    let resource = unsafe {
+        // SAFETY: The native callback retains resource through its paired same-thread release.
+        SectionResource::from_raw(resource)
+    }
+    .unwrap_or_else(|_| {
+        super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
+    });
+    u8::from(
+        acquire_callback(
+            state,
+            resource,
+            true,
+            true,
+            SectionAdmission::for_section_sync(sync_type),
+        )
+        .0,
+    )
+}
+
 /// Acquires ordinary stream admission; the native release callback owns the successful resource/APC scope.
 /// # Safety
 /// The callback retains `state` and `resource`, runs at <= APC_LEVEL, and pairs successful release
@@ -628,5 +680,21 @@ mod tests {
         drop(failed_preparation);
         assert!(owner.get().idle());
         Ok(())
+    }
+
+    /// # Panics
+    /// Fails if Cc's resource-only section exclusion waits on its own mutation admission.
+    #[test]
+    fn kernel_section_exclusion_remains_available_during_cc_reentry() {
+        let exclusion = SectionAdmission::for_section_sync(
+            wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::SyncTypeOther,
+        );
+        assert!(exclusion.accepts(SectionPhase::Preparing));
+        assert!(exclusion.accepts(SectionPhase::Sealed));
+        let creation = SectionAdmission::for_section_sync(
+            wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::SyncTypeCreateSection,
+        );
+        assert!(!creation.accepts(SectionPhase::Preparing));
+        assert!(!creation.accepts(SectionPhase::Sealed));
     }
 }

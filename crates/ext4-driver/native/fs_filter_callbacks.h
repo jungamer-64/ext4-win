@@ -15,7 +15,8 @@ ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
     if (!ext4win_stream_section_callback_stream(data->FileObject, &stream)) {
         return STATUS_SUCCESS;
     }
-    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
+    (VOID)ext4win_section_acquire_sync(stream->SectionState, &stream->MainResource,
+        data->Parameters.AcquireForSectionSynchronization.SyncType);
     if ((data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection)
         && !ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);

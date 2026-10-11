@@ -95,13 +95,13 @@ static BOOLEAN ext4win_stream_fast_io_stream(
 {
     return ext4win_stream_section_callback_stream(object, output);
 }
-static BOOLEAN ext4win_section_acquire_main(const VOID *state, PERESOURCE resource,
-    BOOLEAN exclusive, BOOLEAN wait, BOOLEAN *waited)
+static BOOLEAN ext4win_section_acquire_sync(const VOID *state, PERESOURCE resource,
+    unsigned sync_type)
 {
     (void)state;
-    assert(resource == &stream.MainResource && exclusive && wait && resource->held == 0);
+    assert(resource == &stream.MainResource && resource->held == 0);
+    assert(sync_type == SyncTypeOther || sync_type == SyncTypeCreateSection);
     resource->held++;
-    if (waited != NULL) { *waited = FALSE; }
     return TRUE;
 }
 static BOOLEAN ext4win_section_acquire_paging(const VOID *state, PERESOURCE resource,
