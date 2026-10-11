@@ -42,7 +42,7 @@ enum MdlState {
 struct MdlOperation {
     /// Exact read or write page-acquisition protocol.
     action: MdlTransfer,
-    /// Unique completion authority remains local while cache work borrows the native IRP.
+    /// Completion authority moves between the local operation and its native work owner.
     state: MdlState,
 }
 
@@ -92,7 +92,11 @@ impl MdlOperation {
         &self,
         owned: &mut OwnedIrp,
         access: &MountedVolumeAccess<'_>,
-    ) -> DriverResult<(PassiveWork, MdlCursor)> {
+    ) -> DriverResult<(
+        crate::state::FileObjectCacheLease,
+        crate::irp::MdlTransferRequest,
+        MdlCursor,
+    )> {
         owned.request().with_active(|active| {
             let current = active.current_stack()?;
             let file_object = current.file_object()?;
@@ -153,11 +157,8 @@ impl MdlOperation {
                 requested: length,
             };
             Ok((
-                PassiveWork::mdl(
-                    lease,
-                    active,
-                    crate::irp::MdlTransferRequest::try_new(self.action, start, length)?,
-                ),
+                lease,
+                crate::irp::MdlTransferRequest::try_new(self.action, start, length)?,
                 cursor,
             ))
         })
@@ -198,13 +199,14 @@ impl MountedVolumeOperation for MdlOperation {
                 self.advance_mounted(CompletionEvent::Core(OperationEvent::Admitted), access)
             }
             (MdlState::Ready(mut owned), CompletionEvent::Core(OperationEvent::Admitted)) => {
-                let (work, cursor) = match self.prepare(&mut owned, access) {
+                let (file_object, transfer, cursor) = match self.prepare(&mut owned, access) {
                     Ok(work) => work,
                     Err(error) => {
                         return OperationTransition::Complete(owned.prepare_result(Err(error)));
                     }
                 };
-                self.state = MdlState::Executing { owned, cursor };
+                self.state = MdlState::Executing { cursor };
+                let work = PassiveWork::mdl(file_object, owned, transfer);
                 OperationTransition::SubmitPassiveWork {
                     work,
                     suspended: self,
@@ -213,15 +215,14 @@ impl MountedVolumeOperation for MdlOperation {
             (
                 MdlState::Ready(owned)
                 | MdlState::Checking { owned, .. }
-                | MdlState::Returned { owned, .. }
-                | MdlState::Executing { owned, .. },
+                | MdlState::Returned { owned, .. },
                 CompletionEvent::Core(OperationEvent::CancelRequested),
             ) => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::from(Error::OperationCancelled))),
             ),
             (
-                MdlState::Executing { mut owned, cursor },
-                CompletionEvent::PassiveCompleted(PassiveWorkCompletion::Mdl(result)),
+                MdlState::Executing { cursor },
+                CompletionEvent::PassiveCompleted(PassiveWorkCompletion::Mdl { mut owned, result }),
             ) => {
                 let MdlCursor { start, requested } = cursor;
                 let result = crate::request::file_info::finish_cached_read(
@@ -266,7 +267,7 @@ impl OplockContinuation for MdlOperation {
 
 #[expect(
     unsafe_code,
-    reason = "the reactor retains unique IRP authority and the worker borrows it only while suspended"
+    reason = "the reactor and worker transfer unique IRP authority at each native execution boundary"
 )]
 // SAFETY: The same scheduler slot retains every FILE_OBJECT and IRP until its native effect returns.
 unsafe impl Send for MdlOperation {}

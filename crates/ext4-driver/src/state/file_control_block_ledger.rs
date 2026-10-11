@@ -845,14 +845,14 @@ impl FileObjectCacheLease {
     /// Returns the Cache Manager status without converting the MDL to a byte-buffer mapping.
     pub(crate) fn mdl(
         &self,
-        irp: NonNull<wdk_sys::IRP>,
+        request: crate::irp::PendingIrpLease<'_>,
         transfer: crate::irp::MdlTransferRequest,
     ) -> DriverResult<usize> {
-        self.stream.stream().stream_context.cached_mdl(
-            self.file_object.as_non_null(),
-            irp,
-            transfer,
-        )
+        let transfer = request.cache_mdl_transfer(transfer)?;
+        if transfer.file_object() != self.file_object.as_non_null() {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        self.stream.stream().stream_context.cached_mdl(transfer)
     }
     /// Attenuates this FILE_OBJECT authority to the shared stream cache only.
     pub(crate) fn into_stream(self) -> StreamCacheLease {

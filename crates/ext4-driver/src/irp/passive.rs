@@ -189,12 +189,12 @@ impl PassiveWork {
     /// Captures MDL work under the exclusive top-level completion owner.
     pub(crate) fn mdl(
         file_object: FileObjectCacheLease,
-        active: &super::ActiveIrp<'_>,
+        owned: super::OwnedIrp,
         transfer: super::MdlTransferRequest,
     ) -> Self {
         Self::Mdl {
             file_object,
-            irp: active.irp,
+            owned,
             transfer,
         }
     }
@@ -249,9 +249,12 @@ impl PassiveWork {
             }
             Self::Mdl {
                 file_object,
-                irp,
+                mut owned,
                 transfer,
-            } => PassiveWorkCompletion::Mdl(file_object.mdl(irp, transfer)),
+            } => {
+                let result = file_object.mdl(owned.request(), transfer);
+                PassiveWorkCompletion::Mdl { owned, result }
+            }
             Self::Read {
                 file_object,
                 mut owned,
@@ -301,7 +304,10 @@ impl PassiveWork {
         match self {
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).failed(error)),
             Self::SectorSize { .. } => PassiveWorkCompletion::SectorSize(Err(error)),
-            Self::Mdl { .. } => PassiveWorkCompletion::Mdl(Err(error)),
+            Self::Mdl { owned, .. } => PassiveWorkCompletion::Mdl {
+                owned,
+                result: Err(error),
+            },
             Self::Read { owned, .. } => PassiveWorkCompletion::Read {
                 owned,
                 result: Err(error),
@@ -329,7 +335,7 @@ impl PassiveWork {
     #[cfg(not(test))]
     pub(super) fn cancel_before_execution(self) -> super::reactor::CompletionEvent {
         match self {
-            work @ (Self::Read { .. } | Self::Write { .. }) => {
+            work @ (Self::Read { .. } | Self::Write { .. } | Self::Mdl { .. }) => {
                 super::reactor::CompletionEvent::PassiveCompleted(
                     work.failed(DriverError::from(ext4_core::Error::OperationCancelled)),
                 )

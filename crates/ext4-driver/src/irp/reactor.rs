@@ -5054,7 +5054,8 @@ mod tests {
                         let _owned = owned;
                         let _result = result;
                     }
-                    crate::irp::PassiveWorkCompletion::Mdl(result) => {
+                    crate::irp::PassiveWorkCompletion::Mdl { owned, result } => {
+                        let _owned = owned;
                         let _result = result;
                     }
                     crate::irp::PassiveWorkCompletion::Flush(result)

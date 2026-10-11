@@ -1640,16 +1640,28 @@ mod tests {
         received.with_active(|active| QueueContext::capture(active, major))
     }
 
+    /// # Errors
+    /// Returns fixture capture or transfer construction failure.
     /// # Panics
-    ///
-    /// Panics if page acquisition tries to map absent caller byte buffers.
+    /// Panics if page acquisition tries to map absent caller byte buffers or grants another action.
     #[test]
-    fn mdl_requests_are_captured_before_ordinary_byte_buffer_mapping() {
+    #[expect(
+        unsafe_code,
+        reason = "exclusive stack fixtures retain the device, FILE_OBJECT and IRP through completion"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture errors propagate while assertions verify MDL transfer admission"
+    )]
+    fn mdl_requests_are_captured_before_ordinary_byte_buffer_mapping()
+    -> Result<(), crate::kernel::status::DriverError> {
+        use crate::irp::{MdlTransfer, MdlTransferRequest, OwnedIrp, PendingIrp};
+        use crate::kernel::status::DriverError;
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
         for (major, minor, expected) in [
-            (DispatchMajor::Read, 2, crate::irp::MdlTransfer::Read),
-            (DispatchMajor::Write, 2, crate::irp::MdlTransfer::Write),
+            (DispatchMajor::Read, 2, MdlTransfer::Read),
+            (DispatchMajor::Write, 2, MdlTransfer::Write),
         ] {
             let mut irp = wdk_sys::IRP::default();
             let mut stack = wdk_sys::IO_STACK_LOCATION {
@@ -1658,19 +1670,59 @@ mod tests {
                 ..wdk_sys::IO_STACK_LOCATION::default()
             };
             stack.Parameters.Read.Length = 8192;
-            let target = build_target(&mut device, &mut irp, &mut stack);
-            assert!(target.is_some());
-            let Some(mut target) = target else {
-                return;
+            let mut target = build_target(&mut device, &mut irp, &mut stack)
+                .ok_or(DriverError::InvalidParameter)?;
+            let device = target.device();
+            let captured = capture_context(&mut target, major)
+                .map_err(|completion| DriverError::CacheManagerFailure(completion.status()))?;
+            assert!(matches!(
+                &captured,
+                QueueContextOwnership::Captured(context)
+                    if matches!(context.prepared, PreparedRequest::Mdl(action) if action == expected)
+            ));
+            let raw = PendingIrp::from_received(target, captured).publish();
+            let mut owned = unsafe {
+                // SAFETY: The fixture exclusively removes its published IRP and retains all native
+                // backing objects until this owner is completed below.
+                OwnedIrp::from_queued_raw(device, raw)
             };
-            let captured = capture_context(&mut target, major);
-            assert!(captured.is_ok());
-            if let Ok(QueueContextOwnership::Captured(context)) = captured {
-                assert!(
-                    matches!(context.prepared, PreparedRequest::Mdl(action) if action == expected)
+            let other = match expected {
+                MdlTransfer::Read => MdlTransfer::Write,
+                MdlTransfer::Write => MdlTransfer::Read,
+            };
+            assert_eq!(
+                owned
+                    .request()
+                    .cache_mdl_transfer(MdlTransferRequest::try_new(
+                        other,
+                        ext4_core::FileOffset::ZERO,
+                        8192,
+                    )?)
+                    .err(),
+                Some(DriverError::InternalInvariantViolation)
+            );
+            {
+                let transfer = owned
+                    .request()
+                    .cache_mdl_transfer(MdlTransferRequest::try_new(
+                        expected,
+                        ext4_core::FileOffset::ZERO,
+                        8192,
+                    )?)?;
+                assert_eq!(
+                    transfer.file_object().as_ptr(),
+                    core::ptr::from_mut(&mut file_object)
                 );
+                assert_eq!(transfer.irp().as_ptr(), core::ptr::from_mut(&mut irp));
+                assert_eq!(transfer.request().action(), expected);
+                assert_eq!(transfer.request().length(), 8192);
             }
+            assert_eq!(
+                owned.prepare_result(Ok(IrpCompletion::EMPTY)).notify(),
+                wdk_sys::STATUS_SUCCESS
+            );
         }
+        Ok(())
     }
 
     /// # Panics

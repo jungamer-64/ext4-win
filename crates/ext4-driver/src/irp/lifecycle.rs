@@ -975,7 +975,57 @@ impl CacheWriteTransfer<'_> {
     }
 }
 
+/// Exclusive native MDL linkage access bounded by the IRP's unique completion-owner borrow.
+#[derive(Debug)]
+pub(crate) struct CacheMdlTransfer<'owner> {
+    /// Completion cannot run while this exclusive owner borrow is live.
+    owner: PendingIrpLease<'owner>,
+    /// Exact retained FILE_OBJECT used for stream identity validation.
+    file_object: KernelFileObject,
+    /// Immutable operation and range selected before native execution.
+    request: super::MdlTransferRequest,
+}
+
+impl CacheMdlTransfer<'_> {
+    /// Native file identity retained by the borrowed IRP.
+    pub(crate) const fn file_object(&self) -> NonNull<wdk_sys::FILE_OBJECT> {
+        self.file_object.as_non_null()
+    }
+    /// Native linkage identity usable only during this exclusive transfer borrow.
+    pub(crate) fn irp(&self) -> NonNull<wdk_sys::IRP> {
+        self.owner.owner.target.irp.irp
+    }
+    /// Immutable captured transfer contract.
+    pub(crate) const fn request(&self) -> super::MdlTransferRequest {
+        self.request
+    }
+}
+
 impl<'a> PendingIrpLease<'a> {
+    /// Borrows MDL acquisition only from its captured operation and retaining completion owner.
+    /// # Errors
+    /// Rejects another captured request kind, a mismatched action or an absent FILE_OBJECT.
+    pub(crate) fn cache_mdl_transfer(
+        mut self,
+        request: super::MdlTransferRequest,
+    ) -> DriverResult<CacheMdlTransfer<'a>> {
+        if !matches!(self.owner.actor_request(), ActorRequest::Captured(PreparedRequest::Mdl(action)) if *action == request.action())
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let file_object = self.with_active(|active| {
+            active
+                .current_stack()?
+                .file_object()
+                .map(ActiveFileObject::address)
+        })?;
+        Ok(CacheMdlTransfer {
+            owner: self,
+            file_object,
+            request,
+        })
+    }
+
     /// Borrows a captured read prefix for one synchronous native cache call.
     /// # Errors
     /// Rejects another request kind, an excess prefix or an absent FILE_OBJECT before native access.

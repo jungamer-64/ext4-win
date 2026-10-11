@@ -1291,12 +1291,14 @@ impl StreamContext {
     /// any partially acquired chain before returning.
     pub(crate) fn cached_mdl(
         &self,
-        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
-        _irp: NonNull<wdk_sys::IRP>,
-        _transfer: crate::irp::MdlTransferRequest,
+        _transfer: crate::irp::CacheMdlTransfer<'_>,
     ) -> DriverResult<usize> {
+        let _file_object = _transfer.file_object();
+        let _irp = _transfer.irp();
+        let _request = _transfer.request();
         #[cfg(not(test))]
         {
+            let request = _request;
             self.ensure_storage()?;
             let chain = unsafe {
                 // SAFETY: The suspended operation exclusively retains this IRP through native work.
@@ -1311,7 +1313,7 @@ impl StreamContext {
                 return Err(DriverError::InvalidParameter);
             }
             self.initialize_cache(_file_object)?;
-            if _transfer.length() == 0 {
+            if request.length() == 0 {
                 return Ok(0);
             }
             let status = unsafe {
@@ -1321,32 +1323,32 @@ impl StreamContext {
             cache_status(status)?;
             let mut admission = super::cache_transfer::WriteAdmission::new();
             loop {
-                if _transfer.action() == crate::irp::MdlTransfer::Write {
+                if request.action() == crate::irp::MdlTransfer::Write {
                     unsafe {
                         // SAFETY: The passive owner retains file; no filesystem resource is held while waiting.
-                        admission.wait(_file_object.as_ptr(), _transfer.length());
+                        admission.wait(_file_object.as_ptr(), request.length());
                     }
                 }
                 let _main = self.main_resource()?.ordinary_shared(self.sections.get());
                 self.ensure_ordinary_io()?;
-                if _transfer.action() == crate::irp::MdlTransfer::Write
+                if request.action() == crate::irp::MdlTransfer::Write
                     && !unsafe {
                         // SAFETY: The same retained request rechecks admission without waiting under MainResource.
-                        admission.accepted(_file_object.as_ptr(), _transfer.length(), false)
+                        admission.accepted(_file_object.as_ptr(), request.length(), false)
                     }
                 {
                     drop(_main);
                     continue;
                 }
                 let length =
-                    super::cache_transfer::bounded_length(_transfer, self.sizes()?.file_size())?;
+                    super::cache_transfer::bounded_length(request, self.sizes()?.file_size())?;
                 if length == 0 {
                     return Ok(0);
                 }
-                let offset = i64::try_from(_transfer.start().bytes())
+                let offset = i64::try_from(request.start().bytes())
                     .map_err(|_| DriverError::InvalidParameter)?;
                 let mut information = 0;
-                let status = match _transfer.action() {
+                let status = match request.action() {
                     crate::irp::MdlTransfer::Read => unsafe {
                         // SAFETY: Current-EOF selection holds MainResource; C owns partial read-chain cleanup.
                         ext4win_cc_read_mdl(
