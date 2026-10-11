@@ -51,8 +51,8 @@ pub(crate) enum PassiveWork {
     Mdl {
         /// Retains the exact stream through the native call.
         file_object: FileObjectCacheLease,
-        /// IRP retained by the suspended operation until worker return.
-        irp: NonNull<wdk_sys::IRP>,
+        /// Unique completion authority moves to the worker until native chain access ends.
+        owned: super::OwnedIrp,
         /// Read access or preparation for a within-EOF write.
         transfer: super::MdlTransferRequest,
     },
@@ -135,7 +135,12 @@ pub(crate) enum PassiveWorkCompletion {
     /// Native sector observation, including its exact failure status.
     SectorSize(DriverResult<crate::kernel::storage::SectorSizeInformation>),
     /// MDL chain acquisition and observed byte count.
-    Mdl(DriverResult<usize>),
+    Mdl {
+        /// Unique completion authority returned after the native effect or pre-effect cancellation.
+        owned: super::OwnedIrp,
+        /// Exact chain-acquisition outcome.
+        result: DriverResult<usize>,
+    },
     /// Cached read status and observed transfer byte count.
     Read {
         /// Completion authority returned only after native buffer access ends.

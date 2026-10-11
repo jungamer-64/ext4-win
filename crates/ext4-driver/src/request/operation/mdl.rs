@@ -30,8 +30,6 @@ enum MdlState {
     Ready(OwnedIrp),
     /// The worker owns the MDL operation; cancellation cannot discard its result or chain.
     Executing {
-        /// IRP and its handle lane retained until native effect completion.
-        owned: OwnedIrp,
         /// Completion notifications never publish a user data cursor.
         cursor: MdlCursor,
     },
