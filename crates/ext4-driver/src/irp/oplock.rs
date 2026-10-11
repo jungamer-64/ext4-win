@@ -808,8 +808,8 @@ pub unsafe extern "system" fn ext4win_oplock_prepost(context: *mut c_void, irp: 
 /// Returns one posted IRP to the reactor after the oplock break wait finishes or is cancelled.
 /// # Safety
 ///
-/// `context` must be the posted stable envelope for this exact live `irp`, and FsRtl may invoke
-/// this callback exactly once after it has retired its wait/cancel ownership.
+/// `context` must be the original allocation pointer of the posted envelope for this exact live
+/// `irp`, and FsRtl may invoke this callback exactly once after retiring its wait/cancel ownership.
 #[cfg(not(test))]
 #[unsafe(no_mangle)]
 #[expect(
@@ -820,12 +820,12 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
     context: *mut c_void,
     irp: wdk_sys::PIRP,
 ) {
-    let envelope = NonNull::new(context.cast::<OplockEnvelope>()).unwrap_or_else(|| {
+    let envelope_address = NonNull::new(context.cast::<OplockEnvelope>()).unwrap_or_else(|| {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
     });
     let envelope = unsafe {
         // SAFETY: FsRtl uniquely owns the stable continuation until this completion callback.
-        envelope.as_ref()
+        envelope_address.as_ref()
     };
     let delegated = envelope.delegated.as_ref().unwrap_or_else(|| {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
@@ -845,11 +845,11 @@ pub unsafe extern "system" fn ext4win_oplock_wait_complete(
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     }
     let reactor = envelope.reactor;
-    let envelope = NonNull::from(envelope);
     unsafe {
         // SAFETY: The completed envelope retains this destination until publication takes its
-        // own lease, then transfers the unique node without borrowing reclaimable storage.
-        CompletionReactor::enqueue_oplock_completion(reactor, envelope);
+        // own lease. The original allocation pointer retains write authority for inbox reclamation;
+        // the shared observation above is no longer accessed after this ownership transfer.
+        CompletionReactor::enqueue_oplock_completion(reactor, envelope_address);
     }
 }
 
