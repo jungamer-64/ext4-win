@@ -575,19 +575,19 @@ impl ReactorState {
     }
 }
 
-/// Pending-queue reservation released when actor admission or cancellation removes the IRP.
+/// Pending-queue admission rolled back on drop unless transferred to queue-owned bookkeeping.
 #[derive(Debug)]
-struct OperationReservation {
-    /// Stable per-device count.
-    pending: NonNull<AtomicUsize>,
+struct OperationReservation<'counter> {
+    /// Counter retained by its borrow until rollback or queue publication.
+    pending: &'counter AtomicUsize,
 }
 
-impl OperationReservation {
+impl<'counter> OperationReservation<'counter> {
     /// Reserves one request in this independent pending queue budget.
     /// # Errors
     ///
     /// Returns [`DriverError::DeviceBusy`] when this finite pending queue budget is exhausted.
-    fn acquire(pending: &AtomicUsize) -> DriverResult<Self> {
+    fn acquire(pending: &'counter AtomicUsize) -> DriverResult<Self> {
         pending
             .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current
@@ -595,9 +595,7 @@ impl OperationReservation {
                     .filter(|next| *next <= MAX_OPERATIONS)
             })
             .map_err(|_| DriverError::DeviceBusy)?;
-        Ok(Self {
-            pending: NonNull::from(pending),
-        })
+        Ok(Self { pending })
     }
 
     /// Moves this reservation into queue-owned context bookkeeping.
@@ -606,16 +604,9 @@ impl OperationReservation {
     }
 }
 
-impl Drop for OperationReservation {
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
+impl Drop for OperationReservation<'_> {
     fn drop(&mut self) {
-        release_operation_reservation(unsafe {
-            // SAFETY: Device teardown waits for this pending queue count to reach zero.
-            self.pending.as_ref()
-        });
+        release_operation_reservation(self.pending);
     }
 }
 
@@ -1691,7 +1682,7 @@ impl CompletionReactor {
     fn enqueue(
         &self,
         pending: PendingIrp,
-        reservation: Option<OperationReservation>,
+        reservation: Option<OperationReservation<'_>>,
         class: ExecutionClass,
     ) {
         pending.target.irp.mark_pending();
