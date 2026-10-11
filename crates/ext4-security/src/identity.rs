@@ -1,5 +1,5 @@
 //! Validated SIDs and bounded per-filesystem identity records.
-use crate::{Error, MAX_MAPPING_BYTES, reserve, u32_at};
+use crate::{Error, MAX_MAPPING_BYTES, append_reserved, reserve, u32_at};
 use alloc::vec::Vec;
 use ext4_core::{Ext4Gid, Ext4Owner, Ext4Uid, FilesystemUuid};
 
@@ -394,20 +394,12 @@ impl MappingSnapshot {
         }
         let mut bytes = Vec::new();
         reserve(&mut bytes, length)?;
-        // Encoding can consume only the reservation; no append may implicitly grow the buffer.
-        let mut append = |field: &[u8]| -> Result<(), Error> {
-            for byte in field {
-                bytes
-                    .push_within_capacity(*byte)
-                    .map_err(|_| Error::RecordTooLarge)?;
-            }
-            Ok(())
-        };
-        append(b"E4IM\x01\0\0\0")?;
-        append(&self.generation.to_le_bytes())?;
-        append(&self.uuid.bytes())?;
+        append_reserved(&mut bytes, b"E4IM\x01\0\0\0")?;
+        append_reserved(&mut bytes, &self.generation.to_le_bytes())?;
+        append_reserved(&mut bytes, &self.uuid.bytes())?;
         for count in [self.map.users.len(), self.map.groups.len()] {
-            append(
+            append_reserved(
+                &mut bytes,
                 &u32::try_from(count)
                     .map_err(|_| Error::RecordTooLarge)?
                     .to_le_bytes(),
@@ -420,9 +412,9 @@ impl MappingSnapshot {
             .map(|e| (e.uid.as_u32(), e.sid))
             .chain(self.map.groups.iter().map(|e| (e.gid.as_u32(), e.sid)))
         {
-            append(&id.to_le_bytes())?;
-            append(&u32::from(sid.length).to_le_bytes())?;
-            append(sid.bytes())?;
+            append_reserved(&mut bytes, &id.to_le_bytes())?;
+            append_reserved(&mut bytes, &u32::from(sid.length).to_le_bytes())?;
+            append_reserved(&mut bytes, sid.bytes())?;
         }
         Ok(bytes)
     }

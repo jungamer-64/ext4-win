@@ -69,6 +69,39 @@ fn variable_descriptor_roundtrip() -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// Maximum-length owner/group SIDs occupy the complete descriptor budget.
+/// # Errors
+/// Returns fixture SID, identity or descriptor construction failure.
+/// # Panics
+/// Panics if a valid maximum-size descriptor cannot be encoded within its declared bound.
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture failures propagate while the observable descriptor bound uses assertions"
+)]
+#[test]
+fn maximum_sid_descriptor_fits_the_reserved_budget() -> Result<(), Error> {
+    let map = IdentityMap::new(
+        vec![UserMapping {
+            uid: Ext4Uid::from_u32(1000),
+            sid: "S-1-5-21-1-2-3-4-5-6-7-8-9-10-11-12-13-14".parse()?,
+        }],
+        vec![GroupMapping {
+            gid: Ext4Gid::from_u32(100),
+            sid: "S-1-5-21-1-2-3-4-5-6-7-8-9-10-11-12-13-15".parse()?,
+        }],
+    )?;
+    let target = security(0)?;
+    let descriptor = Descriptor::encode(target, &map, Components::ALL)?;
+    assert_eq!(descriptor.bytes().len(), 488);
+    assert_eq!(descriptor.bytes().len(), MAX_DESCRIPTOR_BYTES);
+    assert_eq!(
+        Descriptor::decode(descriptor.bytes(), &map, Components::ALL, target)?,
+        target
+    );
+    Ok(())
+}
+
 /// Table records retain identity and generation and reject duplicate authority/truncation.
 /// # Errors
 /// Returns a fixture construction failure.

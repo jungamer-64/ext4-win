@@ -1,7 +1,7 @@
 //! Self-relative inode-security descriptors with exclusive POSIX-class selection.
 use crate::{
-    BASE_RIGHTS, CONTROLLED_RIGHTS, Error, IdentityMap, Sid, mode_rights, reserve, rights_mode,
-    u32_at,
+    BASE_RIGHTS, CONTROLLED_RIGHTS, Error, IdentityMap, Sid, append_reserved, mode_rights, reserve,
+    rights_mode, u32_at,
 };
 use alloc::vec::Vec;
 use ext4_core::{Ext4Owner, Ext4Permissions, Ext4Security};
@@ -45,7 +45,7 @@ impl Descriptor {
     ) -> Result<Self, Error> {
         let mut bytes = Vec::new();
         reserve(&mut bytes, MAX_DESCRIPTOR_BYTES)?;
-        bytes.resize(20, 0);
+        append_reserved(&mut bytes, &[0; 20])?;
         put(&mut bytes, 0, &[1])?;
         let mut control = 0x8000_u16;
         let owner = map.user_sid(security.owner().uid())?;
@@ -60,7 +60,7 @@ impl Descriptor {
             control |= 4;
             let mut acl = Vec::new();
             reserve(&mut acl, MAX_DESCRIPTOR_BYTES)?;
-            acl.resize(8, 0);
+            append_reserved(&mut acl, &[0; 8])?;
             let permissions = security.permissions().as_u16();
             let mut count = 0_u16;
             for (sid, bits) in [
@@ -177,32 +177,31 @@ fn put(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<(), Error> {
 }
 /// Appends a relative component, recording its checked byte offset.
 /// # Errors
-/// Returns an error for an out-of-bounds encoding or allocation failure.
+/// Returns an invalid field offset or prepared-buffer exhaustion.
 fn component(bytes: &mut Vec<u8>, field: usize, value: &[u8]) -> Result<(), Error> {
     let offset = u32::try_from(bytes.len()).map_err(|_| Error::InvalidEncoding)?;
     put(bytes, field, &offset.to_le_bytes())?;
-    reserve(bytes, value.len())?;
-    bytes.extend_from_slice(value);
+    append_reserved(bytes, value)?;
     Ok(())
 }
 /// Appends one plain explicit ACE with a validated SID.
 /// # Errors
-/// Returns an error for an out-of-bounds encoding or allocation failure.
+/// Returns encoded-length overflow or prepared-buffer exhaustion.
 fn ace(bytes: &mut Vec<u8>, kind: u8, mask: u32, sid: Sid) -> Result<(), Error> {
     let length = sid
         .bytes()
         .len()
         .checked_add(8)
         .ok_or(Error::InvalidEncoding)?;
-    reserve(bytes, length)?;
-    bytes.extend_from_slice(&[kind, 0]);
-    bytes.extend_from_slice(
+    append_reserved(bytes, &[kind, 0])?;
+    append_reserved(
+        bytes,
         &u16::try_from(length)
             .map_err(|_| Error::InvalidEncoding)?
             .to_le_bytes(),
-    );
-    bytes.extend_from_slice(&mask.to_le_bytes());
-    bytes.extend_from_slice(sid.bytes());
+    )?;
+    append_reserved(bytes, &mask.to_le_bytes())?;
+    append_reserved(bytes, sid.bytes())?;
     Ok(())
 }
 /// Reads one checked sixteen-bit field.

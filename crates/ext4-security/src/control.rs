@@ -1,5 +1,5 @@
 //! Bounded control replies distinguish persistence from live publication and acknowledgement.
-use crate::{Error, MappingSnapshot, reserve};
+use crate::{Error, MappingSnapshot, append_reserved, reserve};
 use alloc::vec::Vec;
 
 /// Fixed versioned status header preceding the complete active table.
@@ -83,10 +83,10 @@ impl MappingReply {
                 .checked_add(record.len())
                 .ok_or(Error::RecordTooLarge)?,
         )?;
-        bytes.extend_from_slice(b"E4IS\x01\0\0\0");
-        bytes.extend_from_slice(&[0; 16]);
-        bytes.extend_from_slice(&active.generation.to_le_bytes());
-        bytes.extend_from_slice(&record);
+        append_reserved(&mut bytes, b"E4IS\x01\0\0\0")?;
+        append_reserved(&mut bytes, &[0; 16])?;
+        append_reserved(&mut bytes, &active.generation.to_le_bytes())?;
+        append_reserved(&mut bytes, &record)?;
         Ok(Self { bytes })
     }
     /// Exact native output admission charge for this prepared table.

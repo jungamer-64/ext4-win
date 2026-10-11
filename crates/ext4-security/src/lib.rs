@@ -61,6 +61,19 @@ pub(crate) fn reserve<T>(values: &mut alloc::vec::Vec<T>, count: usize) -> Resul
         .map_err(|_| Error::AllocationFailed)
 }
 
+/// Writes an encoded field within storage already reserved by the owning encoder.
+/// No field append may introduce an implicit allocation or allocator abort.
+/// # Errors
+/// Returns record-too-large if the prepared storage cannot contain the field.
+pub(crate) fn append_reserved(bytes: &mut alloc::vec::Vec<u8>, field: &[u8]) -> Result<(), Error> {
+    for byte in field {
+        bytes
+            .push_within_capacity(*byte)
+            .map_err(|_| Error::RecordTooLarge)?;
+    }
+    Ok(())
+}
+
 /// Reads one checked little-endian scalar from boundary bytes.
 /// # Errors
 /// Returns an error for an out-of-bounds encoding or allocation failure.
