@@ -29,17 +29,6 @@ ext4win_forward_original_irp(_In_ PDEVICE_OBJECT device, _Inout_ PIRP irp)
     return IoCallDriver(device, irp);
 }
 
-typedef struct _EXT4WIN_STREAM_METADATA {
-    ULONGLONG Epoch;
-    ULONG CreationTimeSeconds;
-    ULONG LastAccessTimeSeconds;
-    ULONG LastWriteTimeSeconds;
-    ULONG ChangeTimeSeconds;
-    ULONG FileAttributes;
-    ULONG NumberOfLinks;
-    ULONG Directory;
-} EXT4WIN_STREAM_METADATA, *PEXT4WIN_STREAM_METADATA;
-
 typedef struct _EXT4WIN_PUBLISHED_STREAM_METADATA {
     ULONGLONG Epoch;
     LARGE_INTEGER CreationTime;
@@ -117,30 +106,6 @@ C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, CreationTimeSeconds) == 8);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, FileAttributes) == 24);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, NumberOfLinks) == 28);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, Directory) == 32);
-
-_Success_(return != FALSE)
-static BOOLEAN
-ext4win_prepare_stream_metadata(
-    _In_ const EXT4WIN_STREAM_METADATA *input,
-    _Out_ PEXT4WIN_PUBLISHED_STREAM_METADATA output)
-{
-    if ((input == NULL) || (output == NULL) ||
-        (input->FileAttributes == 0) || (input->NumberOfLinks == 0) ||
-        (input->Directory > 1)) {
-        return FALSE;
-    }
-
-    RtlZeroMemory(output, sizeof(*output));
-    output->Epoch = input->Epoch;
-    RtlSecondsSince1970ToTime(input->CreationTimeSeconds, &output->CreationTime);
-    RtlSecondsSince1970ToTime(input->LastAccessTimeSeconds, &output->LastAccessTime);
-    RtlSecondsSince1970ToTime(input->LastWriteTimeSeconds, &output->LastWriteTime);
-    RtlSecondsSince1970ToTime(input->ChangeTimeSeconds, &output->ChangeTime);
-    output->FileAttributes = input->FileAttributes;
-    output->NumberOfLinks = input->NumberOfLinks;
-    output->Directory = input->Directory;
-    return TRUE;
-}
 
 static VOID
 ext4win_trace_selected(
