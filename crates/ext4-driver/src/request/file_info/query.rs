@@ -1159,22 +1159,11 @@ fn fixed_record_writer(output: &mut [u8], size: usize) -> DriverResult<LittleEnd
     Ok(LittleEndianOutput::new(record))
 }
 
-/// Converts an ext4 timestamp to a Windows system-time LARGE_INTEGER.
-#[expect(
-    unsafe_code,
-    reason = "Windows time conversion crosses the audited RtlSecondsSince1970ToTime ABI"
-)]
+/// Projects the shared Windows timestamp into this information record's ABI field.
 pub(super) fn windows_time(timestamp: Ext4Timestamp) -> LARGE_INTEGER {
-    let mut time = LARGE_INTEGER { QuadPart: 0 };
-    unsafe {
-        // SAFETY: `time` points to writable stack storage for the conversion
-        // result.
-        crate::kernel::ffi::RtlSecondsSince1970ToTime(
-            timestamp.seconds(),
-            core::ptr::addr_of_mut!(time),
-        );
+    LARGE_INTEGER {
+        QuadPart: crate::kernel::time::windows_timestamp(timestamp),
     }
-    time
 }
 
 /// Converts a Rust boolean to WDK BOOLEAN.

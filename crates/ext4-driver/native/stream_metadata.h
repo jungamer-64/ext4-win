@@ -1,5 +1,5 @@
-#ifndef EXT4WIN_STREAM_METADATA_H
-#define EXT4WIN_STREAM_METADATA_H
+#ifndef EXT4WIN_PUBLISHED_STREAM_METADATA_H
+#define EXT4WIN_PUBLISHED_STREAM_METADATA_H
 
 /* Durable publications are serialized by the volume reactor. Header-only changes must
  * not wait on MainResource: read-ahead can retain it while awaiting that reactor's
@@ -15,11 +15,10 @@ ext4win_stream_publish_metadata(
     _In_ LONGLONG file_size,
     _In_ LONGLONG valid_data_length,
     _In_ LONGLONG allocation_charge,
-    _In_ const EXT4WIN_STREAM_METADATA *metadata,
+    _In_ const EXT4WIN_PUBLISHED_STREAM_METADATA *metadata,
     _Out_ NTSTATUS *cache_status_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-    EXT4WIN_PUBLISHED_STREAM_METADATA prepared_metadata;
     CC_FILE_SIZES sizes;
     PFILE_OBJECT file_object;
     BOOLEAN size_change;
@@ -30,7 +29,7 @@ ext4win_stream_publish_metadata(
     }
     *cache_status_out = STATUS_SUCCESS;
     if ((stream == NULL) || (stream->Kind != 1) ||
-        !ext4win_prepare_stream_metadata(metadata, &prepared_metadata) ||
+        (metadata == NULL) ||
         (allocation_size < 0) || (file_size < 0) ||
         (allocation_charge < 0) ||
         (valid_data_length != file_size) ||
@@ -42,7 +41,7 @@ ext4win_stream_publish_metadata(
     file_object = NULL;
     ExAcquireFastMutex(&stream->HeaderMutex);
     if ((stream->MetadataValid != FALSE) &&
-        (prepared_metadata.Epoch <= stream->PublishedMetadata.Epoch)) {
+        (metadata->Epoch <= stream->PublishedMetadata.Epoch)) {
         ExReleaseFastMutex(&stream->HeaderMutex);
         return STATUS_INVALID_PARAMETER;
     }
@@ -58,7 +57,7 @@ ext4win_stream_publish_metadata(
         stream->Header.ValidDataLength.QuadPart = valid_data_length;
     }
     stream->AllocationCharge = allocation_charge;
-    stream->PublishedMetadata = prepared_metadata;
+    stream->PublishedMetadata = *metadata;
     stream->MetadataValid = TRUE;
     sizes.AllocationSize = stream->Header.AllocationSize;
     sizes.FileSize = stream->Header.FileSize;

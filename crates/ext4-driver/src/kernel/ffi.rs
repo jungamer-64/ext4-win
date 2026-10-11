@@ -9,8 +9,7 @@ pub(crate) use wdk_sys::ntddk::{
 };
 pub(crate) use wdk_sys::ntddk::{
     IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink,
-    IoRegisterFileSystem, IoUnregisterFileSystem, RtlSecondsSince1970ToTime,
-    RtlTimeToSecondsSince1970,
+    IoRegisterFileSystem, IoUnregisterFileSystem, RtlTimeToSecondsSince1970,
 };
 
 /// # Safety

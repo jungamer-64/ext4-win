@@ -26,36 +26,13 @@ struct TransferObservation {
     write_access: u8,
 }
 
-/// Fixed committed metadata projection borrowed from the native header snapshot.
-#[cfg(not(test))]
-#[derive(Clone, Copy, Debug)]
-#[repr(C)]
-struct PublishedMetadata {
-    /// Epoch owns every field of this projection.
-    epoch: u64,
-    /// Windows creation timestamp.
-    creation: i64,
-    /// Windows access timestamp.
-    accessed: i64,
-    /// Windows write timestamp.
-    modified: i64,
-    /// Windows metadata-change timestamp.
-    changed: i64,
-    /// Complete Windows file attributes.
-    attributes: u32,
-    /// Windows-visible namespace link count.
-    links: u32,
-    /// Native directory discriminator.
-    directory: u32,
-}
-
 /// One coherent, allocation-free metadata observation; header storage remains authoritative.
 #[cfg(not(test))]
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
 struct QuerySnapshot {
     /// Epoch-owned committed file metadata.
-    metadata: PublishedMetadata,
+    metadata: super::stream::StreamMetadata,
     /// Physical storage charge, independent of logical section allocation.
     allocation: i64,
     /// Committed logical EOF.

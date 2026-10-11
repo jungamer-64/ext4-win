@@ -31,8 +31,7 @@ typedef struct { PFILE_OBJECT SharedCacheMap; } SECTION_OBJECT_POINTERS;
 typedef struct {
     LARGE_INTEGER AllocationSize, FileSize, ValidDataLength;
 } CC_FILE_SIZES;
-typedef struct { ULONGLONG Epoch; ULONG NumberOfLinks; } EXT4WIN_STREAM_METADATA;
-typedef EXT4WIN_STREAM_METADATA EXT4WIN_PUBLISHED_STREAM_METADATA;
+typedef struct { ULONGLONG Epoch; ULONG NumberOfLinks; } EXT4WIN_PUBLISHED_STREAM_METADATA;
 typedef struct {
     CC_FILE_SIZES Header;
     FAST_MUTEX HeaderMutex;
@@ -58,13 +57,6 @@ static PEXT4WIN_STREAM_CONTEXT ext4win_stream_from_header(PVOID header)
 {
     assert(header == NULL || header == &stream.Header);
     return header == NULL ? NULL : &stream;
-}
-static BOOLEAN ext4win_prepare_stream_metadata(const EXT4WIN_STREAM_METADATA *input,
-    EXT4WIN_PUBLISHED_STREAM_METADATA *output)
-{
-    if (input == NULL || input->NumberOfLinks == 0) { return FALSE; }
-    *output = *input;
-    return TRUE;
 }
 static void ExAcquireFastMutex(FAST_MUTEX *mutex)
 {
@@ -126,7 +118,7 @@ static void ObDereferenceObject(PFILE_OBJECT file)
 static void publish(ULONGLONG epoch, LONGLONG allocation, LONGLONG eof,
     LONGLONG charge, NTSTATUS expected_cache_status)
 {
-    const EXT4WIN_STREAM_METADATA metadata = { epoch, 2 };
+    const EXT4WIN_PUBLISHED_STREAM_METADATA metadata = { epoch, 2 };
     NTSTATUS cache_status = 99;
     assert(ext4win_stream_publish_metadata(&stream.Header, allocation, eof, eof,
         charge, &metadata, &cache_status) == STATUS_SUCCESS);
@@ -141,7 +133,7 @@ static void publish(ULONGLONG epoch, LONGLONG allocation, LONGLONG eof,
 
 int main(void)
 {
-    EXT4WIN_STREAM_METADATA metadata;
+    EXT4WIN_PUBLISHED_STREAM_METADATA metadata;
     NTSTATUS cache_status;
     stream.Kind = 1;
     stream.Header.AllocationSize.QuadPart = 8192;

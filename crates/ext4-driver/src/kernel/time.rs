@@ -4,6 +4,14 @@ use ext4_core::Ext4Timestamp;
 
 use crate::kernel::status::DriverError;
 
+/// Converts ext4's bounded Unix-second domain to Windows 100-nanosecond ticks since 1601.
+/// Every u32 second count fits i64 after this affine conversion.
+pub(crate) fn windows_timestamp(timestamp: Ext4Timestamp) -> i64 {
+    i64::from(timestamp.seconds())
+        .wrapping_mul(10_000_000)
+        .wrapping_add(116_444_736_000_000_000)
+}
+
 /// Returns the current system time as an ext4 inode timestamp.
 /// # Errors
 ///
@@ -32,4 +40,27 @@ pub(crate) fn current_ext4_timestamp() -> Result<Ext4Timestamp, DriverError> {
         return Err(DriverError::InvalidParameter);
     }
     Ok(Ext4Timestamp::from_unix_seconds(seconds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails if epoch conversion or the maximum ext4 timestamp loses ticks.
+    #[test]
+    fn windows_time_known_answers() {
+        assert_eq!(
+            windows_timestamp(Ext4Timestamp::from_unix_seconds(0)),
+            116_444_736_000_000_000
+        );
+        assert_eq!(
+            windows_timestamp(Ext4Timestamp::from_unix_seconds(1)),
+            116_444_736_010_000_000
+        );
+        assert_eq!(
+            windows_timestamp(Ext4Timestamp::from_unix_seconds(u32::MAX)),
+            159_394_408_950_000_000
+        );
+    }
 }

@@ -100,12 +100,9 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
 
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_CONTEXT, Header) == 0);
 C_ASSERT(sizeof(EXT4WIN_STREAM_CONTEXT) <= MAXSHORT);
-C_ASSERT(sizeof(EXT4WIN_STREAM_METADATA) == 40);
-C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, Epoch) == 0);
-C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, CreationTimeSeconds) == 8);
-C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, FileAttributes) == 24);
-C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, NumberOfLinks) == 28);
-C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_METADATA, Directory) == 32);
+C_ASSERT(sizeof(EXT4WIN_PUBLISHED_STREAM_METADATA) == 56);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_PUBLISHED_STREAM_METADATA, CreationTime) == 8);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_PUBLISHED_STREAM_METADATA, Directory) == 48);
 
 static VOID
 ext4win_trace_selected(
@@ -496,13 +493,12 @@ ext4win_stream_create(
     _In_ LONGLONG file_size,
     _In_ LONGLONG valid_data_length,
     _In_ LONGLONG allocation_charge,
-    _In_opt_ const EXT4WIN_STREAM_METADATA *metadata,
+    _In_opt_ const EXT4WIN_PUBLISHED_STREAM_METADATA *metadata,
     _In_ REGHANDLE trace_registration_handle,
     _In_ PVOID rust_state,
     _Outptr_ PVOID *stream_header_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
-    EXT4WIN_PUBLISHED_STREAM_METADATA prepared_metadata;
     BOOLEAN metadata_valid;
     NTSTATUS status;
 
@@ -510,13 +506,8 @@ ext4win_stream_create(
         return STATUS_INVALID_PARAMETER;
     }
     *stream_header_out = NULL;
-    RtlZeroMemory(&prepared_metadata, sizeof(prepared_metadata));
     metadata_valid = FALSE;
     if ((rust_state == NULL) || ((kind != 1) && (kind != 2))) {
-        return STATUS_INVALID_PARAMETER;
-    }
-    if ((metadata != NULL) &&
-        !ext4win_prepare_stream_metadata(metadata, &prepared_metadata)) {
         return STATUS_INVALID_PARAMETER;
     }
     if ((kind == 2) && (metadata != NULL)) {
@@ -586,7 +577,7 @@ ext4win_stream_create(
     stream->Header.ValidDataLength.QuadPart = valid_data_length;
     stream->AllocationCharge = allocation_charge;
     if (metadata_valid) {
-        stream->PublishedMetadata = prepared_metadata;
+        stream->PublishedMetadata = *metadata;
         stream->MetadataValid = TRUE;
     }
     stream->Header.IsFastIoPossible = FastIoIsQuestionable;

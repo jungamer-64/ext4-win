@@ -125,38 +125,38 @@ impl StreamSizes {
 /// Fixed native input used to publish the Fast I/O query projection with stream sizes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
-struct NativeStreamMetadata {
+pub(super) struct StreamMetadata {
     /// Monotonic committed epoch that owns every remaining field.
-    epoch: u64,
-    /// Unix seconds converted to Windows time by the native boundary.
-    creation_time_seconds: u32,
-    /// Unix seconds converted to Windows time by the native boundary.
-    last_access_time_seconds: u32,
-    /// Unix seconds converted to Windows time by the native boundary.
-    last_write_time_seconds: u32,
-    /// Unix seconds converted to Windows time by the native boundary.
-    change_time_seconds: u32,
+    pub(super) epoch: u64,
+    /// Windows creation timestamp.
+    pub(super) creation: i64,
+    /// Windows access timestamp.
+    pub(super) accessed: i64,
+    /// Windows write timestamp.
+    pub(super) modified: i64,
+    /// Windows metadata-change timestamp.
+    pub(super) changed: i64,
     /// Complete Windows file-attribute projection.
-    file_attributes: u32,
+    pub(super) attributes: u32,
     /// Windows-visible namespace link count.
-    number_of_links: u32,
-    /// `1` for directories and `0` for file-like nodes.
-    directory: u32,
+    pub(super) links: u32,
+    /// Fixed native directory discriminator.
+    pub(super) directory: u32,
 }
 
-impl NativeStreamMetadata {
+impl StreamMetadata {
     /// Builds one native projection from a coherent core snapshot and its committed epoch.
     fn from_snapshot(snapshot: NodeMetadataSnapshot, epoch: EpochSequence) -> Self {
         let times = snapshot.times();
         let directory = matches!(snapshot.node(), NodeId::Directory(_));
         Self {
             epoch: epoch.get(),
-            creation_time_seconds: times.created().seconds(),
-            last_access_time_seconds: times.accessed().seconds(),
-            last_write_time_seconds: times.modified().seconds(),
-            change_time_seconds: times.changed().seconds(),
-            file_attributes: snapshot.windows_file_attributes(),
-            number_of_links: if directory {
+            creation: super::time::windows_timestamp(times.created()),
+            accessed: super::time::windows_timestamp(times.accessed()),
+            modified: super::time::windows_timestamp(times.modified()),
+            changed: super::time::windows_timestamp(times.changed()),
+            attributes: snapshot.windows_file_attributes(),
+            links: if directory {
                 1
             } else {
                 u32::from(snapshot.links_count().get())
@@ -229,7 +229,7 @@ pub(crate) struct StreamContext {
     sizes: Mutex<StreamSizes>,
     /// Host equivalent of the native epoch-tagged Fast I/O query projection.
     #[cfg(test)]
-    metadata: Mutex<Option<NativeStreamMetadata>>,
+    metadata: Mutex<Option<StreamMetadata>>,
     /// Host equivalent of the ledger-derived native delete-pending projection.
     #[cfg(test)]
     delete_pending: AtomicBool,
@@ -569,7 +569,7 @@ impl StreamContext {
         Self::try_new(
             StreamOwnerKind::Node,
             sizes,
-            Some(NativeStreamMetadata::from_snapshot(snapshot, epoch)),
+            Some(StreamMetadata::from_snapshot(snapshot, epoch)),
             trace,
         )
     }
@@ -592,7 +592,7 @@ impl StreamContext {
     fn try_new(
         kind: StreamOwnerKind,
         sizes: StreamSizes,
-        metadata: Option<NativeStreamMetadata>,
+        metadata: Option<StreamMetadata>,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
         let runtime = match kind {
@@ -1060,7 +1060,7 @@ impl StreamContext {
         if self.runtime.kind() != StreamOwnerKind::Node {
             return Err(DriverError::InternalInvariantViolation);
         }
-        let metadata = NativeStreamMetadata::from_snapshot(snapshot, epoch);
+        let metadata = StreamMetadata::from_snapshot(snapshot, epoch);
         #[cfg(not(test))]
         {
             let mut cache_status = STATUS_SUCCESS;
@@ -1686,7 +1686,7 @@ unsafe extern "system" {
         file_size: i64,
         valid_data_length: i64,
         allocation_charge: i64,
-        metadata: *const NativeStreamMetadata,
+        metadata: *const StreamMetadata,
         trace_registration_handle: u64,
         runtime: *mut c_void,
         stream_header_out: *mut wdk_sys::PVOID,
@@ -1767,7 +1767,7 @@ unsafe extern "system" {
         file_size: i64,
         valid_data_length: i64,
         allocation_charge: i64,
-        metadata: *const NativeStreamMetadata,
+        metadata: *const StreamMetadata,
         cache_status_out: *mut NTSTATUS,
     ) -> NTSTATUS;
 
@@ -1833,7 +1833,7 @@ unsafe extern "system" {
 mod tests {
     use ext4_core::{ClusterSize, FileAllocationSize, FileSize};
 
-    use super::{NativeStreamMetadata, OperationalTrace, Ordering, StreamContext, StreamSizes};
+    use super::{OperationalTrace, Ordering, StreamContext, StreamMetadata, StreamSizes};
     use crate::kernel::status::{DriverError, DriverResult};
 
     /// # Errors
@@ -2140,13 +2140,10 @@ mod tests {
     /// Panics if the Rust metadata input no longer matches the fixed native ABI.
     #[test]
     fn native_stream_metadata_layout_matches_c_boundary() {
-        assert_eq!(core::mem::size_of::<NativeStreamMetadata>(), 40);
-        assert_eq!(core::mem::offset_of!(NativeStreamMetadata, epoch), 0);
-        assert_eq!(
-            core::mem::offset_of!(NativeStreamMetadata, creation_time_seconds),
-            8
-        );
-        assert_eq!(core::mem::offset_of!(NativeStreamMetadata, directory), 32);
+        assert_eq!(core::mem::size_of::<StreamMetadata>(), 56);
+        assert_eq!(core::mem::offset_of!(StreamMetadata, epoch), 0);
+        assert_eq!(core::mem::offset_of!(StreamMetadata, creation), 8);
+        assert_eq!(core::mem::offset_of!(StreamMetadata, directory), 48);
     }
 
     /// # Errors
