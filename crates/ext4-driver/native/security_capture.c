@@ -3,7 +3,6 @@
 #define EXT4WIN_SECURITY_POOL_TAG ((ULONG)0x53773445UL)
 
 /* Neither-I/O lengths are requestor controlled, so each capture stays bounded. */
-#define EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE (128UL * 1024UL)
 #define EXT4WIN_MAX_EA_NAME_LIST_SIZE (64UL * 1024UL)
 #define EXT4WIN_MAX_DIRECTORY_PATTERN_SIZE (64UL * 1024UL - sizeof(WCHAR))
 #define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS                                      \
@@ -536,9 +535,6 @@ ext4win_capture_set_security_descriptor(
         (maximum_length < header_length)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (maximum_length > EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE) {
-        return STATUS_INVALID_BUFFER_SIZE;
-    }
     if (source == NULL) {
         return STATUS_INVALID_SECURITY_DESCR;
     }
@@ -561,7 +557,7 @@ ext4win_capture_set_security_descriptor(
     }
 
     if ((candidate_length < header_length) ||
-        (candidate_length > EXT4WIN_MAX_SECURITY_DESCRIPTOR_SIZE)) {
+        (candidate_length > maximum_length)) {
         return STATUS_INVALID_SECURITY_DESCR;
     }
 
