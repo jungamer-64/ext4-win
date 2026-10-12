@@ -179,27 +179,11 @@ unsafe extern "system" {
     fn BCryptDestroyHash(hash: *mut c_void) -> NTSTATUS;
 }
 
-/// Non-null CNG algorithm handle whose close authority remains mount-scoped.
-#[derive(Clone, Copy)]
-struct AlgorithmHandle(NonNull<c_void>);
-
-impl AlgorithmHandle {
-    /// Exposes the opaque handle only at the CNG call boundary.
-    const fn as_raw(self) -> *mut c_void {
-        self.0.as_ptr()
-    }
+/// Sole close authority for one live CNG algorithm provider.
+struct OwnedAlgorithmHandle {
+    /// Native identity retained until the last algorithm owner releases it.
+    handle: NonNull<c_void>,
 }
-
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-// SAFETY: CNG algorithm handles are opaque kernel provider identities. They are opened and closed
-// on the PASSIVE_LEVEL reactor, and operation calls are serialized by that same reactor thread.
-unsafe impl Send for AlgorithmHandle {}
-
-/// Mount-owned close authority for one algorithm provider.
-struct OwnedAlgorithmHandle(AlgorithmHandle);
 
 impl OwnedAlgorithmHandle {
     /// Opens one default CNG primitive provider at PASSIVE_LEVEL.
@@ -224,12 +208,7 @@ impl OwnedAlgorithmHandle {
         };
         cng_status_to_driver(status)?;
         let handle = NonNull::new(raw).ok_or(DriverError::Core(Error::CryptographicFailure))?;
-        Ok(Self(AlgorithmHandle(handle)))
-    }
-
-    /// Returns a non-owning handle copy bounded by mounted-runtime teardown.
-    const fn borrowed(&self) -> AlgorithmHandle {
-        self.0
+        Ok(Self { handle })
     }
 }
 
@@ -240,9 +219,8 @@ impl Drop for OwnedAlgorithmHandle {
     )]
     fn drop(&mut self) {
         let _status = unsafe {
-            // SAFETY: This value owns the only close authority and mounted-runtime teardown drains
-            // every operation object before algorithm providers are dropped.
-            BCryptCloseAlgorithmProvider(self.0.as_raw(), 0)
+            // SAFETY: This value owns the only close authority for this live native handle.
+            BCryptCloseAlgorithmProvider(self.handle.as_ptr(), 0)
         };
     }
 }
@@ -293,22 +271,6 @@ impl SymmetricProvider {
         Ok(provider)
     }
 
-    /// Copies the execution values while retaining close authority in the mount.
-    const fn execution(&self) -> SymmetricExecution {
-        SymmetricExecution {
-            algorithm: self.algorithm.borrowed(),
-            key_object_bytes: self.key_object_bytes,
-        }
-    }
-}
-
-/// Non-owning symmetric execution profile copied into one operation.
-#[derive(Clone, Copy)]
-struct SymmetricExecution {
-    /// Mount-owned CNG provider handle.
-    algorithm: AlgorithmHandle,
-    /// Active prefix of the operation-owned key-object buffer.
-    key_object_bytes: usize,
 }
 
 /// Mount-owned hash algorithm and validated object geometry.
@@ -574,12 +536,6 @@ impl Drop for GeneratedKey<'_> {
 /// the suspended operation and is never referenced from a completion context.
 #[derive(Debug)]
 pub(crate) struct CngOperation {
-    /// Mount-owned XTS provider execution values.
-    xts: SymmetricExecution,
-    /// Mount-owned AES-ECB provider execution values.
-    aes_ecb: SymmetricExecution,
-    /// Mount-owned HKDF provider execution values.
-    hkdf: SymmetricExecution,
     /// Reusable SHA-256 object.
     sha256: ReusableHash,
     /// Reusable SHA-512 object.
@@ -587,23 +543,6 @@ pub(crate) struct CngOperation {
     /// Single nonpaged buffer leased exclusively to each generated key.
     key_object: DriverVec<u8>,
 }
-
-impl core::fmt::Debug for SymmetricExecution {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter
-            .debug_struct("SymmetricExecution")
-            .field("key_object_bytes", &self.key_object_bytes)
-            .finish()
-    }
-}
-
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-// SAFETY: Operation admission and every cryptographic call/drop execute on the sole PASSIVE_LEVEL
-// reactor. Opaque provider handles remain live until that reactor drains every operation.
-unsafe impl Send for CngOperation {}
 
 impl CryptographicOperation for CngOperation {
     #[expect(
