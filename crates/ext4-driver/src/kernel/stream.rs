@@ -255,6 +255,16 @@ enum StreamRuntime {
 }
 
 impl StreamRuntime {
+    /// Prepares node-only completion ownership before any native header is exposed.
+    /// # Errors
+    /// Returns nonpaged completion-inbox allocation failure.
+    fn try_node() -> DriverResult<Self> {
+        Ok(Self::Node {
+            #[cfg(not(test))]
+            completion: crate::irp::mdl_completion::MdlCompletionQueue::try_new()?,
+        })
+    }
+
     /// Immutable owner domain implied by the resource variant.
     const fn kind(&self) -> StreamOwnerKind {
         match self {
@@ -557,7 +567,7 @@ impl StreamContext {
         sizes: StreamSizes,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
-        Self::try_new(StreamOwnerKind::Node, sizes, None, trace)
+        Self::try_new(StreamRuntime::try_node()?, sizes, None, trace)
     }
 
     /// Allocates a node advanced header with one coherent committed metadata projection.
@@ -574,7 +584,7 @@ impl StreamContext {
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
         Self::try_new(
-            StreamOwnerKind::Node,
+            StreamRuntime::try_node()?,
             sizes,
             Some(StreamMetadata::from_snapshot(snapshot, epoch)),
             trace,
@@ -588,8 +598,12 @@ impl StreamContext {
     pub(crate) fn try_new_volume(
         sizes: StreamSizes,
         trace: OperationalTrace,
+        reliability: super::io_reliability::IoReliabilityObservation,
     ) -> DriverResult<Self> {
-        Self::try_new(StreamOwnerKind::Volume, sizes, None, trace)
+        let runtime = StreamRuntime::Volume(NativeAllocation::from_box(
+            crate::memory::boxed_try_with(|| Ok(StorageAdmission::new(reliability)))?,
+        ));
+        Self::try_new(runtime, sizes, None, trace)
     }
 
     /// Allocates the opaque native stream with its owner-domain-specific metadata state.
@@ -597,21 +611,12 @@ impl StreamContext {
     ///
     /// Returns an allocation or invariant error when the native stream cannot be constructed.
     fn try_new(
-        kind: StreamOwnerKind,
+        runtime: StreamRuntime,
         sizes: StreamSizes,
         metadata: Option<StreamMetadata>,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
         let sections = SectionSynchronization::try_new()?;
-        let runtime = match kind {
-            StreamOwnerKind::Volume => StreamRuntime::Volume(NativeAllocation::from_box(
-                crate::memory::boxed_try_with(|| Ok(StorageAdmission::new()))?,
-            )),
-            StreamOwnerKind::Node => StreamRuntime::Node {
-                #[cfg(not(test))]
-                completion: crate::irp::mdl_completion::MdlCompletionQueue::try_new()?,
-            },
-        };
         #[cfg(not(test))]
         {
             let mut header = core::ptr::null_mut();
@@ -624,7 +629,7 @@ impl StreamContext {
                 // RustState retains the runtime's original allocation pointer; moving the runtime
                 // preserves that pointer, and StreamContext destroys the native header first.
                 ext4win_stream_create(
-                    kind.native_tag(),
+                    runtime.kind().native_tag(),
                     sizes.allocation_size,
                     sizes.file_size,
                     sizes.valid_data_length,

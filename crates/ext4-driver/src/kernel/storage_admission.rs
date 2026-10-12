@@ -4,6 +4,7 @@
 //! Only submission scopes hold the native resource; revocation never waits for lower completion.
 
 use core::sync::atomic::{AtomicU8, Ordering};
+use super::io_reliability::IoReliabilityObservation;
 
 /// Monotonic lower-device availability, independent of filesystem close.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +78,8 @@ impl QueryPhase {
 /// Sole admission authority. Atomics permit observations from native cache callbacks.
 #[derive(Debug)]
 pub(super) struct StorageAdmission {
+    /// Reactor-owned reliability projection retained independently from media and close.
+    pub(super) reliability: IoReliabilityObservation,
     /// Monotonic media revocation.
     media: AtomicU8,
     /// One-way filesystem close admission.
@@ -87,8 +90,9 @@ pub(super) struct StorageAdmission {
 
 impl StorageAdmission {
     /// Unpublished volume with storage and filesystem admission open.
-    pub(super) const fn new() -> Self {
+    pub(super) const fn new(reliability: IoReliabilityObservation) -> Self {
         Self {
+            reliability,
             media: AtomicU8::new(0),
             close: AtomicU8::new(0),
             query: AtomicU8::new(0),
