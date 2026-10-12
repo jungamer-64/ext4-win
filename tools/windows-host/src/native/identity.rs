@@ -248,17 +248,11 @@ pub fn resolve_identity(account: &str) -> io::Result<Sid> {
     Sid::parse(bytes).map_err(invalid)
 }
 
-/// Queries a mounted ext4 filesystem's core UUID using a direct volume handle.
+/// Queries an ext4 filesystem's core UUID through its root, with attribute-only access.
 /// # Errors
 /// Returns native mount/control errors or an invalid UUID payload.
 pub fn volume_identity(path: &str) -> io::Result<FilesystemUuid> {
-    let trimmed = path.trim_end_matches('\\');
-    let path = if trimmed.len() == 2 && trimmed.ends_with(':') {
-        format!("\\\\.\\{trimmed}")
-    } else {
-        trimmed.to_owned()
-    };
-    let file = FileHandle::open(Path::new(&path), 0x80, 0)?;
+    let file = FileHandle::open_volume_root(path)?;
     let mut bytes = [0_u8; 16];
     let result = file
         .control(QUERY_VOLUME_IDENTITY_FSCTL, &mut bytes)

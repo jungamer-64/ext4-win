@@ -899,24 +899,21 @@ fn dismount_filesystem(session: &mut Session<LiveState>) -> TaskResult<()> {
     }
     Ok(())
 }
-/// Confirms Mount Manager withdrew the exact retired session volume.
+/// Confirms the exact detached session volume no longer resolves to a device.
 /// # Errors
-/// Returns enumeration or timeout failures.
+/// Returns device-query or timeout failures; retained Mount Manager names do not establish presence.
 fn wait_removed(session: &Session<LiveState>) -> TaskResult<()> {
     let Some(volume) = session.state().volume() else {
         return Ok(());
     };
     let start = Instant::now();
     loop {
-        if !windows_host::volume_names()?
-            .iter()
-            .any(|observed| observed == volume)
-        {
+        if !windows_host::volume_device_present(volume)? {
             return Ok(());
         }
         if start.elapsed() >= Duration::from_secs(30) {
             return Err(
-                io::Error::other("Mount Manager retained the removed session volume").into(),
+                io::Error::other("detached session volume still resolves to a device").into(),
             );
         }
         thread::sleep(Duration::from_millis(200));

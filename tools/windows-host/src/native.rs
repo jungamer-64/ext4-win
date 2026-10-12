@@ -138,6 +138,18 @@ impl FileHandle {
             Ok(Self { raw: Some(raw) })
         }
     }
+    /// Opens the filesystem root with attribute access, forcing filesystem routing without raw I/O authority.
+    /// A direct volume open with only attribute access can bypass the filesystem entirely.
+    /// # Errors
+    /// Returns invalid paths, mount failures or filesystem root admission errors.
+    fn open_volume_root(volume: &str) -> io::Result<Self> {
+        let root = format!("{}\\", volume.trim_end_matches('\\'));
+        Self::open(
+            Path::new(&root),
+            FILE_READ_ATTRIBUTES,
+            FILE_FLAG_BACKUP_SEMANTICS,
+        )
+    }
     /// Borrows the live native handle for a synchronous call in this module.
     /// # Errors
     /// Returns an error after close has consumed the handle.
@@ -791,6 +803,25 @@ pub fn volume_names() -> io::Result<Vec<String>> {
             Ok(())
         },
     )
+}
+/// Observes whether a volume GUID path still resolves to a device, without mounting its filesystem.
+/// Mount Manager's names and symbolic links can outlive the target. A zero-access direct open
+/// acquires no filesystem or raw-data authority; only native device absence returns false.
+/// # Errors
+/// Returns invalid GUID paths, native errors other than device absence, or handle-release failures.
+pub fn volume_device_present(volume: &str) -> io::Result<bool> {
+    let name = volume
+        .strip_prefix("\\\\?\\Volume{")
+        .and_then(|value| value.strip_suffix("}\\"))
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "expected a volume GUID path")
+        })?;
+    guid_bytes(name)?;
+    match FileHandle::open(Path::new(volume.trim_end_matches('\\')), 0, 0) {
+        Ok(file) => completed(Ok(true), file.close()),
+        Err(error) if matches!(error.raw_os_error(), Some(2 | 3 | 433)) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 /// Finds a unique volume by its exact disk extent and GPT identity without mounting it.
 ///
@@ -1476,6 +1507,137 @@ pub fn verify_directory(directory: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Errors
+    /// Returns native alias acquisition, namespace observation or mandatory withdrawal failures.
+    /// # Panics
+    /// Fails if a retained volume alias is mistaken for the presence of its absent target device.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible native fixture ownership surrounds assertions about device absence"
+    )]
+    fn stale_volume_binding_does_not_establish_device_presence() -> io::Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let alias = format!(
+            "Volume{{00000000-0000-0000-0000-{:012x}}}",
+            nonce & 0xffff_ffff_ffff
+        );
+        let volume = format!("\\\\?\\{alias}\\");
+        let name = wide(OsStr::new(&alias))?;
+        let target = wide(OsStr::new(&format!("\\Device\\ext4win-absent-{nonce}")))?;
+        let mut observed = [0_u16; 1024];
+        let existing = unsafe {
+            // SAFETY: The terminated name and exclusive initialized output are live synchronously.
+            QueryDosDeviceW(name.as_ptr(), observed.as_mut_ptr(), 1024)
+        };
+        if existing != 0 || io::Error::last_os_error().raw_os_error() != Some(2) {
+            return Err(io::Error::other(
+                "fixture alias is not independently absent",
+            ));
+        }
+        let created = unsafe {
+            // SAFETY: The independently absent, unique alias targets no device. Both terminated
+            // inputs are retained until return; no arrival notification is broadcast.
+            DefineDosDeviceW(
+                DDD_RAW_TARGET_PATH | DDD_NO_BROADCAST_SYSTEM,
+                name.as_ptr(),
+                target.as_ptr(),
+            )
+        };
+        if created == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let result = (|| {
+            let count = unsafe {
+                // SAFETY: The acquired alias and initialized output are live during observation.
+                QueryDosDeviceW(name.as_ptr(), observed.as_mut_ptr(), 1024)
+            };
+            if count == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            volume_device_present(&volume)
+        })();
+        let removed = unsafe {
+            // SAFETY: This function owns this exact alias/target pair; exact-match removal cannot
+            // consume a different mapping. Both terminated inputs are still live.
+            DefineDosDeviceW(
+                DDD_RAW_TARGET_PATH
+                    | DDD_NO_BROADCAST_SYSTEM
+                    | DDD_REMOVE_DEFINITION
+                    | DDD_EXACT_MATCH_ON_REMOVE,
+                name.as_ptr(),
+                target.as_ptr(),
+            )
+        };
+        let present = completed(
+            result,
+            if removed == 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                Ok(())
+            },
+        )?;
+        assert!(!present);
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns native volume discovery, filesystem query or explicit handle-release failures.
+    /// # Panics
+    /// Fails if a filesystem root query bypasses the mounted filesystem or device absence is lost.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independent Windows filesystem and namespace observations"
+    )]
+    fn filesystem_volume_observation_contract() -> io::Result<()> {
+        let executable = std::env::current_exe()?;
+        let root = executable
+            .ancestors()
+            .last()
+            .ok_or_else(|| io::Error::other("executable lacks a volume root"))?;
+        let volume = volume_at_mount(root)?;
+        assert!(volume_device_present(&volume)?);
+        assert!(!volume_device_present(
+            "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\"
+        )?);
+        assert!(volume_device_present("C:\\").is_err());
+        let drive = root
+            .to_str()
+            .ok_or_else(|| io::Error::other("volume root is not Unicode"))?
+            .trim_end_matches('\\');
+        for path in [&volume, drive] {
+            let file = FileHandle::open_volume_root(path)?;
+            let query = (|| {
+                let mut filesystem = [0_u16; 64];
+                let success = unsafe {
+                    // SAFETY: The root handle and exclusive initialized name buffer remain live;
+                    // all unrequested output fields are null and no pointers are retained.
+                    GetVolumeInformationByHandleW(
+                        file.raw()?,
+                        ptr::null_mut(),
+                        0,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        filesystem.as_mut_ptr(),
+                        64,
+                    )
+                };
+                if success == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                assert!(!decode(&filesystem).is_empty());
+                Ok(())
+            })();
+            completed(query, file.close())?;
+        }
+        Ok(())
+    }
+
     /// # Panics
     /// Panics when the real Windows I/O Manager supplies aggregate handle fields that differ
     /// from their independently queried values.
