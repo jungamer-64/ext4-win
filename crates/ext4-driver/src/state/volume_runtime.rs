@@ -333,7 +333,7 @@ pub(crate) struct VolumeRuntime {
     coordinator: MutationCoordinatorState,
     /// Validated lower-device geometry and completion owner.
     storage: MountedStorage,
-    /// Immutable mount-scoped CNG algorithm providers.
+    /// Mount admission owner for independently retained CNG algorithm providers.
     crypto: CngProvider,
     /// Current read/write reliability state.
     failure: VolumeFailureState,
@@ -388,7 +388,7 @@ impl VolumeRuntime {
         self.storage.route()
     }
 
-    /// Mount-scoped algorithm providers used to prebuild operation-owned CNG objects.
+    /// Admission owner used to acquire provider leases and prebuild operation-owned CNG objects.
     pub(crate) const fn crypto(&self) -> &CngProvider {
         &self.crypto
     }

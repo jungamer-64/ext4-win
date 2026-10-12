@@ -7,7 +7,7 @@ use ext4_core::{CryptographicOperation, Error, Result as Ext4Result};
 use wdk_sys::{NT_SUCCESS, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES};
 
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::DriverVec;
+use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
 
 /// NUL-terminated UTF-16 CNG identifier for the kernel XTS-AES provider.
 static XTS_AES_ALGORITHM: [u16; 8] = [88, 84, 83, 45, 65, 69, 83, 0];
@@ -186,6 +186,11 @@ struct OwnedAlgorithmHandle {
 }
 
 impl OwnedAlgorithmHandle {
+    /// Borrows the live provider identity only for a synchronous native call.
+    const fn as_raw(&self) -> *mut c_void {
+        self.handle.as_ptr()
+    }
+
     /// Opens one default CNG primitive provider at PASSIVE_LEVEL.
     /// # Errors
     ///
@@ -219,7 +224,8 @@ impl Drop for OwnedAlgorithmHandle {
     )]
     fn drop(&mut self) {
         let _status = unsafe {
-            // SAFETY: This value owns the only close authority for this live native handle.
+            // SAFETY: Shared ownership releases this sole close authority only after all leases
+            // and their dependent hash/key objects have ended. Teardown runs at PASSIVE_LEVEL.
             BCryptCloseAlgorithmProvider(self.handle.as_ptr(), 0)
         };
     }
@@ -231,7 +237,24 @@ impl core::fmt::Debug for OwnedAlgorithmHandle {
     }
 }
 
-/// Mount-owned symmetric algorithm plus its caller-supplied key-object requirement.
+#[expect(
+    unsafe_code,
+    reason = "CNG provider ownership can transfer between PASSIVE_LEVEL execution threads"
+)]
+// SAFETY: An algorithm handle has no thread affinity. Moving its sole close authority does not
+// move native storage; the last shared owner closes it after dependent objects have retired.
+unsafe impl Send for OwnedAlgorithmHandle {}
+
+#[expect(
+    unsafe_code,
+    reason = "published algorithms have immutable configuration and independent mutable operation objects"
+)]
+// SAFETY: Provider properties are changed only through exclusive construction access. Shared
+// calls query that configuration or create separate hash/key objects with disjoint backing buffers;
+// CNG owns provider-internal synchronization. Shared ownership excludes concurrent close.
+unsafe impl Sync for OwnedAlgorithmHandle {}
+
+/// Immutable symmetric algorithm plus its caller-supplied key-object requirement.
 #[derive(Debug)]
 struct SymmetricProvider {
     /// Algorithm close authority.
@@ -247,7 +270,7 @@ impl SymmetricProvider {
     /// Returns an error when the provider cannot be opened or its object length is invalid.
     fn open(identifier: &[u16]) -> DriverResult<Self> {
         let algorithm = OwnedAlgorithmHandle::open(identifier)?;
-        let key_object_bytes = query_usize_property(algorithm.borrowed(), &OBJECT_LENGTH_PROPERTY)?;
+        let key_object_bytes = query_usize_property(&algorithm, &OBJECT_LENGTH_PROPERTY)?;
         if key_object_bytes == 0 {
             return Err(DriverError::Core(Error::CryptographicFailure));
         }
@@ -263,17 +286,15 @@ impl SymmetricProvider {
     /// Returns an error when provider construction fails or CNG reports a non-AES block length.
     fn open_aes(identifier: &[u16]) -> DriverResult<Self> {
         let provider = Self::open(identifier)?;
-        let block_bytes =
-            query_usize_property(provider.algorithm.borrowed(), &BLOCK_LENGTH_PROPERTY)?;
+        let block_bytes = query_usize_property(&provider.algorithm, &BLOCK_LENGTH_PROPERTY)?;
         if block_bytes != AES_BLOCK_BYTES {
             return Err(DriverError::Core(Error::CryptographicFailure));
         }
         Ok(provider)
     }
-
 }
 
-/// Mount-owned hash algorithm and validated object geometry.
+/// Immutable hash algorithm and validated object geometry.
 #[derive(Debug)]
 struct HashProvider {
     /// Algorithm close authority.
@@ -292,8 +313,8 @@ impl HashProvider {
     /// digest geometry.
     fn open(identifier: &[u16], expected_digest_bytes: usize) -> DriverResult<Self> {
         let algorithm = OwnedAlgorithmHandle::open(identifier)?;
-        let object_bytes = query_usize_property(algorithm.borrowed(), &OBJECT_LENGTH_PROPERTY)?;
-        let digest_bytes = query_usize_property(algorithm.borrowed(), &HASH_LENGTH_PROPERTY)?;
+        let object_bytes = query_usize_property(&algorithm, &OBJECT_LENGTH_PROPERTY)?;
+        let digest_bytes = query_usize_property(&algorithm, &HASH_LENGTH_PROPERTY)?;
         if object_bytes == 0 || digest_bytes != expected_digest_bytes {
             return Err(DriverError::Core(Error::CryptographicFailure));
         }
@@ -305,22 +326,23 @@ impl HashProvider {
     }
 }
 
-/// Mount-scoped immutable CNG providers.
+/// Mount admission owner for immutable CNG providers.
 ///
 /// Algorithm handles are opened once while mounting at PASSIVE_LEVEL. Mutable hash/key objects and
-/// their backing buffers never live here; each admitted operation owns those separately.
+/// their backing buffers belong to each admitted operation. Operations acquire independent leases;
+/// releasing this admission owner cannot close a provider that still has a dependent operation.
 #[derive(Debug)]
 pub(crate) struct CngProvider {
     /// AES-256-XTS contents provider.
-    xts: SymmetricProvider,
+    xts: DriverShared<SymmetricProvider>,
     /// AES-256 ECB primitive used to implement Linux-compatible CBC-CS3.
-    aes_ecb: SymmetricProvider,
+    aes_ecb: DriverShared<SymmetricProvider>,
     /// HKDF-SHA512 key derivation provider.
-    hkdf: SymmetricProvider,
+    hkdf: DriverShared<SymmetricProvider>,
     /// SHA-256 provider.
-    sha256: HashProvider,
+    sha256: DriverShared<HashProvider>,
     /// SHA-512 provider.
-    sha512: HashProvider,
+    sha512: DriverShared<HashProvider>,
 }
 
 impl CngProvider {
@@ -330,16 +352,17 @@ impl CngProvider {
     /// Returns an error when a provider is unavailable, reports unexpected geometry, or CNG runs
     /// out of resources during mount construction.
     pub(crate) fn try_open() -> DriverResult<Self> {
-        let xts = SymmetricProvider::open_aes(&XTS_AES_ALGORITHM)?;
-        let aes_ecb = SymmetricProvider::open_aes(&AES_ALGORITHM)?;
+        let xts = DriverShared::try_new(SymmetricProvider::open_aes(&XTS_AES_ALGORITHM)?)?;
+        let mut aes_ecb = SymmetricProvider::open_aes(&AES_ALGORITHM)?;
         set_wide_property(
-            aes_ecb.algorithm.borrowed(),
+            &mut aes_ecb.algorithm,
             &CHAINING_MODE_PROPERTY,
             &CHAINING_MODE_ECB,
         )?;
-        let hkdf = SymmetricProvider::open(&HKDF_ALGORITHM)?;
-        let sha256 = HashProvider::open(&SHA256_ALGORITHM, 32)?;
-        let sha512 = HashProvider::open(&SHA512_ALGORITHM, 64)?;
+        let aes_ecb = DriverShared::try_new(aes_ecb)?;
+        let hkdf = DriverShared::try_new(SymmetricProvider::open(&HKDF_ALGORITHM)?)?;
+        let sha256 = DriverShared::try_new(HashProvider::open(&SHA256_ALGORITHM, 32)?)?;
+        let sha512 = DriverShared::try_new(HashProvider::open(&SHA512_ALGORITHM, 64)?)?;
         Ok(Self {
             xts,
             aes_ecb,
@@ -352,20 +375,25 @@ impl CngProvider {
     /// Allocates every mutable object and nonpaged work buffer needed by one operation.
     /// # Errors
     ///
-    /// Returns an error when nonpaged allocation or reusable-hash construction fails.
+    /// Returns an error when a provider's finite reference budget is exhausted, nonpaged
+    /// allocation fails, or CNG rejects reusable-hash construction. Partial construction releases
+    /// native objects before their provider leases.
     pub(crate) fn try_new_operation(&self) -> DriverResult<CngOperation> {
-        let key_object_bytes = self
-            .xts
+        let xts = self.xts.try_acquire()?;
+        let aes_ecb = self.aes_ecb.try_acquire()?;
+        let hkdf = self.hkdf.try_acquire()?;
+        let key_object_bytes = xts
+            .get()
             .key_object_bytes
-            .max(self.aes_ecb.key_object_bytes)
-            .max(self.hkdf.key_object_bytes);
+            .max(aes_ecb.get().key_object_bytes)
+            .max(hkdf.get().key_object_bytes);
         let key_object = DriverVec::try_repeated_copy(0_u8, key_object_bytes)?;
-        let sha256 = ReusableHash::try_new(&self.sha256)?;
-        let sha512 = ReusableHash::try_new(&self.sha512)?;
+        let sha256 = ReusableHash::try_new(self.sha256.try_acquire()?)?;
+        let sha512 = ReusableHash::try_new(self.sha512.try_acquire()?)?;
         Ok(CngOperation {
-            xts: self.xts.execution(),
-            aes_ecb: self.aes_ecb.execution(),
-            hkdf: self.hkdf.execution(),
+            xts,
+            aes_ecb,
+            hkdf,
             sha256,
             sha512,
             key_object,
@@ -375,12 +403,12 @@ impl CngProvider {
 
 /// Operation-owned reusable hash object and address-stable nonpaged backing allocation.
 struct ReusableHash {
-    /// CNG hash identity borrowing the mount-owned algorithm provider.
+    /// CNG hash identity destroyed before its provider lease is released.
     handle: NonNull<c_void>,
     /// Hash object bytes retained at one allocation address until `BCryptDestroyHash`.
     object: DriverVec<u8>,
-    /// Fixed digest length validated at mount time.
-    digest_bytes: usize,
+    /// Drops after native hash destruction and backing-buffer release, including rollback.
+    provider: DriverSharedLease<HashProvider>,
 }
 
 impl ReusableHash {
@@ -393,16 +421,17 @@ impl ReusableHash {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn try_new(provider: &HashProvider) -> DriverResult<Self> {
-        let mut object = DriverVec::try_repeated_copy(0_u8, provider.object_bytes)?;
+    fn try_new(provider: DriverSharedLease<HashProvider>) -> DriverResult<Self> {
+        let mut object = DriverVec::try_repeated_copy(0_u8, provider.get().object_bytes)?;
         let object_bytes =
             u32::try_from(object.len()).map_err(|_| DriverError::InvalidBufferSize)?;
         let mut raw = core::ptr::null_mut();
         let status = unsafe {
             // SAFETY: The object allocation is writable and remains address-stable in the returned
-            // value until the hash handle is destroyed. This is an unkeyed reusable hash.
+            // value until the hash handle is destroyed. The owned lease retains its provider
+            // through native construction and every subsequent use. This is an unkeyed hash.
             BCryptCreateHash(
-                provider.algorithm.borrowed().as_raw(),
+                provider.get().algorithm.as_raw(),
                 core::ptr::addr_of_mut!(raw),
                 object.as_mut_slice().as_mut_ptr(),
                 object_bytes,
@@ -416,7 +445,7 @@ impl ReusableHash {
         Ok(Self {
             handle,
             object,
-            digest_bytes: provider.digest_bytes,
+            provider,
         })
     }
 
@@ -430,7 +459,7 @@ impl ReusableHash {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn digest<const N: usize>(&mut self, input: &[u8]) -> Ext4Result<[u8; N]> {
-        if self.digest_bytes != N {
+        if self.provider.get().digest_bytes != N {
             return Err(Error::CryptographicFailure);
         }
         let input_bytes = u32::try_from(input.len()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -477,7 +506,7 @@ impl core::fmt::Debug for ReusableHash {
         formatter
             .debug_struct("ReusableHash")
             .field("object_bytes", &self.object.len())
-            .field("digest_bytes", &self.digest_bytes)
+            .field("digest_bytes", &self.provider.get().digest_bytes)
             .finish()
     }
 }
@@ -486,8 +515,9 @@ impl core::fmt::Debug for ReusableHash {
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-// SAFETY: The object and handle move together, their heap allocation is address-stable, and every
-// call/destroy executes on the sole PASSIVE_LEVEL reactor thread.
+// SAFETY: The object, handle and provider lease move together. Native buffers remain at their
+// allocation addresses, mutable hash access requires &mut self, and the provider stays retained
+// through hash destruction. Calls and destruction execute at PASSIVE_LEVEL.
 unsafe impl Send for ReusableHash {}
 
 /// Generated symmetric key retaining an exclusive lifetime lease on opaque native storage.
@@ -497,8 +527,8 @@ struct GeneratedKey<'object> {
     handle: NonNull<c_void>,
     /// Opaque object storage accessible by CNG until `BCryptDestroyKey`.
     object: NonNull<[u8]>,
-    /// Prevents backing storage reuse without reborrowing the bytes retained by CNG.
-    lifetime: core::marker::PhantomData<&'object mut [u8]>,
+    /// Retains the provider borrow and excludes backing storage reuse through native destruction.
+    lifetime: core::marker::PhantomData<(&'object SymmetricProvider, &'object mut [u8])>,
 }
 
 impl GeneratedKey<'_> {
@@ -516,7 +546,7 @@ impl Drop for GeneratedKey<'_> {
     fn drop(&mut self) {
         let _status = unsafe {
             // SAFETY: This value owns the sole destroy authority; its lifetime lease keeps the
-            // opaque key-object allocation live without borrowing its bytes through Rust.
+            // opaque key-object allocation and provider live without reborrowing retained bytes.
             BCryptDestroyKey(self.handle.as_ptr())
         };
         unsafe {
@@ -536,6 +566,12 @@ impl Drop for GeneratedKey<'_> {
 /// the suspended operation and is never referenced from a completion context.
 #[derive(Debug)]
 pub(crate) struct CngOperation {
+    /// Independent lifetime ownership for XTS key generation.
+    xts: DriverSharedLease<SymmetricProvider>,
+    /// Independent lifetime ownership for CBC-CS3 key generation.
+    aes_ecb: DriverSharedLease<SymmetricProvider>,
+    /// Independent lifetime ownership for HKDF key generation.
+    hkdf: DriverSharedLease<SymmetricProvider>,
     /// Reusable SHA-256 object.
     sha256: ReusableHash,
     /// Reusable SHA-512 object.
@@ -569,7 +605,7 @@ impl CryptographicOperation for CngOperation {
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn hkdf_sha512(&mut self, key: &[u8], info: &[u8], output: &mut [u8]) -> Ext4Result<()> {
-        let generated = generate_key(self.hkdf, self.key_object.as_mut_slice(), key)?;
+        let generated = generate_key(self.hkdf.get(), self.key_object.as_mut_slice(), key)?;
         set_wide_property_core(
             generated.as_raw(),
             &HKDF_HASH_ALGORITHM_PROPERTY,
@@ -628,7 +664,7 @@ impl CryptographicOperation for CngOperation {
         buffer: &mut [u8],
     ) -> Ext4Result<()> {
         crypt_xts(
-            self.xts,
+            self.xts.get(),
             self.key_object.as_mut_slice(),
             key,
             data_unit,
@@ -644,7 +680,7 @@ impl CryptographicOperation for CngOperation {
         buffer: &mut [u8],
     ) -> Ext4Result<()> {
         crypt_xts(
-            self.xts,
+            self.xts.get(),
             self.key_object.as_mut_slice(),
             key,
             data_unit,
@@ -654,12 +690,12 @@ impl CryptographicOperation for CngOperation {
     }
 
     fn encrypt_aes_256_cbc_cs3(&mut self, key: &[u8; 32], buffer: &mut [u8]) -> Ext4Result<()> {
-        let generated = generate_key(self.aes_ecb, self.key_object.as_mut_slice(), key)?;
+        let generated = generate_key(self.aes_ecb.get(), self.key_object.as_mut_slice(), key)?;
         encrypt_cbc_cs3(&generated, buffer)
     }
 
     fn decrypt_aes_256_cbc_cs3(&mut self, key: &[u8; 32], buffer: &mut [u8]) -> Ext4Result<()> {
-        let generated = generate_key(self.aes_ecb, self.key_object.as_mut_slice(), key)?;
+        let generated = generate_key(self.aes_ecb.get(), self.key_object.as_mut_slice(), key)?;
         decrypt_cbc_cs3(&generated, buffer)
     }
 
@@ -691,12 +727,12 @@ enum CipherDirection {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 fn generate_key<'object>(
-    execution: SymmetricExecution,
+    provider: &'object SymmetricProvider,
     key_object: &'object mut [u8],
     secret: &[u8],
 ) -> Ext4Result<GeneratedKey<'object>> {
     let object = key_object
-        .get_mut(..execution.key_object_bytes)
+        .get_mut(..provider.key_object_bytes)
         .ok_or(Error::CryptographicFailure)?;
     object.fill(0);
     let object_bytes = u32::try_from(object.len()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -707,9 +743,9 @@ fn generate_key<'object>(
     let status = unsafe {
         // SAFETY: `object` identifies the exclusive, address-stable nonpaged allocation prefix;
         // `secret` remains readable during this synchronous call. The returned key cannot outlive
-        // the object borrow.
+        // the object or provider borrow.
         BCryptGenerateSymmetricKey(
-            execution.algorithm.as_raw(),
+            provider.algorithm.as_raw(),
             core::ptr::addr_of_mut!(raw),
             object.as_ptr().cast::<u8>(),
             object_bytes,
@@ -747,7 +783,7 @@ fn generate_key<'object>(
 /// Returns an error for an invalid data-unit length, key construction/property failure, or CNG
 /// encryption/decryption failure.
 fn crypt_xts(
-    execution: SymmetricExecution,
+    provider: &SymmetricProvider,
     key_object: &mut [u8],
     key: &[u8; 64],
     data_unit: u64,
@@ -757,7 +793,7 @@ fn crypt_xts(
     if buffer.len() < AES_BLOCK_BYTES || !buffer.len().is_multiple_of(AES_BLOCK_BYTES) {
         return Err(Error::InvalidWriteRange);
     }
-    let generated = generate_key(execution, key_object, key)?;
+    let generated = generate_key(provider, key_object, key)?;
     let data_unit_bytes = u32::try_from(buffer.len()).map_err(|_| Error::ArithmeticOverflow)?;
     set_u32_property_core(
         generated.as_raw(),
@@ -1040,7 +1076,7 @@ fn copy_equal(destination: &mut [u8], source: &[u8]) -> Ext4Result<()> {
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-fn query_usize_property(algorithm: AlgorithmHandle, property: &[u16]) -> DriverResult<usize> {
+fn query_usize_property(algorithm: &OwnedAlgorithmHandle, property: &[u16]) -> DriverResult<usize> {
     let mut value = 0_u32;
     let mut result_bytes = 0_u32;
     let output_bytes =
@@ -1073,7 +1109,7 @@ fn query_usize_property(algorithm: AlgorithmHandle, property: &[u16]) -> DriverR
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 fn set_wide_property(
-    algorithm: AlgorithmHandle,
+    algorithm: &mut OwnedAlgorithmHandle,
     property: &[u16],
     value: &[u16],
 ) -> DriverResult<()> {
@@ -1211,11 +1247,13 @@ mod tests {
 
     /// # Panics
     ///
-    /// Panics when CNG rejects standard SHA vectors or reusable-hash reset semantics.
+    /// Panics when retained hashes reject standard vectors after admission-owner release,
+    /// including reusable-hash reset semantics.
     #[test]
     fn reusable_cng_hashes_match_standard_vectors() {
         let provider = must!(CngProvider::try_open());
         let mut operation = must!(provider.try_new_operation());
+        drop(provider);
         let sha256 = must!(operation.sha256(b"abc"));
         let sha512 = must!(operation.sha512(b"abc"));
         assert_eq!(
@@ -1246,6 +1284,7 @@ mod tests {
     fn cng_hkdf_sha512_matches_fscrypt_v2_vectors() {
         let provider = must!(CngProvider::try_open());
         let mut operation = must!(provider.try_new_operation());
+        drop(provider);
         let mut master_key = [0_u8; 32];
         for (byte, value) in master_key.iter_mut().zip(0_u8..32) {
             *byte = value;
@@ -1286,6 +1325,7 @@ mod tests {
     fn cng_aes_256_xts_matches_linux_vector() {
         let provider = must!(CngProvider::try_open());
         let mut operation = must!(provider.try_new_operation());
+        drop(provider);
         let key = [
             0x27, 0x18, 0x28, 0x18, 0x28, 0x45, 0x90, 0x45, 0x23, 0x53, 0x60, 0x28, 0x74, 0x71,
             0x35, 0x26, 0x62, 0x49, 0x77, 0x57, 0x24, 0x70, 0x93, 0x69, 0x99, 0x59, 0x57, 0x49,
@@ -1322,9 +1362,10 @@ mod tests {
     fn cng_cbc_cs3_matches_linux_rfc3962_vectors() {
         let provider = must!(CngProvider::try_open());
         let mut operation = must!(provider.try_new_operation());
+        drop(provider);
         let key = *b"chicken teriyaki";
         let generated = must!(generate_key(
-            operation.aes_ecb,
+            operation.aes_ecb.get(),
             operation.key_object.as_mut_slice(),
             &key
         ));
