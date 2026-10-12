@@ -40,12 +40,13 @@ pub(crate) fn observations<T: serde::de::DeserializeOwned>(value: Value) -> Task
     Ok(serde_json::from_value(value)?)
 }
 /// Runs one management API expression and normalizes its external representation to JSON.
+/// Empty pipeline output is represented by JSON null, independently of PowerShell's serializer.
 /// # Errors
 /// Returns process, nonzero status, output encoding, or JSON errors.
 pub(crate) fn management(expression: &str) -> TaskResult<Value> {
     let mut command = Command::new("powershell.exe");
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-        .arg(format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $value = & {{ {expression} }}; ConvertTo-Json -InputObject $value -Depth 12 -Compress"));
+        .arg(format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $value = & {{ {expression} }}; if ($null -eq $value) {{ 'null' }} else {{ ConvertTo-Json -InputObject $value -Depth 12 -Compress }}"));
     let output = command.output()?;
     if !output.status.success() {
         return Err(io::Error::other(format!(
@@ -200,6 +201,36 @@ pub(crate) fn checked_outcome(outcome: CommandOutcome, description: &str) -> Tas
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Errors
+    /// Returns native process, serialization or typed observation failures.
+    /// # Panics
+    /// Fails if empty, scalar or plural observations change meaning across the management boundary.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare real PowerShell output after fallible boundary execution"
+    )]
+    fn management_observation_contract() -> TaskResult<()> {
+        for (expression, expected) in [
+            ("", Value::Null),
+            ("@()", Value::Null),
+            ("$null", Value::Null),
+            ("$false", serde_json::json!(false)),
+            (
+                "[pscustomobject]@{ number=7 }",
+                serde_json::json!({ "number": 7 }),
+            ),
+            ("@(1,2)", serde_json::json!([1, 2])),
+        ] {
+            assert_eq!(management(expression)?, expected);
+        }
+        assert!(observations::<u32>(management("@()")?)?.is_empty());
+        assert_eq!(observations::<u32>(management("1")?)?, vec![1]);
+        assert_eq!(observations::<u32>(management("@(1,2)")?)?, vec![1, 2]);
+        assert!(management("throw 'observation failed'").is_err());
+        Ok(())
+    }
+
     /// Native requester capture preserves both exit errors and uncertain timeout acceptance.
     /// # Errors
     /// Returns unexpected native process or pipe failures.
