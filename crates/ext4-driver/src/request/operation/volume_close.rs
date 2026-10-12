@@ -198,7 +198,7 @@ impl VolumeCloseOperation {
             CleanCloseTransition::Complete(Ok(_durability)) => {
                 let result = access.publish_volume_state_transition(transition);
                 if result.is_ok() && self.terminal == CleanCloseTerminal::Dismount {
-                    MountedVolumeDevice::publish_direct_writes_allowed(self.device);
+                    MountedVolumeDevice::publish_dismount(self.device);
                     MountedVolumeDevice::unregister_shutdown_notification(self.device);
                     MountedVolumeDevice::complete_dismount(self.device);
                 }

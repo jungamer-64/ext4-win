@@ -36,7 +36,7 @@ enum LiveWorkload {
 /// WSL attachment stage; interrupted intent is not assumed to have rolled back.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum WslAttachment {
-    /// Session detachment and WSL shutdown have both reached their observed endpoint.
+    /// No session attachment or unobserved WSL shutdown responsibility remains.
     Detached,
     /// Attachment may have been accepted.
     Requested,
@@ -969,6 +969,21 @@ fn exercise_driver(
         )?;
         session.publish(Phase::Observed(Operation::FilesystemIo))?;
     }
+    let retained = OpenOptions::new()
+        .read(true)
+        .open(mount.join("live-ci/alpha.bin"))?;
+    let remount = (|| -> TaskResult<()> {
+        dismount_filesystem(session)?;
+        if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
+            return Err(io::Error::other(
+                "fresh mount while an old FILE_OBJECT remains lost durable content",
+            )
+            .into());
+        }
+        Ok(())
+    })();
+    let released = windows_host::close_file(retained).map_err(Into::into);
+    combine_verification_and_cleanup(remount, released)?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     attachment(session, false)?;
