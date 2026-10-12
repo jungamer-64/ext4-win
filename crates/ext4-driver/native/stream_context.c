@@ -11,6 +11,7 @@
 #include "cache_mdl.h"
 #include "cache_close.h"
 #include "data_protection.h"
+#include "irp_forward.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
@@ -25,16 +26,6 @@ extern UCHAR NTAPI ext4win_storage_media_state(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_close_phase(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_io_policy(_In_ const VOID *state);
 extern NTSTATUS NTAPI ext4win_prepare_mdl_completion(_In_ const VOID *queue, _In_ PFILE_OBJECT file_object);
-
-/* This consuming call preserves buffered/direct/neither IOCTL semantics and lower cancellation. */
-_Must_inspect_result_
-NTSTATUS
-NTAPI
-ext4win_forward_original_irp(_In_ PDEVICE_OBJECT device, _Inout_ PIRP irp)
-{
-    IoSkipCurrentIrpStackLocation(irp);
-    return IoCallDriver(device, irp);
-}
 
 typedef struct _EXT4WIN_PUBLISHED_STREAM_METADATA {
     ULONGLONG Epoch;

@@ -836,7 +836,7 @@ impl ReceivedIrp {
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
-    reason = "this native boundary consumes the original unqueued control IRP"
+    reason = "native consuming boundaries preserve the distinct dispatch and pending stack protocols"
 )]
 unsafe extern "system" {
     fn ext4win_stream_mdl_queue(file: *mut wdk_sys::FILE_OBJECT) -> *mut c_void;
@@ -844,6 +844,8 @@ unsafe extern "system" {
         device: wdk_sys::PDEVICE_OBJECT,
         irp: wdk_sys::PIRP,
     ) -> NTSTATUS;
+    fn ext4win_forward_pending_irp(device: wdk_sys::PDEVICE_OBJECT, irp: wdk_sys::PIRP)
+    -> NTSTATUS;
 }
 
 /// Prepared IRP ready to transfer into the cancel-safe queue.
@@ -1610,7 +1612,8 @@ impl PnpSubmission {
         unsafe {
             // SAFETY: Queue and driver cancellation capture were removed before publication.
             // Lower drivers consume the original IRP; no driver completion callback remains.
-            let _status = ext4win_forward_original_irp(self.lower.as_ptr(), self.irp.as_ptr());
+            // Pending dispatch retains its own stack location while lower drivers use a copy.
+            let _status = ext4win_forward_pending_irp(self.lower.as_ptr(), self.irp.as_ptr());
         }
         #[cfg(test)]
         {

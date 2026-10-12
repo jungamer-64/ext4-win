@@ -180,6 +180,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native FsRtl file-lock completion delegation contract",
         ),
         (
+            "irp-forward",
+            "irp_forward.tests.c",
+            "native immediate and pending IRP stack delegation contract",
+        ),
+        (
             "fs-filter-callbacks",
             "fs_filter_callbacks.tests.c",
             "native filesystem callback completion-context contract",
