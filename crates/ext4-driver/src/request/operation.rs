@@ -2981,8 +2981,21 @@ enum PreparedMutationRequest {
     DataWrite(crate::request::file_info::RegularFileDataAuthority),
     /// Clean-volume key removal retains namespace exclusion through publication or abort.
     KeyRemoval(crate::kernel::stream::KeyRemovalLease),
+    /// Data is frozen and cache coherence established before Merkle construction.
+    Verity(VerityPreparation),
     /// Non-data mutation class whose existing lifecycle authority remains sufficient.
     Other(MutationRequestKind),
+}
+
+/// Exclusive stream admission progresses before the core may read data for hashing.
+#[derive(Debug)]
+enum VerityPreparation {
+    /// Worker has not yet flushed/purged the exact retained stream.
+    Required(crate::state::StreamVerityLease),
+    /// Worker owns preparation; the logical operation can only await its result.
+    Preparing,
+    /// Data and sections remain excluded through durable publication.
+    Sealed(crate::state::PreparedStreamVerity),
 }
 
 impl PreparedMutationRequest {
@@ -4098,13 +4111,13 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::EnableVerity) => {
+            PreparedMutationRequest::Verity(VerityPreparation::Sealed(prepared)) => {
                 let mut request = owned.request();
                 crate::request::file_system_control::authorize_path_handle(
                     &mut request,
                     operations,
                 )?;
-                let completion = crate::request::fsctl::enable_verity(request, mutation)?;
+                let completion = crate::request::fsctl::enable_verity(request, mutation, prepared)?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
                 ))

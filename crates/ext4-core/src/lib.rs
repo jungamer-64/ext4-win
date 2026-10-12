@@ -60,7 +60,7 @@ pub use volume::{
     JournalPayloadDurability, MetadataCache, MetadataCacheAccess, MountOperation, MountTransition,
     MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveOperation,
     MutationResolvePass, MutationResolveReady, MutationResolveTransition, MutationResource, NodeId,
-    NodeMetadataSnapshot, NodeReparsePoint, ObservedResourceVersionSet, OperationEvent,
+    NodeDataPolicy, NodeMetadataSnapshot, NodeReparsePoint, ObservedResourceVersionSet, OperationEvent,
     OperationId, OrderedDataDurability, PublishedMutation, ReadTransition, RenameTargetCollision,
     ReservedMutation, ResolvedMutation, ResourceVersion, RetryPermit, ScannedDirectoryEntry,
     StorageRequestSequence, StorageRequestSequenceStep, SymlinkNode, SymlinkNodeId,

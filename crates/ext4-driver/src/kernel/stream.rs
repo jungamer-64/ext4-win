@@ -145,6 +145,8 @@ pub(super) struct StreamMetadata {
     pub(super) links: u32,
     /// Fixed native directory discriminator.
     pub(super) directory: u32,
+    /// Inode payload eligibility, independent from security and volume reliability.
+    pub(super) writable_data: u32,
 }
 
 impl StreamMetadata {
@@ -165,6 +167,7 @@ impl StreamMetadata {
                 u32::from(snapshot.links_count().get())
             },
             directory: u32::from(directory),
+            writable_data: u32::from(snapshot.data_policy() == ext4_core::NodeDataPolicy::Writable),
         }
     }
 }

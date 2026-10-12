@@ -32,7 +32,7 @@ pub use mount::{
 pub use node::{
     ChildLookup, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,
     FileNode, FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeId, NodeMetadataSnapshot,
-    NodeReparsePoint, SymlinkNode, SymlinkNodeId,
+    NodeDataPolicy, NodeReparsePoint, SymlinkNode, SymlinkNodeId,
 };
 pub use operation::{
     CommittedReadPass, EpochReadOperation, EpochReadPass, MutationResolveOperation,

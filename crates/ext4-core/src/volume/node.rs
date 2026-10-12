@@ -137,6 +137,17 @@ pub struct NodeMetadataSnapshot {
     windows_attributes: Ext4WindowsAttributes,
     /// Windows reparse interpretation validated from inode kind and private xattr state.
     reparse_point: NodeReparsePoint,
+    /// Payload mutation eligibility derived from the observed inode's protection flags.
+    data_policy: NodeDataPolicy,
+}
+
+/// Inode-owned data protection, independent from a handle's granted security rights.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NodeDataPolicy {
+    /// The supported inode profile permits payload mutation.
+    Writable,
+    /// Immutable, verified or unsupported payload mutation must not be accepted into a cache.
+    ReadOnly,
 }
 
 impl NodeMetadataSnapshot {
@@ -167,6 +178,7 @@ impl NodeMetadataSnapshot {
                 .map(WindowsOverlay::attributes)
                 .unwrap_or(Ext4WindowsAttributes::NONE),
             reparse_point,
+            data_policy: if inode.file_payload_mutation().is_ok() { NodeDataPolicy::Writable } else { NodeDataPolicy::ReadOnly },
         }
     }
 
@@ -175,6 +187,10 @@ impl NodeMetadataSnapshot {
     pub const fn node(self) -> NodeId {
         self.node
     }
+
+    /// Payload eligibility from the same inode/epoch as the remaining metadata.
+    #[must_use]
+    pub const fn data_policy(self) -> NodeDataPolicy { self.data_policy }
 
     /// Logical payload length in the observed inode.
     #[must_use]
