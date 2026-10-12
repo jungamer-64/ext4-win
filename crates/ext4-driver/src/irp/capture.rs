@@ -908,6 +908,15 @@ impl QueueContext {
     }
 }
 
+/// Captured mount-key operation authority, checked on the original requestor thread.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PreparedKeyControl {
+    /// Adds a key with enabled volume-management privilege.
+    Add,
+    /// Removes a key with enabled volume-management privilege.
+    Remove,
+}
+
 /// Complete set of requests accepted by the asynchronous device lane.
 #[derive(Debug)]
 pub(crate) enum PreparedRequest {
@@ -933,6 +942,8 @@ pub(crate) enum PreparedRequest {
     DirectoryControl(PreparedDirectoryControl),
     /// File-system control with a sealed minor-function classification.
     FileSystemControl(FileSystemControlMinorFunction),
+    /// Requestor privilege checked before queue handoff; ordinary FSCTL cannot grant it.
+    KeyControl(PreparedKeyControl),
     /// Retrieval request with a copied VCN and uniquely owned locked output pages.
     RetrievalPointers {
         /// Nonnegative file-space allocation-unit index decoded in requestor context.
@@ -1084,6 +1095,24 @@ impl PreparedRequest {
                             .map_err(IrpCompletion::from_error)?;
                         if control.fs_control_code() == super::FsControlCode::GetRetrievalPointers {
                             return capture_retrieval_pointers(target, control, generic_key());
+                        }
+                        let key_control = match control.fs_control_code() {
+                            super::FsControlCode::AddEncryptionKey => Some(PreparedKeyControl::Add),
+                            super::FsControlCode::RemoveEncryptionKey => Some(PreparedKeyControl::Remove),
+                            _ => None,
+                        };
+                        if let Some(key_control) = key_control {
+                            #[cfg(not(test))]
+                            let allowed = unsafe {
+                                // SAFETY: Capture runs on the original dispatch thread, before queue handoff.
+                                ffi::ext4win_key_management_privilege(target.requestor_mode())
+                            } != 0;
+                            #[cfg(test)]
+                            let allowed = false;
+                            if !allowed {
+                                return Err(IrpCompletion::from_error(DriverError::AccessDenied));
+                            }
+                            return Ok((Self::KeyControl(key_control), generic_key()));
                         }
                         generic_key()
                     }

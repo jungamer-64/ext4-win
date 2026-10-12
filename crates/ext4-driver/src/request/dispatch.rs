@@ -769,6 +769,12 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
             Admission::FsControl(*minor)
         }
+        ActorRequest::Captured(PreparedRequest::KeyControl(control)) => {
+            Admission::Mutation(match control {
+                crate::irp::PreparedKeyControl::Add => MutationRequestKind::AddEncryptionKey,
+                crate::irp::PreparedKeyControl::Remove => MutationRequestKind::RemoveEncryptionKey,
+            })
+        }
     };
 
     let admission = match admission {
@@ -810,12 +816,8 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::EnableVerity => {
                         Admission::Mutation(MutationRequestKind::EnableVerity)
                     }
-                    crate::irp::FsControlCode::AddEncryptionKey => {
-                        Admission::Mutation(MutationRequestKind::AddEncryptionKey)
-                    }
-                    crate::irp::FsControlCode::RemoveEncryptionKey => {
-                        Admission::Mutation(MutationRequestKind::RemoveEncryptionKey)
-                    }
+                    crate::irp::FsControlCode::AddEncryptionKey
+                    | crate::irp::FsControlCode::RemoveEncryptionKey => Admission::Unsupported,
                     crate::irp::FsControlCode::GetEncryptionKeyStatus => {
                         Admission::Immediate(ImmediateRequestKind::GetEncryptionKeyStatus)
                     }

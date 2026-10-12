@@ -1,4 +1,12 @@
 #include <ntifs.h>
+/* Evaluated on the requestor dispatch thread, before any reactor queue handoff. */
+BOOLEAN NTAPI
+ext4win_key_management_privilege(KPROCESSOR_MODE requestor_mode)
+{
+    PAGED_CODE();
+    return SeSinglePrivilegeCheck(RtlConvertLongToLuid(SE_MANAGE_VOLUME_PRIVILEGE), requestor_mode);
+}
+
 /* Token information is owned here; only complete copied SIDs cross into Rust. */
 NTSTATUS
 ext4win_creator_sids(
