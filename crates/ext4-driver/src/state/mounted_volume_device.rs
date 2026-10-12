@@ -392,20 +392,6 @@ impl MountedVolumeDevice {
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
-    /// Publishes that direct lower-volume writes are permitted after logical dismount.
-    /// # Errors
-    ///
-    /// Stops the system if the live mounted device has lost its VPB association.
-    pub(crate) fn publish_direct_writes_allowed(device: KernelDevice) {
-        let direct_writes =
-            u16::try_from(wdk_sys::VPB_DIRECT_WRITES_ALLOWED).unwrap_or_else(|_| {
-                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-            });
-        Self::update_vpb_flags(device, |flags| *flags |= direct_writes).unwrap_or_else(|_| {
-            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-        });
-    }
-
     /// Stops shutdown IRP delivery after this volume has logically dismounted.
     #[expect(
         unsafe_code,
@@ -537,36 +523,6 @@ impl MountedVolumeDevice {
         VpbSpinLock::with_mounted(device, |vpb| update(&mut vpb.Flags))
     }
 
-    /// Removes this mounted device from its VPB while holding the global VPB lock.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn detach_vpb(device: KernelDevice) {
-        let mounted = u16::try_from(wdk_sys::VPB_MOUNTED).unwrap_or_else(|_| {
-            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-        });
-        let locked = u16::try_from(wdk_sys::VPB_LOCKED).unwrap_or_else(|_| {
-            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-        });
-        let direct_writes =
-            u16::try_from(wdk_sys::VPB_DIRECT_WRITES_ALLOWED).unwrap_or_else(|_| {
-                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
-            });
-        VpbSpinLock::with_mounted(device, |vpb| {
-            vpb.Flags &= !(mounted | locked | direct_writes);
-            vpb.DeviceObject = core::ptr::null_mut();
-            let association = unsafe {
-                // SAFETY: The lock protects this association and teardown owns the live device.
-                core::ptr::addr_of_mut!((*device.as_ptr()).Vpb)
-            };
-            unsafe {
-                // SAFETY: Clear this mounted device's association before its VPB lock is released.
-                association.write(core::ptr::null_mut());
-            }
-        })
-        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
-    }
 }
 
 /// Thread-local ownership of the global VPB spin lock required by the
@@ -618,51 +574,6 @@ impl VpbSpinLock {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
             _thread: PhantomData,
         }
-    }
-
-    /// Publishes filesystem-owned fields without replacing the I/O Manager's real device,
-    /// reference count or mount-completion flag. Failure leaves both associations unchanged.
-    /// # Errors
-    /// Returns invalid parameter for an absent real device, device busy for an occupied VPB,
-    /// or device removed when PnP has begun withdrawing its storage.
-    #[expect(
-        unsafe_code,
-        reason = "the mount IRP retains the supplied VPB and unpublished device under the VPB lock"
-    )]
-    fn publish_mount(
-        supplied: KernelVpb,
-        device: KernelDevice,
-        serial_number: u32,
-        label: VpbLabel,
-    ) -> DriverResult<()> {
-        let _lock = Self::acquire();
-        let vpb = unsafe {
-            // SAFETY: The mount IRP retains this supplied VPB; the lock excludes other field access.
-            &mut *supplied.as_non_null().as_ptr()
-        };
-        if vpb.RealDevice.is_null() {
-            return Err(DriverError::InvalidParameter);
-        }
-        let remove_pending = u16::try_from(wdk_sys::VPB_REMOVE_PENDING)
-            .map_err(|_| DriverError::InvalidParameter)?;
-        if vpb.Flags & remove_pending != 0 {
-            return Err(DriverError::DeviceRemoved);
-        }
-        if !vpb.DeviceObject.is_null() {
-            return Err(DriverError::DeviceBusy);
-        }
-        let association = unsafe {
-            // SAFETY: The mount owns the unpublished device and the lock protects its association.
-            core::ptr::addr_of_mut!((*device.as_ptr()).Vpb)
-        };
-        unsafe {
-            // SAFETY: The writable device field is published together with VPB.DeviceObject.
-            association.write(supplied.as_non_null().as_ptr());
-        }
-        vpb.SerialNumber = serial_number;
-        label.write_to(vpb);
-        vpb.DeviceObject = device.as_ptr();
-        Ok(())
     }
 
     /// Borrows only this device's live mounted VPB while holding the global lock.
