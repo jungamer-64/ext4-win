@@ -166,8 +166,8 @@ pub(crate) fn get_reparse_point(
 /// Handles `FSCTL_SET_REPARSE_POINT` by storing Windows metadata on the opened node.
 /// # Errors
 ///
-/// Returns an error when the input is malformed, the opened node is a native symbolic link, or
-/// the reparse xattr cannot be committed.
+/// Requires retained data or attribute write authority and an empty regular file or directory.
+/// Returns malformed input, access denial, a nonempty container, or xattr commit failure.
 pub(crate) fn set_reparse_point(
     mut request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
@@ -180,6 +180,7 @@ pub(crate) fn set_reparse_point(
             let input = active.buffered_input(stack.input_buffer_length())?;
             let reparse_point = parse_symlink_reparse_buffer(input)?;
             let opened = OpenedObject::decode(file_object)?;
+            opened.require_reparse_write_access()?;
             let node = opened.node();
             validate_mutable_reparse_node(opened.location(), node)?;
             Ok::<_, DriverError>((reparse_point, node))
@@ -193,7 +194,7 @@ pub(crate) fn set_reparse_point(
 /// # Errors
 ///
 /// Returns an error when the input is malformed, the opened object is not a driver-owned reparse
-/// point, or the xattr mutation cannot be committed.
+/// point, neither write right was granted, or the xattr mutation cannot be committed.
 pub(crate) fn delete_reparse_point(
     mut request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
@@ -206,6 +207,7 @@ pub(crate) fn delete_reparse_point(
             let input = active.buffered_input(stack.input_buffer_length())?;
             parse_delete_reparse_buffer(input)?;
             let opened = OpenedObject::decode(file_object)?;
+            opened.require_reparse_write_access()?;
             let node = opened.node();
             validate_mutable_reparse_node(opened.location(), node)?;
             Ok::<_, DriverError>(node)
@@ -246,12 +248,35 @@ fn validate_mutable_reparse_node(location: &OpenedLocation, node: NodeId) -> Dri
 /// Stores a Windows reparse point on a validated regular file or directory.
 /// # Errors
 ///
-/// Returns an error when the reparse xattr mutation cannot be committed.
+/// Returns invalid-reparse-data for nonempty files, directory-not-empty for directories with
+/// children, or the metadata-read/xattr commit failure. Validation uses the mutation epoch.
 fn set_node_reparse_point(
     transaction: &mut DriverMutationPass<'_, '_, '_>,
     node: NodeId,
     reparse_point: WindowsSymlinkReparsePoint,
 ) -> DriverResult<()> {
+    match node {
+        NodeId::File(file) => {
+            if transaction
+                .load_node_metadata(NodeId::File(file))?
+                .size()
+                .bytes()
+                != 0
+            {
+                return Err(DriverError::InvalidReparseData);
+            }
+        }
+        NodeId::Directory(directory) => {
+            let mut reader =
+                ext4_core::DirectoryReader::new(directory, ext4_core::DirectoryScanCursor::start());
+            while let Some(entry) = transaction.next_directory_entry(&mut reader)? {
+                if !matches!(entry.entry().name().bytes(), b"." | b"..") {
+                    return Err(DriverError::from(ext4_core::Error::DirectoryNotEmpty));
+                }
+            }
+        }
+        NodeId::Symlink(_) => return Err(DriverError::NotSupported),
+    }
     let node = transaction.node(node)?;
     transaction.set_windows_symlink_reparse_point(node, reparse_point)?;
     Ok(())

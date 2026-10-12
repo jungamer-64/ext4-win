@@ -8,6 +8,15 @@ ext4win_key_management_privilege(KPROCESSOR_MODE requestor_mode)
     return SeSinglePrivilegeCheck(RtlConvertLongToLuid(SE_MANAGE_VOLUME_PRIVILEGE), requestor_mode);
 }
 
+/* Checked while the caller's effective token still belongs to the dispatch thread. */
+BOOLEAN NTAPI
+ext4win_symbolic_link_privilege(KPROCESSOR_MODE requestor_mode)
+{
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
+    PAGED_CODE();
+    return SeSinglePrivilegeCheck(RtlConvertLongToLuid(SE_CREATE_SYMBOLIC_LINK_PRIVILEGE), requestor_mode);
+}
+
 /* Token information is owned here; only complete copied SIDs cross into Rust. */
 NTSTATUS
 ext4win_creator_sids(

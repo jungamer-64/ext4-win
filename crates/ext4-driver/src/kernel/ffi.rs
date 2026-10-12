@@ -112,6 +112,8 @@ unsafe extern "system" {
     /// # Safety
     /// Must run on the original requestor dispatch thread before queue insertion.
     pub(crate) fn ext4win_key_management_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
+    /// Checks symbolic-link creation against the dispatch thread's effective token.
+    pub(crate) fn ext4win_symbolic_link_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
     /// Creates the named control device with the exact SDDL and setup-class identity supplied by
     /// the generated lifecycle contract.
     pub(crate) fn WdmlibIoCreateDeviceSecure(

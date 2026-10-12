@@ -946,6 +946,33 @@ fn authorize_key_management(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion
     }
 }
 
+/// Checks symbolic-link authority before the request leaves its effective token's thread.
+/// # Errors
+/// Returns privilege-not-held without enabled symbolic-link creation privilege.
+#[cfg_attr(
+    not(test),
+    expect(
+        unsafe_code,
+        reason = "capture still owns the original requestor context"
+    )
+)]
+fn authorize_symbolic_link(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
+    #[cfg(not(test))]
+    let allowed = unsafe {
+        // SAFETY: Capture executes on the original dispatch thread before queue publication.
+        ffi::ext4win_symbolic_link_privilege(_target.requestor_mode())
+    } != 0;
+    #[cfg(test)]
+    let allowed = false;
+    if allowed {
+        Ok(())
+    } else {
+        Err(IrpCompletion::from_native_failure(
+            wdk_sys::STATUS_PRIVILEGE_NOT_HELD,
+        ))
+    }
+}
+
 /// Captured mount-key operation authority, checked on the original requestor thread.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedKeyControl {
@@ -1131,6 +1158,9 @@ impl PreparedRequest {
                         let control = stack
                             .file_system_control()
                             .map_err(IrpCompletion::from_error)?;
+                        if control.fs_control_code() == super::FsControlCode::SetReparsePoint {
+                            authorize_symbolic_link(target)?;
+                        }
                         if control.fs_control_code() == super::FsControlCode::GetRetrievalPointers {
                             return capture_retrieval_pointers(target, control, generic_key());
                         }
@@ -1715,16 +1745,20 @@ mod tests {
     }
 
     /// # Panics
-    /// Fails if a host request without kernel token authority can enter the privileged key lane.
+    /// Fails if a host request without token authority queues a privileged FSCTL.
     #[test]
     #[expect(
         unsafe_code,
         reason = "initialized stack fixtures remain live through requestor capture"
     )]
-    fn key_control_cannot_queue_without_requestor_privilege() {
+    fn privileged_controls_cannot_queue_without_requestor_privilege() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file = wdk_sys::FILE_OBJECT::default();
-        for code in [0x0009_a400, 0x0009_a404] {
+        for (code, expected) in [
+            (0x0009_a400, wdk_sys::STATUS_ACCESS_DENIED),
+            (0x0009_a404, wdk_sys::STATUS_ACCESS_DENIED),
+            (0x0009_00a4, wdk_sys::STATUS_PRIVILEGE_NOT_HELD),
+        ] {
             let mut irp = wdk_sys::IRP::default();
             let mut stack = wdk_sys::IO_STACK_LOCATION {
                 FileObject: core::ptr::from_mut(&mut file),
@@ -1745,7 +1779,7 @@ mod tests {
                     capture_context(&mut target, DispatchMajor::FileSystemControl)
                         .err()
                         .map(|completion| completion.status()),
-                    Some(wdk_sys::STATUS_ACCESS_DENIED)
+                    Some(expected)
                 );
             }
         }

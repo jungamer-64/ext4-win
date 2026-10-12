@@ -1315,7 +1315,7 @@ impl PendingExistingCreateOpen {
                 location,
                 policy.handle_deletion(),
                 policy.data_transfer_mode(),
-                policy.regular_file_write_access(),
+                policy.granted_access(),
                 normalized_name_access,
             )
         })?;
@@ -1946,7 +1946,7 @@ fn create_missing_node(
             location,
             policy.handle_deletion(),
             policy.data_transfer_mode(),
-            policy.regular_file_write_access(),
+            policy.granted_access(),
             normalized_name_access,
         )
     })?;

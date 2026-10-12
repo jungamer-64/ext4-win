@@ -83,6 +83,8 @@ pub(crate) enum DriverError {
     InvalidInfoClass,
     /// Opened node is not a reparse point.
     NotAReparsePoint,
+    /// Reparse payload or its file container violates the Windows reparse-data contract.
+    InvalidReparseData,
     /// Reparse tag belongs to another handler.
     ReparseTagNotHandled,
     /// EA name is not representable by the Windows EA boundary.
@@ -171,6 +173,7 @@ impl DriverError {
             Self::BufferOverflow => STATUS_BUFFER_OVERFLOW,
             Self::InvalidInfoClass => STATUS_INVALID_INFO_CLASS,
             Self::NotAReparsePoint => ntstatus(0xC000_0275),
+            Self::InvalidReparseData => ntstatus(0xC000_0278),
             Self::ReparseTagNotHandled => ntstatus(0xC000_0279),
             Self::InvalidEaName => STATUS_INVALID_EA_NAME,
             Self::EaListInconsistent => STATUS_EA_LIST_INCONSISTENT,

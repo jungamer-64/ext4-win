@@ -180,17 +180,71 @@ fn directory_handle(
     node_mode: OpenedNodeMode,
     data_transfer_mode: DataTransferMode,
 ) -> Option<OpenedHandle> {
-    let handle = OpenedHandle::new(
-        NodeId::Directory(DirectoryNodeId::ROOT),
+    let state = super::OpenedHandleState::new(
         node_mode,
         OpenedLocation::Root,
         retained_handle_deletion(),
         data_transfer_mode,
-        RegularFileWriteAccess::Denied,
         super::NormalizedNameAccess::Granted,
     );
-    assert!(handle.is_ok());
-    handle.ok()
+    let search = crate::memory::boxed_try_with(|| Ok(super::DirectorySearch::new()));
+    assert!(search.is_ok());
+    search.ok().map(|search| OpenedHandle {
+        state,
+        kind: super::OpenedHandleKind::Directory {
+            search,
+            write_data: false,
+        },
+    })
+}
+
+/// # Panics
+/// Fails if reparse mutation rejects either sufficient right or admits append-only authority.
+#[test]
+fn reparse_mutation_requires_data_and_attribute_write_authority() {
+    for (data, attributes, expected) in [
+        (
+            RegularFileWriteAccess::Positional,
+            FileAttributesWriteAccess::Granted,
+            Ok(()),
+        ),
+        (
+            RegularFileWriteAccess::Denied,
+            FileAttributesWriteAccess::Granted,
+            Ok(()),
+        ),
+        (
+            RegularFileWriteAccess::AppendOnly,
+            FileAttributesWriteAccess::Denied,
+            Err(DriverError::AccessDenied),
+        ),
+        (
+            RegularFileWriteAccess::Positional,
+            FileAttributesWriteAccess::Denied,
+            Ok(()),
+        ),
+    ] {
+        let Some(mut handle) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+        else {
+            return;
+        };
+        handle.state = super::OpenedHandleState::new(
+            OpenedNodeMode::Direct,
+            OpenedLocation::Root,
+            HandleDeletion::Retain {
+                delete_access: DeleteAccess::Denied,
+                file_attributes_write_access: attributes,
+            },
+            DataTransferMode::Cached,
+            super::NormalizedNameAccess::Granted,
+        );
+        if let super::OpenedHandleKind::Directory { write_data, .. } = &mut handle.kind {
+            *write_data = data == RegularFileWriteAccess::Positional;
+        }
+        assert_eq!(handle.require_reparse_write_access(), expected);
+        handle.kind = super::OpenedHandleKind::File { write_access: data };
+        assert_eq!(handle.require_reparse_write_access(), expected);
+    }
 }
 
 #[expect(

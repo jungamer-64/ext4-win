@@ -1084,6 +1084,8 @@ pub(super) enum OpenedHandleKind {
     Directory {
         /// Stable, separately allocated directory search state.
         search: Box<DirectorySearch>,
+        /// Retained FILE_WRITE_DATA bit required when setting or deleting directory reparse data.
+        write_data: bool,
     },
     /// Symlink handle.
     Symlink,
@@ -1100,7 +1102,7 @@ impl OpenedHandle {
         location: OpenedLocation,
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
-        regular_file_write_access: RegularFileWriteAccess,
+        access: GrantedAccess,
         normalized_name_access: NormalizedNameAccess,
     ) -> DriverResult<Self> {
         Self::from_parts(
@@ -1109,7 +1111,7 @@ impl OpenedHandle {
             location,
             deletion,
             data_transfer_mode,
-            regular_file_write_access,
+            access,
             normalized_name_access,
         )
     }
@@ -1124,7 +1126,7 @@ impl OpenedHandle {
         location: OpenedLocation,
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
-        regular_file_write_access: RegularFileWriteAccess,
+        access: GrantedAccess,
         normalized_name_access: NormalizedNameAccess,
     ) -> DriverResult<Self> {
         let state = OpenedHandleState::new(
@@ -1136,10 +1138,11 @@ impl OpenedHandle {
         );
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File {
-                write_access: regular_file_write_access,
+                write_access: access.regular_file_write_access(),
             },
             NodeId::Directory(_) => OpenedHandleKind::Directory {
                 search: memory::boxed_try_with(|| Ok(DirectorySearch::new()))?,
+                write_data: access.as_raw() & wdk_sys::FILE_WRITE_DATA != 0,
             },
             NodeId::Symlink(_) => OpenedHandleKind::Symlink,
         };
@@ -1247,10 +1250,28 @@ impl OpenedHandle {
         }
     }
 
+    /// Requires either data or attribute write authority for this handle's reparse metadata.
+    /// # Errors
+    /// Returns access denied if neither right was granted.
+    pub(super) fn require_reparse_write_access(&self) -> DriverResult<()> {
+        let write_data = match self.kind() {
+            OpenedHandleKind::File { write_access } => {
+                *write_access == RegularFileWriteAccess::Positional
+            }
+            OpenedHandleKind::Directory { write_data, .. } => *write_data,
+            OpenedHandleKind::Symlink => false,
+        };
+        if write_data || self.file_attributes_write_access() == FileAttributesWriteAccess::Granted {
+            Ok(())
+        } else {
+            Err(DriverError::AccessDenied)
+        }
+    }
+
     /// Returns the stable interior search-state address for directory handles.
     fn directory_search(&self) -> Option<NonNull<DirectorySearch>> {
         match &self.kind {
-            OpenedHandleKind::Directory { search } => Some(NonNull::from(search.as_ref())),
+            OpenedHandleKind::Directory { search, .. } => Some(NonNull::from(search.as_ref())),
             OpenedHandleKind::File { .. } | OpenedHandleKind::Symlink => None,
         }
     }
@@ -1485,6 +1506,13 @@ impl<'owner> OpenedObject<'owner> {
     /// Returns `FILE_WRITE_ATTRIBUTES` authority retained when this handle was created.
     pub(crate) fn file_attributes_write_access(&self) -> FileAttributesWriteAccess {
         self.handle().file_attributes_write_access()
+    }
+
+    /// Requires either data or attribute write rights retained by this exact opened handle.
+    /// # Errors
+    /// Returns access denied unless at least one right was granted at create.
+    pub(crate) fn require_reparse_write_access(&self) -> DriverResult<()> {
+        self.handle().require_reparse_write_access()
     }
 
     /// Requires create-time normalized-name disclosure authority.
