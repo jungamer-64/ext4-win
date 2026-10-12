@@ -1028,7 +1028,7 @@ _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
-ext4win_stream_has_native_residency(
+ext4win_stream_may_have_native_residency(
     _In_ PVOID stream_header,
     _Out_ PBOOLEAN resident_out)
 {
@@ -1037,11 +1037,8 @@ ext4win_stream_has_native_residency(
     if ((stream == NULL) || (resident_out == NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
-    *resident_out = (stream->SectionObjects.DataSectionObject != NULL) ||
-        (stream->SectionObjects.SharedCacheMap != NULL) ||
-        (stream->SectionObjects.ImageSectionObject != NULL);
-    ext4win_release_resource(&stream->MainResource);
+    *resident_out = ext4win_cache_may_have_residency(
+        &stream->SectionObjects, &stream->MainResource);
     return STATUS_SUCCESS;
 }
 

@@ -1677,17 +1677,20 @@ impl StreamContext {
         Ok(())
     }
 
-    /// Reports whether Cache Manager or Memory Manager still retains the shared stream sections.
+    /// Rules out native residency only after a nonblocking section observation.
+    ///
+    /// A Cc/MM owner may be waiting for this reactor's paging completion. Resource contention
+    /// therefore retains the stream conservatively for a later delayed-close observation.
     /// # Errors
     ///
     /// Returns an invariant error if the native stream header is malformed.
-    pub(crate) fn has_native_residency(&self) -> DriverResult<bool> {
+    pub(crate) fn may_have_native_residency(&self) -> DriverResult<bool> {
         #[cfg(not(test))]
         {
             let mut resident = 0_u8;
             let status = unsafe {
                 // SAFETY: `self` owns the live native header and the output is one BOOLEAN.
-                ext4win_stream_has_native_residency(
+                ext4win_stream_may_have_native_residency(
                     self.header.as_ptr(),
                     core::ptr::addr_of_mut!(resident),
                 )
@@ -2047,7 +2050,7 @@ unsafe extern "system" {
         file_object: *mut wdk_sys::FILE_OBJECT,
     ) -> NTSTATUS;
 
-    fn ext4win_stream_has_native_residency(
+    fn ext4win_stream_may_have_native_residency(
         stream_header: wdk_sys::PVOID,
         resident_out: *mut wdk_sys::BOOLEAN,
     ) -> NTSTATUS;

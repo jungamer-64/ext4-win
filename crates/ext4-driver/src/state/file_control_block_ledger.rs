@@ -1688,7 +1688,7 @@ impl FileControlBlockLedger {
             // SAFETY: The closing FILE_OBJECT retains its FCB until this release completes.
             fcb.as_ref()
         }
-        .has_native_stream_residency()
+        .may_have_native_stream_residency()
         .unwrap_or_else(|_| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
         });
@@ -1720,7 +1720,7 @@ impl FileControlBlockLedger {
             // SAFETY: The closing FILE_OBJECT retains its FCB until this release completes.
             fcb.as_ref()
         }
-        .has_native_stream_residency()
+        .may_have_native_stream_residency()
         .unwrap_or_else(|_| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
         });
@@ -2675,7 +2675,7 @@ impl FileControlBlockLedger {
             // SAFETY: The outstanding deferred stream lease retains this FCB for the observation.
             fcb.as_ref()
         }
-        .has_native_stream_residency()
+        .may_have_native_stream_residency()
         .unwrap_or_else(|_| {
             KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
         });

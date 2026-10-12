@@ -75,7 +75,23 @@ static void CcMdlWriteAbort(PFILE_OBJECT file, PMDL chain)
 
 #define STATUS_CACHE_PAGE_LOCKED 1
 #define STATUS_USER_MAPPED_FILE (-4)
-typedef struct { unsigned dirty; unsigned mapped; } SECTION_OBJECT_POINTERS, *PSECTION_OBJECT_POINTERS;
+typedef struct {
+    unsigned dirty; unsigned mapped;
+    void *DataSectionObject, *SharedCacheMap, *ImageSectionObject;
+} SECTION_OBJECT_POINTERS, *PSECTION_OBJECT_POINTERS;
+typedef struct { unsigned exclusive, acquisitions, releases; } ERESOURCE, *PERESOURCE;
+static BOOLEAN ext4win_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait)
+{
+    /* An exclusive Cc owner is suspended awaiting this reactor's paging completion. */
+    assert(wait == FALSE);
+    resource->acquisitions++;
+    return !resource->exclusive;
+}
+static void ext4win_release_resource(PERESOURCE resource)
+{
+    assert(!resource->exclusive);
+    resource->releases++;
+}
 static NTSTATUS flush_status;
 static unsigned flush_calls;
 static void CcCoherencyFlushAndPurgeCache(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *offset,
@@ -138,7 +154,7 @@ int main(void)
 
     assert(reads == 3 && prepares == 4 && irp.MdlAddress == NULL);
     {
-        SECTION_OBJECT_POINTERS sections = {1, 0};
+        SECTION_OBJECT_POINTERS sections = { .dirty = 1, .mapped = 0 };
         flush_status = STATUS_SUCCESS;
         assert(ext4win_cache_close_writeback(&sections) == STATUS_SUCCESS);
         assert(flush_calls == 1 && sections.dirty == 0);
@@ -151,6 +167,19 @@ int main(void)
         assert(ext4win_cache_close_writeback(&sections) == STATUS_USER_MAPPED_FILE);
         flush_status = STATUS_UNSUCCESSFUL;
         assert(ext4win_cache_close_writeback(&sections) == STATUS_UNSUCCESSFUL);
+    }
+    {
+        SECTION_OBJECT_POINTERS sections = {0};
+        ERESOURCE resource = { .exclusive = 1 };
+        assert(ext4win_cache_may_have_residency(&sections, &resource));
+        assert(resource.acquisitions == 1 && resource.releases == 0);
+        /* Paging completion can now release the Cc owner, permitting a fresh observation. */
+        resource.exclusive = 0;
+        sections.SharedCacheMap = &file;
+        assert(ext4win_cache_may_have_residency(&sections, &resource));
+        sections.SharedCacheMap = NULL;
+        assert(!ext4win_cache_may_have_residency(&sections, &resource));
+        assert(resource.acquisitions == 3 && resource.releases == 2);
     }
     return 0;
 }

@@ -140,12 +140,12 @@ impl FileControlBlock {
         self.stream_context.sizes()
     }
 
-    /// Reports whether a cache map or mapped section still retains this stream.
+    /// Rules out native residency without waiting for a Cc/MM owner.
     /// # Errors
     ///
     /// Returns an invariant error if native stream metadata is malformed.
-    pub(super) fn has_native_stream_residency(&self) -> DriverResult<bool> {
-        self.stream_context.has_native_residency()
+    pub(super) fn may_have_native_stream_residency(&self) -> DriverResult<bool> {
+        self.stream_context.may_have_native_residency()
     }
 
     /// Returns the mounted VCB pointer that owns this open node.
