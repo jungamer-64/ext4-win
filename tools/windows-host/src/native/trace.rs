@@ -54,10 +54,20 @@ struct Properties {
     /// ETL filename storage.
     file: [u16; 1024],
 }
+
+impl Properties {
+    /// Exposes the complete control buffer, including both trailing string regions.
+    fn as_mut_ptr(&mut self) -> *mut EVENT_TRACE_PROPERTIES {
+        ptr::from_mut(self).cast()
+    }
+}
+
 /// Owned native ETW session and its observed consumer worker.
 pub struct TraceSession {
     /// Storage borrowed only during synchronous control calls.
     properties: Box<Properties>,
+    /// Independent immutable session name retained through consumer close and worker join.
+    name: Vec<u16>,
     /// Native controller authority while the session is live.
     session: Option<CONTROLTRACE_HANDLE>,
     /// Native consumer authority until explicit close.
@@ -187,13 +197,14 @@ impl TraceSession {
         let name = format!("ext4win-live-{}-{instant}", std::process::id());
         fs::create_dir_all(directory)?;
         let filename = directory.canonicalize()?.join(format!("{name}.etl"));
+        let session_name = wide(OsStr::new(&name))?;
         let mut properties = Box::try_new(Properties {
             header: EVENT_TRACE_PROPERTIES::default(),
             name: [0; 128],
             file: [0; 1024],
         })
         .map_err(io::Error::other)?;
-        store(&mut properties.name, &wide(OsStr::new(&name))?)?;
+        store(&mut properties.name, &session_name)?;
         store(&mut properties.file, &wide(filename.as_os_str())?)?;
         properties.header.Wnode.BufferSize =
             u32::try_from(core::mem::size_of::<Properties>()).map_err(io::Error::other)?;
@@ -212,16 +223,14 @@ impl TraceSession {
             u32::try_from(core::mem::offset_of!(Properties, file)).map_err(io::Error::other)?;
         let mut session = CONTROLTRACE_HANDLE::default();
         let status = unsafe {
-            // SAFETY: aligned property storage covers the advertised trailing strings and stays alive through the call.
-            StartTraceW(
-                &mut session,
-                properties.name.as_ptr(),
-                &mut properties.header,
-            )
+            // SAFETY: The property pointer covers the complete aligned allocation, including
+            // writable trailing strings. The separate terminated name remains readable throughout.
+            StartTraceW(&mut session, session_name.as_ptr(), properties.as_mut_ptr())
         };
         win32(status)?;
         let mut owner = Self {
             properties,
+            name: session_name,
             session: Some(session),
             consumer: None,
             worker: None,
@@ -233,7 +242,7 @@ impl TraceSession {
         };
         win32(status)?;
         let mut logfile = EVENT_TRACE_LOGFILEW {
-            LoggerName: owner.properties.name.as_mut_ptr(),
+            LoggerName: owner.name.as_mut_ptr(),
             Context: Arc::as_ptr(&owner.context).cast_mut().cast(),
             ..Default::default()
         };
@@ -282,13 +291,9 @@ impl TraceSession {
         let mut failures = Vec::new();
         if let Some(session) = self.session.take() {
             let status = unsafe {
-                // SAFETY: this owner consumes the live controller; property storage remains aligned and alive.
-                ControlTraceW(
-                    session,
-                    self.properties.name.as_ptr(),
-                    &mut self.properties.header,
-                    1,
-                )
+                // SAFETY: This owner consumes the live controller by handle. The pointer covers
+                // the full writable property buffer, disjoint from the consumer's retained name.
+                ControlTraceW(session, ptr::null(), self.properties.as_mut_ptr(), 1)
             };
             if let Err(error) = win32(status) {
                 failures.push(error.to_string());
@@ -428,6 +433,67 @@ mod tests {
     use super::*;
     use core::time::Duration;
     use std::time::Instant;
+
+    /// Checks writable native string regions through the production control-buffer pointer.
+    /// # Errors
+    /// Returns allocation or native offset conversion failures.
+    /// # Panics
+    /// Fails if native writes cannot reach both complete string regions or corrupt the header.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "allocation and offset conversion errors propagate while assertions verify the ABI buffer"
+    )]
+    fn property_pointer_covers_native_string_regions() -> io::Result<()> {
+        let mut properties = Box::try_new(Properties {
+            header: EVENT_TRACE_PROPERTIES::default(),
+            name: [0; 128],
+            file: [0; 1024],
+        })
+        .map_err(io::Error::other)?;
+        properties.header.Wnode.BufferSize =
+            u32::try_from(core::mem::size_of::<Properties>()).map_err(io::Error::other)?;
+        properties.header.LoggerNameOffset =
+            u32::try_from(core::mem::offset_of!(Properties, name)).map_err(io::Error::other)?;
+        properties.header.LogFileNameOffset =
+            u32::try_from(core::mem::offset_of!(Properties, file)).map_err(io::Error::other)?;
+        let name_offset =
+            usize::try_from(properties.header.LoggerNameOffset).map_err(io::Error::other)?;
+        let file_offset =
+            usize::try_from(properties.header.LogFileNameOffset).map_err(io::Error::other)?;
+        let native = properties.as_mut_ptr().cast::<u8>();
+        let name = unsafe {
+            // SAFETY: The complete property allocation includes this aligned name region.
+            native.add(name_offset).cast::<[u16; 128]>()
+        };
+        let file = unsafe {
+            // SAFETY: The complete property allocation includes this aligned filename region.
+            native.add(file_offset).cast::<[u16; 1024]>()
+        };
+        let mut name_image = [u16::from(b'n'); 128];
+        let mut file_image = [u16::from(b'f'); 1024];
+        if let Some(last) = name_image.last_mut() {
+            *last = 0;
+        }
+        if let Some(last) = file_image.last_mut() {
+            *last = 0;
+        }
+        unsafe {
+            // SAFETY: Native output owns every initialized name byte; its input is disjoint.
+            name.write(name_image);
+        }
+        unsafe {
+            // SAFETY: Native output owns every initialized filename byte; its input is disjoint.
+            file.write(file_image);
+        }
+        assert_eq!(properties.name, name_image);
+        assert_eq!(properties.file, file_image);
+        assert_eq!(
+            usize::try_from(properties.header.Wnode.BufferSize).map_err(io::Error::other)?,
+            core::mem::size_of::<Properties>()
+        );
+        Ok(())
+    }
 
     /// Exercises the real ETW ABI, enable-before-registration, scalar delivery and joined shutdown.
     /// # Errors
