@@ -36,13 +36,13 @@ enum LiveWorkload {
 /// WSL attachment stage; interrupted intent is not assumed to have rolled back.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum WslAttachment {
-    /// No session attachment remains.
+    /// Session detachment and WSL shutdown have both reached their observed endpoint.
     Detached,
     /// Attachment may have been accepted.
     Requested,
     /// An identity-matched Linux device was observed.
     Attached,
-    /// Detachment may already have committed.
+    /// Detachment may already have committed; WSL shutdown still requires observation.
     Detaching,
 }
 /// Delegated driver lifecycle stage, separate from volume state and Driver Verifier admission.
@@ -459,27 +459,32 @@ fn format_storage(
     }
     wsl_words(&["--exec", "e2fsck", "-fn", &partition])?;
     session.publish(Phase::Observed(Operation::Format))?;
-    detach_wsl(session)?;
-    session.publish(Phase::Intent(Operation::ShutdownWsl))?;
-    wsl_words(&["--shutdown"])?;
-    session.publish(Phase::Observed(Operation::ShutdownWsl))?;
+    finish_wsl(session, wsl)?;
     Ok(())
 }
 
-/// Reconciles WSL attachment by querying the recorded GPT identity before any repeated detachment.
+/// Reconciles the recorded GPT identity and observes WSL shutdown before releasing attachment
+/// responsibility. Missing partition data cannot prove that an earlier attachment rolled back.
 /// # Errors
-/// Returns ambiguous device identity, unmount or record-publication failures.
-fn detach_wsl(session: &mut Session<LiveState>) -> TaskResult<()> {
+/// Returns ambiguous identity, external operation or record-publication failure. Every failure
+/// before the observed shutdown retains a non-detached durable state for the next owner.
+fn finish_wsl(
+    session: &mut Session<LiveState>,
+    mut execute: impl FnMut(&[OsString]) -> TaskResult<String>,
+) -> TaskResult<()> {
     if session.state().wsl == WslAttachment::Detached {
         return Ok(());
     }
-    let layout = wsl_words(&[
-        "--exec",
-        "lsblk",
-        "-nr",
-        "-o",
-        "NAME,TYPE,PARTUUID,PARTTYPE",
-    ])?;
+    let layout = execute(
+        &[
+            "--exec",
+            "lsblk",
+            "-nr",
+            "-o",
+            "NAME,TYPE,PARTUUID,PARTTYPE",
+        ]
+        .map(OsString::from),
+    )?;
     let partition = session
         .state()
         .partition()
@@ -499,13 +504,16 @@ fn detach_wsl(session: &mut Session<LiveState>) -> TaskResult<()> {
             io::Error::other("WSL recovery sees ambiguous session partition identity").into(),
         );
     }
+    session.state_mut().wsl = WslAttachment::Detaching;
     if matching == 1 {
-        session.state_mut().wsl = WslAttachment::Detaching;
         session.publish(Phase::Intent(Operation::DetachWsl))?;
-        wsl(&["--unmount".into(), vhdx(session).into_os_string()])?;
+        execute(&["--unmount".into(), vhdx(session).into_os_string()])?;
+        session.publish(Phase::Observed(Operation::DetachWsl))?;
     }
+    session.publish(Phase::Intent(Operation::ShutdownWsl))?;
+    execute(&["--shutdown".into()])?;
     session.state_mut().wsl = WslAttachment::Detached;
-    session.publish(Phase::Observed(Operation::DetachWsl))
+    session.publish(Phase::Observed(Operation::ShutdownWsl))
 }
 
 /// Waits for Mount Manager registration and creates only the owner-generated directory mount point.
@@ -1010,15 +1018,7 @@ fn cleanup(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
         }
         return Ok(());
     }
-    let wsl_may_be_attached = session.state().wsl != WslAttachment::Detached;
-    detach_wsl(session)?;
-    if wsl_may_be_attached {
-        // Dedicated-host authority includes oracle shutdown. This also reconciles attachment
-        // accepted before lsblk published a partition, without treating missing GUID data as rollback.
-        session.publish(Phase::Intent(Operation::ShutdownWsl))?;
-        wsl_words(&["--shutdown"])?;
-        session.publish(Phase::Observed(Operation::ShutdownWsl))?;
-    }
+    finish_wsl(session, wsl)?;
     if let Some(disk) = storage::disk(&vhdx(session))? {
         if session
             .state()
@@ -1130,6 +1130,98 @@ fn run_live_session(root: &Path, workload: LiveWorkload) -> TaskResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns durable fixture setup, reload or mandatory cleanup failures.
+    /// # Panics
+    /// Fails if interruption loses finalization responsibility or a completed shutdown is repeated.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible session setup and recovery surround assertions at external acceptance boundaries"
+    )]
+    fn interrupted_wsl_finalization_retains_shutdown_responsibility() -> TaskResult<()> {
+        let root = crate::process::repository_root()?;
+        let fixture = crate::process::create_task_directory(&root, "wsl-finalization")?;
+        let result = (|| -> TaskResult<()> {
+            let partition = Partition {
+                number: 2,
+                id: windows_host::guid_bytes("2ca3ad84-858a-49ba-be4a-430713ddf498")?,
+                kind: windows_host::guid_bytes("0fc63daf-8483-4772-8e79-3d69d8477de4")?,
+                offset: 4096,
+                length: 8192,
+            };
+            let visible = "sde disk\nsde2 part 2ca3ad84-858a-49ba-be4a-430713ddf498 0fc63daf-8483-4772-8e79-3d69d8477de4\n";
+            for (layout, interrupted) in [
+                ("", "--shutdown"),
+                (visible, "--unmount"),
+                (visible, "--shutdown"),
+            ] {
+                let id = SessionId::create(&fixture)?;
+                let mut session = Session::create(
+                    &fixture,
+                    "sessions",
+                    id.clone(),
+                    LiveState {
+                        storage: StorageIdentity::Partition {
+                            unique: "fixture-disk".into(),
+                            partition: partition.clone(),
+                            volume: None,
+                        },
+                        wsl: WslAttachment::Requested,
+                        driver: DriverStage::Unstarted,
+                        identity: None,
+                    },
+                )?;
+                session.publish(Phase::Intent(Operation::AttachWsl))?;
+                let mut effects = Vec::new();
+                assert!(
+                    finish_wsl(&mut session, |arguments| {
+                        let command = arguments.first().and_then(|value| value.to_str());
+                        if command == Some("--exec") {
+                            return Ok(layout.into());
+                        }
+                        let durable: Session<LiveState> = Session::load(&fixture, "sessions", &id)?;
+                        assert_eq!(durable.state().wsl, WslAttachment::Detaching);
+                        effects.push(command.map(str::to_owned));
+                        if command == Some(interrupted) {
+                            return Err(io::Error::other("external acceptance is uncertain").into());
+                        }
+                        Ok(String::new())
+                    })
+                    .is_err()
+                );
+                assert_eq!(effects.last().and_then(Option::as_deref), Some(interrupted));
+                let mut recovered: Session<LiveState> = Session::load(&fixture, "sessions", &id)?;
+                assert_eq!(recovered.state().wsl, WslAttachment::Detaching);
+                let mut shutdowns = 0;
+                finish_wsl(&mut recovered, |arguments| {
+                    match arguments.first().and_then(|value| value.to_str()) {
+                        Some("--exec") => Ok(String::new()),
+                        Some("--shutdown") => {
+                            shutdowns += 1;
+                            Ok(String::new())
+                        }
+                        _ => Err(io::Error::other("recovery repeated an unobserved detach").into()),
+                    }
+                })?;
+                assert_eq!(shutdowns, 1);
+                let mut completed: Session<LiveState> = Session::load(&fixture, "sessions", &id)?;
+                assert_eq!(completed.state().wsl, WslAttachment::Detached);
+                assert_eq!(completed.phase(), Phase::Observed(Operation::ShutdownWsl));
+                finish_wsl(&mut completed, |_| {
+                    Err(
+                        io::Error::other("completed finalization repeated an external effect")
+                            .into(),
+                    )
+                })?;
+            }
+            Ok(())
+        })();
+        let cleanup = crate::process::remove_task_directory(&root, &fixture, "wsl-finalization");
+        combine_verification_and_cleanup(result, cleanup)
+    }
+
     /// Runtime counters and independent GPT identities decide admission, not loose substrings.
     /// # Errors
     /// Returns unexpected fixture parsing errors.
