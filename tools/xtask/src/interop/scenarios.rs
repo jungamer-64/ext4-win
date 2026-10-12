@@ -683,7 +683,7 @@ fn verify_htree_mutation_profile(
             &source,
             transaction_root,
             &renamed,
-            ext4_core::RenameTargetCollision::Reject,
+            ext4_core::NamespaceDestination::Vacant,
         )
     })?;
 
@@ -1294,14 +1294,14 @@ fn verify_regular_mutation_profile(
             &source,
             root,
             &renamed,
-            ext4_core::RenameTargetCollision::Reject,
+            ext4_core::NamespaceDestination::Vacant,
         )?;
         let hard_link = pass.hard_link_source(ext4_core::HardLinkNodeId::File(file_id))?;
         pass.create_hard_link(
             hard_link,
             root,
             &linked,
-            ext4_core::HardLinkDestination::Vacant,
+            ext4_core::NamespaceDestination::Vacant,
         )?;
         let node = pass.node(ext4_core::NodeId::File(file_id))?;
         pass.set_xattr(
@@ -3805,7 +3805,7 @@ fn run_external_file_mutation_until_boundary(
                 source_name,
                 root,
                 target_name,
-                ext4_core::RenameTargetCollision::Reject,
+                ext4_core::NamespaceDestination::Vacant,
             )?;
             let node = pass.node(ext4_core::NodeId::File(file_id))?;
             pass.set_xattr(

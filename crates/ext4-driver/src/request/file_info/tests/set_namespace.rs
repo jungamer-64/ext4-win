@@ -42,7 +42,7 @@ fn rename_ex_flags_decode_collision_and_reject_unsupported_semantics() {
     ));
     assert_eq!(
         super::RenameInformationFormat::Flags.target_collision(&input),
-        Ok(ext4_core::RenameTargetCollision::Reject)
+        Ok(super::RenameTargetPolicy::Reject)
     );
 
     assert!(put_le_u32(
@@ -52,7 +52,7 @@ fn rename_ex_flags_decode_collision_and_reject_unsupported_semantics() {
     ));
     assert_eq!(
         super::RenameInformationFormat::Flags.target_collision(&input),
-        Ok(ext4_core::RenameTargetCollision::Replace)
+        Ok(super::RenameTargetPolicy::Replace)
     );
 
     assert!(put_le_u32(
@@ -153,12 +153,12 @@ fn hard_link_count_and_archive_boundaries_are_explicit() {
 /// Panics when vacant and replacement destinations select the wrong parent effect.
 #[test]
 fn hard_link_destinations_preserve_parent_oplock_effects() {
-    let vacant = super::PreparedHardLinkDestination::Vacant;
+    let vacant = super::PreparedNamespaceDestination::Vacant;
     assert_eq!(vacant.oplock_effect(), NamespaceParentOplockEffect::Change);
     let name = Ext4Name::new(b"target");
     assert!(name.is_ok());
     if let Ok(name) = name {
-        let replaced = super::PreparedHardLinkDestination::Replace {
+        let replaced = super::PreparedNamespaceDestination::Replace {
             existing_name: name,
         };
         assert_eq!(
@@ -364,7 +364,7 @@ fn rename_replace_flag_decode_boundary_selects_replace_collision() {
         if let Ok(parsed) = parsed {
             assert_eq!(
                 super::RenameInformationFormat::ReplaceIfExistsByte.target_collision(&input),
-                Ok(ext4_core::RenameTargetCollision::Replace)
+                Ok(super::RenameTargetPolicy::Replace)
             );
             assert_eq!(parsed.parent(), ext4_core::DirectoryNodeId::ROOT);
         }

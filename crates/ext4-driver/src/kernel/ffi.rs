@@ -114,6 +114,19 @@ unsafe extern "system" {
     pub(crate) fn ext4win_key_management_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
     /// Checks symbolic-link creation against the dispatch thread's effective token.
     pub(crate) fn ext4win_symbolic_link_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
+    /// Captures the effective requestor and retains a device-bound cleanup work item.
+    pub(crate) fn ext4win_subject_capture(
+        device: wdk_sys::PDEVICE_OBJECT,
+        mode: wdk_sys::KPROCESSOR_MODE,
+        output: *mut wdk_sys::PVOID,
+    ) -> wdk_sys::NTSTATUS;
+    /// Consumes the subject; raised-IRQL cancellation defers token retirement to its retained worker.
+    pub(crate) fn ext4win_subject_release(subject: wdk_sys::PVOID);
+    /// Checks target attribute rights against the retained effective subject at PASSIVE_LEVEL.
+    pub(crate) fn ext4win_subject_write_attributes(
+        subject: wdk_sys::PVOID,
+        descriptor: wdk_sys::PSECURITY_DESCRIPTOR,
+    ) -> wdk_sys::NTSTATUS;
     /// Creates the named control device with the exact SDDL and setup-class identity supplied by
     /// the generated lifecycle contract.
     pub(crate) fn WdmlibIoCreateDeviceSecure(

@@ -201,6 +201,7 @@ pub(super) fn set_file_information(
     pending_disposition: &mut Option<PendingDispositionDeletion>,
     prepared_deletion: Option<&PreparedStreamDeletion>,
     namespace_oplocks: Option<NamespaceOplockPlan>,
+    mapping: &ext4_security::IdentityMap,
 ) -> DriverResult<SetFileResolution> {
     if let Some(pending) = pending_disposition.as_ref() {
         pending.validate_request(&mut request)?;
@@ -379,7 +380,8 @@ pub(super) fn set_file_information(
             mutation: rename,
             file_object,
         } => {
-            let prepared = PreparedRenameMutation::prepare(rename, operations, mutation)?;
+            let prepared =
+                PreparedRenameMutation::prepare(rename, operations, mutation, &request, mapping)?;
             if let Some(oplocks) = prepared.oplock_plan()
                 && namespace_oplocks != Some(oplocks)
             {
@@ -971,7 +973,7 @@ impl HardLinkMutation {
 
 /// Prepared hard-link destination with the exact ext4 name selected for replacement.
 #[derive(Debug)]
-enum PreparedHardLinkDestination {
+enum PreparedNamespaceDestination {
     /// No Windows-visible target exists.
     Vacant,
     /// The caller authorized replacement of this exact existing entry.
@@ -981,7 +983,7 @@ enum PreparedHardLinkDestination {
     },
 }
 
-impl PreparedHardLinkDestination {
+impl PreparedNamespaceDestination {
     /// Parent-directory effect required by this exact destination state.
     const fn oplock_effect(&self) -> NamespaceParentOplockEffect {
         match self {
@@ -1046,7 +1048,7 @@ struct PreparedHardLinkMutation {
     /// Exact ext4 target spelling used by the transaction.
     target_name: Ext4Name,
     /// Validated target state and replacement spelling.
-    destination: PreparedHardLinkDestination,
+    destination: PreparedNamespaceDestination,
     /// Optional archive-bit projection prepared before writes begin.
     archive_overlay: Option<WindowsOverlay>,
     /// Fully allocated post-commit notification sequence.
@@ -1114,17 +1116,17 @@ impl PreparedHardLinkMutation {
             mutation.set_windows_overlay(node, overlay)?;
         }
         match &self.destination {
-            PreparedHardLinkDestination::Vacant => mutation.create_hard_link(
+            PreparedNamespaceDestination::Vacant => mutation.create_hard_link(
                 source,
                 target_parent,
                 &self.target_name,
-                HardLinkDestination::Vacant,
+                NamespaceDestination::Vacant,
             )?,
-            PreparedHardLinkDestination::Replace { existing_name } => mutation.create_hard_link(
+            PreparedNamespaceDestination::Replace { existing_name } => mutation.create_hard_link(
                 source,
                 target_parent,
                 &self.target_name,
-                HardLinkDestination::Replace { existing_name },
+                NamespaceDestination::Replace { existing_name },
             )?,
         }
         Ok(self.changes)
@@ -1145,7 +1147,7 @@ fn prepare_hard_link_destination(
     target_windows_name: &WindowsName,
     target_collision: HardLinkTargetCollision,
 ) -> DriverResult<(
-    PreparedHardLinkDestination,
+    PreparedNamespaceDestination,
     HardLinkCountEffect,
     HardLinkDirectoryChanges,
 )> {
@@ -1157,7 +1159,7 @@ fn prepare_hard_link_destination(
     )?;
     let ChildLookup::Found(target) = target else {
         return Ok((
-            PreparedHardLinkDestination::Vacant,
+            PreparedNamespaceDestination::Vacant,
             HardLinkCountEffect::Increase,
             HardLinkDirectoryChanges {
                 first: DirectoryChange::new(
@@ -1217,7 +1219,7 @@ fn prepare_hard_link_destination(
         HardLinkCountEffect::Increase
     };
     Ok((
-        PreparedHardLinkDestination::Replace { existing_name },
+        PreparedNamespaceDestination::Replace { existing_name },
         count_effect,
         changes,
     ))
@@ -1238,6 +1240,33 @@ fn hard_link_archive_overlay(
     )?)))
 }
 
+/// Verifies the opened namespace link against committed state before any rename or no-op.
+/// # Errors
+/// Returns name-not-found if the saved link was removed or now names another inode.
+fn validate_rename_source(
+    read: &mut impl CommittedReadPass,
+    parent: DirectoryNodeId,
+    name: &Ext4Name,
+    node: NodeId,
+) -> DriverResult<()> {
+    let parent = read.load_directory(parent)?;
+    match read.lookup_child(&parent, name)? {
+        ChildLookup::Found(child) if *child.node() == node => Ok(()),
+        ChildLookup::Found(_) | ChildLookup::NotFound => Err(DriverError::ObjectNameNotFound),
+    }
+}
+
+/// Windows replacement policy, independent of the exact ext4 destination selected later.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenameTargetPolicy {
+    /// Reject another Windows-visible destination.
+    Reject,
+    /// Replace a writable non-directory destination.
+    Replace,
+    /// Replace a non-directory destination after authorizing any read-only override.
+    ReplaceReadonly,
+}
+
 /// Owned rename mutation decoded completely before the first suspension.
 #[derive(Debug)]
 struct RenameMutation {
@@ -1250,7 +1279,7 @@ struct RenameMutation {
     /// Destination path with its explicit resolution base.
     target: NamespaceTargetPath,
     /// Existing-target behavior decoded from the rename information class.
-    target_collision: RenameTargetCollision,
+    target_collision: RenameTargetPolicy,
 }
 
 impl RenameMutation {
@@ -1265,6 +1294,7 @@ impl RenameMutation {
         format: RenameInformationFormat,
         parent: NamespaceParent<'_>,
     ) -> DriverResult<Self> {
+        opened_file.require_delete_access()?;
         if opened_file.delete_pending() {
             return Err(DriverError::DeletePending);
         }
@@ -1319,8 +1349,8 @@ enum PreparedRenameMutation {
         target_parent: DirectoryNodeId,
         /// Exact destination spelling.
         target_name: Ext4Name,
-        /// Validated collision policy passed to the ext4 transaction.
-        target_collision: RenameTargetCollision,
+        /// Exact occupied entry selected for replacement, or a verified vacant destination.
+        destination: PreparedNamespaceDestination,
         /// Parent-directory oplock effects derived from the resolved target state.
         oplocks: NamespaceOplockPlan,
         /// New handle location published only after durable commit.
@@ -1339,6 +1369,8 @@ impl PreparedRenameMutation {
         request: RenameMutation,
         operations: &mut MountedVolumeAccess<'_>,
         read: &mut impl CommittedReadPass,
+        owned: &PendingIrpLease<'_>,
+        mapping: &ext4_security::IdentityMap,
     ) -> DriverResult<Self> {
         let RenameMutation {
             source_parent,
@@ -1347,23 +1379,77 @@ impl PreparedRenameMutation {
             target,
             target_collision,
         } = request;
+        validate_rename_source(read, source_parent, &source_name, source_node)?;
         let (target_parent, target_name) = resolve_namespace_target(read, &target)?;
         operations.ensure_node_openable(NodeId::Directory(source_parent))?;
         operations.ensure_node_openable(NodeId::Directory(target_parent))?;
-        let notifications = RenameDirectoryNameChanges::prepare(
-            operations,
-            read,
-            RenameNotificationRequest {
-                source_parent,
-                source_name: &source_name,
-                source_node,
-                target_parent,
-                target_name: &target_name,
-                target_collision,
-            },
-        )?;
-        let Some(notifications) = notifications else {
+        if source_parent == target_parent && source_name == target_name {
             return Ok(Self::Unchanged);
+        }
+        let parent = read.load_directory(target_parent)?;
+        let target = read.lookup_windows_child(
+            &parent,
+            &WindowsName::from_ext4(&target_name)?,
+            ext4_core::WindowsNameMatch::CaseInsensitive,
+        )?;
+        let (destination, replaced_target) = match target {
+            ChildLookup::NotFound => (PreparedNamespaceDestination::Vacant, None),
+            ChildLookup::Found(child) if *child.node() == source_node => {
+                if source_parent != target_parent || child.name() != &source_name {
+                    return Ok(Self::Unchanged);
+                }
+                // This is a spelling change of the source entry, rather than target replacement.
+                (PreparedNamespaceDestination::Vacant, None)
+            }
+            ChildLookup::Found(child) => {
+                if target_collision == RenameTargetPolicy::Reject {
+                    return Err(DriverError::ObjectNameCollision);
+                }
+                let metadata = metadata_from_node(read, *child.node())?;
+                if matches!(child.node(), NodeId::Directory(_)) {
+                    return Err(DriverError::AccessDenied);
+                }
+                if metadata.file_attributes & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
+                    if target_collision != RenameTargetPolicy::ReplaceReadonly {
+                        return Err(DriverError::AccessDenied);
+                    }
+                    let descriptor = crate::request::security::CreateSecurityDescriptor::for_node(
+                        read,
+                        *child.node(),
+                        mapping,
+                    )?;
+                    owned
+                        .rename_subject()?
+                        .require_write_attributes(descriptor.as_native())?;
+                }
+                operations.ensure_node_replaceable(*child.node())?;
+                (
+                    PreparedNamespaceDestination::Replace {
+                        existing_name: child.name().try_to_owned_name()?,
+                    },
+                    Some(DirectoryChange::new(
+                        target_parent,
+                        child.name(),
+                        *child.node(),
+                        DirectoryChangeAction::Removed,
+                    )?),
+                )
+            }
+        };
+        let notifications = RenameDirectoryNameChanges {
+            replaced_target,
+            old_source_name: DirectoryChange::new(
+                source_parent,
+                &source_name,
+                source_node,
+                DirectoryChangeAction::RenamedOldName,
+            )?,
+            new_source_name: DirectoryChange::new(
+                target_parent,
+                &target_name,
+                source_node,
+                DirectoryChangeAction::RenamedNewName,
+            )?,
         };
         let target_effect = if notifications.replaced_target.is_some() {
             NamespaceParentOplockEffect::Removal
@@ -1378,7 +1464,7 @@ impl PreparedRenameMutation {
             source_name,
             target_parent,
             target_name: target_name.try_to_owned_name()?,
-            target_collision,
+            destination,
             oplocks,
             location: OpenedLocation::DirectoryEntry {
                 parent: target_parent,
@@ -1406,7 +1492,7 @@ impl PreparedRenameMutation {
             source_name,
             target_parent,
             target_name,
-            target_collision,
+            destination,
             location,
             notifications,
             ..
@@ -1421,7 +1507,12 @@ impl PreparedRenameMutation {
             &source_name,
             target_parent,
             &target_name,
-            target_collision,
+            match &destination {
+                PreparedNamespaceDestination::Vacant => NamespaceDestination::Vacant,
+                PreparedNamespaceDestination::Replace { existing_name } => {
+                    NamespaceDestination::Replace { existing_name }
+                }
+            },
         )?;
         Ok(PreparedRename::Changed {
             location,
@@ -1441,87 +1532,7 @@ pub(crate) struct RenameDirectoryNameChanges {
     new_source_name: DirectoryChange,
 }
 
-/// Fully resolved namespace identities used to prepare rename notifications.
-#[derive(Debug)]
-struct RenameNotificationRequest<'name> {
-    /// Source directory before the rename.
-    source_parent: DirectoryNodeId,
-    /// Source ext4 name before the rename.
-    source_name: &'name Ext4Name,
-    /// Typed node being renamed.
-    source_node: NodeId,
-    /// Destination directory after the rename.
-    target_parent: DirectoryNodeId,
-    /// Destination ext4 name after the rename.
-    target_name: &'name Ext4Name,
-    /// Validated collision policy.
-    target_collision: RenameTargetCollision,
-}
-
 impl RenameDirectoryNameChanges {
-    /// Prepares the exact name-change events that a successful rename will publish.
-    /// # Errors
-    ///
-    /// Returns an error when a replace-capable target cannot be read or a visible child name
-    /// cannot be represented in the Windows notification namespace.
-    fn prepare(
-        operations: &mut MountedVolumeAccess<'_>,
-        read: &mut impl CommittedReadPass,
-        request: RenameNotificationRequest<'_>,
-    ) -> DriverResult<Option<Self>> {
-        let RenameNotificationRequest {
-            source_parent,
-            source_name,
-            source_node,
-            target_parent,
-            target_name,
-            target_collision,
-        } = request;
-        if source_parent == target_parent && source_name == target_name {
-            return Ok(None);
-        }
-
-        let replaced_target = match target_collision {
-            RenameTargetCollision::Reject => None,
-            RenameTargetCollision::Replace => {
-                let parent = read.load_directory(target_parent)?;
-                match read.lookup_windows_child(
-                    &parent,
-                    &WindowsName::from_ext4(target_name)?,
-                    ext4_core::WindowsNameMatch::CaseInsensitive,
-                )? {
-                    ChildLookup::Found(child) if *child.node() == source_node => return Ok(None),
-                    ChildLookup::Found(child) => {
-                        operations.ensure_node_replaceable(*child.node())?;
-                        Some(DirectoryChange::new(
-                            target_parent,
-                            child.name(),
-                            *child.node(),
-                            DirectoryChangeAction::Removed,
-                        )?)
-                    }
-                    ChildLookup::NotFound => None,
-                }
-            }
-        };
-
-        Ok(Some(Self {
-            replaced_target,
-            old_source_name: DirectoryChange::new(
-                source_parent,
-                source_name,
-                source_node,
-                DirectoryChangeAction::RenamedOldName,
-            )?,
-            new_source_name: DirectoryChange::new(
-                target_parent,
-                target_name,
-                source_node,
-                DirectoryChangeAction::RenamedNewName,
-            )?,
-        }))
-    }
-
     /// Reports every name transition after the corresponding ext4 transaction commits.
     fn report(self, operations: &MountedVolumeAccess<'_>) {
         if let Some(replaced_target) = self.replaced_target {
@@ -1980,14 +1991,14 @@ impl RenameInformationFormat {
     /// # Errors
     ///
     /// Returns an error when unsupported rename-ex flags are set.
-    fn target_collision(self, bytes: &[u8]) -> DriverResult<RenameTargetCollision> {
+    fn target_collision(self, bytes: &[u8]) -> DriverResult<RenameTargetPolicy> {
         match self {
             Self::ReplaceIfExistsByte => match bytes
                 .get(FILE_NAMESPACE_REPLACE_IF_EXISTS_OFFSET)
                 .ok_or(DriverError::BufferTooSmall)?
             {
-                0 => Ok(RenameTargetCollision::Reject),
-                _ => Ok(RenameTargetCollision::Replace),
+                0 => Ok(RenameTargetPolicy::Reject),
+                _ => Ok(RenameTargetPolicy::Replace),
             },
             Self::Flags => {
                 let flags = LittleEndianInput::new(bytes)
@@ -1996,9 +2007,13 @@ impl RenameInformationFormat {
                     return Err(DriverError::NotSupported);
                 }
                 if flags & wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS != 0 {
-                    Ok(RenameTargetCollision::Replace)
+                    if flags & wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE != 0 {
+                        Ok(RenameTargetPolicy::ReplaceReadonly)
+                    } else {
+                        Ok(RenameTargetPolicy::Replace)
+                    }
                 } else {
-                    Ok(RenameTargetCollision::Reject)
+                    Ok(RenameTargetPolicy::Reject)
                 }
             }
         }

@@ -2977,6 +2977,8 @@ enum PreparedMutationRequest {
     },
     /// Owner/mode mutation pins the same mapping for every replay and reverse conversion.
     Security(crate::identity::IdentitySnapshot),
+    /// File-information mutation pins the mapping used for replacement-target authorization.
+    SetInformation(crate::identity::IdentitySnapshot),
     /// Regular-file data write with handle or paging stream authority.
     DataWrite(crate::request::file_info::RegularFileDataAuthority),
     /// Clean-volume key removal retains namespace exclusion through publication or abort.
@@ -3040,6 +3042,9 @@ impl PreparedMutationRequest {
                 .map(Self::DataWrite)
             }
             MutationRequestKind::SetSecurity => access.identity_snapshot().map(Self::Security),
+            MutationRequestKind::SetInformation => {
+                access.identity_snapshot().map(Self::SetInformation)
+            }
             MutationRequestKind::Create => {
                 let mapping = access.identity_snapshot()?;
                 let creator = owned.request().with_active(|active| {
@@ -3073,6 +3078,7 @@ impl PreparedMutationRequest {
             Self::Verity(_) => MutationRequestKind::EnableVerity,
             Self::Create { .. } => MutationRequestKind::Create,
             Self::Security(_) => MutationRequestKind::SetSecurity,
+            Self::SetInformation(_) => MutationRequestKind::SetInformation,
             Self::Other(kind) => *kind,
         }
     }
@@ -3766,7 +3772,7 @@ impl MutationRequestOperation {
             PreparedMutationRequest::KeyRemoval(_) | PreparedMutationRequest::RemovedKey => false,
             PreparedMutationRequest::Verity(_) => true,
             PreparedMutationRequest::Security(_) => true,
-            PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
+            PreparedMutationRequest::SetInformation(_) => {
                 owned.request().with_active(|active| {
                     let class = active.current_stack()?.set_file()?.operation();
                     Ok::<_, DriverError>(!matches!(
@@ -3990,9 +3996,9 @@ impl MutationRequestOperation {
                 crate::request::file_info::RegularFileDataAuthority::Handle,
             )
             | PreparedMutationRequest::Security(_)
+            | PreparedMutationRequest::SetInformation(_)
             | PreparedMutationRequest::Other(
-                MutationRequestKind::SetInformation
-                | MutationRequestKind::SetEa
+                MutationRequestKind::SetEa
                 | MutationRequestKind::SetReparsePoint
                 | MutationRequestKind::DeleteReparsePoint
                 | MutationRequestKind::EnableVerity,
@@ -4056,7 +4062,7 @@ impl MutationRequestOperation {
                     }
                 }
             }
-            PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
+            PreparedMutationRequest::SetInformation(mapping) => {
                 match crate::request::file_info::set(
                     owned.request(),
                     operations,
@@ -4064,6 +4070,7 @@ impl MutationRequestOperation {
                     state.disposition_deletion,
                     state.prepared_deletion,
                     state.namespace_oplocks,
+                    &mapping.get().map,
                 )? {
                     crate::request::file_info::SetFileResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Normal(completion)),

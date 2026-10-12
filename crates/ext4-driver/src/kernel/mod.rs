@@ -13,6 +13,7 @@ pub(crate) mod io_reliability;
 mod mount_manager;
 pub(crate) mod name_expression;
 pub(crate) mod operational_trace;
+pub(crate) mod requestor_subject;
 pub(crate) mod section;
 pub(crate) mod status;
 pub(crate) mod storage;

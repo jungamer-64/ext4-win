@@ -1121,6 +1121,15 @@ impl<'a> PendingIrpLease<'a> {
         self.owner.context.key_control()
     }
 
+    /// Retains original-thread authorization while resolving an extended rename target.
+    /// # Errors
+    /// Returns access denied for a request without captured extended-rename authority.
+    pub(crate) fn rename_subject(
+        &self,
+    ) -> DriverResult<&crate::kernel::requestor_subject::RequestorSubject> {
+        self.owner.context.rename_subject()
+    }
+
     /// Borrows the read payload captured before queue insertion.
     /// # Errors
     ///

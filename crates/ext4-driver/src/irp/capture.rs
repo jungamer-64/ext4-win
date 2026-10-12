@@ -651,6 +651,21 @@ impl QueueContextOwnership {
         }
     }
 
+    /// Borrows only the original subject captured for an extended rename.
+    /// # Errors
+    /// Rejects attempts to obtain target authorization from an ordinary request.
+    pub(super) fn rename_subject(
+        &self,
+    ) -> DriverResult<&crate::kernel::requestor_subject::RequestorSubject> {
+        match self {
+            Self::Captured(context) => match &context.prepared {
+                PreparedRequest::RenameInformation(subject) => Ok(subject),
+                _ => Err(DriverError::AccessDenied),
+            },
+            Self::Cleanup | Self::Close => Err(DriverError::AccessDenied),
+        }
+    }
+
     /// Borrows the read contract captured before queue insertion.
     /// # Errors
     ///
@@ -999,6 +1014,8 @@ pub(crate) enum PreparedRequest {
     QueryInformation,
     /// File information mutation.
     SetInformation,
+    /// Extended rename retains the original requestor for target attribute checks.
+    RenameInformation(crate::kernel::requestor_subject::RequestorSubject),
     /// Volume information query.
     QueryVolumeInformation,
     /// Volume information mutation.
@@ -1107,7 +1124,21 @@ impl PreparedRequest {
                 generic_key(),
             )),
             DispatchMajor::QueryInformation => Ok((Self::QueryInformation, generic_key())),
-            DispatchMajor::SetInformation => Ok((Self::SetInformation, generic_key())),
+            DispatchMajor::SetInformation => {
+                if matches!(
+                    stack.set_file().map(|set| set.operation()),
+                    Ok(super::SetFileOperation::RenameEx(_))
+                ) {
+                    let subject = crate::kernel::requestor_subject::RequestorSubject::capture(
+                        target.device(),
+                        target.requestor_mode(),
+                    )
+                    .map_err(IrpCompletion::from_error)?;
+                    Ok((Self::RenameInformation(subject), generic_key()))
+                } else {
+                    Ok((Self::SetInformation, generic_key()))
+                }
+            }
             DispatchMajor::QueryVolumeInformation => {
                 Ok((Self::QueryVolumeInformation, generic_key()))
             }

@@ -729,7 +729,9 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::Write(_)) => {
             Admission::Mutation(MutationRequestKind::Write)
         }
-        ActorRequest::Captured(PreparedRequest::SetInformation) => {
+        ActorRequest::Captured(
+            PreparedRequest::SetInformation | PreparedRequest::RenameInformation(_),
+        ) => {
             let admission = owned.request().with_active(|active| {
                 Ok(match active.current_stack()?.set_file()?.operation() {
                     crate::irp::SetFileOperation::AdvanceValidDataLength => {

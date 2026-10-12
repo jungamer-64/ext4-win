@@ -24,6 +24,7 @@ pub(crate) fn set(
     pending_disposition: &mut Option<PendingDispositionDeletion>,
     prepared_deletion: Option<&PreparedStreamDeletion>,
     namespace_oplocks: Option<NamespaceOplockPlan>,
+    mapping: &ext4_security::IdentityMap,
 ) -> DriverResult<SetFileResolution> {
     set_file_information(
         request,
@@ -32,6 +33,7 @@ pub(crate) fn set(
         pending_disposition,
         prepared_deletion,
         namespace_oplocks,
+        mapping,
     )
 }
 
