@@ -5,8 +5,6 @@ use super::*;
 /// Existing target outcome for a replace-capable rename.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExistingRenameTarget {
-    /// No target entry exists.
-    Absent,
     /// A distinct target entry was removed from the namespace.
     Removed,
     /// The target entry already names the source inode.
@@ -195,7 +193,7 @@ impl MutationResolvePass<'_, '_, '_> {
         source: TransactionHardLinkSource,
         target_parent: TransactionDirectory,
         target_name: &Ext4Name,
-        destination: HardLinkDestination<'_>,
+        destination: NamespaceDestination<'_>,
     ) -> Result<()> {
         reject_reserved_directory_name(target_name)?;
         let source_inode_id = source.inode();
@@ -211,10 +209,10 @@ impl MutationResolvePass<'_, '_, '_> {
 
         let mut add_link = true;
         match destination {
-            HardLinkDestination::Vacant => {
+            NamespaceDestination::Vacant => {
                 self.ensure_child_absent(target_parent.inode(), target_name)?;
             }
-            HardLinkDestination::Replace { existing_name } => {
+            NamespaceDestination::Replace { existing_name } => {
                 let existing = self.find_child_entry(target_parent.inode(), existing_name)?;
                 if existing.inode() == source_inode_id {
                     add_link = false;
@@ -499,7 +497,7 @@ impl MutationResolvePass<'_, '_, '_> {
         source_name: &Ext4Name,
         target_parent: TransactionDirectory,
         target_name: &Ext4Name,
-        target_collision: RenameTargetCollision,
+        destination: NamespaceDestination<'_>,
     ) -> Result<()> {
         reject_reserved_directory_name(source_name)?;
         reject_reserved_directory_name(target_name)?;
@@ -510,8 +508,14 @@ impl MutationResolvePass<'_, '_, '_> {
         if source_parent == target_parent && source_name == target_name {
             return Ok(());
         }
-        if matches!(target_collision, RenameTargetCollision::Reject) {
-            self.ensure_child_absent(target_parent, target_name)?;
+        match destination {
+            NamespaceDestination::Vacant => self.ensure_child_absent(target_parent, target_name)?,
+            NamespaceDestination::Replace { existing_name } => {
+                reject_reserved_directory_name(existing_name)?;
+                if existing_name != target_name {
+                    self.ensure_child_absent(target_parent, target_name)?;
+                }
+            }
         }
 
         let child_index = self.mutation.ensure_inode_update(source.inode())?;
@@ -522,10 +526,10 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::CannotRemoveRoot);
         }
         let kind = directory_entry_kind(child_inode.kind());
-        if matches!(target_collision, RenameTargetCollision::Replace) {
+        if let NamespaceDestination::Replace { existing_name } = destination {
             let existing_target = self.remove_existing_rename_target(
                 target_parent,
-                target_name,
+                existing_name,
                 source.inode(),
                 child_inode.kind(),
             )?;
@@ -591,7 +595,7 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<ExistingRenameTarget> {
         let target = match self.find_child_entry(target_parent, target_name) {
             Ok(target) => target,
-            Err(Error::DirectoryEntryNotFound) => return Ok(ExistingRenameTarget::Absent),
+            Err(Error::DirectoryEntryNotFound) => return Err(Error::DirectoryEntryNotFound),
             Err(error) => return Err(error),
         };
         if target.inode() == source {

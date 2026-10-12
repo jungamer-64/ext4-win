@@ -252,9 +252,9 @@ impl TransactionHardLinkSource {
     }
 }
 
-/// Prevalidated namespace state at a requested hard-link destination.
+/// Prevalidated namespace state at a requested destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum HardLinkDestination<'name> {
+pub enum NamespaceDestination<'name> {
     /// No Windows-visible entry occupies the requested destination.
     Vacant,
     /// One exact ext4 entry selected for replacement occupies the destination.
@@ -262,15 +262,6 @@ pub enum HardLinkDestination<'name> {
         /// Existing on-disk name, which can differ from the requested name only by case.
         existing_name: &'name Ext4Name,
     },
-}
-
-/// How a rename handles an already existing target name.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RenameTargetCollision {
-    /// The target name must be absent.
-    Reject,
-    /// The target name may be replaced by the source entry.
-    Replace,
 }
 
 impl TransactionSymlink {
