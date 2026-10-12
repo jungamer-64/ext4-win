@@ -3,8 +3,8 @@
 //! Media revocation, reversible query removal and filesystem close are independent facts.
 //! Only submission scopes hold the native resource; revocation never waits for lower completion.
 
-use core::sync::atomic::{AtomicU8, Ordering};
 use super::io_reliability::IoReliabilityObservation;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 /// Monotonic lower-device availability, independent of filesystem close.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,15 +240,64 @@ unsafe extern "system" fn ext4win_storage_close_phase(state: *const StorageAdmis
     state.close() as u8
 }
 
+/// Observes reliability without acquiring actor or filesystem resources.
+/// # Safety
+/// `state` is retained by the enclosing volume through every native callback.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "native callbacks borrow the retained volume observation"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_storage_io_policy(state: *const StorageAdmission) -> u8 {
+    let state = unsafe {
+        // SAFETY: The native volume header retains this allocation and its observation lease.
+        &*state
+    };
+    state.reliability.policy().raw()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// # Panics
-    /// Fails if reversible cancellation restores media or terminal filesystem admission.
+    /// Fails if native observations retain stale permission after actor publication.
+    /// # Errors
+    /// Returns allocation or reference-budget failure during setup.
     #[test]
-    fn cancellation_does_not_restore_terminal_authority() {
-        let state = StorageAdmission::new();
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions check native revocation while setup propagates allocation failure"
+    )]
+    fn reliability_revokes_native_writes_and_reads_independently()
+    -> crate::kernel::status::DriverResult<()> {
+        use crate::kernel::io_reliability::{IoReliabilityOwner, NativeIoPolicy};
+        let mut owner = IoReliabilityOwner::try_new()?;
+        let state = StorageAdmission::new(owner.observe()?);
+        assert!(state.reliability.policy().permits(true));
+        owner.publish(NativeIoPolicy::ReadOnly);
+        assert!(state.reliability.policy().permits(false));
+        assert!(!state.reliability.policy().permits(true));
+        owner.publish(NativeIoPolicy::Unavailable);
+        assert!(!state.reliability.policy().permits(false));
+        assert!(!state.reliability.policy().permits(true));
+        Ok(())
+    }
+
+    /// # Panics
+    /// Fails if reversible cancellation restores media or terminal filesystem admission.
+    /// # Errors
+    /// Returns allocation or reference-budget failure during setup.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions check cancellation while setup propagates allocation failure"
+    )]
+    fn cancellation_does_not_restore_terminal_authority() -> crate::kernel::status::DriverResult<()>
+    {
+        let owner = crate::kernel::io_reliability::IoReliabilityOwner::try_new()?;
+        let state = StorageAdmission::new(owner.observe()?);
         assert!(state.prepare_query());
         assert!(!state.creates_admitted());
         assert!(state.publish_query());
@@ -267,5 +316,6 @@ mod tests {
         state.cancel_query();
         assert_eq!(state.media(), MediaState::Removed);
         assert!(!state.prepare_query());
+        Ok(())
     }
 }

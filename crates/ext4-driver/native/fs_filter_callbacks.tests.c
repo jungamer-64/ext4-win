@@ -27,7 +27,7 @@ typedef struct { unsigned unused; } DRIVER_OBJECT, *PDRIVER_OBJECT;
 typedef struct {
     PFILE_OBJECT FileObject;
     union {
-        struct { unsigned SyncType; } AcquireForSectionSynchronization;
+        struct { unsigned SyncType, PageProtection; } AcquireForSectionSynchronization;
         struct { PERESOURCE *ResourceToRelease; } AcquireForModifiedPageWriter;
         struct { PERESOURCE ResourceToRelease; } ReleaseForModifiedPageWriter;
     } Parameters;
@@ -113,8 +113,9 @@ static BOOLEAN ext4win_section_acquire_paging(const VOID *state, PERESOURCE reso
     resource->held++;
     return TRUE;
 }
-static BOOLEAN ext4win_stream_ordinary_io_available(PEXT4WIN_STREAM_CONTEXT object)
+static BOOLEAN ext4win_stream_section_io_available(PEXT4WIN_STREAM_CONTEXT object, unsigned protection)
 {
+    (void)protection;
     assert(object == &stream && stream.MainResource.held == 1);
     return ordinary_io_available;
 }
@@ -151,6 +152,7 @@ static void exercise_callbacks(BOOLEAN supply_context)
     PERESOURCE paging_resource = NULL;
     data.FileObject = &file;
     data.Parameters.AcquireForSectionSynchronization.SyncType = SyncTypeCreateSection;
+    data.Parameters.AcquireForSectionSynchronization.PageProtection = 0;
     invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
     assert(stream.MainResource.held == 1);

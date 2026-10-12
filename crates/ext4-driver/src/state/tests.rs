@@ -666,6 +666,7 @@ fn test_file_control_block(
         crate::kernel::stream::StreamContext::try_new_volume(
             crate::kernel::stream::StreamSizes::EMPTY,
             crate::kernel::operational_trace::OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
         )
     })
     .unwrap_or_else(|_| {
@@ -1727,6 +1728,7 @@ fn volume_lock_cache_drain_retains_every_stream_until_worker_completion() -> Res
     let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
+        crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
     )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let stream = super::StagedNodeStreamMetadata {
@@ -1785,6 +1787,7 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
     let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
+        crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
     )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1834,6 +1837,7 @@ fn oplock_stream_lease_retains_fcb_until_continuation_releases() -> Result<(), D
     let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
+        crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
     )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1886,6 +1890,7 @@ fn oplock_mutation_pair_blocks_grants_until_mutation_release() -> Result<(), Dri
     let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
+        crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
     )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let volume = NonNull::<VolumeControlBlock>::dangling();
@@ -1957,6 +1962,7 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
     let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
         crate::kernel::stream::StreamSizes::EMPTY,
         crate::kernel::operational_trace::OperationalTrace::host_test(),
+        crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
     )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let (absent_mutation, absent_stream) =

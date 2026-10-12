@@ -22,6 +22,7 @@ extern BOOLEAN NTAPI ext4win_section_acquire_paging(const VOID *state, PERESOURC
     BOOLEAN exclusive, BOOLEAN wait);
 extern UCHAR NTAPI ext4win_storage_media_state(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_close_phase(_In_ const VOID *state);
+extern UCHAR NTAPI ext4win_storage_io_policy(_In_ const VOID *state);
 extern NTSTATUS NTAPI ext4win_prepare_mdl_completion(_In_ const VOID *queue, _In_ PFILE_OBJECT file_object);
 
 /* This consuming call preserves buffered/direct/neither IOCTL semantics and lower cancellation. */
@@ -55,12 +56,12 @@ typedef struct _EXT4WIN_FAST_IO_QUERY_SNAPSHOT {
 typedef struct _EXT4WIN_FAST_IO_TRANSFER_OBSERVATION {
     LONGLONG Eof;
     ULONG Flags;
-    UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess;
+    UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess, Policy;
 } EXT4WIN_FAST_IO_TRANSFER_OBSERVATION;
 
 extern UCHAR NTAPI ext4win_handle_allows_cached_write(_In_opt_ const VOID *context);
-extern BOOLEAN NTAPI ext4win_fast_io_admit(ULONG flags, UCHAR cached, UCHAR media, UCHAR close, UCHAR mutation);
-extern BOOLEAN NTAPI ext4win_fast_io_query_admit(ULONG flags, UCHAR read_access, UCHAR possible, UCHAR media, UCHAR mutation);
+extern BOOLEAN NTAPI ext4win_fast_io_admit(ULONG flags, UCHAR cached, UCHAR media, UCHAR close, UCHAR mutation, UCHAR policy);
+extern BOOLEAN NTAPI ext4win_fast_io_query_admit(ULONG flags, UCHAR read_access, UCHAR possible, UCHAR media, UCHAR mutation, UCHAR policy);
 extern BOOLEAN NTAPI ext4win_fast_io_check_if_possible(PFILE_OBJECT file, PLARGE_INTEGER offset,
     ULONG length, BOOLEAN wait, ULONG key, BOOLEAN read, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device);
 extern VOID NTAPI ext4win_fast_io_basic_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot, PFILE_BASIC_INFORMATION output);
@@ -181,7 +182,18 @@ ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
     return ext4win_stream_storage_available(stream)
-        && (ext4win_storage_close_phase(volume->RustState) == 0);
+        && (ext4win_storage_close_phase(volume->RustState) == 0)
+        && (ext4win_storage_io_policy(volume->RustState) < 2);
+}
+
+/* Section writes modify backing data; copy-on-write protection does not. */
+static BOOLEAN
+ext4win_stream_section_io_available(PEXT4WIN_STREAM_CONTEXT stream, ULONG protection)
+{
+    BOOLEAN write = (protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
+    PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
+    return ext4win_stream_ordinary_io_available(stream)
+        && (!write || ext4win_storage_io_policy(volume->RustState) == 0);
 }
 
 static BOOLEAN
@@ -292,7 +304,7 @@ ext4win_stream_fast_io_candidate(
     *stream_out = stream;
     return ext4win_fast_io_admit(file_object->Flags, file_object->PrivateCacheMap != NULL,
         ext4win_storage_media_state(volume->RustState), ext4win_storage_close_phase(volume->RustState),
-        (UCHAR)ext4win_section_phase(stream->SectionState));
+        (UCHAR)ext4win_section_phase(stream->SectionState), ext4win_storage_io_policy(volume->RustState));
 }
 
 _Success_(return != FALSE)
@@ -1055,7 +1067,8 @@ ext4win_acquire_fast_io_query_stream(
     if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
-        (UCHAR)ext4win_section_phase(stream->SectionState))) { return FALSE; }
+        (UCHAR)ext4win_section_phase(stream->SectionState),
+        ext4win_storage_io_policy(stream->VolumeStream->RustState))) { return FALSE; }
     if (wait) {
         (VOID)ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
     }
@@ -1065,7 +1078,8 @@ ext4win_acquire_fast_io_query_stream(
     if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
-        (UCHAR)ext4win_section_phase(stream->SectionState))) {
+        (UCHAR)ext4win_section_phase(stream->SectionState),
+        ext4win_storage_io_policy(stream->VolumeStream->RustState))) {
         ext4win_release_resource(&stream->MainResource);
         return FALSE;
     }
@@ -1733,6 +1747,7 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     output->Mutation = (UCHAR)ext4win_section_phase(stream->SectionState);
     output->ReadAccess = file->ReadAccess;
     output->WriteAccess = file->WriteAccess;
+    output->Policy = ext4win_storage_io_policy(stream->VolumeStream->RustState);
     return TRUE;
 }
 

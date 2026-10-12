@@ -18,7 +18,8 @@ ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
     (VOID)ext4win_section_acquire_sync(stream->SectionState, &stream->MainResource,
         data->Parameters.AcquireForSectionSynchronization.SyncType);
     if ((data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection)
-        && !ext4win_stream_ordinary_io_available(stream)) {
+        && !ext4win_stream_section_io_available(stream,
+            data->Parameters.AcquireForSectionSynchronization.PageProtection)) {
         ext4win_release_resource(&stream->MainResource);
         return STATUS_FILE_LOCK_CONFLICT;
     }

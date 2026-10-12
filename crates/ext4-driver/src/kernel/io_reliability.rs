@@ -28,7 +28,10 @@ impl NativeIoPolicy {
     }
 
     /// Fixed scalar representation shared with native callbacks.
-    #[expect(clippy::as_conversions, reason = "repr(u8) fixes this internal native policy ABI")]
+    #[expect(
+        clippy::as_conversions,
+        reason = "repr(u8) fixes this internal native policy ABI"
+    )]
     pub(crate) const fn raw(self) -> u8 {
         self as u8
     }
@@ -46,14 +49,18 @@ impl IoReliabilityOwner {
     /// # Errors
     /// Returns nonpaged allocation failure before native callbacks exist.
     pub(crate) fn try_new() -> DriverResult<Self> {
-        Ok(Self { policy: DriverShared::try_new(AtomicU8::new(0))? })
+        Ok(Self {
+            policy: DriverShared::try_new(AtomicU8::new(0))?,
+        })
     }
 
     /// Attenuates publication ownership to a retained read-only observation.
     /// # Errors
     /// Returns finite reference-budget exhaustion before installing a native stream.
     pub(crate) fn observe(&self) -> DriverResult<IoReliabilityObservation> {
-        self.policy.try_acquire().map(|policy| IoReliabilityObservation { policy })
+        self.policy
+            .try_acquire()
+            .map(|policy| IoReliabilityObservation { policy })
     }
 
     /// Publishes immediately with the actor's failure transition, without allocation.

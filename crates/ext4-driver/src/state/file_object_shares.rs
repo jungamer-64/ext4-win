@@ -153,8 +153,11 @@ mod tests {
         reason = "setup returns errors while assertions verify terminal writeback retention"
     )]
     fn close_writeback_retains_active_streams_through_last_close() -> DriverResult<()> {
-        let volume_stream =
-            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let volume_stream = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
         let mut ledger = FileControlBlockLedger::try_new()?;
         let fcb = ledger.staged_file_control_block(
             NonNull::dangling(),

@@ -559,7 +559,11 @@ impl MountedVolumeBinding {
                 trace,
                 directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
                 file_control_blocks: FileControlBlockLedger::try_new()?,
-                stream_context: StreamContext::try_new_volume(StreamSizes::EMPTY, trace)?,
+                stream_context: StreamContext::try_new_volume(
+                    StreamSizes::EMPTY,
+                    trace,
+                    actor.runtime.observe_reliability()?,
+                )?,
                 _pin: PhantomPinned,
             })
         })?;

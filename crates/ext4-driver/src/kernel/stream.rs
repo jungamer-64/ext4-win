@@ -652,7 +652,7 @@ impl StreamContext {
         }
         #[cfg(test)]
         {
-            if (kind == StreamOwnerKind::Volume) && metadata.is_some() {
+            if (runtime.kind() == StreamOwnerKind::Volume) && metadata.is_some() {
                 return Err(DriverError::InternalInvariantViolation);
             }
             Ok(Self {
@@ -1178,7 +1178,7 @@ impl StreamContext {
             let result = (|| {
                 self.initialize_cache(transfer.file_object())?;
                 let _main = self.main_resource()?.ordinary_shared(self.sections.get());
-                self.ensure_ordinary_io()?;
+                self.ensure_ordinary_io(false)?;
                 super::cache_transfer::validate_copy_range(
                     _offset,
                     _length,
@@ -1242,7 +1242,7 @@ impl StreamContext {
                         admission.wait(transfer.file_object().as_ptr(), _length);
                     }
                     let main = self.main_resource()?.ordinary_shared(self.sections.get());
-                    self.ensure_ordinary_io()?;
+                    self.ensure_ordinary_io(true)?;
                     if !unsafe {
                         // SAFETY: The same retained request rechecks Cc without waiting under MainResource.
                         admission.accepted(transfer.file_object().as_ptr(), _length, false)
@@ -1335,7 +1335,7 @@ impl StreamContext {
                     }
                 }
                 let _main = self.main_resource()?.ordinary_shared(self.sections.get());
-                self.ensure_ordinary_io()?;
+                self.ensure_ordinary_io(request.action() == crate::irp::MdlTransfer::Write)?;
                 if request.action() == crate::irp::MdlTransfer::Write
                     && !unsafe {
                         // SAFETY: The same retained request rechecks admission without waiting under MainResource.
@@ -1387,7 +1387,7 @@ impl StreamContext {
     /// # Errors
     /// Returns removal, terminal filesystem close or a missing bound volume invariant.
     #[cfg(not(test))]
-    fn ensure_ordinary_io(&self) -> DriverResult<()> {
+    fn ensure_ordinary_io(&self, write: bool) -> DriverResult<()> {
         self.ensure_storage()?;
         let address = unsafe {
             // SAFETY: Bound stream lifetime retains the volume's sole admission allocation.
@@ -1397,7 +1397,7 @@ impl StreamContext {
             // SAFETY: Successful storage validation established this immutable, retained allocation identity.
             &*address.cast::<StorageAdmission>()
         };
-        if state.close() == ClosePhase::Open {
+        if state.close() == ClosePhase::Open && state.reliability.policy().permits(write) {
             Ok(())
         } else {
             Err(DriverError::VolumeDismounted)
@@ -2086,8 +2086,11 @@ mod tests {
         reason = "fallible fixture setup precedes semantic admission assertions"
     )]
     fn close_admission_drains_paging_before_sealing() -> DriverResult<()> {
-        let volume =
-            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let volume = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
         let storage = unsafe {
             // SAFETY: This fixture remains live and unmoved until all captured access ends.
             volume.storage_access()
@@ -2123,8 +2126,11 @@ mod tests {
     )]
     fn query_removal_closes_creates_and_cancellation_preserves_terminal_removal() -> DriverResult<()>
     {
-        let volume =
-            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let volume = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
         let storage = unsafe {
             // SAFETY: The fixture stays at this address until all capabilities are consumed.
             volume.storage_access()
@@ -2204,8 +2210,11 @@ mod tests {
         reason = "fixture construction is fallible; assertions verify removal semantics"
     )]
     fn storage_removal_is_terminal_and_distinguishes_final_remove() -> DriverResult<()> {
-        let volume =
-            StreamContext::try_new_volume(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let volume = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
         let storage = unsafe {
             // SAFETY: The volume remains live at this stack location until all accesses end.
             volume.storage_access()

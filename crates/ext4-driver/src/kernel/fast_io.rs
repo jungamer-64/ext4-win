@@ -24,6 +24,8 @@ struct TransferObservation {
     read_access: u8,
     /// Handle-local write access.
     write_access: u8,
+    /// Reactor-owned read/write reliability projection.
+    policy: u8,
 }
 
 /// One coherent, allocation-free metadata observation; header storage remains authoritative.
@@ -50,8 +52,16 @@ const _: () = {
 };
 
 /// Cached transfer admission requires independent media, close and section gates to be open.
-fn cached_transfer_admitted(flags: u32, cached: u8, media: u8, close: u8, mutation: u8) -> bool {
+fn cached_transfer_admitted(
+    flags: u32,
+    cached: u8,
+    media: u8,
+    close: u8,
+    mutation: u8,
+    policy: u8,
+) -> bool {
     media == 0
+        && policy < 2
         && close == 0
         && mutation == 0
         && cached != 0
@@ -72,9 +82,10 @@ extern "system" fn ext4win_fast_io_admit(
     media: u8,
     close: u8,
     mutation: u8,
+    policy: u8,
 ) -> u8 {
     u8::from(cached_transfer_admitted(
-        flags, cached, media, close, mutation,
+        flags, cached, media, close, mutation, policy,
     ))
 }
 
@@ -85,8 +96,10 @@ fn metadata_query_admitted(
     fast_possible: u8,
     media: u8,
     mutation: u8,
+    policy: u8,
 ) -> bool {
     media == 0
+        && policy < 2
         && mutation == 0
         && read_access != 0
         && fast_possible != 0
@@ -106,6 +119,7 @@ extern "system" fn ext4win_fast_io_query_admit(
     fast_possible: u8,
     media: u8,
     mutation: u8,
+    policy: u8,
 ) -> u8 {
     u8::from(metadata_query_admitted(
         flags,
@@ -113,6 +127,7 @@ extern "system" fn ext4win_fast_io_query_admit(
         fast_possible,
         media,
         mutation,
+        policy,
     ))
 }
 
@@ -167,6 +182,7 @@ unsafe extern "system" fn ext4win_fast_io_check_if_possible(
         mutation: 2,
         read_access: 0,
         write_access: 0,
+        policy: 2,
     };
     if unsafe {
         // SAFETY: Native code borrows the retained FILE_OBJECT and fills one local observation.
@@ -192,6 +208,7 @@ unsafe extern "system" fn ext4win_fast_io_check_if_possible(
         observation.media,
         observation.close,
         observation.mutation,
+        observation.policy,
     ) || if read != 0 {
         observation.read_access == 0
     } else {
@@ -203,7 +220,8 @@ unsafe extern "system" fn ext4win_fast_io_check_if_possible(
             // SAFETY: FsContext2 remains initialized while the I/O Manager retains this callback.
             context_address.read()
         };
-        observation.write_access == 0
+        observation.policy != 0
+            || observation.write_access == 0
             || unsafe {
                 // SAFETY: The retained node FILE_OBJECT keeps its driver-published CCB live.
                 crate::state::ext4win_handle_allows_cached_write(context) == 0
@@ -359,13 +377,16 @@ mod tests {
     #[test]
     fn transfer_requires_live_cached_in_eof_authority() {
         let flags = wdk_sys::FO_CACHE_SUPPORTED;
-        assert!(cached_transfer_admitted(flags, 1, 0, 0, 0));
-        assert!(!cached_transfer_admitted(flags, 1, 1, 0, 0));
-        assert!(!cached_transfer_admitted(flags, 1, 0, 1, 0));
-        assert!(!cached_transfer_admitted(flags, 1, 0, 0, 1));
+        assert!(cached_transfer_admitted(flags, 1, 0, 0, 0, 0));
+        assert!(!cached_transfer_admitted(flags, 1, 1, 0, 0, 0));
+        assert!(!cached_transfer_admitted(flags, 1, 0, 1, 0, 0));
+        assert!(!cached_transfer_admitted(flags, 1, 0, 0, 1, 0));
+        assert!(cached_transfer_admitted(flags, 1, 0, 0, 0, 1));
+        assert!(!cached_transfer_admitted(flags, 1, 0, 0, 0, 2));
         assert!(!cached_transfer_admitted(
             flags | wdk_sys::FO_NO_INTERMEDIATE_BUFFERING,
             1,
+            0,
             0,
             0,
             0
@@ -380,9 +401,10 @@ mod tests {
     /// Fails if metadata queries require a cache map or bypass media/oplock exclusion.
     #[test]
     fn metadata_query_admission_is_independent_of_cache_residency() {
-        assert!(metadata_query_admitted(0, 1, 1, 0, 0));
-        assert!(!cached_transfer_admitted(0, 0, 0, 0, 0));
-        assert!(!metadata_query_admitted(0, 1, 1, 1, 0));
-        assert!(!metadata_query_admitted(0, 1, 0, 0, 0));
+        assert!(metadata_query_admitted(0, 1, 1, 0, 0, 0));
+        assert!(!cached_transfer_admitted(0, 0, 0, 0, 0, 0));
+        assert!(!metadata_query_admitted(0, 1, 1, 1, 0, 0));
+        assert!(!metadata_query_admitted(0, 1, 0, 0, 0, 0));
+        assert!(!metadata_query_admitted(0, 1, 1, 0, 0, 2));
     }
 }

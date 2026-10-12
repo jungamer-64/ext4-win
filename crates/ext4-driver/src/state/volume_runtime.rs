@@ -12,6 +12,7 @@ use wdk_sys::NTSTATUS;
 
 use crate::kernel::cng::CngProvider;
 use crate::kernel::fatal::KernelWideInconsistency;
+use crate::kernel::io_reliability::{IoReliabilityObservation, IoReliabilityOwner, NativeIoPolicy};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
 use crate::memory::{DriverShared, DriverSharedLease, DriverSharedSlot};
@@ -44,6 +45,16 @@ pub(crate) enum VolumeFailureState {
 }
 
 impl VolumeFailureState {
+    /// One-way native projection; exact failures remain owned by the actor.
+    fn native_policy(self) -> NativeIoPolicy {
+        if self.authorize_mutation().is_ok() {
+            NativeIoPolicy::ReadWrite
+        } else if self.authorize_read().is_ok() {
+            NativeIoPolicy::ReadOnly
+        } else {
+            NativeIoPolicy::Unavailable
+        }
+    }
     /// Rejects a new mutation unless the runtime is fully operational.
     /// # Errors
     ///
@@ -326,6 +337,8 @@ pub(crate) struct VolumeRuntime {
     crypto: CngProvider,
     /// Current read/write reliability state.
     failure: VolumeFailureState,
+    /// Sole publisher of the native observation of `failure`.
+    native_reliability: IoReliabilityOwner,
     /// Serialized commit/checkpoint ownership.
     commit_gate: CommitGateState,
     /// Short epoch-swap gate independent from checkpoint I/O.
@@ -358,6 +371,7 @@ impl VolumeRuntime {
             storage,
             crypto,
             failure: VolumeFailureState::Operational,
+            native_reliability: IoReliabilityOwner::try_new()?,
             commit_gate: CommitGateState::Ready,
             visibility_gate: VisibilityGateState::Ready,
             active_mutations: DriverShared::try_new(AtomicU32::new(0))?,
@@ -377,6 +391,19 @@ impl VolumeRuntime {
     /// Mount-scoped algorithm providers used to prebuild operation-owned CNG objects.
     pub(crate) const fn crypto(&self) -> &CngProvider {
         &self.crypto
+    }
+
+    /// Retains a read-only reliability projection before native mount publication.
+    /// # Errors
+    /// Returns reference-budget exhaustion before installing callbacks.
+    pub(crate) fn observe_reliability(&self) -> DriverResult<IoReliabilityObservation> {
+        self.native_reliability.observe()
+    }
+
+    /// Publishes with the authoritative transition in one non-suspending actor step.
+    fn set_failure(&mut self, failure: VolumeFailureState) {
+        self.native_reliability.publish(failure.native_policy());
+        self.failure = failure;
     }
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
@@ -543,17 +570,17 @@ impl VolumeRuntime {
 
     /// Moves a confirmed durable abort into read-only state.
     pub(crate) fn record_durable_abort(&mut self) {
-        self.failure = self.failure.durable_abort();
+        self.set_failure(self.failure.durable_abort());
     }
 
     /// Marks commit/abort/data effects as unknown and requires a fresh replay mount.
     pub(crate) fn record_durability_unknown(&mut self) {
-        self.failure = self.failure.durability_unknown();
+        self.set_failure(self.failure.durability_unknown());
     }
 
     /// Marks lower reads untrustworthy.
     pub(crate) fn record_read_unreliable(&mut self) {
-        self.failure = self.failure.read_unreliable();
+        self.set_failure(self.failure.read_unreliable());
     }
 
     /// Records an exact post-commit Cc/MM publication failure and stream progress.
@@ -563,14 +590,16 @@ impl VolumeRuntime {
         published_streams: usize,
         unexamined_updates: usize,
     ) {
-        self.failure =
-            self.failure
-                .publication_failed(status, published_streams, unexamined_updates);
+        self.set_failure(self.failure.publication_failed(
+            status,
+            published_streams,
+            unexamined_updates,
+        ));
     }
 
     /// Records the exact dirty-page writeback failure returned by Cache Manager.
     pub(crate) fn record_cache_writeback_failure(&mut self, status: NTSTATUS) {
-        self.failure = self.failure.cache_writeback_failed(status);
+        self.set_failure(self.failure.cache_writeback_failed(status));
     }
 
     /// Current volume identity from the selected immutable epoch.
