@@ -10,6 +10,7 @@
          : EXCEPTION_CONTINUE_SEARCH)
 #include "cache_mdl.h"
 #include "cache_close.h"
+#include "data_protection.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
@@ -57,7 +58,7 @@ typedef struct _EXT4WIN_FAST_IO_QUERY_SNAPSHOT {
 typedef struct _EXT4WIN_FAST_IO_TRANSFER_OBSERVATION {
     LONGLONG Eof;
     ULONG Flags;
-    UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess, Policy;
+    UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess, Policy, WritableData;
 } EXT4WIN_FAST_IO_TRANSFER_OBSERVATION;
 
 extern UCHAR NTAPI ext4win_handle_allows_cached_write(_In_opt_ const VOID *context);
@@ -110,6 +111,7 @@ C_ASSERT(sizeof(EXT4WIN_STREAM_CONTEXT) <= MAXSHORT);
 C_ASSERT(sizeof(EXT4WIN_PUBLISHED_STREAM_METADATA) == 56);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_PUBLISHED_STREAM_METADATA, CreationTime) == 8);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_PUBLISHED_STREAM_METADATA, Directory) == 48);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_PUBLISHED_STREAM_METADATA, WritableData) == 52);
 
 static VOID
 ext4win_trace_selected(
@@ -187,14 +189,27 @@ ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
         && (ext4win_storage_io_policy(volume->RustState) < 2);
 }
 
+/* Only the coherent committed inode projection determines data protection. */
+BOOLEAN NTAPI
+ext4win_stream_data_writable(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    BOOLEAN writable;
+    if (stream == NULL) { return FALSE; }
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    writable = (stream->MetadataValid != 0) && (stream->PublishedMetadata.WritableData != 0);
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    return writable;
+}
+
 /* Section writes modify backing data; copy-on-write protection does not. */
 static BOOLEAN
 ext4win_stream_section_io_available(PEXT4WIN_STREAM_CONTEXT stream, ULONG protection)
 {
-    BOOLEAN write = (protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
     return ext4win_stream_ordinary_io_available(stream)
-        && (!write || ext4win_storage_io_policy(volume->RustState) == 0);
+        && ext4win_section_data_admitted(ext4win_storage_io_policy(volume->RustState),
+            ext4win_stream_data_writable(&stream->Header), protection);
 }
 
 static BOOLEAN
@@ -1740,6 +1755,7 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     RtlZeroMemory(output, sizeof(*output));
     ExAcquireFastMutex(&stream->HeaderMutex);
     output->Eof = stream->Header.FileSize.QuadPart;
+    output->WritableData = (stream->MetadataValid != 0) && (stream->PublishedMetadata.WritableData != 0);
     ExReleaseFastMutex(&stream->HeaderMutex);
     output->Flags = file->Flags;
     output->Cached = file->PrivateCacheMap != NULL;
@@ -1811,6 +1827,14 @@ NTSTATUS NTAPI ext4win_mm_flush_image(PVOID header, MMFLUSH_TYPE operation, PBOO
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
     return STATUS_SUCCESS;
 }
+NTSTATUS NTAPI ext4win_stream_prepare_verity_data(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
+    __try { return ext4win_prepare_verified_data(&stream->SectionObjects); }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
+}
+
 NTSTATUS NTAPI ext4win_cc_purge_sections(PVOID header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);

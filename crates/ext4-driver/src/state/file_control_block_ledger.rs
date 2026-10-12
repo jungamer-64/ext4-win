@@ -733,6 +733,53 @@ impl PreparedStreamWriteOpen {
     }
 }
 
+/// Regular-file retention before any potentially blocking verity coherence work.
+#[derive(Debug)]
+pub(crate) struct StreamVerityLease {
+    /// Retains stream allocation independently from the requesting handle.
+    stream: StreamCacheLease,
+    /// Hashing may address only this file.
+    node: ext4_core::FileNodeId,
+}
+
+impl StreamVerityLease {
+    /// Flushes and purges old data, excludes mappings and returns frozen-data authority.
+    /// # Errors
+    /// Returns mapped-file conflict or exact cache/writeback failure before hashing.
+    pub(crate) fn execute(self) -> DriverResult<PreparedStreamVerity> {
+        let section = self
+            .stream
+            .stream()
+            .stream_context
+            .prepare_section_mutation(
+                crate::kernel::section::SectionMutationOperation::EnableVerity,
+            )?;
+        Ok(PreparedStreamVerity {
+            _section: section,
+            stream: self.stream,
+            node: self.node,
+        })
+    }
+}
+
+/// Frozen data survives resolve retries and is released after committed protection publication.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamVerity {
+    /// Release before stream retention, so no callback can outlive its synchronization allocation.
+    _section: crate::kernel::section::SealedSectionMutation,
+    /// Keeps the frozen stream alive independently from cleanup of the requesting handle.
+    stream: StreamCacheLease,
+    /// Exact file whose disk payload may be hashed.
+    node: ext4_core::FileNodeId,
+}
+
+impl PreparedStreamVerity {
+    /// Confirms hashing addresses the retained frozen stream.
+    pub(crate) fn authorizes(&self, file: ext4_core::FileNodeId) -> bool {
+        self.node == file && self.stream.stream().node == NodeId::File(file)
+    }
+}
+
 #[expect(
     unsafe_code,
     reason = "the explicit lease retains the exact FCB pointer while publishing outside the ledger"
@@ -2174,15 +2221,43 @@ impl FileControlBlockLedger {
     /// # Errors
     ///
     /// Returns a finite deferred-lease failure before any MM call.
-    #[expect(
-        unsafe_code,
-        reason = "the ledger resource serializes resident FCB lookup and deferred-lease acquisition"
-    )]
     pub(super) fn prepare_stream_write_open(
         &self,
         fcb: NonNull<FileControlBlock>,
         node: NodeId,
     ) -> DriverResult<StreamWriteOpenLease> {
+        Ok(StreamWriteOpenLease {
+            stream: self.retain_regular_stream(fcb, node)?,
+            node,
+        })
+    }
+
+    /// Retains the exact file while native preparation excludes every data-changing route.
+    /// # Errors
+    /// Returns foreign stream or finite deferred-retention failure before preparation.
+    pub(super) fn prepare_stream_verity(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file: ext4_core::FileNodeId,
+    ) -> DriverResult<StreamVerityLease> {
+        Ok(StreamVerityLease {
+            stream: self.retain_regular_stream(fcb, NodeId::File(file))?,
+            node: file,
+        })
+    }
+
+    /// Establishes shared allocation retention for a regular stream under ledger exclusion.
+    /// # Errors
+    /// Returns malformed identity or finite deferred-lease exhaustion.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes exact FCB lookup and lifetime mutation"
+    )]
+    fn retain_regular_stream(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        node: NodeId,
+    ) -> DriverResult<StreamCacheLease> {
         if !matches!(node, NodeId::File(_)) {
             return Err(DriverError::InternalInvariantViolation);
         }
@@ -2200,14 +2275,11 @@ impl FileControlBlockLedger {
             state.as_mut()
         }
         .acquire_deferred_lease()?;
-        Ok(StreamWriteOpenLease {
-            stream: StreamCacheLease {
-                retained: DeferredStreamLease {
-                    owner: NonNull::from(self),
-                    fcb,
-                },
+        Ok(StreamCacheLease {
+            retained: DeferredStreamLease {
+                owner: NonNull::from(self),
+                fcb,
             },
-            node,
         })
     }
 

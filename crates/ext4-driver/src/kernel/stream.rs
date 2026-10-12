@@ -1438,6 +1438,14 @@ impl StreamContext {
             &*address.cast::<StorageAdmission>()
         };
         if state.close() == ClosePhase::Open && state.reliability.policy().permits(write) {
+            if write
+                && unsafe {
+                    // SAFETY: This stream retains its coherent native metadata; caller holds MainResource.
+                    ext4win_stream_data_writable(self.header.as_ptr())
+                } == 0
+            {
+                return Err(DriverError::AccessDenied);
+            }
             Ok(())
         } else {
             Err(DriverError::VolumeDismounted)
@@ -1584,6 +1592,13 @@ impl StreamContext {
                             return Err(DriverError::ShareAccessConflict);
                         }
                     }
+                    SectionMutationOperation::EnableVerity => {
+                        let status = unsafe {
+                            // SAFETY: MainResource excludes mappings/transfers; preparation permits paging reentry.
+                            ext4win_stream_prepare_verity_data(self.header.as_ptr())
+                        };
+                        cache_status(status)?;
+                    }
                 }
                 drop(main);
                 let _paging = self.paging_resource()?.exclusive();
@@ -1597,7 +1612,9 @@ impl StreamContext {
                     SectionMutationOperation::Resize(sizes) => {
                         let _validated = sizes;
                     }
-                    SectionMutationOperation::Delete | SectionMutationOperation::WriteOpen => {}
+                    SectionMutationOperation::Delete
+                    | SectionMutationOperation::WriteOpen
+                    | SectionMutationOperation::EnableVerity => {}
                 }
                 preparation.seal()
             }
@@ -1940,6 +1957,8 @@ fn cache_status(status: NTSTATUS) -> DriverResult<()> {
     reason = "these declarations expose the audited native advanced-FCB-header ownership boundary"
 )]
 unsafe extern "system" {
+    fn ext4win_stream_prepare_verity_data(stream_header: *mut c_void) -> NTSTATUS;
+    fn ext4win_stream_data_writable(stream_header: *mut c_void) -> u8;
     fn ext4win_prepare_mdl_completion(
         queue: *const c_void,
         file: wdk_sys::PFILE_OBJECT,
@@ -2107,6 +2126,46 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
+    /// # Errors
+    /// Returns stream allocation or reference-budget failure.
+    /// # Panics
+    /// Fails if key-removal exclusion is reusable, omitted or restores terminal media on release.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "local stream allocation remains live through every admission lease"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture errors propagate while assertions check exclusion lifetime"
+    )]
+    fn key_removal_exclusion_lasts_until_lease_release() -> DriverResult<()> {
+        let owner = crate::kernel::io_reliability::IoReliabilityOwner::try_new()?;
+        let volume = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            owner.observe()?,
+        )?;
+        let storage = unsafe {
+            // SAFETY: The local volume remains unmoved and alive until its last lease is released.
+            volume.storage_access()
+        }?;
+        let lease = storage.begin_key_removal()?;
+        assert!(!storage.state().creates_admitted());
+        assert_eq!(
+            storage.begin_key_removal().err(),
+            Some(DriverError::DeviceBusy)
+        );
+        storage.state().cancel_query();
+        assert!(!storage.state().creates_admitted());
+        drop(lease);
+        assert!(storage.state().creates_admitted());
+        let lease = storage.begin_key_removal()?;
+        storage.state().remove(super::MediaState::Removed);
+        drop(lease);
+        assert_eq!(storage.authorize_create(), Err(DriverError::DeviceRemoved));
+        Ok(())
+    }
     use ext4_core::{ClusterSize, FileAllocationSize, FileSize};
 
     use super::{OperationalTrace, Ordering, StreamContext, StreamMetadata, StreamSizes};
@@ -2429,6 +2488,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(StreamMetadata, epoch), 0);
         assert_eq!(core::mem::offset_of!(StreamMetadata, creation), 8);
         assert_eq!(core::mem::offset_of!(StreamMetadata, directory), 48);
+        assert_eq!(core::mem::offset_of!(StreamMetadata, writable_data), 52);
     }
 
     /// # Errors

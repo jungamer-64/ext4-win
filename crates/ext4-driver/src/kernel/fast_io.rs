@@ -26,6 +26,8 @@ struct TransferObservation {
     write_access: u8,
     /// Reactor-owned read/write reliability projection.
     policy: u8,
+    /// Inode protection from the same coherent metadata snapshot as EOF.
+    writable_data: u8,
 }
 
 /// One coherent, allocation-free metadata observation; header storage remains authoritative.
@@ -131,6 +133,15 @@ extern "system" fn ext4win_fast_io_query_admit(
     ))
 }
 
+/// Independent inode and volume facts govern acceptance of cached data.
+fn data_transfer_admitted(policy: u8, writable_data: u8, read: bool) -> bool {
+    if read {
+        policy < 2
+    } else {
+        policy == 0 && writable_data != 0
+    }
+}
+
 /// Establishes an in-EOF range before any Cache Manager call.
 fn admitted_range(offset: i64, length: u32, eof: i64) -> Option<i64> {
     let length = i64::from(length);
@@ -183,6 +194,7 @@ unsafe extern "system" fn ext4win_fast_io_check_if_possible(
         read_access: 0,
         write_access: 0,
         policy: 2,
+        writable_data: 0,
     };
     if unsafe {
         // SAFETY: Native code borrows the retained FILE_OBJECT and fills one local observation.
@@ -209,24 +221,25 @@ unsafe extern "system" fn ext4win_fast_io_check_if_possible(
         observation.close,
         observation.mutation,
         observation.policy,
-    ) || if read != 0 {
-        observation.read_access == 0
-    } else {
-        let context_address = unsafe {
-            // SAFETY: Successful native observation established a retained node FILE_OBJECT.
-            core::ptr::addr_of!((*file).FsContext2)
-        };
-        let context = unsafe {
-            // SAFETY: FsContext2 remains initialized while the I/O Manager retains this callback.
-            context_address.read()
-        };
-        observation.policy != 0
-            || observation.write_access == 0
-            || unsafe {
-                // SAFETY: The retained node FILE_OBJECT keeps its driver-published CCB live.
-                crate::state::ext4win_handle_allows_cached_write(context) == 0
-            }
-    } {
+    ) || !data_transfer_admitted(observation.policy, observation.writable_data, read != 0)
+        || if read != 0 {
+            observation.read_access == 0
+        } else {
+            let context_address = unsafe {
+                // SAFETY: Successful native observation established a retained node FILE_OBJECT.
+                core::ptr::addr_of!((*file).FsContext2)
+            };
+            let context = unsafe {
+                // SAFETY: FsContext2 remains initialized while the I/O Manager retains this callback.
+                context_address.read()
+            };
+            observation.write_access == 0
+                || unsafe {
+                    // SAFETY: The retained node FILE_OBJECT keeps its driver-published CCB live.
+                    crate::state::ext4win_handle_allows_cached_write(context) == 0
+                }
+        }
+    {
         return 0;
     }
     unsafe {
@@ -372,6 +385,17 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Panics
+    /// Fails if handle permission can override inode protection or terminal volume reliability.
+    #[test]
+    fn cached_data_respects_inode_and_volume_protection() {
+        assert!(data_transfer_admitted(0, 1, false));
+        assert!(!data_transfer_admitted(0, 0, false));
+        assert!(data_transfer_admitted(0, 0, true));
+        assert!(!data_transfer_admitted(1, 1, false));
+        assert!(data_transfer_admitted(1, 0, true));
+        assert!(!data_transfer_admitted(2, 1, true));
+    }
     /// # Panics
     /// Fails if Fast I/O bypasses independent gates or accepts an out-of-EOF/overflow range.
     #[test]

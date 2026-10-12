@@ -314,6 +314,8 @@ pub(crate) enum SectionMutationOperation {
     Delete,
     /// Executable image residency must admit a writable handle.
     WriteOpen,
+    /// Dirty data must reach disk and all data mappings must drain before Merkle construction.
+    EnableVerity,
 }
 
 /// Paging and ordinary acquisition remain excluded until this unique permit is dropped.

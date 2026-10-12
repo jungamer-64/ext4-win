@@ -681,6 +681,29 @@ mod tests {
     /// Panics when failure-state transitions weaken an already stronger failure.
     #[test]
     fn volume_failure_transitions_are_monotonic() {
+        for failure in [
+            VolumeFailureState::Operational,
+            VolumeFailureState::DegradedReadOnly,
+            VolumeFailureState::RecoveryRequired,
+            VolumeFailureState::Failed,
+            VolumeFailureState::CommittedButUnpublished {
+                status: wdk_sys::STATUS_IO_DEVICE_ERROR,
+                published_streams: 1,
+                unexamined_updates: 2,
+            },
+            VolumeFailureState::CacheWritebackFailed {
+                status: wdk_sys::STATUS_IO_DEVICE_ERROR,
+            },
+        ] {
+            assert_eq!(
+                failure.native_policy().permits(false),
+                failure.authorize_read().is_ok()
+            );
+            assert_eq!(
+                failure.native_policy().permits(true),
+                failure.authorize_mutation().is_ok()
+            );
+        }
         let publication_status = wdk_sys::STATUS_IO_DEVICE_ERROR;
         assert_eq!(
             VolumeFailureState::Operational.durable_abort(),

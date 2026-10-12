@@ -638,6 +638,19 @@ impl QueueContextOwnership {
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
+    /// Returns only key authority captured from the original requestor thread.
+    /// # Errors
+    /// Returns access denied when the queued request has no privileged key capability.
+    pub(super) fn key_control(&self) -> DriverResult<PreparedKeyControl> {
+        match self {
+            Self::Captured(context) => match &context.prepared {
+                PreparedRequest::KeyControl(control) => Ok(*control),
+                _ => Err(DriverError::AccessDenied),
+            },
+            Self::Cleanup | Self::Close => Err(DriverError::AccessDenied),
+        }
+    }
+
     /// Borrows the read contract captured before queue insertion.
     /// # Errors
     ///
@@ -934,7 +947,7 @@ fn authorize_key_management(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion
 }
 
 /// Captured mount-key operation authority, checked on the original requestor thread.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PreparedKeyControl {
     /// Adds a key with enabled volume-management privilege.
     Add,
@@ -1699,6 +1712,43 @@ mod tests {
         major: DispatchMajor,
     ) -> Result<QueueContextOwnership, IrpCompletion> {
         received.with_active(|active| QueueContext::capture(active, major))
+    }
+
+    /// # Panics
+    /// Fails if a host request without kernel token authority can enter the privileged key lane.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "initialized stack fixtures remain live through requestor capture"
+    )]
+    fn key_control_cannot_queue_without_requestor_privilege() {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        for code in [0x0009_a400, 0x0009_a404] {
+            let mut irp = wdk_sys::IRP::default();
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                FileObject: core::ptr::from_mut(&mut file),
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.FileSystemControl.FsControlCode = code;
+            let target = unsafe {
+                // SAFETY: Original device, IRP and stack allocations remain live until capture ends.
+                build_target(
+                    core::ptr::from_mut(&mut device),
+                    core::ptr::from_mut(&mut irp),
+                    core::ptr::from_mut(&mut stack),
+                )
+            };
+            assert!(target.is_some());
+            if let Some(mut target) = target {
+                assert_eq!(
+                    capture_context(&mut target, DispatchMajor::FileSystemControl)
+                        .err()
+                        .map(|completion| completion.status()),
+                    Some(wdk_sys::STATUS_ACCESS_DENIED)
+                );
+            }
+        }
     }
 
     /// # Errors

@@ -223,6 +223,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
 fn verify_cache_manager(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
         (
+            "data-protection",
+            "data_protection.tests.c",
+            "native verified-data coherence and mapping admission contract",
+        ),
+        (
             "cache-mdl",
             "cache_mdl.tests.c",
             "native MDL ownership contract",

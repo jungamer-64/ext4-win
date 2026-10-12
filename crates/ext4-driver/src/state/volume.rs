@@ -429,6 +429,16 @@ impl MountedVolumeState {
         }
     }
 
+    /// Requires a completed lock owned by the exact direct-volume FILE_OBJECT.
+    /// # Errors
+    /// Returns not-locked before the drain completes, after unlock, or for another owner.
+    pub(super) fn authorize_key_removal(self, owner: KernelFileObject) -> DriverResult<()> {
+        match self {
+            Self::Locked { owner: current } if current == owner => Ok(()),
+            _ => Err(DriverError::NotLocked),
+        }
+    }
+
     /// Requires the lock/dismount lifecycle authority for one raw data operation.
     /// # Errors
     ///
@@ -1117,10 +1127,7 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn authorize_key_removal(&self, owner: KernelFileObject) -> DriverResult<()> {
         self.authorize_storage()?;
         self.runtime.authorize_durability()?;
-        match self.volume_control.state {
-            MountedVolumeState::Locked { owner: current } if current == owner => Ok(()),
-            _ => Err(DriverError::NotLocked),
-        }
+        self.volume_control.state.authorize_key_removal(owner)
     }
 
     /// Retains create exclusion through a key mutation, even if its lock owner is cleaned up.
@@ -1292,6 +1299,19 @@ impl MountedVolumeAccess<'_> {
         self.volume
             .file_control_blocks
             .prepare_stream_write_open(fcb, node)
+    }
+
+    /// Retains the exact file for the native verity preparation boundary.
+    /// # Errors
+    /// Returns retention or malformed stream identity before freezing data for hashing.
+    pub(crate) fn prepare_stream_verity(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file: ext4_core::FileNodeId,
+    ) -> DriverResult<StreamVerityLease> {
+        self.volume
+            .file_control_blocks
+            .prepare_stream_verity(fcb, file)
     }
 
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.

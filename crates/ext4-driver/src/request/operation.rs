@@ -2981,6 +2981,8 @@ enum PreparedMutationRequest {
     DataWrite(crate::request::file_info::RegularFileDataAuthority),
     /// Clean-volume key removal retains namespace exclusion through publication or abort.
     KeyRemoval(crate::kernel::stream::KeyRemovalLease),
+    /// Key removal is published; namespace exclusion no longer belongs to this operation.
+    RemovedKey,
     /// Data is frozen and cache coherence established before Merkle construction.
     Verity(VerityPreparation),
     /// Non-data mutation class whose existing lifecycle authority remains sufficient.
@@ -2996,6 +2998,8 @@ enum VerityPreparation {
     Preparing,
     /// Data and sections remain excluded through durable publication.
     Sealed(crate::state::PreparedStreamVerity),
+    /// Durable protection is published; this request retains no native exclusion.
+    Published,
 }
 
 impl PreparedMutationRequest {
@@ -3009,6 +3013,10 @@ impl PreparedMutationRequest {
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Self> {
         match kind {
+            MutationRequestKind::EnableVerity => {
+                crate::request::fsctl::prepare_verity(&mut owned.request(), access)
+                    .map(|stream| Self::Verity(VerityPreparation::Required(stream)))
+            }
             MutationRequestKind::RemoveEncryptionKey => {
                 let mut request = owned.request();
                 crate::request::fsctl::authorize_key_control(
@@ -3061,7 +3069,8 @@ impl PreparedMutationRequest {
     const fn kind(&self) -> MutationRequestKind {
         match self {
             Self::DataWrite(_) => MutationRequestKind::Write,
-            Self::KeyRemoval(_) => MutationRequestKind::RemoveEncryptionKey,
+            Self::KeyRemoval(_) | Self::RemovedKey => MutationRequestKind::RemoveEncryptionKey,
+            Self::Verity(_) => MutationRequestKind::EnableVerity,
             Self::Create { .. } => MutationRequestKind::Create,
             Self::Security(_) => MutationRequestKind::SetSecurity,
             Self::Other(kind) => *kind,
@@ -3509,6 +3518,11 @@ enum MutationOperationState {
         /// Unique top-level create completion authority.
         owned: OwnedIrp,
     },
+    /// Dirty pages and mappings drain before resolve may begin Merkle construction.
+    PreparingVerity {
+        /// Completion authority retained while the passive worker owns the stream preparation.
+        owned: OwnedIrp,
+    },
     /// Read-only resolution against one immutable epoch.
     Resolving {
         /// Unique top-level completion authority.
@@ -3656,6 +3670,8 @@ struct DriverResolveState<'a> {
 
 /// Result of one driver request surface invoked inside an ephemeral core resolve pass.
 enum DriverResolveDisposition {
+    /// Merkle construction must wait for stream-wide data and section exclusion.
+    PrepareVerity,
     /// Request completed without staging a filesystem mutation.
     Complete(TopLevelCompletion),
     /// A regular-file disposition must establish a native deletion gate outside the actor.
@@ -3747,7 +3763,8 @@ impl MutationRequestOperation {
                         .is_empty()
             }
             PreparedMutationRequest::Create { .. } => false,
-            PreparedMutationRequest::KeyRemoval(_) => false,
+            PreparedMutationRequest::KeyRemoval(_) | PreparedMutationRequest::RemovedKey => false,
+            PreparedMutationRequest::Verity(_) => true,
             PreparedMutationRequest::Security(_) => true,
             PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
                 owned.request().with_active(|active| {
@@ -4122,6 +4139,13 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
+            PreparedMutationRequest::Verity(VerityPreparation::Required(_)) => {
+                Ok(DriverResolveDisposition::PrepareVerity)
+            }
+            PreparedMutationRequest::RemovedKey
+            | PreparedMutationRequest::Verity(
+                VerityPreparation::Preparing | VerityPreparation::Published,
+            ) => Err(DriverError::InternalInvariantViolation),
             PreparedMutationRequest::Other(MutationRequestKind::AddEncryptionKey) => {
                 let mut request = owned.request();
                 crate::request::fsctl::authorize_key_control(
@@ -4174,7 +4198,8 @@ impl MutationRequestOperation {
                 MutationRequestKind::Write
                 | MutationRequestKind::Create
                 | MutationRequestKind::SetSecurity
-                | MutationRequestKind::RemoveEncryptionKey,
+                | MutationRequestKind::RemoveEncryptionKey
+                | MutationRequestKind::EnableVerity,
             ) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
@@ -4453,6 +4478,26 @@ impl MutationRequestOperation {
                     };
                     return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
                         work: crate::irp::PassiveWork::prepare_deletion(stream),
+                        suspended: self,
+                    });
+                }
+                Ok(DriverResolveDisposition::PrepareVerity) => {
+                    drop(pass);
+                    let PreparedMutationRequest::Verity(preparation) = &mut self.request else {
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
+                    };
+                    let VerityPreparation::Required(stream) =
+                        core::mem::replace(preparation, VerityPreparation::Preparing)
+                    else {
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
+                    };
+                    self.state = MutationOperationState::PreparingVerity { owned };
+                    return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                        work: crate::irp::PassiveWork::PrepareVerity { stream },
                         suspended: self,
                     });
                 }
@@ -5139,6 +5184,21 @@ impl MutationRequestOperation {
                             }
                         };
                     }
+                    (MutationOperationState::PreparingVerity { owned }, crate::irp::PassiveWorkCompletion::PrepareVerity(result)) => {
+                        return match result {
+                            Ok(prepared) => {
+                                let PreparedMutationRequest::Verity(preparation @ VerityPreparation::Preparing) = &mut self.request else {
+                                    return MutationStep::Transition(self.complete_error(owned, DriverError::InternalInvariantViolation));
+                                };
+                                *preparation = VerityPreparation::Sealed(prepared);
+                                self.restart_resolution(owned, None, None, access)
+                            }
+                            Err(error) => {
+                                record_cache_coherency_failure(error, access);
+                                MutationStep::Transition(self.complete_error(owned, error))
+                            }
+                        };
+                    }
                     (
                         MutationOperationState::PreparingWriteOpen { owned },
                         crate::irp::PassiveWorkCompletion::PrepareWriteOpen(result),
@@ -5370,7 +5430,8 @@ impl MutationRequestOperation {
             }
             MutationOperationState::PreparingSizeChange { owned, .. }
             | MutationOperationState::PreparingDeletion { owned, .. }
-            | MutationOperationState::PreparingWriteOpen { owned } => match event {
+            | MutationOperationState::PreparingWriteOpen { owned }
+            | MutationOperationState::PreparingVerity { owned } => match event {
                 OperationEvent::CancelRequested => MutationStep::Transition(
                     self.complete_error(owned, DriverError::from(Error::OperationCancelled)),
                 ),
@@ -5760,6 +5821,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 | MutationOperationState::PreparingSizeChange { .. }
                 | MutationOperationState::PreparingDeletion { .. }
                 | MutationOperationState::PreparingWriteOpen { .. }
+                | MutationOperationState::PreparingVerity { .. }
                 | MutationOperationState::CacheWriting { .. }
                 | MutationOperationState::CachePurging { .. }
                 | MutationOperationState::AwaitingVisibility { .. }
@@ -5791,6 +5853,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
+            | MutationOperationState::PreparingVerity { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }
@@ -5871,6 +5934,18 @@ impl InfalliblePublication for MutationRequestOperation {
                         }
                     }
                 };
+                if let PreparedMutationRequest::Verity(preparation) = &mut self.request {
+                    drop(core::mem::replace(
+                        preparation,
+                        VerityPreparation::Published,
+                    ));
+                }
+                if matches!(self.request, PreparedMutationRequest::KeyRemoval(_)) {
+                    drop(core::mem::replace(
+                        &mut self.request,
+                        PreparedMutationRequest::RemovedKey,
+                    ));
+                }
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
                 Some(completion)
             }
@@ -5891,6 +5966,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
+            | MutationOperationState::PreparingVerity { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
             | MutationOperationState::AwaitingCommit { .. }

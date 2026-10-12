@@ -31,7 +31,7 @@ typedef struct { PFILE_OBJECT SharedCacheMap; } SECTION_OBJECT_POINTERS;
 typedef struct {
     LARGE_INTEGER AllocationSize, FileSize, ValidDataLength;
 } CC_FILE_SIZES;
-typedef struct { ULONGLONG Epoch; ULONG NumberOfLinks; } EXT4WIN_PUBLISHED_STREAM_METADATA;
+typedef struct { ULONGLONG Epoch; ULONG NumberOfLinks, WritableData; } EXT4WIN_PUBLISHED_STREAM_METADATA;
 typedef struct {
     CC_FILE_SIZES Header;
     FAST_MUTEX HeaderMutex;
@@ -118,13 +118,14 @@ static void ObDereferenceObject(PFILE_OBJECT file)
 static void publish(ULONGLONG epoch, LONGLONG allocation, LONGLONG eof,
     LONGLONG charge, NTSTATUS expected_cache_status)
 {
-    const EXT4WIN_PUBLISHED_STREAM_METADATA metadata = { epoch, 2 };
+    const EXT4WIN_PUBLISHED_STREAM_METADATA metadata = { epoch, 2, epoch == 1 };
     NTSTATUS cache_status = 99;
     assert(ext4win_stream_publish_metadata(&stream.Header, allocation, eof, eof,
         charge, &metadata, &cache_status) == STATUS_SUCCESS);
     assert(cache_status == expected_cache_status);
     assert(stream.MetadataValid && stream.PublishedMetadata.Epoch == epoch);
     assert(stream.PublishedMetadata.NumberOfLinks == 2 && stream.AllocationCharge == charge);
+    assert(stream.PublishedMetadata.WritableData == (epoch == 1));
     assert(stream.Header.AllocationSize.QuadPart == allocation);
     assert(stream.Header.FileSize.QuadPart == eof && stream.Header.ValidDataLength.QuadPart == eof);
     assert(stream.HeaderMutex.held == 0 && stream.MainResource.writer == 0);
@@ -152,6 +153,7 @@ int main(void)
     /* Malformed input and stale epochs have no native commit or cache effect. */
     metadata.Epoch = 2;
     metadata.NumberOfLinks = 1;
+    metadata.WritableData = FALSE;
     cache_status = 99;
     assert(ext4win_stream_publish_metadata(&stream.Header, 16384, 16384, 16384,
         8192, &metadata, &cache_status) == STATUS_INVALID_PARAMETER);

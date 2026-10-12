@@ -316,7 +316,9 @@ impl<'a> CreateCompletionOwner<'a> {
         node: NodeId,
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
-        let descriptor = CreateSecurityDescriptor::for_node(read, node, self.identity)?;
+        let metadata = read.load_node_metadata(node)?;
+        let descriptor =
+            CreateSecurityDescriptor::from_security(metadata.security(), self.identity)?;
         let required = self.parameters.existing_operation_required_access();
         let requested = self.parameters.desired_access();
         let exclusive = self.parameters.require_writable_exclusive();
@@ -327,6 +329,12 @@ impl<'a> CreateCompletionOwner<'a> {
             state.authorize_operation(descriptor.as_native(), required)?;
             state.authorize_requested(descriptor.as_native(), requested)
         })?;
+        if matches!(node, NodeId::File(_))
+            && metadata.data_policy() == ext4_core::NodeDataPolicy::ReadOnly
+            && granted_access.as_raw() & (wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_APPEND_DATA) != 0
+        {
+            return Err(DriverError::AccessDenied);
+        }
         Ok(AuthorizedCreateCompletionOwner {
             target: AuthorizedTarget::Existing,
             owner: self,

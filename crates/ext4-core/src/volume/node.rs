@@ -178,7 +178,11 @@ impl NodeMetadataSnapshot {
                 .map(WindowsOverlay::attributes)
                 .unwrap_or(Ext4WindowsAttributes::NONE),
             reparse_point,
-            data_policy: if inode.file_payload_mutation().is_ok() { NodeDataPolicy::Writable } else { NodeDataPolicy::ReadOnly },
+            data_policy: if inode.file_payload_mutation().is_ok() {
+                NodeDataPolicy::Writable
+            } else {
+                NodeDataPolicy::ReadOnly
+            },
         }
     }
 
@@ -190,7 +194,9 @@ impl NodeMetadataSnapshot {
 
     /// Payload eligibility from the same inode/epoch as the remaining metadata.
     #[must_use]
-    pub const fn data_policy(self) -> NodeDataPolicy { self.data_policy }
+    pub const fn data_policy(self) -> NodeDataPolicy {
+        self.data_policy
+    }
 
     /// Logical payload length in the observed inode.
     #[must_use]

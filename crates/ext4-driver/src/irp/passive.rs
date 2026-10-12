@@ -113,6 +113,11 @@ pub(crate) enum PassiveWork {
         /// Exact resident stream retained independently from the pending create handle.
         stream: StreamWriteOpenLease,
     },
+    /// Flush/purge and freeze one regular file before constructing a verity tree.
+    PrepareVerity {
+        /// Exact stream allocation retained independently from its requesting handle.
+        stream: crate::state::StreamVerityLease,
+    },
     /// Notify FsRtl of non-cancellable handle cleanup without asynchronous continuation allocation.
     CleanupOplock {
         /// Exact retained stream and create-time deletion semantics.
@@ -169,6 +174,8 @@ pub(crate) enum PassiveWorkCompletion {
     PrepareDeletion(DriverResult<PreparedStreamDeletion>),
     /// Native write-open gate acquisition status and release authority.
     PrepareWriteOpen(DriverResult<PreparedStreamWriteOpen>),
+    /// Frozen data and cache invalidation result, retained through protection publication.
+    PrepareVerity(DriverResult<crate::state::PreparedStreamVerity>),
     /// Synchronous handle-oplock release status; driver completion ownership remains retained.
     CleanupOplock(DriverResult<()>),
     /// Private cache-map uninitialization status.
@@ -290,6 +297,9 @@ impl PassiveWork {
             Self::PrepareWriteOpen { stream } => {
                 PassiveWorkCompletion::PrepareWriteOpen(stream.execute())
             }
+            Self::PrepareVerity { stream } => {
+                PassiveWorkCompletion::PrepareVerity(stream.execute())
+            }
             Self::CleanupOplock { check, irp } => {
                 PassiveWorkCompletion::CleanupOplock(check.execute(irp))
             }
@@ -325,6 +335,7 @@ impl PassiveWork {
             Self::PrepareSizeChange { .. } => PassiveWorkCompletion::PrepareSizeChange(Err(error)),
             Self::PrepareDeletion { .. } => PassiveWorkCompletion::PrepareDeletion(Err(error)),
             Self::PrepareWriteOpen { .. } => PassiveWorkCompletion::PrepareWriteOpen(Err(error)),
+            Self::PrepareVerity { .. } => PassiveWorkCompletion::PrepareVerity(Err(error)),
             Self::CleanupOplock { .. } => PassiveWorkCompletion::CleanupOplock(Err(error)),
             Self::Uninitialize { .. } => PassiveWorkCompletion::Uninitialize(Err(error)),
         }

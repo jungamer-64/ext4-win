@@ -579,6 +579,33 @@ pub(crate) struct ActiveFileObject<'owner> {
 }
 
 impl ActiveFileObject<'_> {
+    /// A read handle excluding write sharing prevents new writers during protection preparation.
+    /// # Errors
+    /// Returns access denied unless Windows granted data-read, denied data-write and withheld write sharing.
+    #[expect(
+        unsafe_code,
+        reason = "the active IRP retains initialized FILE_OBJECT access/share projections"
+    )]
+    pub(crate) fn require_exclusive_data_read(self) -> DriverResult<()> {
+        let read = unsafe {
+            // SAFETY: The active IRP retains this initialized create access field.
+            (*self.as_ptr()).ReadAccess
+        };
+        let write = unsafe {
+            // SAFETY: The same FILE_OBJECT retains its initialized data-write projection.
+            (*self.as_ptr()).WriteAccess
+        };
+        let shared_write = unsafe {
+            // SAFETY: The retained FILE_OBJECT owns this initialized share-policy field.
+            (*self.as_ptr()).SharedWrite
+        };
+        if read != 0 && write == 0 && shared_write == 0 {
+            Ok(())
+        } else {
+            Err(DriverError::AccessDenied)
+        }
+    }
+
     /// Returns the stable address for identity comparison and native calls.
     pub(crate) const fn address(self) -> KernelFileObject {
         self.address
@@ -1085,6 +1112,13 @@ impl<'a> PendingIrpLease<'a> {
     pub(crate) fn take_identity(&mut self) -> DriverResult<crate::identity::IdentityCommand> {
         self.owner.context.take_identity()
     }
+    /// Observes key-operation authority retained from the original requestor capture.
+    /// # Errors
+    /// Returns access denied unless the original requestor granted this queued key operation.
+    pub(crate) fn prepared_key_control(&self) -> DriverResult<super::PreparedKeyControl> {
+        self.owner.context.key_control()
+    }
+
     /// Borrows the read payload captured before queue insertion.
     /// # Errors
     ///

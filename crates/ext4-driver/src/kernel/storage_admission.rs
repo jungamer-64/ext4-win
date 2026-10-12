@@ -297,12 +297,6 @@ mod tests {
         let mut owner = IoReliabilityOwner::try_new()?;
         let state = StorageAdmission::new(owner.observe()?);
         assert!(state.reliability.policy().permits(true));
-        assert!(state.begin_key_removal());
-        assert!(!state.begin_key_removal());
-        state.cancel_query();
-        assert!(!state.creates_admitted());
-        state.end_key_removal();
-        assert!(state.creates_admitted());
         owner.publish(NativeIoPolicy::ReadOnly);
         assert!(state.reliability.policy().permits(false));
         assert!(!state.reliability.policy().permits(true));

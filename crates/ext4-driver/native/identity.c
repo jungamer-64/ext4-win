@@ -3,6 +3,7 @@
 BOOLEAN NTAPI
 ext4win_key_management_privilege(KPROCESSOR_MODE requestor_mode)
 {
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
     PAGED_CODE();
     return SeSinglePrivilegeCheck(RtlConvertLongToLuid(SE_MANAGE_VOLUME_PRIVILEGE), requestor_mode);
 }

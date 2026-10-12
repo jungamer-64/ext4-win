@@ -5,6 +5,13 @@
 //! the handle's completed volume lock: accepted dirty data, live mappings and namespace handles
 //! must drain before removal. Independent create exclusion lasts through publication or abort,
 //! including lock-owner cleanup. Successful removal reports no remaining file-key users.
+//!
+//! Verity enable requires data-read and `FILE_WRITE_ATTRIBUTES`, without data-write or write
+//! sharing. Its stream lease excludes ordinary I/O and new sections while dirty pages drain;
+//! paging remains admitted during flushing and is sealed before hashing starts. Old cache pages
+//! are purged and live data/image mappings reject preparation. The exclusion survives resolve
+//! retries until committed inode protection reaches the native stream, or until failure revokes
+//! volume I/O. Subsequent cached/page-in reads verify disk data through the core read contract.
 
 use core::ptr::NonNull;
 
@@ -29,6 +36,9 @@ pub(crate) fn authorize_key_control(
     operations: &MountedVolumeAccess<'_>,
     control: crate::irp::PreparedKeyControl,
 ) -> DriverResult<()> {
+    if request.prepared_key_control()? != control {
+        return Err(DriverError::AccessDenied);
+    }
     request.with_active(|active| {
         let opened = crate::state::OpenedVolume::decode(active.current_stack()?.file_object()?)?;
         if !operations.owns_volume(opened.volume()) {
@@ -146,6 +156,7 @@ fn wire_range(offset: usize, length: usize) -> DriverResult<WireRange> {
 pub(crate) fn enable_verity(
     mut request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
+    prepared: &crate::state::PreparedStreamVerity,
 ) -> DriverResult<IrpCompletion> {
     let (enable, file_id) = {
         request.with_active(|active| {
@@ -159,8 +170,31 @@ pub(crate) fn enable_verity(
         })?
     };
     let file = mutation.file(file_id)?;
+    if !prepared.authorizes(file_id) {
+        return Err(DriverError::InternalInvariantViolation);
+    }
     mutation.enable_verity(file, &enable)?;
     Ok(IrpCompletion::EMPTY)
+}
+
+/// Retains the read-only, non-write-sharing handle's stream before cache/section preparation.
+/// # Errors
+/// Returns access denial, foreign-volume or retention failure before native work or hashing.
+pub(crate) fn prepare_verity(
+    request: &mut PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<crate::state::StreamVerityLease> {
+    request.with_active(|active| {
+        let file = active.current_stack()?.file_object()?;
+        file.require_exclusive_data_read()?;
+        let opened = OpenedObject::decode(file)?;
+        if opened.file_attributes_write_access() != crate::irp::FileAttributesWriteAccess::Granted {
+            return Err(DriverError::AccessDenied);
+        }
+        operations.authorize_handle(opened.file_object())?;
+        let regular = OpenedRegularFile::decode(file)?;
+        operations.prepare_stream_verity(NonNull::from(regular.file_control_block()), regular.id())
+    })
 }
 
 /// Adds an fscrypt master key to the mounted VCB.

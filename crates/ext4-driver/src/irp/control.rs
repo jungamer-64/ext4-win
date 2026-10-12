@@ -420,6 +420,10 @@ const METHOD_BUFFERED: wdk_sys::ULONG = 0;
 const METHOD_NEITHER: wdk_sys::ULONG = 3;
 /// Windows `FILE_ANY_ACCESS`.
 const FILE_ANY_ACCESS: wdk_sys::ULONG = 0;
+/// Windows CTL_CODE data-read admission.
+const FILE_READ_ACCESS: wdk_sys::ULONG = 1;
+/// Windows CTL_CODE data-write admission.
+const FILE_WRITE_ACCESS: wdk_sys::ULONG = 2;
 /// ext4win private function code for adding an fscrypt key.
 const EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION: wdk_sys::ULONG = 0x900;
 /// ext4win private function code for removing an fscrypt key.
@@ -441,16 +445,17 @@ const fn neither_file_system_control(function: wdk_sys::ULONG) -> wdk_sys::ULONG
 
 /// ext4win FSCTL carrying Linux `struct fscrypt_add_key_arg`.
 const FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY: wdk_sys::ULONG =
-    buffered_file_system_control(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION) | (2 << 14);
+    buffered_file_system_control(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION) | (FILE_WRITE_ACCESS << 14);
 /// ext4win FSCTL carrying Linux `struct fscrypt_remove_key_arg`.
 const FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY: wdk_sys::ULONG =
-    buffered_file_system_control(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION) | (2 << 14);
+    buffered_file_system_control(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION)
+        | (FILE_WRITE_ACCESS << 14);
 /// ext4win FSCTL carrying Linux `struct fscrypt_get_key_status_arg`.
 const FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS: wdk_sys::ULONG =
     buffered_file_system_control(EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION);
 /// ext4win FSCTL carrying Linux `struct fsverity_enable_arg`.
 const FSCTL_EXT4WIN_ENABLE_VERITY: wdk_sys::ULONG =
-    buffered_file_system_control(EXT4WIN_ENABLE_VERITY_FUNCTION) | (1 << 14);
+    buffered_file_system_control(EXT4WIN_ENABLE_VERITY_FUNCTION) | (FILE_READ_ACCESS << 14);
 
 /// Decoded query-volume filesystem information class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -1427,6 +1427,7 @@ mod tests {
         );
         assert_eq!(snapshot.reparse_point(), NodeReparsePoint::None);
         assert_eq!(snapshot.windows_file_attributes(), 0x0000_0080);
+        assert_eq!(snapshot.data_policy(), crate::NodeDataPolicy::Writable);
 
         record.set_permissions(Ext4Permissions::new(0o444)?)?;
         let hidden = crate::platform::windows::Ext4WindowsAttributes::new(
@@ -1435,6 +1436,10 @@ mod tests {
         let overlay = crate::platform::windows::WindowsOverlay::new(hidden);
         let reparse = NodeMetadataSnapshot::from_inode(&record.parse()?, Some(overlay), true);
         assert_eq!(reparse.windows_file_attributes(), 0x0000_0403);
+        record.mark_verity()?;
+        let verified = NodeMetadataSnapshot::from_inode(&record.parse()?, Some(overlay), false);
+        assert_eq!(verified.data_policy(), crate::NodeDataPolicy::ReadOnly);
+        assert_eq!(snapshot.data_policy(), crate::NodeDataPolicy::Writable);
         Ok(())
     }
 

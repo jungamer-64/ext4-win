@@ -1094,6 +1094,40 @@ fn ext4win_private_fsctl_codes_decode_to_domain_variants() {
 }
 
 /// # Panics
+/// Fails if a write-capable, non-reading or write-sharing handle admits protection preparation.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "stack FILE_OBJECT fixtures retain their initialized scalar fields through each view"
+)]
+fn verity_preparation_requires_a_read_handle_excluding_write_sharing() {
+    for (read, write, shared_write, permitted) in [
+        (1, 0, 0, true),
+        (0, 0, 0, false),
+        (1, 1, 0, false),
+        (1, 0, 1, false),
+    ] {
+        let mut file = wdk_sys::FILE_OBJECT {
+            ReadAccess: read,
+            WriteAccess: write,
+            SharedWrite: shared_write,
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        let Some(address) = (unsafe {
+            // SAFETY: The initialized local FILE_OBJECT outlives this owner-bounded view.
+            KernelFileObject::from_raw(core::ptr::from_mut(&mut file))
+        }) else {
+            return;
+        };
+        let view = ActiveFileObject {
+            address,
+            owner: core::marker::PhantomData,
+        };
+        assert_eq!(view.require_exclusive_data_read().is_ok(), permitted);
+    }
+}
+
+/// # Panics
 ///
 /// Panics when the standard volume-control wire codes drift from the Windows ABI.
 #[test]

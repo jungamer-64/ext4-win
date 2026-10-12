@@ -270,6 +270,10 @@ fn mounted_volume_lock_policy_is_owned_by_one_file_object() {
     };
 
     let mounted = MountedVolumeState::Mounted;
+    assert_eq!(
+        mounted.authorize_key_removal(owner),
+        Err(DriverError::NotLocked)
+    );
     assert_eq!(mounted.authorize_create(), Ok(()));
     assert_eq!(mounted.authorize_handle(competing), Ok(()));
     let locking = mounted.begin_lock(owner);
@@ -278,6 +282,10 @@ fn mounted_volume_lock_policy_is_owned_by_one_file_object() {
         return;
     };
     assert_eq!(locking.authorize_create(), Err(DriverError::AccessDenied));
+    assert_eq!(
+        locking.authorize_key_removal(owner),
+        Err(DriverError::NotLocked)
+    );
     assert_eq!(
         locking.authorize_handle(owner),
         Err(DriverError::AccessDenied)
@@ -296,6 +304,11 @@ fn mounted_volume_lock_policy_is_owned_by_one_file_object() {
     };
     assert_eq!(locked.authorize_create(), Err(DriverError::AccessDenied));
     assert_eq!(locked.authorize_handle(owner), Ok(()));
+    assert_eq!(locked.authorize_key_removal(owner), Ok(()));
+    assert_eq!(
+        locked.authorize_key_removal(competing),
+        Err(DriverError::NotLocked)
+    );
     assert_eq!(
         locked.authorize_handle(competing),
         Err(DriverError::AccessDenied)
