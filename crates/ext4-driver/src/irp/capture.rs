@@ -1608,24 +1608,38 @@ mod tests {
         PreparedDirectoryControl, ReceivedIrp,
     };
 
-    /// Builds a typed target and installs its current stack pointer.
+    /// Builds a typed target without reborrowing the native fixture allocations.
+    /// # Safety
+    /// The initialized device, IRP, stack and their referenced buffers must remain live at these
+    /// addresses through every use of the returned request. Fixture mutation must not overlap
+    /// request borrows or invalidate the published pointers with exclusive reborrows.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn build_target(
-        device: &mut wdk_sys::DEVICE_OBJECT,
-        irp: &mut wdk_sys::IRP,
-        stack: &mut wdk_sys::IO_STACK_LOCATION,
+    unsafe fn build_target(
+        device: *mut wdk_sys::DEVICE_OBJECT,
+        irp: *mut wdk_sys::IRP,
+        stack: *mut wdk_sys::IO_STACK_LOCATION,
     ) -> Option<ReceivedIrp> {
-        irp.Tail
-            .Overlay
-            .__bindgen_anon_2
-            .__bindgen_anon_1
-            .CurrentStackLocation = core::ptr::from_mut(stack);
+        let location = unsafe {
+            // SAFETY: The caller retains the initialized IRP and uniquely owns this stack slot.
+            core::ptr::addr_of_mut!(
+                (*irp)
+                    .Tail
+                    .Overlay
+                    .__bindgen_anon_2
+                    .__bindgen_anon_1
+                    .CurrentStackLocation
+            )
+        };
         unsafe {
-            // SAFETY: Both mutable fixture objects remain live for the returned test owner.
-            ReceivedIrp::decode(core::ptr::from_mut(device), core::ptr::from_mut(irp)).ok()
+            // SAFETY: This fixture publishes its retained stack before any request borrows it.
+            location.write(stack);
+        }
+        unsafe {
+            // SAFETY: The caller retains these original allocation pointers through request use.
+            ReceivedIrp::decode(device, irp).ok()
         }
     }
 
@@ -1666,12 +1680,15 @@ mod tests {
             let mut irp = wdk_sys::IRP::default();
             let mut stack = wdk_sys::IO_STACK_LOCATION {
                 MinorFunction: minor,
-                FileObject: core::ptr::from_mut(&mut file_object),
+                FileObject: core::ptr::addr_of_mut!(file_object),
                 ..wdk_sys::IO_STACK_LOCATION::default()
             };
             stack.Parameters.Read.Length = 8192;
-            let mut target = build_target(&mut device, &mut irp, &mut stack)
-                .ok_or(DriverError::InvalidParameter)?;
+            let mut target = unsafe {
+                // SAFETY: Local fixture allocations and their buffers outlive every request use.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            }
+            .ok_or(DriverError::InvalidParameter)?;
             let device = target.device();
             let captured = capture_context(&mut target, major)
                 .map_err(|completion| DriverError::CacheManagerFailure(completion.status()))?;
@@ -1711,9 +1728,9 @@ mod tests {
                     )?)?;
                 assert_eq!(
                     transfer.file_object().as_ptr(),
-                    core::ptr::from_mut(&mut file_object)
+                    core::ptr::addr_of_mut!(file_object)
                 );
-                assert_eq!(transfer.irp().as_ptr(), core::ptr::from_mut(&mut irp));
+                assert_eq!(transfer.irp().as_ptr(), core::ptr::addr_of_mut!(irp));
                 assert_eq!(transfer.request().action(), expected);
                 assert_eq!(transfer.request().length(), 8192);
             }
@@ -1730,6 +1747,10 @@ mod tests {
     /// Panics when cleanup or close inherits requestor-state allocation instead of its typed
     /// lifecycle identity.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test retains initialized native fixture allocations through all request access"
+    )]
     fn lifecycle_requests_capture_allocation_free_identities() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -1743,7 +1764,10 @@ mod tests {
                 FileObject: core::ptr::addr_of_mut!(file_object),
                 ..wdk_sys::IO_STACK_LOCATION::default()
             };
-            let target = build_target(&mut device, &mut irp, &mut stack);
+            let target = unsafe {
+                // SAFETY: Local fixture allocations and their buffers outlive every request use.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            };
             assert!(target.is_some());
             if let Some(mut target) = target {
                 let context = capture_context(&mut target, major);
@@ -1766,6 +1790,10 @@ mod tests {
     ///
     /// Panics when lock-control loses its sealed major classification or handle cancellation key.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test retains initialized native fixture allocations through all request access"
+    )]
     fn lock_control_capture_is_file_scoped() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -1776,7 +1804,10 @@ mod tests {
             FileObject: core::ptr::addr_of_mut!(file_object),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, &raw mut irp, &raw mut stack)
+        };
         assert!(target.is_some());
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::LockControl);
@@ -1797,6 +1828,10 @@ mod tests {
     ///
     /// Panics when queue classification can change after requestor-context capture.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test retains initialized native fixture allocations through all request access"
+    )]
     fn prepared_major_and_minor_classification_is_sealed() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -1807,7 +1842,10 @@ mod tests {
             FileObject: core::ptr::addr_of_mut!(file_object),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, &raw mut irp, &raw mut stack)
+        };
         assert!(target.is_some());
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::Read);
@@ -1837,7 +1875,10 @@ mod tests {
             __bindgen_padding_0: 0,
             FileIndex: 0,
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, &raw mut irp, &raw mut stack)
+        };
         assert!(target.is_some());
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::DirectoryControl);
@@ -1864,7 +1905,10 @@ mod tests {
             MinorFunction: 1,
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, &raw mut irp, &raw mut stack)
+        };
         assert!(target.is_some());
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::FileSystemControl);
@@ -1908,11 +1952,11 @@ mod tests {
                 let mut device = wdk_sys::DEVICE_OBJECT::default();
                 let mut file = wdk_sys::FILE_OBJECT::default();
                 let mut bytes = [0_u8; 8];
-                let address = core::ptr::NonNull::new(bytes.as_mut_ptr());
+                let address = core::ptr::NonNull::new(core::ptr::addr_of_mut!(bytes).cast::<u8>());
                 let mut irp = wdk_sys::IRP::default();
-                irp.AssociatedIrp.SystemBuffer = bytes.as_mut_ptr().cast();
+                irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(bytes).cast::<u8>().cast();
                 let mut stack = wdk_sys::IO_STACK_LOCATION {
-                    FileObject: core::ptr::from_mut(&mut file),
+                    FileObject: core::ptr::addr_of_mut!(file),
                     MajorFunction: u8::try_from(major.table_index())
                         .map_err(|_| DriverError::InvalidParameter)?,
                     ..Default::default()
@@ -1934,8 +1978,12 @@ mod tests {
                     }
                     _ => return Err(DriverError::InternalInvariantViolation),
                 }
-                let mut received = build_target(&mut device, &mut irp, &mut stack)
-                    .ok_or(DriverError::InvalidParameter)?;
+                let stack_address = &raw mut stack;
+                let mut received = unsafe {
+                    // SAFETY: Local fixture allocations and their buffers outlive every request use.
+                    build_target(&raw mut device, &raw mut irp, stack_address)
+                }
+                .ok_or(DriverError::InvalidParameter)?;
                 let device = received.device();
                 let context = capture_context(&mut received, major)
                     .map_err(|completion| DriverError::CacheManagerFailure(completion.status()))?;
@@ -1963,7 +2011,7 @@ mod tests {
                     assert_eq!(transfer.length(), capacity);
                     assert_eq!(
                         transfer.file_object().as_ptr(),
-                        core::ptr::from_mut(&mut file)
+                        core::ptr::addr_of_mut!(file)
                     );
                     assert_eq!(
                         transfer.address(),
@@ -1985,15 +2033,18 @@ mod tests {
                     assert_eq!(transfer.length(), capacity);
                     assert_eq!(
                         transfer.file_object().as_ptr(),
-                        core::ptr::from_mut(&mut file)
+                        core::ptr::addr_of_mut!(file)
                     );
                     assert_eq!(
                         transfer.address(),
                         if capacity == 0 { None } else { address }
                     );
                 }
-                stack.FileObject = core::ptr::null_mut();
-                assert!(stack.FileObject.is_null());
+                unsafe {
+                    // SAFETY: Capture and transfer borrows ended; use the published stack pointer
+                    // to change this fixture's FILE_OBJECT field before the next request borrow.
+                    (*stack_address).FileObject = core::ptr::null_mut();
+                }
                 let error = if major == DispatchMajor::Read {
                     owned.request().cache_read_transfer(0).err()
                 } else {
@@ -2023,7 +2074,9 @@ mod tests {
             Flags: wdk_sys::IRP_NOCACHE,
             ..wdk_sys::IRP::default()
         };
-        irp.AssociatedIrp.SystemBuffer = output.as_mut_ptr().cast::<c_void>();
+        irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(output)
+            .cast::<u8>()
+            .cast::<c_void>();
         let mut stack = wdk_sys::IO_STACK_LOCATION {
             MajorFunction: u8::try_from(wdk_sys::IRP_MJ_READ).unwrap_or_default(),
             FileObject: core::ptr::addr_of_mut!(file_object),
@@ -2036,26 +2089,35 @@ mod tests {
             Flags: 0,
             ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 8192 },
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let irp_address = &raw mut irp;
+        let stack_address = &raw mut stack;
+        let target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, irp_address, stack_address)
+        };
         assert!(target.is_some());
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::Read);
             assert!(context.is_ok());
             if let Ok(mut context) = context {
-                stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
-                    Length: 1,
-                    __bindgen_padding_0: 0,
-                    Key: 0,
-                    Flags: 0,
-                    ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                let read = unsafe {
+                    // SAFETY: No request borrow remains; project the fixture's published Read arm.
+                    core::ptr::addr_of_mut!((*stack_address).Parameters.Read)
                 };
-                let rewritten_length = unsafe {
-                    // SAFETY: The test assigned the `Read` union arm immediately above.
-                    stack.Parameters.Read.Length
-                };
-                assert_eq!(rewritten_length, 1);
-                irp.Flags = 0;
-                assert_eq!(irp.Flags, 0);
+                unsafe {
+                    // SAFETY: Only this test accesses the stack between capture and sealed reads.
+                    read.write(wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
+                        Length: 1,
+                        __bindgen_padding_0: 0,
+                        Key: 0,
+                        Flags: 0,
+                        ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                    });
+                }
+                unsafe {
+                    // SAFETY: Capture ended; mutate through the same published IRP pointer.
+                    (*irp_address).Flags = 0;
+                }
                 let prepared = context.read_mut();
                 assert!(prepared.is_ok());
                 if let Ok(prepared) = prepared {
@@ -2087,11 +2149,12 @@ mod tests {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
         let mut input = [0xAA_u8; 32];
+        let input_address = core::ptr::addr_of_mut!(input).cast::<u8>();
         let mut irp = wdk_sys::IRP {
             Flags: wdk_sys::IRP_NOCACHE,
             ..wdk_sys::IRP::default()
         };
-        irp.AssociatedIrp.SystemBuffer = input.as_mut_ptr().cast::<c_void>();
+        irp.AssociatedIrp.SystemBuffer = input_address.cast::<c_void>();
         let mut stack = wdk_sys::IO_STACK_LOCATION {
             MajorFunction: u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default(),
             FileObject: core::ptr::addr_of_mut!(file_object),
@@ -2104,27 +2167,40 @@ mod tests {
             Flags: 0,
             ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 16_384 },
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let irp_address = &raw mut irp;
+        let stack_address = &raw mut stack;
+        let target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, irp_address, stack_address)
+        };
         assert!(target.is_some());
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::Write);
             assert!(context.is_ok());
             if let Ok(context) = context {
-                stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
-                    Length: 1,
-                    __bindgen_padding_0: 0,
-                    Key: 0,
-                    Flags: 0,
-                    ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                let write = unsafe {
+                    // SAFETY: No request borrow remains; project the fixture's published Write arm.
+                    core::ptr::addr_of_mut!((*stack_address).Parameters.Write)
                 };
-                input[0] = 0x55;
-                let rewritten_length = unsafe {
-                    // SAFETY: The test assigned the `Write` union arm immediately above.
-                    stack.Parameters.Write.Length
-                };
-                assert_eq!(rewritten_length, 1);
-                irp.Flags = 0;
-                assert_eq!(irp.Flags, 0);
+                unsafe {
+                    // SAFETY: Only this test accesses the stack between capture and sealed reads.
+                    write.write(wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
+                        Length: 1,
+                        __bindgen_padding_0: 0,
+                        Key: 0,
+                        Flags: 0,
+                        ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                    });
+                }
+                unsafe {
+                    // SAFETY: No copy is active; mutate the retained input through its published
+                    // pointer to model foreign requestor writes without exclusive Rust reborrows.
+                    input_address.write(0x55);
+                }
+                unsafe {
+                    // SAFETY: Capture ended; mutate through the same published IRP pointer.
+                    (*irp_address).Flags = 0;
+                }
                 let prepared = context.write();
                 assert!(prepared.is_ok());
                 if let Ok(prepared) = prepared {
@@ -2165,6 +2241,10 @@ mod tests {
     ///
     /// Panics when direct-I/O capture ignores the MDL byte count or loses its mapped address.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test retains initialized native fixture allocations through all request access"
+    )]
     fn prepared_write_requires_an_exactly_covering_mdl_mapping() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -2178,7 +2258,7 @@ mod tests {
             (u32::try_from(input.len()).unwrap_or_default(), None),
         ] {
             let mut mdl = wdk_sys::MDL {
-                MappedSystemVa: input.as_mut_ptr().cast::<c_void>(),
+                MappedSystemVa: core::ptr::addr_of_mut!(input).cast::<u8>().cast::<c_void>(),
                 ByteCount: byte_count,
                 MdlFlags: i16::try_from(wdk_sys::MDL_MAPPED_TO_SYSTEM_VA).unwrap_or_default(),
                 ..wdk_sys::MDL::default()
@@ -2199,7 +2279,10 @@ mod tests {
                 Flags: 0,
                 ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
             };
-            let target = build_target(&mut device, &mut irp, &mut stack);
+            let target = unsafe {
+                // SAFETY: Local fixture allocations and their buffers outlive every request use.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            };
             assert!(target.is_some());
             if let Some(mut target) = target {
                 let context = capture_context(&mut target, DispatchMajor::Write);
@@ -2231,6 +2314,10 @@ mod tests {
     ///
     /// Panics when zero-byte write capture requires a mapping or a non-empty write accepts none.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test retains initialized native fixture allocations through all request access"
+    )]
     fn prepared_write_mapping_is_required_exactly_for_nonempty_input() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -2249,7 +2336,10 @@ mod tests {
                 Flags: 0,
                 ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
             };
-            let target = build_target(&mut device, &mut irp, &mut stack);
+            let target = unsafe {
+                // SAFETY: Local fixture allocations and their buffers outlive every request use.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            };
             assert!(target.is_some());
             if let Some(mut target) = target {
                 let context = capture_context(&mut target, DispatchMajor::Write);
@@ -2304,6 +2394,10 @@ mod tests {
     ///
     /// Panics when cleanup matching re-decodes a stack or selects a device-wide request.
     #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the test retains initialized native fixture allocations through all request access"
+    )]
     fn cancellation_key_filters_file_and_device_requests() {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -2314,7 +2408,10 @@ mod tests {
             FileObject: core::ptr::addr_of_mut!(file_object),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
-        let target = build_target(&mut device, &mut irp, &mut stack);
+        let target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, &raw mut irp, &raw mut stack)
+        };
         assert!(target.is_some());
         if let Some(mut target) = target {
             let context = capture_context(&mut target, DispatchMajor::Create);
@@ -2339,7 +2436,10 @@ mod tests {
                 MinorFunction: minor,
                 ..wdk_sys::IO_STACK_LOCATION::default()
             };
-            let target = build_target(&mut device, &mut irp, &mut stack);
+            let target = unsafe {
+                // SAFETY: Local fixture allocations and their buffers outlive every request use.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            };
             assert!(target.is_some());
             if let Some(mut target) = target {
                 let context = capture_context(&mut target, major);
@@ -2390,7 +2490,10 @@ mod tests {
             MajorFunction: u8::try_from(wdk_sys::IRP_MJ_CREATE).unwrap_or_default(),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
-        let mut target = build_target(&mut device, &mut irp, &mut stack);
+        let mut target = unsafe {
+            // SAFETY: Local fixture allocations and their buffers outlive every request use.
+            build_target(&raw mut device, &raw mut irp, &raw mut stack)
+        };
         let kernel_irp = unsafe {
             // SAFETY: The stack-local fixture remains live throughout this test.
             KernelIrp::from_raw(core::ptr::addr_of_mut!(irp))

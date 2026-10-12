@@ -1061,11 +1061,7 @@ fn create_name_borrows_validate_descriptor_length_and_alignment() {
         wdk_sys::UNICODE_STRING {
             Length: 2,
             MaximumLength: 2,
-            Buffer: units
-                .as_mut_ptr()
-                .cast::<u8>()
-                .wrapping_add(1)
-                .cast::<u16>(),
+            Buffer: descriptor.Buffer.cast::<u8>().wrapping_add(1).cast::<u16>(),
         },
     ] {
         file.FileName = invalid;
