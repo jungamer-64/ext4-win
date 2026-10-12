@@ -988,6 +988,9 @@ impl MountedVolumeAccess<'_> {
     ///
     /// Returns not-locked when this FILE_OBJECT is not the current lock owner.
     pub(crate) fn unlock_volume(&mut self, owner: KernelFileObject) -> DriverResult<()> {
+        if self.storage_access().key_removal_active() {
+            return Err(DriverError::DeviceBusy);
+        }
         let control = &mut self.volume_control;
         control.state = control.state.unlock(owner)?;
         Ok(())
@@ -1106,6 +1109,29 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn authorize_handle(&self, file_object: KernelFileObject) -> DriverResult<()> {
         self.authorize_storage()?;
         self.volume_control.state.authorize_handle(file_object)
+    }
+
+    /// Requires the completed cache/mapping drain owned by this exact volume FILE_OBJECT.
+    /// # Errors
+    /// Returns not-locked unless this handle owns the clean lock; close or removal revokes it.
+    pub(crate) fn authorize_key_removal(&self, owner: KernelFileObject) -> DriverResult<()> {
+        self.authorize_storage()?;
+        self.runtime.authorize_durability()?;
+        match self.volume_control.state {
+            MountedVolumeState::Locked { owner: current } if current == owner => Ok(()),
+            _ => Err(DriverError::NotLocked),
+        }
+    }
+
+    /// Retains create exclusion through a key mutation, even if its lock owner is cleaned up.
+    /// # Errors
+    /// Returns lock-owner, reliability, media or competing-removal failure before exclusion.
+    pub(crate) fn begin_key_removal(
+        &self,
+        owner: KernelFileObject,
+    ) -> DriverResult<crate::kernel::stream::KeyRemovalLease> {
+        self.authorize_key_removal(owner)?;
+        self.storage_access().begin_key_removal()
     }
 
     /// Retains one regular-file stream for paging I/O without consulting handle-local CCB state.

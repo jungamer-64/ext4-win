@@ -1,4 +1,10 @@
 //! ext4win-private FSCTL payload decoding for fscrypt and fs-verity.
+//!
+//! Key changes require a writable direct-volume handle and enabled `SeManageVolumePrivilege`
+//! on the effective requestor token before queue insertion. Key removal additionally requires
+//! the handle's completed volume lock: accepted dirty data, live mappings and namespace handles
+//! must drain before removal. Independent create exclusion lasts through publication or abort,
+//! including lock-owner cleanup. Successful removal reports no remaining file-key users.
 
 use core::ptr::NonNull;
 
@@ -13,6 +19,29 @@ use ext4_core::{
 };
 
 use super::DriverMutationPass;
+
+/// Requires writable direct-volume authority in addition to requestor privilege capture.
+/// Removal requires this handle's completed volume-lock writeback/mapping drain.
+/// # Errors
+/// Returns handle-right, volume identity, lifecycle or lock-owner failure before changing a key.
+pub(crate) fn authorize_key_control(
+    request: &mut PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+    control: crate::irp::PreparedKeyControl,
+) -> DriverResult<()> {
+    request.with_active(|active| {
+        let opened = crate::state::OpenedVolume::decode(active.current_stack()?.file_object()?)?;
+        if !operations.owns_volume(opened.volume()) {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        opened.require_data_write()?;
+        operations.authorize_handle(opened.file_object())?;
+        if matches!(control, crate::irp::PreparedKeyControl::Remove) {
+            operations.authorize_key_removal(opened.file_object())?;
+        }
+        Ok(())
+    })
+}
 
 /// Linux `FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER`.
 const FSCRYPT_KEY_SPEC_TYPE_IDENTIFIER: u32 = 2;

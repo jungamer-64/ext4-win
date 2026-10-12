@@ -316,6 +316,27 @@ pub(crate) struct QueryRemovalPreparation {
     storage: VolumeStorageAccess,
 }
 
+/// Namespace exclusion through key publication, including implicit owner cleanup.
+/// The mounted mutation operation retains the enclosing volume until this lease is dropped.
+#[derive(Debug)]
+pub(crate) struct KeyRemovalLease {
+    /// Read/transition capability cannot recover the reactor's reliability publisher.
+    storage: VolumeStorageAccess,
+}
+
+impl Drop for KeyRemovalLease {
+    fn drop(&mut self) {
+        self.storage.state().end_key_removal();
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "only volume admission atomics cross threads; the mounted operation retains their allocation"
+)]
+// SAFETY: No same-thread native resource is retained; operation rundown retains the volume.
+unsafe impl Send for KeyRemovalLease {}
+
 impl QueryRemovalPreparation {
     /// Transfers reversible create exclusion to lower PnP resolution.
     /// # Errors
@@ -419,6 +440,22 @@ impl StorageRemovalPublisher {
 }
 
 impl VolumeStorageAccess {
+    /// Claims independent create exclusion while a clean locked volume removes a key.
+    /// # Errors
+    /// Returns device busy if a key-removal lease already owns the exclusion.
+    pub(crate) fn begin_key_removal(self) -> DriverResult<KeyRemovalLease> {
+        self.authorize()?;
+        if self.state().begin_key_removal() {
+            Ok(KeyRemovalLease { storage: self })
+        } else {
+            Err(DriverError::DeviceBusy)
+        }
+    }
+
+    /// Exclusion outlives lock-owner cleanup until the key mutation completes.
+    pub(crate) fn key_removal_active(self) -> bool {
+        self.state().key_removal_active()
+    }
     /// Borrows admission only while its enclosing volume retention is live.
     #[expect(
         unsafe_code,

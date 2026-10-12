@@ -2979,6 +2979,8 @@ enum PreparedMutationRequest {
     Security(crate::identity::IdentitySnapshot),
     /// Regular-file data write with handle or paging stream authority.
     DataWrite(crate::request::file_info::RegularFileDataAuthority),
+    /// Clean-volume key removal retains namespace exclusion through publication or abort.
+    KeyRemoval(crate::kernel::stream::KeyRemovalLease),
     /// Non-data mutation class whose existing lifecycle authority remains sufficient.
     Other(MutationRequestKind),
 }
@@ -2994,6 +2996,21 @@ impl PreparedMutationRequest {
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Self> {
         match kind {
+            MutationRequestKind::RemoveEncryptionKey => {
+                let mut request = owned.request();
+                crate::request::fsctl::authorize_key_control(
+                    &mut request,
+                    access,
+                    crate::irp::PreparedKeyControl::Remove,
+                )?;
+                request.with_active(|active| {
+                    let opened =
+                        crate::state::OpenedVolume::decode(active.current_stack()?.file_object()?)?;
+                    access
+                        .begin_key_removal(opened.file_object())
+                        .map(Self::KeyRemoval)
+                })
+            }
             MutationRequestKind::Write => {
                 crate::request::file_info::prepare_regular_file_data_authority(
                     owned.request(),
@@ -3031,6 +3048,7 @@ impl PreparedMutationRequest {
     const fn kind(&self) -> MutationRequestKind {
         match self {
             Self::DataWrite(_) => MutationRequestKind::Write,
+            Self::KeyRemoval(_) => MutationRequestKind::RemoveEncryptionKey,
             Self::Create { .. } => MutationRequestKind::Create,
             Self::Security(_) => MutationRequestKind::SetSecurity,
             Self::Other(kind) => *kind,
@@ -3716,6 +3734,7 @@ impl MutationRequestOperation {
                         .is_empty()
             }
             PreparedMutationRequest::Create { .. } => false,
+            PreparedMutationRequest::KeyRemoval(_) => false,
             PreparedMutationRequest::Security(_) => true,
             PreparedMutationRequest::Other(MutationRequestKind::SetInformation) => {
                 owned.request().with_active(|active| {
@@ -4092,9 +4111,10 @@ impl MutationRequestOperation {
             }
             PreparedMutationRequest::Other(MutationRequestKind::AddEncryptionKey) => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(
+                crate::request::fsctl::authorize_key_control(
                     &mut request,
                     operations,
+                    crate::irp::PreparedKeyControl::Add,
                 )?;
                 let stack =
                     request.with_active(|active| active.current_stack()?.file_system_control())?;
@@ -4104,11 +4124,12 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::RemoveEncryptionKey) => {
+            PreparedMutationRequest::KeyRemoval(_exclusion) => {
                 let mut request = owned.request();
-                crate::request::file_system_control::authorize_path_handle(
+                crate::request::fsctl::authorize_key_control(
                     &mut request,
                     operations,
+                    crate::irp::PreparedKeyControl::Remove,
                 )?;
                 let stack =
                     request.with_active(|active| active.current_stack()?.file_system_control())?;
@@ -4139,7 +4160,8 @@ impl MutationRequestOperation {
             PreparedMutationRequest::Other(
                 MutationRequestKind::Write
                 | MutationRequestKind::Create
-                | MutationRequestKind::SetSecurity,
+                | MutationRequestKind::SetSecurity
+                | MutationRequestKind::RemoveEncryptionKey,
             ) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()

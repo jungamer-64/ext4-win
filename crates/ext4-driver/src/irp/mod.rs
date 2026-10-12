@@ -43,8 +43,8 @@ pub(crate) use buffer::*;
 use buffer::{mdl_data_buffer_address, stack_flag};
 pub(crate) use capture::{
     CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
-    PreparedEaSelection, PreparedQueryDirectory, PreparedQueryEa, PreparedRead, PreparedRequest,
-    PreparedWrite, PreparedKeyControl,
+    PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory, PreparedQueryEa, PreparedRead,
+    PreparedRequest, PreparedWrite,
 };
 use capture::{QueueContext, QueueContextOwnership};
 #[cfg(not(test))]

@@ -4,7 +4,7 @@
 //! Only submission scopes hold the native resource; revocation never waits for lower completion.
 
 use super::io_reliability::IoReliabilityObservation;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Monotonic lower-device availability, independent of filesystem close.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +86,8 @@ pub(super) struct StorageAdmission {
     close: AtomicU8,
     /// Independent reversible create exclusion.
     query: AtomicU8,
+    /// Independent namespace exclusion retained while a drained-volume key is removed.
+    key_removal: AtomicBool,
 }
 
 impl StorageAdmission {
@@ -96,6 +98,7 @@ impl StorageAdmission {
             media: AtomicU8::new(0),
             close: AtomicU8::new(0),
             query: AtomicU8::new(0),
+            key_removal: AtomicBool::new(false),
         }
     }
 
@@ -122,6 +125,24 @@ impl StorageAdmission {
         self.media() == MediaState::Present
             && self.close() == ClosePhase::Open
             && self.query.load(Ordering::Acquire) == QueryPhase::Open.raw()
+            && !self.key_removal_active()
+    }
+
+    /// Claims the unique exclusion after the actor validates completed volume-lock ownership.
+    pub(super) fn begin_key_removal(&self) -> bool {
+        self.key_removal
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    /// Observes only exclusion; it grants neither lock ownership nor key mutation authority.
+    pub(super) fn key_removal_active(&self) -> bool {
+        self.key_removal.load(Ordering::Acquire)
+    }
+
+    /// Released by the unique operation lease after publication or abandonment.
+    pub(super) fn end_key_removal(&self) {
+        self.key_removal.store(false, Ordering::Release);
     }
 
     /// Claims close writeback exactly once without restoring revoked media.
@@ -276,6 +297,12 @@ mod tests {
         let mut owner = IoReliabilityOwner::try_new()?;
         let state = StorageAdmission::new(owner.observe()?);
         assert!(state.reliability.policy().permits(true));
+        assert!(state.begin_key_removal());
+        assert!(!state.begin_key_removal());
+        state.cancel_query();
+        assert!(!state.creates_admitted());
+        state.end_key_removal();
+        assert!(state.creates_admitted());
         owner.publish(NativeIoPolicy::ReadOnly);
         assert!(state.reliability.policy().permits(false));
         assert!(!state.reliability.policy().permits(true));

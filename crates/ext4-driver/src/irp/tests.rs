@@ -1076,11 +1076,11 @@ fn device_control_stack_preserves_payload_shape_and_control_code() {
 #[test]
 fn ext4win_private_fsctl_codes_decode_to_domain_variants() {
     assert_eq!(
-        FsControlCode::from_raw(0x0009_2400),
+        FsControlCode::from_raw(0x0009_a400),
         Ok(FsControlCode::AddEncryptionKey)
     );
     assert_eq!(
-        FsControlCode::from_raw(0x0009_2404),
+        FsControlCode::from_raw(0x0009_a404),
         Ok(FsControlCode::RemoveEncryptionKey)
     );
     assert_eq!(
@@ -1088,7 +1088,7 @@ fn ext4win_private_fsctl_codes_decode_to_domain_variants() {
         Ok(FsControlCode::GetEncryptionKeyStatus)
     );
     assert_eq!(
-        FsControlCode::from_raw(0x0009_240c),
+        FsControlCode::from_raw(0x0009_640c),
         Ok(FsControlCode::EnableVerity)
     );
 }

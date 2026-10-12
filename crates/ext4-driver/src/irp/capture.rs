@@ -908,6 +908,31 @@ impl QueueContext {
     }
 }
 
+/// Checks the effective requestor token before leaving its dispatch context.
+/// # Errors
+/// Returns access denied without enabled volume-management privilege.
+#[cfg_attr(
+    not(test),
+    expect(
+        unsafe_code,
+        reason = "dispatch capture retains the original requestor context"
+    )
+)]
+fn authorize_key_management(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
+    #[cfg(not(test))]
+    let allowed = unsafe {
+        // SAFETY: Request capture calls here before its original dispatch thread queues work.
+        ffi::ext4win_key_management_privilege(_target.requestor_mode())
+    } != 0;
+    #[cfg(test)]
+    let allowed = false;
+    if allowed {
+        Ok(())
+    } else {
+        Err(IrpCompletion::from_error(DriverError::AccessDenied))
+    }
+}
+
 /// Captured mount-key operation authority, checked on the original requestor thread.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum PreparedKeyControl {
@@ -1098,20 +1123,13 @@ impl PreparedRequest {
                         }
                         let key_control = match control.fs_control_code() {
                             super::FsControlCode::AddEncryptionKey => Some(PreparedKeyControl::Add),
-                            super::FsControlCode::RemoveEncryptionKey => Some(PreparedKeyControl::Remove),
+                            super::FsControlCode::RemoveEncryptionKey => {
+                                Some(PreparedKeyControl::Remove)
+                            }
                             _ => None,
                         };
                         if let Some(key_control) = key_control {
-                            #[cfg(not(test))]
-                            let allowed = unsafe {
-                                // SAFETY: Capture runs on the original dispatch thread, before queue handoff.
-                                ffi::ext4win_key_management_privilege(target.requestor_mode())
-                            } != 0;
-                            #[cfg(test)]
-                            let allowed = false;
-                            if !allowed {
-                                return Err(IrpCompletion::from_error(DriverError::AccessDenied));
-                            }
+                            authorize_key_management(target)?;
                             return Ok((Self::KeyControl(key_control), generic_key()));
                         }
                         generic_key()

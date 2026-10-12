@@ -441,16 +441,16 @@ const fn neither_file_system_control(function: wdk_sys::ULONG) -> wdk_sys::ULONG
 
 /// ext4win FSCTL carrying Linux `struct fscrypt_add_key_arg`.
 const FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY: wdk_sys::ULONG =
-    buffered_file_system_control(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION);
+    buffered_file_system_control(EXT4WIN_ADD_ENCRYPTION_KEY_FUNCTION) | (2 << 14);
 /// ext4win FSCTL carrying Linux `struct fscrypt_remove_key_arg`.
 const FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY: wdk_sys::ULONG =
-    buffered_file_system_control(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION);
+    buffered_file_system_control(EXT4WIN_REMOVE_ENCRYPTION_KEY_FUNCTION) | (2 << 14);
 /// ext4win FSCTL carrying Linux `struct fscrypt_get_key_status_arg`.
 const FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS: wdk_sys::ULONG =
     buffered_file_system_control(EXT4WIN_GET_ENCRYPTION_KEY_STATUS_FUNCTION);
 /// ext4win FSCTL carrying Linux `struct fsverity_enable_arg`.
 const FSCTL_EXT4WIN_ENABLE_VERITY: wdk_sys::ULONG =
-    buffered_file_system_control(EXT4WIN_ENABLE_VERITY_FUNCTION);
+    buffered_file_system_control(EXT4WIN_ENABLE_VERITY_FUNCTION) | (1 << 14);
 
 /// Decoded query-volume filesystem information class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

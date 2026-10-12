@@ -1923,6 +1923,21 @@ pub(crate) struct OpenedVolume<'owner> {
 }
 
 impl<'owner> OpenedVolume<'owner> {
+    /// Requires the data-write right retained by this direct-volume handle's create check.
+    /// # Errors
+    /// Returns access denied for metadata-only or read-only volume handles.
+    #[expect(
+        unsafe_code,
+        reason = "the decoded active FILE_OBJECT retains its immutable create authority"
+    )]
+    pub(crate) fn require_data_write(&self) -> DriverResult<()> {
+        let handle = unsafe {
+            // SAFETY: Decode validated this CCB; the active FILE_OBJECT retains it through this call.
+            self.handle.as_ref()
+        };
+        handle.raw_access.require(RawVolumeOperationKind::Write)
+    }
+
     /// Lower-device control authority fixed in the native volume header at mount publication.
     /// # Errors
     ///
