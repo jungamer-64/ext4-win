@@ -945,21 +945,46 @@ fn set_file_allocation(file: &FileHandle, bound: i64) -> io::Result<()> {
     }
 }
 
-/// Exercises explicit basic times, handle-local suppression, independent handles, and resumption.
+/// Exercises archive restoration, explicit basic times, handle-local suppression, and resumption.
 /// # Errors
 /// Returns native set/write/query/flush failures, timestamp disagreement, or explicit close failure.
 pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
     const FIXED_TIME: i64 = 125_911_584_000_000_000;
     let file = FileHandle::open(path, 0x4000_0080, 0)?;
     let result = (|| {
+        write_byte(&file)?;
+        let original = file_information_query(&file, 4, 40, 0)?;
+        let attributes = u32::from_le_bytes(field(&original, 32)?) & !FILE_ATTRIBUTE_ARCHIVE;
         let explicit = FILE_BASIC_INFO {
             CreationTime: FIXED_TIME,
             LastAccessTime: FIXED_TIME,
             LastWriteTime: FIXED_TIME,
             ChangeTime: FIXED_TIME,
-            FileAttributes: 0,
+            FileAttributes: if attributes == 0 {
+                FILE_ATTRIBUTE_NORMAL
+            } else {
+                attributes
+            },
         };
         set_basic_information(&file, &explicit)?;
+        let cleared = file_information_query(&file, 4, 40, 0)?;
+        if u32::from_le_bytes(field(&cleared, 32)?) & FILE_ATTRIBUTE_ARCHIVE != 0 {
+            return Err(io::Error::other(
+                "explicit attributes did not clear archive",
+            ));
+        }
+        write_and_flush_byte(&file)?;
+        let retained = file_information_query(&file, 4, 40, 0)?;
+        for offset in [8, 16, 24] {
+            if i64::from_le_bytes(field(&retained, offset)?) != FIXED_TIME {
+                return Err(io::Error::other(
+                    "write replaced an explicitly assigned timestamp",
+                ));
+            }
+        }
+        if u32::from_le_bytes(field(&retained, 32)?) & FILE_ATTRIBUTE_ARCHIVE == 0 {
+            return Err(io::Error::other("write did not restore archive"));
+        }
         let suppressed = FILE_BASIC_INFO {
             CreationTime: 0,
             LastAccessTime: -1,
@@ -1026,10 +1051,10 @@ fn set_basic_information(file: &FileHandle, info: &FILE_BASIC_INFO) -> io::Resul
     }
 }
 
-/// Writes one byte at the handle cursor and observes durable cached-write completion.
+/// Writes one byte at the handle cursor without requiring Cache Manager writeback.
 /// # Errors
-/// Returns short-write, native write or flush failures.
-fn write_and_flush_byte(file: &FileHandle) -> io::Result<()> {
+/// Returns short-write or native write failures.
+fn write_byte(file: &FileHandle) -> io::Result<()> {
     let raw = file.raw()?;
     let byte = [0xAC_u8];
     let mut written = 0;
@@ -1044,6 +1069,15 @@ fn write_and_flush_byte(file: &FileHandle) -> io::Result<()> {
     if written != 1 {
         return Err(io::Error::other("native timestamp fixture short write"));
     }
+    Ok(())
+}
+
+/// Writes one byte and observes durable completion before querying metadata.
+/// # Errors
+/// Returns short-write, native write or flush failures.
+fn write_and_flush_byte(file: &FileHandle) -> io::Result<()> {
+    write_byte(file)?;
+    let raw = file.raw()?;
     let flushed = unsafe {
         // SAFETY: This borrowed handle remains live through synchronous flush completion.
         FlushFileBuffers(raw)

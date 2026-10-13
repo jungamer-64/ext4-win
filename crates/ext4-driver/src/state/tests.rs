@@ -199,7 +199,7 @@ fn directory_handle(
 /// # Panics
 /// Fails if reparse mutation rejects either sufficient right or admits append-only authority.
 #[test]
-fn reparse_mutation_requires_data_and_attribute_write_authority() {
+fn reparse_mutation_accepts_either_retained_write_right() {
     for (data, attributes, expected) in [
         (
             RegularFileWriteAccess::Positional,

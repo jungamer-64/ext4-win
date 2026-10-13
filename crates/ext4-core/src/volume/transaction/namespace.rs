@@ -488,8 +488,8 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Renames or moves a child entry.
     ///
     /// # Errors
-    /// Returns an error when the source entry is absent, the target collision mode rejects an
-    /// existing target, either parent is outside the mutable directory domain, or a moved directory
+    /// Returns an error when the source or selected replacement is absent, a vacant destination
+    /// is occupied, either parent is outside the mutable directory domain, or a moved directory
     /// cannot have its parent link updated.
     pub fn rename_child(
         &mut self,

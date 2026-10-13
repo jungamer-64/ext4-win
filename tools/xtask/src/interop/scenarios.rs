@@ -1319,6 +1319,71 @@ fn verify_regular_mutation_profile(
         "regular-update",
     )?;
 
+    let existing = ext4_core::Ext4Name::new(b"CaseTarget.bin").map_err(core_task_error)?;
+    let requested = ext4_core::Ext4Name::new(b"casetarget.bin").map_err(core_task_error)?;
+    let expected = initial
+        .get(..FINAL_BYTES)
+        .ok_or_else(|| io::Error::other("regular expected-content range is absent"))?;
+    drive_internal_core_mutation(image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let _file = pass.create_file(root, &existing, mutation_file_metadata()?)?;
+        Ok(())
+    })?;
+    drive_internal_core_mutation(image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        pass.rename_child(
+            root,
+            &renamed,
+            root,
+            &requested,
+            ext4_core::NamespaceDestination::Replace {
+                existing_name: &existing,
+            },
+        )
+    })?;
+    debugfs_require_absent(linux, image, "/CaseTarget.bin")?;
+    debugfs_require_absent(linux, image, "/renamed.bin")?;
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/casetarget.bin",
+        expected,
+        2,
+        "selected-replacement",
+    )?;
+    verify_internal_e2fsck_clean(linux, image, "selected rename replacement")?;
+    drive_internal_core_mutation(image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        pass.rename_child(
+            root,
+            &requested,
+            root,
+            &existing,
+            ext4_core::NamespaceDestination::Vacant,
+        )
+    })?;
+    debugfs_require_absent(linux, image, "/casetarget.bin")?;
+    debugfs_require_file(
+        linux,
+        case_root,
+        image,
+        "/CaseTarget.bin",
+        expected,
+        2,
+        "case-only-rename",
+    )?;
+    drive_internal_core_mutation(image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        pass.rename_child(
+            root,
+            &existing,
+            root,
+            &renamed,
+            ext4_core::NamespaceDestination::Vacant,
+        )
+    })?;
+
     drive_internal_core_mutation(image, |pass| {
         let (root, file_id) = mutation_root_file(pass, &linked)?;
         pass.unlink_file(root, &renamed)?;
@@ -1330,9 +1395,6 @@ fn verify_regular_mutation_profile(
         Ok(())
     })?;
 
-    let expected = initial
-        .get(..FINAL_BYTES)
-        .ok_or_else(|| io::Error::other("regular expected-content range is absent"))?;
     debugfs_require_file(
         linux,
         case_root,

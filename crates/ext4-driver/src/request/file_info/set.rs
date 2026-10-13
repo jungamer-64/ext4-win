@@ -972,7 +972,7 @@ impl HardLinkMutation {
     }
 }
 
-/// Prepared hard-link destination with the exact ext4 name selected for replacement.
+/// Prepared namespace destination with the exact ext4 name selected for replacement.
 #[derive(Debug)]
 enum PreparedNamespaceDestination {
     /// No Windows-visible target exists.

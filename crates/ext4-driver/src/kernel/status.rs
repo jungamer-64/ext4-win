@@ -414,6 +414,20 @@ mod tests {
     }
 
     /// # Panics
+    /// Fails if a nonempty reparse container loses the Windows file/directory failure distinction.
+    #[test]
+    fn reparse_container_errors_use_exact_statuses() {
+        assert_eq!(
+            DriverError::InvalidReparseData.ntstatus(),
+            super::ntstatus(0xC000_0278)
+        );
+        assert_eq!(
+            DriverError::from(Error::DirectoryNotEmpty).ntstatus(),
+            super::ntstatus(0xC000_0101)
+        );
+    }
+
+    /// # Panics
     ///
     /// Panics when the byte-range lock conflict status changes.
     #[test]
