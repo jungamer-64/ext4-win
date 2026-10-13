@@ -5435,6 +5435,11 @@ impl MutationRequestOperation {
                         }
                         let file = current.file_object()?;
                         let opened = crate::state::OpenedObject::decode(file)?;
+                        if opened.file_attributes_write_access()
+                            != crate::irp::FileAttributesWriteAccess::Granted
+                        {
+                            return Err(DriverError::AccessDenied);
+                        }
                         if !matches!(opened.node(), ext4_core::NodeId::File(_)) {
                             return Ok(None);
                         }
