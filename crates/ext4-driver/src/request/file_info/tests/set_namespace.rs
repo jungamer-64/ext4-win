@@ -3,6 +3,44 @@ use crate::irp::ReceivedIrp;
 use crate::request::file_info::test_support::*;
 use alloc::{vec, vec::Vec};
 
+/// # Panics
+/// Fails if ordinary rename replaces a directory/read-only file or bypasses a required access check.
+#[test]
+fn rename_replacement_preserves_directory_and_readonly_contracts() {
+    assert_eq!(
+        super::rename_target_requires_attribute_access(
+            FileMetadataKind::Directory,
+            0,
+            super::RenameTargetPolicy::ReplaceReadonly
+        ),
+        Err(DriverError::AccessDenied)
+    );
+    assert_eq!(
+        super::rename_target_requires_attribute_access(
+            FileMetadataKind::File,
+            wdk_sys::FILE_ATTRIBUTE_READONLY,
+            super::RenameTargetPolicy::Replace
+        ),
+        Err(DriverError::AccessDenied)
+    );
+    assert_eq!(
+        super::rename_target_requires_attribute_access(
+            FileMetadataKind::File,
+            wdk_sys::FILE_ATTRIBUTE_READONLY,
+            super::RenameTargetPolicy::ReplaceReadonly
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        super::rename_target_requires_attribute_access(
+            FileMetadataKind::File,
+            0,
+            super::RenameTargetPolicy::Replace
+        ),
+        Ok(false)
+    );
+}
+
 fn namespace_information_input(units: &[u16]) -> Option<alloc::vec::Vec<u8>> {
     let name_bytes = units.len().checked_mul(core::mem::size_of::<u16>())?;
     let payload = super::FILE_NAMESPACE_NAME_OFFSET.checked_add(name_bytes)?;
@@ -53,6 +91,16 @@ fn rename_ex_flags_decode_collision_and_reject_unsupported_semantics() {
     assert_eq!(
         super::RenameInformationFormat::Flags.target_collision(&input),
         Ok(super::RenameTargetPolicy::Replace)
+    );
+
+    assert!(put_le_u32(
+        &mut input,
+        super::FILE_NAMESPACE_FLAGS_OFFSET,
+        wdk_sys::FILE_RENAME_REPLACE_IF_EXISTS | wdk_sys::FILE_RENAME_IGNORE_READONLY_ATTRIBUTE
+    ));
+    assert_eq!(
+        super::RenameInformationFormat::Flags.target_collision(&input),
+        Ok(super::RenameTargetPolicy::ReplaceReadonly)
     );
 
     assert!(put_le_u32(

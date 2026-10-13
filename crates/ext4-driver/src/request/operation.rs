@@ -2987,8 +2987,18 @@ enum PreparedMutationRequest {
     RemovedKey,
     /// Data is frozen and cache coherence established before Merkle construction.
     Verity(VerityPreparation),
-    /// Non-data mutation class whose existing lifecycle authority remains sufficient.
-    Other(MutationRequestKind),
+    /// Extended attributes use retained handle authority.
+    SetEa,
+    /// Reparse creation uses captured privilege and retained write authority.
+    SetReparsePoint,
+    /// Reparse deletion uses retained write authority.
+    DeleteReparsePoint,
+    /// Volume metadata mutation.
+    SetVolumeInformation,
+    /// Captured mount-key addition.
+    AddEncryptionKey,
+    /// Final cleanup owns its exact namespace deletion.
+    CleanupDeletion,
 }
 
 /// Exclusive stream admission progresses before the core may read data for hashing.
@@ -3066,7 +3076,12 @@ impl PreparedMutationRequest {
                 })?;
                 Ok(Self::Create { mapping, creator })
             }
-            _ => Ok(Self::Other(kind)),
+            MutationRequestKind::SetEa => Ok(Self::SetEa),
+            MutationRequestKind::SetReparsePoint => Ok(Self::SetReparsePoint),
+            MutationRequestKind::DeleteReparsePoint => Ok(Self::DeleteReparsePoint),
+            MutationRequestKind::SetVolumeInformation => Ok(Self::SetVolumeInformation),
+            MutationRequestKind::AddEncryptionKey => Ok(Self::AddEncryptionKey),
+            MutationRequestKind::CleanupDeletion => Ok(Self::CleanupDeletion),
         }
     }
 
@@ -3079,7 +3094,12 @@ impl PreparedMutationRequest {
             Self::Create { .. } => MutationRequestKind::Create,
             Self::Security(_) => MutationRequestKind::SetSecurity,
             Self::SetInformation(_) => MutationRequestKind::SetInformation,
-            Self::Other(kind) => *kind,
+            Self::SetEa => MutationRequestKind::SetEa,
+            Self::SetReparsePoint => MutationRequestKind::SetReparsePoint,
+            Self::DeleteReparsePoint => MutationRequestKind::DeleteReparsePoint,
+            Self::SetVolumeInformation => MutationRequestKind::SetVolumeInformation,
+            Self::AddEncryptionKey => MutationRequestKind::AddEncryptionKey,
+            Self::CleanupDeletion => MutationRequestKind::CleanupDeletion,
         }
     }
 
@@ -3782,26 +3802,12 @@ impl MutationRequestOperation {
                     ))
                 })?
             }
-            PreparedMutationRequest::Other(
-                MutationRequestKind::SetEa
-                | MutationRequestKind::SetReparsePoint
-                | MutationRequestKind::DeleteReparsePoint
-                | MutationRequestKind::EnableVerity,
-            ) => true,
-            PreparedMutationRequest::Other(
-                MutationRequestKind::SetVolumeInformation
-                | MutationRequestKind::AddEncryptionKey
-                | MutationRequestKind::RemoveEncryptionKey,
-            ) => false,
-            PreparedMutationRequest::Other(MutationRequestKind::CleanupDeletion) => false,
-            PreparedMutationRequest::Other(
-                MutationRequestKind::Write
-                | MutationRequestKind::Create
-                | MutationRequestKind::SetSecurity,
-            ) => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                    .bugcheck()
-            }
+            PreparedMutationRequest::SetEa
+            | PreparedMutationRequest::SetReparsePoint
+            | PreparedMutationRequest::DeleteReparsePoint => true,
+            PreparedMutationRequest::SetVolumeInformation
+            | PreparedMutationRequest::AddEncryptionKey
+            | PreparedMutationRequest::CleanupDeletion => false,
         };
         if !requires_check {
             return Ok(None);
@@ -3997,16 +4003,15 @@ impl MutationRequestOperation {
             )
             | PreparedMutationRequest::Security(_)
             | PreparedMutationRequest::SetInformation(_)
-            | PreparedMutationRequest::Other(
-                MutationRequestKind::SetEa
-                | MutationRequestKind::SetReparsePoint
-                | MutationRequestKind::DeleteReparsePoint
-                | MutationRequestKind::EnableVerity,
-            ) => crate::request::file_info::PreservedHandleTimes::capture(
-                owned.request(),
-                request.kind() == MutationRequestKind::SetInformation,
-                mutation,
-            )?,
+            | PreparedMutationRequest::SetEa
+            | PreparedMutationRequest::SetReparsePoint
+            | PreparedMutationRequest::DeleteReparsePoint => {
+                crate::request::file_info::PreservedHandleTimes::capture(
+                    owned.request(),
+                    request.kind() == MutationRequestKind::SetInformation,
+                    mutation,
+                )?
+            }
             _ => None,
         };
         let result: DriverResult<DriverResolveDisposition> = match request {
@@ -4088,7 +4093,7 @@ impl MutationRequestOperation {
                     }
                 }
             }
-            PreparedMutationRequest::Other(MutationRequestKind::SetEa) => {
+            PreparedMutationRequest::SetEa => {
                 let completion = crate::request::ea::set(owned.request(), mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
@@ -4101,7 +4106,7 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::SetVolumeInformation) => {
+            PreparedMutationRequest::SetVolumeInformation => {
                 match crate::request::volume_info::set(owned.request(), operations, mutation)? {
                     crate::request::volume_info::SetVolumeResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Normal(completion)),
@@ -4113,7 +4118,7 @@ impl MutationRequestOperation {
                     }
                 }
             }
-            PreparedMutationRequest::Other(MutationRequestKind::SetReparsePoint) => {
+            PreparedMutationRequest::SetReparsePoint => {
                 let mut request = owned.request();
                 crate::request::file_system_control::authorize_path_handle(
                     &mut request,
@@ -4124,7 +4129,7 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::DeleteReparsePoint) => {
+            PreparedMutationRequest::DeleteReparsePoint => {
                 let mut request = owned.request();
                 crate::request::file_system_control::authorize_path_handle(
                     &mut request,
@@ -4153,7 +4158,7 @@ impl MutationRequestOperation {
             | PreparedMutationRequest::Verity(
                 VerityPreparation::Preparing | VerityPreparation::Published,
             ) => Err(DriverError::InternalInvariantViolation),
-            PreparedMutationRequest::Other(MutationRequestKind::AddEncryptionKey) => {
+            PreparedMutationRequest::AddEncryptionKey => {
                 let mut request = owned.request();
                 crate::request::fsctl::authorize_key_control(
                     &mut request,
@@ -4183,7 +4188,7 @@ impl MutationRequestOperation {
                     PendingDriverPublication::Normal(completion),
                 ))
             }
-            PreparedMutationRequest::Other(MutationRequestKind::CleanupDeletion) => {
+            PreparedMutationRequest::CleanupDeletion => {
                 let Some(deletion) = state.cleanup_deletion.as_ref() else {
                     return Err(DriverError::InternalInvariantViolation);
                 };
@@ -4200,16 +4205,6 @@ impl MutationRequestOperation {
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Cleanup(publication),
                 ))
-            }
-            PreparedMutationRequest::Other(
-                MutationRequestKind::Write
-                | MutationRequestKind::Create
-                | MutationRequestKind::SetSecurity
-                | MutationRequestKind::RemoveEncryptionKey
-                | MutationRequestKind::EnableVerity,
-            ) => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                    .bugcheck()
             }
         };
         let result = result?;

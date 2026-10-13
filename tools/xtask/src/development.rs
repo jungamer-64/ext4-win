@@ -165,6 +165,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native identity persistence failure contract",
         ),
         (
+            "requestor-subject",
+            "requestor_subject.tests.c",
+            "native requestor token retention and cancellation contract",
+        ),
+        (
             "executive-resource",
             "executive_resource.tests.c",
             "native executive resource APC contract",

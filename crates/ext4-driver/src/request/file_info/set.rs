@@ -1267,6 +1267,27 @@ enum RenameTargetPolicy {
     ReplaceReadonly,
 }
 
+/// Determines whether an occupied rename destination needs a target attribute access check.
+/// # Errors
+/// Rejects directory replacement and read-only replacement without the explicit override.
+fn rename_target_requires_attribute_access(
+    kind: FileMetadataKind,
+    attributes: u32,
+    policy: RenameTargetPolicy,
+) -> DriverResult<bool> {
+    if kind == FileMetadataKind::Directory {
+        return Err(DriverError::AccessDenied);
+    }
+    if attributes & wdk_sys::FILE_ATTRIBUTE_READONLY == 0 {
+        return Ok(false);
+    }
+    if policy == RenameTargetPolicy::ReplaceReadonly {
+        Ok(true)
+    } else {
+        Err(DriverError::AccessDenied)
+    }
+}
+
 /// Owned rename mutation decoded completely before the first suspension.
 #[derive(Debug)]
 struct RenameMutation {
@@ -1406,13 +1427,11 @@ impl PreparedRenameMutation {
                     return Err(DriverError::ObjectNameCollision);
                 }
                 let metadata = metadata_from_node(read, *child.node())?;
-                if matches!(child.node(), NodeId::Directory(_)) {
-                    return Err(DriverError::AccessDenied);
-                }
-                if metadata.file_attributes & wdk_sys::FILE_ATTRIBUTE_READONLY != 0 {
-                    if target_collision != RenameTargetPolicy::ReplaceReadonly {
-                        return Err(DriverError::AccessDenied);
-                    }
+                if rename_target_requires_attribute_access(
+                    metadata.kind,
+                    metadata.file_attributes,
+                    target_collision,
+                )? {
                     let descriptor = crate::request::security::CreateSecurityDescriptor::for_node(
                         read,
                         *child.node(),
