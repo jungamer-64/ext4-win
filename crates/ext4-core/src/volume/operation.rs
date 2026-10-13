@@ -432,10 +432,11 @@ impl EpochReadOperation {
     pub fn run<T>(
         mut self,
         event: super::OperationEvent,
-        cache: crate::MetadataCacheAccess<'_>,
+        context: super::CommittedReadContext<'_>,
         crypto: &mut dyn CryptographicOperation,
         resolve: impl FnOnce(&mut EpochReadPass<'_, '_, '_>) -> Result<T>,
     ) -> ReadTransition<T> {
+        let cache = context.cache;
         let epoch = cache.epoch();
         match event {
             super::OperationEvent::Admitted => {}

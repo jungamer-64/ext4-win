@@ -728,9 +728,10 @@ impl DirectoryReadOperation {
     pub fn advance(
         mut self,
         event: super::OperationEvent,
-        mut cache: crate::MetadataCacheAccess<'_>,
+        context: super::CommittedReadContext<'_>,
         crypto: &mut dyn CryptographicOperation,
     ) -> DirectoryReadTransition {
+        let mut cache = context.cache;
         let epoch = cache.epoch();
         match event {
             super::OperationEvent::Admitted => {}
