@@ -182,7 +182,7 @@ fn hard_link_count_and_archive_boundaries_are_explicit() {
         );
     }
 
-    let overlay = super::hard_link_archive_overlay(0);
+    let overlay = super::archive_overlay(0);
     assert!(overlay.is_ok());
     if let Ok(Some(overlay)) = overlay {
         assert_eq!(
@@ -191,7 +191,7 @@ fn hard_link_count_and_archive_boundaries_are_explicit() {
         );
     }
     assert_eq!(
-        super::hard_link_archive_overlay(ext4_core::Ext4WindowsAttributes::ARCHIVE),
+        super::archive_overlay(ext4_core::Ext4WindowsAttributes::ARCHIVE),
         Ok(None)
     );
 }

@@ -49,7 +49,7 @@ typedef struct _EXT4WIN_FAST_IO_QUERY_SNAPSHOT {
 typedef struct _EXT4WIN_FAST_IO_TRANSFER_OBSERVATION {
     LONGLONG Eof;
     ULONG Flags;
-    UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess, Policy, WritableData;
+    UCHAR Cached, Media, Close, Mutation, ReadAccess, WriteAccess, Policy, WritableData, Archive;
 } EXT4WIN_FAST_IO_TRANSFER_OBSERVATION;
 
 extern UCHAR NTAPI ext4win_handle_allows_cached_write(_In_opt_ const VOID *context);
@@ -62,6 +62,7 @@ extern VOID NTAPI ext4win_fast_io_standard_record(const EXT4WIN_FAST_IO_QUERY_SN
 extern VOID NTAPI ext4win_fast_io_network_record(const EXT4WIN_FAST_IO_QUERY_SNAPSHOT *snapshot, PFILE_NETWORK_OPEN_INFORMATION output);
 C_ASSERT(sizeof(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION) == 24);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION, Cached) == 12);
+C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION, Archive) == 20);
 C_ASSERT(sizeof(EXT4WIN_FAST_IO_QUERY_SNAPSHOT) == 80);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_QUERY_SNAPSHOT, DeletePending) == 72);
 
@@ -1735,6 +1736,18 @@ PVOID NTAPI ext4win_stream_mdl_queue(_In_ PFILE_OBJECT file)
     return stream->RustState;
 }
 
+/* The archive bit belongs to the committed inode projection, never a second dirty flag. */
+BOOLEAN NTAPI ext4win_stream_archive_is_set(PVOID stream_header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
+    BOOLEAN archived;
+    if (stream == NULL) { return FALSE; }
+    ExAcquireFastMutex(&stream->HeaderMutex);
+    archived = stream->MetadataValid && ((stream->PublishedMetadata.FileAttributes & FILE_ATTRIBUTE_ARCHIVE) != 0);
+    ExReleaseFastMutex(&stream->HeaderMutex);
+    return archived;
+}
+
 /* Fixed observation only; Rust decides whether this callback may select Fast I/O. */
 BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFER_OBSERVATION *output)
 {
@@ -1747,6 +1760,7 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     ExAcquireFastMutex(&stream->HeaderMutex);
     output->Eof = stream->Header.FileSize.QuadPart;
     output->WritableData = (stream->MetadataValid != 0) && (stream->PublishedMetadata.WritableData != 0);
+    output->Archive = (stream->MetadataValid != 0) && ((stream->PublishedMetadata.FileAttributes & FILE_ATTRIBUTE_ARCHIVE) != 0);
     ExReleaseFastMutex(&stream->HeaderMutex);
     output->Flags = file->Flags;
     output->Cached = file->PrivateCacheMap != NULL;

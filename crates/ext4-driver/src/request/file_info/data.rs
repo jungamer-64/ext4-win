@@ -258,6 +258,7 @@ pub(crate) fn prepare_write_cache_plan(
             || matches!(mode, DataTransferMode::Direct(_))
             || write_through
             || opened.timestamp_policy().requires_journaled_write()
+            || !opened.file_control_block().archive_is_set()
             || end > eof
         {
             return Ok(WriteCachePlan::PurgeBeforeDirect(PassiveWork::purge(
@@ -1060,6 +1061,16 @@ fn write_regular_file_windowed(
         }
         windows.completed()
     };
+    let node = NodeId::File(file_id);
+    if let Some(overlay) = super::set::archive_overlay(
+        mutation
+            .staged_node_metadata(node)?
+            .windows_attributes()
+            .bits(),
+    )? {
+        let node = mutation.node(node)?;
+        mutation.set_windows_overlay(node, overlay)?;
+    }
     let position = match authority {
         RegularFileDataAuthority::Handle => request.with_active(|active| {
             let file_object = active.current_stack()?.file_object()?;

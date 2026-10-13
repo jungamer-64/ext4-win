@@ -198,6 +198,10 @@ fn basic_timestamp_sentinels_keep_values_and_select_handle_policy() {
         AutomaticTimeUpdate::Suppressed
     );
     assert_eq!(
+        super::BasicTimeUpdate::Set(time).automatic(AutomaticTimeUpdate::Enabled),
+        AutomaticTimeUpdate::Suppressed
+    );
+    assert_eq!(
         super::BasicTimeUpdate::decode(LARGE_INTEGER { QuadPart: -3 }),
         Err(DriverError::InvalidParameter)
     );

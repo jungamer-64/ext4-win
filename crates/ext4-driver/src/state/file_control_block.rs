@@ -140,6 +140,11 @@ impl FileControlBlock {
         self.stream_context.sizes()
     }
 
+    /// Observes the committed archive attribute before selecting a data-only cache write.
+    pub(crate) fn archive_is_set(&self) -> bool {
+        self.stream_context.archive_is_set()
+    }
+
     /// Rules out native residency without waiting for a Cc/MM owner.
     /// # Errors
     ///

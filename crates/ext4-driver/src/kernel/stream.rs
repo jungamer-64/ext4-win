@@ -596,6 +596,26 @@ impl core::fmt::Debug for StreamContext {
     reason = "the audited wrapper is the sole Rust boundary for the opaque native advanced FCB header"
 )]
 impl StreamContext {
+    /// Observes the archive bit from the sole coherent committed metadata projection.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the retained native header serializes this observation with its metadata mutex"
+        )
+    )]
+    pub(crate) fn archive_is_set(&self) -> bool {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This owner retains the native header through its bounded metadata observation.
+            ext4win_stream_archive_is_set(self.header.as_ptr()) != 0
+        }
+        #[cfg(test)]
+        self.metadata.lock().is_ok_and(|metadata| {
+            metadata
+                .is_some_and(|metadata| metadata.attributes & wdk_sys::FILE_ATTRIBUTE_ARCHIVE != 0)
+        })
+    }
     /// Allocates a node advanced header in an unbound construction state.
     ///
     /// The enclosing Rust owner must reach pinned storage and call [`Self::bind_node_owner`]
@@ -1283,6 +1303,11 @@ impl StreamContext {
                     }
                     let main = self.main_resource()?.ordinary_shared(self.sections.get());
                     self.ensure_ordinary_io(true)?;
+                    if !self.archive_is_set() {
+                        return Err(DriverError::CacheManagerFailure(
+                            crate::kernel::status::STATUS_RETRY,
+                        ));
+                    }
                     if !unsafe {
                         // SAFETY: The same retained request rechecks Cc without waiting under MainResource.
                         admission.accepted(transfer.file_object().as_ptr(), _length, false)
@@ -1376,6 +1401,9 @@ impl StreamContext {
                 }
                 let _main = self.main_resource()?.ordinary_shared(self.sections.get());
                 self.ensure_ordinary_io(request.action() == crate::irp::MdlTransfer::Write)?;
+                if request.action() == crate::irp::MdlTransfer::Write && !self.archive_is_set() {
+                    return Err(DriverError::NotSupported);
+                }
                 if request.action() == crate::irp::MdlTransfer::Write
                     && !unsafe {
                         // SAFETY: The same retained request rechecks admission without waiting under MainResource.
@@ -2063,6 +2091,9 @@ unsafe extern "system" {
         allocation_charge_out: *mut i64,
     ) -> NTSTATUS;
 
+    /// Observes the committed archive attribute under the native header mutex.
+    fn ext4win_stream_archive_is_set(header: *mut c_void) -> u8;
+
     fn ext4win_stream_publish_metadata(
         stream_header: wdk_sys::PVOID,
         allocation_size: i64,
@@ -2470,6 +2501,7 @@ mod tests {
         let stream =
             StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
         assert_eq!(stream.sizes()?, StreamSizes::EMPTY);
+        assert!(!stream.archive_is_set());
         assert!(
             stream
                 .metadata

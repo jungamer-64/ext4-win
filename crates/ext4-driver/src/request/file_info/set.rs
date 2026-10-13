@@ -480,7 +480,7 @@ enum BasicTimeUpdate {
     Suppress,
     /// Keep the value and resume subsequent automatic updates.
     Resume,
-    /// Assign an explicit timestamp without changing the handle's automatic-update policy.
+    /// Assign an explicit timestamp and suppress subsequent automatic updates on this handle.
     Set(Ext4Timestamp),
 }
 
@@ -511,7 +511,8 @@ impl BasicTimeUpdate {
         match self {
             Self::Suppress => AutomaticTimeUpdate::Suppressed,
             Self::Resume => AutomaticTimeUpdate::Enabled,
-            Self::Keep | Self::Set(_) => current,
+            Self::Set(_) => AutomaticTimeUpdate::Suppressed,
+            Self::Keep => current,
         }
     }
 }
@@ -535,7 +536,7 @@ impl BasicTimeUpdates {
     /// Returns invalid parameter for unsupported timestamp values.
     fn decode(info: wdk_sys::FILE_BASIC_INFORMATION) -> DriverResult<Self> {
         let created = match large_integer_quad(info.CreationTime) {
-            0 | -1 => None,
+            -2..=0 => None,
             value if value < 0 => return Err(DriverError::InvalidParameter),
             _ => Some(windows_timestamp(info.CreationTime)?),
         };
@@ -557,7 +558,7 @@ impl BasicTimeUpdates {
         )
     }
 
-    /// Changes only fields explicitly selecting suppression or resumption.
+    /// Explicit assignments and -1 suppress updates; -2 resumes them and zero retains policy.
     const fn policy(self, current: HandleTimestampPolicy) -> HandleTimestampPolicy {
         HandleTimestampPolicy {
             accessed: self.accessed.automatic(current.accessed),
@@ -1084,7 +1085,7 @@ impl PreparedHardLinkMutation {
             target_collision,
         )?;
         count_effect.validate(source_metadata.links_count)?;
-        let archive_overlay = hard_link_archive_overlay(source_metadata.overlay_attributes)?;
+        let archive_overlay = archive_overlay(source_metadata.overlay_attributes)?;
         Ok(Self {
             source,
             source_node,
@@ -1225,11 +1226,11 @@ fn prepare_hard_link_destination(
     ))
 }
 
-/// Returns the archive overlay update required by successful hard-link creation.
+/// Returns the archive transition required by a successful file modification.
 /// # Errors
 ///
 /// Returns an error when the combined overlay cannot inhabit the ext4 Windows-attribute domain.
-fn hard_link_archive_overlay(
+pub(super) fn archive_overlay(
     current_attributes: wdk_sys::ULONG,
 ) -> DriverResult<Option<WindowsOverlay>> {
     if current_attributes & Ext4WindowsAttributes::ARCHIVE != 0 {

@@ -3523,6 +3523,15 @@ enum MutationOperationState {
         /// Restartable core resolve state entered only after coherency succeeds.
         resolve: MutationResolveOperation,
     },
+    /// Basic information waits for all previously accepted cached data before assigning metadata.
+    MetadataFlushing {
+        /// Unique top-level completion authority.
+        owned: OwnedIrp,
+        /// Epoch pinned before the explicit assignment's resolve attempt.
+        epoch: EpochLease,
+        /// Resolver entered only after previous cached writes have completed.
+        resolve: MutationResolveOperation,
+    },
     /// A resolved size mutation establishes its native cache/section gate outside the actor.
     PreparingSizeChange {
         /// Unique top-level completion authority.
@@ -5110,6 +5119,9 @@ impl MutationRequestOperation {
                             resolve,
                         },
                         crate::irp::PassiveWorkCompletion::Purge(result),
+                    ) | (
+                        MutationOperationState::MetadataFlushing { owned, epoch, resolve },
+                        crate::irp::PassiveWorkCompletion::Flush(result),
                     ) => {
                         return match result {
                             Ok(()) => MutationStep::Resolve { operation: self, owned, attempt: ResolutionAttempt {
@@ -5413,6 +5425,44 @@ impl MutationRequestOperation {
                         crate::request::file_info::WriteCachePlan::Direct => {}
                     }
                 }
+                if matches!(event, OperationEvent::Admitted)
+                    && matches!(self.request, PreparedMutationRequest::SetInformation(_))
+                {
+                    let work = owned.request().with_active(|active| {
+                        let current = active.current_stack()?;
+                        if current.set_file()?.operation() != crate::irp::SetFileOperation::Basic {
+                            return Ok(None);
+                        }
+                        let file = current.file_object()?;
+                        let opened = crate::state::OpenedObject::decode(file)?;
+                        if !matches!(opened.node(), ext4_core::NodeId::File(_)) {
+                            return Ok(None);
+                        }
+                        let lease = access.acquire_file_object_cache_lease(file)?;
+                        Ok::<_, DriverError>(Some(crate::irp::PassiveWork::flush(
+                            lease.into_stream(),
+                        )))
+                    });
+                    match work {
+                        Ok(Some(work)) => {
+                            self.state = MutationOperationState::MetadataFlushing {
+                                owned,
+                                epoch,
+                                resolve,
+                            };
+                            return MutationStep::Transition(
+                                OperationTransition::SubmitPassiveWork {
+                                    work,
+                                    suspended: self,
+                                },
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
+                    }
+                }
                 MutationStep::Resolve {
                     operation: self,
                     owned,
@@ -5426,7 +5476,8 @@ impl MutationRequestOperation {
                 }
             }
             MutationOperationState::CacheWriting { .. }
-            | MutationOperationState::CachePurging { .. } => {
+            | MutationOperationState::CachePurging { .. }
+            | MutationOperationState::MetadataFlushing { .. } => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
@@ -5826,6 +5877,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 | MutationOperationState::PreparingVerity { .. }
                 | MutationOperationState::CacheWriting { .. }
                 | MutationOperationState::CachePurging { .. }
+                | MutationOperationState::MetadataFlushing { .. }
                 | MutationOperationState::AwaitingVisibility { .. }
                 | MutationOperationState::PublishingDurable { .. }
                 | MutationOperationState::AwaitingCheckpoint(_)
@@ -5852,6 +5904,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
+            | MutationOperationState::MetadataFlushing { .. }
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
@@ -5965,6 +6018,7 @@ impl InfalliblePublication for MutationRequestOperation {
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }
             | MutationOperationState::CachePurging { .. }
+            | MutationOperationState::MetadataFlushing { .. }
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }

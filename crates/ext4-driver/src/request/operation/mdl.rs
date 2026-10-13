@@ -88,6 +88,8 @@ impl MdlOperation {
     /// # Errors
     ///
     /// Rejects direct/paging transfers, invalid ranges and conflicting byte locks before Cc runs.
+    /// Returns not-supported when a write needs a journaled metadata update or origin-handle
+    /// timestamp suppression; callers must then use an ordinary write instead of exposing pages.
     fn prepare(
         &self,
         owned: &mut OwnedIrp,
@@ -124,6 +126,11 @@ impl MdlOperation {
                     };
                     if opened.write_access() != crate::irp::RegularFileWriteAccess::Positional {
                         return Err(DriverError::AccessDenied);
+                    }
+                    if opened.timestamp_policy().requires_journaled_write()
+                        || !opened.file_control_block().archive_is_set()
+                    {
+                        return Err(DriverError::NotSupported);
                     }
                     (start, stack.length().as_usize(), stack.key())
                 }
