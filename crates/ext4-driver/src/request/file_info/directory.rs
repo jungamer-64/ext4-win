@@ -276,7 +276,7 @@ fn directory_file_index(ordinal: u64) -> u32 {
 
 /// Metadata and EA charge observed together from the query's retained epoch.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DirectoryMetadata {
+struct DirectoryMetadata {
     /// Coherent inode and Windows attribute projection.
     file: FileMetadata,
     /// Windows EA byte charge, without copying EA values into the wire record.
@@ -287,7 +287,7 @@ pub(crate) struct DirectoryMetadata {
 /// # Errors
 ///
 /// Returns an error when any fixed field or UTF-16 name range falls outside the output buffer.
-pub(super) fn pack_directory_record(
+fn pack_directory_record(
     buffer: &mut [u8],
     start: usize,
     class: DirectoryInformationClass,
@@ -599,17 +599,21 @@ impl DirectoryQuery {
             let opened = OpenedDirectory::decode(active.current_stack()?.file_object()?)?;
             opened.search().expression()
         })?;
-        let prepared = request.prepared_query_directory()?;
-        let stack = prepared.stack();
-        let pattern = if existing.is_none() {
-            let matching = request.with_active(|active| {
+        let matching = if existing.is_none() {
+            Some(request.with_active(|active| {
                 let file = active.current_stack()?.file_object()?;
                 Ok::<_, DriverError>(if file.flags() & wdk_sys::FO_OPENED_CASE_SENSITIVE != 0 {
                     ext4_core::WindowsNameMatch::Exact
                 } else {
                     ext4_core::WindowsNameMatch::CaseInsensitive
                 })
-            })?;
+            })?)
+        } else {
+            None
+        };
+        let prepared = request.prepared_query_directory()?;
+        let stack = prepared.stack();
+        let pattern = if let Some(matching) = matching {
             Some(DirectoryPattern::from_prepared(
                 prepared.pattern(),
                 matching,
@@ -716,6 +720,13 @@ impl DirectoryQuery {
                 ea_size,
             }),
         )
+    }
+
+    /// Selects EA observation only when this wire class uses the byte-charge field.
+    pub(crate) fn needs_ea_size(&self, metadata: NodeMetadataSnapshot) -> bool {
+        self.class.ea_size_offset().is_some()
+            && (self.class.reparse_tag_offset().is_some()
+                || metadata.reparse_point() == NodeReparsePoint::None)
     }
 
     /// Commits one packed record locally. A partial first record preserves its original cursor.

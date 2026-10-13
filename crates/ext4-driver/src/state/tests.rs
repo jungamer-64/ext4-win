@@ -5,9 +5,7 @@ use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::ptr::NonNull;
 
-use ext4_core::{
-    ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset, NodeId, WindowsName,
-};
+use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset, NodeId};
 
 use crate::irp::{
     ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
@@ -1018,10 +1016,13 @@ fn decoded_directory_views_share_publication_without_exclusive_references() {
         assert_eq!(directory.id(), DirectoryNodeId::ROOT);
         assert_eq!(first_search.cursor().ordinal(), 0);
         let original = first_search.capture_pattern(DirectoryPattern::All)?;
-        let later =
-            second_search.capture_pattern(DirectoryPattern::Exact(WindowsName::from_utf16(&[
-                u16::from(b'a'),
-            ])?))?;
+        let later_input = crate::irp::PreparedDirectoryPattern::Name(
+            crate::memory::DriverVec::try_copied_from_slice(&[u16::from(b'a')])?,
+        );
+        let later = second_search.capture_pattern(DirectoryPattern::from_prepared(
+            &later_input,
+            ext4_core::WindowsNameMatch::CaseInsensitive,
+        )?)?;
         assert_eq!(original.get(), later.get());
         let mut cursor = first_search.cursor();
         cursor.seek_ordinal(7);

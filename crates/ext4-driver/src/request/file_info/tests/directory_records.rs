@@ -3,6 +3,76 @@ use crate::request::file_info::test_support::*;
 use alloc::vec;
 
 /// # Panics
+/// Fails if directory metadata truncates a 64-bit EOF or reports logical size as physical charge.
+#[test]
+fn directory_metadata_preserves_large_eof_and_allocation_charge() {
+    let result = (|| -> DriverResult<()> {
+        let Some(mut file) = test_metadata(super::FileMetadataKind::File) else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let eof = (1_u64 << 32) + 17;
+        file.size = FileSize::from_bytes(eof);
+        file.allocation_size = FileAllocationSize::from_bytes(4096);
+        let name = WindowsName::from_utf16(&[u16::from(b'a')])?;
+        let class = DirectoryInformationClass::Directory;
+        let layout = DirectoryRecordLayout::new(class, &name)?;
+        let mut buffer = vec![0; layout.padded_size];
+        pack_directory_record(
+            &mut buffer,
+            0,
+            class,
+            1,
+            &name,
+            DirectoryMetadata { file, ea_size: 0 },
+            layout,
+        )?;
+        assert_eq!(
+            le_i64(&buffer, DIRECTORY_END_OF_FILE_OFFSET),
+            i64::try_from(eof).ok()
+        );
+        assert_eq!(
+            le_i64(&buffer, DIRECTORY_ALLOCATION_SIZE_OFFSET),
+            Some(4096)
+        );
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if regular-file enumeration loses its EA byte charge in a legacy or extended class.
+#[test]
+fn directory_metadata_returns_regular_file_ea_charge() {
+    let result = (|| -> DriverResult<()> {
+        let Some(file) = test_metadata(super::FileMetadataKind::File) else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let name = WindowsName::from_utf16(&[u16::from(b'a')])?;
+        for class in [
+            DirectoryInformationClass::Full,
+            DirectoryInformationClass::Both,
+            DirectoryInformationClass::IdBoth,
+            DirectoryInformationClass::IdExtd,
+        ] {
+            let layout = DirectoryRecordLayout::new(class, &name)?;
+            let mut buffer = vec![0; layout.padded_size];
+            pack_directory_record(
+                &mut buffer,
+                0,
+                class,
+                1,
+                &name,
+                DirectoryMetadata { file, ea_size: 29 },
+                layout,
+            )?;
+            assert_eq!(le_u32(&buffer, DIRECTORY_EA_SIZE_OFFSET), Some(29));
+        }
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
 ///
 /// Panics when the names-only directory record loses its Windows wire layout.
 #[test]
@@ -107,8 +177,19 @@ fn identity_directory_records_preserve_exact_windows_layouts() {
         assert_eq!(layout.name_offset, name_offset);
         let mut buffer = vec![0xFF_u8; layout.padded_size];
         assert!(
-            super::pack_directory_record(&mut buffer, 0, class, 7, &name, metadata, layout,)
-                .is_ok()
+            super::pack_directory_record(
+                &mut buffer,
+                0,
+                class,
+                7,
+                &name,
+                super::DirectoryMetadata {
+                    file: metadata,
+                    ea_size: 44
+                },
+                layout,
+            )
+            .is_ok()
         );
         assert_eq!(
             le_u64(&buffer, file_id_offset),
@@ -126,6 +207,14 @@ fn identity_directory_records_preserve_exact_windows_layouts() {
                 Some(wdk_sys::IO_REPARSE_TAG_SYMLINK)
             );
         }
+        assert_eq!(
+            le_u32(&buffer, super::DIRECTORY_EA_SIZE_OFFSET),
+            Some(if reparse_offset.is_some() {
+                44
+            } else {
+                wdk_sys::IO_REPARSE_TAG_SYMLINK
+            })
+        );
         if let Some(offset) = short_offset {
             assert_eq!(byte_at(&buffer, offset), Some(0));
         }

@@ -31,23 +31,39 @@ pub(crate) fn information_size(
     read: &mut impl CommittedReadPass,
     node: ext4_core::NodeId,
 ) -> DriverResult<u32> {
-    let entries = load_windows_eas(read, node)?;
-    windows_ea_size(entries.as_slice())
+    information_size_from_xattrs(&read.read_xattrs(node)?)
 }
 
 /// Windows charges one list header and packed attributes without `NextEntryOffset` or padding.
+/// Only the Windows EA namespace contributes; borrowed name/value validation avoids payload copies.
 /// # Errors
 ///
-/// Returns an error when the Windows EA charge exceeds its 32-bit size domain.
-fn windows_ea_size(entries: &[WindowsEaRecord]) -> DriverResult<u32> {
-    let header: usize = if entries.is_empty() { 0 } else { 4 };
-    let size = entries.iter().try_fold(header, |size, entry| {
-        let packed = full_ea_record_length(entry.name.len(), entry.value.len())?
+/// Rejects malformed stored Windows EA names/values or a charge exceeding its 32-bit wire domain.
+pub(crate) fn information_size_from_xattrs(xattrs: &ext4_core::XattrSet) -> DriverResult<u32> {
+    let mut payload = 0_usize;
+    for (name, value) in xattrs.entries() {
+        if name.namespace() != XattrNamespace::User {
+            continue;
+        }
+        let Some(name) = name.local().strip_prefix(EA_XATTR_PREFIX) else {
+            continue;
+        };
+        WindowsEaName::validate(name)?;
+        WindowsEaValue::validate(value.bytes())?;
+        let packed = full_ea_record_length(name.len(), value.bytes().len())?
             .checked_sub(4)
             .ok_or(DriverError::InternalInvariantViolation)?;
-        size.checked_add(packed)
-            .ok_or(DriverError::InvalidBufferSize)
-    })?;
+        payload = payload
+            .checked_add(packed)
+            .ok_or(DriverError::InvalidBufferSize)?;
+    }
+    let size = if payload == 0 {
+        0
+    } else {
+        payload
+            .checked_add(4)
+            .ok_or(DriverError::InvalidBufferSize)?
+    };
     u32::try_from(size).map_err(|_| DriverError::InvalidBufferSize)
 }
 
@@ -218,6 +234,16 @@ impl WindowsEaName {
     /// Returns an error when the EA name is empty, contains Windows-prohibited characters, uses the reserved ext4win prefix,
     /// or exceeds the one-byte FILE_FULL_EA_INFORMATION name length.
     fn new(name: &[u8]) -> DriverResult<Self> {
+        Self::validate(name)?;
+        Ok(Self {
+            bytes: DriverVec::try_copied_from_slice(name)?,
+        })
+    }
+
+    /// Checks stored or caller EA name bytes without copying their payload.
+    /// # Errors
+    /// Returns invalid-EA-name for prohibited bytes, the reserved prefix, or a wire-length overflow.
+    fn validate(name: &[u8]) -> DriverResult<()> {
         if name.is_empty()
             || name.iter().any(|byte| {
                 *byte < 0x20
@@ -247,9 +273,7 @@ impl WindowsEaName {
             return Err(DriverError::InvalidEaName);
         }
         u8::try_from(name.len()).map_err(|_| DriverError::InvalidEaName)?;
-        Ok(Self {
-            bytes: DriverVec::try_copied_from_slice(name)?,
-        })
+        Ok(())
     }
 
     /// Returns name bytes for Windows and xattr encoding.
@@ -286,10 +310,18 @@ impl WindowsEaValue {
     ///
     /// Returns an error when the value exceeds the two-byte FILE_FULL_EA_INFORMATION value length.
     fn new(value: &[u8]) -> DriverResult<Self> {
-        u16::try_from(value.len()).map_err(|_| DriverError::EaTooLarge)?;
+        Self::validate(value)?;
         Ok(Self {
             bytes: DriverVec::try_copied_from_slice(value)?,
         })
+    }
+
+    /// Validates borrowed EA value bytes without copying them for size-only queries.
+    /// # Errors
+    /// Returns EA-too-large when the Windows value-length field cannot represent this payload.
+    fn validate(value: &[u8]) -> DriverResult<()> {
+        u16::try_from(value.len()).map_err(|_| DriverError::EaTooLarge)?;
+        Ok(())
     }
 
     /// Returns value bytes.
@@ -951,9 +983,27 @@ mod tests {
     /// Panics if EA accounting includes wire offsets or query record alignment.
     #[test]
     fn ea_information_charges_one_header_and_packed_attribute_payloads() {
-        assert_eq!(super::windows_ea_size(&[]), Ok(0));
-        let entries = sample_ea_records();
-        assert_eq!(super::windows_ea_size(entries.as_slice()), Ok(44));
+        let result = (|| -> Result<(), DriverError> {
+            let mut xattrs = ext4_core::XattrSet::empty();
+            assert_eq!(super::information_size_from_xattrs(&xattrs), Ok(0));
+            for (name, value) in [
+                (b"ext4win.ea.alpha".as_slice(), b"one".as_slice()),
+                (b"ext4win.ea.beta".as_slice(), b"two".as_slice()),
+            ] {
+                xattrs.insert(
+                    ext4_core::XattrName::new(ext4_core::XattrNamespace::User, name)?,
+                    ext4_core::XattrValue::new(value)?,
+                )?;
+            }
+            assert_eq!(super::information_size_from_xattrs(&xattrs), Ok(29));
+            xattrs.insert(
+                ext4_core::XattrName::new(ext4_core::XattrNamespace::User, b"unrelated")?,
+                ext4_core::XattrValue::new(b"ignored")?,
+            )?;
+            assert_eq!(super::information_size_from_xattrs(&xattrs), Ok(29));
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
     }
     use alloc::vec;
     use core::ffi::c_void;

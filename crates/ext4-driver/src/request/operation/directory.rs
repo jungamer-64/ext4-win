@@ -160,10 +160,19 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                             cache.access(self.epoch.epoch()),
                             &mut self.crypto,
                             |pass| {
-                                ext4_core::CommittedReadPass::load_node_metadata(
+                                let metadata = ext4_core::CommittedReadPass::load_node_metadata(
                                     pass,
                                     record.node(),
-                                )
+                                )?;
+                                let xattrs = if self.query.needs_ea_size(metadata) {
+                                    Some(ext4_core::CommittedReadPass::read_xattrs(
+                                        pass,
+                                        record.node(),
+                                    )?)
+                                } else {
+                                    None
+                                };
+                                Ok((metadata, xattrs))
                             },
                         )
                     });
@@ -180,8 +189,15 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                                 suspended: self,
                             };
                         }
-                        ReadTransition::Complete(Ok(metadata)) => {
-                            match self.query.append_metadata(record, metadata) {
+                        ReadTransition::Complete(Ok((metadata, xattrs))) => {
+                            let ea_size = xattrs
+                                .as_ref()
+                                .map(crate::request::ea::information_size_from_xattrs)
+                                .transpose();
+                            match ea_size.and_then(|size| {
+                                self.query
+                                    .append_metadata(record, metadata, size.unwrap_or(0))
+                            }) {
                                 Ok(true) => return self.finish(None),
                                 Ok(false) => self.phase = DirectoryPhase::Walking(walk),
                                 Err(error) => return self.fail(error),

@@ -49,48 +49,6 @@ fn large_file_information_preserves_eof_and_inode_allocation_size() {
     assert!(super::pack_network_open_information(&mut network, metadata, stream_sizes).is_ok());
     assert_eq!(le_i64(&network, 32), i64::try_from(allocation_size).ok());
     assert_eq!(le_i64(&network, 40), i64::try_from(eof).ok());
-
-    let name = WindowsName::from_utf16(&[u16::from(b'a')]);
-    assert!(name.is_ok());
-    let Ok(name) = name else {
-        return;
-    };
-    let layout = crate::request::file_info::directory::DirectoryRecordLayout::new(
-        DirectoryInformationClass::Directory,
-        &name,
-    );
-    assert!(layout.is_ok());
-    let Ok(layout) = layout else {
-        return;
-    };
-    let mut directory = [0_u8; 72];
-    assert!(
-        crate::request::file_info::directory::pack_directory_record(
-            &mut directory,
-            0,
-            DirectoryInformationClass::Directory,
-            1,
-            &name,
-            metadata,
-            layout,
-        )
-        .is_ok()
-    );
-    assert_eq!(
-        le_i64(
-            &directory,
-            crate::request::file_info::directory::DIRECTORY_ALLOCATION_SIZE_OFFSET,
-        ),
-        i64::try_from(allocation_size).ok()
-    );
-    assert_eq!(
-        le_i64(
-            &directory,
-            crate::request::file_info::directory::DIRECTORY_END_OF_FILE_OFFSET,
-        ),
-        i64::try_from(eof).ok()
-    );
-
     assert_eq!(
         crate::request::file_info::set::file_size_from_large_integer(wdk_sys::LARGE_INTEGER {
             QuadPart: i64::try_from(eof).unwrap_or(i64::MAX),
