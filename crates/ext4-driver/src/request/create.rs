@@ -792,6 +792,9 @@ impl CreateFileObjectFlags {
     /// Projects FILE_OBJECT flags from decoded create parameters.
     const fn from_parameters(parameters: CreateParameters) -> Self {
         let mut raw = 0;
+        if matches!(parameters.name_match(), ext4_core::WindowsNameMatch::Exact) {
+            raw |= wdk_sys::FO_OPENED_CASE_SENSITIVE;
+        }
         if matches!(parameters.write_commitment(), WriteCommitment::FlushThrough) {
             raw |= wdk_sys::FO_WRITE_THROUGH;
         }

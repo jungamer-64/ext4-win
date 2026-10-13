@@ -274,6 +274,15 @@ fn directory_file_index(ordinal: u64) -> u32 {
     u32::try_from(ordinal).unwrap_or(0)
 }
 
+/// Metadata and EA charge observed together from the query's retained epoch.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirectoryMetadata {
+    /// Coherent inode and Windows attribute projection.
+    file: FileMetadata,
+    /// Windows EA byte charge, without copying EA values into the wire record.
+    ea_size: u32,
+}
+
 /// Packs one variable-length directory information record.
 /// # Errors
 ///
@@ -284,9 +293,13 @@ pub(super) fn pack_directory_record(
     class: DirectoryInformationClass,
     file_index: u32,
     name: &WindowsName,
-    metadata: FileMetadata,
+    metadata: DirectoryMetadata,
     layout: DirectoryRecordLayout,
 ) -> DriverResult<()> {
+    let DirectoryMetadata {
+        file: metadata,
+        ea_size,
+    } = metadata;
     clear_record(buffer, start, layout.unpadded_size)?;
     LittleEndianOutput::new(buffer)
         .write_u32(record_field_offset(start, DIRECTORY_NEXT_ENTRY_OFFSET)?, 0)?;
@@ -327,7 +340,14 @@ pub(super) fn pack_directory_record(
         u32::try_from(utf16_byte_len(name.utf16())?).map_err(|_| DriverError::InvalidParameter)?,
     )?;
     if let Some(offset) = class.ea_size_offset() {
-        LittleEndianOutput::new(buffer).write_u32(record_field_offset(start, offset)?, 0)?;
+        let value = if class.reparse_tag_offset().is_none()
+            && metadata.reparse_point != FileMetadataReparsePoint::None
+        {
+            reparse_tag(metadata.reparse_point)
+        } else {
+            ea_size
+        };
+        LittleEndianOutput::new(buffer).write_u32(record_field_offset(start, offset)?, value)?;
     }
     if let Some(offset) = class.short_name_length_offset() {
         LittleEndianOutput::new(buffer).write_u8(record_field_offset(start, offset)?, 0)?;
@@ -582,7 +602,18 @@ impl DirectoryQuery {
         let prepared = request.prepared_query_directory()?;
         let stack = prepared.stack();
         let pattern = if existing.is_none() {
-            Some(DirectoryPattern::from_prepared(prepared.pattern())?)
+            let matching = request.with_active(|active| {
+                let file = active.current_stack()?.file_object()?;
+                Ok::<_, DriverError>(if file.flags() & wdk_sys::FO_OPENED_CASE_SENSITIVE != 0 {
+                    ext4_core::WindowsNameMatch::Exact
+                } else {
+                    ext4_core::WindowsNameMatch::CaseInsensitive
+                })
+            })?;
+            Some(DirectoryPattern::from_prepared(
+                prepared.pattern(),
+                matching,
+            )?)
         } else {
             None
         };
@@ -676,8 +707,15 @@ impl DirectoryQuery {
         &mut self,
         record: DirectoryRecord,
         metadata: NodeMetadataSnapshot,
+        ea_size: u32,
     ) -> DriverResult<bool> {
-        self.append(record, Some(metadata.into()))
+        self.append(
+            record,
+            Some(DirectoryMetadata {
+                file: metadata.into(),
+                ea_size,
+            }),
+        )
     }
 
     /// Commits one packed record locally. A partial first record preserves its original cursor.
@@ -686,7 +724,7 @@ impl DirectoryQuery {
     fn append(
         &mut self,
         record: DirectoryRecord,
-        metadata: Option<FileMetadata>,
+        metadata: Option<DirectoryMetadata>,
     ) -> DriverResult<bool> {
         let file_index = directory_file_index(record.entry.ordinal());
         let pack = |buffer: &mut [u8], start| match metadata {

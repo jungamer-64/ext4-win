@@ -2,14 +2,14 @@
 
 use crate::kernel::status::{DriverError, DriverResult};
 
-/// Evaluates a case-sensitive expression without changing either input.
+/// Evaluates an expression without changing either input; insensitive expressions are uppercase.
 /// # Errors
 /// Returns invalid-buffer-size for oversized counted strings or a native evaluation failure.
 #[expect(
     unsafe_code,
     reason = "bounded immutable UTF-16 slices remain live through the native expression call"
 )]
-pub(crate) fn matches(expression: &[u16], name: &[u16]) -> DriverResult<bool> {
+pub(crate) fn matches(expression: &[u16], name: &[u16], ignore_case: bool) -> DriverResult<bool> {
     let expression_length = counted_length(expression)?;
     let name_length = counted_length(name)?;
     #[cfg(not(test))]
@@ -23,6 +23,7 @@ pub(crate) fn matches(expression: &[u16], name: &[u16]) -> DriverResult<bool> {
                 expression_length,
                 name.as_ptr(),
                 name_length,
+                u8::from(ignore_case),
                 &mut matched,
             )
         };
@@ -45,9 +46,36 @@ pub(crate) fn matches(expression: &[u16], name: &[u16]) -> DriverResult<bool> {
         };
         Ok(unsafe {
             // SAFETY: ntdll evaluates counted immutable strings with the same expression contract.
-            RtlIsNameInExpression(&expression, &name, 0, core::ptr::null()) != 0
+            RtlIsNameInExpression(&expression, &name, u8::from(ignore_case), core::ptr::null()) != 0
         })
     }
+}
+
+/// Normalizes an owned insensitive expression once using the Windows uppercase table.
+/// # Errors
+/// Rejects strings that exceed the counted-string byte-length domain.
+#[expect(
+    unsafe_code,
+    reason = "the exclusive bounded slice owns every transformed UTF-16 unit"
+)]
+pub(crate) fn uppercase(units: &mut [u16]) -> DriverResult<()> {
+    let length = counted_length(units)?;
+    #[cfg(not(test))]
+    unsafe {
+        // SAFETY: Length fits USHORT and the exclusive slice retains the complete writable range.
+        ext4win_upcase_expression(units.as_mut_ptr(), length);
+    }
+    #[cfg(test)]
+    {
+        let _length = length;
+        for unit in units {
+            *unit = unsafe {
+                // SAFETY: ntdll accepts one value and returns the Windows UTF-16 uppercase mapping.
+                RtlUpcaseUnicodeChar(*unit)
+            };
+        }
+    }
+    Ok(())
 }
 
 /// Returns the UTF-16 byte length for UNICODE_STRING.
@@ -69,8 +97,11 @@ unsafe extern "system" {
         expression_length: u16,
         name: *const u16,
         name_length: u16,
+        ignore_case: u8,
         matched: *mut u8,
     ) -> wdk_sys::NTSTATUS;
+    /// Uppercases the exclusive counted expression before insensitive FsRtl matching.
+    fn ext4win_upcase_expression(units: *mut u16, length: u16);
 }
 
 #[cfg(test)]
@@ -80,6 +111,8 @@ unsafe extern "system" {
 )]
 #[link(name = "ntdll")]
 unsafe extern "system" {
+    /// Native Windows uppercase mapping for one UTF-16 code unit.
+    fn RtlUpcaseUnicodeChar(unit: u16) -> u16;
     /// Both counted strings and the optional uppercase table remain live through evaluation.
     fn RtlIsNameInExpression(
         expression: *const wdk_sys::UNICODE_STRING,

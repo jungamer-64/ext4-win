@@ -79,68 +79,57 @@ impl DirectorySearch {
     }
 }
 
-/// Caller-supplied directory filename pattern.
+/// Filename expression captured once together with the directory handle's comparison policy.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum DirectoryPattern {
-    /// Enumerate every Windows-representable ext4 entry.
+    /// Every Windows-representable entry.
     All,
-    /// Return the entry with this exact Windows name.
-    Exact(WindowsName),
-    /// Return entries matched by a caller-supplied wildcard expression.
-    Wildcard(DirectoryWildcardPattern),
+    /// A complete Windows name expression, with or without wildcard characters.
+    Expression(DirectoryNameExpression),
 }
 
 impl DirectoryPattern {
-    /// Decodes the captured QueryDirectory filename pattern.
+    /// Captures the original expression and open-time case policy before enumeration.
     /// # Errors
-    ///
-    /// Returns an error when the pattern UNICODE_STRING is malformed, contains unsupported
-    /// wildcards, or is not a valid Windows name.
-    pub(crate) fn from_prepared(pattern: &PreparedDirectoryPattern) -> DriverResult<Self> {
+    /// Returns malformed UTF-16/name, counted-string overflow, or allocation failure.
+    pub(crate) fn from_prepared(
+        pattern: &PreparedDirectoryPattern,
+        matching: ext4_core::WindowsNameMatch,
+    ) -> DriverResult<Self> {
         let PreparedDirectoryPattern::Name(units) = pattern else {
             return Ok(Self::All);
         };
-        let units = units.as_slice();
-        if is_all_directory_pattern(units) {
+        if is_all_directory_pattern(units.as_slice()) {
             return Ok(Self::All);
         }
-        if units.iter().any(|unit| {
-            matches!(
-                *unit,
-                UTF16_ASTERISK | UTF16_QUESTION_MARK | 0x0022 | 0x003C | 0x003E
-            )
-        }) {
-            return DirectoryWildcardPattern::from_utf16(units).map(Self::Wildcard);
-        }
-        WindowsName::from_utf16(units)
-            .map(Self::Exact)
-            .map_err(DriverError::from)
+        DirectoryNameExpression::from_utf16(units.as_slice(), matching).map(Self::Expression)
     }
 
-    /// Returns true when the projected Windows name matches this pattern.
+    /// Matches through the same Windows expression contract for literal and wildcard names.
     /// # Errors
-    /// Returns native expression evaluation failures, including resource exhaustion.
+    /// Returns native evaluation failure before cursor publication.
     pub(crate) fn matches(&self, name: &WindowsName) -> DriverResult<bool> {
         match self {
             Self::All => Ok(true),
-            Self::Exact(requested) => Ok(name.equals(requested)),
-            Self::Wildcard(pattern) => pattern.matches(name),
+            Self::Expression(expression) => expression.matches(name),
         }
     }
 }
 
-/// Owned Windows expression, including DOS wildcard characters.
+/// Owned expression normalized once for the Windows comparison table selected at open.
 #[derive(Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryWildcardPattern {
-    /// UTF-16 expression retained independently of the requestor buffer.
+pub(crate) struct DirectoryNameExpression {
+    /// UTF-16 expression; insensitive expressions are uppercase as required by FsRtl.
     units: DriverVec<u16>,
+    /// Immutable comparison mode from the directory FILE_OBJECT.
+    matching: ext4_core::WindowsNameMatch,
 }
 
-impl DirectoryWildcardPattern {
-    /// Captures a well-formed expression while preserving Windows wildcard syntax.
+impl DirectoryNameExpression {
+    /// Captures a well-formed expression while preserving DOS wildcard syntax.
     /// # Errors
-    /// Returns invalid-name for separators, NUL, or malformed UTF-16, or allocation failure.
-    fn from_utf16(units: &[u16]) -> DriverResult<Self> {
+    /// Returns invalid-name for separators, NUL or malformed UTF-16, or preparation failure.
+    fn from_utf16(units: &[u16], matching: ext4_core::WindowsNameMatch) -> DriverResult<Self> {
         if units
             .iter()
             .any(|unit| matches!(*unit, 0 | 0x002F | 0x003A | 0x005C | 0x007C))
@@ -148,25 +137,28 @@ impl DirectoryWildcardPattern {
         {
             return Err(DriverError::from(ext4_core::Error::InvalidName));
         }
-        Ok(Self {
-            units: DriverVec::try_copied_from_slice(units)?,
-        })
+        let mut units = DriverVec::try_copied_from_slice(units)?;
+        if matching == ext4_core::WindowsNameMatch::CaseInsensitive {
+            crate::kernel::name_expression::uppercase(units.as_mut_slice())?;
+        }
+        Ok(Self { units, matching })
     }
 
-    /// Evaluates the complete Windows expression at the native boundary.
+    /// Evaluates a normalized Windows expression at the native boundary.
     /// # Errors
-    /// Returns native expression evaluation failures, including resource exhaustion.
+    /// Returns native expression evaluation failure.
     fn matches(&self, name: &WindowsName) -> DriverResult<bool> {
-        crate::kernel::name_expression::matches(self.units.as_slice(), name.utf16())
+        crate::kernel::name_expression::matches(
+            self.units.as_slice(),
+            name.utf16(),
+            self.matching == ext4_core::WindowsNameMatch::CaseInsensitive,
+        )
     }
 }
-
 /// UTF-16 `*`.
 const UTF16_ASTERISK: u16 = 0x002A;
 /// UTF-16 `.`.
 const UTF16_DOT: u16 = 0x002E;
-/// UTF-16 `?`.
-const UTF16_QUESTION_MARK: u16 = 0x003F;
 
 /// Returns true for the all-entries patterns accepted without wildcard matching.
 fn is_all_directory_pattern(units: &[u16]) -> bool {
