@@ -614,6 +614,87 @@ impl IdentityWork {
 mod tests {
     use super::*;
     /// # Errors
+    /// Returns identity fixture or prepared-work allocation failure.
+    /// # Panics
+    /// Panics if registry work requests mounted storage or loses a pre-effect cancellation outcome.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture setup propagates failures while assertions check registry authority and cancellation"
+    )]
+    #[test]
+    fn registry_work_admission_is_independent_of_mounted_storage() -> DriverResult<()> {
+        use crate::irp::PassiveWork;
+        use crate::irp::reactor::ReactorTarget;
+        use ext4_security::{Sid, UserMapping};
+
+        let uuid = FilesystemUuid::from_bytes([9; 16]);
+        let sid: Sid = "S-1-5-21-1-2-3-1001".parse()?;
+        let mut users = Vec::new();
+        users
+            .try_reserve_exact(1)
+            .map_err(|_| DriverError::InsufficientResources)?;
+        users.push(UserMapping {
+            sid,
+            uid: ext4_core::Ext4Uid::from_u32(1000),
+        });
+        let mut catalog = IdentityCatalog::empty();
+        catalog.registry = Some(DriverShared::try_new(RegistryStore {})?);
+        let command = IdentityCommand::Replace(Replacement::new(
+            0,
+            MappingSnapshot {
+                uuid,
+                generation: 1,
+                map: IdentityMap::new(users, Vec::new())?,
+            },
+        )?);
+        let PreparedIdentityAction::Work(work) = catalog.prepare(
+            command,
+            ext4_security::MAX_MAPPING_BYTES + ext4_security::CONTROL_REPLY_BYTES,
+        )?
+        else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let mut target = ReactorTarget::ControlDevice(catalog);
+        let work = PassiveWork::Identity(work);
+        work.authorize_storage(|| target.with_mounted_access(|access| access.authorize_storage()))?;
+        let error = DriverError::from(ext4_core::Error::OperationCancelled);
+        let PassiveWork::Identity(work) = work else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let bytes = work.failed(error);
+        let state = ext4_security::MappingState::decode(&bytes)?;
+        assert_eq!(state.outcome, PublicationOutcome::NotSaved);
+        assert_eq!(state.status, error.ntstatus());
+        assert_eq!(state.saved_generation, 0);
+        assert_eq!(state.active.generation, 0);
+        let catalog = target.control_catalog();
+        let binding = catalog.directory.binding(uuid)?;
+        assert_eq!(binding.get().capture()?.get().generation, 0);
+
+        binding
+            .get()
+            .record_failure(PublicationOutcome::Unknown, -123);
+        let PreparedIdentityAction::Work(work) = catalog.prepare(
+            IdentityCommand::Query(uuid),
+            ext4_security::MAX_MAPPING_BYTES + ext4_security::CONTROL_REPLY_BYTES,
+        )?
+        else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let work = PassiveWork::Identity(work);
+        work.authorize_storage(|| target.with_mounted_access(|access| access.authorize_storage()))?;
+        let PassiveWork::Identity(work) = work else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let bytes = work.failed(error);
+        assert_eq!(
+            ext4_security::MappingState::decode(&bytes)?.outcome,
+            PublicationOutcome::Unknown
+        );
+        Ok(())
+    }
+
+    /// # Errors
     /// Returns pool or shared-record allocation failure.
     /// # Panics
     /// Panics if replacement changes a pinned snapshot or loses failure facts.

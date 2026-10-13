@@ -19,7 +19,8 @@ enum ControlState {
         /// Fully captured reply or persistence work.
         action: PreparedIdentityAction,
     },
-    /// The passive completion envelope retains this operation until the effect finishes.
+    /// The passive envelope retains this operation until work finishes or is withdrawn before queueing.
+    /// Cancellation resumes only after that ownership returns; any saved effect remains queryable.
     Waiting(OwnedIrp),
     /// Terminal ownership has been consumed.
     Terminal,
@@ -112,7 +113,7 @@ impl CompletionOperation for IdentityControlOperation {
                 }
             }
             (
-                ControlState::Ready { owned, .. },
+                ControlState::Ready { owned, .. } | ControlState::Waiting(owned),
                 CompletionEvent::Core(ext4_core::OperationEvent::CancelRequested),
             ) => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::from(ext4_core::Error::OperationCancelled))),

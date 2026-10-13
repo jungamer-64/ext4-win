@@ -3109,11 +3109,8 @@ impl CompletionReactor {
         work: crate::irp::PassiveWork,
         suspended: SuspendedOperation,
     ) {
-        if !matches!(
-            work,
-            crate::irp::PassiveWork::Uninitialize { .. }
-                | crate::irp::PassiveWork::CleanupOplock { .. }
-        ) && let Err(error) = self.with_mounted_access(|access| access.authorize_storage())
+        if let Err(error) =
+            work.authorize_storage(|| self.with_mounted_access(|access| access.authorize_storage()))
         {
             self.set_ready_operation_event(
                 index,

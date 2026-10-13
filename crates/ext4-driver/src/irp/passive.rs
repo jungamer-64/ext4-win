@@ -183,6 +183,31 @@ pub(crate) enum PassiveWorkCompletion {
 }
 
 impl PassiveWork {
+    /// Checks mounted storage only for work that can access the volume's data device.
+    /// Registry work owns independent authority; terminal cleanup must remain possible after removal.
+    /// # Errors
+    /// Returns the supplied storage authorization failure before volume work can be queued.
+    pub(crate) fn authorize_storage(
+        &self,
+        authorize: impl FnOnce() -> DriverResult<()>,
+    ) -> DriverResult<()> {
+        match self {
+            Self::Identity(_) | Self::Uninitialize { .. } | Self::CleanupOplock { .. } => Ok(()),
+            Self::SectorSize { .. }
+            | Self::Mdl { .. }
+            | Self::Read { .. }
+            | Self::Write { .. }
+            | Self::Flush { .. }
+            | Self::CloseWriteback { .. }
+            | Self::Purge { .. }
+            | Self::DrainForVolumeLock { .. }
+            | Self::PrepareSizeChange { .. }
+            | Self::PrepareDeletion { .. }
+            | Self::PrepareWriteOpen { .. }
+            | Self::PrepareVerity { .. } => authorize(),
+        }
+    }
+
     /// Captures cleanup-only FsRtl work while the suspended IRP remains the sole completion owner.
     pub(crate) fn cleanup_oplock(
         check: super::CleanupOplock,
