@@ -906,7 +906,7 @@ pub(crate) fn validate_pending_deletion(
     readonly: DeleteReadonlyPolicy,
 ) -> DriverResult<()> {
     let parent = read.load_directory(target.parent())?;
-    match read.lookup_child(&parent, target.name())? {
+    match read.lookup_child(parent.id(), target.name())? {
         ChildLookup::Found(child) if *child.node() == node => {}
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }
@@ -1154,7 +1154,7 @@ fn prepare_hard_link_destination(
 )> {
     let parent = read.load_directory(target_parent)?;
     let target = read.lookup_windows_child(
-        &parent,
+        parent.id(),
         target_windows_name,
         ext4_core::WindowsNameMatch::CaseInsensitive,
     )?;
@@ -1251,7 +1251,7 @@ fn validate_rename_source(
     node: NodeId,
 ) -> DriverResult<()> {
     let parent = read.load_directory(parent)?;
-    match read.lookup_child(&parent, name)? {
+    match read.lookup_child(parent.id(), name)? {
         ChildLookup::Found(child) if *child.node() == node => Ok(()),
         ChildLookup::Found(_) | ChildLookup::NotFound => Err(DriverError::ObjectNameNotFound),
     }
@@ -1410,7 +1410,7 @@ impl PreparedRenameMutation {
         }
         let parent = read.load_directory(target_parent)?;
         let target = read.lookup_windows_child(
-            &parent,
+            parent.id(),
             &WindowsName::from_ext4(&target_name)?,
             ext4_core::WindowsNameMatch::CaseInsensitive,
         )?;
@@ -2152,7 +2152,7 @@ fn resolve_namespace_target(
             .load_directory(parent_id)
             .map_err(|_| DriverError::ObjectPathNotFound)?;
         let child = read.lookup_windows_child(
-            &parent,
+            parent.id(),
             component,
             ext4_core::WindowsNameMatch::CaseInsensitive,
         )?;

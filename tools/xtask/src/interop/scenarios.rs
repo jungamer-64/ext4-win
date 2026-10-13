@@ -651,7 +651,7 @@ fn verify_htree_mutation_profile(
             return Err(ext4_core::Error::InvalidDirectoryEntry);
         }
         if !matches!(
-            ext4_core::CommittedReadPass::lookup_child(pass, &root, &source)?,
+            ext4_core::CommittedReadPass::lookup_child(pass, root.id(), &source)?,
             ext4_core::ChildLookup::Found(_)
         ) {
             return Err(ext4_core::Error::DirectoryEntryNotFound);
@@ -668,8 +668,12 @@ fn verify_htree_mutation_profile(
                 true,
             ),
         ] {
-            let found =
-                ext4_core::CommittedReadPass::lookup_windows_child(pass, &root, requested, policy)?;
+            let found = ext4_core::CommittedReadPass::lookup_windows_child(
+                pass,
+                root.id(),
+                requested,
+                policy,
+            )?;
             match found {
                 ext4_core::ChildLookup::Found(child) if should_exist && child.name() == &source => {
                 }
@@ -851,7 +855,7 @@ fn verify_large_directory_depth_two(
     let ((), exact_lower_reads) = drive_internal_core_read_observed(&image, |pass| {
         let root =
             ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
-        let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, &directory_name)?;
+        let child = ext4_core::CommittedReadPass::lookup_child(pass, root.id(), &directory_name)?;
         let directory_id = match child {
             ext4_core::ChildLookup::Found(child) => match *child.node() {
                 ext4_core::NodeId::Directory(directory) => directory,
@@ -865,7 +869,7 @@ fn verify_large_directory_depth_two(
         };
         let directory = ext4_core::CommittedReadPass::load_directory(pass, directory_id)?;
         if !matches!(
-            ext4_core::CommittedReadPass::lookup_child(pass, &directory, &target_name)?,
+            ext4_core::CommittedReadPass::lookup_child(pass, directory.id(), &target_name)?,
             ext4_core::ChildLookup::Found(_)
         ) {
             return Err(ext4_core::Error::DirectoryEntryNotFound);
@@ -883,7 +887,7 @@ fn verify_large_directory_depth_two(
     let directory_id = drive_internal_core_read(&image, |pass| {
         let root =
             ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
-        let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, &directory_name)?;
+        let child = ext4_core::CommittedReadPass::lookup_child(pass, root.id(), &directory_name)?;
         let directory_id = match child {
             ext4_core::ChildLookup::Found(child) => match *child.node() {
                 ext4_core::NodeId::Directory(directory) => directory,
@@ -1136,7 +1140,7 @@ fn verify_regular_mutation_profile(
     })?;
     let resized = drive_internal_core_read(image, |pass| {
         let root = pass.load_directory(ext4_core::DirectoryNodeId::ROOT)?;
-        let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, &source)?;
+        let child = ext4_core::CommittedReadPass::lookup_child(pass, root.id(), &source)?;
         let ext4_core::ChildLookup::Found(child) = child else {
             return Err(ext4_core::Error::WrongInodeKind);
         };
@@ -1509,7 +1513,7 @@ fn verify_payload_allocation(
         let root = pass.load_directory(ext4_core::DirectoryNodeId::ROOT)?;
         let child = ext4_core::CommittedReadPass::lookup_child(
             pass,
-            &root,
+            root.id(),
             &ext4_core::Ext4Name::new(name)?,
         )?;
         let node = match child {
@@ -1585,7 +1589,7 @@ fn mutation_root_file(
 ) -> ext4_core::Result<(ext4_core::TransactionDirectory, ext4_core::FileNodeId)> {
     let root =
         ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
-    let child = ext4_core::CommittedReadPass::lookup_child(pass, &root, name)?;
+    let child = ext4_core::CommittedReadPass::lookup_child(pass, root.id(), name)?;
     let file_id = match child {
         ext4_core::ChildLookup::Found(child) => match *child.node() {
             ext4_core::NodeId::File(file) => file,
@@ -3934,7 +3938,7 @@ fn verify_directory_enumeration_scaling(
             )?;
             match ext4_core::CommittedReadPass::lookup_child(
                 pass,
-                &root,
+                root.id(),
                 &ext4_core::Ext4Name::new(b"depth2")?,
             )? {
                 ext4_core::ChildLookup::Found(child) => match *child.node() {
@@ -3999,7 +4003,7 @@ fn verify_locked_directory_enumeration(
             ext4_core::CommittedReadPass::load_directory(pass, ext4_core::DirectoryNodeId::ROOT)?;
         match ext4_core::CommittedReadPass::lookup_child(
             pass,
-            &root,
+            root.id(),
             &ext4_core::Ext4Name::new(b"locked")?,
         )? {
             ext4_core::ChildLookup::Found(child) => match *child.node() {

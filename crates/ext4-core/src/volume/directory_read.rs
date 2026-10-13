@@ -127,7 +127,7 @@ enum DirectoryLayout {
 /// An opened directory and the bounded storage state interpreting it.
 #[derive(Debug)]
 struct DirectoryWalk {
-    /// Validated directory inode from the retained read epoch.
+    /// Validated directory inode guarded by its observed resource version.
     directory: DirectoryNode,
     /// Only the extent nodes mapping the currently requested block.
     mapping: ExtentMappingCursor,
@@ -150,21 +150,23 @@ enum ReaderState {
     Failed(Error),
 }
 
-/// Incremental directory traversal against one immutable committed read context.
+/// Incremental directory traversal whose decoded progress belongs to one inode version.
 ///
-/// A reader must remain attached to the same epoch throughout its lifetime. Only its opaque
-/// cursor may be carried to a later epoch. A suspended call retains progress; other failures
-/// terminate this reader and must not be retried. Use DirectoryReadOperation for owned I/O.
+/// A changed directory version terminates the reader; a new reader can acquire a current context
+/// at its opaque cursor. A suspended call retains progress. Use DirectoryReadOperation for owned
+/// I/O and resource validation across completion boundaries.
 #[derive(Debug)]
 pub struct DirectoryReader {
+    /// Identity whose decoded mapping and traversal are owned by this reader.
+    directory: DirectoryNodeId,
     /// Open/active/end protocol state.
     state: ReaderState,
     /// Last consumed coordinate and next raw ordinal.
     cursor: DirectoryScanCursor,
     /// Remaining live records for an explicit ordinal seek.
     skip: u64,
-    /// Snapshot binding rejects accidental continuation on a replacement epoch.
-    epoch: Option<(crate::FilesystemUuid, super::EpochSequence)>,
+    /// Inode version associated with retained decoded traversal.
+    version: Option<ResourceVersion>,
 }
 
 /// One decoded reader stage, before the owning operation retires the raw I/O transcript.
@@ -190,6 +192,7 @@ impl DirectoryReader {
             _ => 0,
         };
         Self {
+            directory,
             state: if matches!(cursor.position, DirectoryScanPosition::End) {
                 ReaderState::End
             } else {
@@ -197,7 +200,7 @@ impl DirectoryReader {
             },
             cursor,
             skip,
-            epoch: None,
+            version: None,
         }
     }
 
@@ -218,11 +221,13 @@ impl DirectoryReader {
         if let ReaderState::Failed(error) = self.state {
             return Err(error);
         }
-        let identity = view.epoch.ok_or(Error::DeviceIo)?;
-        if self.epoch.is_some_and(|expected| expected != identity) {
-            return Err(Error::DeviceIo);
+        view.observe_inode(self.directory.inode())?;
+        let version = view.inode_version(self.directory.inode());
+        if self.version.is_some() && self.version != version {
+            self.state = ReaderState::Failed(Error::ReadConflict);
+            return Err(Error::ReadConflict);
         }
-        self.epoch = Some(identity);
+        self.version = version;
         if let ReaderState::Opening(id) = self.state {
             let directory = view.load_directory(id)?;
             if directory.protection().is_verity() {
@@ -690,7 +695,7 @@ pub enum DirectoryReadTransition {
     Entry {
         /// Caller-visible name, identity and publication cursor.
         entry: ScannedDirectoryEntry,
-        /// Remaining walk in the same immutable epoch.
+        /// Remaining walk with its namespace and unfinished projection dependencies.
         continuation: DirectoryReadOperation,
     },
     /// End of directory or a terminal failure.
@@ -699,10 +704,15 @@ pub enum DirectoryReadTransition {
 
 /// Completion-driven enumeration with depth/leaf-bounded retained storage.
 ///
-/// The caller retains the immutable epoch lease until completion. Entries are yielded once;
-/// only cursors, never decoded nodes, may cross from one request epoch to another.
+/// Each advance admits current metadata and validates retained inode/key dependencies. A changed
+/// dependency consumes the operation with [`Error::ReadConflict`]; only its opaque cursor can be
+/// used for a newly admitted walk. Unrelated publications preserve decoded progress.
 #[derive(Debug)]
 pub struct DirectoryReadOperation {
+    /// Dependencies of decoded progress and unfinished entry projection.
+    observed: ReadObservations,
+    /// Provenance against which this walk last retired raw whole-block metadata.
+    metadata_stamp: Option<super::CacheReadStamp>,
     /// Single directory's decoded progress.
     reader: DirectoryReader,
     /// Unfinished decoding reads plus a fixed recent-read reuse budget.
@@ -710,6 +720,23 @@ pub struct DirectoryReadOperation {
 }
 
 impl DirectoryReadOperation {
+    /// Prepares metadata interpretation for a node identified by this walk.
+    ///
+    /// Namespace and inode versions remain attached through projection I/O. A changed dependency
+    /// terminates the projection before any returned bytes are interpreted.
+    /// # Errors
+    /// Returns allocation failure or an inode not identified by this walk before projection
+    /// ownership is transferred.
+    pub fn entry_read(
+        &self,
+        profile: &MountedProfile,
+        node: NodeId,
+    ) -> Result<super::EpochReadOperation> {
+        Ok(super::EpochReadOperation::entry(
+            profile,
+            self.observed.entry(self.reader.directory, node)?,
+        ))
+    }
     /// Creates a read at a caller's committed cursor.
     #[must_use]
     pub const fn new(
@@ -718,6 +745,8 @@ impl DirectoryReadOperation {
         cursor: DirectoryScanCursor,
     ) -> Self {
         Self {
+            observed: ReadObservations::new(),
+            metadata_stamp: None,
             reader: DirectoryReader::new(directory, cursor),
             storage: StorageTranscript::new(StorageTarget::Filesystem, profile.filesystem_length()),
         }
@@ -733,6 +762,9 @@ impl DirectoryReadOperation {
     ) -> DirectoryReadTransition {
         let mut cache = context.cache;
         let epoch = cache.epoch();
+        if matches!(event, super::OperationEvent::Admitted) {
+            self.observed.retain_directory(self.reader.directory);
+        }
         match event {
             super::OperationEvent::Admitted => {}
             super::OperationEvent::StorageCompleted(completion) => {
@@ -745,11 +777,19 @@ impl DirectoryReadOperation {
             }
             _ => return DirectoryReadTransition::Complete(Err(Error::DeviceIo)),
         }
+        if !context.versions.revalidate_read(&self.observed) {
+            return DirectoryReadTransition::Complete(Err(Error::ReadConflict));
+        }
+        if self.metadata_stamp != Some(cache.stamp()) {
+            self.storage.refresh_metadata(cache.stamp());
+            self.metadata_stamp = Some(cache.stamp());
+        }
         loop {
             let step = {
                 let device =
                     OperationDevice::with_overlay(&mut self.storage, epoch, Some(cache.reborrow()));
-                let mut view = EpochReadView::committed(device, epoch);
+                let mut view =
+                    EpochReadView::observing(device, epoch, context.versions, &mut self.observed);
                 self.reader.step(&mut view, crypto)
             };
             match step {

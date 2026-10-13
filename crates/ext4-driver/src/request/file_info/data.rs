@@ -888,10 +888,6 @@ fn read_regular_file_direct(
         return Ok(IrpCompletion::EMPTY);
     };
 
-    let file = read.load_file(file_id)?;
-    if matches!(authority, RegularFileDataAuthority::Handle) {
-        ordinary_read_length(range.start(), range.length(), file.size().bytes())?;
-    }
     let total = NonZeroUsize::new(range.length()).ok_or(DriverError::InternalInvariantViolation)?;
     let mut windows = DataTransferWindows::new(total);
     let mut snapshot = DriverVec::try_repeated_copy(0_u8, windows.snapshot_capacity())?;
@@ -902,7 +898,7 @@ fn read_regular_file_direct(
             .get_mut(..window.length())
             .ok_or(DriverError::InternalInvariantViolation)?;
         let chunk_offset = range.start().checked_add_len(window.offset())?;
-        let chunk_read = read.read_file(&file, chunk_offset, chunk)?.as_usize();
+        let chunk_read = read.read_file(file_id, chunk_offset, chunk)?.as_usize();
         let source = chunk
             .get(..chunk_read)
             .ok_or(DriverError::InternalInvariantViolation)?;
@@ -917,6 +913,9 @@ fn read_regular_file_direct(
         }
     }
     if let RegularFileDataAuthority::Handle = authority {
+        if bytes_read == 0 {
+            return Err(DriverError::EndOfFile);
+        }
         request.with_active(|active| {
             if active.data_io_kind() != DataIoKind::Handle {
                 return Err(DriverError::InternalInvariantViolation);

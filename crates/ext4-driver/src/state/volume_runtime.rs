@@ -426,6 +426,19 @@ impl VolumeRuntime {
         self.epochs.current()
     }
 
+    /// Combines read reliability admission with current metadata and dependency versions.
+    /// # Errors
+    /// Returns the authoritative volume failure or a mismatched coordinator publication.
+    pub(crate) fn committed_read<'state>(
+        &'state self,
+        cache: &'state mut ext4_core::MetadataCache,
+    ) -> DriverResult<ext4_core::CommittedReadContext<'state>> {
+        self.failure.authorize_read()?;
+        Ok(self
+            .coordinator
+            .read_context(cache.access(self.epochs.current()))?)
+    }
+
     /// Mutation coordinator under reactor-issued intent/commit capability.
     pub(crate) const fn coordinator(&self) -> &MutationCoordinatorState {
         &self.coordinator

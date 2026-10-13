@@ -266,7 +266,7 @@ pub(crate) fn stage_cleanup_deletion(
         plan.target.as_ref()
     };
     let parent = mutation.load_directory(target.parent())?;
-    match mutation.lookup_child(&parent, target.name())? {
+    match mutation.lookup_child(parent.id(), target.name())? {
         ChildLookup::Found(child) if *child.node() == plan.node => {}
         ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
     }

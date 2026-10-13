@@ -24,10 +24,11 @@ pub use event::{
 };
 pub use mount::{
     CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CommittedEpoch,
-    CompletedMount, EpochSequence, ExternalJournalProbeOperation, ExternalJournalProbeOutcome,
-    ExternalJournalProbeTransition, ExternalJournalRequirement, MountOperation, MountTransition,
-    MountedProfile, MutationCoordinatorState, MutationResource, ObservedResourceVersionSet,
-    ResourceVersion, ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
+    CommittedReadContext, CompletedMount, EpochSequence, ExternalJournalProbeOperation,
+    ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
+    MountOperation, MountTransition, MountedProfile, MutationCoordinatorState, MutationResource,
+    ObservedResourceVersionSet, ResourceVersion, ValidatedExternalJournal, VolumeGeometry,
+    VolumeIdentity,
 };
 pub use node::{
     ChildLookup, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,

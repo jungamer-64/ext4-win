@@ -310,7 +310,7 @@ fn read_core_symlink(
     symlink_id: SymlinkNodeId,
 ) -> DriverResult<Vec<u8>> {
     let symlink = read.load_symlink(symlink_id)?;
-    Ok(read.read_symlink(&symlink)?)
+    Ok(read.read_symlink(symlink.id())?)
 }
 
 impl SymlinkReparseData {

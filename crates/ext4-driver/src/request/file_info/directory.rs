@@ -656,7 +656,7 @@ impl DirectoryQuery {
         ))
     }
 
-    /// Starts a fresh core walk in this request's epoch.
+    /// Starts a fresh core walk from this request's private continuation.
     pub(crate) const fn cursor(&self) -> DirectoryCursor {
         self.cursor
     }
@@ -704,7 +704,7 @@ impl DirectoryQuery {
     pub(crate) fn append_name(&mut self, record: DirectoryRecord) -> DriverResult<bool> {
         self.append(record, None)
     }
-    /// Serializes a reserved record using metadata from the retained request epoch.
+    /// Serializes a reserved record whose traversal dependencies remain validated.
     /// # Errors
     /// Returns record layout or metadata serialization failures.
     pub(crate) fn append_metadata(

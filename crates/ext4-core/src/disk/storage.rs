@@ -314,6 +314,15 @@ impl StorageTranscript {
         }
     }
 
+    /// Retires whole metadata images before interpreting another current resource version.
+    /// Inode validation protects payload and decoded progress, but a cached table block can also
+    /// contain an as-yet unobserved neighboring inode. Its raw image cannot acquire new provenance.
+    /// Payload completions remain reusable under their owning operation's inode dependencies.
+    pub(crate) fn refresh_metadata(&mut self, stamp: crate::volume::CacheReadStamp) {
+        self.completed_reads
+            .retain(|read| read.stamp.is_none_or(|previous| previous == stamp));
+    }
+
     /// Retires an already decoded stage while retaining a fixed recent-read working set.
     /// Call only after the consumer has retained its semantic progress. Eviction during a
     /// restartable stage could discard reads that the unfinished stage needs to replay.
@@ -485,12 +494,24 @@ impl<'transcript> OperationDevice<'transcript> {
     /// Returns an error from the transcript read or when the committed overlay cannot be applied
     /// to the requested range.
     pub(crate) fn read_exact_at(&mut self, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
+        self.read_exact_with_stamp(offset, out, None)
+    }
+
+    /// Applies committed overlays while preserving metadata provenance independently of caching.
+    /// # Errors
+    /// Returns storage range, allocation, completion, or overlay failures.
+    fn read_exact_with_stamp(
+        &mut self,
+        offset: ByteOffset,
+        out: &mut [u8],
+        stamp: Option<crate::volume::CacheReadStamp>,
+    ) -> Result<()> {
         if let Some(overlay) = self.overlay
             && overlay.read(self.transcript.target, offset, out)?
         {
             return Ok(());
         }
-        let _stamp = self.transcript.read_exact_at(offset, out, None)?;
+        let _stamp = self.transcript.read_exact_at(offset, out, stamp)?;
         if let Some(overlay) = self.overlay {
             overlay.apply(self.transcript.target, offset, out)?;
         }
@@ -506,8 +527,9 @@ impl<'transcript> OperationDevice<'transcript> {
         out: &mut [u8],
     ) -> Result<()> {
         validate_device_range(self.transcript.len(), offset, out.len())?;
+        let stamp = self.cache.as_ref().map(crate::MetadataCacheAccess::stamp);
         let Some(cache) = self.cache.as_mut().filter(|cache| cache.enabled()) else {
-            return self.read_exact_at(offset, out);
+            return self.read_exact_with_stamp(offset, out, stamp);
         };
         let block_size = cache.block_size();
         let width = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;

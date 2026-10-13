@@ -42,9 +42,18 @@ enum MutationResourceDomain {
     VolumeMetadata,
     /// Mount-scoped fscrypt key snapshot.
     KeySet,
+    /// One complete filesystem metadata image written through the journal.
+    MetadataBlock,
 }
 
 impl MutationResource {
+    /// Names the physical unit preserved by a journal metadata image.
+    pub(crate) const fn metadata_block(block: BlockAddress) -> Self {
+        Self {
+            domain: MutationResourceDomain::MetadataBlock,
+            identity: block.get(),
+        }
+    }
     /// Builds an inode resource identity.
     pub(crate) fn inode(inode: InodeId) -> Self {
         Self {
@@ -171,7 +180,7 @@ struct ResourceVersionEntry {
 
 /// Fallibly expanding index of committed resource versions.
 #[derive(Debug)]
-struct ResourceVersionTable {
+pub(super) struct ResourceVersionTable {
     /// Open-addressed slots, with growth admitted before lower I/O.
     slots: Vec<Option<ResourceVersionEntry>>,
     /// Number of populated resource identities.
@@ -194,6 +203,7 @@ impl ResourceVersionTable {
             MutationResourceDomain::BlockGroup => 2,
             MutationResourceDomain::VolumeMetadata => 3,
             MutationResourceDomain::KeySet => 4,
+            MutationResourceDomain::MetadataBlock => 5,
         };
         let mut hash = resource.identity ^ domain.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -600,9 +610,129 @@ impl StorageReadOverlay for CommittedEpoch {
 #[derive(Debug)]
 pub(crate) enum JournalCoordinatorState {
     /// Clean journal with space available for one commit.
-    Ready(Journal<CleanJournal>),
+    Ready {
+        /// Clean log whose space can admit the next commit.
+        journal: Journal<CleanJournal>,
+        /// Published identity paired with the version table while no checkpoint is pending.
+        epoch: (FilesystemUuid, EpochSequence),
+    },
     /// Commit is visible, while an independent checkpoint still owns the dirty journal state.
-    CheckpointPending,
+    CheckpointPending {
+        /// Durable overlay identity paired with versions until home-block durability completes.
+        epoch: (FilesystemUuid, EpochSequence),
+    },
+}
+
+impl JournalCoordinatorState {
+    /// Identity published by the transition that owns this journal phase.
+    const fn epoch(&self) -> (FilesystemUuid, EpochSequence) {
+        match self {
+            Self::Ready { epoch, .. } | Self::CheckpointPending { epoch } => *epoch,
+        }
+    }
+}
+
+/// Current committed metadata and its resource-version observation authority.
+///
+/// Constructed by the coordinator at each synchronous pass. An epoch retains metadata and
+/// keys, not old disk sectors; suspended reads must revalidate their inode dependencies before
+/// interpreting any returned buffer. Unrelated publications do not invalidate a read.
+#[derive(Debug)]
+pub struct CommittedReadContext<'state> {
+    /// Current metadata and cache borrow.
+    pub(super) cache: crate::MetadataCacheAccess<'state>,
+    /// Sole committed resource-version authority.
+    pub(super) versions: &'state ResourceVersionTable,
+}
+
+/// Dependencies retained by one completion-driven read.
+#[derive(Debug, Default)]
+pub(super) struct ReadObservations {
+    /// Ordinary file reads and directory/entry projections need no dependency allocation.
+    inline: [Option<ObservedResourceVersion>; 2],
+    /// Traversals that interpret additional independent inodes admit their storage fallibly.
+    additional: Vec<ObservedResourceVersion>,
+}
+
+impl ReadObservations {
+    /// Starts a read without any interpreted storage dependency.
+    pub(super) const fn new() -> Self {
+        Self {
+            inline: [None; 2],
+            additional: Vec::new(),
+        }
+    }
+    /// All dependencies, independent of their storage representation.
+    fn entries(&self) -> impl Iterator<Item = &ObservedResourceVersion> {
+        self.inline.iter().flatten().chain(&self.additional)
+    }
+    /// Records each dependency once, before a lower read can suspend the pass.
+    /// # Errors
+    /// Returns allocation failure before consuming dependent storage bytes.
+    fn include(&mut self, resource: MutationResource, version: ResourceVersion) -> Result<()> {
+        if self.entries().any(|entry| entry.resource == resource) {
+            return Ok(());
+        }
+        let entry = ObservedResourceVersion { resource, version };
+        if let Some(slot) = self.inline.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(entry);
+        } else {
+            self.additional.try_push(entry)?;
+        }
+        Ok(())
+    }
+
+    /// Retains the namespace and inode identity of a directory record through its metadata read.
+    /// # Errors
+    /// Returns allocation failure before handing entry projection to another read operation.
+    pub(super) fn entry(&self, directory: DirectoryNodeId, node: NodeId) -> Result<Self> {
+        if !self
+            .entries()
+            .any(|entry| entry.resource == MutationResource::inode(node.inode()))
+        {
+            return Err(Error::InvalidInode);
+        }
+        let mut observed = Self::new();
+        for entry in self.entries().filter(|entry| {
+            entry.resource == MutationResource::inode(directory.inode())
+                || entry.resource == MutationResource::inode(node.inode())
+                || entry.resource == MutationResource::KEY_SET
+        }) {
+            observed.include(entry.resource, entry.version)?;
+        }
+        Ok(observed)
+    }
+
+    /// Keeps only directory and key dependencies after an entry's projection is consumed.
+    pub(super) fn retain_directory(&mut self, directory: DirectoryNodeId) {
+        let retained = |entry: &ObservedResourceVersion| {
+            entry.resource == MutationResource::inode(directory.inode())
+                || entry.resource == MutationResource::KEY_SET
+        };
+        for slot in &mut self.inline {
+            if slot.is_some_and(|entry| !retained(&entry)) {
+                *slot = None;
+            }
+        }
+        self.additional.retain(retained);
+    }
+}
+
+impl ResourceVersionTable {
+    /// Whether all bytes decoded by a suspended reader still belong to its observed inodes.
+    pub(super) fn revalidate_read(&self, read: &ReadObservations) -> bool {
+        read.entries()
+            .all(|entry| self.version(entry.resource) == entry.version)
+    }
+}
+
+/// A pass-local read dependency recorder; no mutation or publication authority is exposed.
+#[derive(Debug)]
+struct ReadObservation<'pass, 'state> {
+    /// Dependencies owned by the suspended read operation.
+    observed: &'pass mut ReadObservations,
+    /// Current committed versions for this pass.
+    versions: &'state ResourceVersionTable,
 }
 
 /// Mutable journal cursor, resource versions, and allocation reservations.
@@ -617,13 +747,37 @@ pub struct MutationCoordinatorState {
 }
 
 impl MutationCoordinatorState {
+    /// Published identity paired with the committed resource-version authority.
+    pub(super) const fn published_epoch(&self) -> (FilesystemUuid, EpochSequence) {
+        self.journal.epoch()
+    }
     /// Builds coordinator state after mount replay has produced a clean journal.
-    pub(crate) const fn new(journal: Journal<CleanJournal>) -> Self {
+    pub(crate) const fn new(journal: Journal<CleanJournal>, uuid: FilesystemUuid) -> Self {
         Self {
-            journal: JournalCoordinatorState::Ready(journal),
+            journal: JournalCoordinatorState::Ready {
+                journal,
+                epoch: (uuid, EpochSequence::INITIAL),
+            },
             next_ticket: 0,
             resource_versions: ResourceVersionTable::empty(),
         }
+    }
+
+    /// Admits a read pass against the coordinator's currently published epoch.
+    /// # Errors
+    /// Returns [`Error::StaleReadContext`] when the supplied metadata belongs to another epoch.
+    pub fn read_context<'state>(
+        &'state self,
+        cache: crate::MetadataCacheAccess<'state>,
+    ) -> Result<CommittedReadContext<'state>> {
+        let epoch = cache.epoch();
+        if self.journal.epoch() != (epoch.identity().uuid(), epoch.sequence()) {
+            return Err(Error::StaleReadContext);
+        }
+        Ok(CommittedReadContext {
+            cache,
+            versions: &self.resource_versions,
+        })
     }
 
     /// Allocates one stable FIFO ticket without wrapping.
@@ -688,6 +842,8 @@ impl MutationCoordinatorState {
 /// in a lower completion context.
 #[derive(Debug)]
 pub(super) struct EpochReadView<'storage, 'epoch> {
+    /// Read dependencies; mount and mutation resolution have separate admission protocols.
+    observation: Option<ReadObservation<'storage, 'epoch>>,
     /// Concrete operation storage view.
     pub(super) device: OperationDevice<'storage>,
     /// Current validated superblock snapshot.
@@ -707,6 +863,7 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
         epoch: &'epoch CommittedEpoch,
     ) -> Self {
         Self {
+            observation: None,
             device,
             superblock: epoch.superblock,
             fscrypt_keys: &epoch.fscrypt_keys,
@@ -722,12 +879,51 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
         fscrypt_keys: &'epoch FscryptKeySet,
     ) -> Self {
         Self {
+            observation: None,
             device,
             superblock,
             fscrypt_keys,
             clusters: None,
             epoch: None,
         }
+    }
+
+    /// Constructs a read view whose lower bytes are checked against committed inode versions.
+    pub(super) fn observing(
+        device: OperationDevice<'storage>,
+        epoch: &'epoch CommittedEpoch,
+        versions: &'epoch ResourceVersionTable,
+        observed: &'storage mut ReadObservations,
+    ) -> Self {
+        let mut view = Self::committed(device, epoch);
+        view.observation = Some(ReadObservation { observed, versions });
+        view
+    }
+
+    /// Records an inode dependency before mapping or reading its disk representation.
+    /// # Errors
+    /// Returns allocation failure before issuing an inode-dependent lower read.
+    pub(super) fn observe_inode(&mut self, inode: InodeId) -> Result<()> {
+        self.observe_resource(MutationResource::inode(inode))
+    }
+
+    /// Records a dependency on the current key set before deriving plaintext.
+    /// # Errors
+    /// Returns allocation failure before consuming key-dependent bytes.
+    pub(super) fn observe_resource(&mut self, resource: MutationResource) -> Result<()> {
+        if let Some(observation) = &mut self.observation {
+            observation
+                .observed
+                .include(resource, observation.versions.version(resource))?;
+        }
+        Ok(())
+    }
+
+    /// Current inode version for decoded directory progress, absent during mount or resolution.
+    pub(super) fn inode_version(&self, inode: InodeId) -> Option<ResourceVersion> {
+        self.observation
+            .as_ref()
+            .map(|observation| observation.versions.version(MutationResource::inode(inode)))
     }
 
     /// Returns the committed allocation ownership required by mutation resolution.
@@ -1810,6 +2006,7 @@ impl MountOperation {
                                 epoch: CommittedEpoch::initial(marked, keys, indexed.clusters),
                                 coordinator: MutationCoordinatorState::new(
                                     indexed.publication.journal,
+                                    marked.uuid(),
                                 ),
                             };
                             let completed = match memory::try_box(completed) {
@@ -1895,7 +2092,7 @@ impl MountOperation {
                     let result = {
                         let device = OperationDevice::new(&mut self.filesystem);
                         let view = EpochReadView::committed(device, &mount.completed.epoch);
-                        let JournalCoordinatorState::Ready(journal) =
+                        let JournalCoordinatorState::Ready { journal, .. } =
                             &mount.completed.coordinator.journal
                         else {
                             return MountTransition::Complete(Err(Error::JournalCorrupt));
@@ -1936,8 +2133,13 @@ impl MountOperation {
                         mount.completed.epoch.superblock = completion.superblock;
                         mount.completed.epoch.clusters = completion.clusters;
                         mount.completed.profile.superblock = completion.superblock;
-                        mount.completed.coordinator.journal =
-                            JournalCoordinatorState::Ready(completion.journal);
+                        mount.completed.coordinator.journal = JournalCoordinatorState::Ready {
+                            journal: completion.journal,
+                            epoch: (
+                                mount.completed.epoch.identity().uuid(),
+                                mount.completed.epoch.sequence(),
+                            ),
+                        };
                         self.filesystem = StorageTranscript::new(
                             StorageTarget::Filesystem,
                             self.filesystem.len(),

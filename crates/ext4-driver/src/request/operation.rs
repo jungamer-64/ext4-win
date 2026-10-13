@@ -706,7 +706,7 @@ impl CompletionOperation for MountRequestOperation {
 // IRP move only by value between the reactor and nonpaged completion envelopes.
 unsafe impl Send for MountRequestOperation {}
 
-/// Read-only request executed against one immutable epoch lease.
+/// Read-only request retaining handle authority through current committed read admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadRequestKind {
     /// Regular file data read.
@@ -811,11 +811,9 @@ enum ReadOperationState {
     Terminal,
 }
 
-/// One restartable read operation over a fixed committed epoch.
+/// One completion-driven read whose core transcript revalidates committed inode dependencies.
 #[derive(Debug)]
 struct ReadRequestOperation {
-    /// Immutable epoch pinned independently from later checkpoint publication.
-    epoch: EpochLease,
     /// Concrete mounted lower devices.
     devices: MountedStorageRoute,
     /// Request semantics plus any paging stream lease captured at admission.
@@ -857,7 +855,7 @@ impl ReadRequestOperation {
     /// Allocates and initializes one read operation while preserving IRP ownership on failure.
     /// # Errors
     ///
-    /// Returns the still-owned IRP when mounted-state lookup, crypto/epoch acquisition, or
+    /// Returns the still-owned IRP when mounted-state lookup, crypto acquisition, or
     /// operation allocation fails.
     fn try_new(
         mut owned: OwnedIrp,
@@ -880,19 +878,14 @@ impl ReadRequestOperation {
         };
         let read = EpochReadOperation::new(access.mounted_profile());
         let devices = access.storage_route();
-        let epoch = match access.acquire_epoch() {
-            Ok(epoch) => epoch,
-            Err(error) => return Err(AdmitOperationError::new(error, owned)),
-        };
         match memory::boxed_try_map(
-            (owned, epoch, crypto, request, oplock),
-            |(owned, epoch, crypto, request, oplock)| {
+            (owned, crypto, request, oplock),
+            |(owned, crypto, request, oplock)| {
                 let state = match oplock {
                     Some(check) => ReadOperationState::CheckingOplock { owned, read, check },
                     None => ReadOperationState::Running { owned, read },
                 };
                 Self {
-                    epoch,
                     devices,
                     request,
                     crypto,
@@ -911,7 +904,7 @@ impl ReadRequestOperation {
                 Ok(operation)
             }
             Err(error) => {
-                let (error, (owned, _epoch, _crypto, _request, _oplock)) = error.into_parts();
+                let (error, (owned, _crypto, _request, _oplock)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
         }
@@ -963,17 +956,15 @@ impl ReadRequestOperation {
         OperationTransition::Complete(owned.prepare_result(result))
     }
 
-    /// Reacquires the current durable epoch after a native size gate invalidated a cache plan.
-    fn restart_cache_plan(
+    /// Acquires fresh read admission after cache or inode dependencies have changed.
+    /// The retained handle/paging stream still owns the same inode, and no file position has been
+    /// published. The new pass can suspend again; committed versions cannot change recursively
+    /// while this actor retains mounted access.
+    fn restart_current_read(
         mut self: Box<Self>,
         owned: OwnedIrp,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        let epoch = match access.acquire_epoch() {
-            Ok(epoch) => epoch,
-            Err(error) => return Self::complete(owned, Err(error)),
-        };
-        self.epoch = epoch;
         self.state = ReadOperationState::Running {
             owned,
             read: EpochReadOperation::new(access.mounted_profile()),
@@ -1042,11 +1033,6 @@ impl MountedVolumeOperation for ReadRequestOperation {
             } => {
                 return match event.into_core() {
                     OperationEvent::Admitted if status >= STATUS_SUCCESS => {
-                        let epoch = match access.acquire_epoch() {
-                            Ok(epoch) => epoch,
-                            Err(error) => return Self::complete(owned, Err(error)),
-                        };
-                        self.epoch = epoch;
                         self.state = ReadOperationState::Running { owned, read };
                         self.advance_mounted(
                             CompletionEvent::Core(OperationEvent::Admitted),
@@ -1086,7 +1072,7 @@ impl MountedVolumeOperation for ReadRequestOperation {
                 }),
             ) => {
                 if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
-                    return self.restart_cache_plan(owned, access);
+                    return self.restart_current_read(owned, access);
                 } else {
                     let result = crate::request::file_info::finish_cached_read(
                         owned.request(),
@@ -1103,7 +1089,7 @@ impl MountedVolumeOperation for ReadRequestOperation {
             ) => match result {
                 Ok(()) => (owned, read, OperationEvent::Admitted, true),
                 Err(DriverError::CacheManagerFailure(STATUS_RETRY)) => {
-                    return self.restart_cache_plan(owned, access);
+                    return self.restart_current_read(owned, access);
                 }
                 Err(error) => {
                     record_cache_coherency_failure(error, access);
@@ -1166,7 +1152,10 @@ impl MountedVolumeOperation for ReadRequestOperation {
         let transition = access.with_metadata_cache(|cache, access| {
             read.run(
                 event,
-                cache.access(self.epoch.epoch()),
+                match access.committed_read(cache) {
+                    Ok(context) => context,
+                    Err(error) => return ReadTransition::Complete(Ok(Err(error))),
+                },
                 &mut self.crypto,
                 |pass| match Self::execute_pass(request, &mut owned, access, pass) {
                     Err(DriverError::Core(Error::OperationSuspended)) => {
@@ -1197,6 +1186,9 @@ impl MountedVolumeOperation for ReadRequestOperation {
                 Self::complete(owned, result)
             }
             ReadTransition::Complete(Err(error)) => {
+                if error == Error::ReadConflict {
+                    return self.restart_current_read(owned, access);
+                }
                 let result = Err(DriverError::from(error));
                 if self.request.is_paging() {
                     access
@@ -1232,9 +1224,9 @@ impl MountedVolumeOperation for ReadRequestOperation {
 
 #[expect(
     unsafe_code,
-    reason = "the read operation moves only through the reactor while its VCB and epoch stay retained"
+    reason = "the read operation moves only through the reactor while its VCB and owned buffers stay retained"
 )]
-// SAFETY: The VCB and epoch remain stable until reactor drain, and the unique IRP moves only
+// SAFETY: The VCB remains stable until reactor drain, and the unique IRP moves only
 // between this box and completion envelopes.
 unsafe impl Send for ReadRequestOperation {}
 

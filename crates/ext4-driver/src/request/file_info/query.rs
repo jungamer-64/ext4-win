@@ -851,7 +851,7 @@ fn volume_relative_name(
             let loaded = read.load_directory(*parent)?;
             let visible_name = WindowsName::from_ext4(name)?;
             let child = match read.lookup_windows_child(
-                &loaded,
+                loaded.id(),
                 &visible_name,
                 ext4_core::WindowsNameMatch::Exact,
             )? {
@@ -920,7 +920,7 @@ fn directory_relative_name(
         }
         visited.try_push(directory)?;
         let loaded = read.load_directory(directory)?;
-        let parent = match read.lookup_child(&loaded, &Ext4Name::new(b"..")?)? {
+        let parent = match read.lookup_child(loaded.id(), &Ext4Name::new(b"..")?)? {
             ChildLookup::Found(child) => match *child.node() {
                 NodeId::Directory(parent) => parent,
                 NodeId::File(_) | NodeId::Symlink(_) => {

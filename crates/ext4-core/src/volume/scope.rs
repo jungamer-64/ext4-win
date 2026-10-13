@@ -69,8 +69,8 @@ pub(super) use super::inode_record::{
 };
 pub(super) use super::mount::{
     CommittedEpoch, EpochReadView, JournalCoordinatorState, MountedProfile,
-    MutationCoordinatorState, MutationResource, ObservedResourceVersionSet,
-    ResourceVersionPublication,
+    MutationCoordinatorState, MutationResource, ObservedResourceVersionSet, ReadObservations,
+    ResourceVersion, ResourceVersionPublication,
 };
 pub(super) use super::node::{
     ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,

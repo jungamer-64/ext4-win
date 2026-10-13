@@ -1028,17 +1028,19 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
 
     fn read_file(
         &mut self,
-        file: &FileNode,
+        file: FileNodeId,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
+        let file = self.mutation.volume.load_file(file)?;
         self.mutation
             .volume
-            .read_file(file, offset, out, self.crypto)
+            .read_file(&file, offset, out, self.crypto)
     }
 
-    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
-        self.mutation.volume.read_symlink(symlink)
+    fn read_symlink(&mut self, symlink: SymlinkNodeId) -> Result<Vec<u8>> {
+        let symlink = self.mutation.volume.load_symlink(symlink)?;
+        self.mutation.volume.read_symlink(&symlink)
     }
 
     fn next_directory_entry(
@@ -1054,19 +1056,21 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
         self.mutation.volume.read_hard_links(target, self.crypto)
     }
 
-    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
-        self.mutation.volume.lookup_child(parent, name)
+    fn lookup_child(&mut self, parent: DirectoryNodeId, name: &Ext4Name) -> Result<ChildLookup> {
+        let parent = self.mutation.volume.load_directory(parent)?;
+        self.mutation.volume.lookup_child(&parent, name)
     }
 
     fn lookup_windows_child(
         &mut self,
-        parent: &DirectoryNode,
+        parent: DirectoryNodeId,
         requested: &WindowsName,
         name_match: crate::volume::operation::WindowsNameMatch,
     ) -> Result<ChildLookup> {
+        let parent = self.mutation.volume.load_directory(parent)?;
         self.mutation
             .volume
-            .lookup_windows_child(parent, requested, name_match, self.crypto)
+            .lookup_windows_child(&parent, requested, name_match, self.crypto)
     }
 }
 

@@ -1401,14 +1401,21 @@ where
     let filesystem_length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_internal_core(&mut storage)?;
-    let (profile, epoch, _coordinator) = (*completed).into_parts();
+    let (profile, epoch, coordinator) = (*completed).into_parts();
     let mut cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
     let mut operation = ext4_core::EpochReadOperation::new(&profile);
     let mut event = ext4_core::OperationEvent::Admitted;
     let mut lower_reads = 0_usize;
     let output = loop {
         let mut crypto = RejectingCryptographicOperation;
-        match operation.run(event, cache.access(&epoch), &mut crypto, |pass| read(pass)) {
+        match operation.run(
+            event,
+            coordinator
+                .read_context(cache.access(&epoch))
+                .map_err(core_task_error)?,
+            &mut crypto,
+            |pass| read(pass),
+        ) {
             ext4_core::ReadTransition::SubmitLower { request, suspended } => {
                 if !matches!(&request, ext4_core::StorageRequest::Read { .. }) {
                     return Err(io::Error::other(
@@ -1682,7 +1689,7 @@ fn drive_directory_enumeration(
     let mut storage = FileStorageAdapter::open_internal(image)?;
     let length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
-    let (profile, epoch, _coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut operation = ext4_core::DirectoryReadOperation::new(
         &profile,
         directory,
@@ -1696,7 +1703,9 @@ fn drive_directory_enumeration(
     let cursor = loop {
         match operation.advance(
             event,
-            ext4_core::MetadataCache::default().access(&epoch),
+            coordinator
+                .read_context(ext4_core::MetadataCache::default().access(&epoch))
+                .map_err(core_task_error)?,
             &mut RejectingCryptographicOperation,
         ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
@@ -1742,7 +1751,9 @@ fn drive_directory_enumeration(
     }
     match ext4_core::DirectoryReadOperation::new(&profile, directory, cursor).advance(
         ext4_core::OperationEvent::Admitted,
-        ext4_core::MetadataCache::default().access(&epoch),
+        coordinator
+            .read_context(ext4_core::MetadataCache::default().access(&epoch))
+            .map_err(core_task_error)?,
         &mut RejectingCryptographicOperation,
     ) {
         ext4_core::DirectoryReadTransition::Complete(Ok(end)) if end == cursor => {}
@@ -1767,7 +1778,7 @@ fn verify_directory_read_faults(
     let mut storage = FileStorageAdapter::open_internal(image)?;
     let length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
-    let (profile, epoch, _coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut baseline = Vec::new();
     let mut read_count = 0_usize;
     let mut operation = ext4_core::DirectoryReadOperation::new(
@@ -1779,7 +1790,9 @@ fn verify_directory_read_faults(
     loop {
         match operation.advance(
             event,
-            ext4_core::MetadataCache::default().access(&epoch),
+            coordinator
+                .read_context(ext4_core::MetadataCache::default().access(&epoch))
+                .map_err(core_task_error)?,
             &mut RejectingCryptographicOperation,
         ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
@@ -1821,7 +1834,9 @@ fn verify_directory_read_faults(
             loop {
                 match operation.advance(
                     event,
-                    ext4_core::MetadataCache::default().access(&epoch),
+                    coordinator
+                        .read_context(ext4_core::MetadataCache::default().access(&epoch))
+                        .map_err(core_task_error)?,
                     &mut RejectingCryptographicOperation,
                 ) {
                     ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
@@ -1839,7 +1854,11 @@ fn verify_directory_read_faults(
                             };
                             match suspended.advance(
                                 event,
-                                ext4_core::MetadataCache::default().access(&epoch),
+                                coordinator
+                                    .read_context(
+                                        ext4_core::MetadataCache::default().access(&epoch),
+                                    )
+                                    .map_err(core_task_error)?,
                                 &mut RejectingCryptographicOperation,
                             ) {
                                 ext4_core::DirectoryReadTransition::Complete(Err(error))
@@ -1917,14 +1936,16 @@ fn read_directory_request(
     let mut storage = FileStorageAdapter::open_internal(image)?;
     let length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
-    let (profile, epoch, _coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut operation = ext4_core::DirectoryReadOperation::new(&profile, directory, cursor);
     let mut event = ext4_core::OperationEvent::Admitted;
     let mut names = Vec::new();
     let cursor = loop {
         match operation.advance(
             event,
-            ext4_core::MetadataCache::default().access(&epoch),
+            coordinator
+                .read_context(ext4_core::MetadataCache::default().access(&epoch))
+                .map_err(core_task_error)?,
             &mut RejectingCryptographicOperation,
         ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {

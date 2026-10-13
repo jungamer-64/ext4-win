@@ -251,9 +251,22 @@ impl MetadataMutation<'_, '_> {
         ticket: u64,
         coordinator: &MutationCoordinatorState,
     ) -> Result<ResolvedMutation> {
+        if self.volume.epoch != Some(coordinator.published_epoch()) {
+            return Err(Error::ClusterReferenceConflict);
+        }
         let metadata_blocks = self.metadata_blocks()?;
         let _validated_next_state = self.committed_cluster_state()?;
         let mut observed = ObservedResourceVersionSet::new(ticket);
+        // Journaling replaces whole blocks, including neighboring inode records. Their base
+        // image must therefore be versioned even when the semantic inode intents are disjoint.
+        for block in &metadata_blocks {
+            let resource = MutationResource::metadata_block(block.block());
+            observed.include(resource, coordinator.resource_version(resource))?;
+        }
+        if self.fscrypt_keys_update.is_some() {
+            let resource = MutationResource::KEY_SET;
+            observed.include(resource, coordinator.resource_version(resource))?;
+        }
         let mut node_metadata_updates = Vec::new();
         node_metadata_updates
             .try_reserve_exact(self.inode_updates.len())
@@ -320,9 +333,12 @@ impl ReservedMutation {
         }
         let version_publication =
             coordinator.prepare_version_publication(&self.resolved.observed)?;
-        let JournalCoordinatorState::Ready(journal) = &coordinator.journal else {
+        let JournalCoordinatorState::Ready { journal, epoch } = &coordinator.journal else {
             return Err(Error::JournalCorrupt);
         };
+        if *epoch != (current_epoch.identity().uuid(), current_epoch.sequence()) {
+            return Err(Error::ClusterReferenceConflict);
+        }
 
         let durable_clusters = current_epoch
             .clusters
@@ -459,7 +475,12 @@ impl DurableMutation {
     ) -> PublishedMutation {
         let _ticket = visibility.into_ticket();
         let _durable_journal = self.durable_journal;
-        coordinator.journal = JournalCoordinatorState::CheckpointPending;
+        coordinator.journal = JournalCoordinatorState::CheckpointPending {
+            epoch: (
+                self.durable_epoch.identity().uuid(),
+                self.durable_epoch.sequence(),
+            ),
+        };
         coordinator.publish_versions(self.version_publication);
         PublishedMutation {
             epoch: self.durable_epoch,
@@ -495,7 +516,13 @@ impl CleanJournalDurability {
     /// This transition performs no allocation and cannot return an ordinary error.
     #[must_use]
     pub fn completed(self, coordinator: &mut MutationCoordinatorState) -> CommittedEpoch {
-        coordinator.journal = JournalCoordinatorState::Ready(self.clean_journal);
+        coordinator.journal = JournalCoordinatorState::Ready {
+            journal: self.clean_journal,
+            epoch: (
+                self.checkpointed_epoch.identity().uuid(),
+                self.checkpointed_epoch.sequence(),
+            ),
+        };
         self.checkpointed_epoch
     }
 }

@@ -234,6 +234,7 @@ impl EpochReadView<'_, '_> {
         &mut self,
         inode: &Inode,
     ) -> Result<(FscryptContextV2, &FscryptMasterKey)> {
+        self.observe_resource(MutationResource::KEY_SET)?;
         let Some(context) = self.read_inode_fscrypt_context(inode.id())? else {
             return Err(Error::InvalidEncryptionContext);
         };
@@ -1427,6 +1428,7 @@ impl EpochReadView<'_, '_> {
         &mut self,
         inode_id: InodeId,
     ) -> Result<RawInodeRecord<Vec<u8>>> {
+        self.observe_inode(inode_id)?;
         if inode_id.as_u32() > self.superblock.inode_count().as_u32() {
             return Err(Error::InvalidInode);
         }

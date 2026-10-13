@@ -72,6 +72,10 @@ pub enum Error {
     NoSpace,
     /// Cluster ownership references conflict with allocation state.
     ClusterReferenceConflict,
+    /// Read admission supplied metadata that is no longer the published epoch.
+    StaleReadContext,
+    /// An inode or key dependency changed while a lower read was outstanding.
+    ReadConflict,
     /// The staged mutation cannot fit in one supported journal transaction.
     TransactionTooLarge,
     /// A write operation was outside the file range accepted by that operation.
@@ -118,6 +122,8 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::StaleReadContext => "read context is no longer current",
+            Self::ReadConflict => "read dependency changed during storage I/O",
             Self::DeviceRange => "block read is outside the backing device",
             Self::DeviceIo => "backing device I/O request failed",
             Self::CryptographicFailure => "platform cryptographic operation failed",

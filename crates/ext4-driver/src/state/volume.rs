@@ -1466,6 +1466,17 @@ impl MountedVolumeAccess<'_> {
         self.runtime.acquire_epoch()
     }
 
+    /// Admits current metadata and committed dependency versions for one synchronous read pass.
+    /// # Errors
+    /// Returns storage removal or a mismatched coordinator publication before read interpretation.
+    pub(crate) fn committed_read<'state>(
+        &'state self,
+        cache: &'state mut ext4_core::MetadataCache,
+    ) -> DriverResult<ext4_core::CommittedReadContext<'state>> {
+        self.authorize_storage()?;
+        self.runtime.committed_read(cache)
+    }
+
     /// Allocates one mutation ticket and active-mutation lifetime lease.
     /// # Errors
     ///

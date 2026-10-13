@@ -1,4 +1,4 @@
-//! Completion-driven read operation sessions over immutable committed epochs.
+//! Completion-driven reads with current metadata and revalidated inode dependencies.
 
 use super::scope::*;
 use super::transaction::{MutationResolvePass, ResolvedMutation};
@@ -31,7 +31,7 @@ pub enum WindowsNameMatch {
     CaseInsensitive,
 }
 
-/// Read surface shared by immutable read passes and mutation resolve passes.
+/// Read surface shared by committed read passes and mutation resolve passes.
 ///
 /// These are the two concrete restart-local contexts that may inspect committed state. Neither
 /// implementation can survive suspension: all storage and continuation ownership remains in its
@@ -120,7 +120,7 @@ pub trait CommittedReadPass {
     /// cannot be completed.
     fn read_file(
         &mut self,
-        file: &FileNode,
+        file: FileNodeId,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes>;
@@ -128,7 +128,7 @@ pub trait CommittedReadPass {
     /// # Errors
     ///
     /// Returns an error when the target is malformed, cannot be read, or cannot be allocated.
-    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>>;
+    fn read_symlink(&mut self, symlink: SymlinkNodeId) -> Result<Vec<u8>>;
     /// Advances one entry in an owned directory reader; suspension retains its progress.
     /// # Errors
     ///
@@ -147,14 +147,14 @@ pub trait CommittedReadPass {
     /// # Errors
     ///
     /// Returns an error when the directory is invalid or its storage cannot be searched.
-    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup>;
+    fn lookup_child(&mut self, parent: DirectoryNodeId, name: &Ext4Name) -> Result<ChildLookup>;
     /// Looks up one unambiguous Windows-visible child name.
     /// # Errors
     ///
     /// Returns an error when directory traversal, name decoding, or ambiguity validation fails.
     fn lookup_windows_child(
         &mut self,
-        parent: &DirectoryNode,
+        parent: DirectoryNodeId,
         requested: &WindowsName,
         name_match: WindowsNameMatch,
     ) -> Result<ChildLookup>;
@@ -269,19 +269,21 @@ impl EpochReadPass<'_, '_, '_> {
     /// Returns an error when storage is incomplete or the file mapping is invalid.
     pub fn read_file(
         &mut self,
-        file: &FileNode,
+        file: FileNodeId,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
-        self.view.read_file(file, offset, out, self.crypto)
+        let file = self.view.load_file(file)?;
+        self.view.read_file(&file, offset, out, self.crypto)
     }
 
     /// Reads one symbolic-link target into an owned byte vector.
     /// # Errors
     ///
     /// Returns an error when storage is incomplete or the target is invalid.
-    pub fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
-        self.view.read_symlink(symlink)
+    pub fn read_symlink(&mut self, symlink: SymlinkNodeId) -> Result<Vec<u8>> {
+        let symlink = self.view.load_symlink(symlink)?;
+        self.view.read_symlink(&symlink)
     }
 
     /// Reads one bounded live-directory page.
@@ -307,8 +309,13 @@ impl EpochReadPass<'_, '_, '_> {
     /// # Errors
     ///
     /// Returns an error when storage is incomplete or the directory is invalid.
-    pub fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
-        self.view.lookup_child(parent, name)
+    pub fn lookup_child(
+        &mut self,
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+    ) -> Result<ChildLookup> {
+        let parent = self.view.load_directory(parent)?;
+        self.view.lookup_child(&parent, name)
     }
 
     /// Looks up one unambiguous Windows-visible child name.
@@ -318,12 +325,13 @@ impl EpochReadPass<'_, '_, '_> {
     /// name is ambiguous.
     pub fn lookup_windows_child(
         &mut self,
-        parent: &DirectoryNode,
+        parent: DirectoryNodeId,
         requested: &WindowsName,
         name_match: WindowsNameMatch,
     ) -> Result<ChildLookup> {
+        let parent = self.view.load_directory(parent)?;
         self.view
-            .lookup_windows_child(parent, requested, name_match, self.crypto)
+            .lookup_windows_child(&parent, requested, name_match, self.crypto)
     }
 }
 
@@ -365,14 +373,14 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
 
     fn read_file(
         &mut self,
-        file: &FileNode,
+        file: FileNodeId,
         offset: FileOffset,
         out: &mut [u8],
     ) -> Result<ReadBytes> {
         self.read_file(file, offset, out)
     }
 
-    fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
+    fn read_symlink(&mut self, symlink: SymlinkNodeId) -> Result<Vec<u8>> {
         self.read_symlink(symlink)
     }
 
@@ -387,13 +395,13 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
         self.read_hard_links(target)
     }
 
-    fn lookup_child(&mut self, parent: &DirectoryNode, name: &Ext4Name) -> Result<ChildLookup> {
+    fn lookup_child(&mut self, parent: DirectoryNodeId, name: &Ext4Name) -> Result<ChildLookup> {
         self.lookup_child(parent, name)
     }
 
     fn lookup_windows_child(
         &mut self,
-        parent: &DirectoryNode,
+        parent: DirectoryNodeId,
         requested: &WindowsName,
         name_match: WindowsNameMatch,
     ) -> Result<ChildLookup> {
@@ -401,21 +409,39 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
     }
 }
 
-/// Operation-owned transcript for one logical read against an immutable epoch.
+/// Operation-owned transcript and dependency versions for one logical read.
 ///
-/// The caller retains the immutable epoch lease and logical request arguments. This value retains
-/// only owned lower-read buffers and therefore remains address-independent while suspended.
+/// Each pass requires a current coordinator context. A changed inode or key dependency terminates
+/// the operation with [`Error::ReadConflict`] before interpreting a lower completion; a new read
+/// requires fresh admission. Unrelated publications preserve owned buffers across suspension.
 #[derive(Debug)]
 pub struct EpochReadOperation {
     /// Completed and in-flight reads for the filesystem device.
     filesystem: StorageTranscript,
+    /// Inode and key versions establishing the interpretation of retained storage bytes.
+    observed: ReadObservations,
+    /// Provenance against which this reader last retired raw whole-block metadata.
+    metadata_stamp: Option<super::CacheReadStamp>,
 }
 
 impl EpochReadOperation {
+    /// Opens an entry projection with the dependencies of the traversal that identified it.
+    pub(super) fn entry(profile: &MountedProfile, observed: ReadObservations) -> Self {
+        Self {
+            filesystem: StorageTranscript::new(
+                StorageTarget::Filesystem,
+                profile.filesystem_length(),
+            ),
+            observed,
+            metadata_stamp: None,
+        }
+    }
     /// Creates an empty read transcript for one mounted filesystem device.
     #[must_use]
     pub const fn new(profile: &MountedProfile) -> Self {
         Self {
+            observed: ReadObservations::new(),
+            metadata_stamp: None,
             filesystem: StorageTranscript::new(
                 StorageTarget::Filesystem,
                 profile.filesystem_length(),
@@ -427,7 +453,7 @@ impl EpochReadOperation {
     ///
     /// The closure is invoked at most once for this event and receives only an ephemeral pass. A
     /// lower-storage miss suspends the owning operation by value; unrelated operations are never
-    /// probed.
+    /// probed. A read conflict consumes the operation and cannot resume its transcript.
     #[must_use]
     pub fn run<T>(
         mut self,
@@ -458,9 +484,17 @@ impl EpochReadOperation {
                 return ReadTransition::Complete(Err(Error::DeviceIo));
             }
         }
+        if !context.versions.revalidate_read(&self.observed) {
+            return ReadTransition::Complete(Err(Error::ReadConflict));
+        }
+        if self.metadata_stamp != Some(cache.stamp()) {
+            self.filesystem.refresh_metadata(cache.stamp());
+            self.metadata_stamp = Some(cache.stamp());
+        }
         let result = {
             let device = OperationDevice::with_overlay(&mut self.filesystem, epoch, Some(cache));
-            let mut view = EpochReadView::committed(device, epoch);
+            let mut view =
+                EpochReadView::observing(device, epoch, context.versions, &mut self.observed);
             let mut pass = EpochReadPass {
                 view: &mut view,
                 crypto,

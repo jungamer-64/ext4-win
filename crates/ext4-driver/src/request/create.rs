@@ -1610,7 +1610,7 @@ fn revalidate_existing_open(
         OpenedLocation::DirectoryEntry { parent, name } => {
             let parent = read.load_directory(*parent)?;
             matches!(
-                read.lookup_child(&parent, name)?,
+                read.lookup_child(parent.id(), name)?,
                 ChildLookup::Found(child) if *child.node() == pending.node
             )
         }
@@ -2131,7 +2131,7 @@ fn resolve_path(
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
-        let child = match read.lookup_windows_child(&parent, component.name(), name_match) {
+        let child = match read.lookup_windows_child(parent.id(), component.name(), name_match) {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound)
                 if position == PathComponentPosition::Final
