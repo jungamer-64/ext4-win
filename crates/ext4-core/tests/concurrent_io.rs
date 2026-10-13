@@ -698,3 +698,46 @@ fn current_versions_reject_an_earlier_epoch_at_admission() -> Result<()> {
     fixture.epoch = current;
     Ok(())
 }
+
+/// # Errors
+/// Returns fixture, directory resolution, or namespace mutation failure.
+/// # Panics
+/// Fails when decoded directory progress is reused by resolution against another epoch.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture setup is separate from directory resolution lifetime assertions"
+)]
+fn retained_directory_resolution_rejects_a_replacement_epoch() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let mut reader = DirectoryReader::new(DirectoryNodeId::ROOT, DirectoryScanCursor::start());
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (_resolved, _entry) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        |pass| pass.next_directory_entry(&mut reader),
+    )?;
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let metadata = NewFileMetadata::new(
+            Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(1000)),
+            Ext4Permissions::new(0o644)?,
+        );
+        pass.create_file(root, &Ext4Name::new(b"reader-admission")?, metadata)?;
+        Ok(())
+    })?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    assert!(matches!(
+        fixture.disk.resolve(
+            &fixture.profile,
+            &fixture.epoch,
+            &fixture.coordinator,
+            ticket,
+            |pass| pass.next_directory_entry(&mut reader),
+        ),
+        Err(Error::ReadConflict)
+    ));
+    Ok(())
+}

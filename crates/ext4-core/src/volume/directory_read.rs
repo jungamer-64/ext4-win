@@ -150,11 +150,30 @@ enum ReaderState {
     Failed(Error),
 }
 
-/// Incremental directory traversal whose decoded progress belongs to one inode version.
+/// Admission identity of decoded directory progress.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DirectoryReadBinding {
+    /// A committed reader can continue through unrelated publications on the same filesystem.
+    Observed {
+        /// Filesystem whose directory mapping was decoded.
+        filesystem: crate::FilesystemUuid,
+        /// Directory version established by coordinator read admission.
+        version: ResourceVersion,
+    },
+    /// Resolution has no committed version recorder; decoded progress belongs to its exact epoch.
+    Resolution {
+        /// Filesystem whose directory mapping was decoded.
+        filesystem: crate::FilesystemUuid,
+        /// Snapshot supplying all metadata interpreted by this resolution.
+        epoch: super::EpochSequence,
+    },
+}
+
+/// Incremental directory traversal bound to its interpretation authority.
 ///
-/// A changed directory version terminates the reader; a new reader can acquire a current context
-/// at its opaque cursor. A suspended call retains progress. Use DirectoryReadOperation for owned
-/// I/O and resource validation across completion boundaries.
+/// Committed reads retain a filesystem and directory version; mutation resolution retains an
+/// exact epoch. A changed binding terminates the reader. Only its opaque cursor can transfer to
+/// a newly admitted reader. Use DirectoryReadOperation for owned I/O across completions.
 #[derive(Debug)]
 pub struct DirectoryReader {
     /// Identity whose decoded mapping and traversal are owned by this reader.
@@ -165,8 +184,8 @@ pub struct DirectoryReader {
     cursor: DirectoryScanCursor,
     /// Remaining live records for an explicit ordinal seek.
     skip: u64,
-    /// Inode version associated with retained decoded traversal.
-    version: Option<ResourceVersion>,
+    /// Absent until the first pass establishes ownership of decoded traversal.
+    binding: Option<DirectoryReadBinding>,
 }
 
 /// One decoded reader stage, before the owning operation retires the raw I/O transcript.
@@ -200,7 +219,7 @@ impl DirectoryReader {
             },
             cursor,
             skip,
-            version: None,
+            binding: None,
         }
     }
 
@@ -222,12 +241,19 @@ impl DirectoryReader {
             return Err(error);
         }
         view.observe_inode(self.directory.inode())?;
-        let version = view.inode_version(self.directory.inode());
-        if self.version.is_some() && self.version != version {
+        let (filesystem, epoch) = view.epoch.ok_or(Error::DeviceIo)?;
+        let binding = match view.inode_version(self.directory.inode()) {
+            Some(version) => DirectoryReadBinding::Observed {
+                filesystem,
+                version,
+            },
+            None => DirectoryReadBinding::Resolution { filesystem, epoch },
+        };
+        if self.binding.is_some_and(|expected| expected != binding) {
             self.state = ReaderState::Failed(Error::ReadConflict);
             return Err(Error::ReadConflict);
         }
-        self.version = version;
+        self.binding = Some(binding);
         if let ReaderState::Opening(id) = self.state {
             let directory = view.load_directory(id)?;
             if directory.protection().is_verity() {
