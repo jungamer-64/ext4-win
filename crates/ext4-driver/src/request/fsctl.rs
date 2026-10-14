@@ -326,20 +326,20 @@ const fn key_presence_user_count(presence: FscryptKeyPresence) -> u32 {
 
 /// Parsed fscrypt add-key payload.
 #[derive(Debug, Eq, PartialEq)]
-struct FscryptAddKeyPayload {
+struct FscryptAddKeyPayload<'a> {
     /// Identifier supplied by the Linux-compatible key specifier.
     identifier: FscryptKeyIdentifier,
-    /// Raw key copied out of the transient IRP input mapping before domain validation.
-    raw_key: DriverVec<u8>,
+    /// Raw key borrowed from the captured input until domain validation completes.
+    raw_key: &'a [u8],
 }
 
-impl FscryptAddKeyPayload {
+impl<'a> FscryptAddKeyPayload<'a> {
     /// Parses Linux `struct fscrypt_add_key_arg`.
     /// # Errors
     ///
     /// Returns an error when the add-key buffer is truncated, has unsupported flags/reserved fields,
     /// has inconsistent raw-key length, or the raw key identifier does not match the specifier.
-    fn parse(input: &[u8]) -> DriverResult<Self> {
+    fn parse(input: &'a [u8]) -> DriverResult<Self> {
         if input.len() < FSCRYPT_ADD_KEY_FIXED_BYTES {
             return Err(DriverError::BufferTooSmall);
         }
@@ -364,16 +364,10 @@ impl FscryptAddKeyPayload {
         if raw.len() != raw_size {
             return Err(DriverError::InvalidParameter);
         }
-        let raw_key = DriverVec::try_copied_from_slice(raw)?;
         Ok(Self {
             identifier,
-            raw_key,
+            raw_key: raw,
         })
-    }
-
-    /// Consumes this payload into the validated mount key.
-    fn into_parts(self) -> (FscryptKeyIdentifier, DriverVec<u8>) {
-        (self.identifier, self.raw_key)
     }
 }
 
