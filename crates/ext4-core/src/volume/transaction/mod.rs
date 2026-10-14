@@ -330,8 +330,6 @@ struct MetadataMutation<'storage, 'epoch> {
     free_inodes_delta: i64,
     /// Superblock volume label replacement staged by this transaction.
     volume_label_update: Option<Ext4VolumeLabel>,
-    /// Mount-scoped fscrypt key snapshot prepared during resolve.
-    fscrypt_keys_update: Option<FscryptKeySet>,
     /// Ancestors whose committed parent relation authorizes a directory move.
     namespace_ancestors: Vec<InodeId>,
 }
@@ -363,8 +361,6 @@ pub struct ResolvedMutation {
     free_inodes_delta: i64,
     /// Optional label replacement merged at commit grant.
     volume_label_update: Option<Ext4VolumeLabel>,
-    /// Optional replacement for the mount-scoped fscrypt key snapshot.
-    fscrypt_keys_update: Option<FscryptKeySet>,
 }
 
 impl ResolvedMutation {
@@ -843,42 +839,6 @@ impl MutationResolvePass<'_, '_, '_> {
         self.mutation.volume_label_update = Some(label);
     }
 
-    /// Adds one key to an operation-owned snapshot for allocation-free durable publication.
-    /// # Errors
-    ///
-    /// Returns an error when cloning key material fails or the identifier already exists.
-    pub fn add_fscrypt_key(
-        &mut self,
-        expected_identifier: FscryptKeyIdentifier,
-        raw_key: &[u8],
-    ) -> Result<()> {
-        let key = FscryptMasterKey::from_raw(raw_key, self.crypto)?;
-        if key.identifier() != expected_identifier {
-            return Err(Error::InvalidEncryptionContext);
-        }
-        let mut keys = match self.mutation.fscrypt_keys_update.take() {
-            Some(keys) => keys,
-            None => self.mutation.volume.fscrypt_keys.try_clone()?,
-        };
-        keys.insert(key)?;
-        self.mutation.fscrypt_keys_update = Some(keys);
-        Ok(())
-    }
-
-    /// Removes one key from an operation-owned snapshot for allocation-free publication.
-    /// # Errors
-    ///
-    /// Returns an error when cloning or rebuilding the key set fails.
-    pub fn remove_fscrypt_key(&mut self, identifier: FscryptKeyIdentifier) -> Result<bool> {
-        let mut keys = match self.mutation.fscrypt_keys_update.take() {
-            Some(keys) => keys,
-            None => self.mutation.volume.fscrypt_keys.try_clone()?,
-        };
-        let removed = keys.remove(identifier)?.is_some();
-        self.mutation.fscrypt_keys_update = Some(keys);
-        Ok(removed)
-    }
-
     /// Verifies directory-entry creation policy using the latest staged inode.
     /// # Errors
     ///
@@ -1108,7 +1068,6 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
             free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             volume_label_update: None,
-            fscrypt_keys_update: None,
             namespace_ancestors: Vec::new(),
         }
     }

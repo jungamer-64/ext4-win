@@ -263,10 +263,6 @@ impl MetadataMutation<'_, '_> {
             let resource = MutationResource::metadata_block(block.block());
             observed.include(resource, coordinator.resource_version(resource))?;
         }
-        if self.fscrypt_keys_update.is_some() {
-            let resource = MutationResource::KEY_SET;
-            observed.include(resource, coordinator.resource_version(resource))?;
-        }
         let mut node_metadata_updates = Vec::new();
         node_metadata_updates
             .try_reserve_exact(self.inode_updates.len())
@@ -294,7 +290,6 @@ impl MetadataMutation<'_, '_> {
         if !self.free_clusters_delta.is_zero()
             || self.free_inodes_delta != 0
             || self.volume_label_update.is_some()
-            || self.fscrypt_keys_update.is_some()
         {
             observed.include(
                 MutationResource::VOLUME_METADATA,
@@ -310,7 +305,6 @@ impl MetadataMutation<'_, '_> {
             free_clusters_delta: self.free_clusters_delta,
             free_inodes_delta: self.free_inodes_delta,
             volume_label_update: self.volume_label_update,
-            fscrypt_keys_update: self.fscrypt_keys_update,
         })
     }
 }
@@ -348,10 +342,7 @@ impl ReservedMutation {
             .clusters
             .with_deltas(&self.resolved.cluster_deltas)?;
         let checkpoint_clusters = durable_clusters.try_clone()?;
-        let durable_keys = match self.resolved.fscrypt_keys_update {
-            Some(keys) => keys,
-            None => current_epoch.fscrypt_keys.try_clone()?,
-        };
+        let durable_keys = current_epoch.fscrypt_keys.try_clone()?;
         let checkpoint_keys = durable_keys.try_clone()?;
         let mut superblock = current_epoch.superblock;
         superblock.apply_free_cluster_delta(self.resolved.free_clusters_delta)?;
