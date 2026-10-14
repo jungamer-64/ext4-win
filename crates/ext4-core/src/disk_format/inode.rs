@@ -475,25 +475,41 @@ impl ReadBytes {
     }
 }
 
-/// Ext4 inode timestamp supplied by the caller at a mutation boundary.
+/// Ext4 time with signed Unix seconds and nanosecond precision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ext4Timestamp {
-    /// Low 32-bit Unix seconds stored by ext4 timestamp fields.
-    seconds: u32,
+    /// Seconds in the signed base field plus the two-bit ext4 epoch domain.
+    seconds: i64,
+    /// Fractional second, strictly below one billion.
+    nanoseconds: u32,
 }
 
 impl Ext4Timestamp {
-    /// Creates an ext4 timestamp from low 32-bit Unix seconds.
+    /// Constructs a whole-second time representable even without extended fields.
     #[must_use]
-    pub const fn from_unix_seconds(seconds: u32) -> Self {
-        Self { seconds }
+    pub const fn from_seconds(seconds: i32) -> Self {
+        Self { seconds: seconds as i64, nanoseconds: 0 }
     }
 
-    /// Returns the low 32-bit Unix seconds stored in this timestamp.
+    /// Constructs a time in the ext4 signed-seconds and two-bit epoch range.
+    /// # Errors
+    /// Returns [`Error::InvalidTimestamp`] for out-of-range seconds or nanoseconds.
+    pub const fn new(seconds: i64, nanoseconds: u32) -> Result<Self> {
+        if seconds < -2_147_483_648 || seconds > 15_032_385_535 || nanoseconds >= 1_000_000_000 {
+            return Err(Error::InvalidTimestamp);
+        }
+        Ok(Self { seconds, nanoseconds })
+    }
+
+    /// Signed Unix seconds.
     #[must_use]
-    pub const fn seconds(self) -> u32 {
+    pub const fn seconds(self) -> i64 {
         self.seconds
     }
+
+    /// Nanoseconds within the second.
+    #[must_use]
+    pub const fn nanoseconds(self) -> u32 { self.nanoseconds }
 }
 
 /// ext4 inode timestamps.
