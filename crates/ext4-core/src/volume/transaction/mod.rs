@@ -347,6 +347,9 @@ impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
 pub struct ResolvedMutation {
     /// Resource set and versions observed by this resolve pass.
     observed: ObservedResourceVersionSet,
+    /// Read dependency, revalidated at reservation and commit without serializing disjoint files.
+    /// The commit lane excludes key publication after preparation begins.
+    key_version: Option<ResourceVersion>,
     /// Complete final metadata for every live inode serialized by this mutation.
     node_metadata_updates: Vec<NodeMetadataSnapshot>,
     /// Ordered data images that must be durable before journal metadata is written.
@@ -364,6 +367,14 @@ pub struct ResolvedMutation {
 }
 
 impl ResolvedMutation {
+    /// Tests both exclusive metadata freshness and any consumed mount-key authority.
+    fn is_current(&self, coordinator: &MutationCoordinatorState) -> bool {
+        coordinator.revalidate(&self.observed)
+            && self.key_version.is_none_or(|version| {
+                coordinator.resource_version(MutationResource::KEY_SET) == version
+            })
+    }
+
     /// Resource/version snapshot used for intent acquisition and pre-reservation revalidation.
     #[must_use]
     pub const fn observed_resources(&self) -> &ObservedResourceVersionSet {
@@ -382,8 +393,7 @@ impl ResolvedMutation {
         coordinator: &MutationCoordinatorState,
         intent: super::MutationLease,
     ) -> Result<ReservedMutation> {
-        if intent.into_ticket() != self.observed.ticket() || !coordinator.revalidate(&self.observed)
-        {
+        if intent.into_ticket() != self.observed.ticket() || !self.is_current(coordinator) {
             return Err(Error::ClusterReferenceConflict);
         }
         Ok(ReservedMutation { resolved: self })

@@ -836,12 +836,23 @@ impl MutationCoordinatorState {
     }
 }
 
+/// Whether a pass has consumed mount-key authority while building its result.
+#[derive(Clone, Copy, Debug)]
+enum KeySetDependency {
+    /// No operation in this pass has depended on a master key.
+    Independent,
+    /// Mutation reservation and serialized commit preparation must revalidate the key version.
+    Required,
+}
+
 /// Ephemeral read facade reconstructed for each completion-driven resolve pass.
 ///
 /// It borrows immutable epoch state and an operation-owned storage transcript; it is never stored
 /// in a lower completion context.
 #[derive(Debug)]
 pub(super) struct EpochReadView<'storage, 'epoch> {
+    /// Retains key usage across the remainder of mutation resolution, including plaintext staging.
+    key_dependency: KeySetDependency,
     /// Read dependencies; mount and mutation resolution have separate admission protocols.
     observation: Option<ReadObservation<'storage, 'epoch>>,
     /// Concrete operation storage view.
@@ -863,6 +874,7 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
         epoch: &'epoch CommittedEpoch,
     ) -> Self {
         Self {
+            key_dependency: KeySetDependency::Independent,
             observation: None,
             device,
             superblock: epoch.superblock,
@@ -879,6 +891,7 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
         fscrypt_keys: &'epoch FscryptKeySet,
     ) -> Self {
         Self {
+            key_dependency: KeySetDependency::Independent,
             observation: None,
             device,
             superblock,
@@ -916,7 +929,18 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
                 .observed
                 .include(resource, observation.versions.version(resource))?;
         }
+        if resource == MutationResource::KEY_SET {
+            self.key_dependency = KeySetDependency::Required;
+        }
         Ok(())
+    }
+
+    /// Key snapshot dependency checked before a mutation enters its serialized commit.
+    pub(super) const fn key_dependency(&self) -> Option<MutationResource> {
+        match self.key_dependency {
+            KeySetDependency::Independent => None,
+            KeySetDependency::Required => Some(MutationResource::KEY_SET),
+        }
     }
 
     /// Current inode version for decoded directory progress, absent during mount or resolution.

@@ -1,0 +1,172 @@
+//! Mount-local key publication, serialized with filesystem commits but issuing no storage I/O.
+
+use super::scope::*;
+use super::{CommitLease, MutationLease, VisibilityLease};
+
+/// Replacement key snapshot resolved against one committed key-set version.
+///
+/// Key material is mount-local. Publishing this change does not journal or persist it, and
+/// unmounting discards it. Removing an absent identifier succeeds without granting data access.
+#[derive(Debug)]
+pub struct ResolvedKeyChange {
+    /// Exclusive intent and freshness requirements for the key snapshot.
+    observed: ObservedResourceVersionSet,
+    /// Complete successor, erased if preparation is abandoned.
+    keys: FscryptKeySet,
+}
+
+impl ResolvedKeyChange {
+    /// Resolves insertion of an already validated master key.
+    /// # Errors
+    /// Returns stale epoch, duplicate identifier, or allocation failures before publication.
+    pub fn add(
+        epoch: &CommittedEpoch,
+        coordinator: &MutationCoordinatorState,
+        ticket: u64,
+        key: FscryptMasterKey,
+    ) -> Result<Self> {
+        let mut change = Self::snapshot(epoch, coordinator, ticket)?;
+        change.keys.insert(key)?;
+        Ok(change)
+    }
+
+    /// Resolves removal of one identifier, including an identifier already absent.
+    /// # Errors
+    /// Returns stale epoch or allocation failures before publication.
+    pub fn remove(
+        epoch: &CommittedEpoch,
+        coordinator: &MutationCoordinatorState,
+        ticket: u64,
+        identifier: FscryptKeyIdentifier,
+    ) -> Result<Self> {
+        let mut change = Self::snapshot(epoch, coordinator, ticket)?;
+        drop(change.keys.remove(identifier)?);
+        Ok(change)
+    }
+
+    /// Captures the sole authoritative key snapshot and its resource version together.
+    /// # Errors
+    /// Returns a stale epoch or allocation failure.
+    fn snapshot(
+        epoch: &CommittedEpoch,
+        coordinator: &MutationCoordinatorState,
+        ticket: u64,
+    ) -> Result<Self> {
+        if coordinator.published_epoch() != (epoch.identity().uuid(), epoch.sequence()) {
+            return Err(Error::StaleReadContext);
+        }
+        let mut observed = ObservedResourceVersionSet::new(ticket);
+        observed.include(
+            MutationResource::KEY_SET,
+            coordinator.resource_version(MutationResource::KEY_SET),
+        )?;
+        Ok(Self {
+            observed,
+            keys: epoch.fscrypt_keys.try_clone()?,
+        })
+    }
+
+    /// Resource/version snapshot used to acquire the exclusive key-set intent.
+    #[must_use]
+    pub const fn observed_resources(&self) -> &ObservedResourceVersionSet {
+        &self.observed
+    }
+
+    /// Consumes a matching key-set intent after revalidating its observed version.
+    /// # Errors
+    /// Returns a mismatched ticket or a changed key set before reserving publication authority.
+    pub fn reserve(
+        self,
+        coordinator: &MutationCoordinatorState,
+        intent: MutationLease,
+    ) -> Result<ReservedKeyChange> {
+        if intent.into_ticket() != self.observed.ticket() || !coordinator.revalidate(&self.observed)
+        {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        Ok(ReservedKeyChange { resolved: self })
+    }
+}
+
+/// Key successor protected by its exclusive key-set resource intent.
+#[derive(Debug)]
+pub struct ReservedKeyChange {
+    /// Version-revalidated successor owned until commit preparation or abandonment.
+    resolved: ResolvedKeyChange,
+}
+
+impl ReservedKeyChange {
+    /// Preallocates one successor epoch under the matching serialized commit grant.
+    ///
+    /// The serialized commit lane keeps checkpoint completion from replacing this successor.
+    /// It grants ordering authority only; a key change does not make a journal transaction.
+    /// # Errors
+    /// Returns mismatched grants, stale keys/epoch, a pending checkpoint, or allocation failure.
+    pub fn prepare(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+        current: &CommittedEpoch,
+        commit: CommitLease,
+    ) -> Result<PreparedKeyChange> {
+        let ticket = self.resolved.observed.ticket();
+        if commit.into_ticket() != ticket || !coordinator.revalidate(&self.resolved.observed) {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        let expected_epoch = (current.identity().uuid(), current.sequence());
+        match &coordinator.journal {
+            JournalCoordinatorState::Ready { epoch, .. } if *epoch == expected_epoch => {}
+            _ => return Err(Error::StaleReadContext),
+        }
+        let versions = coordinator.prepare_version_publication(&self.resolved.observed)?;
+        let epoch = CommittedEpoch::prepared(
+            current.sequence().next()?,
+            current.superblock,
+            self.resolved.keys,
+            current.clusters.try_clone()?,
+            Vec::new(),
+        );
+        Ok(PreparedKeyChange {
+            ticket,
+            expected_epoch,
+            epoch,
+            versions,
+        })
+    }
+}
+
+/// Fully prepared mount-key publication; dropping it leaves the published keys unchanged.
+#[derive(Debug)]
+pub struct PreparedKeyChange {
+    /// Mutation whose exclusive grants protect this publication.
+    ticket: u64,
+    /// Published epoch that must still be current at the consuming transition.
+    expected_epoch: (crate::FilesystemUuid, super::EpochSequence),
+    /// Complete successor requiring no allocation during the swap.
+    epoch: CommittedEpoch,
+    /// Key-resource freshness publication, prepared under commit serialization.
+    versions: ResourceVersionPublication,
+}
+
+impl PreparedKeyChange {
+    /// Publishes the key snapshot and read-dependency version in one allocation-free transition.
+    /// # Errors
+    /// Returns a mismatched visibility grant or intervening epoch change before any publication.
+    pub fn publish(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+        visibility: VisibilityLease,
+    ) -> Result<CommittedEpoch> {
+        if visibility.into_ticket() != self.ticket {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        let JournalCoordinatorState::Ready { epoch, .. } = &mut coordinator.journal else {
+            return Err(Error::StaleReadContext);
+        };
+        if *epoch != self.expected_epoch {
+            return Err(Error::StaleReadContext);
+        }
+        *epoch = (self.epoch.identity().uuid(), self.epoch.sequence());
+        coordinator.publish_versions(self.versions);
+        Ok(self.epoch)
+    }
+}

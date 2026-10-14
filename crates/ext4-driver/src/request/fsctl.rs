@@ -197,46 +197,57 @@ pub(crate) fn prepare_verity(
     })
 }
 
-/// Adds an fscrypt master key to the mounted VCB.
+/// Captures and validates a key addition for mount-local publication.
 /// # Errors
 ///
 /// Returns an error when the add-key payload is malformed or the key cannot be added to the mounted
 /// VCB.
-pub(crate) fn add_encryption_key(
+pub(crate) fn resolve_encryption_key_addition(
     request: &mut PendingIrpLease<'_>,
     stack: FileSystemControlStack,
-    mutation: &mut DriverMutationPass<'_, '_, '_>,
-) -> DriverResult<IrpCompletion> {
+    access: &MountedVolumeAccess<'_>,
+    ticket: u64,
+    crypto: &mut dyn ext4_core::CryptographicOperation,
+) -> DriverResult<(ext4_core::ResolvedKeyChange, IrpCompletion)> {
     request.with_active(|active| {
         let input = SensitiveBytes::try_copied_from_slice(
             active.buffered_input(stack.input_buffer_length())?,
         )?;
         let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
         let _volume = mounted_vcb(active)?;
-        mutation.add_fscrypt_key(payload.identifier, payload.raw_key)?;
-        Ok(IrpCompletion::EMPTY)
+        let key = ext4_core::FscryptMasterKey::from_raw(payload.raw_key, crypto)?;
+        if key.identifier() != payload.identifier {
+            return Err(DriverError::from(
+                ext4_core::Error::InvalidEncryptionContext,
+            ));
+        }
+        Ok((
+            access.resolve_key_addition(ticket, key)?,
+            IrpCompletion::EMPTY,
+        ))
     })
 }
 
-/// Removes an fscrypt master key from the mounted VCB.
+/// Resolves mount-local removal and prepares its acknowledgment before publication.
 /// # Errors
 ///
 /// Returns an error when the remove-key payload is malformed, the mounted VCB cannot be resolved, or
 /// the Linux-compatible output buffer is too small.
-pub(crate) fn remove_encryption_key(
+pub(crate) fn resolve_encryption_key_removal(
     request: &mut PendingIrpLease<'_>,
     stack: FileSystemControlStack,
-    mutation: &mut DriverMutationPass<'_, '_, '_>,
-) -> DriverResult<IrpCompletion> {
+    access: &MountedVolumeAccess<'_>,
+    ticket: u64,
+) -> DriverResult<(ext4_core::ResolvedKeyChange, IrpCompletion)> {
     request.with_active(|active| {
         let input = read_input(active, stack)?;
         let payload = FscryptRemoveKeyPayload::parse(input.as_slice())?;
         let _volume = mounted_vcb(active)?;
-        let _removed = mutation.remove_fscrypt_key(payload.identifier())?;
+        let resolved = access.resolve_key_removal(ticket, payload.identifier())?;
 
         let output = output_buffer(active, stack, FSCRYPT_REMOVE_KEY_BYTES)?;
         write_remove_key_output(output)?;
-        completion_for_length(FSCRYPT_REMOVE_KEY_BYTES)
+        Ok((resolved, completion_for_length(FSCRYPT_REMOVE_KEY_BYTES)?))
     })
 }
 
@@ -349,7 +360,7 @@ impl<'a> FscryptAddKeyPayload<'a> {
     /// # Errors
     ///
     /// Returns an error when the add-key buffer is truncated, has unsupported flags/reserved fields,
-    /// has inconsistent raw-key length, or the raw key identifier does not match the specifier.
+    /// or has inconsistent raw-key length. Identifier matching occurs during key resolution.
     fn parse(input: &'a [u8]) -> DriverResult<Self> {
         if input.len() < FSCRYPT_ADD_KEY_FIXED_BYTES {
             return Err(DriverError::BufferTooSmall);

@@ -6,6 +6,8 @@ mod directory_read;
 pub use directory_read::{DirectoryReadOperation, DirectoryReadTransition, DirectoryReader};
 mod event;
 mod inode_record;
+mod keys;
+pub use keys::{PreparedKeyChange, ReservedKeyChange, ResolvedKeyChange};
 mod metadata_cache;
 mod mount;
 pub(crate) use metadata_cache::CacheReadStamp;

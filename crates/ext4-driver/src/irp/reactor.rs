@@ -397,8 +397,8 @@ pub(crate) trait MountedVolumeOperation: fmt::Debug + Send + 'static {
 /// Authority consumed by one allocation-free reactor publication.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PublicationAuthority {
-    /// Durable visibility releases resource intents and the serialized commit grant.
-    Durable {
+    /// Mutation publication releases resource intents and the serialized commit grant.
+    Mutation {
         /// FIFO mutation ticket whose grants are consumed.
         ticket: u64,
     },
@@ -410,13 +410,13 @@ pub(crate) enum PublicationAuthority {
 }
 
 /// Prebuilt publication that reuses its existing operation allocation.
-pub(crate) trait InfalliblePublication: fmt::Debug + Send + 'static {
+pub(crate) trait InfalliblePublication: CompletionOperation {
     /// Scheduler authority consumed by this publication.
     fn authority(&self) -> PublicationAuthority;
 
     /// Publishes prepared values and returns the same box in its next operation phase.
     ///
-    /// A durable publication also transfers its prepared top-level acknowledgment; checkpoint
+    /// A mutation publication also transfers its prepared top-level acknowledgment; checkpoint
     /// publication has none. The caller must end the mounted-volume borrow and release the
     /// top-level handle lane before notifying upper drivers, while retaining checkpoint work.
     fn publish(
@@ -517,7 +517,7 @@ pub(crate) enum OperationTransition {
     },
     /// Apply a prebuilt allocation-free publication and continue one operation.
     Publish {
-        /// Publication values and continuation prepared before durable I/O.
+        /// Publication values and continuation prepared before visibility is granted.
         publication: Box<dyn InfalliblePublication>,
     },
     /// Release operation authority before notifying upper drivers of the prepared result.
@@ -2901,10 +2901,20 @@ impl CompletionReactor {
             }
             OperationTransition::Publish { publication } => {
                 let authority = publication.authority();
+                if matches!(authority, PublicationAuthority::Mutation { .. })
+                    && self.consume_cancellation_before_effect(index)
+                {
+                    self.set_ready_operation_event(
+                        index,
+                        publication,
+                        CompletionEvent::Core(OperationEvent::CancelRequested),
+                    );
+                    return;
+                }
                 self.consume_publication_authority(index, authority);
                 let (operation, completion) =
                     self.with_mounted_access(|access| publication.publish(access));
-                if matches!(authority, PublicationAuthority::Durable { .. }) {
+                if matches!(authority, PublicationAuthority::Mutation { .. }) {
                     self.retire_cancel_slot(index);
                     self.release_handle_lane(index);
                 }
@@ -3072,13 +3082,13 @@ impl CompletionReactor {
     #[cfg(not(test))]
     fn consume_publication_authority(&self, index: usize, authority: PublicationAuthority) {
         match authority {
-            PublicationAuthority::Durable { ticket } => {
+            PublicationAuthority::Mutation { ticket } => {
                 let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
                 else {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 };
                 if !self.with_scheduler(|scheduler| {
-                    scheduler.consume_durable_authority(identity, ticket)
+                    scheduler.consume_mutation_authority(identity, ticket)
                 }) {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }

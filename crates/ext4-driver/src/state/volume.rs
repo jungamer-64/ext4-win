@@ -1499,6 +1499,69 @@ impl MountedVolumeAccess<'_> {
         pass.resolve(ticket, self.runtime.coordinator())
     }
 
+    /// Resolves a validated key insertion against the current mounted key snapshot.
+    /// # Errors
+    /// Returns storage removal, key conflict, or allocation failure.
+    pub(crate) fn resolve_key_addition(
+        &self,
+        ticket: u64,
+        key: ext4_core::FscryptMasterKey,
+    ) -> DriverResult<ext4_core::ResolvedKeyChange> {
+        self.authorize_storage()?;
+        self.runtime.resolve_key_addition(ticket, key)
+    }
+
+    /// Resolves a key removal while its native namespace exclusion remains held.
+    /// # Errors
+    /// Returns storage removal or snapshot allocation failure.
+    pub(crate) fn resolve_key_removal(
+        &self,
+        ticket: u64,
+        identifier: FscryptKeyIdentifier,
+    ) -> DriverResult<ext4_core::ResolvedKeyChange> {
+        self.authorize_storage()?;
+        self.runtime.resolve_key_removal(ticket, identifier)
+    }
+
+    /// Preallocates a version-revalidated key publication under exclusive scheduler grants.
+    /// # Errors
+    /// Returns stale grants or allocation failure before any key becomes visible.
+    pub(crate) fn prepare_key_change(
+        &mut self,
+        change: ext4_core::ReservedKeyChange,
+        commit: CommitLease,
+    ) -> DriverResult<ext4_core::PreparedKeyChange> {
+        self.runtime.prepare_key_change(change, commit)
+    }
+
+    /// Revalidates the key snapshot after the scheduler acquired its exclusive intent.
+    /// # Errors
+    /// Returns a changed key version before commit admission.
+    pub(crate) fn reserve_key_change(
+        &self,
+        change: ext4_core::ResolvedKeyChange,
+        intent: MutationLease,
+    ) -> DriverResult<ext4_core::ReservedKeyChange> {
+        Ok(change.reserve(self.runtime.coordinator(), intent)?)
+    }
+
+    /// Reserves one immutable slot for a key-only publication.
+    /// # Errors
+    /// Returns admission or allocation failure before publication.
+    pub(crate) fn reserve_key_publication(&self) -> DriverResult<EpochPublicationSlot> {
+        self.runtime.reserve_key_publication()
+    }
+
+    /// Consumes the matching visibility grant into one mount-local key epoch.
+    pub(crate) fn publish_keys(
+        &mut self,
+        change: ext4_core::PreparedKeyChange,
+        visibility: VisibilityLease,
+        slot: EpochPublicationSlot,
+    ) {
+        self.runtime.publish_keys(change, visibility, slot);
+    }
+
     /// Revalidates one resolved mutation under its granted resource intent.
     /// # Errors
     ///

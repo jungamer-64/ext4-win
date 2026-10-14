@@ -257,6 +257,10 @@ impl MetadataMutation<'_, '_> {
         let metadata_blocks = self.metadata_blocks()?;
         let _validated_next_state = self.committed_cluster_state()?;
         let mut observed = ObservedResourceVersionSet::new(ticket);
+        let key_version = self
+            .volume
+            .key_dependency()
+            .map(|resource| coordinator.resource_version(resource));
         // Journaling replaces whole blocks, including neighboring inode records. Their base
         // image must therefore be versioned even when the semantic inode intents are disjoint.
         for block in &metadata_blocks {
@@ -298,6 +302,7 @@ impl MetadataMutation<'_, '_> {
         }
         Ok(ResolvedMutation {
             observed,
+            key_version,
             node_metadata_updates,
             data_writes: core::mem::take(&mut self.data_writes),
             metadata_blocks,
@@ -325,7 +330,7 @@ impl ReservedMutation {
         commit: super::super::CommitLease,
     ) -> Result<CommitReadyMutation> {
         if commit.into_ticket() != self.resolved.observed.ticket()
-            || !coordinator.revalidate(&self.resolved.observed)
+            || !self.resolved.is_current(coordinator)
         {
             return Err(Error::ClusterReferenceConflict);
         }

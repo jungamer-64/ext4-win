@@ -186,13 +186,18 @@ impl EpochRegistry {
     ///
     /// Returns insufficient resources when either stable allocation fails.
     pub(crate) fn reserve_publication(&self) -> DriverResult<EpochPublicationSlots> {
-        let durable = DriverSharedSlot::try_new()?;
-        let checkpoint = DriverSharedSlot::try_new()?;
         Ok(EpochPublicationSlots {
-            durable: EpochPublicationSlot { storage: durable },
-            checkpoint: EpochPublicationSlot {
-                storage: checkpoint,
-            },
+            durable: self.reserve_slot()?,
+            checkpoint: self.reserve_slot()?,
+        })
+    }
+
+    /// Reserves one immutable publication without implying a later checkpoint.
+    /// # Errors
+    /// Returns insufficient resources before publication can start.
+    fn reserve_slot(&self) -> DriverResult<EpochPublicationSlot> {
+        Ok(EpochPublicationSlot {
+            storage: DriverSharedSlot::try_new()?,
         })
     }
 
@@ -274,11 +279,19 @@ enum CommitGateState {
 }
 
 impl CommitGateState {
-    /// Revokes only the ticket owning the pre-write lane and its cache registration fence.
+    /// Revokes the ticket's pre-effect commit and visibility grants and its cache fence.
     /// Unrelated tickets and checkpoint authority cannot reopen metadata registration.
-    fn abandon(&mut self, ticket: u64, cache: &mut ext4_core::MetadataCache) {
+    fn abandon(
+        &mut self,
+        ticket: u64,
+        cache: &mut ext4_core::MetadataCache,
+        visibility: &mut VisibilityGateState,
+    ) {
         if *self == (Self::CommitGranted { ticket }) {
             cache.abandon_mutation();
+            if *visibility == (VisibilityGateState::Granted { ticket }) {
+                *visibility = VisibilityGateState::Ready;
+            }
             *self = Self::Ready;
         }
     }
@@ -308,11 +321,11 @@ impl CommitGateState {
 /// Short allocation-free visibility gate, separate from checkpoint ownership.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum VisibilityGateState {
-    /// No durable epoch is being installed.
+    /// No epoch is being installed.
     Ready,
-    /// One durable mutation owns the sole epoch-swap transition.
+    /// One prepared mutation owns the sole epoch-swap transition.
     Granted {
-        /// Durable mutation ticket owning the short publication gate.
+        /// Mutation ticket owning the short publication gate.
         ticket: u64,
     },
 }
@@ -489,6 +502,82 @@ impl VolumeRuntime {
         self.epochs.reserve_publication()
     }
 
+    /// Resolves a mount-local insertion against the current key authority.
+    /// # Errors
+    /// Returns mutation admission, duplicate-key, or snapshot allocation failures.
+    pub(crate) fn resolve_key_addition(
+        &self,
+        ticket: u64,
+        key: ext4_core::FscryptMasterKey,
+    ) -> DriverResult<ext4_core::ResolvedKeyChange> {
+        self.failure.authorize_mutation()?;
+        Ok(ext4_core::ResolvedKeyChange::add(
+            self.epochs.current(),
+            &self.coordinator,
+            ticket,
+            key,
+        )?)
+    }
+
+    /// Resolves mount-local removal without touching filesystem storage.
+    /// # Errors
+    /// Returns mutation admission or snapshot allocation failures.
+    pub(crate) fn resolve_key_removal(
+        &self,
+        ticket: u64,
+        identifier: FscryptKeyIdentifier,
+    ) -> DriverResult<ext4_core::ResolvedKeyChange> {
+        self.failure.authorize_mutation()?;
+        Ok(ext4_core::ResolvedKeyChange::remove(
+            self.epochs.current(),
+            &self.coordinator,
+            ticket,
+            identifier,
+        )?)
+    }
+
+    /// Prepares the key epoch while both scheduler grants remain exclusively held.
+    /// # Errors
+    /// Returns stale grants, changed key versions, or allocation failures before publication.
+    pub(crate) fn prepare_key_change(
+        &mut self,
+        change: ext4_core::ReservedKeyChange,
+        commit: ext4_core::CommitLease,
+    ) -> DriverResult<ext4_core::PreparedKeyChange> {
+        Ok(change.prepare(&mut self.coordinator, self.epochs.current(), commit)?)
+    }
+
+    /// Reserves the single immutable epoch needed by a mount-local key publication.
+    /// # Errors
+    /// Returns mutation admission or stable allocation failure.
+    pub(crate) fn reserve_key_publication(&self) -> DriverResult<EpochPublicationSlot> {
+        self.failure.authorize_mutation()?;
+        self.epochs.reserve_slot()
+    }
+
+    /// Publishes prepared mount keys and releases commit serialization without checkpoint work.
+    pub(crate) fn publish_keys(
+        &mut self,
+        change: ext4_core::PreparedKeyChange,
+        visibility: VisibilityLease,
+        slot: EpochPublicationSlot,
+    ) {
+        let ticket = visibility.ticket();
+        if self.commit_gate != (CommitGateState::CommitGranted { ticket })
+            || self.visibility_gate != (VisibilityGateState::Granted { ticket })
+        {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let epoch = match change.publish(&mut self.coordinator, visibility) {
+            Ok(epoch) => epoch,
+            Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+        };
+        self.metadata_cache.publish(&epoch);
+        self.epochs.publish(slot, epoch);
+        self.commit_gate = CommitGateState::Ready;
+        self.visibility_gate = VisibilityGateState::Ready;
+    }
+
     /// Attempts a commit grant while retaining volume failure separately from contention.
     /// # Errors
     ///
@@ -502,7 +591,8 @@ impl VolumeRuntime {
 
     /// Releases a commit grant before the first lower write was issued.
     pub(crate) fn abandon_commit(&mut self, ticket: u64) {
-        self.commit_gate.abandon(ticket, &mut self.metadata_cache);
+        self.commit_gate
+            .abandon(ticket, &mut self.metadata_cache, &mut self.visibility_gate);
     }
 
     /// Grants the short visibility swap independently of checkpoint I/O.
@@ -687,7 +777,7 @@ impl PendingCheckpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitGateState, VolumeFailureState, VolumeRuntime};
+    use super::{CommitGateState, VisibilityGateState, VolumeFailureState, VolumeRuntime};
 
     /// # Panics
     ///
@@ -800,12 +890,15 @@ mod tests {
         assert!(matches!(vacant.acquire(9, failed), Err(failure) if failure == error));
         assert_eq!(vacant, CommitGateState::Ready);
         let mut cache = ext4_core::MetadataCache::default();
-        gate.abandon(8, &mut cache);
+        let mut visibility = VisibilityGateState::Granted { ticket: 7 };
+        gate.abandon(8, &mut cache, &mut visibility);
+        assert_eq!(visibility, VisibilityGateState::Granted { ticket: 7 });
         assert!(matches!(
             gate.acquire(9, VolumeFailureState::Operational),
             Ok(None)
         ));
-        gate.abandon(7, &mut cache);
+        gate.abandon(7, &mut cache, &mut visibility);
+        assert_eq!(visibility, VisibilityGateState::Ready);
         assert_eq!(
             gate.acquire(9, VolumeFailureState::Operational)
                 .map(|grant| grant.map(ext4_core::CommitLease::into_ticket)),

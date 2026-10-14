@@ -172,7 +172,7 @@ impl IntentRequest {
 pub(crate) enum WaitCondition {
     /// Durable values are waiting for the epoch visibility gate.
     Visibility {
-        /// Mutation ticket whose durable overlay is awaiting publication.
+        /// Mutation ticket whose prepared state is awaiting publication.
         ticket: u64,
     },
     /// Published overlay work is waiting for the checkpoint slot.
@@ -244,9 +244,9 @@ struct HeldCommit {
 struct Slot {
     /// Monotonic reuse generation.
     generation: u64,
-    /// Resource set held through durable visibility publication.
+    /// Resource set held through mutation visibility publication.
     intent: Option<HeldIntent>,
-    /// Commit grant held through durable publication.
+    /// Commit grant held through mutation publication.
     commit: Option<HeldCommit>,
     /// Published cancellation not yet consumed.
     cancel_pending: bool,
@@ -877,8 +877,8 @@ impl Scheduler {
         )
     }
 
-    /// Consumes grants required by durable publication.
-    pub(crate) fn consume_durable_authority(&mut self, identity: SlotId, ticket: u64) -> bool {
+    /// Consumes grants required by mutation publication.
+    pub(crate) fn consume_mutation_authority(&mut self, identity: SlotId, ticket: u64) -> bool {
         let Some(slot) = self.slot_mut(identity) else {
             return false;
         };
@@ -1669,12 +1669,12 @@ mod tests {
         );
     }
 
-    /// Verifies durable publication consumes exact mutation grants and no device-operation grants.
+    /// Verifies mutation publication consumes exact mutation grants and no device-operation grants.
     /// # Panics
     ///
     /// Panics when publication authority can be duplicated, mismatched, or retained.
     #[test]
-    fn durable_publication_consumes_exact_intent_and_commit_authority() {
+    fn mutation_publication_consumes_exact_intent_and_commit_authority() {
         let mut storage = core::mem::MaybeUninit::uninit();
         Scheduler::initialize(&mut storage);
         #[expect(
@@ -1686,6 +1686,9 @@ mod tests {
             // ordinary drop ownership, including any resource sets retained when an assertion fails.
             storage.assume_init()
         };
+        let cancelled = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        assert!(scheduler.consume_cancel_before_effect(cancelled.index(), true));
+        assert!(scheduler.complete(cancelled));
         let mutation = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         let mutation_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(
@@ -1699,7 +1702,12 @@ mod tests {
             Some((mutation, 7))
         );
         assert!(scheduler.grant_commit(mutation, 7));
-        assert!(scheduler.consume_durable_authority(mutation, 7));
+        assert!(!scheduler.consume_cancel_before_effect(mutation.index(), false));
+        assert_eq!(
+            scheduler.request_cancel(mutation.index()),
+            CancelDisposition::Ignored
+        );
+        assert!(scheduler.consume_mutation_authority(mutation, 7));
         assert!(scheduler.checkpoint_authority_is_clear(mutation));
         assert!(scheduler.complete(mutation));
 

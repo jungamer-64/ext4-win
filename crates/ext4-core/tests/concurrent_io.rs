@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::{boxed::Box, vec::Vec};
 use ext4_core::*;
 
-/// Plain fixtures must never request cryptographic execution.
+/// Independent HKDF oracle for key publication; fixture data must never invoke a cipher.
 #[derive(Debug)]
 struct PlainCrypto;
 
@@ -15,8 +15,10 @@ impl CryptographicOperation for PlainCrypto {
     fn fill_random(&mut self, _: &mut [u8]) -> Result<()> {
         Err(Error::CryptographicFailure)
     }
-    fn hkdf_sha512(&mut self, _: &[u8], _: &[u8], _: &mut [u8]) -> Result<()> {
-        Err(Error::CryptographicFailure)
+    fn hkdf_sha512(&mut self, key: &[u8], info: &[u8], output: &mut [u8]) -> Result<()> {
+        hkdf::Hkdf::<sha2::Sha512>::new(None, key)
+            .expand(info, output)
+            .map_err(|_| Error::CryptographicFailure)
     }
     fn encrypt_aes_256_xts(&mut self, _: &[u8; 64], _: u64, _: &mut [u8]) -> Result<()> {
         Err(Error::CryptographicFailure)
@@ -350,6 +352,23 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Publishes mount-local key state without passing any request to the disk executor.
+    /// # Errors
+    /// Returns stale authority or allocation failure before publication.
+    fn publish_keys(&mut self, change: ResolvedKeyChange) -> Result<()> {
+        let ticket = change.observed_resources().ticket();
+        let prepared = change
+            .reserve(&self.coordinator, MutationLease::granted(ticket))?
+            .prepare(
+                &mut self.coordinator,
+                &self.epoch,
+                CommitLease::granted(ticket),
+            )?;
+        self.epoch = prepared.publish(&mut self.coordinator, VisibilityLease::granted(ticket))?;
+        self.cache.publish(&self.epoch);
+        Ok(())
+    }
+
     /// Reads through the production completion-driven boundary without staging a mutation.
     /// # Errors
     /// Returns read admission, storage, or requested-domain failures.
@@ -893,6 +912,289 @@ fn namespace_context(identifier: u8) -> [u8; 40] {
         *destination = source;
     }
     bytes
+}
+
+/// # Errors
+/// Returns fixture, derivation, or pre-publication failure.
+/// # Panics
+/// Fails if key-only publication touches storage or abandoned preparation changes presence.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare publication and persistence boundaries"
+)]
+fn mount_keys_publish_without_storage_and_disappear_on_remount() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let before = (
+        fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+        fixture_crc32c(u32::MAX, &fixture.disk.journal),
+    );
+    let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
+    let identifier = key.identifier();
+    assert_eq!(
+        identifier.bytes(),
+        [
+            0x11, 0x01, 0x42, 0x0d, 0x49, 0x92, 0x90, 0xb0, 0x05, 0xfc, 0x68, 0x15, 0x27, 0x25,
+            0x71, 0x59
+        ]
+    );
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let change = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, key)?;
+    fixture.publish_keys(change)?;
+    assert_eq!(
+        fixture.epoch.fscrypt_key_presence(identifier),
+        FscryptKeyPresence::Present
+    );
+    let published = fixture.epoch.sequence();
+
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let abandoned =
+        ResolvedKeyChange::remove(&fixture.epoch, &fixture.coordinator, ticket, identifier)?
+            .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+            .prepare(
+                &mut fixture.coordinator,
+                &fixture.epoch,
+                CommitLease::granted(ticket),
+            )?;
+    drop(abandoned);
+    assert_eq!(fixture.epoch.sequence(), published);
+    assert_eq!(
+        fixture.epoch.fscrypt_key_presence(identifier),
+        FscryptKeyPresence::Present
+    );
+
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let removal =
+        ResolvedKeyChange::remove(&fixture.epoch, &fixture.coordinator, ticket, identifier)?;
+    fixture.publish_keys(removal)?;
+    assert_eq!(
+        fixture.epoch.fscrypt_key_presence(identifier),
+        FscryptKeyPresence::Absent
+    );
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let absent =
+        ResolvedKeyChange::remove(&fixture.epoch, &fixture.coordinator, ticket, identifier)?;
+    fixture.publish_keys(absent)?;
+
+    let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let addition = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, key)?;
+    fixture.publish_keys(addition)?;
+    assert_eq!(
+        before,
+        (
+            fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+            fixture_crc32c(u32::MAX, &fixture.disk.journal),
+        )
+    );
+    let (_, remounted, _) = fixture.disk.mount()?.into_parts();
+    assert_eq!(
+        remounted.fscrypt_key_presence(identifier),
+        FscryptKeyPresence::Absent
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, derivation, or publication failure.
+/// # Panics
+/// Fails if a stale key snapshot overwrites a newer one or key publication reverts file metadata.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions distinguish key-resource conflicts from independent file progress"
+)]
+fn key_publication_revalidates_keys_and_retains_independent_file_commits() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let first = FscryptMasterKey::from_raw(&[1; 32], &mut PlainCrypto)?;
+    let first_id = first.identifier();
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let first = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, first)?;
+    let second = FscryptMasterKey::from_raw(&[2; 32], &mut PlainCrypto)?;
+    let second_id = second.identifier();
+    let stale_ticket = fixture.coordinator.admit_mutation()?;
+    let stale = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, stale_ticket, second)?;
+    fixture.publish_keys(first)?;
+    assert!(matches!(
+        stale.reserve(&fixture.coordinator, MutationLease::granted(stale_ticket)),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let second = FscryptMasterKey::from_raw(&[2; 32], &mut PlainCrypto)?;
+    let pending = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, second)?;
+    let b = fixture.b;
+    fixture.mutate(|pass| {
+        let file = pass.file(b)?;
+        pass.write_file_range(file, FileOffset::ZERO, &[b'B'; 8192])
+    })?;
+    let a = fixture.a;
+    let mut pending_data = [0; 1];
+    let (pending_read, request) = fixture.suspend_payload(a, &mut pending_data)?;
+    fixture.publish_keys(pending)?;
+    let completion = fixture.disk.complete(request)?;
+    match pending_read.run(
+        OperationEvent::StorageCompleted(completion),
+        fixture
+            .coordinator
+            .read_context(fixture.cache.access(&fixture.epoch))?,
+        &mut PlainCrypto,
+        |pass| pass.read_file(a, FileOffset::ZERO, &mut pending_data),
+    ) {
+        ReadTransition::Complete(result) => assert_eq!(result?, ReadBytes::from_usize(1)),
+        ReadTransition::SubmitLower { .. } => return Err(Error::DeviceIo),
+    }
+    assert_eq!(pending_data, [b'a']);
+    assert_eq!(
+        fixture.epoch.fscrypt_key_presence(first_id),
+        FscryptKeyPresence::Present
+    );
+    assert_eq!(
+        fixture.epoch.fscrypt_key_presence(second_id),
+        FscryptKeyPresence::Present
+    );
+    let mut data = [0; 8192];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(b, FileOffset::ZERO, &mut data))?,
+        ReadBytes::from_usize(data.len())
+    );
+    assert_eq!(data, [b'B'; 8192]);
+    // Exercise the allocation ownership retained by the key epoch in a subsequent disk mutation.
+    fixture.mutate(|pass| {
+        let file = pass.file(b)?;
+        pass.truncate_file(file, FileSize::from_bytes(0))
+    })?;
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, independent inode encoding, read admission, or key publication failures.
+/// # Panics
+/// Fails if a read consumes encrypted bytes after its master key is removed.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe revocation before cipher execution and output copy"
+)]
+fn key_removal_revokes_encrypted_reads_and_resolved_mutations() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
+    let identifier = key.identifier();
+    let mut context = namespace_context(0x55);
+    for (byte, identifier_byte) in context.iter_mut().skip(8).zip(identifier.bytes()) {
+        *byte = identifier_byte;
+    }
+    fixture
+        .disk
+        .encode_inode(NodeId::File(a), 0x0008_0800, Some(&context))?;
+    let b = fixture.b;
+    fixture
+        .disk
+        .encode_inode(NodeId::File(b), 0x0008_0800, Some(&context))?;
+    let (profile, epoch, coordinator) = fixture.disk.mount()?.into_parts();
+    fixture.profile = profile;
+    fixture.epoch = epoch;
+    fixture.coordinator = coordinator;
+    fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let addition = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, key)?;
+    fixture.publish_keys(addition)?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let other_key = FscryptMasterKey::from_raw(&[9; 32], &mut PlainCrypto)?;
+    let pending_keys =
+        ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, other_key)?;
+    fixture.mutate(|pass| {
+        let file = pass.file(b)?;
+        pass.truncate_file(file, FileSize::from_bytes(0))
+    })?;
+    fixture.publish_keys(pending_keys)?;
+    let payload = fixture
+        .read(|pass| pass.node_data_allocation(NodeId::File(a), FileOffset::ZERO))?
+        .and_then(DataAllocationRun::physical)
+        .ok_or(Error::InvalidExtentTree)?;
+    let mut output = [0; 1];
+    let mut read = EpochReadOperation::new(&fixture.profile);
+    let mut event = OperationEvent::Admitted;
+    let (read, request) = loop {
+        match read.run(
+            event,
+            fixture
+                .coordinator
+                .read_context(fixture.cache.access(&fixture.epoch))?,
+            &mut PlainCrypto,
+            |pass| pass.read_file(a, FileOffset::ZERO, &mut output),
+        ) {
+            ReadTransition::SubmitLower { request, suspended } if matches!(&request, StorageRequest::Read { offset, .. } if *offset == payload) =>
+            {
+                break (suspended, request);
+            }
+            ReadTransition::SubmitLower { request, suspended } => {
+                event = OperationEvent::StorageCompleted(fixture.disk.complete(request)?);
+                read = suspended;
+            }
+            ReadTransition::Complete(result) => {
+                result?;
+                return Err(Error::DeviceIo);
+            }
+        }
+    };
+    let pending_ticket = fixture.coordinator.admit_mutation()?;
+    let (pending, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        pending_ticket,
+        |pass| {
+            let file = pass.file(a)?;
+            pass.truncate_file(file, FileSize::from_bytes(0))
+        },
+    )?;
+    let reserved_ticket = fixture.coordinator.admit_mutation()?;
+    let (reserved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        reserved_ticket,
+        |pass| {
+            let file = pass.file(a)?;
+            pass.truncate_file(file, FileSize::from_bytes(0))
+        },
+    )?;
+    let reserved = reserved.reserve(
+        &fixture.coordinator,
+        MutationLease::granted(reserved_ticket),
+    )?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let removal =
+        ResolvedKeyChange::remove(&fixture.epoch, &fixture.coordinator, ticket, identifier)?;
+    fixture.publish_keys(removal)?;
+    assert!(matches!(
+        pending.reserve(&fixture.coordinator, MutationLease::granted(pending_ticket)),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    assert!(matches!(
+        reserved.prepare_commit(
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+            CommitLease::granted(reserved_ticket)
+        ),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    let completion = fixture.disk.complete(request)?;
+    match read.run(
+        OperationEvent::StorageCompleted(completion),
+        fixture
+            .coordinator
+            .read_context(fixture.cache.access(&fixture.epoch))?,
+        &mut PlainCrypto,
+        |pass| pass.read_file(a, FileOffset::ZERO, &mut output),
+    ) {
+        ReadTransition::Complete(result) => assert_eq!(result, Err(Error::ReadConflict)),
+        ReadTransition::SubmitLower { .. } => return Err(Error::DeviceIo),
+    }
+    assert_eq!(output, [0]);
+    Ok(())
 }
 
 /// # Errors

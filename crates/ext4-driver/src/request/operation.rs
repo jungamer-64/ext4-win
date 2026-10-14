@@ -83,6 +83,7 @@ mod mdl;
 pub(crate) use mdl::mdl;
 mod cleanup;
 mod close;
+mod keys;
 
 mod volume_close;
 pub(crate) use volume_close::{VolumeCloseRequest, volume_close};
@@ -2973,10 +2974,6 @@ enum PreparedMutationRequest {
     SetInformation(crate::identity::IdentitySnapshot),
     /// Regular-file data write with handle or paging stream authority.
     DataWrite(crate::request::file_info::RegularFileDataAuthority),
-    /// Clean-volume key removal retains namespace exclusion through publication or abort.
-    KeyRemoval(crate::kernel::stream::KeyRemovalLease),
-    /// Key removal is published; namespace exclusion no longer belongs to this operation.
-    RemovedKey,
     /// Data is frozen and cache coherence established before Merkle construction.
     Verity(VerityPreparation),
     /// Extended attributes use retained handle authority.
@@ -2987,8 +2984,6 @@ enum PreparedMutationRequest {
     DeleteReparsePoint,
     /// Volume metadata mutation.
     SetVolumeInformation,
-    /// Captured mount-key addition.
-    AddEncryptionKey,
     /// Final cleanup owns its exact namespace deletion.
     CleanupDeletion,
 }
@@ -3021,20 +3016,8 @@ impl PreparedMutationRequest {
                 crate::request::fsctl::prepare_verity(&mut owned.request(), access)
                     .map(|stream| Self::Verity(VerityPreparation::Required(stream)))
             }
-            MutationRequestKind::RemoveEncryptionKey => {
-                let mut request = owned.request();
-                crate::request::fsctl::authorize_key_control(
-                    &mut request,
-                    access,
-                    crate::irp::PreparedKeyControl::Remove,
-                )?;
-                request.with_active(|active| {
-                    let opened =
-                        crate::state::OpenedVolume::decode(active.current_stack()?.file_object()?)?;
-                    access
-                        .begin_key_removal(opened.file_object())
-                        .map(Self::KeyRemoval)
-                })
+            MutationRequestKind::RemoveEncryptionKey | MutationRequestKind::AddEncryptionKey => {
+                Err(DriverError::InvalidDeviceRequest)
             }
             MutationRequestKind::Write => {
                 crate::request::file_info::prepare_regular_file_data_authority(
@@ -3072,7 +3055,6 @@ impl PreparedMutationRequest {
             MutationRequestKind::SetReparsePoint => Ok(Self::SetReparsePoint),
             MutationRequestKind::DeleteReparsePoint => Ok(Self::DeleteReparsePoint),
             MutationRequestKind::SetVolumeInformation => Ok(Self::SetVolumeInformation),
-            MutationRequestKind::AddEncryptionKey => Ok(Self::AddEncryptionKey),
             MutationRequestKind::CleanupDeletion => Ok(Self::CleanupDeletion),
         }
     }
@@ -3081,7 +3063,6 @@ impl PreparedMutationRequest {
     const fn kind(&self) -> MutationRequestKind {
         match self {
             Self::DataWrite(_) => MutationRequestKind::Write,
-            Self::KeyRemoval(_) | Self::RemovedKey => MutationRequestKind::RemoveEncryptionKey,
             Self::Verity(_) => MutationRequestKind::EnableVerity,
             Self::Create { .. } => MutationRequestKind::Create,
             Self::Security(_) => MutationRequestKind::SetSecurity,
@@ -3090,7 +3071,6 @@ impl PreparedMutationRequest {
             Self::SetReparsePoint => MutationRequestKind::SetReparsePoint,
             Self::DeleteReparsePoint => MutationRequestKind::DeleteReparsePoint,
             Self::SetVolumeInformation => MutationRequestKind::SetVolumeInformation,
-            Self::AddEncryptionKey => MutationRequestKind::AddEncryptionKey,
             Self::CleanupDeletion => MutationRequestKind::CleanupDeletion,
         }
     }
@@ -3790,7 +3770,6 @@ impl MutationRequestOperation {
                         .is_empty()
             }
             PreparedMutationRequest::Create { .. } => false,
-            PreparedMutationRequest::KeyRemoval(_) | PreparedMutationRequest::RemovedKey => false,
             PreparedMutationRequest::Verity(_) => true,
             PreparedMutationRequest::Security(_) => true,
             PreparedMutationRequest::SetInformation(_) => {
@@ -3807,7 +3786,6 @@ impl MutationRequestOperation {
             | PreparedMutationRequest::SetReparsePoint
             | PreparedMutationRequest::DeleteReparsePoint => true,
             PreparedMutationRequest::SetVolumeInformation
-            | PreparedMutationRequest::AddEncryptionKey
             | PreparedMutationRequest::CleanupDeletion => false,
         };
         if !requires_check {
@@ -4155,40 +4133,9 @@ impl MutationRequestOperation {
             PreparedMutationRequest::Verity(VerityPreparation::Required(_)) => {
                 Ok(DriverResolveDisposition::PrepareVerity)
             }
-            PreparedMutationRequest::RemovedKey
-            | PreparedMutationRequest::Verity(
+            PreparedMutationRequest::Verity(
                 VerityPreparation::Preparing | VerityPreparation::Published,
             ) => Err(DriverError::InternalInvariantViolation),
-            PreparedMutationRequest::AddEncryptionKey => {
-                let mut request = owned.request();
-                crate::request::fsctl::authorize_key_control(
-                    &mut request,
-                    operations,
-                    crate::irp::PreparedKeyControl::Add,
-                )?;
-                let stack =
-                    request.with_active(|active| active.current_stack()?.file_system_control())?;
-                let completion =
-                    crate::request::fsctl::add_encryption_key(&mut request, stack, mutation)?;
-                Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
-                ))
-            }
-            PreparedMutationRequest::KeyRemoval(_exclusion) => {
-                let mut request = owned.request();
-                crate::request::fsctl::authorize_key_control(
-                    &mut request,
-                    operations,
-                    crate::irp::PreparedKeyControl::Remove,
-                )?;
-                let stack =
-                    request.with_active(|active| active.current_stack()?.file_system_control())?;
-                let completion =
-                    crate::request::fsctl::remove_encryption_key(&mut request, stack, mutation)?;
-                Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
-                ))
-            }
             PreparedMutationRequest::CleanupDeletion => {
                 let Some(deletion) = state.cleanup_deletion.as_ref() else {
                     return Err(DriverError::InternalInvariantViolation);
@@ -5890,7 +5837,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
 impl InfalliblePublication for MutationRequestOperation {
     fn authority(&self) -> PublicationAuthority {
         match &self.state {
-            MutationOperationState::PublishingDurable { .. } => PublicationAuthority::Durable {
+            MutationOperationState::PublishingDurable { .. } => PublicationAuthority::Mutation {
                 ticket: self.ticket,
             },
             MutationOperationState::PublishingCheckpoint { epoch, .. } => {
@@ -5990,12 +5937,6 @@ impl InfalliblePublication for MutationRequestOperation {
                     drop(core::mem::replace(
                         preparation,
                         VerityPreparation::Published,
-                    ));
-                }
-                if matches!(self.request, PreparedMutationRequest::KeyRemoval(_)) {
-                    drop(core::mem::replace(
-                        &mut self.request,
-                        PreparedMutationRequest::RemovedKey,
                     ));
                 }
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
@@ -6154,8 +6095,18 @@ pub(crate) fn mutation(
     kind: MutationRequestKind,
     access: &mut MountedVolumeAccess<'_>,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
-    MutationRequestOperation::try_new(owned, kind, access)
-        .map(|operation| -> Box<dyn CompletionOperation> { operation })
+    match kind {
+        MutationRequestKind::AddEncryptionKey => {
+            keys::KeyRequestOperation::try_new(owned, crate::irp::PreparedKeyControl::Add, access)
+        }
+        MutationRequestKind::RemoveEncryptionKey => keys::KeyRequestOperation::try_new(
+            owned,
+            crate::irp::PreparedKeyControl::Remove,
+            access,
+        ),
+        _ => MutationRequestOperation::try_new(owned, kind, access)
+            .map(|operation| -> Box<dyn CompletionOperation> { operation }),
+    }
 }
 
 /// Allocates one concrete durability-barrier and lower-flush operation.
