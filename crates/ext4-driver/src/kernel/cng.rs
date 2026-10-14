@@ -5,6 +5,7 @@ use core::ptr::NonNull;
 
 use ext4_core::{CryptographicOperation, Error, Result as Ext4Result};
 use wdk_sys::{NT_SUCCESS, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES};
+use zeroize::Zeroize;
 
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
@@ -552,10 +553,7 @@ impl Drop for GeneratedKey<'_> {
         unsafe {
             // SAFETY: DestroyKey ended native access. The lifetime lease still retains the exact
             // writable range, which has no competing Rust reference.
-            self.object
-                .as_ptr()
-                .cast::<u8>()
-                .write_bytes(0, self.object.len());
+            self.object.as_mut().zeroize();
         }
     }
 }
@@ -738,7 +736,7 @@ fn generate_key<'object>(
     let object_bytes = u32::try_from(object.len()).map_err(|_| Error::ArithmeticOverflow)?;
     let secret_bytes = u32::try_from(secret.len()).map_err(|_| Error::ArithmeticOverflow)?;
     // Establish the sole byte pointer before native retention; no reference reborrow follows it.
-    let object = NonNull::from(object);
+    let mut object = NonNull::from(object);
     let mut raw = core::ptr::null_mut();
     let status = unsafe {
         // SAFETY: `object` identifies the exclusive, address-stable nonpaged allocation prefix;
@@ -758,7 +756,7 @@ fn generate_key<'object>(
         unsafe {
             // SAFETY: Generation failed without returning a key; the caller's exclusive borrow
             // retains these writable bytes through rollback.
-            object.as_ptr().cast::<u8>().write_bytes(0, object.len());
+            object.as_mut().zeroize();
         }
         return Err(error);
     }
@@ -766,7 +764,7 @@ fn generate_key<'object>(
         unsafe {
             // SAFETY: No native key was returned; the same exclusive allocation remains owned
             // by the caller and may be cleared before reporting the provider invariant failure.
-            object.as_ptr().cast::<u8>().write_bytes(0, object.len());
+            object.as_mut().zeroize();
         }
         return Err(Error::CryptographicFailure);
     };

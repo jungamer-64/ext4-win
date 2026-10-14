@@ -2,6 +2,7 @@
 
 use alloc::vec::Vec;
 use core::fmt;
+use zeroize::Zeroize;
 
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
@@ -463,6 +464,9 @@ impl FscryptNoKeyName {
 }
 
 /// Raw fscrypt master key material supplied at the mount boundary.
+///
+/// Owned key bytes are erased on drop. Callers retain erasure responsibility for the raw input
+/// storage borrowed during construction.
 #[derive(Eq, PartialEq)]
 pub struct FscryptMasterKey {
     /// Stable fscrypt v2 identifier derived from the raw key.
@@ -510,15 +514,17 @@ impl FscryptMasterKey {
         nonce: FscryptFileNonce,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<FscryptContentsKey> {
-        let mut bytes = [0_u8; FSCRYPT_AES_256_XTS_KEY_BYTES];
+        let mut key = FscryptContentsKey {
+            bytes: [0_u8; FSCRYPT_AES_256_XTS_KEY_BYTES],
+        };
         fscrypt_hkdf_expand(
             crypto,
             &self.bytes,
             FscryptHkdfContext::PerFileEncryptionKey,
             &nonce.bytes(),
-            &mut bytes,
+            &mut key.bytes,
         )?;
-        Ok(FscryptContentsKey { bytes })
+        Ok(key)
     }
 
     /// Derives the AES-256-CBC-CS3 per-file filename key for a directory.
@@ -530,21 +536,23 @@ impl FscryptMasterKey {
         nonce: FscryptFileNonce,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<FscryptFilenamesKey> {
-        let mut bytes = [0_u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES];
+        let mut key = FscryptFilenamesKey {
+            bytes: [0_u8; FSCRYPT_AES_256_CBC_CTS_KEY_BYTES],
+        };
         fscrypt_hkdf_expand(
             crypto,
             &self.bytes,
             FscryptHkdfContext::PerFileEncryptionKey,
             &nonce.bytes(),
-            &mut bytes,
+            &mut key.bytes,
         )?;
-        Ok(FscryptFilenamesKey { bytes })
+        Ok(key)
     }
 }
 
 impl Drop for FscryptMasterKey {
     fn drop(&mut self) {
-        self.bytes.fill(0);
+        self.bytes.as_mut_slice().zeroize();
     }
 }
 
@@ -699,7 +707,7 @@ impl FscryptContentsKey {
 
 impl Drop for FscryptContentsKey {
     fn drop(&mut self) {
-        self.bytes.fill(0);
+        self.bytes.zeroize();
     }
 }
 
@@ -770,7 +778,7 @@ impl FscryptFilenamesKey {
 
 impl Drop for FscryptFilenamesKey {
     fn drop(&mut self) {
-        self.bytes.fill(0);
+        self.bytes.zeroize();
     }
 }
 

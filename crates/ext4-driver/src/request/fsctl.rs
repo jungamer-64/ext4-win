@@ -17,7 +17,7 @@ use core::ptr::NonNull;
 
 use crate::irp::{ActiveIrp, FileSystemControlStack, IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::DriverVec;
+use crate::memory::{DriverVec, SensitiveBytes};
 use crate::state::{MountedVolumeAccess, OpenedObject, OpenedRegularFile, VolumeControlBlock};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 use ext4_core::{
@@ -208,11 +208,12 @@ pub(crate) fn add_encryption_key(
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<IrpCompletion> {
     request.with_active(|active| {
-        let input = read_input(active, stack)?;
+        let input = SensitiveBytes::try_copied_from_slice(
+            active.buffered_input(stack.input_buffer_length())?,
+        )?;
         let payload = FscryptAddKeyPayload::parse(input.as_slice())?;
         let _volume = mounted_vcb(active)?;
-        let (identifier, raw_key) = payload.into_parts();
-        mutation.add_fscrypt_key(identifier, raw_key.as_slice())?;
+        mutation.add_fscrypt_key(payload.identifier, payload.raw_key)?;
         Ok(IrpCompletion::EMPTY)
     })
 }
@@ -325,12 +326,22 @@ const fn key_presence_user_count(presence: FscryptKeyPresence) -> u32 {
 }
 
 /// Parsed fscrypt add-key payload.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Eq, PartialEq)]
 struct FscryptAddKeyPayload<'a> {
     /// Identifier supplied by the Linux-compatible key specifier.
     identifier: FscryptKeyIdentifier,
     /// Raw key borrowed from the captured input until domain validation completes.
     raw_key: &'a [u8],
+}
+
+impl core::fmt::Debug for FscryptAddKeyPayload<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("FscryptAddKeyPayload")
+            .field("identifier", &self.identifier)
+            .field("key_bytes", &self.raw_key.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> FscryptAddKeyPayload<'a> {
@@ -674,10 +685,9 @@ mod tests {
         let payload = must!(add_key_payload(&RAW_KEY, RAW_KEY_IDENTIFIER));
 
         let decoded = must!(FscryptAddKeyPayload::parse(&payload));
-        let (identifier, raw_key) = decoded.into_parts();
 
-        assert_eq!(identifier, RAW_KEY_IDENTIFIER);
-        assert_eq!(raw_key.as_slice(), RAW_KEY);
+        assert_eq!(decoded.identifier, RAW_KEY_IDENTIFIER);
+        assert_eq!(decoded.raw_key, RAW_KEY);
     }
 
     /// # Panics
@@ -692,9 +702,8 @@ mod tests {
         }
 
         let decoded = must!(FscryptAddKeyPayload::parse(&payload));
-        let (identifier, raw_key) = decoded.into_parts();
-        assert_ne!(identifier, RAW_KEY_IDENTIFIER);
-        assert_eq!(raw_key.as_slice(), RAW_KEY);
+        assert_ne!(decoded.identifier, RAW_KEY_IDENTIFIER);
+        assert_eq!(decoded.raw_key, RAW_KEY);
     }
 
     /// # Panics

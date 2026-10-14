@@ -21,6 +21,7 @@ ext4-core = { path = "../ext4-core" }
 ext4-security = { path = "../ext4-security" }
 wdk-alloc.workspace = true
 wdk-sys.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # Host tests supply the driver boundary doubles; kernel import libraries must not resolve

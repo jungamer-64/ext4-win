@@ -17,6 +17,7 @@ use core::{
 
 use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
+use zeroize::Zeroize;
 
 mod native_allocation;
 pub(crate) use native_allocation::NativeAllocation;
@@ -187,6 +188,57 @@ pub(crate) struct KernelVec<T, A: Allocator = Global> {
 /// In driver builds, `Global` is backed by `wdk_alloc::WdkAllocator`, which allocates from
 /// `POOL_FLAG_NON_PAGED`.
 pub(crate) type DriverVec<T> = KernelVec<T, Global>;
+
+/// Fixed-length captured secret storage erased before its allocation is released.
+///
+/// Only immutable borrows escape: the buffer cannot grow, shrink, or transfer its backing
+/// allocation, so no discarded allocation or truncated prefix can retain a secret copy.
+pub(crate) struct SensitiveBytes<A: Allocator = Global> {
+    /// Initialized bytes owned until erasure and allocator release.
+    bytes: KernelVec<u8, A>,
+}
+
+impl SensitiveBytes<Global> {
+    /// Captures secret bytes with the driver's nonpaged global allocator.
+    /// # Errors
+    /// Returns invalid capacity or allocation failure without copying input bytes.
+    pub(crate) fn try_copied_from_slice(source: &[u8]) -> DriverResult<Self> {
+        Self::try_copied_from_slice_in(source, Global)
+    }
+}
+
+impl<A: Allocator> SensitiveBytes<A> {
+    /// Captures bytes under the supplied allocator's lifetime and release contract.
+    /// # Errors
+    /// Returns reservation or filling failure; any copied prefix is erased before release.
+    pub(crate) fn try_copied_from_slice_in(source: &[u8], allocator: A) -> DriverResult<Self> {
+        let mut output = Self {
+            bytes: KernelVec::try_with_capacity_in(source.len(), allocator)?,
+        };
+        output.bytes.try_extend_from_copy_slice(source)?;
+        Ok(output)
+    }
+
+    /// Borrows the captured bytes without changing allocation or erasure ownership.
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+impl<A: Allocator> Drop for SensitiveBytes<A> {
+    fn drop(&mut self) {
+        self.bytes.as_mut_slice().zeroize();
+    }
+}
+
+impl<A: Allocator> fmt::Debug for SensitiveBytes<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SensitiveBytes")
+            .field("length", &self.bytes.len())
+            .finish_non_exhaustive()
+    }
+}
 
 /// One stable nonpaged allocation shared by explicit owner and lease types.
 ///
@@ -839,10 +891,116 @@ pub(crate) fn boxed_zeroed_bytes(length: usize) -> DriverResult<Box<[u8]>> {
 
 #[cfg(test)]
 mod tests {
+    use alloc::alloc::{AllocError, Allocator, Global};
+    use core::alloc::Layout;
+    use core::cell::Cell;
+    use core::ptr::NonNull;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{DriverShared, DriverSharedSlot, InPlaceInitialization};
-    use crate::kernel::status::DriverError;
+    use super::{DriverShared, DriverSharedSlot, InPlaceInitialization, SensitiveBytes};
+    use crate::kernel::status::{DriverError, DriverResult};
+
+    /// Observes captured bytes while their allocation is still live at release.
+    struct ErasureAllocator<'a> {
+        /// Whether the allocator should deny acquisition.
+        fail: bool,
+        /// Number of allocations released by the owning buffer.
+        releases: &'a Cell<usize>,
+        /// Whether every initialized byte was cleared before release.
+        erased: &'a Cell<bool>,
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the observer delegates allocation to Global and inspects live initialized bytes before matching deallocation"
+    )]
+    // SAFETY: Allocations and matching layouts retain Global's ownership contract. The
+    // observer reads initialized storage before forwarding each unique release to Global.
+    unsafe impl Allocator for ErasureAllocator<'_> {
+        fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+            if self.fail {
+                return Err(AllocError);
+            }
+            Global.allocate_zeroed(layout)
+        }
+
+        unsafe fn deallocate(&self, pointer: NonNull<u8>, layout: Layout) {
+            let bytes = unsafe {
+                // SAFETY: This allocator initialized the entire allocation, and capture
+                // writes initialized bytes into it. The original Global allocation remains
+                // live for its full layout until the matching release below.
+                core::slice::from_raw_parts(pointer.as_ptr(), layout.size())
+            };
+            self.erased.set(bytes.iter().all(|byte| *byte == 0));
+            self.releases.set(self.releases.get().saturating_add(1));
+            unsafe {
+                // SAFETY: The caller transfers this live Global allocation and its original
+                // layout for one release; observation above did not change ownership.
+                Global.deallocate(pointer, layout);
+            }
+        }
+    }
+
+    /// Consumes captured bytes through a fallible operation before ownership is released.
+    /// # Errors
+    /// Returns allocator denial or the supplied consumer failure.
+    /// # Panics
+    /// Fails if capture changes the input bytes.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the test consumer asserts copy fidelity while returning an injected failure to exercise early erasure"
+    )]
+    fn consume_sensitive(
+        source: &[u8],
+        allocator: ErasureAllocator<'_>,
+        outcome: DriverResult<()>,
+    ) -> DriverResult<()> {
+        let input = SensitiveBytes::try_copied_from_slice_in(source, allocator)?;
+        assert_eq!(input.as_slice(), source);
+        outcome?;
+        Ok(())
+    }
+
+    /// # Panics
+    /// Fails if success or an early error releases an allocation containing secret bytes.
+    #[test]
+    fn sensitive_capture_erases_before_release_on_success_and_error() {
+        for outcome in [Ok(()), Err(DriverError::InvalidParameter)] {
+            let releases = Cell::new(0);
+            let erased = Cell::new(false);
+            let result = consume_sensitive(
+                &[0xA5; 32],
+                ErasureAllocator {
+                    fail: false,
+                    releases: &releases,
+                    erased: &erased,
+                },
+                outcome,
+            );
+            assert_eq!(result, outcome);
+            assert_eq!(releases.get(), 1);
+            assert!(erased.get());
+        }
+    }
+
+    /// # Panics
+    /// Fails if allocation denial changes failure classification or releases unowned storage.
+    #[test]
+    fn sensitive_capture_preserves_allocation_failure() {
+        let releases = Cell::new(0);
+        let erased = Cell::new(false);
+        let result = consume_sensitive(
+            &[0xA5; 32],
+            ErasureAllocator {
+                fail: true,
+                releases: &releases,
+                erased: &erased,
+            },
+            Ok(()),
+        );
+        assert_eq!(result, Err(DriverError::InsufficientResources));
+        assert_eq!(releases.get(), 0);
+    }
 
     /// Records exactly when the final shared reference destroys its value.
     struct DropProbe<'a> {
