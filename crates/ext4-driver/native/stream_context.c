@@ -12,6 +12,7 @@
 #include "cache_close.h"
 #include "data_protection.h"
 #include "irp_forward.h"
+#include "directory_notification.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);

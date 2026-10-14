@@ -175,17 +175,17 @@ pub(crate) use wdk_sys::ntddk::{
     ExReleaseRundownProtection, ExWaitForRundownProtectionRelease, FsRtlDismountComplete,
     FsRtlFastCheckLockForRead, FsRtlFastCheckLockForWrite, FsRtlGetSectorSizeInformation,
     FsRtlInitializeFileLock, FsRtlNotifyCleanup, FsRtlNotifyCleanupAll,
-    FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyInitializeSync,
-    FsRtlNotifyUninitializeSync, FsRtlUninitializeFileLock, IoAcquireVpbSpinLock, IoAllocateIrp,
-    IoAllocateMdl, IoAllocateWorkItem, IoCancelIrp, IoCsqInitialize, IoCsqInsertIrp,
-    IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoFreeWorkItem, IoGetNextIrpStackLocation,
-    IoGetRequestorProcess, IoGetTopLevelIrp, IoQueueWorkItem, IoRegisterShutdownNotification,
-    IoReleaseVpbSpinLock, IoSetCompletionRoutineEx, IoSetTopLevelIrp,
-    IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeCancelTimer,
-    KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer,
-    KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject,
-    MmBuildMdlForNonPagedPool, MmUnlockPages, ObfDereferenceObject, ObfReferenceObject,
-    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
+    FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyUninitializeSync,
+    FsRtlUninitializeFileLock, IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl,
+    IoAllocateWorkItem, IoCancelIrp, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp,
+    IoFreeIrp, IoFreeMdl, IoFreeWorkItem, IoGetNextIrpStackLocation, IoGetRequestorProcess,
+    IoGetTopLevelIrp, IoQueueWorkItem, IoRegisterShutdownNotification, IoReleaseVpbSpinLock,
+    IoSetCompletionRoutineEx, IoSetTopLevelIrp, IoUnregisterShutdownNotification, IofCallDriver,
+    KeAcquireSpinLockRaiseToDpc, KeCancelTimer, KeFlushQueuedDpcs, KeInitializeDpc,
+    KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer, KeInsertQueueDpc,
+    KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool,
+    MmUnlockPages, ObfDereferenceObject, ObfReferenceObject, PsCreateSystemThread,
+    PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]
@@ -207,6 +207,12 @@ pub(crate) use wdk_sys::ntddk::{
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 unsafe extern "system" {
+    /// Initializes unowned FsRtl synchronization storage at PASSIVE_LEVEL.
+    /// Returns only success or insufficient resources; allocation exceptions are caught in C.
+    pub(crate) fn ext4win_notify_initialize_sync(
+        sync: *mut wdk_sys::PNOTIFY_SYNC,
+    ) -> wdk_sys::NTSTATUS;
+
     /// Copies effective user/primary-group SIDs while retaining and locking the captured subject.
     pub(crate) fn ext4win_creator_sids(
         subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,

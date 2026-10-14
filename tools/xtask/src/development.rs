@@ -194,6 +194,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "fs_filter_callbacks.tests.c",
             "native filesystem callback completion-context contract",
         ),
+        (
+            "directory-notification",
+            "directory_notification.tests.c",
+            "native directory notification allocation exception contract",
+        ),
     ] {
         let directory = crate::process::create_task_directory(root, name)?;
         let executable = directory.join("synchronization-tests.exe");
@@ -214,6 +219,8 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
                     "/subsystem:console",
                 ])
                 .arg(root.join("crates/ext4-driver/native").join(source))
+                // SDK imports exercise real SEH without CRT initialization.
+                .args(["-lkernel32", "-lntdllp"])
                 .arg("-o")
                 .arg(&executable);
             run_checked(compiler, "native synchronization oracle compilation")?;

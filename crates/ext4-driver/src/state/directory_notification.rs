@@ -195,16 +195,13 @@ impl DirectoryChangeNotifier {
                 // yet been initialized by FsRtl.
                 core::ptr::addr_of_mut!((*native).sync)
             };
-            unsafe {
-                // SAFETY: FsRtl initializes the one opaque synchronization
-                // pointer stored in this mounted VCB.
-                ffi::FsRtlNotifyInitializeSync(sync);
-            }
-            if unsafe {
-                // SAFETY: FsRtl initialized the out pointer above; this only
-                // reads the pointer value before publication.
-                (*native).sync.is_null()
-            } {
+            let status = unsafe {
+                // SAFETY: Mount initialization runs at PASSIVE_LEVEL with exclusive
+                // ownership of the unpublished VCB's writable synchronization storage.
+                // The native boundary catches FsRtl's allocation exception.
+                ffi::ext4win_notify_initialize_sync(sync)
+            };
+            if status != STATUS_SUCCESS {
                 return Err(DriverError::InsufficientResources);
             }
             self.initialized = true;
