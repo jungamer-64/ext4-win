@@ -1009,9 +1009,14 @@ impl TryFrom<u32> for InodeId {
     }
 }
 
-/// Nonzero link count of a live ext4 inode.
+/// Live namespace link count, including ext4's uncounted-directory state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Ext4LinkCount(NonZeroU16);
+pub enum Ext4LinkCount {
+    /// Exact nonzero namespace reference count.
+    Known(NonZeroU16),
+    /// An indexed directory whose references are not counted under DIR_NLINK.
+    UncountedDirectory,
+}
 
 impl Ext4LinkCount {
     /// Link count for a newly linked file or symlink.
