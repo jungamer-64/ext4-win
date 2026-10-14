@@ -88,6 +88,8 @@ pub enum Error {
     DirectoryEntryNotFound,
     /// A directory removal target still contains children.
     DirectoryNotEmpty,
+    /// A directory move would place the directory below itself.
+    DirectoryCycle,
     /// No free inode exists for a required allocation.
     NoFreeInode,
     /// A hashed directory uses a hash profile outside the write domain.
@@ -164,6 +166,7 @@ impl fmt::Display for Error {
             Self::TooManyLinks => "inode cannot receive another hard link",
             Self::DirectoryEntryNotFound => "directory child name was not found",
             Self::DirectoryNotEmpty => "directory is not empty",
+            Self::DirectoryCycle => "directory move would create an ancestry cycle",
             Self::NoFreeInode => "ext4 volume has no free inodes",
             Self::UnsupportedDirectoryHash => "unsupported ext4 directory hash",
             Self::UnsupportedInodeMutation => "unsupported ext4 inode mutation",

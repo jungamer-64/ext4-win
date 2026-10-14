@@ -1413,7 +1413,64 @@ fn verify_regular_mutation_profile(
     verify_payload_allocation(linux, image, b"linked.bin", 4)?;
     debugfs_require_xattr_absent(linux, image, "/linked.bin", b"user.ext4win.interop")?;
     require_free_space_delta(baseline, debugfs_free_space(linux, image)?, 3, 1, "regular")?;
-    verify_internal_e2fsck_clean(linux, image, "regular mutation profile")
+    verify_internal_e2fsck_clean(linux, image, "regular mutation profile")?;
+    verify_symlink_namespace(linux, image)
+}
+
+/// Checks native symlink storage boundaries and link lifetime against the independent fsck oracle.
+/// # Errors
+/// Returns a mutation, payload, link-count, or disk-format conformance failure.
+fn verify_symlink_namespace(linux: LinuxEnvironment, image: &Path) -> TaskResult<()> {
+    for length in [59, 60, 61, 4095] {
+        let first = ext4_core::Ext4Name::new(b"symlink-first").map_err(core_task_error)?;
+        let second = ext4_core::Ext4Name::new(b"symlink-second").map_err(core_task_error)?;
+        let target = ext4_core::SymlinkTarget::new(&vec![b'x'; length]).map_err(core_task_error)?;
+        let id = drive_internal_core_mutation(image, |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            Ok(pass
+                .create_symlink(
+                    root,
+                    &first,
+                    &target,
+                    ext4_core::NewSymlinkMetadata::new(
+                        ext4_core::Ext4Owner::new(
+                            ext4_core::Ext4Uid::from_u32(1000),
+                            ext4_core::Ext4Gid::from_u32(100),
+                        ),
+                        ext4_core::Ext4Permissions::new(0o777)?,
+                    ),
+                )?
+                .id())
+        })?;
+        verify_internal_e2fsck_clean(linux, image, "native symlink storage")?;
+        drive_internal_core_mutation(image, |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            let source = pass.hard_link_source(ext4_core::HardLinkNodeId::Symlink(id))?;
+            pass.create_hard_link(
+                source,
+                root,
+                &second,
+                ext4_core::NamespaceDestination::Vacant,
+            )
+        })?;
+        drive_internal_core_mutation(image, |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            pass.remove_symlink(root, &first)
+        })?;
+        verify_internal_e2fsck_clean(linux, image, "surviving symlink hard link")?;
+        let observed = drive_internal_core_read(image, |pass| {
+            ext4_core::CommittedReadPass::read_symlink(pass, id)
+        })?;
+        if observed != target.bytes() {
+            return Err(io::Error::other("surviving symlink changed its target").into());
+        }
+        drive_internal_core_mutation(image, |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            pass.remove_symlink(root, &second)
+        })?;
+        verify_internal_e2fsck_clean(linux, image, "final symlink unlink")?;
+    }
+    Ok(())
 }
 
 /// Exercises allocation, truncation, unlink, and deterministic cluster reuse on one fresh

@@ -259,6 +259,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidEncryptionContext
         | Error::InvalidVerityMetadata
         | Error::InvalidWriteRange
+        | Error::DirectoryCycle
         | Error::TransactionTooLarge => STATUS_INVALID_PARAMETER,
         Error::TruncatedStructure
         | Error::InvalidMagic

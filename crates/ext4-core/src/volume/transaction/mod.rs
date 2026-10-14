@@ -332,6 +332,8 @@ struct MetadataMutation<'storage, 'epoch> {
     volume_label_update: Option<Ext4VolumeLabel>,
     /// Mount-scoped fscrypt key snapshot prepared during resolve.
     fscrypt_keys_update: Option<FscryptKeySet>,
+    /// Ancestors whose committed parent relation authorizes a directory move.
+    namespace_ancestors: Vec<InodeId>,
 }
 
 impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
@@ -782,7 +784,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when the typed identity does not match the inode or names a directory.
     pub fn hard_link_source(&mut self, id: HardLinkNodeId) -> Result<TransactionHardLinkSource> {
         let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
-        let _metadata = inode.metadata_mutation()?;
+        let _namespace = inode.namespace_mutation()?;
         match (id, inode.kind()) {
             (HardLinkNodeId::File(_), InodeKind::File)
             | (HardLinkNodeId::Symlink(_), InodeKind::Symlink) => {}
@@ -1107,6 +1109,7 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
             free_inodes_delta: 0,
             volume_label_update: None,
             fscrypt_keys_update: None,
+            namespace_ancestors: Vec::new(),
         }
     }
 }

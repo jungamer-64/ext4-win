@@ -1032,7 +1032,7 @@ impl RawInodeRecord<Vec<u8>> {
     ///
     /// Returns an error when `target` exceeds inline capacity or the `i_block` storage is truncated.
     pub(super) fn set_inline_target(&mut self, target: &[u8]) -> Result<()> {
-        if target.len() > SymlinkTarget::INLINE_CAPACITY {
+        if target.len() >= SymlinkTarget::INLINE_CAPACITY {
             return Err(Error::InvalidWriteRange);
         }
         let end = INODE_BLOCK_OFFSET

@@ -287,6 +287,10 @@ impl MetadataMutation<'_, '_> {
             let resource = MutationResource::block_group(delta.group);
             observed.include(resource, coordinator.resource_version(resource))?;
         }
+        for ancestor in &self.namespace_ancestors {
+            let resource = MutationResource::inode(*ancestor);
+            observed.include(resource, coordinator.resource_version(resource))?;
+        }
         if !self.free_clusters_delta.is_zero()
             || self.free_inodes_delta != 0
             || self.volume_label_update.is_some()

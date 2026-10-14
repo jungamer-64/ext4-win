@@ -46,6 +46,106 @@ struct Disk {
 }
 
 impl Disk {
+    /// Encodes flags and a private encryption xattr in the independent 4 KiB/256-byte fixture.
+    /// Its inode-table address and CRC32C computation come from the disk format, not core encoders.
+    /// # Errors
+    /// Returns an invalid fixture layout or an out-of-range encoded field.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "each fixture copy uses a checked range with the exact encoded field width"
+    )]
+    fn encode_inode(&mut self, node: NodeId, flags: u32, context: Option<&[u8; 40]>) -> Result<()> {
+        let number = node.file_index();
+        let index = usize::try_from(number.checked_sub(1).ok_or(Error::InvalidInode)?)
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        let start = index
+            .checked_mul(256)
+            .and_then(|offset| offset.checked_add(35 * 4096))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let end = start.checked_add(256).ok_or(Error::ArithmeticOverflow)?;
+        let uuid = self
+            .filesystem
+            .get(1128..1144)
+            .ok_or(Error::InvalidSuperblock)?
+            .to_vec();
+        let record = self
+            .filesystem
+            .get_mut(start..end)
+            .ok_or(Error::InvalidInode)?;
+        record
+            .get_mut(32..36)
+            .ok_or(Error::InvalidInode)?
+            .copy_from_slice(&flags.to_le_bytes());
+        if let Some(context) = context {
+            record
+                .get_mut(128..130)
+                .ok_or(Error::InvalidInode)?
+                .copy_from_slice(&32_u16.to_le_bytes());
+            record.get_mut(160..).ok_or(Error::InvalidInode)?.fill(0);
+            record
+                .get_mut(160..164)
+                .ok_or(Error::InvalidInode)?
+                .copy_from_slice(&0xea02_0000_u32.to_le_bytes());
+            *record.get_mut(164).ok_or(Error::InvalidInode)? = 1;
+            *record.get_mut(165).ok_or(Error::InvalidInode)? = 9;
+            record
+                .get_mut(166..168)
+                .ok_or(Error::InvalidInode)?
+                .copy_from_slice(&52_u16.to_le_bytes());
+            record
+                .get_mut(172..176)
+                .ok_or(Error::InvalidInode)?
+                .copy_from_slice(&40_u32.to_le_bytes());
+            *record.get_mut(180).ok_or(Error::InvalidInode)? = b'c';
+            record
+                .get_mut(216..256)
+                .ok_or(Error::InvalidInode)?
+                .copy_from_slice(context);
+        }
+        let generation = record.get(100..104).ok_or(Error::InvalidInode)?.to_vec();
+        record.get_mut(124..126).ok_or(Error::InvalidInode)?.fill(0);
+        record.get_mut(130..132).ok_or(Error::InvalidInode)?.fill(0);
+        let crc = fixture_crc32c(
+            fixture_crc32c(
+                fixture_crc32c(fixture_crc32c(u32::MAX, &uuid), &number.to_le_bytes()),
+                &generation,
+            ),
+            record,
+        );
+        let checksum = crc.to_le_bytes();
+        record
+            .get_mut(124..126)
+            .ok_or(Error::InvalidInode)?
+            .copy_from_slice(checksum.get(..2).ok_or(Error::InvalidInode)?);
+        record
+            .get_mut(130..132)
+            .ok_or(Error::InvalidInode)?
+            .copy_from_slice(checksum.get(2..).ok_or(Error::InvalidInode)?);
+        if context.is_some() {
+            let mut features = [0_u8; 4];
+            features.copy_from_slice(
+                self.filesystem
+                    .get(1120..1124)
+                    .ok_or(Error::InvalidSuperblock)?,
+            );
+            self.filesystem
+                .get_mut(1120..1124)
+                .ok_or(Error::InvalidSuperblock)?
+                .copy_from_slice(&(u32::from_le_bytes(features) | 0x0001_0000).to_le_bytes());
+            let crc = fixture_crc32c(
+                u32::MAX,
+                self.filesystem
+                    .get(1024..2044)
+                    .ok_or(Error::InvalidSuperblock)?,
+            );
+            self.filesystem
+                .get_mut(2044..2048)
+                .ok_or(Error::InvalidSuperblock)?
+                .copy_from_slice(&crc.to_le_bytes());
+        }
+        Ok(())
+    }
+
     fn fixture() -> Self {
         Self {
             filesystem: include_bytes!(
@@ -250,6 +350,34 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Reads through the production completion-driven boundary without staging a mutation.
+    /// # Errors
+    /// Returns read admission, storage, or requested-domain failures.
+    fn read<F, R>(&mut self, mut read: F) -> Result<R>
+    where
+        F: for<'pass, 'storage, 'epoch> FnMut(
+            &mut EpochReadPass<'pass, 'storage, 'epoch>,
+        ) -> Result<R>,
+    {
+        let mut operation = EpochReadOperation::new(&self.profile);
+        let mut event = OperationEvent::Admitted;
+        loop {
+            match operation.run(
+                event,
+                self.coordinator
+                    .read_context(self.cache.access(&self.epoch))?,
+                &mut PlainCrypto,
+                |pass| read(pass),
+            ) {
+                ReadTransition::SubmitLower { request, suspended } => {
+                    event = OperationEvent::StorageCompleted(self.disk.complete(request)?);
+                    operation = suspended;
+                }
+                ReadTransition::Complete(result) => return result,
+            }
+        }
+    }
+
     /// # Errors
     /// Returns fixture mount, allocation, create, write, or commit failure.
     fn new() -> Result<Self> {
@@ -738,6 +866,326 @@ fn retained_directory_resolution_rejects_a_replacement_epoch() -> Result<()> {
             |pass| pass.next_directory_entry(&mut reader),
         ),
         Err(Error::ReadConflict)
+    ));
+    Ok(())
+}
+
+/// Independent owner shared by namespace fixtures.
+fn namespace_owner() -> Ext4Owner {
+    Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(1000))
+}
+
+/// Independent reflected CRC32C for fixture field encoding.
+fn fixture_crc32c(mut state: u32, bytes: &[u8]) -> u32 {
+    for byte in bytes {
+        state ^= u32::from(*byte);
+        for _ in 0..8 {
+            state = (state >> 1) ^ (0x82f6_3b78 & 0_u32.wrapping_sub(state & 1));
+        }
+    }
+    state
+}
+
+/// Supported v2 policy plus an independently chosen key identifier and file nonce.
+fn namespace_context(identifier: u8) -> [u8; 40] {
+    let mut bytes = [identifier; 40];
+    for (destination, source) in bytes.iter_mut().zip([2, 1, 4, 0, 0, 0, 0, 0]) {
+        *destination = source;
+    }
+    bytes
+}
+
+/// # Errors
+/// Returns fixture, independent encoding, or read failures.
+/// # Panics
+/// Fails if namespace operations bypass an inode's append-only flag.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "namespace admission assertions follow fallible fixture setup"
+)]
+fn append_only_inode_retains_its_names_and_link_count() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    fixture
+        .disk
+        .encode_inode(NodeId::File(file), 0x0008_0020, None)?;
+    fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+    assert!(matches!(
+        fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            pass.unlink_file(root, &Ext4Name::new(b"concurrent-a")?)
+        }),
+        Err(Error::UnsupportedInodeMutation)
+    ));
+    assert!(matches!(
+        fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            pass.rename_child(
+                root,
+                &Ext4Name::new(b"concurrent-a")?,
+                root,
+                &Ext4Name::new(b"renamed")?,
+                NamespaceDestination::Vacant,
+            )
+        }),
+        Err(Error::UnsupportedInodeMutation)
+    ));
+    assert!(matches!(
+        fixture.mutate(|pass| pass.hard_link_source(HardLinkNodeId::File(file))),
+        Err(Error::UnsupportedInodeMutation)
+    ));
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_file(file)?.links_count()))?,
+        Ext4LinkCount::ONE
+    );
+    assert!(matches!(
+        fixture.read(
+            |pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?)
+        )?,
+        ChildLookup::Found(_)
+    ));
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, independent encryption-context encoding, or read failures.
+/// # Panics
+/// Fails if rename inserts a plaintext or foreign-policy child into an encrypted directory.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "encryption policy assertions follow fallible fixture setup"
+)]
+fn rename_requires_the_encrypted_destination_policy() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let destination = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        Ok(pass
+            .create_directory(
+                root,
+                &Ext4Name::new(b"encrypted")?,
+                NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+            )?
+            .id())
+    })?;
+    fixture.disk.encode_inode(
+        NodeId::Directory(destination),
+        0x0008_0800,
+        Some(&namespace_context(0x11)),
+    )?;
+    for encrypted_source in [false, true] {
+        if encrypted_source {
+            fixture.disk.encode_inode(
+                NodeId::File(fixture.a),
+                0x0008_0800,
+                Some(&namespace_context(0x22)),
+            )?;
+        }
+        fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+        assert!(matches!(
+            fixture.mutate(|pass| {
+                let root = pass.directory(DirectoryNodeId::ROOT)?;
+                let target = pass.directory(destination)?;
+                pass.rename_child(
+                    root,
+                    &Ext4Name::new(b"concurrent-a")?,
+                    target,
+                    &Ext4Name::new(b"moved")?,
+                    NamespaceDestination::Vacant,
+                )
+            }),
+            Err(Error::UnsupportedEncryption)
+        ));
+        assert!(matches!(
+            fixture
+                .read(|pass| pass
+                    .lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?))?,
+            ChildLookup::Found(_)
+        ));
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, namespace, or payload failures.
+/// # Panics
+/// Fails if unlink invalidates a surviving name or inline storage includes the terminator byte.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "observable namespace assertions follow fallible fixture setup"
+)]
+fn symlink_names_share_storage_until_the_final_unlink() -> Result<()> {
+    for length in [59, 60, 61, 4095] {
+        let mut fixture = Fixture::new()?;
+        let free_before = fixture.epoch.geometry().free_cluster_count();
+        let target = SymlinkTarget::new(&vec![b'x'; length])?;
+        let first = Ext4Name::new(b"link-first")?;
+        let second = Ext4Name::new(b"link-second")?;
+        let link = fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            Ok(pass
+                .create_symlink(
+                    root,
+                    &first,
+                    &target,
+                    NewSymlinkMetadata::new(namespace_owner(), Ext4Permissions::new(0o777)?),
+                )?
+                .id())
+        })?;
+        let allocation =
+            fixture.read(|pass| Ok(pass.load_symlink(link)?.allocation_size().bytes()))?;
+        assert_eq!(allocation, if length < 60 { 0 } else { 4096 });
+        fixture.mutate(|pass| {
+            let source = pass.hard_link_source(HardLinkNodeId::Symlink(link))?;
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            pass.create_hard_link(source, root, &second, NamespaceDestination::Vacant)
+        })?;
+        fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            pass.remove_symlink(root, &first)
+        })?;
+        assert_eq!(
+            fixture.read(|pass| pass.read_symlink(link))?,
+            target.bytes()
+        );
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_symlink(link)?.links_count()))?,
+            Ext4LinkCount::ONE
+        );
+        fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            pass.remove_symlink(root, &second)
+        })?;
+        assert!(matches!(
+            fixture.read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &second))?,
+            ChildLookup::NotFound
+        ));
+        assert_eq!(fixture.epoch.geometry().free_cluster_count(), free_before);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture or lookup failures.
+/// # Panics
+/// Fails if native target admission creates a name for an unrepresentable target.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "native symlink admission assertions follow fallible setup"
+)]
+fn native_symlink_target_reserves_its_terminator_inside_one_block() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    for length in [4096, 4097] {
+        let name = Ext4Name::new(b"oversized-link")?;
+        let target = SymlinkTarget::new(&vec![b'x'; length])?;
+        assert!(matches!(
+            fixture.mutate(|pass| {
+                let root = pass.directory(DirectoryNodeId::ROOT)?;
+                pass.create_symlink(
+                    root,
+                    &name,
+                    &target,
+                    NewSymlinkMetadata::new(namespace_owner(), Ext4Permissions::new(0o777)?),
+                )
+            }),
+            Err(Error::InvalidName)
+        ));
+        assert!(matches!(
+            fixture.read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &name))?,
+            ChildLookup::NotFound
+        ));
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, directory, resolve, or commit failures.
+/// # Panics
+/// Fails if a directory can enter its descendants or a stale ancestry proof can be committed.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "ancestry and conflict assertions follow fallible setup"
+)]
+fn directory_moves_revalidate_destination_ancestry() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a_name = Ext4Name::new(b"tree-a")?;
+    let b_name = Ext4Name::new(b"tree-b")?;
+    let c_name = Ext4Name::new(b"tree-c")?;
+    let moved = Ext4Name::new(b"moved")?;
+    let (a, b, c) = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let metadata = NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?);
+        let a = pass.create_directory(root, &a_name, metadata)?;
+        let b = pass.create_directory(a, &b_name, metadata)?;
+        let c = pass.create_directory(root, &c_name, metadata)?;
+        Ok((a.id(), b.id(), c.id()))
+    })?;
+    for destination in [a, b] {
+        assert!(matches!(
+            fixture.mutate(|pass| {
+                let root = pass.directory(DirectoryNodeId::ROOT)?;
+                let destination = pass.directory(destination)?;
+                pass.rename_child(
+                    root,
+                    &a_name,
+                    destination,
+                    &moved,
+                    NamespaceDestination::Vacant,
+                )
+            }),
+            Err(Error::DirectoryCycle)
+        ));
+    }
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        |pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            let destination = pass.directory(c)?;
+            pass.rename_child(
+                root,
+                &a_name,
+                destination,
+                &moved,
+                NamespaceDestination::Vacant,
+            )
+        },
+    )?;
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let destination = pass.directory(b)?;
+        pass.rename_child(
+            root,
+            &c_name,
+            destination,
+            &moved,
+            NamespaceDestination::Vacant,
+        )
+    })?;
+    assert!(matches!(
+        resolved.reserve(&fixture.coordinator, MutationLease::granted(ticket)),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    assert!(matches!(
+        fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            let destination = pass.directory(c)?;
+            pass.rename_child(
+                root,
+                &a_name,
+                destination,
+                &moved,
+                NamespaceDestination::Vacant,
+            )
+        }),
+        Err(Error::DirectoryCycle)
     ));
     Ok(())
 }

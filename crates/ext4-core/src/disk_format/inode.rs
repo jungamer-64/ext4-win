@@ -864,7 +864,7 @@ impl SymlinkTarget {
     /// Returns whether the target fits in the inode body.
     #[must_use]
     pub fn is_inline(&self) -> bool {
-        self.bytes.len() <= Self::INLINE_CAPACITY
+        self.bytes.len() < Self::INLINE_CAPACITY
     }
 }
 
@@ -1112,13 +1112,16 @@ impl InodeFlags {
         Ok(FileSizeMutationCapability { _private: () })
     }
 
-    /// Creates a final deletion mutation capability for these flags.
+    /// Authorizes changing a name or link count belonging to this inode.
     ///
     /// # Errors
-    /// Returns an error when immutable or inline-data semantics reject deletion.
-    pub fn deletion_mutation(self) -> Result<DeletionMutationCapability> {
+    /// Returns an error when immutable, append-only, or inline-data semantics reject the change.
+    pub fn namespace_mutation(self) -> Result<NamespaceMutationCapability> {
         self.require_common_mutation()?;
-        Ok(DeletionMutationCapability { _private: () })
+        if self.0 & EXT4_APPEND_FL != 0 {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        Ok(NamespaceMutationCapability { _private: () })
     }
 
     /// Rejects inode flags that make every mutation unsupported.
@@ -1177,9 +1180,9 @@ pub struct FileSizeMutationCapability {
     _private: (),
 }
 
-/// Capability proving final deletion is allowed by inode flags.
+/// Capability proving namespace and link-count changes are allowed by inode flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DeletionMutationCapability {
+pub struct NamespaceMutationCapability {
     /// Prevents construction outside this module.
     _private: (),
 }
@@ -1333,7 +1336,7 @@ impl InodeData {
         memory::copy_exact(&mut block, block_slice)?;
         let storage = if flags.has_extent_tree() {
             InodeStorage::Extents(InodeExtentRoot::from_bytes(block))
-        } else if mode.kind() == InodeKind::Symlink && size.to_usize()? <= block.len() {
+        } else if mode.kind() == InodeKind::Symlink && size.to_usize()? < block.len() {
             InodeStorage::InlineBytes(InodeInlineBytes::from_bytes(block))
         } else {
             InodeStorage::UnsupportedBlockMap
@@ -1494,12 +1497,12 @@ impl Inode {
         self.data.flags.file_size_mutation()
     }
 
-    /// Builds a deletion mutation capability for this inode.
+    /// Builds a namespace and link-count mutation capability for this inode.
     ///
     /// # Errors
-    /// Returns an error when this inode's flags reject final deletion.
-    pub fn deletion_mutation(&self) -> Result<DeletionMutationCapability> {
-        self.data.flags.deletion_mutation()
+    /// Returns an error when this inode's flags reject namespace or link-count changes.
+    pub fn namespace_mutation(&self) -> Result<NamespaceMutationCapability> {
+        self.data.flags.namespace_mutation()
     }
 
     /// Data storage selected by inode flags and node kind.
@@ -1896,6 +1899,10 @@ mod tests {
         let append_only = InodeFlags::from_u32(super::EXT4_APPEND_FL);
         assert_eq!(
             append_only.directory_entry_mutation(),
+            Err(Error::UnsupportedInodeMutation)
+        );
+        assert_eq!(
+            append_only.namespace_mutation(),
             Err(Error::UnsupportedInodeMutation)
         );
 
