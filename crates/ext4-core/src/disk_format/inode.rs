@@ -487,8 +487,11 @@ pub struct Ext4Timestamp {
 impl Ext4Timestamp {
     /// Constructs a whole-second time representable even without extended fields.
     #[must_use]
-    pub const fn from_seconds(seconds: i32) -> Self {
-        Self { seconds: seconds as i64, nanoseconds: 0 }
+    pub fn from_seconds(seconds: i32) -> Self {
+        Self {
+            seconds: i64::from(seconds),
+            nanoseconds: 0,
+        }
     }
 
     /// Constructs a time in the ext4 signed-seconds and two-bit epoch range.
@@ -498,7 +501,10 @@ impl Ext4Timestamp {
         if seconds < -2_147_483_648 || seconds > 15_032_385_535 || nanoseconds >= 1_000_000_000 {
             return Err(Error::InvalidTimestamp);
         }
-        Ok(Self { seconds, nanoseconds })
+        Ok(Self {
+            seconds,
+            nanoseconds,
+        })
     }
 
     /// Signed Unix seconds.
@@ -509,7 +515,99 @@ impl Ext4Timestamp {
 
     /// Nanoseconds within the second.
     #[must_use]
-    pub const fn nanoseconds(self) -> u32 { self.nanoseconds }
+    pub const fn nanoseconds(self) -> u32 {
+        self.nanoseconds
+    }
+}
+
+/// Validated boundary between extended inode fields and in-inode xattrs.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InodeRecordLayout {
+    /// Exclusive end of declared fields; bytes beyond this belong to xattrs.
+    extra_end: usize,
+}
+
+impl InodeRecordLayout {
+    /// Validates the declared field span against the actual inode record.
+    /// # Errors
+    /// Returns an invalid inode or truncated field for an out-of-record declaration.
+    pub(crate) fn parse(raw: &[u8]) -> Result<Self> {
+        if raw.len() < 128 {
+            return Err(Error::TruncatedStructure);
+        }
+        let extra = if raw.len() == 128 {
+            0
+        } else {
+            usize::from(le_u16(raw, disk_offset(128))?)
+        };
+        let extra_end = 128_usize
+            .checked_add(extra)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if extra_end > raw.len() {
+            return Err(Error::InvalidInode);
+        }
+        Ok(Self { extra_end })
+    }
+
+    /// Checks storage declared for a complete extra field, excluding xattr bytes.
+    pub(crate) fn contains(self, offset: usize, width: usize) -> bool {
+        offset >= 128
+            && offset
+                .checked_add(width)
+                .is_some_and(|end| end <= self.extra_end)
+    }
+
+    /// Start of the inode's xattr body.
+    pub(crate) const fn xattr_offset(self) -> usize {
+        self.extra_end
+    }
+}
+
+impl Ext4Timestamp {
+    /// Decodes the signed base and the optional ext4 epoch/nanosecond extension.
+    /// # Errors
+    /// Returns an invalid timestamp for an out-of-range nanosecond field.
+    pub(crate) fn decode(seconds: u32, extra: Option<u32>) -> Result<Self> {
+        let base = i64::from(i32::from_le_bytes(seconds.to_le_bytes()));
+        let extension = extra.unwrap_or(0);
+        let epoch = i64::from(extension & 3)
+            .checked_mul(4_294_967_296)
+            .ok_or(Error::ArithmeticOverflow)?;
+        Self::new(
+            base.checked_add(epoch).ok_or(Error::ArithmeticOverflow)?,
+            extension >> 2,
+        )
+    }
+
+    /// Signed-base bits at the on-disk serialization boundary.
+    /// # Errors
+    /// Returns arithmetic overflow if the private timestamp invariant is violated.
+    pub(crate) fn base_seconds_bits(self) -> Result<u32> {
+        u32::try_from(self.seconds.rem_euclid(4_294_967_296)).map_err(|_| Error::ArithmeticOverflow)
+    }
+
+    /// Encodes the field at its available precision; unextended fields store whole seconds.
+    /// # Errors
+    /// Returns invalid timestamp when seconds require an absent epoch extension.
+    pub(crate) fn encode(self, extended: bool) -> Result<(u32, Option<u32>)> {
+        let seconds = self.base_seconds_bits()?;
+        let signed = i64::from(i32::from_le_bytes(seconds.to_le_bytes()));
+        if !extended {
+            if self.seconds != signed {
+                return Err(Error::InvalidTimestamp);
+            }
+            return Ok((seconds, None));
+        }
+        let epoch = u32::try_from(
+            self.seconds
+                .checked_sub(signed)
+                .ok_or(Error::ArithmeticOverflow)?
+                .checked_div(4_294_967_296)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )
+        .map_err(|_| Error::InvalidTimestamp)?;
+        Ok((seconds, Some((self.nanoseconds << 2) | epoch)))
+    }
 }
 
 /// ext4 inode timestamps.
@@ -521,8 +619,8 @@ pub struct Ext4Times {
     modified: Ext4Timestamp,
     /// Last metadata change time.
     changed: Ext4Timestamp,
-    /// Creation time.
-    created: Ext4Timestamp,
+    /// Creation time when the inode declares storage for it.
+    created: Option<Ext4Timestamp>,
 }
 
 impl Ext4Times {
@@ -532,7 +630,7 @@ impl Ext4Times {
         accessed: Ext4Timestamp,
         modified: Ext4Timestamp,
         changed: Ext4Timestamp,
-        created: Ext4Timestamp,
+        created: Option<Ext4Timestamp>,
     ) -> Self {
         Self {
             accessed,
@@ -560,9 +658,9 @@ impl Ext4Times {
         self.changed
     }
 
-    /// Creation time.
+    /// Creation time when the inode declares storage for it.
     #[must_use]
-    pub const fn created(self) -> Ext4Timestamp {
+    pub const fn created(self) -> Option<Ext4Timestamp> {
         self.created
     }
 }
@@ -1593,27 +1691,94 @@ fn parse_gid(raw: &[u8]) -> Result<u32> {
 ///
 /// Returns an error when any required inode timestamp field is outside the raw inode bytes.
 fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
-    let accessed = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_ATIME_OFFSET))?);
-    let changed = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_CTIME_OFFSET))?);
-    let modified = Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_MTIME_OFFSET))?);
-    let created = if raw
-        .get(
-            INODE_CRTIME_OFFSET
-                ..INODE_CRTIME_OFFSET
-                    .checked_add(core::mem::size_of::<u32>())
-                    .ok_or(Error::ArithmeticOverflow)?,
+    let layout = InodeRecordLayout::parse(raw)?;
+    let read = |base: usize, extra: usize| -> Result<Ext4Timestamp> {
+        Ext4Timestamp::decode(
+            le_u32(raw, disk_offset(base))?,
+            if layout.contains(extra, 4) {
+                Some(le_u32(raw, disk_offset(extra))?)
+            } else {
+                None
+            },
         )
-        .is_some()
-    {
-        Ext4Timestamp::from_unix_seconds(le_u32(raw, disk_offset(INODE_CRTIME_OFFSET))?)
-    } else {
-        changed
     };
-    Ok(Ext4Times::new(accessed, modified, changed, created))
+    let created = if layout.contains(INODE_CRTIME_OFFSET, 4) {
+        Some(read(INODE_CRTIME_OFFSET, 148)?)
+    } else {
+        None
+    };
+    Ok(Ext4Times::new(
+        read(INODE_ATIME_OFFSET, 140)?,
+        read(INODE_MTIME_OFFSET, 136)?,
+        read(INODE_CTIME_OFFSET, 132)?,
+        created,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    /// Independent wire vectors cover signed base seconds, every epoch, and fractional precision.
+    /// # Errors
+    /// Returns a decoding or encoding failure for an expected valid time.
+    /// # Panics
+    /// Fails when the external ext4 time encoding or inode-field boundary differs.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independent on-disk timestamp vectors"
+    )]
+    fn timestamp_wire_vectors_and_declared_fields() -> crate::Result<()> {
+        use super::{Ext4Timestamp, parse_times};
+        use crate::disk::endian::put_le_u16;
+        for (low, extra, seconds, nanos) in [
+            (0xffff_ffff, 0, -1, 0),
+            (0x8000_0000, 1, 2_147_483_648, 0),
+            (1, 5, 4_294_967_297, 1),
+            (0x8000_0000, 2, 6_442_450_944, 0),
+            (0x8000_0000, 3, 10_737_418_240, 0),
+            (0x7fff_ffff, 3_999_999_999, 15_032_385_535, 999_999_999),
+        ] {
+            let time = Ext4Timestamp::decode(low, Some(extra))?;
+            assert_eq!(time, Ext4Timestamp::new(seconds, nanos)?);
+            assert_eq!(time.encode(true)?, (low, Some(extra)));
+        }
+        assert_eq!(
+            Ext4Timestamp::new(15_032_385_536, 0),
+            Err(Error::InvalidTimestamp)
+        );
+        assert_eq!(
+            Ext4Timestamp::new(-2_147_483_649, 0),
+            Err(Error::InvalidTimestamp)
+        );
+        assert_eq!(
+            Ext4Timestamp::decode(0, Some(4_000_000_000)),
+            Err(Error::InvalidTimestamp)
+        );
+        assert_eq!(
+            Ext4Timestamp::new(2_147_483_648, 0)?.encode(false),
+            Err(Error::InvalidTimestamp)
+        );
+        let mut raw = [0_u8; 256];
+        put_le_u16(&mut raw, super::disk_offset(128), 4)?;
+        put_le_u32(&mut raw, super::disk_offset(132), 0xea02_0000)?;
+        put_le_u32(&mut raw, super::disk_offset(144), 8)?;
+        assert_eq!(parse_times(&raw)?.created(), None);
+        assert_eq!(parse_times(&raw)?.changed(), Ext4Timestamp::from_seconds(0));
+        put_le_u16(&mut raw, super::disk_offset(128), 24)?;
+        put_le_u32(&mut raw, super::disk_offset(132), 0)?;
+        put_le_u32(&mut raw, super::disk_offset(136), 5)?;
+        put_le_u32(&mut raw, super::disk_offset(16), 1)?;
+        assert_eq!(
+            parse_times(&raw)?.modified(),
+            Ext4Timestamp::new(4_294_967_297, 1)?
+        );
+        assert_eq!(
+            parse_times(&raw)?.created(),
+            Some(Ext4Timestamp::from_seconds(8))
+        );
+        Ok(())
+    }
+
     use super::{
         DirectorySize, DirectorySizeEncoding, DirectoryStorageKind, Ext4LinkCount, Ext4Permissions,
         FileAllocationSize, FileSize, FileSizeEncoding, Inode, InodeBlockCountEncoding,

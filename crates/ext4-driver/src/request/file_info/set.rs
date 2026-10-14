@@ -554,7 +554,7 @@ impl BasicTimeUpdates {
             self.accessed.value(current.accessed()),
             self.modified.value(current.modified()),
             self.changed.value(current.changed()),
-            self.created.unwrap_or(current.created()),
+            self.created.or(current.created()),
         )
     }
 
@@ -568,26 +568,19 @@ impl BasicTimeUpdates {
     }
 }
 
-/// Converts a validated positive Windows absolute timestamp to the core seconds domain.
+/// Converts a validated positive Windows absolute timestamp to the ext4 time domain.
 /// # Errors
 /// Returns invalid parameter when Windows cannot represent this timestamp as Unix seconds.
 #[expect(
     unsafe_code,
-    reason = "RtlTimeToSecondsSince1970 converts fixed local timestamp storage"
+    reason = "the decoder receives an initialized Windows LARGE_INTEGER"
 )]
-fn windows_timestamp(mut value: LARGE_INTEGER) -> DriverResult<Ext4Timestamp> {
-    let mut seconds = 0;
-    let converted = unsafe {
-        // SAFETY: Both pointers refer to writable stack storage valid throughout the call.
-        crate::kernel::ffi::RtlTimeToSecondsSince1970(
-            core::ptr::addr_of_mut!(value),
-            core::ptr::addr_of_mut!(seconds),
-        )
+fn windows_timestamp(value: LARGE_INTEGER) -> DriverResult<Ext4Timestamp> {
+    let ticks = unsafe {
+        // SAFETY: The basic-information decoder supplied an initialized LARGE_INTEGER.
+        value.QuadPart
     };
-    if converted == 0 {
-        return Err(DriverError::InvalidParameter);
-    }
-    Ok(Ext4Timestamp::from_unix_seconds(seconds))
+    crate::kernel::time::ext4_timestamp(ticks)
 }
 
 /// Applies attributes before final explicit timestamps so attribute setters cannot overwrite them.

@@ -156,10 +156,7 @@ impl MutationResolvePass<'_, '_, '_> {
         let _namespace = inode.namespace_mutation()?;
         match raw_inode.decrement_links_count()? {
             LinkCountAfterDecrement::StillLinked(_) => {
-                raw_inode.set_timestamps(
-                    self.now,
-                    self.mutation.volume.superblock.inode_timestamp_encoding(),
-                )?;
+                raw_inode.set_timestamps(self.now)?;
                 self.mutation.replace_live_inode(inode_index, raw_inode)?;
             }
             LinkCountAfterDecrement::Unlinked => {
@@ -171,11 +168,8 @@ impl MutationResolvePass<'_, '_, '_> {
                     self.mutation.release_cluster_reference(block)?;
                 }
                 self.mutation.reclaim_inode(raw_inode.raw())?;
-                let deleted = raw_inode.delete_and_touch(
-                    self.now,
-                    self.mutation.volume.superblock.block_size(),
-                    self.mutation.volume.superblock.inode_timestamp_encoding(),
-                )?;
+                let deleted = raw_inode
+                    .delete_and_touch(self.now, self.mutation.volume.superblock.block_size())?;
                 self.mutation.replace_deleted_inode(inode_index, deleted)?;
             }
         }
@@ -256,10 +250,7 @@ impl MutationResolvePass<'_, '_, '_> {
             )?;
             raw_source.increment_links_count()?;
         }
-        raw_source.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_source.set_timestamps(self.now)?;
         self.mutation.replace_live_inode(source_index, raw_source)?;
         Ok(())
     }
@@ -587,10 +578,7 @@ impl MutationResolvePass<'_, '_, '_> {
             }
         }
 
-        child_raw.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        child_raw.set_timestamps(self.now)?;
         self.mutation.replace_live_inode(child_index, child_raw)?;
         Ok(())
     }
@@ -690,10 +678,7 @@ impl MutationResolvePass<'_, '_, '_> {
             raw_inode.decrement_links_count()?,
             LinkCountAfterDecrement::StillLinked(_)
         ) {
-            raw_inode.set_timestamps(
-                self.now,
-                self.mutation.volume.superblock.inode_timestamp_encoding(),
-            )?;
+            raw_inode.set_timestamps(self.now)?;
             self.mutation.replace_live_inode(inode_index, raw_inode)?;
             return Ok(());
         }
@@ -827,10 +812,7 @@ impl MutationResolvePass<'_, '_, '_> {
             )?;
             if block.insert(child, &disk_name, kind)? {
                 self.stage_directory_block(physical, block.into_bytes())?;
-                raw_parent.set_timestamps(
-                    self.now,
-                    self.mutation.volume.superblock.inode_timestamp_encoding(),
-                )?;
+                raw_parent.set_timestamps(self.now)?;
                 self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 return Ok(());
             }
@@ -879,10 +861,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .inode_data_encoding()
             .encode_directory_size(DirectorySize::from_bytes(new_parent_size.bytes()))?;
         raw_parent.set_encoded_size(encoded_size)?;
-        raw_parent.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_parent.set_timestamps(self.now)?;
         self.mutation.stage_extent_tree(&mut raw_parent, tree)?;
         self.mutation.replace_live_inode(inode_index, raw_parent)?;
         Ok(())
@@ -914,10 +893,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .remove(&disk_name)?
             .ok_or(Error::DirectoryEntryNotFound)?;
         self.stage_directory_block(location.physical, location.block.into_bytes())?;
-        raw_parent.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_parent.set_timestamps(self.now)?;
         self.mutation.replace_live_inode(inode_index, raw_parent)?;
         Ok(removed)
     }
@@ -989,10 +965,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 self.stage_directory_block(source.physical, source.block.into_bytes())?;
-                raw_parent.set_timestamps(
-                    self.now,
-                    self.mutation.volume.superblock.inode_timestamp_encoding(),
-                )?;
+                raw_parent.set_timestamps(self.now)?;
                 self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 return Ok(renamed);
             }
@@ -1022,10 +995,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 self.stage_directory_block(source.physical, source.block.into_bytes())?;
-                raw_parent.set_timestamps(
-                    self.now,
-                    self.mutation.volume.superblock.inode_timestamp_encoding(),
-                )?;
+                raw_parent.set_timestamps(self.now)?;
                 self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 Ok(renamed)
             }
@@ -1077,10 +1047,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .replace(&disk_name, child, kind)?
             .ok_or(Error::DirectoryEntryNotFound)?;
         self.stage_directory_block(location.physical, location.block.into_bytes())?;
-        raw_parent.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_parent.set_timestamps(self.now)?;
         self.mutation.replace_live_inode(inode_index, raw_parent)?;
         Ok(replaced)
     }
@@ -1378,10 +1345,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .validate_leaf(&leaf.entries()?, context.root.hash_scheme())?;
         if leaf.insert(entry.inode(), entry.name(), entry.kind())? {
             self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
-            raw_parent.set_timestamps(
-                self.now,
-                self.mutation.volume.superblock.inode_timestamp_encoding(),
-            )?;
+            raw_parent.set_timestamps(self.now)?;
             return self.mutation.replace_live_inode(inode_index, raw_parent);
         }
 
@@ -1751,10 +1715,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .inode_data_encoding()
             .encode_directory_size(DirectorySize::from_bytes(size.bytes()))?;
         raw_parent.set_encoded_size(encoded)?;
-        raw_parent.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_parent.set_timestamps(self.now)?;
         self.mutation.stage_extent_tree(&mut raw_parent, tree)?;
         self.mutation.replace_live_inode(inode_index, raw_parent)
     }

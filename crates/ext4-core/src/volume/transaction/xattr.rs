@@ -219,7 +219,7 @@ impl MetadataMutation<'_, '_> {
         let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
         update(set.public_mut())?;
         self.store_xattr_set(&mut raw_inode, &set)?;
-        raw_inode.set_timestamps(now, self.volume.superblock.inode_timestamp_encoding())?;
+        raw_inode.set_timestamps(now)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }

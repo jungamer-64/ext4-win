@@ -309,7 +309,8 @@ fn pack_directory_record(
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
         record_field_offset(start, DIRECTORY_CREATION_TIME_OFFSET)?,
-        &windows_time_quad(metadata.times.created()).to_le_bytes(),
+        &windows_time_quad(metadata.times.created().unwrap_or(metadata.times.changed()))
+            .to_le_bytes(),
     )?;
     LittleEndianOutput::new(buffer).write_bytes(
         record_field_offset(start, DIRECTORY_LAST_ACCESS_TIME_OFFSET)?,

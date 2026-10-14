@@ -124,13 +124,13 @@ mod tests {
             modified: AutomaticTimeUpdate::Suppressed,
             changed: AutomaticTimeUpdate::Enabled,
         });
-        let old = Ext4Timestamp::from_unix_seconds(10);
-        let new = Ext4Timestamp::from_unix_seconds(20);
-        let before = Ext4Times::new(old, old, old, old);
-        let after = Ext4Times::new(new, new, new, old);
+        let old = Ext4Timestamp::from_seconds(10);
+        let new = Ext4Timestamp::from_seconds(20);
+        let before = Ext4Times::new(old, old, old, Some(old));
+        let after = Ext4Times::new(new, new, new, Some(old));
         assert_eq!(
             first.policy().preserve(before, after),
-            Ext4Times::new(old, old, new, old)
+            Ext4Times::new(old, old, new, Some(old))
         );
         assert_eq!(second.policy().preserve(before, after), after);
         assert!(first.policy().requires_journaled_write());

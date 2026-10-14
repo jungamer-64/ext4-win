@@ -12,7 +12,7 @@ pub(super) fn test_metadata_with_permissions(
     permissions: u16,
     overlay_attributes: u32,
 ) -> Option<super::FileMetadata> {
-    let timestamp = Ext4Timestamp::from_unix_seconds(1);
+    let timestamp = Ext4Timestamp::from_seconds(1);
     let mut file_attributes = overlay_attributes;
     if permissions & 0o222 == 0 {
         file_attributes |= wdk_sys::FILE_ATTRIBUTE_READONLY;
@@ -35,7 +35,7 @@ pub(super) fn test_metadata_with_permissions(
             Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(0)),
             Ext4Permissions::new(permissions).ok()?,
         ),
-        times: Ext4Times::new(timestamp, timestamp, timestamp, timestamp),
+        times: Ext4Times::new(timestamp, timestamp, timestamp, Some(timestamp)),
         links_count: Ext4LinkCount::ONE,
         overlay_attributes,
         file_attributes,

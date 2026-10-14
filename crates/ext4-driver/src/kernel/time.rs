@@ -4,12 +4,28 @@ use ext4_core::Ext4Timestamp;
 
 use crate::kernel::status::DriverError;
 
-/// Converts ext4's bounded Unix-second domain to Windows 100-nanosecond ticks since 1601.
-/// Every u32 second count fits i64 after this affine conversion.
+/// Converts the bounded ext4 time domain to Windows ticks, truncating below 100 ns.
 pub(crate) fn windows_timestamp(timestamp: Ext4Timestamp) -> i64 {
-    i64::from(timestamp.seconds())
+    timestamp
+        .seconds()
         .wrapping_mul(10_000_000)
         .wrapping_add(116_444_736_000_000_000)
+        .wrapping_add(i64::from(timestamp.nanoseconds() / 100))
+}
+
+/// Converts Windows ticks to signed Unix seconds and fractional time.
+/// # Errors
+/// Returns invalid parameter outside the ext4 representable time range.
+pub(crate) fn ext4_timestamp(ticks: i64) -> Result<Ext4Timestamp, DriverError> {
+    let unix = ticks
+        .checked_sub(116_444_736_000_000_000)
+        .ok_or(DriverError::InvalidParameter)?;
+    let nanoseconds = u32::try_from(unix.rem_euclid(10_000_000))
+        .map_err(|_| DriverError::InvalidParameter)?
+        .checked_mul(100)
+        .ok_or(DriverError::InvalidParameter)?;
+    Ext4Timestamp::new(unix.div_euclid(10_000_000), nanoseconds)
+        .map_err(|_| DriverError::InvalidParameter)
 }
 
 /// Returns the current system time as an ext4 inode timestamp.
@@ -27,19 +43,11 @@ pub(crate) fn current_ext4_timestamp() -> Result<Ext4Timestamp, DriverError> {
         // receive the current system time.
         crate::kernel::ffi::KeQuerySystemTimePrecise(core::ptr::addr_of_mut!(time));
     }
-    let mut seconds: wdk_sys::ULONG = 0;
-    let converted = unsafe {
-        // SAFETY: Both pointers reference writable stack storage valid for the
-        // duration of the conversion call.
-        crate::kernel::ffi::RtlTimeToSecondsSince1970(
-            core::ptr::addr_of_mut!(time),
-            core::ptr::addr_of_mut!(seconds),
-        )
+    let ticks = unsafe {
+        // SAFETY: KeQuerySystemTimePrecise initialized the LARGE_INTEGER value.
+        time.QuadPart
     };
-    if converted == 0 {
-        return Err(DriverError::InvalidParameter);
-    }
-    Ok(Ext4Timestamp::from_unix_seconds(seconds))
+    ext4_timestamp(ticks)
 }
 
 #[cfg(test)]
@@ -49,18 +57,28 @@ mod tests {
     /// # Panics
     /// Fails if epoch conversion or the maximum ext4 timestamp loses ticks.
     #[test]
-    fn windows_time_known_answers() {
+    fn windows_time_known_answers() -> Result<(), DriverError> {
         assert_eq!(
-            windows_timestamp(Ext4Timestamp::from_unix_seconds(0)),
+            windows_timestamp(Ext4Timestamp::from_seconds(0)),
             116_444_736_000_000_000
         );
         assert_eq!(
-            windows_timestamp(Ext4Timestamp::from_unix_seconds(1)),
+            windows_timestamp(Ext4Timestamp::from_seconds(1)),
             116_444_736_010_000_000
         );
         assert_eq!(
-            windows_timestamp(Ext4Timestamp::from_unix_seconds(u32::MAX)),
+            windows_timestamp(Ext4Timestamp::new(i64::from(u32::MAX), 0)?),
             159_394_408_950_000_000
         );
+        for (seconds, nanos) in [
+            (-1, 999_999_900),
+            (2_147_483_648, 100),
+            (4_294_967_297, 123_456_700),
+            (15_032_385_535, 999_999_900),
+        ] {
+            let time = Ext4Timestamp::new(seconds, nanos)?;
+            assert_eq!(ext4_timestamp(windows_timestamp(time))?, time);
+        }
+        Ok(())
     }
 }

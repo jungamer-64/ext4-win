@@ -1,7 +1,7 @@
 //! Inode record typestates staged by mounted volume transactions.
 
 use super::scope::*;
-use crate::disk_format::inode::InodeData;
+use crate::disk_format::inode::{InodeData, InodeRecordLayout};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Raw inode image paired with its identity and device offset. Read-only consumers may borrow
@@ -290,12 +290,8 @@ impl LiveInodeRecord {
     ///
     /// Returns an error when inode timestamp fields or required extra timestamp storage cannot be
     /// updated.
-    pub(super) fn set_timestamps(
-        &mut self,
-        now: Ext4Timestamp,
-        timestamp_encoding: InodeTimestampEncoding,
-    ) -> Result<()> {
-        self.raw.set_timestamps(now, timestamp_encoding)
+    pub(super) fn set_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
+        self.raw.set_timestamps(now)
     }
 
     /// Writes explicit ext4 inode timestamps.
@@ -303,12 +299,8 @@ impl LiveInodeRecord {
     ///
     /// Returns an error when any explicit ext4 timestamp field or required extra timestamp storage
     /// cannot be updated.
-    pub(super) fn set_ext4_times(
-        &mut self,
-        times: Ext4Times,
-        timestamp_encoding: InodeTimestampEncoding,
-    ) -> Result<()> {
-        self.raw.set_ext4_times(times, timestamp_encoding)
+    pub(super) fn set_ext4_times(&mut self, times: Ext4Times) -> Result<()> {
+        self.raw.set_ext4_times(times)
     }
 
     /// Writes a file size already validated by the mounted inode encoding.
@@ -416,7 +408,7 @@ impl LiveInodeRecord {
         block_size: BlockSize,
     ) -> Result<DeletedInodeRecord> {
         let kind = self.parse()?.kind();
-        self.raw.set_deletion_time(now.seconds())?;
+        self.raw.set_deletion_time(now.base_seconds_bits()?)?;
         self.raw.set_deleted_links_count()?;
         let size = match kind {
             InodeKind::Directory => self
@@ -449,10 +441,9 @@ impl LiveInodeRecord {
         mut self,
         now: Ext4Timestamp,
         block_size: BlockSize,
-        timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<DeletedInodeRecord> {
         let kind = self.parse()?.kind();
-        self.raw.set_deletion_time(now.seconds())?;
+        self.raw.set_deletion_time(now.base_seconds_bits()?)?;
         self.raw.set_deleted_links_count()?;
         let size = match kind {
             InodeKind::Directory => self
@@ -473,7 +464,7 @@ impl LiveInodeRecord {
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.raw.set_extent_root_bytes(serialized.inode_root())?;
-        self.raw.set_timestamps(now, timestamp_encoding)?;
+        self.raw.set_timestamps(now)?;
         Ok(DeletedInodeRecord { raw: self.raw })
     }
 }
@@ -562,13 +553,16 @@ impl RawInodeRecord<Vec<u8>> {
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<()> {
         self.bytes.fill(0);
+        if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
+            self.initialize_extra_fields()?;
+        }
         self.set_mode(InodeMode::regular_file(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         let size = self.encoding.encode_file_size(FileSize::from_bytes(0))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
-        self.set_timestamps(now, timestamp_encoding)?;
-        self.set_creation_time(now, timestamp_encoding)?;
+        self.set_timestamps(now)?;
+        self.set_creation_time(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -595,6 +589,9 @@ impl RawInodeRecord<Vec<u8>> {
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<()> {
         self.bytes.fill(0);
+        if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
+            self.initialize_extra_fields()?;
+        }
         self.set_mode(InodeMode::directory(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         let size = self
@@ -602,8 +599,8 @@ impl RawInodeRecord<Vec<u8>> {
             .encode_directory_size(DirectorySize::from_bytes(u64::from(block_size.bytes())))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::TWO)?;
-        self.set_timestamps(now, timestamp_encoding)?;
-        self.set_creation_time(now, timestamp_encoding)?;
+        self.set_timestamps(now)?;
+        self.set_creation_time(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let mut extents = Vec::new();
@@ -635,6 +632,9 @@ impl RawInodeRecord<Vec<u8>> {
             return Err(Error::InvalidWriteRange);
         }
         self.bytes.fill(0);
+        if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
+            self.initialize_extra_fields()?;
+        }
         self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         let size = self.encoding.encode_file_size(FileSize::from_bytes(
@@ -642,8 +642,8 @@ impl RawInodeRecord<Vec<u8>> {
         ))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
-        self.set_timestamps(now, timestamp_encoding)?;
-        self.set_creation_time(now, timestamp_encoding)?;
+        self.set_timestamps(now)?;
+        self.set_creation_time(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY)?;
         self.set_inline_target(target.bytes())?;
@@ -670,6 +670,9 @@ impl RawInodeRecord<Vec<u8>> {
             return Err(Error::InvalidWriteRange);
         }
         self.bytes.fill(0);
+        if timestamp_encoding == InodeTimestampEncoding::ExtraFields {
+            self.initialize_extra_fields()?;
+        }
         self.set_mode(InodeMode::symlink(metadata.permissions()))?;
         self.set_owner(metadata.owner())?;
         let size = self.encoding.encode_file_size(FileSize::from_bytes(
@@ -677,8 +680,8 @@ impl RawInodeRecord<Vec<u8>> {
         ))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
-        self.set_timestamps(now, timestamp_encoding)?;
-        self.set_creation_time(now, timestamp_encoding)?;
+        self.set_timestamps(now)?;
+        self.set_creation_time(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -827,63 +830,41 @@ impl RawInodeRecord<Vec<u8>> {
     ///
     /// Returns an error when base timestamp fields are truncated or extra timestamp storage cannot
     /// be initialized.
-    pub(super) fn set_timestamps(
-        &mut self,
-        now: Ext4Timestamp,
-        timestamp_encoding: InodeTimestampEncoding,
-    ) -> Result<()> {
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_ATIME_OFFSET),
-            now.seconds(),
-        )?;
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_CTIME_OFFSET),
-            now.seconds(),
-        )?;
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_MTIME_OFFSET),
-            now.seconds(),
-        )?;
-        match timestamp_encoding {
-            InodeTimestampEncoding::LegacySeconds => {}
-            InodeTimestampEncoding::ExtraFields => {
-                if self.bytes.len() > INODE_ATIME_EXTRA_OFFSET {
-                    self.ensure_extra_isize()?;
-                    put_le_u32(&mut self.bytes, disk_offset(INODE_ATIME_EXTRA_OFFSET), 0)?;
-                    put_le_u32(&mut self.bytes, disk_offset(INODE_CTIME_EXTRA_OFFSET), 0)?;
-                    put_le_u32(&mut self.bytes, disk_offset(INODE_MTIME_EXTRA_OFFSET), 0)?;
-                }
-            }
+    pub(super) fn set_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
+        for (base, extra) in [
+            (INODE_ATIME_OFFSET, INODE_ATIME_EXTRA_OFFSET),
+            (INODE_CTIME_OFFSET, INODE_CTIME_EXTRA_OFFSET),
+            (INODE_MTIME_OFFSET, INODE_MTIME_EXTRA_OFFSET),
+        ] {
+            self.set_timestamp_field(now, base, extra)?;
         }
         Ok(())
     }
 
-    /// Writes creation time when the inode record has extra timestamp fields.
+    /// Writes one time only within this inode's declared field storage.
     /// # Errors
-    ///
-    /// Returns an error when extra inode storage cannot be initialized or creation-time fields are
-    /// not writable.
-    pub(super) fn set_creation_time(
+    /// Returns invalid timestamp when its epoch cannot fit, or a malformed inode layout.
+    fn set_timestamp_field(
         &mut self,
-        now: Ext4Timestamp,
-        timestamp_encoding: InodeTimestampEncoding,
+        time: Ext4Timestamp,
+        base: usize,
+        extra: usize,
     ) -> Result<()> {
-        match timestamp_encoding {
-            InodeTimestampEncoding::LegacySeconds => {}
-            InodeTimestampEncoding::ExtraFields => {
-                if self.bytes.len() > INODE_CRTIME_EXTRA_OFFSET {
-                    self.ensure_extra_isize()?;
-                    put_le_u32(
-                        &mut self.bytes,
-                        disk_offset(INODE_CRTIME_OFFSET),
-                        now.seconds(),
-                    )?;
-                    put_le_u32(&mut self.bytes, disk_offset(INODE_CRTIME_EXTRA_OFFSET), 0)?;
-                }
-            }
+        let layout = InodeRecordLayout::parse(&self.bytes)?;
+        let (seconds, extension) = time.encode(layout.contains(extra, 4))?;
+        put_le_u32(&mut self.bytes, disk_offset(base), seconds)?;
+        if let Some(extension) = extension {
+            put_le_u32(&mut self.bytes, disk_offset(extra), extension)?;
+        }
+        Ok(())
+    }
+
+    /// Writes creation time when the inode declares that field.
+    /// # Errors
+    /// Returns malformed storage or a timestamp outside the available epoch range.
+    pub(super) fn set_creation_time(&mut self, now: Ext4Timestamp) -> Result<()> {
+        if InodeRecordLayout::parse(&self.bytes)?.contains(INODE_CRTIME_OFFSET, 4) {
+            self.set_timestamp_field(now, INODE_CRTIME_OFFSET, INODE_CRTIME_EXTRA_OFFSET)?;
         }
         Ok(())
     }
@@ -917,38 +898,26 @@ impl RawInodeRecord<Vec<u8>> {
     ///
     /// Returns an error when explicit timestamp fields or optional extra timestamp fields are not
     /// writable.
-    pub(super) fn set_ext4_times(
-        &mut self,
-        times: Ext4Times,
-        timestamp_encoding: InodeTimestampEncoding,
-    ) -> Result<()> {
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_ATIME_OFFSET),
-            times.accessed().seconds(),
+    pub(super) fn set_ext4_times(&mut self, times: Ext4Times) -> Result<()> {
+        self.set_timestamp_field(
+            times.accessed(),
+            INODE_ATIME_OFFSET,
+            INODE_ATIME_EXTRA_OFFSET,
         )?;
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_CTIME_OFFSET),
-            times.changed().seconds(),
+        self.set_timestamp_field(
+            times.changed(),
+            INODE_CTIME_OFFSET,
+            INODE_CTIME_EXTRA_OFFSET,
         )?;
-        put_le_u32(
-            &mut self.bytes,
-            disk_offset(INODE_MTIME_OFFSET),
-            times.modified().seconds(),
+        self.set_timestamp_field(
+            times.modified(),
+            INODE_MTIME_OFFSET,
+            INODE_MTIME_EXTRA_OFFSET,
         )?;
-        match timestamp_encoding {
-            InodeTimestampEncoding::LegacySeconds => {}
-            InodeTimestampEncoding::ExtraFields => {
-                if self.bytes.len() > INODE_ATIME_EXTRA_OFFSET {
-                    self.ensure_extra_isize()?;
-                    put_le_u32(&mut self.bytes, disk_offset(INODE_ATIME_EXTRA_OFFSET), 0)?;
-                    put_le_u32(&mut self.bytes, disk_offset(INODE_CTIME_EXTRA_OFFSET), 0)?;
-                    put_le_u32(&mut self.bytes, disk_offset(INODE_MTIME_EXTRA_OFFSET), 0)?;
-                }
-            }
+        if let Some(created) = times.created() {
+            self.set_creation_time(created)?;
         }
-        self.set_creation_time(times.created(), timestamp_encoding)
+        Ok(())
     }
 
     /// Writes the external xattr block reference into `i_file_acl`.
@@ -985,14 +954,11 @@ impl RawInodeRecord<Vec<u8>> {
         self.bytes.get(offset..).ok_or(Error::InvalidXattr)
     }
 
-    /// Returns the mutable in-inode xattr body region, initializing extra inode
-    /// size before new xattrs are written.
+    /// Returns the mutable xattr body without changing the declared field boundary.
     /// # Errors
     ///
-    /// Returns an error when `i_extra_isize` cannot be initialized or resolves beyond the inode
-    /// record.
+    /// Returns an error when the declared field boundary lies outside the inode record.
     pub(super) fn writable_inline_xattr_region(&mut self) -> Result<&mut [u8]> {
-        self.ensure_extra_isize()?;
         let offset = self.inline_xattr_offset()?;
         self.bytes.get_mut(offset..).ok_or(Error::InvalidXattr)
     }
@@ -1012,19 +978,7 @@ impl RawInodeRecord<Vec<u8>> {
     /// Returns an error when `i_extra_isize` is truncated, overflows the base inode size, or points
     /// beyond the record.
     pub(super) fn inline_xattr_offset(&self) -> Result<usize> {
-        if self.bytes.len() <= INODE_EXTRA_ISIZE_OFFSET {
-            return Ok(self.bytes.len());
-        }
-        let offset = 128_usize
-            .checked_add(usize::from(le_u16(
-                &self.bytes,
-                disk_offset(INODE_EXTRA_ISIZE_OFFSET),
-            )?))
-            .ok_or(Error::ArithmeticOverflow)?;
-        if offset > self.bytes.len() {
-            return Err(Error::InvalidXattr);
-        }
-        Ok(offset)
+        Ok(InodeRecordLayout::parse(&self.bytes)?.xattr_offset())
     }
 
     /// Writes an inline symbolic link target into `i_block`.
@@ -1099,19 +1053,7 @@ impl RawInodeRecord<Vec<u8>> {
     /// # Errors
     /// Returns an error for a truncated or out-of-range extra-inode layout.
     fn checksum(&self, superblock: &Superblock) -> Result<(u32, bool)> {
-        let extra = if self.bytes.len() > 128 {
-            usize::from(le_u16(&self.bytes, disk_offset(128))?)
-        } else {
-            0
-        };
-        if 128_usize
-            .checked_add(extra)
-            .ok_or(Error::ArithmeticOverflow)?
-            > self.bytes.len()
-        {
-            return Err(Error::InvalidInode);
-        }
-        let high = extra >= 4;
+        let high = InodeRecordLayout::parse(&self.bytes)?.contains(INODE_CHECKSUM_HI_OFFSET, 2);
         let seed = ext4_crc32c(
             superblock.checksum_seed().as_u32(),
             &self.id.as_u32().to_le_bytes(),
@@ -1144,11 +1086,11 @@ impl RawInodeRecord<Vec<u8>> {
         Ok((checksum, high))
     }
 
-    /// Ensures the inode advertises enough extra space for extended fields.
+    /// Establishes extra-field storage in a newly zeroed inode record.
     /// # Errors
     ///
     /// Returns an error when the `i_extra_isize` field is present but cannot be read or initialized.
-    pub(super) fn ensure_extra_isize(&mut self) -> Result<()> {
+    fn initialize_extra_fields(&mut self) -> Result<()> {
         if self.bytes.len() > INODE_EXTRA_ISIZE_OFFSET
             && le_u16(&self.bytes, disk_offset(INODE_EXTRA_ISIZE_OFFSET))? == 0
         {
@@ -1164,6 +1106,33 @@ impl RawInodeRecord<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// # Errors
+    /// Returns fixture construction or timestamp encoding failure.
+    /// # Panics
+    /// Fails if timestamp updates overwrite xattrs or lose declared epoch/precision.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare preserved xattr bytes and independent timestamp fields"
+    )]
+    fn timestamp_updates_preserve_the_declared_xattr_boundary() -> Result<()> {
+        let mut record = raw_record(11)?;
+        record.bytes = memory::repeated_vec(0_u8, 256)?;
+        put_le_u16(&mut record.bytes, disk_offset(128), 4)?;
+        put_le_u32(&mut record.bytes, disk_offset(132), 0xea02_0000)?;
+        let original = memory::copied_slice(record.bytes.get(132..).ok_or(Error::InvalidInode)?)?;
+        record.set_timestamps(Ext4Timestamp::new(100, 123)?)?;
+        assert_eq!(record.bytes.get(132..), Some(original.as_slice()));
+        put_le_u16(&mut record.bytes, disk_offset(128), 32)?;
+        record.set_timestamps(Ext4Timestamp::new(4_294_967_297, 1)?)?;
+        assert_eq!(le_u32(&record.bytes, disk_offset(INODE_MTIME_OFFSET))?, 1);
+        assert_eq!(
+            le_u32(&record.bytes, disk_offset(INODE_MTIME_EXTRA_OFFSET))?,
+            5
+        );
+        Ok(())
+    }
+
     use super::*;
     use crate::NodeReparsePoint;
     use crate::disk_format::inode::{Ext4Gid, Ext4Uid};
@@ -1199,7 +1168,7 @@ mod tests {
     }
 
     fn now() -> Ext4Timestamp {
-        Ext4Timestamp::from_unix_seconds(7)
+        Ext4Timestamp::from_seconds(7)
     }
 
     /// Builds the default 1024-byte test block size.
@@ -1338,9 +1307,7 @@ mod tests {
             file.decrement_links_count(),
             Ok(LinkCountAfterDecrement::Unlinked)
         );
-        let deleted = block_size().and_then(|block_size| {
-            file.delete_and_touch(now(), block_size, InodeTimestampEncoding::LegacySeconds)
-        });
+        let deleted = block_size().and_then(|block_size| file.delete_and_touch(now(), block_size));
         assert!(deleted.is_ok());
         let Ok(deleted) = deleted else {
             return;

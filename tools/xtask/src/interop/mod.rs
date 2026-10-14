@@ -1217,7 +1217,7 @@ where
             let mut crypto = RejectingCryptographicOperation;
             let mut pass = ready.begin_pass(
                 cache.access(epoch),
-                ext4_core::Ext4Timestamp::from_unix_seconds(1),
+                ext4_core::Ext4Timestamp::from_seconds(1),
                 &mut crypto,
             );
             match mutate(&mut pass) {

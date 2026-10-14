@@ -1673,7 +1673,7 @@ fn finish_existing_create(
                     times.accessed(),
                     times.modified(),
                     times.changed(),
-                    times.modified(),
+                    Some(times.modified()),
                 ),
             )?;
         }

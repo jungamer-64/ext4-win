@@ -265,6 +265,9 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidMagic
         | Error::InvalidSuperblock
         | Error::InvalidClusterGeometry
+        | Error::InvalidTimestamp
+        | Error::InvalidTimestamp
+        | Error::InvalidTimestamp
         | Error::InvalidInode
         | Error::InvalidOrphanTracking
         | Error::InvalidExtentTree

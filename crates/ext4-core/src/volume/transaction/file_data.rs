@@ -220,10 +220,7 @@ impl MutationResolvePass<'_, '_, '_> {
         if let Some(encoded_new_size) = encoded_new_size {
             raw_inode.set_encoded_size(encoded_new_size)?;
         }
-        raw_inode.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_inode.set_timestamps(self.now)?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -828,10 +825,7 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::InvalidWriteRange);
         }
         raw_inode.set_encoded_size(encoded_size)?;
-        raw_inode.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_inode.set_timestamps(self.now)?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -876,10 +870,7 @@ impl MutationResolvePass<'_, '_, '_> {
             }
         }
         raw_inode.set_encoded_size(encoded_size)?;
-        raw_inode.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_inode.set_timestamps(self.now)?;
         self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
@@ -964,10 +955,7 @@ impl MutationResolvePass<'_, '_, '_> {
             self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
         }
         raw_inode.mark_verity()?;
-        raw_inode.set_timestamps(
-            self.now,
-            self.mutation.volume.superblock.inode_timestamp_encoding(),
-        )?;
+        raw_inode.set_timestamps(self.now)?;
         self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())

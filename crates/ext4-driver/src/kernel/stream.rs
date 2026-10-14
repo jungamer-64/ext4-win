@@ -156,7 +156,7 @@ impl StreamMetadata {
         let directory = matches!(snapshot.node(), NodeId::Directory(_));
         Self {
             epoch: epoch.get(),
-            creation: super::time::windows_timestamp(times.created()),
+            creation: super::time::windows_timestamp(times.created().unwrap_or(times.changed())),
             accessed: super::time::windows_timestamp(times.accessed()),
             modified: super::time::windows_timestamp(times.modified()),
             changed: super::time::windows_timestamp(times.changed()),

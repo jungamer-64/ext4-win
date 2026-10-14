@@ -190,8 +190,8 @@ fn basic_timestamp_sentinels_keep_values_and_select_handle_policy() {
             changed: AutomaticTimeUpdate::Enabled,
         }
     );
-    let time = Ext4Timestamp::from_unix_seconds(10);
-    let current = Ext4Times::new(time, time, time, time);
+    let time = Ext4Timestamp::from_seconds(10);
+    let current = Ext4Times::new(time, time, time, Some(time));
     assert_eq!(update.times(current), current);
     assert_eq!(
         super::BasicTimeUpdate::Set(time).automatic(AutomaticTimeUpdate::Suppressed),

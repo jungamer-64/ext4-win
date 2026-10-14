@@ -318,7 +318,7 @@ impl Disk {
             let result = {
                 let mut pass = ready.begin_pass(
                     cache.access(epoch),
-                    Ext4Timestamp::from_unix_seconds(2),
+                    Ext4Timestamp::from_seconds(2),
                     &mut crypto,
                 );
                 mutate(&mut pass).and_then(|value| {

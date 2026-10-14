@@ -662,7 +662,7 @@ fn pack_basic_information(
     IrpCompletion::from_usize(
         crate::kernel::file_information::BasicInformation {
             times: [
-                windows_time_quad(metadata.times.created()),
+                windows_time_quad(metadata.times.created().unwrap_or(metadata.times.changed())),
                 windows_time_quad(metadata.times.accessed()),
                 windows_time_quad(metadata.times.modified()),
                 windows_time_quad(metadata.times.changed()),
@@ -792,7 +792,7 @@ fn pack_network_open_information(
     IrpCompletion::from_usize(
         crate::kernel::file_information::BasicInformation {
             times: [
-                windows_time_quad(metadata.times.created()),
+                windows_time_quad(metadata.times.created().unwrap_or(metadata.times.changed())),
                 windows_time_quad(metadata.times.accessed()),
                 windows_time_quad(metadata.times.modified()),
                 windows_time_quad(metadata.times.changed()),
