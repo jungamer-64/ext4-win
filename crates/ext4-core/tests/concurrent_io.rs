@@ -13,6 +13,112 @@ use sha2::Digest as _;
 struct PlainCrypto;
 
 /// # Errors
+/// Returns fixture, explicit timestamp, namespace, metadata or content mutation failures.
+/// # Panics
+/// Fails if metadata changes imply file access/content changes, or writes imply reads.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare each timestamp meaning with independent event inputs"
+)]
+fn inode_timestamps_distinguish_metadata_contents_and_access() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    let accessed = Ext4Timestamp::new(100, 10)?;
+    let modified = Ext4Timestamp::new(200, 20)?;
+    let created = Ext4Timestamp::new(50, 5)?;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.set_times(
+            node,
+            Ext4Times::new(
+                accessed,
+                modified,
+                Ext4Timestamp::from_seconds(300),
+                Some(created),
+            ),
+        )
+    })?;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.set_posix_security(
+            node,
+            Ext4Security::new(namespace_owner(), Ext4Permissions::new(0o600)?),
+        )?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"times")?,
+            XattrValue::new(b"metadata")?,
+        )?;
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let source = pass.hard_link_source(HardLinkNodeId::File(a))?;
+        let alias = Ext4Name::new(b"time-alias")?;
+        let renamed = Ext4Name::new(b"renamed-alias")?;
+        pass.create_hard_link(source, root, &alias, NamespaceDestination::Vacant)?;
+        pass.rename_child(root, &alias, root, &renamed, NamespaceDestination::Vacant)?;
+        pass.unlink_file(root, &renamed)
+    })?;
+    let times = fixture.read(|pass| Ok(pass.load_file(a)?.times()))?;
+    assert_eq!(times.accessed(), accessed);
+    assert_eq!(times.modified(), modified);
+    assert_eq!(times.changed(), Ext4Timestamp::from_seconds(2));
+    assert_eq!(times.created(), Some(created));
+    fixture.mutate(|pass| {
+        let a = pass.file(a)?;
+        pass.write_file_range(a, FileOffset::ZERO, b"Z")
+    })?;
+    let times = fixture.read(|pass| Ok(pass.load_file(a)?.times()))?;
+    assert_eq!(times.accessed(), accessed);
+    assert_eq!(times.modified(), Ext4Timestamp::from_seconds(2));
+    assert_eq!(times.changed(), Ext4Timestamp::from_seconds(2));
+    assert_eq!(times.created(), Some(created));
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, explicit timestamp, namespace or metadata-read failures.
+/// # Panics
+/// Fails if directory mutation changes access time or new inode timestamps are incomplete.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare directory and creation events with their supplied timestamps"
+)]
+fn directory_entry_changes_preserve_access_and_initialize_child_times() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let accessed = Ext4Timestamp::new(100, 10)?;
+    fixture.mutate(|pass| {
+        let root = pass.node(NodeId::Directory(DirectoryNodeId::ROOT))?;
+        pass.set_times(
+            root,
+            Ext4Times::new(
+                accessed,
+                Ext4Timestamp::from_seconds(300),
+                Ext4Timestamp::from_seconds(200),
+                None,
+            ),
+        )
+    })?;
+    let child = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.create_file(
+            root,
+            &Ext4Name::new(b"time-child")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )
+        .map(|child| child.id())
+    })?;
+    let times = fixture.read(|pass| Ok(pass.load_directory(DirectoryNodeId::ROOT)?.times()))?;
+    assert_eq!(times.accessed(), accessed);
+    assert_eq!(times.modified(), Ext4Timestamp::from_seconds(2));
+    assert_eq!(times.changed(), Ext4Timestamp::from_seconds(2));
+    let times = fixture.read(|pass| Ok(pass.load_file(child)?.times()))?;
+    let now = Ext4Timestamp::from_seconds(2);
+    assert_eq!(times, Ext4Times::new(now, now, now, Some(now)));
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture setup, remount, namespace lookup or the independent successor mutation failure.
 /// # Panics
 /// Fails if a handled failure can publish partial namespace changes or recover staging authority.

@@ -285,6 +285,20 @@ impl LiveInodeRecord {
         self.raw.set_permissions(permissions)
     }
 
+    /// Records an inode-status change without treating it as file access or content modification.
+    /// # Errors
+    /// Returns timestamp encoding or inode-field boundary failures.
+    pub(super) fn touch_metadata(&mut self, now: Ext4Timestamp) -> Result<()> {
+        self.raw.touch_metadata(now)
+    }
+
+    /// Records a payload, size or directory-entry modification while preserving access time.
+    /// # Errors
+    /// Returns timestamp encoding or inode-field boundary failures.
+    pub(super) fn touch_contents(&mut self, now: Ext4Timestamp) -> Result<()> {
+        self.raw.touch_contents(now)
+    }
+
     /// Writes explicit ext4 inode timestamps.
     /// # Errors
     ///
@@ -446,6 +460,7 @@ impl LiveInodeRecord {
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.raw.set_extent_root_bytes(serialized.inode_root())?;
+        self.raw.touch_metadata(now)?;
         Ok(DeletedInodeRecord { raw: self.raw })
     }
 }
@@ -542,8 +557,7 @@ impl RawInodeRecord<Vec<u8>> {
         let size = self.encoding.encode_file_size(FileSize::from_bytes(0))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -580,8 +594,7 @@ impl RawInodeRecord<Vec<u8>> {
             .encode_directory_size(DirectorySize::from_bytes(u64::from(block_size.bytes())))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::TWO)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let mut extents = Vec::new();
@@ -623,8 +636,7 @@ impl RawInodeRecord<Vec<u8>> {
         ))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY)?;
         self.set_inline_target(target.bytes())?;
@@ -661,8 +673,7 @@ impl RawInodeRecord<Vec<u8>> {
         ))?;
         self.set_encoded_size(size)?;
         self.set_links_count(Ext4LinkCount::ONE)?;
-        self.set_timestamps(now)?;
-        self.set_creation_time(now)?;
+        self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
         self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
@@ -804,6 +815,30 @@ impl RawInodeRecord<Vec<u8>> {
             InodeBlockCountUnit::FileSystemBlocks => self.flags()?.with_huge_file_blocks(),
         };
         self.set_flags(flags)
+    }
+
+    /// Establishes every available timestamp when an inode first becomes live.
+    /// # Errors
+    /// Returns timestamp encoding or inode-field boundary failures.
+    fn initialize_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
+        self.touch_contents(now)?;
+        self.set_timestamp_field(now, INODE_ATIME_OFFSET, INODE_ATIME_EXTRA_OFFSET)?;
+        self.set_creation_time(now)
+    }
+
+    /// Writes only inode status-change time for metadata changes.
+    /// # Errors
+    /// Returns timestamp encoding or inode-field boundary failures.
+    fn touch_metadata(&mut self, now: Ext4Timestamp) -> Result<()> {
+        self.set_timestamp_field(now, INODE_CTIME_OFFSET, INODE_CTIME_EXTRA_OFFSET)
+    }
+
+    /// Writes status-change and contents-modification times without implying a read.
+    /// # Errors
+    /// Returns timestamp encoding or inode-field boundary failures.
+    fn touch_contents(&mut self, now: Ext4Timestamp) -> Result<()> {
+        self.touch_metadata(now)?;
+        self.set_timestamp_field(now, INODE_MTIME_OFFSET, INODE_MTIME_EXTRA_OFFSET)
     }
 
     /// Writes one time only within this inode's declared field storage.
@@ -1086,10 +1121,10 @@ mod tests {
         put_le_u16(&mut record.bytes, disk_offset(128), 4)?;
         put_le_u32(&mut record.bytes, disk_offset(132), 0xea02_0000)?;
         let original = memory::copied_slice(record.bytes.get(132..).ok_or(Error::InvalidInode)?)?;
-        record.set_timestamps(Ext4Timestamp::new(100, 123)?)?;
+        record.touch_contents(Ext4Timestamp::new(100, 123)?)?;
         assert_eq!(record.bytes.get(132..), Some(original.as_slice()));
         put_le_u16(&mut record.bytes, disk_offset(128), 32)?;
-        record.set_timestamps(Ext4Timestamp::new(4_294_967_297, 1)?)?;
+        record.touch_contents(Ext4Timestamp::new(4_294_967_297, 1)?)?;
         assert_eq!(le_u32(&record.bytes, disk_offset(INODE_MTIME_OFFSET))?, 1);
         assert_eq!(
             le_u32(&record.bytes, disk_offset(INODE_MTIME_EXTRA_OFFSET))?,
@@ -1273,7 +1308,7 @@ mod tests {
             file.decrement_links_count(),
             Ok(LinkCountAfterDecrement::Unlinked)
         );
-        let deleted = block_size().and_then(|block_size| file.delete_and_touch(now(), block_size));
+        let deleted = block_size().and_then(|block_size| file.delete(now(), block_size));
         assert!(deleted.is_ok());
         let Ok(deleted) = deleted else {
             return;

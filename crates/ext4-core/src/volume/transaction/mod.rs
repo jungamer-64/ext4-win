@@ -875,7 +875,7 @@ impl MutationResolvePass<'_, '_, '_> {
             let _metadata = inode.metadata_mutation()?;
             raw_inode.set_owner(security.owner())?;
             raw_inode.set_permissions(security.permissions())?;
-            raw_inode.set_timestamps(pass.now)?;
+            raw_inode.touch_metadata(pass.now)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;
             Ok(())
         })
@@ -1325,7 +1325,7 @@ impl MetadataMutation<'_, '_> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         raw_inode.increment_directory_links()?;
-        raw_inode.set_timestamps(now)?;
+        raw_inode.touch_metadata(now)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
@@ -1339,7 +1339,7 @@ impl MetadataMutation<'_, '_> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
         raw_inode.decrement_directory_links()?;
-        raw_inode.set_timestamps(now)?;
+        raw_inode.touch_metadata(now)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
     }
