@@ -100,6 +100,8 @@ fn verify_times_and_xattrs(linux: LinuxEnvironment, image: &Path) -> TaskResult<
     }
     request(linux, image, "set_inode_field /payload extra_isize 4")?;
     request(linux, image, "ea_set /payload user.probe evidence")?;
+    request(linux, image, "ea_set /payload user.z Z")?;
+    request(linux, image, "ea_set /payload user.a A")?;
     verify_internal_e2fsck_clean(linux, image, "small extra-field inode baseline")?;
     drive_internal_core_mutation(image, |pass| {
         let (_, file) = mutation_root_file(pass, &name)?;
@@ -111,7 +113,10 @@ fn verify_times_and_xattrs(linux: LinuxEnvironment, image: &Path) -> TaskResult<
         pass.write_file_range(file, ext4_core::FileOffset::ZERO, &[0x11])
     })?;
     let attributes = request(linux, image, "ea_list /payload")?;
-    if !attributes.contains("user.probe (8) = \"evidence\"") {
+    if !attributes.contains("user.probe (8) = \"evidence\"")
+        || !attributes.contains("user.z (1) = \"Z\"")
+        || !attributes.contains("user.a (1) = \"A\"")
+    {
         return Err(io::Error::other("timestamp update overwrote inline xattr storage").into());
     }
     verify_internal_e2fsck_clean(linux, image, "small extra-field inode mutation")

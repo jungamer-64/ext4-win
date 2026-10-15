@@ -675,7 +675,8 @@ fn parse_xattr_entries(
             index,
             local: memory::copied_slice(local)?,
         };
-        if let Some(previous) = &previous_key
+        if placement == XattrValuePlacement::ExternalBlock
+            && let Some(previous) = &previous_key
             && previous.cmp_disk(&key) != Ordering::Less
         {
             return Err(Error::InvalidXattr);
@@ -994,6 +995,45 @@ mod tests {
         InodeXattrSet, XattrName, XattrNamespace, XattrSet, XattrValue, merge_xattr_sets,
         parse_inline_xattrs, serialize_inline_xattrs,
     };
+
+    /// # Errors
+    /// Returns parsing or name-construction failures for the independent inode-region vector.
+    /// # Panics
+    /// Fails if valid insertion-ordered inode attributes are rejected or values are mixed.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare an independent disk vector with its named attribute values"
+    )]
+    fn inode_attributes_accept_unsorted_disk_entries() -> crate::Result<()> {
+        // A 96-byte inode region: user.z was inserted before user.a. Offsets are relative to
+        // the first entry, immediately after the four-byte header.
+        let region: [u8; 96] = core::array::from_fn(|offset| match offset {
+            2 => 2,
+            3 => 0xea,
+            4 | 5 | 12 | 24 | 25 | 32 => 1,
+            6 => 88,
+            20 => b'z',
+            26 => 84,
+            40 => b'a',
+            88 => b'A',
+            92 => b'Z',
+            _ => 0,
+        });
+        let parsed = parse_inline_xattrs(&region)?;
+        for (name, value) in [(b"a", b"A"), (b"z", b"Z")] {
+            let name = XattrName::new(XattrNamespace::User, name)?;
+            assert_eq!(
+                parsed.public().get(&name).map(XattrValue::bytes),
+                Some(value.as_slice())
+            );
+        }
+        assert_eq!(
+            super::parse_xattr_entries(&region, 4, 4, super::XattrValuePlacement::ExternalBlock),
+            Err(crate::Error::InvalidXattr)
+        );
+        Ok(())
+    }
 
     /// # Panics
     ///
