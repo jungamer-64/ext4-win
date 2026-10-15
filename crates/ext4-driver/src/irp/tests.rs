@@ -2359,9 +2359,10 @@ fn forced_user_access_does_not_reuse_kernel_grants() -> Result<(), DriverError> 
         ),
         ext4_core::Ext4Permissions::new(0)?,
     );
-    let descriptor = crate::request::security::CreateSecurityDescriptor::from_security(
-        security,
-        &ext4_security::IdentityMap::empty(),
+    let identity = ext4_security::IdentityMap::empty();
+    let descriptor = crate::request::security::CreateSecurityDescriptor::from_access(
+        ext4_core::Ext4Access::from_mode(security),
+        &identity,
     )?;
     let requested = super::DesiredAccess::from_raw(wdk_sys::GENERIC_WRITE);
     for policy in [

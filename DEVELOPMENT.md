@@ -98,9 +98,12 @@ Repeat `--user` and `--group` for additional principals. Replacement contains th
 clear durably replaces it with an empty table. Both SID and numeric ID must be unique within each
 identity domain. Synthetic UNIX SIDs identify otherwise unmapped inode metadata and cannot alias
 another configured numeric identity. New inode creation requires explicit mappings for both
-effective token principals; existing inodes use their owner/group/other mode permissions.
+effective token principals; existing inodes use their access ACL, or owner/group/other mode when
+no access ACL is stored. Named user/group entries are constrained by the ACL mask. Inode rwx
+fields and access ACL base classes must agree; chmod updates the corresponding ACL entries.
 New files use 0644 and directories 0755. Parent setgid selects the inherited GID and propagates
-setgid to child directories.
+setgid to child directories. A parent default ACL supplies the child access ACL, restricted
+by its creation mode, and propagates unchanged as the default ACL of child directories.
 
 Configuration is keyed by ext4 UUID, shared by mounts of that UUID, and stored as the `Table`
 REG_BINARY value under the service's `Parameters\IdentityMappings\<UUID>` key. The driver validates
@@ -118,7 +121,9 @@ A communication failure or cancellation is not evidence that replacement failed 
 Query first and inspect the complete table and generations before deciding on another replacement.
 The CLI does not automatically retry an unacknowledged write or a generation conflict.
 
-Mode controls data, EA and mutable attribute rights through specific-right ACEs. Read attributes,
+POSIX access policy controls data, EA and mutable attribute rights through specific-right ACEs.
+Owner and named-user matches take precedence over group membership and other permissions.
+A composite rwx request requires one matching group entry to supply the whole combination. Read attributes,
 READ_CONTROL and SYNCHRONIZE are common base rights. Maximum access checks individual rights with
 the same native subject, excluding implicit exploration of WRITE_OWNER, ACCESS_SYSTEM_SECURITY
 and namespace deletion. Explicit ownership/security privilege requests are checked by Windows.
@@ -127,7 +132,9 @@ Backup-intent opens evaluate enabled backup and restore privileges before remain
 rights, and record privilege use before publishing handle authority. Ordinary opens do not
 receive these privilege grants.
 Security queries support variable SID lengths and report the required size for short buffers.
-Security mutations accept only the owner/group/mode projection; arbitrary Windows ACLs are rejected.
+Security mutations accept the owner/group/mode projection for inodes without an access ACL.
+An inode with an access ACL accepts owner/group updates and an unchanged projected DACL;
+arbitrary Windows ACL edits are rejected. Mode changes through file attributes update its ACL mask.
 Native token oracles run in portable Windows tests; the elevated `verify-windows-host` gate also
 checks explicit ownership and security privileges.
 

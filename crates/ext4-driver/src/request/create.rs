@@ -317,8 +317,7 @@ impl<'a> CreateCompletionOwner<'a> {
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
         let metadata = read.load_node_metadata(node)?;
-        let descriptor =
-            CreateSecurityDescriptor::from_security(metadata.security(), self.identity)?;
+        let descriptor = CreateSecurityDescriptor::for_node(read, node, self.identity)?;
         let required = self.parameters.existing_operation_required_access();
         let requested = self.parameters.desired_access();
         let exclusive = self.parameters.require_writable_exclusive();
@@ -353,7 +352,8 @@ impl<'a> CreateCompletionOwner<'a> {
         requirement: CreateTargetRequirement,
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
-        let parent_security = super::security::security_from_node(read, NodeId::Directory(parent))?;
+        let parent_access = read.load_access(NodeId::Directory(parent))?;
+        let parent_security = parent_access.security();
         let kind = match requirement {
             CreateTargetRequirement::Directory => ext4_security::ChildKind::Directory,
             CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
@@ -363,8 +363,10 @@ impl<'a> CreateCompletionOwner<'a> {
         let identity = self.identity;
         let creator = self.creator.require()?;
         let security = ext4_security::child_security(creator, parent_security, kind)?;
-        let parent_descriptor = CreateSecurityDescriptor::from_security(parent_security, identity)?;
-        let child_descriptor = CreateSecurityDescriptor::from_security(security, identity)?;
+        let child_access = read.child_access(parent, security)?;
+        let security = child_access.security();
+        let parent_descriptor = CreateSecurityDescriptor::from_access(parent_access, identity)?;
+        let child_descriptor = CreateSecurityDescriptor::from_access(child_access, identity)?;
         let required = match kind {
             ext4_security::ChildKind::Directory => wdk_sys::FILE_ADD_SUBDIRECTORY,
             ext4_security::ChildKind::File => wdk_sys::FILE_ADD_FILE,

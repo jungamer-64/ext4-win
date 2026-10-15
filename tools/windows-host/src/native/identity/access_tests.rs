@@ -71,7 +71,12 @@ fn descriptor(mode: u16, user: Sid, group: Sid, owner: u32) -> io::Result<[u32; 
         Ext4Owner::new(Ext4Uid::from_u32(owner), Ext4Gid::from_u32(100)),
         Ext4Permissions::new(mode).map_err(|error| io::Error::other(format!("{error:?}")))?,
     );
-    let image = Descriptor::encode(security, &table, Components::ALL).map_err(invalid)?;
+    let image = Descriptor::encode(
+        &ext4_core::Ext4Access::from_mode(security),
+        &table,
+        Components::ALL,
+    )
+    .map_err(invalid)?;
     let mut words = [0_u32; 122];
     for (target, chunk) in words.iter_mut().zip(image.bytes().as_chunks::<4>().0) {
         *target = u32::from_le_bytes(*chunk);
@@ -81,7 +86,7 @@ fn descriptor(mode: u16, user: Sid, group: Sid, owner: u32) -> io::Result<[u32; 
 /// Normal access check; expected refusals and execution failures remain distinct.
 /// # Errors
 /// Propagates native resource or invalid-token failures.
-fn check(image: &[u32; 122], token: &OwnedHandle, requested: u32) -> io::Result<AccessDecision> {
+fn check(image: &[u32], token: &OwnedHandle, requested: u32) -> io::Result<AccessDecision> {
     let mapping = GENERIC_MAPPING {
         GenericRead: 0x0012_0089,
         GenericWrite: 0x0012_0116,
@@ -370,6 +375,84 @@ fn native_backup_restore_privileges_contract() -> io::Result<()> {
                 return Err(io::Error::last_os_error());
             }
             assert_eq!(granted != 0, enabled);
+        }
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns native token, validated ACL, identity or descriptor failure.
+/// # Panics
+/// Panics if named-user precedence, ACL mask or composite group requests differ from POSIX.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "native token decisions are compared with independent POSIX ACL vectors"
+)]
+fn native_posix_acl_precedence_mask_and_group_requests() -> io::Result<()> {
+    let source = process_token()?;
+    let user = token_sid(&source, TokenUser)?;
+    let group = token_sid(&source, TokenPrimaryGroup)?;
+    let token = impersonation(&source)?;
+    let table = IdentityMap::new(
+        vec![UserMapping {
+            sid: user,
+            uid: Ext4Uid::from_u32(1000),
+        }],
+        vec![
+            GroupMapping {
+                sid: group,
+                gid: Ext4Gid::from_u32(100),
+            },
+            GroupMapping {
+                sid: Sid::everyone().map_err(invalid)?,
+                gid: Ext4Gid::from_u32(200),
+            },
+        ],
+    )
+    .map_err(invalid)?;
+    let named = [
+        1, 0, 0, 0, 1, 0, 6, 0, 2, 0, 6, 0, 232, 3, 0, 0, 4, 0, 6, 0, 16, 0, 4, 0, 32, 0, 7, 0,
+    ];
+    let groups = [
+        1, 0, 0, 0, 1, 0, 6, 0, 4, 0, 4, 0, 8, 0, 2, 0, 200, 0, 0, 0, 16, 0, 6, 0, 32, 0, 7, 0,
+    ];
+    for (bytes, mode, cases) in [
+        (
+            named.as_slice(),
+            0o647,
+            [(1, true), (2, false), (0x20, false), (3, false)],
+        ),
+        (
+            groups.as_slice(),
+            0o667,
+            [(1, true), (2, true), (0x20, false), (3, false)],
+        ),
+    ] {
+        let security = Ext4Security::new(
+            Ext4Owner::new(Ext4Uid::from_u32(2000), Ext4Gid::from_u32(100)),
+            Ext4Permissions::new(mode).map_err(|error| io::Error::other(format!("{error:?}")))?,
+        );
+        let acl = ext4_core::PosixAcl::parse(bytes)
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        let access = ext4_core::Ext4Access::new(security, Some(acl))
+            .map_err(|error| io::Error::other(format!("{error:?}")))?;
+        for (requested, allowed) in cases {
+            let image = Descriptor::for_request(&access, &table, requested).map_err(invalid)?;
+            let words: Vec<u32> = image
+                .bytes()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|chunk| u32::from_le_bytes(*chunk))
+                .collect();
+            assert_eq!(
+                matches!(
+                    check(&words, &token, requested)?,
+                    AccessDecision::Granted(_)
+                ),
+                allowed
+            );
         }
     }
     Ok(())

@@ -1,5 +1,7 @@
 //! Independent ownership, permission and boundary vectors for the shared security contract.
-use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, FilesystemUuid};
+use ext4_core::{
+    Ext4Access, Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, FilesystemUuid,
+};
 use ext4_security::*;
 
 /// Constructs one core-valid fixture.
@@ -53,19 +55,32 @@ fn variable_descriptor_roundtrip() -> Result<(), Error> {
         for bits in 1..=7 {
             let target = security(mode)?;
             let selection = Components::new(bits)?;
-            let descriptor = Descriptor::encode(target, &map, selection)?;
-            let actual = Descriptor::decode(descriptor.bytes(), &map, selection, target)?;
+            let descriptor = Descriptor::encode(&Ext4Access::from_mode(target), &map, selection)?;
+            let actual = Descriptor::decode(
+                descriptor.bytes(),
+                &map,
+                selection,
+                &Ext4Access::from_mode(target),
+            )?;
             assert_eq!(actual, target);
             assert!(descriptor.bytes().len() <= MAX_DESCRIPTOR_BYTES);
         }
     }
     assert_ne!(
-        Descriptor::encode(security(0o640)?, &map, Components::ALL)?
-            .bytes()
-            .len(),
-        Descriptor::encode(security(0o777)?, &IdentityMap::empty(), Components::ALL)?
-            .bytes()
-            .len()
+        Descriptor::encode(
+            &Ext4Access::from_mode(security(0o640)?),
+            &map,
+            Components::ALL
+        )?
+        .bytes()
+        .len(),
+        Descriptor::encode(
+            &Ext4Access::from_mode(security(0o777)?),
+            &IdentityMap::empty(),
+            Components::ALL
+        )?
+        .bytes()
+        .len()
     );
     Ok(())
 }
@@ -92,11 +107,16 @@ fn maximum_sid_descriptor_fits_the_reserved_budget() -> Result<(), Error> {
         }],
     )?;
     let target = security(0)?;
-    let descriptor = Descriptor::encode(target, &map, Components::ALL)?;
+    let descriptor = Descriptor::encode(&Ext4Access::from_mode(target), &map, Components::ALL)?;
     assert_eq!(descriptor.bytes().len(), 488);
-    assert_eq!(descriptor.bytes().len(), MAX_DESCRIPTOR_BYTES);
+    assert!(descriptor.bytes().len() <= MAX_DESCRIPTOR_BYTES);
     assert_eq!(
-        Descriptor::decode(descriptor.bytes(), &map, Components::ALL, target)?,
+        Descriptor::decode(
+            descriptor.bytes(),
+            &map,
+            Components::ALL,
+            &Ext4Access::from_mode(target)
+        )?,
         target
     );
     Ok(())
@@ -255,10 +275,73 @@ fn synthetic_identity_remains_bijective() -> Result<(), Error> {
         unmapped,
         Ext4Permissions::new(0o640).map_err(|_| Error::InvalidEncoding)?,
     );
-    let descriptor = Descriptor::encode(security, &map, Components::ALL)?;
+    let descriptor = Descriptor::encode(&Ext4Access::from_mode(security), &map, Components::ALL)?;
     assert_eq!(
-        Descriptor::decode(descriptor.bytes(), &map, Components::ALL, security)?,
+        Descriptor::decode(
+            descriptor.bytes(),
+            &map,
+            Components::ALL,
+            &Ext4Access::from_mode(security)
+        )?,
         security
     );
+    Ok(())
+}
+
+/// # Errors
+/// Returns ACL or descriptor fixture failure.
+/// # Panics
+/// Panics if descriptor roundtrip erases a named entry or a changed ACL is accepted as mode.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare the validated ACL with independent descriptor mutations"
+)]
+fn extended_acl_descriptor_preserves_policy() -> Result<(), Error> {
+    let acl = ext4_core::PosixAcl::parse(&[
+        1, 0, 0, 0, 1, 0, 6, 0, 2, 0, 6, 0, 233, 3, 0, 0, 4, 0, 6, 0, 16, 0, 4, 0, 32, 0, 0, 0,
+    ])
+    .map_err(|_| Error::InvalidEncoding)?;
+    let access =
+        Ext4Access::new(security(0o640)?, Some(acl)).map_err(|_| Error::InvalidEncoding)?;
+    let map = map()?;
+    let descriptor = Descriptor::encode(&access, &map, Components::ALL)?;
+    assert_eq!(
+        Descriptor::decode(descriptor.bytes(), &map, Components::ALL, &access)?,
+        access.security()
+    );
+    let mut changed = descriptor.bytes().to_vec();
+    let last = changed.len().checked_sub(1).ok_or(Error::InvalidEncoding)?;
+    *changed.get_mut(last).ok_or(Error::InvalidEncoding)? ^= 1;
+    assert_eq!(
+        Descriptor::decode(&changed, &map, Components::ALL, &access),
+        Err(Error::UnrepresentableDescriptor)
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Returns ACL construction or identity failure.
+/// # Panics
+/// Panics if the native ACL length budget silently truncates a valid POSIX policy.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify the native ACL's independent sixteen-bit size limit"
+)]
+fn descriptor_reports_native_acl_size_exhaustion() -> Result<(), Error> {
+    let mut bytes = vec![1, 0, 0, 0, 1, 0, 6, 0];
+    for id in 1_u32..=2000 {
+        bytes.extend_from_slice(&[2, 0, 4, 0]);
+        bytes.extend_from_slice(&id.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[4, 0, 4, 0, 16, 0, 4, 0, 32, 0, 0, 0]);
+    let acl = ext4_core::PosixAcl::parse(&bytes).map_err(|_| Error::InvalidEncoding)?;
+    let access =
+        Ext4Access::new(security(0o640)?, Some(acl)).map_err(|_| Error::InvalidEncoding)?;
+    assert!(matches!(
+        Descriptor::encode(&access, &IdentityMap::empty(), Components::ALL),
+        Err(Error::RecordTooLarge)
+    ));
     Ok(())
 }

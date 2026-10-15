@@ -669,7 +669,7 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         &descriptor,
         &fixture_identity()?,
         ext4_security::Components::ALL,
-        expected,
+        &ext4_core::Ext4Access::from_mode(expected),
     )
     .map_err(|error| io::Error::other(format!("{error:?}")))?;
     if actual != expected {

@@ -1,6 +1,6 @@
 //! Portable Windows identity, access-right and security-descriptor contracts.
 //!
-//! Inode ownership and mode remain authoritative. Identity tables only interpret those facts at
+//! Inode ownership and validated POSIX access policies remain authoritative. Identity tables only interpret those facts at
 //! the Windows boundary. A table belongs to one filesystem UUID and one publication generation.
 #![no_std]
 #![feature(vec_push_within_capacity)]
@@ -17,7 +17,7 @@ pub use control::{
     CONTROL_REPLY_BYTES, MappingReply, MappingState, PublicationOutcome, Replacement,
 };
 pub use creation::{ChildKind, child_security};
-pub use descriptor::{Components, Descriptor, MAX_DESCRIPTOR_BYTES};
+pub use descriptor::{Components, Descriptor, MAX_DESCRIPTOR_BYTES, required_permissions};
 pub use identity::{
     GroupMapping, IdentityMap, MappingSnapshot, Sid, UserMapping, parse_uuid, uuid_text,
 };

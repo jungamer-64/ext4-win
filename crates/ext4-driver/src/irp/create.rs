@@ -660,6 +660,7 @@ impl CreateAccessState<'_> {
             desired,
             previously_granted | backup_granted,
             |wanted, previous| {
+                let prepared = descriptor.prepare(wanted & !previous)?;
                 let mut privileges: wdk_sys::PPRIVILEGE_SET = core::ptr::null_mut();
                 let mut granted = 0;
                 let mut status = wdk_sys::STATUS_ACCESS_DENIED;
@@ -667,7 +668,7 @@ impl CreateAccessState<'_> {
                     // SAFETY: Every pointer names live storage; wanted contains no MAXIMUM_ALLOWED.
                     // The same descriptor, mapping and locked subject are retained for every probe.
                     ffi::SeAccessCheck(
-                        descriptor.as_ptr(),
+                        prepared.as_ptr(),
                         context,
                         1,
                         wanted,

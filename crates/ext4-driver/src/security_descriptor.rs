@@ -14,6 +14,24 @@ pub(crate) struct SecurityDescriptorRef<'a> {
         )
     )]
     bytes: &'a [u8],
+    /// Validated POSIX policy underlying this immutable projection.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "native token evaluation is unavailable in driver unit tests"
+        )
+    )]
+    access: &'a ext4_core::Ext4Access,
+    /// Operation-pinned identity interpretation.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "native token evaluation is unavailable in driver unit tests"
+        )
+    )]
+    map: &'a ext4_security::IdentityMap,
 }
 
 impl<'a> SecurityDescriptorRef<'a> {
@@ -22,26 +40,55 @@ impl<'a> SecurityDescriptorRef<'a> {
     /// # Safety
     ///
     /// `bytes` must be suitably aligned and encode a complete, valid self-relative security
-    /// descriptor whose owner, group, ACLs, and referenced SIDs are contained in the slice. Native
-    /// access checks may read the image but must not mutate it.
+    /// descriptor whose owner, group, ACLs, and referenced SIDs are contained in the slice. It must
+    /// be the complete projection of `access` through `map`; all three remain immutable together.
+    /// Native access checks may read the image but must not mutate it.
     #[expect(
         unsafe_code,
         reason = "descriptor encoders establish the native layout invariant once before creating this immutable view"
     )]
-    pub(crate) unsafe fn from_validated_bytes(bytes: &'a [u8]) -> Self {
-        Self { bytes }
+    pub(crate) unsafe fn from_validated_bytes(
+        bytes: &'a [u8],
+        access: &'a ext4_core::Ext4Access,
+        map: &'a ext4_security::IdentityMap,
+    ) -> Self {
+        Self { bytes, access, map }
     }
 
-    /// Returns the borrowed address only for native input parameters.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "the user-mode driver tests cannot call the kernel Security Reference Monitor"
-        )
-    )]
-    pub(crate) fn as_ptr(self) -> wdk_sys::PSECURITY_DESCRIPTOR {
-        self.bytes.as_ptr().cast_mut().cast()
+    /// Prepares the exact request projection before native token evaluation.
+    /// # Errors
+    /// Returns descriptor allocation or length failure.
+    #[cfg(not(test))]
+    pub(crate) fn prepare(self, requested: u32) -> DriverResult<PreparedDescriptor<'a>> {
+        if self.access.acl().is_some()
+            && ext4_security::required_permissions(requested).count_ones() > 1
+        {
+            Ok(PreparedDescriptor::Encoded(
+                ext4_security::Descriptor::for_request(self.access, self.map, requested)?,
+            ))
+        } else {
+            Ok(PreparedDescriptor::Borrowed(self.bytes))
+        }
+    }
+}
+
+/// Byte ownership retained through one native check.
+#[cfg(not(test))]
+pub(crate) enum PreparedDescriptor<'a> {
+    /// Existing complete projection for a single-class check.
+    Borrowed(&'a [u8]),
+    /// Composite-request image allocated by the driver's nonpaged, pool-aligned global allocator.
+    Encoded(ext4_security::Descriptor),
+}
+#[cfg(not(test))]
+impl PreparedDescriptor<'_> {
+    /// Native input pointer, valid while this owner remains retained.
+    pub(crate) fn as_ptr(&self) -> wdk_sys::PSECURITY_DESCRIPTOR {
+        let bytes = match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Encoded(image) => image.bytes(),
+        };
+        bytes.as_ptr().cast_mut().cast()
     }
 }
 

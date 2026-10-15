@@ -63,11 +63,12 @@ impl RequestorSubject {
     ) -> DriverResult<()> {
         #[cfg(not(test))]
         {
+            let prepared = _descriptor.prepare(wdk_sys::FILE_WRITE_ATTRIBUTES)?;
             let status = unsafe {
                 // SAFETY: This owner retains its native subject; the descriptor owner retains all encoded bytes.
                 super::ffi::ext4win_subject_write_attributes(
                     self.native.as_ptr(),
-                    _descriptor.as_ptr(),
+                    prepared.as_ptr(),
                 )
             };
             if status < 0 {

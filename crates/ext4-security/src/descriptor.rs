@@ -6,8 +6,10 @@ use crate::{
 use alloc::vec::Vec;
 use ext4_core::{Ext4Owner, Ext4Permissions, Ext4Security};
 
-/// Upper bound with two maximum-length identity SIDs and five ACEs.
-pub const MAX_DESCRIPTOR_BYTES: usize = 488;
+/// Native ACL's sixteen-bit length plus descriptor header and two maximum-length SIDs.
+pub const MAX_DESCRIPTOR_BYTES: usize = 65_691;
+/// Initial storage sufficient for the complete three-class projection.
+const MODE_DESCRIPTOR_BYTES: usize = 488;
 /// Supported security-information component selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Components(u32);
@@ -43,8 +45,33 @@ impl Descriptor {
         map: &IdentityMap,
         selection: Components,
     ) -> Result<Self, Error> {
+        Self::project(access, map, selection, 0)
+    }
+    /// Encodes an access-check image for a specific, generic-mapped request.
+    /// A matching group must supply the complete requested rwx combination; rights from
+    /// separate group entries cannot combine to satisfy a composite POSIX request.
+    /// # Errors
+    /// Returns descriptor length, allocation or identity encoding failure.
+    pub fn for_request(
+        access: &ext4_core::Ext4Access,
+        map: &IdentityMap,
+        requested: u32,
+    ) -> Result<Self, Error> {
+        let required = required_permissions(requested);
+        Self::project(access, map, Components::ALL, required)
+    }
+    /// Builds the query projection or one request-specific group projection.
+    /// # Errors
+    /// Returns descriptor length, allocation or identity encoding failure.
+    fn project(
+        access: &ext4_core::Ext4Access,
+        map: &IdentityMap,
+        selection: Components,
+        required: u16,
+    ) -> Result<Self, Error> {
+        let security = access.security();
         let mut bytes = Vec::new();
-        reserve(&mut bytes, MAX_DESCRIPTOR_BYTES)?;
+        reserve(&mut bytes, MODE_DESCRIPTOR_BYTES)?;
         append_reserved(&mut bytes, &[0; 20])?;
         put(&mut bytes, 0, &[1])?;
         let mut control = 0x8000_u16;
@@ -59,30 +86,59 @@ impl Descriptor {
         if selection.0 & 4 != 0 {
             control |= 4;
             let mut acl = Vec::new();
-            reserve(&mut acl, MAX_DESCRIPTOR_BYTES)?;
+            reserve(&mut acl, MODE_DESCRIPTOR_BYTES)?;
             append_reserved(&mut acl, &[0; 8])?;
             let permissions = security.permissions().as_u16();
             let mut count = 0_u16;
-            for (sid, bits) in [
-                (owner, (permissions >> 6) & 7),
-                (group, (permissions >> 3) & 7),
-            ] {
-                let allow = mode_rights(bits);
-                let deny = CONTROLLED_RIGHTS & !allow;
-                if deny != 0 {
-                    ace(&mut acl, 1, deny, sid)?;
-                    count = count.checked_add(1).ok_or(Error::InvalidEncoding)?;
+            class(&mut acl, &mut count, owner, (permissions >> 6) & 7)?;
+            if let Some(policy) = access.acl() {
+                let mask = policy.mask().map_or(7, ext4_core::AclPermissions::bits);
+                for entry in policy.users() {
+                    class(
+                        &mut acl,
+                        &mut count,
+                        map.user_sid(entry.uid())?,
+                        entry.permissions().bits() & mask,
+                    )?;
                 }
-                ace(&mut acl, 0, allow, sid)?;
-                count = count.checked_add(1).ok_or(Error::InvalidEncoding)?;
+                counted_ace(
+                    &mut acl,
+                    &mut count,
+                    0,
+                    group_rights(policy.group().bits() & mask, required),
+                    group,
+                )?;
+                for entry in policy.groups() {
+                    counted_ace(
+                        &mut acl,
+                        &mut count,
+                        0,
+                        group_rights(entry.permissions().bits() & mask, required),
+                        map.group_sid(entry.gid())?,
+                    )?;
+                }
+                // Eligible groups grant before matched-group denials prevent fallback.
+                // These denials prevent a matched group from falling through to the other class.
+                counted_ace(&mut acl, &mut count, 1, CONTROLLED_RIGHTS, group)?;
+                for entry in policy.groups() {
+                    counted_ace(
+                        &mut acl,
+                        &mut count,
+                        1,
+                        CONTROLLED_RIGHTS,
+                        map.group_sid(entry.gid())?,
+                    )?;
+                }
+            } else {
+                class(&mut acl, &mut count, group, (permissions >> 3) & 7)?;
             }
-            ace(
+            counted_ace(
                 &mut acl,
+                &mut count,
                 0,
                 BASE_RIGHTS | mode_rights(permissions & 7),
                 Sid::everyone()?,
             )?;
-            count = count.checked_add(1).ok_or(Error::InvalidEncoding)?;
             let length = u16::try_from(acl.len()).map_err(|_| Error::InvalidEncoding)?;
             put(&mut acl, 0, &[2])?;
             put(&mut acl, 2, &length.to_le_bytes())?;
@@ -103,7 +159,7 @@ impl Descriptor {
         bytes: &[u8],
         map: &IdentityMap,
         selection: Components,
-        current: Ext4Security,
+        current: &ext4_core::Ext4Access,
     ) -> Result<Ext4Security, Error> {
         if bytes.first() != Some(&1) || bytes.len() < 20 {
             return Err(Error::InvalidEncoding);
@@ -112,17 +168,24 @@ impl Descriptor {
         if control & 0x8000 == 0 || control & !0x8004 != 0 || u32_at(bytes, 12)? != 0 {
             return Err(Error::UnrepresentableDescriptor);
         }
-        let mut owner = current.owner();
+        let mut owner = current.security().owner();
         if selection.0 & 1 != 0 {
             owner = Ext4Owner::new(map.uid(sid_component(bytes, 4)?)?, owner.gid());
         }
         if selection.0 & 2 != 0 {
             owner = Ext4Owner::new(owner.uid(), map.gid(sid_component(bytes, 8)?)?);
         }
-        let mut permissions = current.permissions().as_u16();
+        let mut permissions = current.security().permissions().as_u16();
         if selection.0 & 4 != 0 {
             if control & 4 == 0 {
                 return Err(Error::UnrepresentableDescriptor);
+            }
+            if current.acl().is_some() {
+                let expected = Self::encode(current, map, Components::new(4)?)?;
+                if acl_component(bytes)? != acl_component(expected.bytes())? {
+                    return Err(Error::UnrepresentableDescriptor);
+                }
+                return Ok(Ext4Security::new(owner, current.security().permissions()));
             }
             let offset = usize::try_from(u32_at(bytes, 16)?).map_err(|_| Error::InvalidEncoding)?;
             if offset < 20 || offset % 4 != 0 {
@@ -181,6 +244,7 @@ fn put(bytes: &mut [u8], offset: usize, value: &[u8]) -> Result<(), Error> {
 fn component(bytes: &mut Vec<u8>, field: usize, value: &[u8]) -> Result<(), Error> {
     let offset = u32::try_from(bytes.len()).map_err(|_| Error::InvalidEncoding)?;
     put(bytes, field, &offset.to_le_bytes())?;
+    reserve(bytes, value.len())?;
     append_reserved(bytes, value)?;
     Ok(())
 }
@@ -193,6 +257,15 @@ fn ace(bytes: &mut Vec<u8>, kind: u8, mask: u32, sid: Sid) -> Result<(), Error> 
         .len()
         .checked_add(8)
         .ok_or(Error::InvalidEncoding)?;
+    if bytes
+        .len()
+        .checked_add(length)
+        .ok_or(Error::RecordTooLarge)?
+        > usize::from(u16::MAX)
+    {
+        return Err(Error::RecordTooLarge);
+    }
+    reserve(bytes, length)?;
     append_reserved(bytes, &[kind, 0])?;
     append_reserved(
         bytes,
@@ -297,5 +370,70 @@ impl AceCursor<'_> {
             _ => return Err(Error::UnrepresentableDescriptor),
         }
         Ok(bits)
+    }
+}
+
+/// Emits one exclusive user or inode class before less-specific principals.
+/// # Errors
+/// Returns SID encoding, ACL budget or allocation failures.
+fn class(bytes: &mut Vec<u8>, count: &mut u16, sid: Sid, bits: u16) -> Result<(), Error> {
+    let allow = mode_rights(bits);
+    let deny = CONTROLLED_RIGHTS & !allow;
+    if deny != 0 {
+        counted_ace(bytes, count, 1, deny, sid)?;
+    }
+    counted_ace(bytes, count, 0, allow, sid)
+}
+
+/// Tracks the native entry count together with successfully encoded ACEs.
+/// # Errors
+/// Returns encoded ACL length, count or allocation failures.
+fn counted_ace(
+    bytes: &mut Vec<u8>,
+    count: &mut u16,
+    kind: u8,
+    mask: u32,
+    sid: Sid,
+) -> Result<(), Error> {
+    ace(bytes, kind, mask, sid)?;
+    *count = count.checked_add(1).ok_or(Error::RecordTooLarge)?;
+    Ok(())
+}
+
+/// Borrows a bounded native DACL for a representability comparison.
+/// # Errors
+/// Returns invalid descriptor offsets or truncated ACL storage.
+fn acl_component(bytes: &[u8]) -> Result<&[u8], Error> {
+    let offset = usize::try_from(u32_at(bytes, 16)?).map_err(|_| Error::InvalidEncoding)?;
+    if offset < 20 || !offset.is_multiple_of(4) {
+        return Err(Error::InvalidEncoding);
+    }
+    let remaining = bytes.get(offset..).ok_or(Error::InvalidEncoding)?;
+    remaining
+        .get(..usize::from(u16_at(remaining, 2)?))
+        .ok_or(Error::InvalidEncoding)
+}
+
+/// Rwx classes needed by a generic-mapped native specific-right request.
+pub fn required_permissions(requested: u32) -> u16 {
+    let read = if requested & crate::READ_RIGHTS != 0 {
+        4
+    } else {
+        0
+    };
+    let write = if requested & crate::WRITE_RIGHTS != 0 {
+        2
+    } else {
+        0
+    };
+    let execute = u16::from(requested & crate::EXECUTE_RIGHTS != 0);
+    read | write | execute
+}
+/// Grants only when this one group entry supplies the whole requested combination.
+fn group_rights(permissions: u16, required: u16) -> u32 {
+    if permissions & required == required {
+        mode_rights(permissions)
+    } else {
+        0
     }
 }

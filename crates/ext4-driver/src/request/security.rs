@@ -1,29 +1,44 @@
-//! Windows security descriptor boundary for authoritative ext4 owner and mode.
+//! Windows descriptor boundary for authoritative ext4 ownership and POSIX access policy.
 use super::DriverMutationPass;
 use crate::irp::{CapturedRequestorOutput, IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use crate::security_descriptor::{SecurityDescriptorRef, SecuritySelection};
 use crate::state::OpenedObject;
-use ext4_core::{CommittedReadPass, Ext4Security, NodeId};
+use ext4_core::{CommittedReadPass, Ext4Access, NodeId};
 use ext4_security::{Components, Descriptor, IdentityMap};
 
 /// Complete pool-aligned self-relative descriptor retained through native checks.
 #[derive(Debug)]
-pub(crate) struct CreateSecurityDescriptor {
+pub(crate) struct CreateSecurityDescriptor<'a> {
     /// Immutable owned image; kernel pool allocations satisfy native alignment.
     bytes: DriverVec<u8>,
+    /// Validated policy retained for request-specific group-class checks.
+    access: Ext4Access,
+    /// Immutable identity interpretation pinned by the operation.
+    map: &'a IdentityMap,
 }
-impl CreateSecurityDescriptor {
+impl<'a> CreateSecurityDescriptor<'a> {
+    /// Projects a validated access policy with its pinned identity table.
+    /// # Errors
+    /// Returns descriptor validation or allocation failure.
+    pub(crate) fn from_access(access: Ext4Access, map: &'a IdentityMap) -> DriverResult<Self> {
+        let descriptor = Descriptor::encode(&access, map, Components::ALL)?;
+        Ok(Self {
+            bytes: DriverVec::try_copied_from_slice(descriptor.bytes())?,
+            access,
+            map,
+        })
+    }
     /// Loads and projects a node using the operation's pinned identity table.
     /// # Errors
     /// Propagates metadata, validation and allocation failures.
     pub(crate) fn for_node(
         read: &mut impl CommittedReadPass,
         node: NodeId,
-        map: &IdentityMap,
+        map: &'a IdentityMap,
     ) -> DriverResult<Self> {
-        Self::from_security(security_from_node(read, node)?, map)
+        Self::from_access(read.load_access(node)?, map)
     }
     /// Borrows the encoded descriptor during one native check.
     #[expect(
@@ -33,7 +48,11 @@ impl CreateSecurityDescriptor {
     pub(crate) fn as_native(&self) -> SecurityDescriptorRef<'_> {
         unsafe {
             // SAFETY: The immutable complete encoder image is contained in pool-aligned storage.
-            SecurityDescriptorRef::from_validated_bytes(self.bytes.as_slice())
+            SecurityDescriptorRef::from_validated_bytes(
+                self.bytes.as_slice(),
+                &self.access,
+                self.map,
+            )
         }
     }
 }
@@ -46,9 +65,9 @@ pub(crate) fn query(
     map: &IdentityMap,
 ) -> DriverResult<IrpCompletion> {
     let request = QuerySecurityRequest::decode(request)?;
-    let security = security_from_node(read, request.node)?;
+    let access = read.load_access(request.node)?;
     let descriptor = Descriptor::encode(
-        security,
+        &access,
         map,
         Components::new(request.selection.required_information())?,
     )?;
@@ -68,14 +87,14 @@ pub(crate) fn set(
     map: &IdentityMap,
 ) -> DriverResult<IrpCompletion> {
     let request = SetSecurityRequest::decode(request)?;
-    let current = security_from_node(mutation, request.node)?;
+    let current = mutation.load_access(request.node)?;
     let security = Descriptor::decode(
         request.descriptor,
         map,
         Components::new(request.selection.required_information())?,
-        current,
+        &current,
     )?;
-    if security != current {
+    if security != current.security() {
         let node = mutation.node(request.node)?;
         mutation.set_posix_security(node, security)?;
     }
@@ -142,4 +161,3 @@ impl<'a> SetSecurityRequest<'a> {
         })
     }
 }
-
