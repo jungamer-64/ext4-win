@@ -322,7 +322,7 @@ impl AclKind {
         set.entries()
             .find(|(name, _)| Self::of(name) == Some(self))
             .map(|(_, value)| {
-                if value.bytes() == 1_u32.to_le_bytes() {
+                if Self::is_absent_value(value) {
                     Ok(None)
                 } else {
                     PosixAcl::parse(value.bytes()).map(Some)
@@ -330,6 +330,11 @@ impl AclKind {
             })
             .transpose()
             .map(Option::flatten)
+    }
+
+    /// A version header without entries denotes the absence of an ACL.
+    pub(crate) fn is_absent_value(value: &XattrValue) -> bool {
+        value.bytes() == 1_u32.to_le_bytes()
     }
 
     /// Returns the logical xattr name.

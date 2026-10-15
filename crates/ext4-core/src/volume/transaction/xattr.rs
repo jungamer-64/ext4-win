@@ -15,6 +15,7 @@ fn require_windows_reparse_storage_node(node: TransactionNode) -> Result<()> {
 
 impl MutationResolvePass<'_, '_, '_> {
     /// Sets or replaces one ext4 extended attribute.
+    /// Access ACL values synchronize inode rwx; a header-only ACL removes either reserved ACL slot.
     ///
     /// # Errors
     /// Returns an error when the inode is not mutable or the xattr set cannot
@@ -26,8 +27,14 @@ impl MutationResolvePass<'_, '_, '_> {
         value: XattrValue,
     ) -> Result<()> {
         self.edit(|pass| {
-            pass.mutation
-                .update_xattrs(node, pass.now, |set| set.insert(name, value))
+            pass.mutation.update_xattrs(node, pass.now, |set| {
+                if AclKind::of(&name).is_some() && AclKind::is_absent_value(&value) {
+                    set.remove(&name)?;
+                    Ok(())
+                } else {
+                    set.insert(name, value)
+                }
+            })
         })
     }
 

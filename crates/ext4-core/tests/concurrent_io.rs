@@ -2318,3 +2318,54 @@ fn malformed_acl_mutations_leave_committed_policy_unchanged() -> Result<()> {
     );
     Ok(())
 }
+
+/// # Errors
+/// Returns fixture, xattr mutation or remount failure.
+/// # Panics
+/// Panics if an empty ACL remains stored or changes the remaining inode permissions.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify persistent absence as the empty ACL contract"
+)]
+fn empty_acl_values_remove_the_reserved_slot() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::System, b"posix_acl_access")?,
+            XattrValue::new(&NAMED_ACL)?,
+        )?;
+        for local in [
+            b"posix_acl_access".as_slice(),
+            b"posix_acl_default".as_slice(),
+        ] {
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::System, local)?,
+                XattrValue::new(&1_u32.to_le_bytes())?,
+            )?;
+        }
+        Ok(())
+    })?;
+    fixture.remount()?;
+    fixture.read(|pass| {
+        let access = pass.load_access(NodeId::File(a))?;
+        assert!(access.acl().is_none());
+        assert_eq!(access.security().permissions().as_u16(), 0o660);
+        let attrs = pass.read_xattrs(NodeId::File(a))?;
+        for local in [
+            b"posix_acl_access".as_slice(),
+            b"posix_acl_default".as_slice(),
+        ] {
+            assert!(
+                attrs
+                    .get(&XattrName::new(XattrNamespace::System, local)?)
+                    .is_none()
+            );
+        }
+        Ok(())
+    })
+}

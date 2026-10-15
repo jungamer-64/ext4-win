@@ -438,5 +438,30 @@ fn verify_acl_contract(linux: LinuxEnvironment, root: &Path, image: &Path) -> Ta
             );
         }
     }
-    verify_internal_e2fsck_clean(linux, image, "ACL inheritance and chmod")
+    verify_internal_e2fsck_clean(linux, image, "ACL inheritance and chmod")?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, file) = mutation_root_file(pass, &ext4_core::Ext4Name::new(b"payload")?)?;
+        let node = pass.node(ext4_core::NodeId::File(file))?;
+        pass.set_xattr(
+            node,
+            ext4_core::XattrName::new(ext4_core::XattrNamespace::System, b"posix_acl_access")?,
+            ext4_core::XattrValue::new(&1_u32.to_le_bytes())?,
+        )?;
+        let root = pass.node(ext4_core::NodeId::Directory(
+            ext4_core::DirectoryNodeId::ROOT,
+        ))?;
+        pass.set_xattr(
+            root,
+            ext4_core::XattrName::new(ext4_core::XattrNamespace::System, b"posix_acl_default")?,
+            ext4_core::XattrValue::new(&1_u32.to_le_bytes())?,
+        )?;
+        let parent = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        pass.unlink_file(parent, &ext4_core::Ext4Name::new(b"acl-inherited")?)
+    })?;
+    for path in ["/payload", "/"] {
+        if request(linux, image, &format!("ea_list {path}"))?.contains("system.posix_acl_") {
+            return Err(io::Error::other("empty ACL retained a persistent policy slot").into());
+        }
+    }
+    verify_internal_e2fsck_clean(linux, image, "ACL removal")
 }
