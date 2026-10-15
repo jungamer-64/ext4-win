@@ -12,6 +12,64 @@ use ext4_core::*;
 struct PlainCrypto;
 
 /// # Errors
+/// Returns mount, write, durability or read failures while recovering an interrupted extension.
+/// # Panics
+/// Fails if data flushed without an EOF commit becomes visible through sparse extension.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe bytes after an independently interrupted persistence boundary"
+)]
+fn sparse_extension_zeroes_initialized_storage_after_interrupted_write() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        |pass| {
+            let target = pass.file(file)?;
+            pass.write_file_range(target, FileOffset::from_bytes(1), b"SECRET")
+        },
+    )?;
+    let prepared = resolved
+        .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+        .prepare_commit(
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+            CommitLease::granted(ticket),
+        )?;
+    {
+        let ordered = fixture.disk.sequence(prepared.start())?;
+        fixture.disk.checked(ordered.flush_request())?;
+        // A crash loses preparation and publication state after data reaches its home block.
+    }
+    let (profile, epoch, coordinator) = fixture.disk.mount()?.into_parts();
+    fixture.profile = profile;
+    fixture.cache = MetadataCache::try_new(&epoch)?;
+    fixture.epoch = epoch;
+    fixture.coordinator = coordinator;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_file(file)?.size()))?,
+        FileSize::from_bytes(1)
+    );
+    fixture.mutate(|pass| {
+        let target = pass.file(file)?;
+        pass.extend_file(target, FileSize::from_bytes(7))
+    })?;
+    let mut bytes = [0xff; 7];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?,
+        ReadBytes::from_usize(7)
+    );
+    assert_eq!(bytes, [b'a', 0, 0, 0, 0, 0, 0]);
+    Ok(())
+}
+
+/// # Errors
 /// Returns storage, journal, or read failure while exercising the production commit protocol.
 /// # Panics
 /// Fails if journaled bytes reach home early or are absent from the published epoch overlay.

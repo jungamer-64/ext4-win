@@ -854,7 +854,8 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Extends a regular file as a sparse range.
     ///
     /// # Errors
-    /// Returns an error when `new_size` would shrink the file.
+    /// Returns an error when `new_size` would shrink the file, existing initialized storage cannot
+    /// be zeroed before becoming visible, or the inode metadata cannot be staged.
     pub fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
         let encoded_size = self
             .mutation
@@ -868,6 +869,15 @@ impl MutationResolvePass<'_, '_, '_> {
         self.require_file_size_mutation(&inode)?;
         if new_size < inode.size() {
             return Err(Error::InvalidWriteRange);
+        }
+        if new_size > inode.size() {
+            let tree = self.mutation.mutable_extent_tree(&inode)?;
+            self.stage_visible_extension_gap(
+                &inode,
+                &tree,
+                inode.size(),
+                FileOffset::from_bytes(new_size.bytes()),
+            )?;
         }
         raw_inode.set_encoded_size(encoded_size)?;
         raw_inode.set_timestamps(self.now)?;
