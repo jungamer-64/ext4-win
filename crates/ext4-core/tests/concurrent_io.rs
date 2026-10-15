@@ -13,6 +13,94 @@ use sha2::Digest as _;
 struct PlainCrypto;
 
 /// # Errors
+/// Returns fixture, mutation, durability or payload-read failures.
+/// # Panics
+/// Fails if released journal images overwrite a successor owner's bytes after checkpoint.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare committed payloads with independent write inputs"
+)]
+fn block_release_retires_staged_images_across_persistence_policies() -> Result<()> {
+    for offset in [FileOffset::ZERO, FileOffset::from_bytes(4096)] {
+        let mut fixture = Fixture::new()?;
+        let a = fixture.a;
+        let b = fixture.b;
+        fixture
+            .disk
+            .encode_inode(NodeId::File(a), 0x0008_4000, None)?;
+        fixture.remount()?;
+        fixture.mutate(|pass| {
+            let a = pass.file(a)?;
+            let b = pass.file(b)?;
+            pass.write_file_range(a, offset, b"J")?;
+            pass.truncate_file(a, FileSize::from_bytes(0))?;
+            pass.truncate_file(b, FileSize::from_bytes(0))?;
+            pass.write_file_range(b, FileOffset::ZERO, b"NEW")
+        })?;
+        let mut output = [0; 3];
+        fixture.read(|pass| pass.read_file(b, FileOffset::ZERO, &mut output))?;
+        assert_eq!(&output, b"NEW");
+        fixture.remount()?;
+        fixture.read(|pass| pass.read_file(b, FileOffset::ZERO, &mut output))?;
+        assert_eq!(&output, b"NEW");
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, write-plan, storage-flush, remount or payload-read failures.
+/// # Panics
+/// Fails if allocation overwrites a committed owner before its retirement is committed.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe the old filesystem after an interrupted commit"
+)]
+fn allocation_preserves_committed_owners_until_the_retirement_commit() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    let b = fixture.b;
+    fixture
+        .disk
+        .encode_inode(NodeId::File(a), 0x0008_4000, None)?;
+    fixture.remount()?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        |pass| {
+            let a = pass.file(a)?;
+            let b = pass.file(b)?;
+            pass.write_file_range(a, FileOffset::ZERO, b"J")?;
+            pass.truncate_file(a, FileSize::from_bytes(0))?;
+            pass.truncate_file(b, FileSize::from_bytes(0))?;
+            pass.write_file_range(b, FileOffset::ZERO, b"NEW")
+        },
+    )?;
+    let prepared = resolved
+        .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+        .prepare_commit(
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+            CommitLease::granted(ticket),
+        )?;
+    let ordered = fixture.disk.sequence(prepared.start())?;
+    fixture.disk.checked(ordered.flush_request())?;
+    drop(ordered);
+    fixture.remount()?;
+    for (file, expected) in [(a, b'a'), (b, b'b')] {
+        let mut output = [0; 1];
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut output))?;
+        assert_eq!(output, [expected]);
+    }
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture preparation, parameter construction or read failures.
 /// # Panics
 /// Fails if an undeclared filesystem feature can publish a verity inode or any storage effect.
@@ -621,6 +709,17 @@ struct Fixture {
 }
 
 impl Fixture {
+    /// Replaces mount-local state with independently recovered storage state.
+    /// # Errors
+    /// Returns mount recovery or cache allocation failure.
+    fn remount(&mut self) -> Result<()> {
+        let (profile, epoch, coordinator) = self.disk.mount()?.into_parts();
+        self.profile = profile;
+        self.cache = MetadataCache::try_new(&epoch)?;
+        self.epoch = epoch;
+        self.coordinator = coordinator;
+        Ok(())
+    }
     /// Publishes mount-local key state without passing any request to the disk executor.
     /// # Errors
     /// Returns stale authority or allocation failure before publication.

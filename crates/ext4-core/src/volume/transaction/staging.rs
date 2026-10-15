@@ -69,6 +69,20 @@ pub(super) struct RangeWrite {
     pub(super) bytes: Vec<u8>,
 }
 
+/// A byte image owned by one physical block for the lifetime of its allocation.
+///
+/// Ordered ranges stay within that block; journaled ranges cover it completely. Block release
+/// revokes every pending image before a subsequent allocation can reuse the physical identity.
+#[derive(Debug)]
+pub(super) struct StagedFileWrite {
+    /// Allocation identity invalidated by block release.
+    pub(super) block: BlockAddress,
+    /// Durability boundary selected by the current inode owner.
+    pub(super) persistence: FileDataPersistence,
+    /// Immutable range identity; only journaled payload bytes may be patched in place.
+    pub(super) write: RangeWrite,
+}
+
 impl MetadataMutation<'_, '_> {
     /// Reads the current transaction's physical block, applying staged data in operation order.
     /// A staged image covering the whole block replaces the device read, including new allocation.
@@ -85,7 +99,7 @@ impl MetadataMutation<'_, '_> {
         let mut bytes = memory::repeated_vec(0_u8, width)?;
         let mut after_base = None;
         for (index, write) in self.file_writes.iter().enumerate().rev() {
-            let (write_offset, payload) = write.byte_range(block_size)?;
+            let (write_offset, payload) = (write.write.offset, &write.write.bytes);
             let write_start = write_offset.get();
             let write_end = write_start
                 .checked_add(u64::try_from(payload.len()).map_err(|_| Error::ArithmeticOverflow)?)
@@ -110,7 +124,7 @@ impl MetadataMutation<'_, '_> {
             self.volume.device.read_exact_at(offset, &mut bytes)?;
         }
         for write in self.file_writes.iter().skip(after_base.unwrap_or(0)) {
-            let (write_offset, payload) = write.byte_range(block_size)?;
+            let (write_offset, payload) = (write.write.offset, &write.write.bytes);
             let write_start = write_offset.get();
             let write_end = write_start
                 .checked_add(u64::try_from(payload.len()).map_err(|_| Error::ArithmeticOverflow)?)
@@ -156,4 +170,84 @@ impl MetadataMutation<'_, '_> {
         Ok(bytes)
     }
 
+    /// Stages one block-owned range at its inode's persistence boundary.
+    /// # Errors
+    /// Returns invalid ranges, allocation failure or an unavailable partial-block base image.
+    pub(super) fn stage_file_write(
+        &mut self,
+        persistence: FileDataPersistence,
+        write: RangeWrite,
+    ) -> Result<()> {
+        let block_size = self.volume.superblock.block_size();
+        let width = u64::from(block_size.bytes());
+        let block = BlockAddress::new(
+            write
+                .offset
+                .get()
+                .checked_div(width)
+                .ok_or(Error::InvalidSuperblock)?,
+        );
+        let start = usize::try_from(
+            write
+                .offset
+                .get()
+                .checked_rem(width)
+                .ok_or(Error::InvalidSuperblock)?,
+        )
+        .map_err(|_| Error::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(write.bytes.len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        let block_bytes = usize::try_from(width).map_err(|_| Error::ArithmeticOverflow)?;
+        if end > block_bytes {
+            return Err(Error::InvalidWriteRange);
+        }
+        if persistence == FileDataPersistence::Ordered {
+            return self.file_writes.try_push(StagedFileWrite {
+                block,
+                persistence,
+                write,
+            });
+        }
+        if let Some(staged) = self
+            .file_writes
+            .iter_mut()
+            .find(|item| item.block == block && item.persistence == FileDataPersistence::Journaled)
+        {
+            return memory::copy_exact(
+                staged
+                    .write
+                    .bytes
+                    .get_mut(start..end)
+                    .ok_or(Error::InvalidWriteRange)?,
+                &write.bytes,
+            );
+        }
+        let bytes = if start == 0 && write.bytes.len() == block_bytes {
+            write.bytes
+        } else {
+            let mut bytes = self.file_block_bytes(block)?;
+            memory::copy_exact(
+                bytes.get_mut(start..end).ok_or(Error::InvalidWriteRange)?,
+                &write.bytes,
+            )?;
+            bytes
+        };
+        self.file_writes.try_push(StagedFileWrite {
+            block,
+            persistence,
+            write: RangeWrite {
+                offset: block_size.offset_of(block)?,
+                bytes,
+            },
+        })
+    }
+
+    /// Revokes every staged representation whose owning physical block has been released.
+    pub(super) fn release_block_images(&mut self, block: BlockAddress) {
+        self.file_writes.retain(|write| write.block != block);
+        self.directory_updates.retain(|image| image.block != block);
+        self.extent_updates.retain(|image| image.block != block);
+        self.xattr_updates.retain(|image| image.block != block);
+    }
 }

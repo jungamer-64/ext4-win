@@ -63,6 +63,11 @@ impl MetadataMutation<'_, '_> {
                 if occupied == BitmapBitState::Used {
                     continue;
                 }
+                // Home writes precede the metadata commit. A committed owner must remain intact
+                // until that commit retires its references, even if the final bitmap is free.
+                if self.volume.committed_clusters()?.count(cluster) != 0 {
+                    continue;
+                }
                 if self.staged_cluster_reference_count(cluster)? != 0 {
                     return Err(Error::ClusterReferenceConflict);
                 }
@@ -92,19 +97,23 @@ impl MetadataMutation<'_, '_> {
     pub(super) fn stage_cluster_zeroes(&mut self, cluster: ClusterAddress) -> Result<()> {
         let first_block = self.volume.superblock.first_block_of_cluster(cluster)?;
         let blocks = self.volume.superblock.blocks_in_cluster(cluster)?;
-        let bytes = usize::try_from(
-            u64::from(blocks)
-                .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
-                .ok_or(Error::ArithmeticOverflow)?,
-        )
-        .map_err(|_| Error::ArithmeticOverflow)?;
-        self.stage_file_write(
-            FileDataPersistence::Ordered,
-            RangeWrite {
-                offset: self.volume.superblock.block_size().offset_of(first_block)?,
-                bytes: memory::repeated_vec(0_u8, bytes)?,
-            },
-        )?;
+        let block_size = self.volume.superblock.block_size();
+        let bytes = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        for index in 0..blocks {
+            let block = BlockAddress::new(
+                first_block
+                    .get()
+                    .checked_add(u64::from(index))
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
+            self.stage_file_write(
+                FileDataPersistence::Ordered,
+                RangeWrite {
+                    offset: block_size.offset_of(block)?,
+                    bytes: memory::repeated_vec(0_u8, bytes)?,
+                },
+            )?;
+        }
         Ok(())
     }
 
@@ -168,6 +177,7 @@ impl MetadataMutation<'_, '_> {
     pub(super) fn release_cluster_reference(&mut self, block: BlockAddress) -> Result<()> {
         let cluster = self.volume.superblock.cluster_of_block(block)?;
         self.record_cluster_reference_delta(cluster, -1)?;
+        self.release_block_images(block);
         if self.staged_cluster_reference_count(cluster)? == 0 {
             self.free_cluster(cluster)?;
         }

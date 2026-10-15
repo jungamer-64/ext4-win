@@ -257,9 +257,11 @@ impl MetadataMutation<'_, '_> {
         let mut journal_blocks = self.metadata_blocks()?;
         let mut data_writes = Vec::new();
         for write in core::mem::take(&mut self.file_writes) {
-            match write {
-                StagedFileWrite::Ordered(write) => data_writes.try_push(write)?,
-                StagedFileWrite::Journaled(block) => journal_blocks.try_push(block)?,
+            match write.persistence {
+                FileDataPersistence::Ordered => data_writes.try_push(write.write)?,
+                FileDataPersistence::Journaled => {
+                    journal_blocks.try_push(JournalBlock::new(write.block, write.write.bytes))?
+                }
             }
         }
         let _validated_next_state = self.committed_cluster_state()?;
