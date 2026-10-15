@@ -24,6 +24,7 @@ pub(super) fn verify_inode_contracts(
     request(linux, &image, "set_inode_field /payload flags 0x84000")?;
     verify_internal_e2fsck_clean(linux, &image, "journal-data baseline")?;
     verify_data_cuts(linux, &root, &image)?;
+    verify_block_retirement(linux, &root, &image)?;
     verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
     Ok(())
@@ -46,6 +47,46 @@ fn request(linux: LinuxEnvironment, image: &Path, text: &str) -> TaskResult<Stri
         );
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Checks the payload and allocation endpoint when journaled storage retires beside ordered data.
+/// # Errors
+/// Returns image construction, production mutation or independent content/allocation mismatches.
+fn verify_block_retirement(
+    linux: LinuxEnvironment,
+    root: &Path,
+    baseline: &Path,
+) -> TaskResult<()> {
+    let image = root.join("retired-owner.img");
+    fs::copy(baseline, &image)?;
+    let payload = root.join("successor.bin");
+    fs::write(&payload, b"old")?;
+    request(
+        linux,
+        &image,
+        &format!("write \"{}\" /successor", linux.tool_path(&payload)?),
+    )?;
+    drive_internal_core_mutation(&image, |pass| {
+        let (_, old) = mutation_root_file(pass, &ext4_core::Ext4Name::new(b"payload")?)?;
+        let (_, successor) = mutation_root_file(pass, &ext4_core::Ext4Name::new(b"successor")?)?;
+        let old = pass.file(old)?;
+        let successor = pass.file(successor)?;
+        pass.write_file_range(old, ext4_core::FileOffset::ZERO, b"J")?;
+        pass.truncate_file(old, ext4_core::FileSize::from_bytes(0))?;
+        pass.truncate_file(successor, ext4_core::FileSize::from_bytes(0))?;
+        pass.write_file_range(successor, ext4_core::FileOffset::ZERO, b"NEW")
+    })?;
+    request(
+        linux,
+        &image,
+        &format!("dump /successor \"{}\"", linux.tool_path(&payload)?),
+    )?;
+    if fs::read(&payload)? != b"NEW" {
+        return Err(
+            io::Error::other("retired journal data overwrote its ordered successor").into(),
+        );
+    }
+    verify_internal_e2fsck_clean(linux, &image, "retired block ownership")
 }
 
 /// Checks epoch/nanosecond wire fields and a small extra-field record containing real xattrs.
@@ -87,6 +128,27 @@ fn verify_times_and_xattrs(linux: LinuxEnvironment, image: &Path) -> TaskResult<
             return Err(
                 io::Error::other(format!("independent timestamp field mismatch: {field}")).into(),
             );
+        }
+    }
+    drive_internal_core_mutation(image, |pass| {
+        let (_, file) = mutation_root_file(pass, &name)?;
+        let snapshot = pass.staged_node_metadata(ext4_core::NodeId::File(file))?;
+        let node = pass.node(ext4_core::NodeId::File(file))?;
+        pass.set_posix_security(
+            node,
+            ext4_core::Ext4Security::new(
+                snapshot.security().owner(),
+                ext4_core::Ext4Permissions::new(0o640)?,
+            ),
+        )
+    })?;
+    let stat = request(linux, image, "stat /payload")?;
+    for field in ["atime: 0x00000001:00000005", "mtime: 0x00000001:00000005"] {
+        if !stat.contains(field) {
+            return Err(io::Error::other(format!(
+                "inode metadata update changed access/content time: {field}"
+            ))
+            .into());
         }
     }
     for field in [
