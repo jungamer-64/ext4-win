@@ -40,9 +40,9 @@ const fn disk_offset(offset: usize) -> DiskOffset {
     DiskOffset::new(offset)
 }
 /// Local name exposed for access ACLs at the public xattr boundary.
-const POSIX_ACL_ACCESS_NAME: &[u8] = b"posix_acl_access";
+pub(crate) const POSIX_ACL_ACCESS_NAME: &[u8] = b"posix_acl_access";
 /// Local name exposed for default ACLs at the public xattr boundary.
-const POSIX_ACL_DEFAULT_NAME: &[u8] = b"posix_acl_default";
+pub(crate) const POSIX_ACL_DEFAULT_NAME: &[u8] = b"posix_acl_default";
 /// On-disk local name for ext4's private fscrypt context xattr.
 const ENCRYPTION_CONTEXT_NAME: &[u8] = b"c";
 

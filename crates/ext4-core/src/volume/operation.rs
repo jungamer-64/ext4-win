@@ -37,6 +37,19 @@ pub enum WindowsNameMatch {
 /// implementation can survive suspension: all storage and continuation ownership remains in its
 /// enclosing operation.
 pub trait CommittedReadPass {
+    /// Loads validated inode ownership, mode and the complete access ACL.
+    /// # Errors
+    /// Returns storage, ACL decoding or inode/ACL disagreement failures.
+    fn load_access(&mut self, node: NodeId) -> Result<Ext4Access>;
+    /// Computes child access from the directory's default ACL and requested inode fields.
+    /// # Errors
+    /// Returns storage, default ACL or allocation failures.
+    fn child_access(
+        &mut self,
+        parent: DirectoryNodeId,
+        security: Ext4Security,
+    ) -> Result<Ext4Access>;
+
     /// Reads complete stream metadata from one committed inode and its Windows xattrs.
     /// # Errors
     ///
@@ -336,6 +349,17 @@ impl EpochReadPass<'_, '_, '_> {
 }
 
 impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
+    fn load_access(&mut self, node: NodeId) -> Result<Ext4Access> {
+        self.view.load_access(node)
+    }
+    fn child_access(
+        &mut self,
+        parent: DirectoryNodeId,
+        security: Ext4Security,
+    ) -> Result<Ext4Access> {
+        self.view.child_access(parent, security)
+    }
+
     fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
         self.load_file(id)
     }

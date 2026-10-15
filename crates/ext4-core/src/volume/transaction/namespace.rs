@@ -134,6 +134,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 pass.mutation.volume.superblock.inode_timestamp_encoding(),
             )?;
             pass.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
+            pass.mutation.inherit_acl(&parent_inode, &mut raw_inode)?;
             let inode_id = raw_inode.id();
             pass.add_directory_entry(parent.inode(), name, inode_id, DirectoryEntryKind::File)?;
             pass.mutation.inode_updates.try_push(raw_inode.into())?;
@@ -341,6 +342,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 pass.mutation.volume.superblock.inode_timestamp_encoding(),
             )?;
             pass.apply_fscrypt_context(&mut raw_inode, inherited_context)?;
+            pass.mutation.inherit_acl(&parent_inode, &mut raw_inode)?;
             let inode_id = raw_inode.id();
             let directory_checksum = pass.mutation.volume.directory_checksum(&raw_inode.parse()?);
 

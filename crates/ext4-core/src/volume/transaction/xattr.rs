@@ -110,6 +110,39 @@ impl MutationResolvePass<'_, '_, '_> {
 }
 
 impl MetadataMutation<'_, '_> {
+    /// Establishes the child's access/default ACLs before its inode is published.
+    /// # Errors
+    /// Returns invalid parent policy, allocation or xattr serialization failures.
+    pub(super) fn inherit_acl(
+        &mut self,
+        parent: &Inode,
+        raw_inode: &mut LiveInodeRecord,
+    ) -> Result<()> {
+        let raw_parent = self.raw_inode_for_policy(parent.id())?;
+        let parent_xattrs = self.xattr_set_for_raw_inode(&raw_parent)?;
+        let Some(default) = AclKind::Default.read(parent_xattrs.public())? else {
+            return Ok(());
+        };
+        let inode = raw_inode.parse()?;
+        let directory_default = if inode.kind() == InodeKind::Directory {
+            Some(default.try_clone()?)
+        } else {
+            None
+        };
+        let access = Ext4Access::inherit(inode.security(), Some(default))?;
+        raw_inode.set_permissions(access.security().permissions())?;
+        let mut set = self.xattr_set_for_raw_inode(raw_inode)?;
+        if let Some(acl) = access.acl() {
+            set.public_mut()
+                .insert(AclKind::Access.name()?, acl.value()?)?;
+        }
+        if let Some(default) = directory_default {
+            set.public_mut()
+                .insert(AclKind::Default.name()?, default.value()?)?;
+        }
+        self.store_xattr_set(raw_inode, &set)
+    }
+
     /// Retires execution privileges in the same transaction as a file-content change.
     /// The core has no authority that permits retaining setid or file capabilities.
     /// # Errors
@@ -255,6 +288,15 @@ impl MetadataMutation<'_, '_> {
 
         let mut set = self.xattr_set_for_raw_inode(&raw_inode)?;
         update(set.public_mut())?;
+        if let Some(acl) = AclKind::Access.read(set.public())? {
+            if inode.kind() == InodeKind::Symlink {
+                return Err(Error::InvalidAcl);
+            }
+            raw_inode.set_permissions(acl.mode(inode.security().permissions())?)?;
+        }
+        if AclKind::Default.read(set.public())?.is_some() && inode.kind() != InodeKind::Directory {
+            return Err(Error::InvalidAcl);
+        }
         self.store_xattr_set(&mut raw_inode, &set)?;
         raw_inode.touch_metadata(now)?;
         self.replace_live_inode(inode_index, raw_inode)?;

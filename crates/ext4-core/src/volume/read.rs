@@ -104,6 +104,44 @@ impl HtreePath {
 }
 
 impl EpochReadView<'_, '_> {
+    /// Loads one cohesive access policy, checking its agreement with inode fields.
+    /// # Errors
+    /// Returns inode-kind, xattr, ACL agreement, I/O or allocation failures.
+    pub(super) fn load_access(&mut self, node: NodeId) -> Result<Ext4Access> {
+        let raw = self.read_live_inode_record(node.inode())?;
+        let inode = raw.parse()?;
+        if !matches!(
+            (node, inode.kind()),
+            (NodeId::File(_), InodeKind::File)
+                | (NodeId::Directory(_), InodeKind::Directory)
+                | (NodeId::Symlink(_), InodeKind::Symlink)
+        ) {
+            return Err(Error::WrongInodeKind);
+        }
+        let xattrs = self.read_inode_xattrs_from_live(&raw)?;
+        let acl = AclKind::Access.read(xattrs.public())?;
+        if inode.kind() == InodeKind::Symlink && acl.is_some() {
+            return Err(Error::InvalidAcl);
+        }
+        Ext4Access::new(inode.security(), acl)
+    }
+
+    /// Computes access before child creation from the parent's committed default ACL.
+    /// # Errors
+    /// Returns directory, default ACL, storage or allocation failures.
+    pub(super) fn child_access(
+        &mut self,
+        parent: DirectoryNodeId,
+        security: Ext4Security,
+    ) -> Result<Ext4Access> {
+        let raw = self.read_live_inode_record(parent.inode())?;
+        if raw.parse()?.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        let xattrs = self.read_inode_xattrs_from_live(&raw)?;
+        Ext4Access::inherit(security, AclKind::Default.read(xattrs.public())?)
+    }
+
     /// Loads a regular file by previously validated file identity.
     /// # Errors
     ///

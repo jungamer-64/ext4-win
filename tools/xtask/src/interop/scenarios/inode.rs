@@ -22,6 +22,7 @@ pub(super) fn verify_inode_contracts(
         &format!("write \"{}\" /payload", linux.tool_path(&payload)?),
     )?;
     verify_times_and_xattrs(linux, &image)?;
+    verify_acl_contract(linux, &root, &image)?;
     request(linux, &image, "set_inode_field /payload flags 0x84000")?;
     verify_internal_e2fsck_clean(linux, &image, "journal-data baseline")?;
     verify_data_cuts(linux, &root, &image)?;
@@ -363,4 +364,79 @@ fn verify_64k_directories(linux: LinuxEnvironment, root: &Path) -> TaskResult<()
     verify_internal_e2fsck_clean(linux, &image, "64 KiB directory mutation")?;
     fs::remove_file(image)?;
     Ok(())
+}
+
+/// Keeps chmod and inherited ACL bytes interoperable with independently encoded ext4 policies.
+/// # Errors
+/// Returns oracle, ACL mutation or final filesystem consistency failure.
+fn verify_acl_contract(linux: LinuxEnvironment, root: &Path, image: &Path) -> TaskResult<()> {
+    let acl = root.join("posix-acl.bin");
+    fs::write(
+        &acl,
+        [
+            2, 0, 0, 0, 1, 0, 6, 0, 255, 255, 255, 255, 2, 0, 6, 0, 233, 3, 0, 0, 4, 0, 6, 0, 255,
+            255, 255, 255, 16, 0, 6, 0, 255, 255, 255, 255, 32, 0, 0, 0, 255, 255, 255, 255,
+        ],
+    )?;
+    request(
+        linux,
+        image,
+        &format!(
+            "ea_set -f \"{}\" /payload system.posix_acl_access",
+            linux.tool_path(&acl)?
+        ),
+    )?;
+    request(linux, image, "set_inode_field /payload mode 0100660")?;
+    request(
+        linux,
+        image,
+        &format!(
+            "ea_set -f \"{}\" / system.posix_acl_default",
+            linux.tool_path(&acl)?
+        ),
+    )?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, file) = mutation_root_file(pass, &ext4_core::Ext4Name::new(b"payload")?)?;
+        let node = pass.node(ext4_core::NodeId::File(file))?;
+        pass.set_posix_security(
+            node,
+            ext4_core::Ext4Security::new(
+                mutation_file_metadata()?.owner(),
+                ext4_core::Ext4Permissions::new(0o640)?,
+            ),
+        )?;
+        let parent = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        pass.create_file(
+            parent,
+            &ext4_core::Ext4Name::new(b"acl-inherited")?,
+            mutation_file_metadata()?,
+        )?;
+        Ok(())
+    })?;
+    for path in ["/payload", "/acl-inherited"] {
+        let text = request(linux, image, &format!("stat {path}"))?;
+        if !text.contains("Mode:  0640") {
+            return Err(io::Error::other("ACL mode projection differs from oracle").into());
+        }
+        let output = root.join("acl-readback.bin");
+        request(
+            linux,
+            image,
+            &format!(
+                "ea_get -f \"{}\" {path} system.posix_acl_access",
+                linux.tool_path(&output)?
+            ),
+        )?;
+        let actual = fs::read(&output)?;
+        let mut expected = fs::read(&acl)?;
+        *expected
+            .get_mut(30)
+            .ok_or_else(|| io::Error::other("ACL fixture is truncated"))? = 4;
+        if actual != expected {
+            return Err(
+                io::Error::other("ACL mask or named permissions differ from oracle").into(),
+            );
+        }
+    }
+    verify_internal_e2fsck_clean(linux, image, "ACL inheritance and chmod")
 }

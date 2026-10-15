@@ -2165,3 +2165,156 @@ fn locked_long_names_support_lookup_and_unlink() -> Result<()> {
     assert_eq!(remaining, 2);
     Ok(())
 }
+
+/// Independent reduced-width ext4 ACL with one named user and a group-class mask.
+const NAMED_ACL: [u8; 28] = [
+    1, 0, 0, 0, 1, 0, 6, 0, 2, 0, 6, 0, 233, 3, 0, 0, 4, 0, 6, 0, 16, 0, 6, 0, 32, 0, 0, 0,
+];
+
+/// # Errors
+/// Returns fixture, ACL or mutation failure.
+/// # Panics
+/// Panics when ACL mode synchronization or directory inheritance differs from the disk contract.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare independent ACL byte and permission vectors"
+)]
+fn posix_acl_mode_and_inheritance() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::System, b"posix_acl_access")?,
+            XattrValue::new(&NAMED_ACL)?,
+        )
+    })?;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass
+            .load_access(NodeId::File(a))?
+            .security()
+            .permissions()
+            .as_u16()))?,
+        0o660
+    );
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.set_posix_security(
+            node,
+            Ext4Security::new(namespace_owner(), Ext4Permissions::new(0o640)?),
+        )
+    })?;
+    fixture.remount()?;
+    fixture.read(|pass| {
+        let access = pass.load_access(NodeId::File(a))?;
+        assert_eq!(access.security().permissions().as_u16(), 0o640);
+        let acl = access.acl().ok_or(Error::InvalidAcl)?;
+        assert_eq!(acl.mask().ok_or(Error::InvalidAcl)?.bits(), 4);
+        assert_eq!(
+            acl.users()
+                .first()
+                .ok_or(Error::InvalidAcl)?
+                .permissions()
+                .bits(),
+            6
+        );
+        Ok(())
+    })?;
+    let (file, directory, nested, symlink) = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let parent_node = pass.node(NodeId::Directory(DirectoryNodeId::ROOT))?;
+        pass.set_xattr(
+            parent_node,
+            XattrName::new(XattrNamespace::System, b"posix_acl_default")?,
+            XattrValue::new(&NAMED_ACL)?,
+        )?;
+        let file = pass.create_file(
+            root,
+            &Ext4Name::new(b"acl-child")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        let directory = pass.create_directory(
+            root,
+            &Ext4Name::new(b"acl-dir")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )?;
+        let nested = pass.create_file(
+            directory,
+            &Ext4Name::new(b"nested")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        let symlink = pass.create_symlink(
+            root,
+            &Ext4Name::new(b"acl-link")?,
+            &SymlinkTarget::new(b"acl-child")?,
+            NewSymlinkMetadata::new(namespace_owner(), Ext4Permissions::new(0o777)?),
+        )?;
+        Ok((file.id(), directory.id(), nested.id(), symlink.id()))
+    })?;
+    fixture.remount()?;
+    for (node, mode) in [
+        (NodeId::File(file), 0o640),
+        (NodeId::Directory(directory), 0o640),
+        (NodeId::File(nested), 0o640),
+    ] {
+        fixture.read(|pass| {
+            let access = pass.load_access(node)?;
+            assert_eq!(access.security().permissions().as_u16(), mode);
+            assert!(access.acl().is_some());
+            Ok(())
+        })?;
+    }
+    assert!(fixture.read(|pass| Ok(pass.load_access(NodeId::Symlink(symlink))?.acl().is_none()))?);
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture or xattr setup failure.
+/// # Panics
+/// Panics when malformed ACLs or illegal inode-kind policies are accepted.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify ACL rejection at the persistent mutation boundary"
+)]
+fn malformed_acl_mutations_leave_committed_policy_unchanged() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    let before = fixture.read(|pass| Ok(pass.load_file(a)?.security()))?;
+    for bad in [vec![], {
+        let mut bad = NAMED_ACL.to_vec();
+        *bad.get_mut(6).ok_or(Error::InvalidAcl)? = 8;
+        bad
+    }] {
+        assert_eq!(
+            fixture.mutate(|pass| {
+                let node = pass.node(NodeId::File(a))?;
+                pass.set_xattr(
+                    node,
+                    XattrName::new(XattrNamespace::System, b"posix_acl_access")?,
+                    XattrValue::new(&bad)?,
+                )
+            }),
+            Err(Error::InvalidAcl)
+        );
+    }
+    assert_eq!(
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(a))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::System, b"posix_acl_default")?,
+                XattrValue::new(&NAMED_ACL)?,
+            )
+        }),
+        Err(Error::InvalidAcl)
+    );
+    fixture.remount()?;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_file(a)?.security()))?,
+        before
+    );
+    Ok(())
+}

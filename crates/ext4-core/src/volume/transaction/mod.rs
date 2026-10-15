@@ -873,6 +873,14 @@ impl MutationResolvePass<'_, '_, '_> {
             let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
             let inode = raw_inode.parse()?;
             let _metadata = inode.metadata_mutation()?;
+            let mut xattrs = pass.mutation.xattr_set_for_raw_inode(&raw_inode)?;
+            if let Some(mut acl) = AclKind::Access.read(xattrs.public())? {
+                acl.chmod(security.permissions());
+                xattrs
+                    .public_mut()
+                    .insert(AclKind::Access.name()?, acl.value()?)?;
+                pass.mutation.store_xattr_set(&mut raw_inode, &xattrs)?;
+            }
             raw_inode.set_owner(security.owner())?;
             raw_inode.set_permissions(security.permissions())?;
             raw_inode.touch_metadata(pass.now)?;
@@ -1018,6 +1026,17 @@ impl MutationResolvePass<'_, '_, '_> {
 }
 
 impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
+    fn load_access(&mut self, node: NodeId) -> Result<Ext4Access> {
+        self.mutation.volume.load_access(node)
+    }
+    fn child_access(
+        &mut self,
+        parent: DirectoryNodeId,
+        security: Ext4Security,
+    ) -> Result<Ext4Access> {
+        self.mutation.volume.child_access(parent, security)
+    }
+
     fn load_file(&mut self, id: FileNodeId) -> Result<FileNode> {
         self.mutation.volume.load_file(id)
     }
