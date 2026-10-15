@@ -1020,31 +1020,6 @@ impl EpochReadView<'_, '_> {
         HardLinks::try_from_entries(links, expected)
     }
 
-    /// Projects one encrypted on-disk dirent name into a no-key display name.
-    /// # Errors
-    ///
-    /// Returns an error when the ciphertext name cannot be represented as an ext4 no-key display
-    /// name.
-    pub(super) fn project_locked_directory_name(name: &Ext4Name) -> Result<Ext4Name> {
-        if matches!(name.bytes(), b"." | b"..") {
-            return Ext4Name::new(name.bytes());
-        }
-        let display = FscryptNoKeyName::from_ciphertext(name.bytes())?.display_bytes()?;
-        Ext4Name::new(&display)
-    }
-
-    /// Decodes a no-key display name back into its encrypted on-disk name.
-    /// # Errors
-    ///
-    /// Returns an error when `name` looks like a no-key display name but decodes to an invalid ext4
-    /// ciphertext component.
-    pub(super) fn locked_directory_ciphertext_name(name: &Ext4Name) -> Result<Option<Ext4Name>> {
-        let Some(no_key_name) = FscryptNoKeyName::from_display(name.bytes())? else {
-            return Ok(None);
-        };
-        Ok(Some(Ext4Name::from_disk(no_key_name.ciphertext_bytes())?))
-    }
-
     /// Looks up an exact ext4 child name under a directory.
     ///
     /// # Errors
