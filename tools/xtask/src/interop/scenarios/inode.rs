@@ -374,8 +374,8 @@ fn verify_acl_contract(linux: LinuxEnvironment, root: &Path, image: &Path) -> Ta
     fs::write(
         &acl,
         [
-            2, 0, 0, 0, 1, 0, 6, 0, 255, 255, 255, 255, 2, 0, 6, 0, 233, 3, 0, 0, 4, 0, 6, 0, 255,
-            255, 255, 255, 16, 0, 6, 0, 255, 255, 255, 255, 32, 0, 0, 0, 255, 255, 255, 255,
+            2, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0, 2, 0, 6, 0, 233, 3, 0, 0, 4, 0, 6, 0, 0, 0, 0, 0,
+            16, 0, 6, 0, 0, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0,
         ],
     )?;
     request(
@@ -434,7 +434,7 @@ fn verify_acl_contract(linux: LinuxEnvironment, root: &Path, image: &Path) -> Ta
             .ok_or_else(|| io::Error::other("ACL fixture is truncated"))? = 4;
         if actual != expected {
             return Err(
-                io::Error::other("ACL mask or named permissions differ from oracle").into(),
+                io::Error::other(format!("ACL mask or named permissions differ for {path}: actual={actual:02x?}, expected={expected:02x?}")).into(),
             );
         }
     }

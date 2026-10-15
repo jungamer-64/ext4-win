@@ -816,7 +816,17 @@ fn serialize_xattr_entries(
             disk_offset(cursor).checked_add_bytes(8)?,
             u32::try_from(entry.value.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
         )?;
-        put_le_u32(storage, disk_offset(cursor).checked_add_bytes(12)?, 0)?;
+        let entry_hash = match placement {
+            XattrValuePlacement::InInode => 0,
+            XattrValuePlacement::ExternalBlock => {
+                external_entry_fingerprint(&entry.key.local, entry.value.bytes())
+            }
+        };
+        put_le_u32(
+            storage,
+            disk_offset(cursor).checked_add_bytes(12)?,
+            entry_hash,
+        )?;
         let name_start = cursor
             .checked_add(EXT4_XATTR_ENTRY_BYTES)
             .ok_or(Error::ArithmeticOverflow)?;
@@ -833,9 +843,30 @@ fn serialize_xattr_entries(
     }
 
     if placement == XattrValuePlacement::ExternalBlock {
+        // A zero block hash opts out of block sharing; each entry still has its required hash.
         put_le_u32(storage, disk_offset(12), 0)?;
     }
     Ok(())
+}
+
+/// External entry identity mixes unsigned name octets with five-bit rotations, then
+/// zero-padded little-endian value words with sixteen-bit rotations. Inline entries use zero.
+fn external_entry_fingerprint(name: &[u8], value: &[u8]) -> u32 {
+    let named = name
+        .iter()
+        .fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte));
+    let (words, tail) = value.as_chunks::<4>();
+    let aligned = words.iter().fold(named, |state, word| {
+        state.rotate_left(16) ^ u32::from_le_bytes(*word)
+    });
+    if tail.is_empty() {
+        return aligned;
+    }
+    let mut padded = [0_u8; 4];
+    for (target, byte) in padded.iter_mut().zip(tail) {
+        *target = *byte;
+    }
+    aligned.rotate_left(16) ^ u32::from_le_bytes(padded)
 }
 
 /// Returns the end of the serialized entry table including terminator padding.
@@ -995,6 +1026,30 @@ mod tests {
         InodeXattrSet, XattrName, XattrNamespace, XattrSet, XattrValue, merge_xattr_sets,
         parse_inline_xattrs, serialize_inline_xattrs,
     };
+
+    /// Fixed vectors from an independent ext4 encoder include unsigned names and padded values.
+    /// # Panics
+    /// Panics when an external-entry fingerprint differs from its disk-format vector.
+    #[test]
+    fn external_entry_hash_vectors() {
+        for (name, value, expected) in [
+            (b"a".as_slice(), b"123".as_slice(), 0x0052_3231),
+            (b"a".as_slice(), b"ABCD".as_slice(), 0x4422_4241),
+            (b"probe".as_slice(), b"evidence".as_slice(), 0x143e_ba29),
+            ([0x80, 0xff].as_slice(), b"12345".as_slice(), 0x3231_24f9),
+            (
+                b"".as_slice(),
+                [
+                    1, 0, 0, 0, 1, 0, 6, 0, 2, 0, 6, 0, 233, 3, 0, 0, 4, 0, 6, 0, 16, 0, 4, 0, 32,
+                    0, 0, 0,
+                ]
+                .as_slice(),
+                0x03f8_0025,
+            ),
+        ] {
+            assert_eq!(super::external_entry_fingerprint(name, value), expected);
+        }
+    }
 
     /// # Errors
     /// Returns parsing or name-construction failures for the independent inode-region vector.
