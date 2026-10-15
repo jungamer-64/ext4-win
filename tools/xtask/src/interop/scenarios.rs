@@ -10,6 +10,9 @@ use std::{ffi::OsStr, path::PathBuf, process::Stdio};
 /// Independent orphan-file/chain encoders and recovery oracles.
 mod orphan;
 
+/// Independent inode-field and data-journaling interoperability vectors.
+mod inode;
+
 /// One generated internal-journal interoperability profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JournalInteropCase {
@@ -269,6 +272,7 @@ pub(crate) fn verify_journal_interop(repository_root: &Path) -> TaskResult<()> {
         },
     ];
     let verification = (|| -> TaskResult<()> {
+        inode::verify_inode_contracts(linux, &temporary_root)?;
         orphan::verify_orphan_recovery(linux, &temporary_root)?;
         verify_internal_mutation_profiles(linux, &temporary_root)?;
         for case in cases {
