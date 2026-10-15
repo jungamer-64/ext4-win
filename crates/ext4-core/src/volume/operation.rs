@@ -315,7 +315,7 @@ impl EpochReadPass<'_, '_, '_> {
         name: &Ext4Name,
     ) -> Result<ChildLookup> {
         let parent = self.view.load_directory(parent)?;
-        self.view.lookup_child(&parent, name)
+        self.view.lookup_child(&parent, name, self.crypto)
     }
 
     /// Looks up one unambiguous Windows-visible child name.

@@ -94,12 +94,14 @@ struct DirectoryEntryLocation {
     physical: BlockAddress,
     /// Parsed staged-aware leaf image.
     block: DirectoryBlock,
+    /// Exact entry selected by the query in this owned leaf image.
+    entry: RawDirectoryEntry,
 }
 
 /// Selection mode for a staged-aware HTree route.
 enum HtreePathTarget<'name> {
     /// Select the leaf routed by an exact raw name.
-    Name(&'name Ext4Name),
+    Query(DirectoryLookup<'name>),
     /// Select the first leaf in index order.
     First,
 }
@@ -750,7 +752,9 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::WrongInodeKind);
         }
         let lookup_name = self.directory_lookup_name(&inode, name)?;
-        if let Some(location) = self.directory_entry_location(&inode, &lookup_name)? {
+        if let Some(location) =
+            self.directory_entry_location(&inode, DirectoryLookup::Exact(&lookup_name))?
+        {
             return location
                 .block
                 .find(&lookup_name)?
@@ -771,11 +775,16 @@ impl MutationResolvePass<'_, '_, '_> {
             .encrypt_directory_child_name(directory, name, self.crypto)
         {
             Err(Error::MissingEncryptionKey) => {
-                if let Some(ciphertext) = EpochReadView::locked_directory_ciphertext_name(name)? {
-                    Ok(ciphertext)
-                } else {
-                    Ext4Name::new(name.bytes())
+                if matches!(name.bytes(), b"." | b"..") {
+                    return name.try_to_owned_name();
                 }
+                let Some(query) = FscryptNoKeyName::from_display(name.bytes())? else {
+                    return name.try_to_owned_name();
+                };
+                let location = self
+                    .directory_entry_location(directory, DirectoryLookup::NoKey(&query))?
+                    .ok_or(Error::DirectoryEntryNotFound)?;
+                location.entry.name().try_to_owned_name()
             }
             result => result,
         }
@@ -805,7 +814,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         if self
-            .directory_entry_location(&parent_inode, &disk_name)?
+            .directory_entry_location(&parent_inode, DirectoryLookup::Exact(&disk_name))?
             .is_some()
         {
             return Err(Error::NameAlreadyExists);
@@ -910,7 +919,9 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         self.require_directory_entry_delete_mutation_for_inode(&parent_inode)?;
         let disk_name = self.directory_lookup_name(&parent_inode, name)?;
-        let Some(mut location) = self.directory_entry_location(&parent_inode, &disk_name)? else {
+        let Some(mut location) =
+            self.directory_entry_location(&parent_inode, DirectoryLookup::Exact(&disk_name))?
+        else {
             return Err(Error::DirectoryEntryNotFound);
         };
         let removed = location
@@ -954,12 +965,14 @@ impl MutationResolvePass<'_, '_, '_> {
             self.crypto,
         )?;
         if self
-            .directory_entry_location(&parent_inode, &new_disk_name)?
+            .directory_entry_location(&parent_inode, DirectoryLookup::Exact(&new_disk_name))?
             .is_some()
         {
             return Err(Error::NameAlreadyExists);
         }
-        let Some(mut source) = self.directory_entry_location(&parent_inode, &old_disk_name)? else {
+        let Some(mut source) =
+            self.directory_entry_location(&parent_inode, DirectoryLookup::Exact(&old_disk_name))?
+        else {
             return Err(Error::DirectoryEntryNotFound);
         };
         if matches!(
@@ -970,7 +983,7 @@ impl MutationResolvePass<'_, '_, '_> {
             let target_context = self.mutation_htree_context(
                 &parent_inode,
                 &tree,
-                HtreePathTarget::Name(&new_disk_name),
+                HtreePathTarget::Query(DirectoryLookup::Exact(&new_disk_name)),
             )?;
             let (target_physical, _target_block) = self.read_mutation_directory_block(
                 &parent_inode,
@@ -1064,7 +1077,9 @@ impl MutationResolvePass<'_, '_, '_> {
             self.mutation
                 .volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
-        let Some(mut location) = self.directory_entry_location(&parent_inode, &disk_name)? else {
+        let Some(mut location) =
+            self.directory_entry_location(&parent_inode, DirectoryLookup::Exact(&disk_name))?
+        else {
             return Err(Error::DirectoryEntryNotFound);
         };
         let replaced = location
@@ -1175,7 +1190,7 @@ impl MutationResolvePass<'_, '_, '_> {
             checksum,
         )?;
         let major = match target {
-            HtreePathTarget::Name(name) => root.hash_scheme().hash(name).major,
+            HtreePathTarget::Query(query) => query.major(root.hash_scheme()),
             HtreePathTarget::First => 0,
         };
         let mut levels = Vec::new();
@@ -1284,7 +1299,7 @@ impl MutationResolvePass<'_, '_, '_> {
     fn directory_entry_location(
         &mut self,
         inode: &Inode,
-        name: &Ext4Name,
+        query: DirectoryLookup<'_>,
     ) -> Result<Option<DirectoryEntryLocation>> {
         let tree = self.mutation.mutable_extent_tree(inode)?;
         match inode.directory_storage_kind()? {
@@ -1299,19 +1314,26 @@ impl MutationResolvePass<'_, '_, '_> {
                         &tree,
                         LogicalBlock::try_from(logical)?,
                     )?;
-                    if block.find(name)?.is_some() {
-                        return Ok(Some(DirectoryEntryLocation { physical, block }));
+                    if let Some(entry) = query.find(block.entries()?, self.crypto)? {
+                        return Ok(Some(DirectoryEntryLocation {
+                            physical,
+                            block,
+                            entry,
+                        }));
                     }
                 }
                 Ok(None)
             }
             DirectoryStorageKind::HTree => {
-                if matches!(name.bytes(), b"." | b"..") {
+                if query
+                    .exact()
+                    .is_some_and(|name| matches!(name.bytes(), b"." | b".."))
+                {
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 let mut context =
-                    self.mutation_htree_context(inode, &tree, HtreePathTarget::Name(name))?;
-                let hash = context.root.hash_scheme().hash(name);
+                    self.mutation_htree_context(inode, &tree, HtreePathTarget::Query(query))?;
+                let major = query.major(context.root.hash_scheme());
                 loop {
                     let (physical, block) = self.read_mutation_directory_block(
                         inode,
@@ -1323,15 +1345,19 @@ impl MutationResolvePass<'_, '_, '_> {
                         .path
                         .hash_range()?
                         .validate_leaf(&entries, context.root.hash_scheme())?;
-                    if entries.iter().any(|entry| entry.name() == name) {
-                        return Ok(Some(DirectoryEntryLocation { physical, block }));
+                    if let Some(entry) = query.find(entries, self.crypto)? {
+                        return Ok(Some(DirectoryEntryLocation {
+                            physical,
+                            block,
+                            entry,
+                        }));
                     }
                     if !self.advance_mutation_htree_path(
                         inode,
                         &tree,
                         &mut context.path,
                         context.root.indirect_levels(),
-                    )? || context.path.boundary()? & !1 != hash.major
+                    )? || context.path.boundary()? & !1 != major
                     {
                         return Ok(None);
                     }
@@ -1357,8 +1383,11 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::UnsupportedInodeMutation);
         }
         let checksum = self.mutation.volume.directory_checksum(parent_inode);
-        let mut context =
-            self.mutation_htree_context(parent_inode, &tree, HtreePathTarget::Name(entry.name()))?;
+        let mut context = self.mutation_htree_context(
+            parent_inode,
+            &tree,
+            HtreePathTarget::Query(DirectoryLookup::Exact(entry.name())),
+        )?;
         let leaf_logical = context.path.leaf()?;
         let (leaf_physical, mut leaf) = self.read_mutation_directory_block(
             parent_inode,

@@ -61,7 +61,8 @@ pub(super) use super::block_group::{
     set_inode_bitmap_bit,
 };
 pub(super) use super::directory::{
-    DirectoryCursorName, DirectoryScanCursor, DirectoryScanPosition, ScannedDirectoryEntry,
+    DirectoryCursorName, DirectoryLookup, DirectoryScanCursor, DirectoryScanPosition,
+    ScannedDirectoryEntry,
 };
 pub(super) use super::directory_read::DirectoryReader;
 pub(super) use super::inode_record::{

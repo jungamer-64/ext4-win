@@ -4121,7 +4121,14 @@ fn verify_locked_directory_enumeration(
     let image_path = linux.tool_path(&image)?;
     let commands = case_root.join("populate.debugfs");
     let mut script = String::from("feature encrypt\nmkdir /locked\n");
-    for name in ["abcdefghijklmnop", "ponmlkjihgfedcba"] {
+    let mut raw_names = vec![
+        String::from("abcdefghijklmnop"),
+        String::from("ponmlkjihgfedcba"),
+    ];
+    for index in 0..50 {
+        raw_names.push(format!("{index:03}{}", "x".repeat(252)));
+    }
+    for name in &raw_names {
         script.push_str(&format!("write /dev/null /locked/{name}\nea_set -f {context_path} /locked/{name} c\nset_inode_field /locked/{name} flags 0x80800\n"));
     }
     script.push_str(&format!(
@@ -4135,8 +4142,17 @@ fn verify_locked_directory_enumeration(
     // byte in its otherwise generated inline attribute; this fixture has no metadata checksum.
     let executable = crate::fixture::executable(&crate::process::repository_root()?)?;
     let mut namespace = linux.command(&linux.tool_path(&executable)?);
-    namespace.args(["encryption-namespace", &image_path]);
+    namespace.args(["encryption-namespace", &image_path, "/locked"]);
+    for name in &raw_names {
+        namespace.arg(format!("/locked/{name}"));
+    }
     run_checked(namespace, "encryption context namespace encoding")?;
+    let mut optimize = linux.command("e2fsck");
+    optimize.args(["-fyD", &image_path]);
+    let output = optimize.output()?;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(io::Error::other("locked HTree optimization failed").into());
+    }
     verify_internal_e2fsck_clean(linux, &image, "encrypted directory fixture")?;
     let directory = drive_internal_core_read_observed(&image, |pass| {
         let root =
@@ -4154,16 +4170,51 @@ fn verify_locked_directory_enumeration(
         }
     })?
     .0;
-    let mut expected = [
-        b".".to_vec(),
-        b"..".to_vec(),
-        b"_fscrypt_YWJjZGVmZ2hpamtsbW5vcA".to_vec(),
-        b"_fscrypt_cG9ubWxramloZ2ZlZGNiYQ".to_vec(),
-    ]
-    .into_iter()
-    .collect();
+    let mut expected = alloc::collections::BTreeSet::new();
+    let mut reader =
+        ext4_core::DirectoryReader::new(directory, ext4_core::DirectoryScanCursor::start());
+    while let Some(entry) =
+        drive_internal_core_read(&image, |pass| pass.next_directory_entry(&mut reader))?
+    {
+        let entry = entry.into_entry();
+        if !matches!(entry.name().bytes(), b"." | b"..") {
+            let visible =
+                ext4_core::WindowsName::from_ext4(entry.name()).map_err(core_task_error)?;
+            let found = drive_internal_core_read(&image, |pass| {
+                pass.lookup_windows_child(directory, &visible, ext4_core::WindowsNameMatch::Exact)
+            })?;
+            if !matches!(found, ext4_core::ChildLookup::Found(child) if child.node() == entry.node())
+            {
+                return Err(
+                    io::Error::other("locked name reverse lookup changed its inode").into(),
+                );
+            }
+        }
+        expected.insert(entry.name().bytes().to_vec());
+    }
+    if expected.len().checked_sub(2) != Some(raw_names.len()) {
+        return Err(io::Error::other("locked HTree enumeration lost a ciphertext identity").into());
+    }
+    let visible_names: Vec<_> = expected
+        .iter()
+        .filter(|name| !matches!(name.as_slice(), b"." | b".."))
+        .map(|name| ext4_core::Ext4Name::new(name).map_err(core_task_error))
+        .collect::<Result<_, _>>()?;
     drive_directory_enumeration(&image, directory, &mut expected)?;
     verify_directory_read_faults(&image, directory)?;
+    drive_internal_core_mutation(&image, |pass| {
+        let parent = pass.directory(directory)?;
+        for name in &visible_names {
+            pass.unlink_file(parent, name)?;
+        }
+        Ok(())
+    })?;
+    let listing = debugfs_request_output(linux, &image, "ls -p /locked")?;
+    if raw_names.iter().any(|name| listing.contains(name)) {
+        return Err(io::Error::other("keyless unlink left an independently named file").into());
+    }
+    verify_internal_e2fsck_clean(linux, &image, "locked HTree unlink")?;
+
     Ok(())
 }
 

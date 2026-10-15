@@ -1214,7 +1214,7 @@ where
         let mut ready = operation.accept(event).map_err(core_task_error)?;
         let mut pass_output = None;
         let result = {
-            let mut crypto = RejectingCryptographicOperation;
+            let mut crypto = UnkeyedCryptographicOperation;
             let mut pass = ready.begin_pass(
                 cache.access(epoch),
                 ext4_core::Ext4Timestamp::from_seconds(1),
@@ -1407,7 +1407,7 @@ where
     let mut event = ext4_core::OperationEvent::Admitted;
     let mut lower_reads = 0_usize;
     let output = loop {
-        let mut crypto = RejectingCryptographicOperation;
+        let mut crypto = UnkeyedCryptographicOperation;
         match operation.run(
             event,
             coordinator
@@ -1518,11 +1518,11 @@ fn complete_file_request_checked(
     Ok(())
 }
 
-/// Cryptographic boundary used by unencrypted interoperability mutation resolve passes.
+/// Hash-capable boundary for unencrypted and locked-namespace interoperability passes.
 #[derive(Debug)]
-struct RejectingCryptographicOperation;
+struct UnkeyedCryptographicOperation;
 
-impl ext4_core::CryptographicOperation for RejectingCryptographicOperation {
+impl ext4_core::CryptographicOperation for UnkeyedCryptographicOperation {
     fn fill_random(&mut self, _output: &mut [u8]) -> ext4_core::Result<()> {
         Err(ext4_core::Error::CryptographicFailure)
     }
@@ -1570,12 +1570,14 @@ impl ext4_core::CryptographicOperation for RejectingCryptographicOperation {
         Err(ext4_core::Error::CryptographicFailure)
     }
 
-    fn sha256(&mut self, _input: &[u8]) -> ext4_core::Result<[u8; 32]> {
-        Err(ext4_core::Error::CryptographicFailure)
+    fn sha256(&mut self, input: &[u8]) -> ext4_core::Result<[u8; 32]> {
+        use sha2::Digest as _;
+        Ok(sha2::Sha256::digest(input).into())
     }
 
-    fn sha512(&mut self, _input: &[u8]) -> ext4_core::Result<[u8; 64]> {
-        Err(ext4_core::Error::CryptographicFailure)
+    fn sha512(&mut self, input: &[u8]) -> ext4_core::Result<[u8; 64]> {
+        use sha2::Digest as _;
+        Ok(sha2::Sha512::digest(input).into())
     }
 }
 
@@ -1706,7 +1708,7 @@ fn drive_directory_enumeration(
             coordinator
                 .read_context(ext4_core::MetadataCache::default().access(&epoch))
                 .map_err(core_task_error)?,
-            &mut RejectingCryptographicOperation,
+            &mut UnkeyedCryptographicOperation,
         ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                 reads = reads
@@ -1754,7 +1756,7 @@ fn drive_directory_enumeration(
         coordinator
             .read_context(ext4_core::MetadataCache::default().access(&epoch))
             .map_err(core_task_error)?,
-        &mut RejectingCryptographicOperation,
+        &mut UnkeyedCryptographicOperation,
     ) {
         ext4_core::DirectoryReadTransition::Complete(Ok(end)) if end == cursor => {}
         _ => return Err(io::Error::other("directory end cursor did not remain exhausted").into()),
@@ -1793,7 +1795,7 @@ fn verify_directory_read_faults(
             coordinator
                 .read_context(ext4_core::MetadataCache::default().access(&epoch))
                 .map_err(core_task_error)?,
-            &mut RejectingCryptographicOperation,
+            &mut UnkeyedCryptographicOperation,
         ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                 read_count = read_count
@@ -1837,7 +1839,7 @@ fn verify_directory_read_faults(
                     coordinator
                         .read_context(ext4_core::MetadataCache::default().access(&epoch))
                         .map_err(core_task_error)?,
-                    &mut RejectingCryptographicOperation,
+                    &mut UnkeyedCryptographicOperation,
                 ) {
                     ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                         if !injected && reads == fault {
@@ -1859,7 +1861,7 @@ fn verify_directory_read_faults(
                                         ext4_core::MetadataCache::default().access(&epoch),
                                     )
                                     .map_err(core_task_error)?,
-                                &mut RejectingCryptographicOperation,
+                                &mut UnkeyedCryptographicOperation,
                             ) {
                                 ext4_core::DirectoryReadTransition::Complete(Err(error))
                                     if error == failure => {}
@@ -1946,7 +1948,7 @@ fn read_directory_request(
             coordinator
                 .read_context(ext4_core::MetadataCache::default().access(&epoch))
                 .map_err(core_task_error)?,
-            &mut RejectingCryptographicOperation,
+            &mut UnkeyedCryptographicOperation,
         ) {
             ext4_core::DirectoryReadTransition::SubmitLower { request, suspended } => {
                 event = ext4_core::OperationEvent::StorageCompleted(complete_file_request(

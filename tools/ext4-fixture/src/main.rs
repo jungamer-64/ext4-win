@@ -29,12 +29,14 @@ fn execute(arguments: Vec<String>) -> io::Result<()> {
             count.parse().map_err(io::Error::other)?,
             width.parse().map_err(io::Error::other)?,
         ),
-        [command, image] if command == "encryption-namespace" => namespace(Path::new(image)),
+        [command, image, names @ ..] if command == "encryption-namespace" && !names.is_empty() => {
+            namespace(Path::new(image), names)
+        }
         [command, image] if command == "live-directory" => live(Path::new(image)),
         [command, image] if command == "live-random-files" => random_files(Path::new(image)),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "ext4-fixture <populate-mounted ROOT COUNT NAME_BYTES|encryption-namespace IMAGE|live-directory IMAGE|live-random-files IMAGE>",
+            "ext4-fixture <populate-mounted ROOT COUNT NAME_BYTES|encryption-namespace IMAGE PATH...|live-directory IMAGE|live-random-files IMAGE>",
         )),
     }
 }
@@ -180,12 +182,8 @@ fn populate(root: &Path, count: usize, width: usize) -> io::Result<()> {
 /// Encodes only the ext4 encryption namespace byte that debugfs cannot spell.
 /// # Errors
 /// Returns oracle parsing, unexpected inline attribute, or image-write failures.
-fn namespace(image: &Path) -> io::Result<()> {
-    for name in [
-        "/locked",
-        "/locked/abcdefghijklmnop",
-        "/locked/ponmlkjihgfedcba",
-    ] {
+fn namespace(image: &Path, names: &[String]) -> io::Result<()> {
+    for name in names {
         let output = Command::new("debugfs")
             .args(["-R", &format!("imap {name}")])
             .arg(image)

@@ -480,7 +480,9 @@ impl EpochReadView<'_, '_> {
         if directory.protection().is_encrypted() {
             match self.decrypt_directory_child_name(directory.inode(), raw.name(), crypto) {
                 Ok(name) => Ok(name),
-                Err(Error::MissingEncryptionKey) => Self::project_locked_directory_name(raw.name()),
+                Err(Error::MissingEncryptionKey) => {
+                    self.project_locked_directory_name(directory.inode(), raw.name(), crypto)
+                }
                 Err(error) => Err(error),
             }
         } else {
@@ -637,7 +639,8 @@ impl EpochReadView<'_, '_> {
     fn find_raw_directory_entry(
         &mut self,
         inode: &Inode,
-        name: &Ext4Name,
+        query: DirectoryLookup<'_>,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<Option<RawDirectoryEntry>> {
         let mut tree = ExtentMappingCursor::new(
             inode.extent_root()?,
@@ -655,7 +658,7 @@ impl EpochReadView<'_, '_> {
                         &mut tree,
                         LogicalBlock::try_from(logical)?,
                     )?;
-                    if let Some(entry) = block.find(name)? {
+                    if let Some(entry) = query.find(block.entries()?, crypto)? {
                         return Ok(Some(entry));
                     }
                 }
@@ -676,16 +679,20 @@ impl EpochReadView<'_, '_> {
                     self.superblock.directory_indexing().require_supported()?,
                     checksum,
                 )?;
-                if let Some(entry) = root.dot_entries().iter().find(|entry| entry.name() == name) {
+                if let Some(entry) = root
+                    .dot_entries()
+                    .iter()
+                    .find(|entry| query.exact() == Some(entry.name()))
+                {
                     return Ok(Some(entry.try_clone()?));
                 }
-                let hash = root.hash_scheme().hash(name);
+                let major = query.major(root.hash_scheme());
                 let mut path = self.htree_path_for_hash(
                     inode,
                     &mut tree,
                     root.index().try_clone()?,
                     root.indirect_levels(),
-                    hash.major,
+                    major,
                     checksum,
                 )?;
                 loop {
@@ -697,7 +704,7 @@ impl EpochReadView<'_, '_> {
                     let entries = leaf.entries()?;
                     path.hash_range()?
                         .validate_leaf(&entries, root.hash_scheme())?;
-                    if let Some(entry) = entries.into_iter().find(|entry| entry.name() == name) {
+                    if let Some(entry) = query.find(entries, crypto)? {
                         return Ok(Some(entry));
                     }
                     if !self.advance_htree_path(
@@ -706,7 +713,7 @@ impl EpochReadView<'_, '_> {
                         &mut path,
                         root.indirect_levels(),
                         checksum,
-                    )? || path.boundary()? & !1 != hash.major
+                    )? || path.boundary()? & !1 != major
                     {
                         return Ok(None);
                     }
@@ -1020,6 +1027,51 @@ impl EpochReadView<'_, '_> {
         HardLinks::try_from_entries(links, expected)
     }
 
+    /// Projects a locked name with a root-selected routing hint for long ciphertext.
+    /// # Errors
+    /// Returns directory validation, allocation, or hash-provider failure.
+    fn project_locked_directory_name(
+        &mut self,
+        inode: &Inode,
+        name: &Ext4Name,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<Ext4Name> {
+        if matches!(name.bytes(), b"." | b"..") {
+            return name.try_to_owned_name();
+        }
+        let major = if name.bytes().len() > 184
+            && inode.directory_storage_kind()? == DirectoryStorageKind::HTree
+        {
+            let block_size = self.superblock.block_size();
+            let mut tree = ExtentMappingCursor::new(
+                inode.extent_root()?,
+                block_size,
+                self.extent_tree_context(inode),
+            )?;
+            let block = self.read_directory_logical_block(
+                inode,
+                &mut tree,
+                LogicalBlock::try_from(0_u64)?,
+            )?;
+            HtreeRoot::parse(
+                block.bytes(),
+                inode.id(),
+                self.superblock.directory_hash_seed(),
+                self.superblock.directory_hash_signedness(),
+                self.superblock.directory_indexing().require_supported()?,
+                self.directory_checksum(inode),
+            )?
+            .hash_scheme()
+            .hash(name)
+            .major
+        } else {
+            0
+        };
+        Ext4Name::new(
+            &FscryptNoKeyName::from_ciphertext(name.bytes(), major, crypto)?.display_bytes()?,
+        )
+    }
+
     /// Looks up an exact ext4 child name under a directory.
     ///
     /// # Errors
@@ -1028,8 +1080,11 @@ impl EpochReadView<'_, '_> {
         &mut self,
         parent: &DirectoryNode,
         name: &Ext4Name,
+        crypto: &mut dyn CryptographicOperation,
     ) -> Result<ChildLookup> {
-        if let Some(entry) = self.find_raw_directory_entry(parent.inode(), name)? {
+        if let Some(entry) =
+            self.find_raw_directory_entry(parent.inode(), DirectoryLookup::Exact(name), crypto)?
+        {
             return Ok(ChildLookup::Found(self.directory_child(parent, entry)?));
         }
         Ok(ChildLookup::NotFound)
@@ -1067,25 +1122,33 @@ impl EpochReadView<'_, '_> {
     ) -> Result<Option<DirectoryEntry>> {
         let visible_name = requested.to_ext4()?;
         let exact_entry = if parent.protection().is_encrypted() {
-            let ciphertext =
-                match self.encrypt_directory_child_name(parent.inode(), &visible_name, crypto) {
-                    Ok(ciphertext) => ciphertext,
-                    Err(Error::MissingEncryptionKey) => {
-                        let Some(ciphertext) =
-                            Self::locked_directory_ciphertext_name(&visible_name)?
-                        else {
-                            return Err(Error::MissingEncryptionKey);
-                        };
-                        ciphertext
-                    }
-                    Err(error) => return Err(error),
-                };
-            self.find_raw_directory_entry(parent.inode(), &ciphertext)?
+            match self.encrypt_directory_child_name(parent.inode(), &visible_name, crypto) {
+                Ok(ciphertext) => self.find_raw_directory_entry(
+                    parent.inode(),
+                    DirectoryLookup::Exact(&ciphertext),
+                    crypto,
+                )?,
+                Err(Error::MissingEncryptionKey) => {
+                    let Some(query) = FscryptNoKeyName::from_display(visible_name.bytes())? else {
+                        return Err(Error::MissingEncryptionKey);
+                    };
+                    self.find_raw_directory_entry(
+                        parent.inode(),
+                        DirectoryLookup::NoKey(&query),
+                        crypto,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             if parent.protection().is_verity() {
                 return Err(Error::UnsupportedVerity);
             }
-            self.find_raw_directory_entry(parent.inode(), &visible_name)?
+            self.find_raw_directory_entry(
+                parent.inode(),
+                DirectoryLookup::Exact(&visible_name),
+                crypto,
+            )?
         };
         if let Some(raw) = exact_entry {
             return Ok(Some(self.validate_directory_entry(raw, &visible_name)?));

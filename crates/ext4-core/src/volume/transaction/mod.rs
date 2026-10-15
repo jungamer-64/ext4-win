@@ -1089,7 +1089,9 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
 
     fn lookup_child(&mut self, parent: DirectoryNodeId, name: &Ext4Name) -> Result<ChildLookup> {
         let parent = self.mutation.volume.load_directory(parent)?;
-        self.mutation.volume.lookup_child(&parent, name)
+        self.mutation
+            .volume
+            .lookup_child(&parent, name, self.crypto)
     }
 
     fn lookup_windows_child(

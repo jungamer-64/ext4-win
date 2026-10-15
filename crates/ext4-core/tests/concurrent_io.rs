@@ -2089,3 +2089,79 @@ fn content_mutation_retires_execution_privileges() -> Result<()> {
     );
     Ok(())
 }
+
+/// # Errors
+/// Returns fixture, enumeration, exact lookup, unlink or recovery failures.
+/// # Panics
+/// Fails if any supported ciphertext length loses its keyless namespace identity.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare enumeration and lookup against independently encoded ciphertext names"
+)]
+fn locked_long_names_support_lookup_and_unlink() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let (directory, files) = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let directory = pass.create_directory(
+            root,
+            &Ext4Name::new(b"locked-long")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )?;
+        let mut files = Vec::new();
+        for length in [184, 192, 255] {
+            let file = pass.create_file(
+                directory,
+                &Ext4Name::new(&vec![b'x'; length])?,
+                NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+            )?;
+            files.push(file.id());
+        }
+        Ok((directory.id(), files))
+    })?;
+    fixture.disk.encode_inode(
+        NodeId::Directory(directory),
+        0x0008_0800,
+        Some(&namespace_context(0x11)),
+    )?;
+    for file in files {
+        fixture.disk.encode_inode(
+            NodeId::File(file),
+            0x0008_0800,
+            Some(&namespace_context(0x11)),
+        )?;
+    }
+    fixture.remount()?;
+    let mut reader = DirectoryReader::new(directory, DirectoryScanCursor::start());
+    let mut names = Vec::new();
+    while let Some(scanned) = fixture.read(|pass| pass.next_directory_entry(&mut reader))? {
+        let entry = scanned.into_entry();
+        if matches!(entry.name().bytes(), b"." | b"..") {
+            continue;
+        }
+        assert!(entry.name().bytes().len() <= 255);
+        let visible = WindowsName::from_ext4(entry.name())?;
+        let found = fixture
+            .read(|pass| pass.lookup_windows_child(directory, &visible, WindowsNameMatch::Exact))?;
+        assert!(matches!(found, ChildLookup::Found(child) if child.node() == entry.node()));
+        names.push(entry.name().try_to_owned_name()?);
+    }
+    assert_eq!(names.len(), 3);
+    for name in names {
+        fixture.mutate(|pass| {
+            let directory = pass.directory(directory)?;
+            pass.unlink_file(directory, &name)
+        })?;
+    }
+    fixture.remount()?;
+    let mut reader = DirectoryReader::new(directory, DirectoryScanCursor::start());
+    let mut remaining = 0;
+    while fixture
+        .read(|pass| pass.next_directory_entry(&mut reader))?
+        .is_some()
+    {
+        remaining += 1;
+    }
+    assert_eq!(remaining, 2);
+    Ok(())
+}

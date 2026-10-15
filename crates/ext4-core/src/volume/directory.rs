@@ -1,4 +1,4 @@
-//! Bounded directory enumeration domain types.
+//! Directory lookup and bounded enumeration domain types.
 
 use crate::error::{Error, Result};
 use crate::memory;
@@ -230,5 +230,57 @@ mod tests {
         assert_eq!(cursor.position, DirectoryScanPosition::Ordinal(ordinal));
         cursor.restart();
         assert_eq!(cursor, DirectoryScanCursor::start());
+    }
+}
+
+/// Lookup semantics independent of traversal through committed or staged directory blocks.
+#[derive(Clone, Copy)]
+pub(super) enum DirectoryLookup<'name> {
+    /// Exact on-disk component.
+    Exact(&'name Ext4Name),
+    /// Keyless ciphertext identity, including long-name digest queries.
+    NoKey(&'name crate::protection::fscrypt::FscryptNoKeyName),
+}
+impl DirectoryLookup<'_> {
+    /// Returns exact bytes when present in the query.
+    pub(super) fn exact(&self) -> Option<&Ext4Name> {
+        match self {
+            Self::Exact(name) => Some(name),
+            Self::NoKey(name) => name.direct(),
+        }
+    }
+    /// Routes a query using the directory's authoritative hash profile.
+    pub(super) fn major(
+        &self,
+        scheme: crate::disk_format::directory_hash::DirectoryHashScheme,
+    ) -> u32 {
+        match *self {
+            Self::Exact(name)
+            | Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Ciphertext(name)) => {
+                scheme.hash(name).major
+            }
+            Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Digest { major, .. }) => {
+                *major
+            }
+        }
+    }
+    /// Selects a verified candidate from one leaf.
+    /// # Errors
+    /// Returns hash-provider failures while checking a digest query.
+    pub(super) fn find(
+        &self,
+        entries: alloc::vec::Vec<crate::disk_format::dir::DirectoryEntry>,
+        crypto: &mut dyn crate::CryptographicOperation,
+    ) -> Result<Option<crate::disk_format::dir::DirectoryEntry>> {
+        for entry in entries {
+            let matches = match self {
+                Self::Exact(name) => entry.name() == *name,
+                Self::NoKey(name) => name.matches(entry.name().bytes(), crypto)?,
+            };
+            if matches {
+                return Ok(Some(entry));
+            }
+        }
+        Ok(None)
     }
 }

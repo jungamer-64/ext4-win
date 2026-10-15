@@ -396,6 +396,130 @@ impl FscryptContextV2 {
     }
 }
 
+/// A bounded no-key name: reversible ciphertext or a routed strong digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FscryptNoKeyName {
+    /// Ciphertext that fits the reversible display encoding.
+    Ciphertext(crate::Ext4Name),
+    /// HTree routing hint and ciphertext identity; the hint never replaces digest verification.
+    Digest {
+        /// Root-profile routing hint, ignored by linear directory traversal.
+        major: u32,
+        /// Identity checked against the complete candidate ciphertext.
+        sha256: [u8; 32],
+    },
+}
+
+impl FscryptNoKeyName {
+    /// Projects ciphertext without exceeding the visible component bound.
+    /// Linear directories supply zero as the unused routing hint.
+    /// # Errors
+    /// Returns invalid ciphertext, allocation, or hash-provider failures.
+    pub(crate) fn from_ciphertext(
+        ciphertext: &[u8],
+        major: u32,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<Self> {
+        validate_ciphertext_filename_len(ciphertext.len())?;
+        if ciphertext.len() <= 184 {
+            Ok(Self::Ciphertext(crate::Ext4Name::from_disk(ciphertext)?))
+        } else {
+            Ok(Self::Digest {
+                major,
+                sha256: crypto.sha256(ciphertext)?,
+            })
+        }
+    }
+
+    /// Parses canonical reversible or digest display names.
+    /// # Errors
+    /// Returns invalid framing, encoding, or routing hints.
+    pub(crate) fn from_display(display: &[u8]) -> Result<Option<Self>> {
+        if let Some(encoded) = display.strip_prefix(b"_fscrypt_.") {
+            let wire = base64url_decode_nopad(encoded)?;
+            require_exact_len(&wire, 36).map_err(|_| Error::InvalidName)?;
+            let major = u32::from_le_bytes(fixed(&wire, 0)?);
+            if major & 1 != 0 || major >= 0xffff_fffe {
+                return Err(Error::InvalidName);
+            }
+            return Ok(Some(Self::Digest {
+                major,
+                sha256: fixed(&wire, 4)?,
+            }));
+        }
+        let Some(encoded) = display.strip_prefix(FSCRYPT_NOKEY_NAME_PREFIX) else {
+            return Ok(None);
+        };
+        let ciphertext = base64url_decode_nopad(encoded)?;
+        validate_ciphertext_filename_len(ciphertext.len())?;
+        if ciphertext.len() > 184 {
+            return Err(Error::InvalidName);
+        }
+        Ok(Some(Self::Ciphertext(crate::Ext4Name::from_disk(
+            &ciphertext,
+        )?)))
+    }
+
+    /// Encodes a name using disjoint reversible and digest prefixes.
+    /// # Errors
+    /// Returns display-buffer allocation or encoding failure.
+    pub(crate) fn display_bytes(&self) -> Result<Vec<u8>> {
+        let mut display = Vec::new();
+        match self {
+            Self::Ciphertext(name) => {
+                display
+                    .try_reserve_exact(
+                        FSCRYPT_NOKEY_NAME_PREFIX
+                            .len()
+                            .checked_add(base64url_nopad_len(name.bytes().len())?)
+                            .ok_or(Error::ArithmeticOverflow)?,
+                    )
+                    .map_err(|_| Error::OutOfMemory)?;
+                display.try_extend_from_slice(FSCRYPT_NOKEY_NAME_PREFIX)?;
+                base64url_encode_nopad(name.bytes(), &mut display)?;
+            }
+            Self::Digest { major, sha256 } => {
+                display
+                    .try_reserve_exact(58)
+                    .map_err(|_| Error::OutOfMemory)?;
+                display.try_extend_from_slice(b"_fscrypt_.")?;
+                let mut wire = [0; 36];
+                memory::copy_exact(
+                    wire.get_mut(..4).ok_or(Error::InvalidName)?,
+                    &major.to_le_bytes(),
+                )?;
+                memory::copy_exact(wire.get_mut(4..).ok_or(Error::InvalidName)?, sha256)?;
+                base64url_encode_nopad(&wire, &mut display)?;
+            }
+        }
+        Ok(display)
+    }
+
+    /// Returns reversible ciphertext, when the display encoding retains it.
+    pub(crate) const fn direct(&self) -> Option<&crate::Ext4Name> {
+        match self {
+            Self::Ciphertext(name) => Some(name),
+            Self::Digest { .. } => None,
+        }
+    }
+
+    /// Verifies candidate identity independently of the routing hint.
+    /// # Errors
+    /// Returns hash-provider failures.
+    pub(crate) fn matches(
+        &self,
+        ciphertext: &[u8],
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<bool> {
+        match self {
+            Self::Ciphertext(name) => Ok(name.bytes() == ciphertext),
+            Self::Digest { sha256, .. } => {
+                Ok(ciphertext.len() > 184 && crypto.sha256(ciphertext)? == *sha256)
+            }
+        }
+    }
+}
+
 /// Raw fscrypt master key material supplied at the mount boundary.
 ///
 /// Owned key bytes are erased on drop. Callers retain erasure responsibility for the raw input
@@ -1408,7 +1532,11 @@ mod tests {
     #[test]
     fn fscrypt_nokey_name_roundtrips_ciphertext_with_windows_safe_bytes() {
         let ciphertext = b"\x00\xff/opaque encrypted name";
-        let name = must!(FscryptNoKeyName::from_ciphertext(ciphertext));
+        let name = must!(FscryptNoKeyName::from_ciphertext(
+            ciphertext,
+            0,
+            &mut TestCryptographicOperation
+        ));
         let display = must!(name.display_bytes());
 
         assert!(display.starts_with(FSCRYPT_NOKEY_NAME_PREFIX));
@@ -1418,10 +1546,43 @@ mod tests {
                 .all(|byte| { byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-') })
         );
         assert_eq!(
-            some!(must!(FscryptNoKeyName::from_display(&display))).ciphertext_bytes(),
-            ciphertext
+            some!(must!(FscryptNoKeyName::from_display(&display)))
+                .direct()
+                .map(crate::Ext4Name::bytes),
+            Some(ciphertext.as_slice())
         );
         assert_eq!(FscryptNoKeyName::from_display(b"plain"), Ok(None));
+    }
+
+    /// # Errors
+    /// Returns allocation, display encoding, or independent hash-provider failures.
+    /// # Panics
+    /// Fails if long-name identity or the maximum visible component bound is lost.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare query identity across independently selected ciphertext boundary lengths"
+    )]
+    fn keyless_names_cover_the_complete_ciphertext_length_domain() -> Result<()> {
+        for length in [184, 185, 192, 255] {
+            let ciphertext = memory::repeated_vec(0xa5, length)?;
+            let name = FscryptNoKeyName::from_ciphertext(
+                &ciphertext,
+                0x1234,
+                &mut TestCryptographicOperation,
+            )?;
+            let display = name.display_bytes()?;
+            assert!(display.len() <= 255);
+            assert_eq!(FscryptNoKeyName::from_display(&display)?, Some(name));
+            let Some(query) = FscryptNoKeyName::from_display(&display)? else {
+                return Err(Error::InvalidName);
+            };
+            assert!(query.matches(&ciphertext, &mut TestCryptographicOperation)?);
+            let other = memory::repeated_vec(0xa6, length)?;
+            assert!(!query.matches(&other, &mut TestCryptographicOperation)?);
+        }
+        assert!(FscryptNoKeyName::from_display(b"_fscrypt_.AA").is_err());
+        Ok(())
     }
 
     /// # Panics
