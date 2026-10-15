@@ -56,7 +56,13 @@ mod tests {
 
     /// # Panics
     /// Fails if epoch conversion or the maximum ext4 timestamp loses ticks.
+    /// # Errors
+    /// Returns an error if a known-answer timestamp cannot be represented.
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "known-answer assertions report test failures while fallible timestamp construction propagates errors"
+    )]
     fn windows_time_known_answers() -> Result<(), DriverError> {
         assert_eq!(
             windows_timestamp(Ext4Timestamp::from_seconds(0)),
@@ -79,6 +85,12 @@ mod tests {
             let time = Ext4Timestamp::new(seconds, nanos)?;
             assert_eq!(ext4_timestamp(windows_timestamp(time))?, time);
         }
+        assert_eq!(
+            windows_timestamp(Ext4Timestamp::new(0, 99)?),
+            116_444_736_000_000_000
+        );
+        assert_eq!(ext4_timestamp(i64::MIN), Err(DriverError::InvalidParameter));
+        assert_eq!(ext4_timestamp(i64::MAX), Err(DriverError::InvalidParameter));
         Ok(())
     }
 }

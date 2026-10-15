@@ -359,8 +359,7 @@ impl LiveInodeRecord {
     /// Returns mutable in-inode xattr body storage.
     /// # Errors
     ///
-    /// Returns an error when the extra-inode size marker cannot be initialized or its xattr offset
-    /// points outside this inode record.
+    /// Returns an error when the declared field boundary lies outside this inode record.
     pub(super) fn writable_inline_xattr_region(&mut self) -> Result<&mut [u8]> {
         self.raw.writable_inline_xattr_region()
     }
@@ -855,8 +854,7 @@ impl RawInodeRecord<Vec<u8>> {
     /// Updates access, change, and modification timestamps.
     /// # Errors
     ///
-    /// Returns an error when base timestamp fields are truncated or extra timestamp storage cannot
-    /// be initialized.
+    /// Returns an error when timestamp fields are truncated or the time needs an absent epoch field.
     pub(super) fn set_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
         for (base, extra) in [
             (INODE_ATIME_OFFSET, INODE_ATIME_EXTRA_OFFSET),

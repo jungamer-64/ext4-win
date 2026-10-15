@@ -588,7 +588,7 @@ impl WindowsLinkInformation {
         let total_links = if directory {
             1
         } else {
-            wdk_sys::ULONG::from(metadata.links_count.get())
+            wdk_sys::ULONG::from(metadata.links_count.on_disk_count())
         };
         let pending_links = wdk_sys::ULONG::from(delete_pending);
         let accessible_links = total_links

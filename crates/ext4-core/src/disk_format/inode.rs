@@ -586,7 +586,7 @@ impl InodeRecordLayout {
 impl Ext4Timestamp {
     /// Decodes the signed base and the optional ext4 epoch/nanosecond extension.
     /// # Errors
-    /// Returns an invalid timestamp for an out-of-range nanosecond field.
+    /// Returns invalid inode for an out-of-range nanosecond field.
     pub(crate) fn decode(seconds: u32, extra: Option<u32>) -> Result<Self> {
         let base = i64::from(i32::from_le_bytes(seconds.to_le_bytes()));
         let extension = extra.unwrap_or(0);
