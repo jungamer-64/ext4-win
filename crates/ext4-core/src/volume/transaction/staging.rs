@@ -69,27 +69,6 @@ pub(super) struct RangeWrite {
     pub(super) bytes: Vec<u8>,
 }
 
-/// Persistence authority retained by each staged file-data update.
-#[derive(Debug)]
-pub(super) enum StagedFileWrite {
-    /// Data that must reach its home location before the metadata commit.
-    Ordered(RangeWrite),
-    /// A complete data block that must travel through the journal commit and checkpoint.
-    Journaled(JournalBlock),
-}
-
-impl StagedFileWrite {
-    /// Locates ordered ranges and journaled block images in the same device byte domain.
-    /// # Errors
-    /// Returns an error when a journaled block's byte offset overflows.
-    fn byte_range(&self, block_size: BlockSize) -> Result<(ByteOffset, &[u8])> {
-        match self {
-            Self::Ordered(write) => Ok((write.offset, &write.bytes)),
-            Self::Journaled(write) => Ok((block_size.offset_of(write.block())?, write.bytes())),
-        }
-    }
-}
-
 impl MetadataMutation<'_, '_> {
     /// Reads the current transaction's physical block, applying staged data in operation order.
     /// A staged image covering the whole block replaces the device read, including new allocation.
@@ -177,64 +156,4 @@ impl MetadataMutation<'_, '_> {
         Ok(bytes)
     }
 
-    /// Stages data at the inode-selected persistence boundary before any lower write.
-    /// Journaled partial writes retain a full committed or already staged block image.
-    /// # Errors
-    /// Returns allocation, read, arithmetic or single-block-range errors during preparation.
-    pub(super) fn stage_file_write(
-        &mut self,
-        persistence: FileDataPersistence,
-        write: RangeWrite,
-    ) -> Result<()> {
-        if persistence == FileDataPersistence::Ordered {
-            return self.file_writes.try_push(StagedFileWrite::Ordered(write));
-        }
-        let block_size = self.volume.superblock.block_size();
-        let width = u64::from(block_size.bytes());
-        let block = BlockAddress::new(
-            write
-                .offset
-                .get()
-                .checked_div(width)
-                .ok_or(Error::InvalidSuperblock)?,
-        );
-        let start = usize::try_from(
-            write
-                .offset
-                .get()
-                .checked_rem(width)
-                .ok_or(Error::InvalidSuperblock)?,
-        )
-        .map_err(|_| Error::ArithmeticOverflow)?;
-        let end = start
-            .checked_add(write.bytes.len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        let block_bytes = usize::try_from(width).map_err(|_| Error::ArithmeticOverflow)?;
-        if end > block_bytes {
-            return Err(Error::InvalidWriteRange);
-        }
-        if let Some(StagedFileWrite::Journaled(staged)) = self.file_writes.iter_mut().find(
-            |item| matches!(item, StagedFileWrite::Journaled(staged) if staged.block() == block),
-        ) {
-            return memory::copy_exact(
-                staged
-                    .bytes_mut()
-                    .get_mut(start..end)
-                    .ok_or(Error::InvalidWriteRange)?,
-                &write.bytes,
-            );
-        }
-        let bytes = if start == 0 && write.bytes.len() == block_bytes {
-            write.bytes
-        } else {
-            let mut bytes = self.file_block_bytes(block)?;
-            memory::copy_exact(
-                bytes.get_mut(start..end).ok_or(Error::InvalidWriteRange)?,
-                &write.bytes,
-            )?;
-            bytes
-        };
-        self.file_writes
-            .try_push(StagedFileWrite::Journaled(JournalBlock::new(block, bytes)))
-    }
 }
