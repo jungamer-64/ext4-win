@@ -625,3 +625,19 @@ pub(super) fn reject_reserved_directory_name(name: &Ext4Name) -> Result<()> {
     }
 }
 
+impl MutationResolvePass<'_, '_, '_> {
+    /// Seals only staging whose public operations all completed successfully.
+    /// # Errors
+    /// Returns the first staging failure, incomplete-operation cancellation, or resolution failure.
+    pub fn resolve(
+        self,
+        ticket: u64,
+        coordinator: &MutationCoordinatorState,
+    ) -> Result<ResolvedMutation> {
+        match self.state {
+            MutationState::Ready => self.mutation.resolve(ticket, coordinator),
+            MutationState::Editing => Err(Error::OperationCancelled),
+            MutationState::Rejected(error) => Err(error),
+        }
+    }
+}

@@ -13,6 +13,57 @@ use sha2::Digest as _;
 struct PlainCrypto;
 
 /// # Errors
+/// Returns fixture setup, remount, namespace lookup or the independent successor mutation failure.
+/// # Panics
+/// Fails if a handled failure can publish partial namespace changes or recover staging authority.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe rejected commit authority and unchanged physical storage"
+)]
+fn handled_staging_failure_revokes_resolution_without_storage_effects() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    fixture
+        .disk
+        .encode_inode(NodeId::File(a), 0x0008_0010, None)?;
+    fixture.remount()?;
+    let before = (
+        fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+        fixture_crc32c(u32::MAX, &fixture.disk.journal),
+    );
+    let result = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        match pass.unlink_file(root, &Ext4Name::new(b"concurrent-a")?) {
+            Err(Error::OperationSuspended) => return Err(Error::OperationSuspended),
+            result => assert_eq!(result, Err(Error::UnsupportedInodeMutation)),
+        }
+        assert_eq!(
+            pass.set_volume_label(Ext4VolumeLabel::new(b"rejected")?),
+            Err(Error::UnsupportedInodeMutation),
+        );
+        Ok(())
+    });
+    assert_eq!(result, Err(Error::UnsupportedInodeMutation));
+    assert_eq!(
+        before,
+        (
+            fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+            fixture_crc32c(u32::MAX, &fixture.disk.journal),
+        )
+    );
+    let found = fixture
+        .read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?))?;
+    assert!(matches!(found, ChildLookup::Found(_)));
+    let b = fixture.b;
+    fixture.mutate(|pass| {
+        let b = pass.file(b)?;
+        pass.write_file_range(b, FileOffset::ZERO, b"B")
+    })?;
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, mutation, durability or payload-read failures.
 /// # Panics
 /// Fails if released journal images overwrite a successor owner's bytes after checkpoint.

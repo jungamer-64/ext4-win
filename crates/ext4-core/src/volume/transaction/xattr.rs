@@ -25,8 +25,10 @@ impl MutationResolvePass<'_, '_, '_> {
         name: XattrName,
         value: XattrValue,
     ) -> Result<()> {
-        self.mutation
-            .update_xattrs(node, self.now, |set| set.insert(name, value))
+        self.edit(|pass| {
+            pass.mutation
+                .update_xattrs(node, pass.now, |set| set.insert(name, value))
+        })
     }
 
     /// Removes one ext4 extended attribute.
@@ -38,12 +40,14 @@ impl MutationResolvePass<'_, '_, '_> {
         node: TransactionNode,
         name: &XattrName,
     ) -> Result<Option<XattrValue>> {
-        let mut removed = None;
-        self.mutation.update_xattrs(node, self.now, |set| {
-            removed = set.remove(name)?;
-            Ok(())
-        })?;
-        Ok(removed)
+        self.edit(|pass| {
+            let mut removed = None;
+            pass.mutation.update_xattrs(node, pass.now, |set| {
+                removed = set.remove(name)?;
+                Ok(())
+            })?;
+            Ok(removed)
+        })
     }
 
     /// Sets Windows overlay metadata in `user.ext4win.*` xattrs.
@@ -55,11 +59,13 @@ impl MutationResolvePass<'_, '_, '_> {
         node: TransactionNode,
         overlay: WindowsOverlay,
     ) -> Result<()> {
-        self.set_xattr(
-            node,
-            WindowsOverlay::attributes_xattr_name()?,
-            overlay.to_xattr_value()?,
-        )
+        self.edit(|pass| {
+            pass.set_xattr(
+                node,
+                WindowsOverlay::attributes_xattr_name()?,
+                overlay.to_xattr_value()?,
+            )
+        })
     }
 
     /// Sets Windows symbolic-link reparse metadata on a regular file or directory.
@@ -72,12 +78,14 @@ impl MutationResolvePass<'_, '_, '_> {
         node: TransactionNode,
         reparse_point: WindowsSymlinkReparsePoint,
     ) -> Result<()> {
-        require_windows_reparse_storage_node(node)?;
-        self.set_xattr(
-            node,
-            WindowsSymlinkReparsePoint::xattr_name()?,
-            reparse_point.to_xattr_value()?,
-        )
+        self.edit(|pass| {
+            require_windows_reparse_storage_node(node)?;
+            pass.set_xattr(
+                node,
+                WindowsSymlinkReparsePoint::xattr_name()?,
+                reparse_point.to_xattr_value()?,
+            )
+        })
     }
 
     /// Removes Windows symbolic-link reparse metadata from a regular file or directory.
@@ -89,12 +97,15 @@ impl MutationResolvePass<'_, '_, '_> {
         &mut self,
         node: TransactionNode,
     ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        require_windows_reparse_storage_node(node)?;
-        let Some(value) = self.remove_xattr(node, &WindowsSymlinkReparsePoint::xattr_name()?)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
+        self.edit(|pass| {
+            require_windows_reparse_storage_node(node)?;
+            let Some(value) =
+                pass.remove_xattr(node, &WindowsSymlinkReparsePoint::xattr_name()?)?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
+        })
     }
 }
 

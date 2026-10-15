@@ -257,7 +257,7 @@ pub(crate) fn set(
     if operations.volume_identity().label() == label {
         return Ok(SetVolumeResolution::Complete(IrpCompletion::EMPTY));
     }
-    mutation.set_volume_label(label);
+    mutation.set_volume_label(label)?;
     let publication = MountedVolumeDevice::prepare_vpb_label_publication(device, label)?;
     Ok(SetVolumeResolution::Mutation(
         PreparedVolumeLabelPublication { publication },

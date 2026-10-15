@@ -174,65 +174,67 @@ impl MutationResolvePass<'_, '_, '_> {
         offset: FileOffset,
         bytes: &[u8],
     ) -> Result<()> {
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        let end_offset = offset.checked_add_len(bytes.len())?;
-        let new_size = FileSize::from_bytes(end_offset.bytes());
-        let encoded_size = self
-            .mutation
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_file_size(new_size)?;
-        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        if inode.kind() != InodeKind::File {
-            return Err(Error::WrongInodeKind);
-        }
-        self.require_file_data_mutation(&inode)?;
-        let extends_file = new_size > inode.size();
-        let encoded_new_size = if extends_file {
-            self.require_file_size_mutation(&inode)?;
-            Some(encoded_size)
-        } else {
-            None
-        };
+        self.edit(|pass| {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            let end_offset = offset.checked_add_len(bytes.len())?;
+            let new_size = FileSize::from_bytes(end_offset.bytes());
+            let encoded_size = pass
+                .mutation
+                .volume
+                .superblock
+                .inode_data_encoding()
+                .encode_file_size(new_size)?;
+            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            if inode.kind() != InodeKind::File {
+                return Err(Error::WrongInodeKind);
+            }
+            pass.require_file_data_mutation(&inode)?;
+            let extends_file = new_size > inode.size();
+            let encoded_new_size = if extends_file {
+                pass.require_file_size_mutation(&inode)?;
+                Some(encoded_size)
+            } else {
+                None
+            };
 
-        let plan = self.prepare_file_write(&inode, offset, bytes.len())?;
-        match plan {
-            FileWritePlan::Overwrite(plan) => {
-                self.stage_initialized_overwrite(&inode, plan, bytes)?
-            }
-            FileWritePlan::AllocationChange(mut tree) => {
-                if offset.bytes() > inode.size().bytes() {
-                    self.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)?;
+            let plan = pass.prepare_file_write(&inode, offset, bytes.len())?;
+            match plan {
+                FileWritePlan::Overwrite(plan) => {
+                    pass.stage_initialized_overwrite(&inode, plan, bytes)?
                 }
-                if inode.protection().is_encrypted() {
-                    self.stage_encrypted_inode_stream_write(
-                        &inode,
-                        &mut tree,
-                        offset.bytes(),
-                        bytes,
-                    )?;
-                } else {
-                    self.stage_inode_stream_write(
-                        inode.data_persistence(),
-                        &mut tree,
-                        offset.bytes(),
-                        bytes,
-                    )?;
+                FileWritePlan::AllocationChange(mut tree) => {
+                    if offset.bytes() > inode.size().bytes() {
+                        pass.stage_visible_extension_gap(&inode, &tree, inode.size(), offset)?;
+                    }
+                    if inode.protection().is_encrypted() {
+                        pass.stage_encrypted_inode_stream_write(
+                            &inode,
+                            &mut tree,
+                            offset.bytes(),
+                            bytes,
+                        )?;
+                    } else {
+                        pass.stage_inode_stream_write(
+                            inode.data_persistence(),
+                            &mut tree,
+                            offset.bytes(),
+                            bytes,
+                        )?;
+                    }
+                    pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
                 }
-                self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
             }
-        }
-        if let Some(encoded_new_size) = encoded_new_size {
-            raw_inode.set_encoded_size(encoded_new_size)?;
-        }
-        raw_inode.set_timestamps(self.now)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        Ok(())
+            if let Some(encoded_new_size) = encoded_new_size {
+                raw_inode.set_encoded_size(encoded_new_size)?;
+            }
+            raw_inode.set_timestamps(pass.now)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            Ok(())
+        })
     }
 
     /// Reserves zero-readable unwritten extents through an allocation bound without changing EOF.
@@ -246,33 +248,36 @@ impl MutationResolvePass<'_, '_, '_> {
         file: TransactionFile,
         bound: FileAllocationSize,
     ) -> Result<()> {
-        if bound.bytes() == 0 {
-            return Ok(());
-        }
-        self.mutation
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
-        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        self.require_file_data_mutation(&inode)?;
-        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        let block_size = self.mutation.volume.superblock.block_size();
-        let width = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        let mut offset = FileOffset::ZERO;
-        while offset.bytes() < bound.bytes() {
-            let logical = offset.logical_block(block_size)?;
-            if matches!(tree.map_logical(logical), BlockMapping::Hole) {
-                let physical = self.physical_block_for_hole(&tree, logical)?;
-                tree.insert_uninitialized(logical, physical)?;
+        self.edit(|pass| {
+            if bound.bytes() == 0 {
+                return Ok(());
             }
-            offset = offset.checked_add_len(width)?;
-        }
-        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        Ok(())
+            pass.mutation
+                .volume
+                .superblock
+                .inode_data_encoding()
+                .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
+            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            pass.require_file_data_mutation(&inode)?;
+            let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
+            let block_size = pass.mutation.volume.superblock.block_size();
+            let width =
+                usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+            let mut offset = FileOffset::ZERO;
+            while offset.bytes() < bound.bytes() {
+                let logical = offset.logical_block(block_size)?;
+                if matches!(tree.map_logical(logical), BlockMapping::Hole) {
+                    let physical = pass.physical_block_for_hole(&tree, logical)?;
+                    tree.insert_uninitialized(logical, physical)?;
+                }
+                offset = offset.checked_add_len(width)?;
+            }
+            pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            Ok(())
+        })
     }
 
     /// Sets block-rounded allocated storage while preserving EOF and existing visible payload.
@@ -285,23 +290,25 @@ impl MutationResolvePass<'_, '_, '_> {
         file: TransactionFile,
         bound: FileAllocationSize,
     ) -> Result<()> {
-        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        self.require_file_data_mutation(&inode)?;
-        if bound.bytes() < inode.size().bytes() {
-            return Err(Error::InvalidWriteRange);
-        }
-        self.mutation
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
-        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        self.retain_file_allocation(&mut tree, bound)?;
-        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        self.reserve_file_allocation(file, bound)
+        self.edit(|pass| {
+            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            pass.require_file_data_mutation(&inode)?;
+            if bound.bytes() < inode.size().bytes() {
+                return Err(Error::InvalidWriteRange);
+            }
+            pass.mutation
+                .volume
+                .superblock
+                .inode_data_encoding()
+                .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
+            let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
+            pass.retain_file_allocation(&mut tree, bound)?;
+            pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            pass.reserve_file_allocation(file, bound)
+        })
     }
 
     /// Releases extent tails beyond a block-rounded byte bound, preserving initialization state.
@@ -829,32 +836,34 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when `new_size` would shrink the file, existing initialized storage cannot
     /// be zeroed before becoming visible, or the inode metadata cannot be staged.
     pub fn extend_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
-        let encoded_size = self
-            .mutation
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_file_size(new_size)?;
-        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        self.require_file_size_mutation(&inode)?;
-        if new_size < inode.size() {
-            return Err(Error::InvalidWriteRange);
-        }
-        if new_size > inode.size() {
-            let tree = self.mutation.mutable_extent_tree(&inode)?;
-            self.stage_visible_extension_gap(
-                &inode,
-                &tree,
-                inode.size(),
-                FileOffset::from_bytes(new_size.bytes()),
-            )?;
-        }
-        raw_inode.set_encoded_size(encoded_size)?;
-        raw_inode.set_timestamps(self.now)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        Ok(())
+        self.edit(|pass| {
+            let encoded_size = pass
+                .mutation
+                .volume
+                .superblock
+                .inode_data_encoding()
+                .encode_file_size(new_size)?;
+            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            pass.require_file_size_mutation(&inode)?;
+            if new_size < inode.size() {
+                return Err(Error::InvalidWriteRange);
+            }
+            if new_size > inode.size() {
+                let tree = pass.mutation.mutable_extent_tree(&inode)?;
+                pass.stage_visible_extension_gap(
+                    &inode,
+                    &tree,
+                    inode.size(),
+                    FileOffset::from_bytes(new_size.bytes()),
+                )?;
+            }
+            raw_inode.set_encoded_size(encoded_size)?;
+            raw_inode.set_timestamps(pass.now)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            Ok(())
+        })
     }
 
     /// Truncates a regular file and releases whole blocks beyond the new EOF.
@@ -863,49 +872,54 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when `new_size` would extend the file or root extent
     /// updates cannot fit in the inode.
     pub fn truncate_file(&mut self, file: TransactionFile, new_size: FileSize) -> Result<()> {
-        let encoded_size = self
-            .mutation
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_file_size(new_size)?;
-        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        self.require_file_size_mutation(&inode)?;
-        if new_size > inode.size() {
-            return Err(Error::InvalidWriteRange);
-        }
-        let block_size_u64 = u64::from(self.mutation.volume.superblock.block_size().bytes());
-        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        self.retain_file_allocation(&mut tree, FileAllocationSize::from_bytes(new_size.bytes()))?;
-        if new_size
-            .bytes()
-            .checked_rem(block_size_u64)
-            .ok_or(Error::InvalidSuperblock)?
-            != 0
-        {
-            if inode.protection().is_encrypted() {
-                self.zero_encrypted_truncated_tail(
-                    &inode,
-                    tree.extents(),
-                    new_size,
-                    block_size_u64,
-                )?;
-            } else {
-                self.zero_truncated_tail(
-                    inode.data_persistence(),
-                    tree.extents(),
-                    new_size,
-                    block_size_u64,
-                )?;
+        self.edit(|pass| {
+            let encoded_size = pass
+                .mutation
+                .volume
+                .superblock
+                .inode_data_encoding()
+                .encode_file_size(new_size)?;
+            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            pass.require_file_size_mutation(&inode)?;
+            if new_size > inode.size() {
+                return Err(Error::InvalidWriteRange);
             }
-        }
-        raw_inode.set_encoded_size(encoded_size)?;
-        raw_inode.set_timestamps(self.now)?;
-        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        Ok(())
+            let block_size_u64 = u64::from(pass.mutation.volume.superblock.block_size().bytes());
+            let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
+            pass.retain_file_allocation(
+                &mut tree,
+                FileAllocationSize::from_bytes(new_size.bytes()),
+            )?;
+            if new_size
+                .bytes()
+                .checked_rem(block_size_u64)
+                .ok_or(Error::InvalidSuperblock)?
+                != 0
+            {
+                if inode.protection().is_encrypted() {
+                    pass.zero_encrypted_truncated_tail(
+                        &inode,
+                        tree.extents(),
+                        new_size,
+                        block_size_u64,
+                    )?;
+                } else {
+                    pass.zero_truncated_tail(
+                        inode.data_persistence(),
+                        tree.extents(),
+                        new_size,
+                        block_size_u64,
+                    )?;
+                }
+            }
+            raw_inode.set_encoded_size(encoded_size)?;
+            raw_inode.set_timestamps(pass.now)?;
+            pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            Ok(())
+        })
     }
 
     /// Enables fs-verity on a regular file by journal-staging ext4
@@ -917,74 +931,76 @@ impl MutationResolvePass<'_, '_, '_> {
     /// or represented. Merkle data covers the current transaction's file image, including writes
     /// and size changes preceding this call.
     pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
-        self.mutation.volume.superblock.require_verity()?;
-        let inode_index = self.mutation.ensure_inode_update(file.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        if inode.kind() != InodeKind::File {
-            return Err(Error::WrongInodeKind);
-        }
-        if inode.protection().is_encrypted() {
-            self.mutation.volume.require_encryption_key(&inode)?;
-        }
-        if inode.protection().is_verity() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
-        if enable.block_size().bytes() > self.mutation.volume.superblock.block_size().bytes() {
-            return Err(Error::InvalidVerityMetadata);
-        }
-        let _payload = inode.file_payload_mutation()?;
+        self.edit(|pass| {
+            pass.mutation.volume.superblock.require_verity()?;
+            let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            if inode.kind() != InodeKind::File {
+                return Err(Error::WrongInodeKind);
+            }
+            if inode.protection().is_encrypted() {
+                pass.mutation.volume.require_encryption_key(&inode)?;
+            }
+            if inode.protection().is_verity() {
+                return Err(Error::UnsupportedInodeMutation);
+            }
+            if enable.block_size().bytes() > pass.mutation.volume.superblock.block_size().bytes() {
+                return Err(Error::InvalidVerityMetadata);
+            }
+            let _payload = inode.file_payload_mutation()?;
 
-        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        self.retain_file_allocation(
-            &mut tree,
-            FileAllocationSize::from_bytes(inode.size().bytes()),
-        )?;
-        let plaintext = self.staged_file_plaintext(&inode, &tree)?;
-        let merkle_tree = FsverityMerkleTree::build(
-            &plaintext,
-            enable.algorithm(),
-            enable.block_size(),
-            enable.salt(),
-            self.crypto,
-        )?;
-        let descriptor = FsverityDescriptor::new(
-            enable.algorithm(),
-            enable.block_size(),
-            inode.size().bytes(),
-            merkle_tree.root_hash(),
-            enable.salt().try_clone()?,
-        )?;
-        let descriptor_image = descriptor.to_bytes(enable.signature())?;
-        let descriptor_bytes =
-            u32::try_from(descriptor_image.len()).map_err(|_| Error::ArithmeticOverflow)?;
-        let layout = Ext4VerityMetadataLayout::new(
-            inode.size(),
-            self.mutation.volume.superblock.block_size(),
-            u64::try_from(merkle_tree.blocks().len()).map_err(|_| Error::ArithmeticOverflow)?,
-            descriptor_bytes,
-        )?;
-        let metadata = verity_metadata_image(layout, merkle_tree.blocks(), &descriptor_image)?;
-        if inode.protection().is_encrypted() {
-            self.stage_encrypted_inode_stream_write(
-                &inode,
+            let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
+            pass.retain_file_allocation(
                 &mut tree,
-                layout.merkle_tree_offset(),
-                &metadata,
+                FileAllocationSize::from_bytes(inode.size().bytes()),
             )?;
-        } else {
-            self.stage_inode_stream_write(
-                inode.data_persistence(),
-                &mut tree,
-                layout.merkle_tree_offset(),
-                &metadata,
+            let plaintext = pass.staged_file_plaintext(&inode, &tree)?;
+            let merkle_tree = FsverityMerkleTree::build(
+                &plaintext,
+                enable.algorithm(),
+                enable.block_size(),
+                enable.salt(),
+                pass.crypto,
             )?;
-        }
-        raw_inode.mark_verity()?;
-        raw_inode.set_timestamps(self.now)?;
-        self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        Ok(())
+            let descriptor = FsverityDescriptor::new(
+                enable.algorithm(),
+                enable.block_size(),
+                inode.size().bytes(),
+                merkle_tree.root_hash(),
+                enable.salt().try_clone()?,
+            )?;
+            let descriptor_image = descriptor.to_bytes(enable.signature())?;
+            let descriptor_bytes =
+                u32::try_from(descriptor_image.len()).map_err(|_| Error::ArithmeticOverflow)?;
+            let layout = Ext4VerityMetadataLayout::new(
+                inode.size(),
+                pass.mutation.volume.superblock.block_size(),
+                u64::try_from(merkle_tree.blocks().len()).map_err(|_| Error::ArithmeticOverflow)?,
+                descriptor_bytes,
+            )?;
+            let metadata = verity_metadata_image(layout, merkle_tree.blocks(), &descriptor_image)?;
+            if inode.protection().is_encrypted() {
+                pass.stage_encrypted_inode_stream_write(
+                    &inode,
+                    &mut tree,
+                    layout.merkle_tree_offset(),
+                    &metadata,
+                )?;
+            } else {
+                pass.stage_inode_stream_write(
+                    inode.data_persistence(),
+                    &mut tree,
+                    layout.merkle_tree_offset(),
+                    &metadata,
+                )?;
+            }
+            raw_inode.mark_verity()?;
+            raw_inode.set_timestamps(pass.now)?;
+            pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            Ok(())
+        })
     }
 
     /// Reads the staged file image, preserving sparse and unwritten zero semantics before

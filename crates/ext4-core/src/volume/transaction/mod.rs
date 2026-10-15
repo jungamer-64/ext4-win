@@ -293,13 +293,30 @@ impl TransactionNode {
 }
 
 /// Restart-local mutation resolver that owns no committed or coordinator state.
+///
+/// A failed staging operation permanently rejects this pass, even when its caller handles the
+/// returned error. Resolution returns the first failure and cannot publish partial staging.
+/// Suspension also rejects the pass; its storage transcript resumes through a newly built pass.
 pub struct MutationResolvePass<'storage, 'epoch, 'crypto> {
+    /// Sole permission to continue staging or seal the transaction.
+    state: MutationState,
     /// Timestamp supplied by the ordinary mutation caller, not by mount recovery.
     now: Ext4Timestamp,
     /// Filesystem staging authority, independent of cryptographic execution.
     mutation: MetadataMutation<'storage, 'epoch>,
     /// Mutable provider objects owned by the enclosing top-level operation.
     crypto: &'crypto mut dyn CryptographicOperation,
+}
+
+/// Commit eligibility while synchronous staging operations compose.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationState {
+    /// No staging call is outstanding and every completed call succeeded.
+    Ready,
+    /// An outer operation owns completion; nested operations cannot restore commit eligibility.
+    Editing,
+    /// The first failure revokes resolution and every subsequent staging operation.
+    Rejected(Error),
 }
 
 /// Private metadata, allocation, and serialization authority shared by ordinary mutation and recovery.
@@ -718,6 +735,33 @@ impl CleanJournalDurability {
 }
 
 impl MutationResolvePass<'_, '_, '_> {
+    /// Runs a staging operation while retaining failure and completion authority in this pass.
+    /// # Errors
+    /// Returns the first rejected operation's error, including failures handled by nested callers.
+    fn edit<T>(&mut self, edit: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        let outer = match self.state {
+            MutationState::Ready => {
+                self.state = MutationState::Editing;
+                true
+            }
+            MutationState::Editing => false,
+            MutationState::Rejected(error) => return Err(error),
+        };
+        let result = edit(self);
+        if let Err(error) = &result
+            && !matches!(self.state, MutationState::Rejected(_))
+        {
+            self.state = MutationState::Rejected(*error);
+        }
+        if let MutationState::Rejected(error) = self.state {
+            return Err(error);
+        }
+        if outer {
+            self.state = MutationState::Ready;
+        }
+        result
+    }
+
     /// Observes this pass's latest staged inode and Windows xattrs.
     ///
     /// This is distinct from `CommittedReadPass`: callers use it to prepare post-commit state,
@@ -726,8 +770,10 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error if the inode was deleted, storage cannot be read, or metadata is invalid.
     pub fn staged_node_metadata(&mut self, node: NodeId) -> Result<NodeMetadataSnapshot> {
-        let record = self.mutation.raw_inode_for_policy(node.inode())?;
-        self.mutation.node_metadata_snapshot(&record)
+        self.edit(|pass| {
+            let record = pass.mutation.raw_inode_for_policy(node.inode())?;
+            pass.mutation.node_metadata_snapshot(&record)
+        })
     }
 
     /// Selects a staged or committed inode for POSIX metadata mutation.
@@ -736,14 +782,16 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when the inode cannot be read or carries mutation
     /// semantics outside the write domain.
     pub fn node(&mut self, id: NodeId) -> Result<TransactionNode> {
-        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
-        let _metadata = inode.metadata_mutation()?;
-        match (id, inode.kind()) {
-            (NodeId::File(_), InodeKind::File)
-            | (NodeId::Directory(_), InodeKind::Directory)
-            | (NodeId::Symlink(_), InodeKind::Symlink) => Ok(TransactionNode { id }),
-            _ => Err(Error::WrongInodeKind),
-        }
+        self.edit(|pass| {
+            let inode = pass.mutation.raw_inode_for_policy(id.inode())?.parse()?;
+            let _metadata = inode.metadata_mutation()?;
+            match (id, inode.kind()) {
+                (NodeId::File(_), InodeKind::File)
+                | (NodeId::Directory(_), InodeKind::Directory)
+                | (NodeId::Symlink(_), InodeKind::Symlink) => Ok(TransactionNode { id }),
+                _ => Err(Error::WrongInodeKind),
+            }
+        })
     }
 
     /// Selects a staged or committed regular file for mutation.
@@ -751,11 +799,13 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the inode is not a regular file or cannot be read.
     pub fn file(&mut self, id: FileNodeId) -> Result<TransactionFile> {
-        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
-        if inode.kind() != InodeKind::File {
-            return Err(Error::WrongInodeKind);
-        }
-        Ok(TransactionFile { id })
+        self.edit(|pass| {
+            let inode = pass.mutation.raw_inode_for_policy(id.inode())?.parse()?;
+            if inode.kind() != InodeKind::File {
+                return Err(Error::WrongInodeKind);
+            }
+            Ok(TransactionFile { id })
+        })
     }
 
     /// Selects a directory for mutation.
@@ -763,11 +813,13 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the inode is not a directory or cannot be read.
     pub fn directory(&mut self, id: DirectoryNodeId) -> Result<TransactionDirectory> {
-        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
-        if inode.kind() != InodeKind::Directory {
-            return Err(Error::WrongInodeKind);
-        }
-        Ok(TransactionDirectory { id })
+        self.edit(|pass| {
+            let inode = pass.mutation.raw_inode_for_policy(id.inode())?.parse()?;
+            if inode.kind() != InodeKind::Directory {
+                return Err(Error::WrongInodeKind);
+            }
+            Ok(TransactionDirectory { id })
+        })
     }
 
     /// Selects a symbolic link for mutation.
@@ -776,12 +828,14 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when the inode is not a symbolic link or carries
     /// mutation semantics outside the write domain.
     pub fn symlink(&mut self, id: SymlinkNodeId) -> Result<TransactionSymlink> {
-        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
-        if inode.kind() != InodeKind::Symlink {
-            return Err(Error::WrongInodeKind);
-        }
-        self.require_file_data_mutation(&inode)?;
-        Ok(TransactionSymlink { id })
+        self.edit(|pass| {
+            let inode = pass.mutation.raw_inode_for_policy(id.inode())?.parse()?;
+            if inode.kind() != InodeKind::Symlink {
+                return Err(Error::WrongInodeKind);
+            }
+            pass.require_file_data_mutation(&inode)?;
+            Ok(TransactionSymlink { id })
+        })
     }
 
     /// Selects a regular file or symbolic link as a hard-link source.
@@ -789,17 +843,19 @@ impl MutationResolvePass<'_, '_, '_> {
     /// # Errors
     /// Returns an error when the typed identity does not match the inode or names a directory.
     pub fn hard_link_source(&mut self, id: HardLinkNodeId) -> Result<TransactionHardLinkSource> {
-        let inode = self.mutation.raw_inode_for_policy(id.inode())?.parse()?;
-        let _namespace = inode.namespace_mutation()?;
-        match (id, inode.kind()) {
-            (HardLinkNodeId::File(_), InodeKind::File)
-            | (HardLinkNodeId::Symlink(_), InodeKind::Symlink) => {}
-            (HardLinkNodeId::File(_), InodeKind::Directory | InodeKind::Symlink)
-            | (HardLinkNodeId::Symlink(_), InodeKind::File | InodeKind::Directory) => {
-                return Err(Error::WrongInodeKind);
+        self.edit(|pass| {
+            let inode = pass.mutation.raw_inode_for_policy(id.inode())?.parse()?;
+            let _namespace = inode.namespace_mutation()?;
+            match (id, inode.kind()) {
+                (HardLinkNodeId::File(_), InodeKind::File)
+                | (HardLinkNodeId::Symlink(_), InodeKind::Symlink) => {}
+                (HardLinkNodeId::File(_), InodeKind::Directory | InodeKind::Symlink)
+                | (HardLinkNodeId::Symlink(_), InodeKind::File | InodeKind::Directory) => {
+                    return Err(Error::WrongInodeKind);
+                }
             }
-        }
-        Ok(TransactionHardLinkSource { id })
+            Ok(TransactionHardLinkSource { id })
+        })
     }
 
     /// Updates POSIX owner and permission state representable by ext4 inode fields.
@@ -812,15 +868,17 @@ impl MutationResolvePass<'_, '_, '_> {
         node: TransactionNode,
         security: Ext4Security,
     ) -> Result<()> {
-        let inode_index = self.mutation.ensure_inode_update(node.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        let _metadata = inode.metadata_mutation()?;
-        raw_inode.set_owner(security.owner())?;
-        raw_inode.set_permissions(security.permissions())?;
-        raw_inode.set_timestamps(self.now)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        Ok(())
+        self.edit(|pass| {
+            let inode_index = pass.mutation.ensure_inode_update(node.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            let _metadata = inode.metadata_mutation()?;
+            raw_inode.set_owner(security.owner())?;
+            raw_inode.set_permissions(security.permissions())?;
+            raw_inode.set_timestamps(pass.now)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            Ok(())
+        })
     }
 
     /// Updates ext4 inode timestamps from a complete timestamp domain value.
@@ -829,18 +887,25 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when the inode leaves the mutable write domain or the
     /// inode record cannot be rewritten.
     pub fn set_times(&mut self, node: TransactionNode, times: Ext4Times) -> Result<()> {
-        let inode_index = self.mutation.ensure_inode_update(node.inode())?;
-        let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
-        let inode = raw_inode.parse()?;
-        let _metadata = inode.metadata_mutation()?;
-        raw_inode.set_ext4_times(times)?;
-        self.mutation.replace_live_inode(inode_index, raw_inode)?;
-        Ok(())
+        self.edit(|pass| {
+            let inode_index = pass.mutation.ensure_inode_update(node.inode())?;
+            let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            let inode = raw_inode.parse()?;
+            let _metadata = inode.metadata_mutation()?;
+            raw_inode.set_ext4_times(times)?;
+            pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+            Ok(())
+        })
     }
 
     /// Replaces the ext4 volume label stored in the primary superblock.
-    pub fn set_volume_label(&mut self, label: Ext4VolumeLabel) {
-        self.mutation.volume_label_update = Some(label);
+    /// # Errors
+    /// Returns the first failure when this pass has already rejected a staging operation.
+    pub fn set_volume_label(&mut self, label: Ext4VolumeLabel) -> Result<()> {
+        self.edit(|pass| {
+            pass.mutation.volume_label_update = Some(label);
+            Ok(())
+        })
     }
 
     /// Verifies directory-entry creation policy using the latest staged inode.
@@ -1048,6 +1113,7 @@ impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
         crypto: &'crypto mut dyn CryptographicOperation,
     ) -> Self {
         Self {
+            state: MutationState::Ready,
             mutation: MetadataMutation::begin(volume),
             now,
             crypto,

@@ -1285,7 +1285,7 @@ fn prepare_volume_label_commit<S: HostStorage>(
         &mut coordinator,
         ticket,
         |pass| {
-            pass.set_volume_label(ext4_core::Ext4VolumeLabel::new(label)?);
+            pass.set_volume_label(ext4_core::Ext4VolumeLabel::new(label)?)?;
             Ok(())
         },
     )?;
