@@ -39,7 +39,7 @@ impl Descriptor {
     /// # Errors
     /// Returns allocation or malformed representation failures.
     pub fn encode(
-        security: Ext4Security,
+        access: &ext4_core::Ext4Access,
         map: &IdentityMap,
         selection: Components,
     ) -> Result<Self, Error> {

@@ -25,15 +25,6 @@ impl CreateSecurityDescriptor {
     ) -> DriverResult<Self> {
         Self::from_security(security_from_node(read, node)?, map)
     }
-    /// Projects prepared inode security before handle authority is published.
-    /// # Errors
-    /// Propagates descriptor and pool allocation failures.
-    pub(crate) fn from_security(security: Ext4Security, map: &IdentityMap) -> DriverResult<Self> {
-        let descriptor = Descriptor::encode(security, map, Components::ALL)?;
-        Ok(Self {
-            bytes: DriverVec::try_copied_from_slice(descriptor.bytes())?,
-        })
-    }
     /// Borrows the encoded descriptor during one native check.
     #[expect(
         unsafe_code,
@@ -152,17 +143,3 @@ impl<'a> SetSecurityRequest<'a> {
     }
 }
 
-/// Extracts security metadata after validating FCB kind against core metadata.
-/// # Errors
-///
-/// Returns an error when `identity` cannot be loaded as its typed ext4 node.
-pub(crate) fn security_from_node(
-    read: &mut impl CommittedReadPass,
-    identity: NodeId,
-) -> DriverResult<Ext4Security> {
-    match identity {
-        NodeId::File(file) => Ok(read.load_file(file)?.security()),
-        NodeId::Directory(directory) => Ok(read.load_directory(directory)?.security()),
-        NodeId::Symlink(symlink) => Ok(read.load_symlink(symlink)?.security()),
-    }
-}
