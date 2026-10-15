@@ -11,6 +11,7 @@ pub(super) fn verify_inode_contracts(
 ) -> TaskResult<()> {
     let root = temporary_root.join("inode-contracts");
     fs::create_dir(&root)?;
+    verify_64k_directories(linux, &root)?;
     let image = root.join("filesystem.img");
     format_htree_image(linux, &image, 32 * 1024 * 1024, 4096, true, false, 4)?;
     let payload = root.join("payload.bin");
@@ -300,5 +301,66 @@ fn verify_data_cuts(linux: LinuxEnvironment, root: &Path, baseline: &Path) -> Ta
         "journaled file data: PASS ({} sector/flush cuts)",
         cuts.len()
     );
+    Ok(())
+}
+
+/// Exercises independently encoded full-block records and core mutation at 64 KiB.
+/// # Errors
+/// Returns oracle, traversal, mutation, or filesystem consistency failures.
+fn verify_64k_directories(linux: LinuxEnvironment, root: &Path) -> TaskResult<()> {
+    let image = root.join("directory-64k.img");
+    File::create(&image)?.set_len(128 * 1024 * 1024)?;
+    let mut format = linux.command("mke2fs");
+    format.args([
+        "-q",
+        "-F",
+        "-t",
+        "ext4",
+        "-b",
+        "65536",
+        "-O",
+        "^metadata_csum,^metadata_csum_seed",
+        "-E",
+        "lazy_itable_init=0,lazy_journal_init=0",
+        &linux.tool_path(&image)?,
+    ]);
+    run_checked(format, "64 KiB directory image format")?;
+    let parent = drive_internal_core_read(&image, |pass| {
+        let ext4_core::ChildLookup::Found(child) = pass.lookup_child(
+            ext4_core::DirectoryNodeId::ROOT,
+            &ext4_core::Ext4Name::new(b"lost+found")?,
+        )?
+        else {
+            return Err(ext4_core::Error::DirectoryEntryNotFound);
+        };
+        let ext4_core::NodeId::Directory(parent) = *child.node() else {
+            return Err(ext4_core::Error::WrongInodeKind);
+        };
+        if pass.lookup_child(parent, &ext4_core::Ext4Name::new(b"missing")?)?
+            != ext4_core::ChildLookup::NotFound
+        {
+            return Err(ext4_core::Error::NameAlreadyExists);
+        }
+        Ok(parent)
+    })?;
+    drive_internal_core_mutation(&image, |pass| {
+        let parent = pass.directory(parent)?;
+        pass.create_file(
+            parent,
+            &ext4_core::Ext4Name::new(b"created")?,
+            mutation_file_metadata()?,
+        )?;
+        pass.create_directory(
+            parent,
+            &ext4_core::Ext4Name::new(b"directory")?,
+            ext4_core::NewDirectoryMetadata::new(
+                mutation_file_metadata()?.owner(),
+                ext4_core::Ext4Permissions::new(0o755)?,
+            ),
+        )?;
+        Ok(())
+    })?;
+    verify_internal_e2fsck_clean(linux, &image, "64 KiB directory mutation")?;
+    fs::remove_file(image)?;
     Ok(())
 }

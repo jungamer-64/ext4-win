@@ -143,7 +143,7 @@ impl DirectoryEntry {
             }
 
             let inode = le_u32(bytes, disk_offset(offset))?;
-            let rec_len = usize::from(le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?)?);
+            let rec_len = read_record_length(bytes, offset)?;
             let name_len = usize::from(
                 *bytes
                     .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
@@ -552,7 +552,7 @@ impl HtreeRoot {
         {
             return Err(Error::InvalidDirectoryEntry);
         }
-        if usize::from(le_u16(bytes, disk_offset(4))?) != checked_rec_len(DIRENT_HEADER_SIZE + 1)? {
+        if read_record_length(bytes, 0)? != checked_rec_len(DIRENT_HEADER_SIZE + 1)? {
             return Err(Error::InvalidDirectoryEntry);
         }
         let dotdot = parse_live_entry_at(bytes, checked_rec_len(DIRENT_HEADER_SIZE + 1)?)?;
@@ -560,13 +560,11 @@ impl HtreeRoot {
             return Err(Error::InvalidDirectoryEntry);
         }
         let dotdot_offset = checked_rec_len(DIRENT_HEADER_SIZE + 1)?;
-        if usize::from(le_u16(
-            bytes,
-            disk_offset(dotdot_offset).checked_add_bytes(4)?,
-        )?) != bytes
-            .len()
-            .checked_sub(dotdot_offset)
-            .ok_or(Error::ArithmeticOverflow)?
+        if read_record_length(bytes, dotdot_offset)?
+            != bytes
+                .len()
+                .checked_sub(dotdot_offset)
+                .ok_or(Error::ArithmeticOverflow)?
         {
             return Err(Error::InvalidDirectoryEntry);
         }
@@ -713,7 +711,7 @@ impl DxIndex {
     /// checksum tail is invalid.
     pub(crate) fn parse_node(bytes: &[u8], checksum: DirectoryChecksum) -> Result<Self> {
         if le_u32(bytes, disk_offset(0))? != 0
-            || usize::from(le_u16(bytes, disk_offset(4))?) != bytes.len()
+            || read_record_length(bytes, 0)? != bytes.len()
             || *bytes.get(6).ok_or(Error::InvalidDirectoryEntry)? != 0
             || *bytes.get(7).ok_or(Error::InvalidDirectoryEntry)? != 0
         {
@@ -1074,7 +1072,11 @@ pub(crate) fn write_htree_node(
     checksum: DirectoryChecksum,
 ) -> Result<()> {
     bytes.fill(0);
-    put_le_u16(bytes, disk_offset(4), checked_u16(bytes.len())?)?;
+    put_le_u16(
+        bytes,
+        disk_offset(4),
+        encode_record_length(bytes.len(), bytes.len())?,
+    )?;
     index.write_at(bytes, DX_NODE_COUNT_OFFSET, checksum)
 }
 
@@ -1114,7 +1116,7 @@ pub(crate) fn create_htree_root(
         &mut bytes,
         0,
         self_inode,
-        checked_u16(dot_len)?,
+        dot_len,
         b".",
         DirectoryEntryKind::Directory,
     )?;
@@ -1122,11 +1124,9 @@ pub(crate) fn create_htree_root(
         &mut bytes,
         dot_len,
         parent_inode,
-        checked_u16(
-            block_size
-                .checked_sub(dot_len)
-                .ok_or(Error::ArithmeticOverflow)?,
-        )?,
+        block_size
+            .checked_sub(dot_len)
+            .ok_or(Error::ArithmeticOverflow)?,
         b"..",
         DirectoryEntryKind::Directory,
     )?;
@@ -1212,7 +1212,7 @@ impl DirectoryBlock {
                 &mut block.bytes,
                 offset,
                 entry.inode(),
-                checked_u16(rec_len)?,
+                rec_len,
                 entry.name().bytes(),
                 entry.kind(),
             )?;
@@ -1256,7 +1256,7 @@ impl DirectoryBlock {
             &mut self.bytes,
             0,
             self_inode,
-            checked_u16(checked_rec_len(DIRENT_HEADER_SIZE + 1)?)?,
+            checked_rec_len(DIRENT_HEADER_SIZE + 1)?,
             b".",
             DirectoryEntryKind::Directory,
         )?;
@@ -1265,11 +1265,9 @@ impl DirectoryBlock {
             &mut self.bytes,
             dotdot_offset,
             parent_inode,
-            checked_u16(
-                live_limit
-                    .checked_sub(dotdot_offset)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )?,
+            live_limit
+                .checked_sub(dotdot_offset)
+                .ok_or(Error::ArithmeticOverflow)?,
             b"..",
             DirectoryEntryKind::Directory,
         )?;
@@ -1282,7 +1280,7 @@ impl DirectoryBlock {
     /// Returns an error when the block length cannot be represented as an ext4 `rec_len`.
     pub(crate) fn initialize_free_space(&mut self) -> Result<()> {
         let live_limit = self.live_limit()?;
-        let rec_len = checked_u16(live_limit)?;
+        let rec_len = encode_record_length(live_limit, self.bytes.len())?;
         self.bytes.fill(0);
         put_le_u16(&mut self.bytes, disk_offset(4), rec_len)?;
         self.refresh_leaf_checksum()
@@ -1318,10 +1316,7 @@ impl DirectoryBlock {
             if remaining < DIRENT_HEADER_SIZE {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            let rec_len = usize::from(le_u16(
-                &self.bytes,
-                disk_offset(offset).checked_add_bytes(4)?,
-            )?);
+            let rec_len = read_record_length(&self.bytes, offset)?;
             if rec_len < DIRENT_HEADER_SIZE
                 || !rec_len.is_multiple_of(DIRENT_ALIGNMENT)
                 || rec_len > remaining
@@ -1405,10 +1400,7 @@ impl DirectoryBlock {
         )?;
         let mut offset = 0_usize;
         while offset < live_limit {
-            let rec_len = usize::from(le_u16(
-                &self.bytes,
-                disk_offset(offset).checked_add_bytes(4)?,
-            )?);
+            let rec_len = read_record_length(&self.bytes, offset)?;
             if rec_len < DIRENT_HEADER_SIZE
                 || offset
                     .checked_add(rec_len)
@@ -1425,14 +1417,7 @@ impl DirectoryBlock {
                     .ok_or(Error::InvalidDirectoryEntry)?,
             );
             if live_inode == 0 && rec_len >= needed {
-                write_entry(
-                    &mut self.bytes,
-                    offset,
-                    inode,
-                    checked_u16(rec_len)?,
-                    name.bytes(),
-                    kind,
-                )?;
+                write_entry(&mut self.bytes, offset, inode, rec_len, name.bytes(), kind)?;
                 self.refresh_leaf_checksum()?;
                 return Ok(true);
             }
@@ -1444,10 +1429,11 @@ impl DirectoryBlock {
             if live_inode != 0
                 && rec_len >= used.checked_add(needed).ok_or(Error::ArithmeticOverflow)?
             {
+                let encoded = encode_record_length(used, self.bytes.len())?;
                 put_le_u16(
                     &mut self.bytes,
                     disk_offset(offset).checked_add_bytes(4)?,
-                    checked_u16(used)?,
+                    encoded,
                 )?;
                 let insert_offset = offset.checked_add(used).ok_or(Error::ArithmeticOverflow)?;
                 let insert_len = rec_len.checked_sub(used).ok_or(Error::ArithmeticOverflow)?;
@@ -1455,7 +1441,7 @@ impl DirectoryBlock {
                     &mut self.bytes,
                     insert_offset,
                     inode,
-                    checked_u16(insert_len)?,
+                    insert_len,
                     name.bytes(),
                     kind,
                 )?;
@@ -1479,10 +1465,7 @@ impl DirectoryBlock {
         let live_limit = self.live_limit()?;
         let mut offset = 0_usize;
         while offset < live_limit {
-            let rec_len = usize::from(le_u16(
-                &self.bytes,
-                disk_offset(offset).checked_add_bytes(4)?,
-            )?);
+            let rec_len = read_record_length(&self.bytes, offset)?;
             if rec_len < DIRENT_HEADER_SIZE
                 || offset
                     .checked_add(rec_len)
@@ -1575,10 +1558,7 @@ impl DirectoryBlock {
         let live_limit = self.live_limit()?;
         let mut offset = 0_usize;
         while offset < live_limit {
-            let rec_len = usize::from(le_u16(
-                &self.bytes,
-                disk_offset(offset).checked_add_bytes(4)?,
-            )?);
+            let rec_len = read_record_length(&self.bytes, offset)?;
             if rec_len < DIRENT_HEADER_SIZE
                 || offset
                     .checked_add(rec_len)
@@ -1617,14 +1597,7 @@ impl DirectoryBlock {
                             .ok_or(Error::InvalidDirectoryEntry)?,
                     ),
                 };
-                write_entry(
-                    &mut self.bytes,
-                    offset,
-                    inode,
-                    checked_u16(rec_len)?,
-                    name.bytes(),
-                    kind,
-                )?;
+                write_entry(&mut self.bytes, offset, inode, rec_len, name.bytes(), kind)?;
                 self.refresh_leaf_checksum()?;
                 return Ok(Some(previous));
             }
@@ -1664,13 +1637,47 @@ impl DirectoryBlock {
     }
 }
 
+/// Decodes the full-block marker only in a 64 KiB directory block.
+/// # Errors
+/// Rejects truncated fields and full-block markers in smaller blocks.
+fn read_record_length(bytes: &[u8], offset: usize) -> Result<usize> {
+    let raw = le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?)?;
+    if matches!(raw, 0 | u16::MAX) {
+        if bytes.len() == 65_536 {
+            Ok(65_536)
+        } else {
+            Err(Error::InvalidDirectoryEntry)
+        }
+    } else {
+        Ok(usize::from(raw))
+    }
+}
+
+/// Encodes aligned byte lengths, including the 64 KiB full-block marker.
+/// # Errors
+/// Rejects lengths outside their containing block or the supported directory-block domain.
+fn encode_record_length(length: usize, block_bytes: usize) -> Result<u16> {
+    if length < DIRENT_HEADER_SIZE
+        || !length.is_multiple_of(DIRENT_ALIGNMENT)
+        || length > block_bytes
+        || block_bytes > 65_536
+    {
+        return Err(Error::InvalidDirectoryEntry);
+    }
+    if length == 65_536 {
+        Ok(u16::MAX)
+    } else {
+        checked_u16(length)
+    }
+}
+
 /// Parses one live directory entry at a fixed offset.
 /// # Errors
 ///
 /// Returns an error when the record length, inode, name length, name bytes, or file-type byte is not
 /// a valid live ext4 dirent at `offset`.
 fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
-    let rec_len = usize::from(le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?)?);
+    let rec_len = read_record_length(bytes, offset)?;
     if rec_len < DIRENT_HEADER_SIZE
         || offset
             .checked_add(rec_len)
@@ -1724,23 +1731,27 @@ fn write_entry(
     bytes: &mut [u8],
     offset: usize,
     inode: InodeId,
-    rec_len: u16,
+    rec_len: usize,
     name: &[u8],
     kind: DirectoryEntryKind,
 ) -> Result<()> {
     // The record length is owned by the caller so existing free-space shape can
     // be preserved when inserting into a hole or splitting a live entry.
-    let rec_len_usize = usize::from(rec_len);
-    if rec_len_usize < required_name_rec_len(name.len())?
+    let encoded_length = encode_record_length(rec_len, bytes.len())?;
+    if rec_len < required_name_rec_len(name.len())?
         || offset
-            .checked_add(rec_len_usize)
+            .checked_add(rec_len)
             .ok_or(Error::ArithmeticOverflow)?
             > bytes.len()
     {
         return Err(Error::InvalidDirectoryEntry);
     }
     put_le_u32(bytes, disk_offset(offset), inode.as_u32())?;
-    put_le_u16(bytes, disk_offset(offset).checked_add_bytes(4)?, rec_len)?;
+    put_le_u16(
+        bytes,
+        disk_offset(offset).checked_add_bytes(4)?,
+        encoded_length,
+    )?;
     *bytes
         .get_mut(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
         .ok_or(Error::InvalidDirectoryEntry)? =
@@ -1762,14 +1773,14 @@ fn write_entry(
     )?;
     if name_end
         < offset
-            .checked_add(rec_len_usize)
+            .checked_add(rec_len)
             .ok_or(Error::ArithmeticOverflow)?
     {
         bytes
             .get_mut(
                 name_end
                     ..offset
-                        .checked_add(rec_len_usize)
+                        .checked_add(rec_len)
                         .ok_or(Error::ArithmeticOverflow)?,
             )
             .ok_or(Error::InvalidDirectoryEntry)?
@@ -1814,7 +1825,7 @@ fn checked_rec_len(value: usize) -> Result<usize> {
     Ok(aligned)
 }
 
-/// Converts a checked record length into the on-disk `rec_len` field.
+/// Converts an index count or limit into its on-disk field.
 /// # Errors
 ///
 /// Returns an error when the record length cannot be represented as an ext4 `u16` field.
@@ -1827,6 +1838,56 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    /// # Errors
+    /// Propagates fixture encoding and directory surgery failures.
+    /// # Panics
+    /// Fails if independent full-block wire markers lose their byte-length meaning.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independently encoded disk fields with directory behavior"
+    )]
+    fn full_block_dirents_support_64k_read_and_mutation() -> Result<()> {
+        for marker in [0_u16, u16::MAX] {
+            let mut bytes = memory::repeated_vec(0, 65_536)?;
+            put_le_u16(&mut bytes, disk_offset(4), marker)?;
+            let mut block = DirectoryBlock::new(bytes, DirectoryChecksum::None);
+            assert!(block.entries()?.is_empty());
+            assert!(block.records()?.is_empty());
+            let name = Ext4Name::new(b"file")?;
+            assert!(block.insert(inode(12)?, &name, DirectoryEntryKind::File)?);
+            assert_eq!(
+                block.find(&name)?.map(|entry| entry.inode()),
+                Some(inode(12)?)
+            );
+            assert!(block.insert(
+                inode(13)?,
+                &Ext4Name::new(b"second")?,
+                DirectoryEntryKind::File
+            )?);
+            assert_eq!(block.records()?.len(), 2);
+            assert!(block.remove(&name)?.is_some());
+        }
+        let mut block = DirectoryBlock::empty(65_536, DirectoryChecksum::None)?;
+        block.initialize_free_space()?;
+        assert_eq!(le_u16(block.bytes(), disk_offset(4))?, u16::MAX);
+        let mut routes = Vec::new();
+        routes.try_push(DxEntry::new(0, 1)?)?;
+        let index = DxIndex::from_routes(
+            dx_capacity(65_536, DX_NODE_COUNT_OFFSET, DirectoryChecksum::None)?,
+            routes,
+        )?;
+        let mut bytes = memory::repeated_vec(0, 65_536)?;
+        write_htree_node(&mut bytes, &index, DirectoryChecksum::None)?;
+        assert_eq!(
+            DxIndex::parse_node(&bytes, DirectoryChecksum::None)?.len(),
+            1
+        );
+        let small = memory::repeated_vec(0, 4096)?;
+        assert!(DirectoryEntry::parse_all(&small).is_err());
+        Ok(())
+    }
 
     /// Builds a fixed nonzero inode id for directory-format tests.
     /// # Errors
