@@ -18,6 +18,7 @@ use commit::{
 };
 use staging::{
     BitmapInitializationTransition, BlockImage, EncryptedBlockBase, GroupDelta, RangeWrite,
+    StagedFileWrite,
 };
 
 /// Extent-tree reader that overlays this transaction's staged metadata blocks on the device.
@@ -321,7 +322,7 @@ struct MetadataMutation<'storage, 'epoch> {
     /// Per-group allocation count deltas to fold into descriptors.
     group_deltas: Vec<GroupDelta>,
     /// Ordered file data writes that must reach disk before metadata commit.
-    data_writes: Vec<RangeWrite>,
+    file_writes: Vec<StagedFileWrite>,
     /// Staged cluster-reference changes to apply after journal commit.
     cluster_deltas: Vec<ClusterReferenceDelta>,
     /// Superblock free-cluster delta accumulated by this transaction.

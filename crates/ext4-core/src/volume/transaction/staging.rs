@@ -68,3 +68,12 @@ pub(super) struct RangeWrite {
     /// Bytes to write at the offset.
     pub(super) bytes: Vec<u8>,
 }
+
+/// Persistence authority retained by each staged file-data update.
+#[derive(Debug)]
+pub(super) enum StagedFileWrite {
+    /// Data that must reach its home location before the metadata commit.
+    Ordered(RangeWrite),
+    /// A complete data block that must travel through the journal commit and checkpoint.
+    Journaled(JournalBlock),
+}
