@@ -625,15 +625,3 @@ pub(super) fn reject_reserved_directory_name(name: &Ext4Name) -> Result<()> {
     }
 }
 
-impl MutationResolvePass<'_, '_, '_> {
-    /// Seals restart-local filesystem staging after the public mutation operations finish.
-    /// # Errors
-    /// Returns the metadata resolver's validation, allocation, or suspended-I/O failure.
-    pub fn resolve(
-        self,
-        ticket: u64,
-        coordinator: &MutationCoordinatorState,
-    ) -> Result<ResolvedMutation> {
-        self.mutation.resolve(ticket, coordinator)
-    }
-}
