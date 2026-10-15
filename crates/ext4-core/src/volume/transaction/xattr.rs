@@ -110,6 +110,32 @@ impl MutationResolvePass<'_, '_, '_> {
 }
 
 impl MetadataMutation<'_, '_> {
+    /// Retires execution privileges in the same transaction as a file-content change.
+    /// The core has no authority that permits retaining setid or file capabilities.
+    /// # Errors
+    /// Returns inode, xattr, allocation-accounting, or serialization failures before commit.
+    pub(super) fn retire_file_privileges(&mut self, raw_inode: &mut LiveInodeRecord) -> Result<()> {
+        let inode = raw_inode.parse()?;
+        let permissions = inode.security().permissions().without_file_privileges();
+        if permissions != inode.security().permissions() {
+            raw_inode.set_permissions(permissions)?;
+        }
+        let mut xattrs = self.xattr_set_for_raw_inode(raw_inode)?;
+        let capability = xattrs
+            .public()
+            .entries()
+            .find(|(name, _)| {
+                name.namespace() == crate::XattrNamespace::Security && name.local() == b"capability"
+            })
+            .map(|(name, _)| name.try_clone())
+            .transpose()?;
+        if let Some(capability) = capability {
+            xattrs.public_mut().remove(&capability)?;
+            self.store_xattr_set(raw_inode, &xattrs)?;
+        }
+        Ok(())
+    }
+
     /// Builds the exact post-mutation metadata projection for one staged live inode.
     /// # Errors
     ///

@@ -768,6 +768,13 @@ impl Ext4Permissions {
         }
     }
 
+    /// Removes executable identity privileges when file contents change.
+    /// Non-executable setgid is not an execution privilege and remains intact.
+    pub(crate) const fn without_file_privileges(self) -> Self {
+        let removed = if self.0 & 0o010 != 0 { 0o6000 } else { 0o4000 };
+        Self(self.0 & !removed)
+    }
+
     /// Returns permission bits for inode encoding.
     #[must_use]
     pub const fn as_u16(self) -> u16 {

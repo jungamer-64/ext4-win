@@ -2022,3 +2022,70 @@ fn directory_moves_revalidate_destination_ancestry() -> Result<()> {
     ));
     Ok(())
 }
+
+/// # Errors
+/// Returns fixture, privilege staging, data mutation, or remount failures.
+/// # Panics
+/// Fails if content mutation preserves execution authority or changes non-executable setgid.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare durable privilege state with independent modification inputs"
+)]
+fn content_mutation_retires_execution_privileges() -> Result<()> {
+    for operation in 0..3 {
+        let mut fixture = Fixture::new()?;
+        let file = fixture.a;
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_posix_security(
+                node,
+                Ext4Security::new(namespace_owner(), Ext4Permissions::new(0o6777)?),
+            )?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::Security, b"capability")?,
+                XattrValue::new(&[1, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])?,
+            )
+        })?;
+        fixture.mutate(|pass| {
+            let file = pass.file(file)?;
+            match operation {
+                0 => pass.write_file_range(file, FileOffset::ZERO, b"changed"),
+                1 => pass.truncate_file(file, FileSize::from_bytes(0)),
+                _ => pass.extend_file(file, FileSize::from_bytes(8192)),
+            }
+        })?;
+        fixture.remount()?;
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(file)?.security().permissions().as_u16()))?,
+            0o777
+        );
+        assert!(
+            fixture
+                .read(|pass| pass.read_xattr(
+                    NodeId::File(file),
+                    &XattrName::new(XattrNamespace::Security, b"capability")?
+                ))?
+                .is_none()
+        );
+    }
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(file))?;
+        pass.set_posix_security(
+            node,
+            Ext4Security::new(namespace_owner(), Ext4Permissions::new(0o2640)?),
+        )
+    })?;
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.write_file_range(file, FileOffset::ZERO, b"Z")
+    })?;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_file(file)?.security().permissions().as_u16()))?,
+        0o2640
+    );
+    Ok(())
+}

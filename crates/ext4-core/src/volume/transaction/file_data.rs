@@ -231,6 +231,7 @@ impl MutationResolvePass<'_, '_, '_> {
             if let Some(encoded_new_size) = encoded_new_size {
                 raw_inode.set_encoded_size(encoded_new_size)?;
             }
+            pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_contents(pass.now)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;
             Ok(())
@@ -275,6 +276,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 offset = offset.checked_add_len(width)?;
             }
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_metadata(pass.now)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;
             Ok(())
@@ -307,6 +309,7 @@ impl MutationResolvePass<'_, '_, '_> {
             let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
             pass.retain_file_allocation(&mut tree, bound)?;
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_metadata(pass.now)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;
             pass.reserve_file_allocation(file, bound)
@@ -862,6 +865,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 )?;
             }
             raw_inode.set_encoded_size(encoded_size)?;
+            pass.mutation.retire_file_privileges(&mut raw_inode)?;
             raw_inode.touch_contents(pass.now)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;
             Ok(())
@@ -917,8 +921,9 @@ impl MutationResolvePass<'_, '_, '_> {
                 }
             }
             raw_inode.set_encoded_size(encoded_size)?;
-            raw_inode.touch_contents(pass.now)?;
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.retire_file_privileges(&mut raw_inode)?;
+            raw_inode.touch_contents(pass.now)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;
             Ok(())
         })
