@@ -23,6 +23,7 @@ pub(super) fn verify_inode_contracts(
     )?;
     verify_times_and_xattrs(linux, &image)?;
     verify_acl_contract(linux, &root, &image)?;
+    verify_ownership_privileges(linux, &root, &image)?;
     request(linux, &image, "set_inode_field /payload flags 0x84000")?;
     verify_internal_e2fsck_clean(linux, &image, "journal-data baseline")?;
     verify_data_cuts(linux, &root, &image)?;
@@ -49,6 +50,72 @@ fn request(linux: LinuxEnvironment, image: &Path, text: &str) -> TaskResult<Stri
         );
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Observes setid and capability retirement from independently encoded privilege-bearing inodes.
+/// # Errors
+/// Returns oracle, ownership mutation, mode/capability mismatch or filesystem consistency failures.
+fn verify_ownership_privileges(
+    linux: LinuxEnvironment,
+    root: &Path,
+    image: &Path,
+) -> TaskResult<()> {
+    let capability = root.join("file-capability.bin");
+    fs::write(
+        &capability,
+        [1, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    )?;
+    for (before, expected) in [("0106777", 0o777), ("0106640", 0o2640)] {
+        request(linux, image, "set_inode_field /payload uid 1000")?;
+        request(linux, image, "set_inode_field /payload gid 1000")?;
+        request(
+            linux,
+            image,
+            &format!("set_inode_field /payload mode {before}"),
+        )?;
+        request(
+            linux,
+            image,
+            &format!(
+                "ea_set -f \"{}\" /payload security.capability",
+                linux.tool_path(&capability)?
+            ),
+        )?;
+        verify_internal_e2fsck_clean(linux, image, "ownership privilege baseline")?;
+        drive_internal_core_mutation(image, |pass| {
+            let (_, file) = mutation_root_file(pass, &ext4_core::Ext4Name::new(b"payload")?)?;
+            let current = pass
+                .staged_node_metadata(ext4_core::NodeId::File(file))?
+                .security();
+            let node = pass.node(ext4_core::NodeId::File(file))?;
+            pass.set_posix_security(
+                node,
+                ext4_core::Ext4Security::new(
+                    ext4_core::Ext4Owner::new(
+                        ext4_core::Ext4Uid::from_u32(0),
+                        current.owner().gid(),
+                    ),
+                    current.permissions(),
+                ),
+            )
+        })?;
+        let stat = request(linux, image, "stat /payload")?;
+        let mode = stat
+            .split_whitespace()
+            .skip_while(|field| *field != "Mode:")
+            .nth(1)
+            .ok_or_else(|| io::Error::other("debugfs omitted the inode mode"))?;
+        let mode = u16::from_str_radix(mode, 8)?;
+        if mode != expected {
+            return Err(io::Error::other(format!(
+                "ownership mutation mode differs: actual={mode:o}, expected={expected:o}"
+            ))
+            .into());
+        }
+        debugfs_require_xattr_absent(linux, image, "/payload", b"security.capability")?;
+        verify_internal_e2fsck_clean(linux, image, "ownership privilege retirement")?;
+    }
+    Ok(())
 }
 
 /// Checks the payload and allocation endpoint when journaled storage retires beside ordered data.

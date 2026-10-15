@@ -859,10 +859,11 @@ impl MutationResolvePass<'_, '_, '_> {
     }
 
     /// Updates POSIX owner and permission state representable by ext4 inode fields.
+    /// Changing a non-directory's owner or group retires executable setid bits and file
+    /// capabilities. Directory inheritance bits and non-executable setgid remain intact.
     ///
     /// # Errors
-    /// Returns an error when the inode leaves the mutable write domain or the
-    /// inode record cannot be rewritten.
+    /// Returns inode-policy, xattr, allocation or serialization failures before commit.
     pub fn set_posix_security(
         &mut self,
         node: TransactionNode,
@@ -883,6 +884,10 @@ impl MutationResolvePass<'_, '_, '_> {
             }
             raw_inode.set_owner(security.owner())?;
             raw_inode.set_permissions(security.permissions())?;
+            if security.owner() != inode.security().owner() && inode.kind() != InodeKind::Directory
+            {
+                pass.mutation.retire_file_privileges(&mut raw_inode)?;
+            }
             raw_inode.touch_metadata(pass.now)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;
             Ok(())

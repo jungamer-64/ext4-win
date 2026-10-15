@@ -150,7 +150,7 @@ impl MetadataMutation<'_, '_> {
         self.store_xattr_set(raw_inode, &set)
     }
 
-    /// Retires execution privileges in the same transaction as a file-content change.
+    /// Retires execution privileges within the transaction changing contents or ownership.
     /// The core has no authority that permits retaining setid or file capabilities.
     /// # Errors
     /// Returns inode, xattr, allocation-accounting, or serialization failures before commit.

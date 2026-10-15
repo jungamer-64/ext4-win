@@ -2091,6 +2091,88 @@ fn content_mutation_retires_execution_privileges() -> Result<()> {
 }
 
 /// # Errors
+/// Returns fixture, security mutation, xattr or remount failures.
+/// # Panics
+/// Fails if ownership changes retain execution privileges or discard access policy or mode semantics.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare durable ownership, setid and capability state with independent transition inputs"
+)]
+fn ownership_mutation_retires_execution_privileges() -> Result<()> {
+    let uid_changed = Ext4Owner::new(Ext4Uid::from_u32(0), Ext4Gid::from_u32(1000));
+    let gid_changed = Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(0));
+    for (before, owner, requested, expected, keeps_capability) in [
+        (0o6777, uid_changed, 0o6777, 0o777, false),
+        (0o6777, gid_changed, 0o6777, 0o777, false),
+        (0o6640, uid_changed, 0o6640, 0o2640, false),
+        (0o6777, namespace_owner(), 0o6755, 0o6755, true),
+    ] {
+        let mut fixture = Fixture::new()?;
+        let file = fixture.a;
+        let capability = XattrName::new(XattrNamespace::Security, b"capability")?;
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::System, b"posix_acl_access")?,
+                XattrValue::new(&NAMED_ACL)?,
+            )?;
+            pass.set_posix_security(
+                node,
+                Ext4Security::new(namespace_owner(), Ext4Permissions::new(before)?),
+            )?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::Security, b"capability")?,
+                XattrValue::new(&[1, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])?,
+            )
+        })?;
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_posix_security(
+                node,
+                Ext4Security::new(owner, Ext4Permissions::new(requested)?),
+            )
+        })?;
+        fixture.remount()?;
+        let access = fixture.read(|pass| pass.load_access(NodeId::File(file)))?;
+        assert_eq!(access.security().owner(), owner);
+        assert_eq!(access.security().permissions().as_u16(), expected);
+        assert_eq!(access.acl().map(|acl| acl.users().len()), Some(1));
+        assert_eq!(
+            fixture
+                .read(|pass| pass.read_xattr(NodeId::File(file), &capability))?
+                .is_some(),
+            keeps_capability
+        );
+    }
+    let mut fixture = Fixture::new()?;
+    let directory = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.create_directory(
+            root,
+            &Ext4Name::new(b"setgid-directory")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o2755)?),
+        )
+        .map(|directory| directory.id())
+    })?;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::Directory(directory))?;
+        pass.set_posix_security(
+            node,
+            Ext4Security::new(uid_changed, Ext4Permissions::new(0o2755)?),
+        )
+    })?;
+    fixture.remount()?;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_directory(directory)?.security()))?,
+        Ext4Security::new(uid_changed, Ext4Permissions::new(0o2755)?)
+    );
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, enumeration, exact lookup, unlink or recovery failures.
 /// # Panics
 /// Fails if any supported ciphertext length loses its keyless namespace identity.

@@ -768,7 +768,7 @@ impl Ext4Permissions {
         }
     }
 
-    /// Removes executable identity privileges when file contents change.
+    /// Applies setid retirement for contents or ownership changes.
     /// Non-executable setgid is not an execution privilege and remains intact.
     pub(crate) const fn without_file_privileges(self) -> Self {
         let removed = if self.0 & 0o010 != 0 { 0o6000 } else { 0o4000 };
