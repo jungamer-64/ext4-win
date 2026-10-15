@@ -21,10 +21,10 @@ pub(super) fn verify_inode_contracts(
         &format!("write \"{}\" /payload", linux.tool_path(&payload)?),
     )?;
     verify_times_and_xattrs(linux, &image)?;
-    verify_directory_links(linux, &root, &image)?;
     request(linux, &image, "set_inode_field /payload flags 0x84000")?;
     verify_internal_e2fsck_clean(linux, &image, "journal-data baseline")?;
     verify_data_cuts(linux, &root, &image)?;
+    verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
     Ok(())
 }
