@@ -194,7 +194,7 @@ pub(crate) struct PreparedJournalCommit {
     journal_target: StorageTarget,
     /// Coordinator journal state after commit durability and before checkpoint completion.
     durable_journal: Journal<DirtyJournal>,
-    /// Immutable metadata overlay published at commit durability.
+    /// Immutable filesystem-block overlay published at commit durability.
     overlay: Vec<JournalBlock>,
     /// Independent checkpoint work prepared before the first lower write.
     checkpoint: PreparedJournalCheckpoint,
@@ -1448,12 +1448,12 @@ impl<State> Journal<State> {
     pub(crate) fn prepare_commit(
         &self,
         block_size: BlockSize,
-        metadata_blocks: Vec<JournalBlock>,
+        journal_blocks: Vec<JournalBlock>,
     ) -> Result<PreparedJournalCommit> {
         if self.superblock.start() != 0 {
             return Err(Error::JournalCorrupt);
         }
-        let prepared = self.prepare_metadata_transaction(block_size, &metadata_blocks)?;
+        let prepared = self.prepare_transaction(block_size, &journal_blocks)?;
         let journal_target = self.location.storage_target();
         let dirty_superblock =
             self.superblock
@@ -1516,9 +1516,9 @@ impl<State> Journal<State> {
 
         let mut home_writes = Vec::new();
         home_writes
-            .try_reserve_exact(metadata_blocks.len())
+            .try_reserve_exact(journal_blocks.len())
             .map_err(|_| Error::OutOfMemory)?;
-        for metadata in &metadata_blocks {
+        for metadata in &journal_blocks {
             home_writes.try_push(PlannedStorageWrite::new(
                 StorageTarget::Filesystem,
                 block_size.offset_of(metadata.block())?,
@@ -1531,7 +1531,7 @@ impl<State> Journal<State> {
             commit_write,
             journal_target,
             durable_journal,
-            overlay: metadata_blocks,
+            overlay: journal_blocks,
             checkpoint: PreparedJournalCheckpoint {
                 home_writes,
                 clean_write,
@@ -1543,22 +1543,22 @@ impl<State> Journal<State> {
     /// Builds descriptor, escaped data blocks, and commit block for a transaction.
     /// # Errors
     ///
-    /// Returns an error when the transaction is too large, a metadata block has the wrong size, data
+    /// Returns an error when the transaction is too large, a payload block has the wrong size, data
     /// escaping fails, or descriptor/commit serialization fails.
-    fn prepare_metadata_transaction(
+    fn prepare_transaction(
         &self,
         block_size: BlockSize,
-        metadata_blocks: &[JournalBlock],
+        journal_blocks: &[JournalBlock],
     ) -> Result<PreparedJournalTransaction> {
-        let credits = self.journal_credits(metadata_blocks.len(), block_size)?;
+        let credits = self.journal_credits(journal_blocks.len(), block_size)?;
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        for (index, metadata) in metadata_blocks.iter().enumerate() {
+        for (index, metadata) in journal_blocks.iter().enumerate() {
             if metadata.bytes().len() != block_bytes {
                 return Err(Error::InvalidWriteRange);
             }
             self.validate_replay_target(metadata.block())?;
-            if metadata_blocks
+            if journal_blocks
                 .get(..index)
                 .ok_or(Error::InvalidWriteRange)?
                 .iter()
@@ -1569,9 +1569,9 @@ impl<State> Journal<State> {
         }
         let mut data_blocks = Vec::new();
         data_blocks
-            .try_reserve_exact(metadata_blocks.len())
+            .try_reserve_exact(journal_blocks.len())
             .map_err(|_| Error::OutOfMemory)?;
-        for metadata in metadata_blocks {
+        for metadata in journal_blocks {
             let mut data = memory::copied_slice(metadata.bytes())?;
             if starts_with_jbd2_magic(&data) {
                 put_be_u32(&mut data, disk_offset(0), 0)?;
@@ -1590,12 +1590,12 @@ impl<State> Journal<State> {
             .try_reserve_exact(log_capacity)
             .map_err(|_| Error::OutOfMemory)?;
         let mut first = 0_usize;
-        while first < metadata_blocks.len() {
-            let end = self.descriptor_group_end(first, metadata_blocks.len(), block_size)?;
+        while first < journal_blocks.len() {
+            let end = self.descriptor_group_end(first, journal_blocks.len(), block_size)?;
             log_blocks.try_push(
                 self.encode_descriptor_block(
                     sequence,
-                    metadata_blocks
+                    journal_blocks
                         .get(first..end)
                         .ok_or(Error::InvalidWriteRange)?,
                     data_blocks
@@ -1650,7 +1650,7 @@ impl<State> Journal<State> {
     /// Computes exact descriptor and ring credits from the active wire profile.
     /// # Errors
     ///
-    /// Returns an error when no metadata payload is present, a descriptor cannot hold its required
+    /// Returns an error when no payload is present, a descriptor cannot hold its required
     /// explicit UUID tag, arithmetic overflows, or the complete transaction does not fit the ring.
     fn journal_credits(&self, payloads: usize, block_size: BlockSize) -> Result<JournalCredits> {
         if payloads == 0 || block_size != self.geometry.block_size {
@@ -2001,7 +2001,7 @@ impl<State> Journal<State> {
         Ok(())
     }
 
-    /// Encodes descriptor tags for the metadata blocks in a new transaction.
+    /// Encodes descriptor tags for filesystem blocks in a new transaction.
     /// # Errors
     ///
     /// Returns an error when the block size cannot be allocated, a data block is missing, a tag does
@@ -2009,7 +2009,7 @@ impl<State> Journal<State> {
     fn encode_descriptor_block(
         &self,
         sequence: JournalSequence,
-        metadata_blocks: &[JournalBlock],
+        journal_blocks: &[JournalBlock],
         data_blocks: &[Vec<u8>],
         block_size: BlockSize,
     ) -> Result<Vec<u8>> {
@@ -2019,9 +2019,9 @@ impl<State> Journal<State> {
         )?;
         Jbd2Header::descriptor(sequence.get()).encode(&mut block)?;
         let mut offset = JOURNAL_HEADER_BYTES;
-        for (index, metadata) in metadata_blocks.iter().enumerate() {
+        for (index, metadata) in journal_blocks.iter().enumerate() {
             let last =
-                index.checked_add(1).ok_or(Error::ArithmeticOverflow)? == metadata_blocks.len();
+                index.checked_add(1).ok_or(Error::ArithmeticOverflow)? == journal_blocks.len();
             let data = data_blocks.get(index).ok_or(Error::InvalidWriteRange)?;
             let flags = if index == 0 {
                 0
@@ -3149,7 +3149,7 @@ struct PreparedJournalTransaction {
 struct JournalCredits {
     /// Number of descriptor blocks required by the tag stream.
     descriptors: usize,
-    /// Number of metadata payload blocks.
+    /// Number of filesystem payload blocks.
     payloads: usize,
     /// Descriptor, payload, and final commit blocks combined.
     total: u32,
@@ -3191,7 +3191,7 @@ fn read_journal_block(
     reader.read_exact_at(offset, out)
 }
 
-/// Returns whether a metadata payload must be escaped before journaling.
+/// Returns whether a payload must be escaped before journaling.
 fn starts_with_jbd2_magic(bytes: &[u8]) -> bool {
     bytes
         .get(0..4)
@@ -3724,8 +3724,7 @@ mod tests {
                     ))
                     .map_err(|_metadata| Error::OutOfMemory)?;
             }
-            let prepared =
-                journal.prepare_metadata_transaction(journal.geometry.block_size, &metadata)?;
+            let prepared = journal.prepare_transaction(journal.geometry.block_size, &metadata)?;
             let mut descriptors = 0_usize;
             for block in &prepared.log_blocks {
                 if let Ok(header) = super::Jbd2Header::parse(block)
@@ -3771,7 +3770,7 @@ mod tests {
                     .ok_or(Error::ArithmeticOverflow)?,
             )?;
             assert_eq!(
-                narrow.prepare_metadata_transaction(narrow.geometry.block_size, &metadata),
+                narrow.prepare_transaction(narrow.geometry.block_size, &metadata),
                 Err(Error::TransactionTooLarge)
             );
 
@@ -3786,8 +3785,7 @@ mod tests {
                     .checked_add(10)
                     .ok_or(Error::ArithmeticOverflow)?,
             )?;
-            let prepared =
-                wide.prepare_metadata_transaction(wide.geometry.block_size, &metadata)?;
+            let prepared = wide.prepare_transaction(wide.geometry.block_size, &metadata)?;
             assert_eq!(prepared.descriptor, 14);
             assert_eq!(prepared.commit, 3);
             assert_eq!(prepared.next_cursor.head, 4);
@@ -3905,12 +3903,12 @@ mod tests {
                 JournalBlock::new(BlockAddress::new(10), vec![1; 1024]),
             ];
             assert_eq!(
-                external.prepare_metadata_transaction(external.geometry.block_size, &duplicate),
+                external.prepare_transaction(external.geometry.block_size, &duplicate),
                 Err(Error::JournalCorrupt)
             );
             let outside = [JournalBlock::new(BlockAddress::new(100), vec![0; 1024])];
             assert_eq!(
-                external.prepare_metadata_transaction(external.geometry.block_size, &outside),
+                external.prepare_transaction(external.geometry.block_size, &outside),
                 Err(Error::JournalCorrupt)
             );
 
@@ -3933,7 +3931,7 @@ mod tests {
             };
             let collision = [JournalBlock::new(BlockAddress::new(45), vec![0; 1024])];
             assert_eq!(
-                internal.prepare_metadata_transaction(block_size, &collision),
+                internal.prepare_transaction(block_size, &collision),
                 Err(Error::JournalCorrupt)
             );
             Ok(())

@@ -442,7 +442,7 @@ pub struct CommittedEpoch {
     pub(super) fscrypt_keys: FscryptKeySet,
     /// Committed allocation-cluster ownership.
     pub(super) clusters: ClusterReferenceIndex,
-    /// Durable journal metadata not yet copied to home blocks.
+    /// Durable journal payloads not yet copied to home blocks.
     pub(super) overlay: Vec<JournalBlock>,
 }
 
@@ -634,9 +634,10 @@ impl JournalCoordinatorState {
 
 /// Current committed metadata and its resource-version observation authority.
 ///
-/// Constructed by the coordinator at each synchronous pass. An epoch retains metadata and
-/// keys, not old disk sectors; suspended reads must revalidate their inode dependencies before
-/// interpreting any returned buffer. Unrelated publications do not invalidate a read.
+/// Constructed by the coordinator at each synchronous pass. An epoch retains journal payloads and
+/// keys, without snapshotting unrelated backing sectors; suspended reads must revalidate their
+/// inode dependencies before interpreting a returned buffer. Unrelated publications do not
+/// invalidate a read.
 #[derive(Debug)]
 pub struct CommittedReadContext<'state> {
     /// Current metadata and cache borrow.
