@@ -164,7 +164,7 @@ impl StreamMetadata {
             links: if directory {
                 1
             } else {
-                u32::from(snapshot.links_count().get())
+                u32::from(snapshot.links_count().on_disk_count())
             },
             directory: u32::from(directory),
             writable_data: u32::from(snapshot.data_policy() == ext4_core::NodeDataPolicy::Writable),

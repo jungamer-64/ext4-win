@@ -1258,7 +1258,7 @@ impl MetadataMutation<'_, '_> {
     fn increment_directory_links(&mut self, inode_id: InodeId, now: Ext4Timestamp) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
-        raw_inode.increment_links_count()?;
+        raw_inode.increment_directory_links()?;
         raw_inode.set_timestamps(now)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
@@ -1272,7 +1272,7 @@ impl MetadataMutation<'_, '_> {
     fn decrement_directory_links(&mut self, inode_id: InodeId, now: Ext4Timestamp) -> Result<()> {
         let inode_index = self.ensure_inode_update(inode_id)?;
         let mut raw_inode = self.staged_live_inode(inode_index)?;
-        let _links = raw_inode.decrement_links_count()?;
+        raw_inode.decrement_directory_links()?;
         raw_inode.set_timestamps(now)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())

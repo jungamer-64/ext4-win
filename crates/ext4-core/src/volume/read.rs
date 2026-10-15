@@ -971,9 +971,11 @@ impl EpochReadView<'_, '_> {
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<HardLinks> {
         let expected = match target {
-            HardLinkNodeId::File(file) => usize::from(self.load_file(file)?.links_count().get()),
+            HardLinkNodeId::File(file) => {
+                usize::from(self.load_file(file)?.links_count().on_disk_count())
+            }
             HardLinkNodeId::Symlink(symlink) => {
-                usize::from(self.load_symlink(symlink)?.links_count().get())
+                usize::from(self.load_symlink(symlink)?.links_count().on_disk_count())
             }
         };
         let target_node = NodeId::from(target);

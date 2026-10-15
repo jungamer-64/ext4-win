@@ -1005,7 +1005,13 @@ impl HardLinkCountEffect {
         const WINDOWS_HARD_LINK_LIMIT: u16 = 1024;
         match self {
             Self::Preserve => Ok(()),
-            Self::Increase if links.get() < WINDOWS_HARD_LINK_LIMIT => Ok(()),
+            Self::Increase
+                if links
+                    .known_count()
+                    .is_some_and(|count| count < WINDOWS_HARD_LINK_LIMIT) =>
+            {
+                Ok(())
+            }
             Self::Increase => Err(DriverError::from(ext4_core::Error::TooManyLinks)),
         }
     }

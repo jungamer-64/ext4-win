@@ -1262,6 +1262,8 @@ pub(crate) struct FeatureSet {
     sparse_superblock_layout: SparseSuperblockLayout,
     /// Directory indexing capability.
     directory_indexing: DirectoryIndexing,
+    /// Mounted directory reference accounting.
+    directory_links: crate::disk_format::inode::DirectoryLinkEncoding,
     /// Allocation bitmap addressing domain.
     allocation_bitmap_domain: AllocationBitmapDomain,
     /// Source used to construct mounted checksum seeds.
@@ -1415,6 +1417,11 @@ impl FeatureSet {
                 DirectoryIndexing::LargeDirectory
             } else {
                 DirectoryIndexing::Standard
+            },
+            directory_links: if read_only_compat & RO_COMPAT_DIR_NLINK != 0 {
+                crate::disk_format::inode::DirectoryLinkEncoding::Uncounted
+            } else {
+                crate::disk_format::inode::DirectoryLinkEncoding::Counted
             },
             allocation_bitmap_domain: if read_only_compat & RO_COMPAT_BIGALLOC != 0 {
                 AllocationBitmapDomain::Clusters
@@ -2030,6 +2037,7 @@ impl Superblock {
             self.features.directory_size_encoding,
             self.features.inode_block_count_encoding,
             self.block_size,
+            self.features.directory_links,
         )
     }
 

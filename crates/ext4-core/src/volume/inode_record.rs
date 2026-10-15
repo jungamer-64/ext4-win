@@ -383,6 +383,33 @@ impl LiveInodeRecord {
         self.raw.set_links_count(links.incremented()?)
     }
 
+    /// Updates directory reference accounting under this record's validated mounted policy.
+    /// # Errors
+    /// Returns wrong kind, malformed count, or saturated counted-directory state.
+    pub(super) fn increment_directory_links(&mut self) -> Result<()> {
+        let inode = self.parse()?;
+        if inode.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        let indexed = matches!(inode.directory_storage_kind()?, DirectoryStorageKind::HTree);
+        let links = inode
+            .links_count()
+            .directory_incremented(self.raw.encoding.directory_links(), indexed)?;
+        self.raw.set_links_count(links)
+    }
+
+    /// Removes one child reference without resolving an uncounted directory to an exact count.
+    /// # Errors
+    /// Returns wrong kind or invalid directory reference state.
+    pub(super) fn decrement_directory_links(&mut self) -> Result<()> {
+        let inode = self.parse()?;
+        if inode.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        self.raw
+            .set_links_count(inode.links_count().directory_decremented()?)
+    }
+
     /// Decrements link count and returns the resulting live/deletion boundary.
     /// # Errors
     ///
@@ -759,7 +786,7 @@ impl RawInodeRecord<Vec<u8>> {
         put_le_u16(
             &mut self.bytes,
             disk_offset(INODE_LINKS_COUNT_OFFSET),
-            links.get(),
+            links.on_disk_count(),
         )
     }
 
@@ -1151,6 +1178,7 @@ mod tests {
                 crate::disk_format::inode::DirectorySizeEncoding::LargeDirectory,
                 crate::disk_format::inode::InodeBlockCountEncoding::HugeFile,
                 block_size()?,
+                crate::disk_format::inode::DirectoryLinkEncoding::Counted,
             ),
         })
     }

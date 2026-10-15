@@ -259,15 +259,13 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidEncryptionContext
         | Error::InvalidVerityMetadata
         | Error::InvalidWriteRange
+        | Error::InvalidTimestamp
         | Error::DirectoryCycle
         | Error::TransactionTooLarge => STATUS_INVALID_PARAMETER,
         Error::TruncatedStructure
         | Error::InvalidMagic
         | Error::InvalidSuperblock
         | Error::InvalidClusterGeometry
-        | Error::InvalidTimestamp
-        | Error::InvalidTimestamp
-        | Error::InvalidTimestamp
         | Error::InvalidInode
         | Error::InvalidOrphanTracking
         | Error::InvalidExtentTree

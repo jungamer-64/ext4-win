@@ -273,6 +273,15 @@ impl EncodedInodeBlockCount {
     }
 }
 
+/// Directory reference accounting selected by DIR_NLINK.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryLinkEncoding {
+    /// Every directory keeps its exact reference count.
+    Counted,
+    /// Indexed directories may retain an uncounted reference state.
+    Uncounted,
+}
+
 /// Mounted inode size and allocation-count encoding policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct InodeDataEncoding {
@@ -284,6 +293,8 @@ pub(crate) struct InodeDataEncoding {
     block_count: InodeBlockCountEncoding,
     /// Mounted block geometry used by size limits and block units.
     block_size: BlockSize,
+    /// Mounted directory reference-count format.
+    directory_links: DirectoryLinkEncoding,
 }
 
 impl InodeDataEncoding {
@@ -293,13 +304,20 @@ impl InodeDataEncoding {
         directory_size: DirectorySizeEncoding,
         block_count: InodeBlockCountEncoding,
         block_size: BlockSize,
+        directory_links: DirectoryLinkEncoding,
     ) -> Self {
         Self {
             file_size,
             directory_size,
             block_count,
             block_size,
+            directory_links,
         }
+    }
+
+    /// Mounted reference-count policy for indexed directories.
+    pub(crate) const fn directory_links(self) -> DirectoryLinkEncoding {
+        self.directory_links
     }
 
     /// Returns the largest byte size addressable by the extent logical-block field.
@@ -577,6 +595,7 @@ impl Ext4Timestamp {
             base.checked_add(epoch).ok_or(Error::ArithmeticOverflow)?,
             extension >> 2,
         )
+        .map_err(|_| Error::InvalidInode)
     }
 
     /// Signed-base bits at the on-disk serialization boundary.
@@ -1020,9 +1039,9 @@ pub enum Ext4LinkCount {
 
 impl Ext4LinkCount {
     /// Link count for a newly linked file or symlink.
-    pub const ONE: Self = Self(NonZeroU16::MIN);
+    pub const ONE: Self = Self::Known(NonZeroU16::MIN);
     /// Link count for a newly created directory with `.` and its parent entry.
-    pub const TWO: Self = Self(match NonZeroU16::new(2) {
+    pub const TWO: Self = Self::Known(match NonZeroU16::new(2) {
         Some(value) => value,
         None => NonZeroU16::MIN,
     });
@@ -1033,13 +1052,18 @@ impl Ext4LinkCount {
     /// Returns an error when the count is zero, which belongs to deleted inode
     /// serialization rather than the live inode domain.
     pub fn new(value: u16) -> Result<Self> {
-        NonZeroU16::new(value).map(Self).ok_or(Error::InvalidInode)
+        NonZeroU16::new(value)
+            .map(Self::Known)
+            .ok_or(Error::InvalidInode)
     }
 
     /// Returns the raw count for on-disk encoding.
     #[must_use]
-    pub const fn get(self) -> u16 {
-        self.0.get()
+    pub const fn on_disk_count(self) -> u16 {
+        match self {
+            Self::Known(count) => count.get(),
+            Self::UncountedDirectory => 1,
+        }
     }
 
     /// Returns the next representable live link count.
@@ -1047,16 +1071,71 @@ impl Ext4LinkCount {
     /// # Errors
     /// Returns an error when the ext4 link-count field is saturated.
     pub fn incremented(self) -> Result<Self> {
-        Self::new(self.get().checked_add(1).ok_or(Error::TooManyLinks)?)
+        let count = self.known_count().ok_or(Error::InvalidInode)?;
+        if count >= 65_000 {
+            return Err(Error::TooManyLinks);
+        }
+        Self::new(count.checked_add(1).ok_or(Error::TooManyLinks)?)
     }
 
     /// Decrements this live link count and reports the live/deleted boundary.
     #[must_use]
     pub fn decremented(self) -> LinkCountAfterDecrement {
-        match self.get().checked_sub(1).and_then(NonZeroU16::new) {
-            Some(updated) => LinkCountAfterDecrement::StillLinked(Self(updated)),
+        if self == Self::UncountedDirectory {
+            return LinkCountAfterDecrement::StillLinked(self);
+        }
+        match self
+            .on_disk_count()
+            .checked_sub(1)
+            .and_then(NonZeroU16::new)
+        {
+            Some(updated) => LinkCountAfterDecrement::StillLinked(Self::Known(updated)),
             None => LinkCountAfterDecrement::Unlinked,
         }
+    }
+    /// Exact count, absent for directories whose references are not counted.
+    #[must_use]
+    pub const fn known_count(self) -> Option<u16> {
+        match self {
+            Self::Known(count) => Some(count.get()),
+            Self::UncountedDirectory => None,
+        }
+    }
+
+    /// Adds a child-directory reference under the inode's indexing and mounted feature policy.
+    /// # Errors
+    /// Returns too many links when counting is required at saturation, or invalid inode below two.
+    pub(crate) fn directory_incremented(
+        self,
+        encoding: DirectoryLinkEncoding,
+        indexed: bool,
+    ) -> Result<Self> {
+        let Some(count) = self.known_count() else {
+            return Ok(self);
+        };
+        if count < 2 {
+            return Err(Error::InvalidInode);
+        }
+        if count >= 65_000 {
+            if encoding == DirectoryLinkEncoding::Uncounted && indexed {
+                return Ok(Self::UncountedDirectory);
+            }
+            return Err(Error::TooManyLinks);
+        }
+        Self::new(count.checked_add(1).ok_or(Error::TooManyLinks)?)
+    }
+
+    /// Removes a child-directory reference while retaining the uncounted state.
+    /// # Errors
+    /// Returns invalid inode when a counted directory has no child reference to remove.
+    pub(crate) fn directory_decremented(self) -> Result<Self> {
+        let Some(count) = self.known_count() else {
+            return Ok(self);
+        };
+        if count <= 2 {
+            return Err(Error::InvalidInode);
+        }
+        Self::new(count.checked_sub(1).ok_or(Error::InvalidInode)?)
     }
 }
 
@@ -1508,11 +1587,19 @@ impl Inode {
     /// # Errors
     /// Returns an error for malformed storage facts or a zero link count.
     pub(crate) fn parse(id: InodeId, raw: &[u8], encoding: InodeDataEncoding) -> Result<Self> {
-        let links_count = Ext4LinkCount::new(le_u16(raw, disk_offset(26))?)?;
-        Ok(Self {
-            data: InodeData::parse(id, raw, encoding)?,
-            links_count,
-        })
+        let data = InodeData::parse(id, raw, encoding)?;
+        let count = le_u16(raw, disk_offset(26))?;
+        let links_count = if data.kind() == InodeKind::Directory && count == 1 {
+            if encoding.directory_links != DirectoryLinkEncoding::Uncounted
+                || !data.flags.has_indexed_directory()
+            {
+                return Err(Error::InvalidInode);
+            }
+            Ext4LinkCount::UncountedDirectory
+        } else {
+            Ext4LinkCount::new(count)?
+        };
+        Ok(Self { data, links_count })
     }
 
     /// Inode identifier.
@@ -1722,6 +1809,49 @@ fn parse_times(raw: &[u8]) -> Result<Ext4Times> {
 
 #[cfg(test)]
 mod tests {
+    /// # Errors
+    /// Returns malformed reference accounting for an expected valid transition.
+    /// # Panics
+    /// Fails when DIR_NLINK state changes under increment/decrement or saturation.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare ext4 directory reference accounting transitions"
+    )]
+    fn directory_link_accounting_preserves_uncounted_state() -> crate::Result<()> {
+        use super::DirectoryLinkEncoding;
+        let uncounted = Ext4LinkCount::UncountedDirectory;
+        assert_eq!(uncounted.known_count(), None);
+        assert_eq!(uncounted.on_disk_count(), 1);
+        assert_eq!(
+            uncounted.directory_incremented(DirectoryLinkEncoding::Uncounted, true)?,
+            uncounted
+        );
+        assert_eq!(uncounted.directory_decremented()?, uncounted);
+        let limit = Ext4LinkCount::new(65_000)?;
+        assert_eq!(
+            limit.directory_incremented(DirectoryLinkEncoding::Uncounted, true)?,
+            uncounted
+        );
+        assert_eq!(
+            limit.directory_incremented(DirectoryLinkEncoding::Counted, true),
+            Err(Error::TooManyLinks)
+        );
+        assert_eq!(
+            limit.directory_incremented(DirectoryLinkEncoding::Uncounted, false),
+            Err(Error::TooManyLinks)
+        );
+        assert_eq!(
+            Ext4LinkCount::TWO.directory_decremented(),
+            Err(Error::InvalidInode)
+        );
+        assert_eq!(
+            Ext4LinkCount::new(3)?.directory_decremented()?,
+            Ext4LinkCount::TWO
+        );
+        Ok(())
+    }
+
     /// Independent wire vectors cover signed base seconds, every epoch, and fractional precision.
     /// # Errors
     /// Returns a decoding or encoding failure for an expected valid time.
@@ -1757,7 +1887,7 @@ mod tests {
         );
         assert_eq!(
             Ext4Timestamp::decode(0, Some(4_000_000_000)),
-            Err(Error::InvalidTimestamp)
+            Err(Error::InvalidInode)
         );
         assert_eq!(
             Ext4Timestamp::new(2_147_483_648, 0)?.encode(false),
@@ -1812,6 +1942,7 @@ mod tests {
             DirectorySizeEncoding::LargeDirectory,
             InodeBlockCountEncoding::HugeFile,
             BlockSize::from_superblock_log(0)?,
+            crate::disk_format::inode::DirectoryLinkEncoding::Counted,
         ))
     }
 
@@ -1822,7 +1953,12 @@ mod tests {
     fn inode_bytes(mode: u16, flags: u32) -> Result<[u8; 128]> {
         let mut raw = [0_u8; 128];
         put_le_u16(&mut raw, super::disk_offset(0), mode)?;
-        put_le_u16(&mut raw, super::disk_offset(26), 1)?;
+        let links = if mode & super::MODE_KIND_MASK == MODE_DIRECTORY {
+            2
+        } else {
+            1
+        };
+        put_le_u16(&mut raw, super::disk_offset(26), links)?;
         put_le_u32(&mut raw, super::disk_offset(32), flags)?;
         Ok(raw)
     }
@@ -1922,6 +2058,7 @@ mod tests {
             DirectorySizeEncoding::Standard,
             InodeBlockCountEncoding::LegacySectors,
             block_size,
+            crate::disk_format::inode::DirectoryLinkEncoding::Counted,
         );
 
         assert_eq!(
@@ -2023,6 +2160,7 @@ mod tests {
             DirectorySizeEncoding::LargeDirectory,
             InodeBlockCountEncoding::LegacySectors,
             block_size,
+            crate::disk_format::inode::DirectoryLinkEncoding::Counted,
         );
         let largest_block_aligned_legacy_sectors = u64::from(u32::MAX) - 1;
         assert!(
