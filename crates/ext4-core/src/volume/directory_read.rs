@@ -343,6 +343,7 @@ impl DirectoryReader {
                     block.bytes(),
                     inode.id(),
                     view.superblock.directory_hash_seed(),
+                    view.superblock.directory_hash_signedness(),
                     view.superblock.directory_indexing().require_supported()?,
                     view.directory_checksum(inode),
                 )?;
@@ -950,7 +951,9 @@ mod tests {
         reason = "fallible fixtures use Result; assertions compare independently ordered names"
     )]
     fn cross_leaf_collision_walk_emits_all_pages_then_suffix() -> Result<()> {
-        use crate::disk_format::superblock::{DirectoryHashSeed, DirectoryHashVersion};
+        use crate::disk_format::superblock::{
+            DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
+        };
         let routes = alloc::vec![
             DxEntry::new(0, 1)?,
             DxEntry::new(3, 2)?,
@@ -961,6 +964,7 @@ mod tests {
             hash: DirectoryHashScheme::from_metadata(
                 DirectoryHashSeed::from_words([0; 4]),
                 DirectoryHashVersion::Legacy,
+                DirectoryHashSignedness::Signed,
             ),
             depth: 0,
             path: HtreePath {

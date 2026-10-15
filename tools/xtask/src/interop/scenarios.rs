@@ -337,6 +337,7 @@ pub(crate) fn verify_htree_interop(repository_root: &Path) -> TaskResult<()> {
     let linux = LinuxEnvironment::require(&manifest.e2fsprogs_version)?;
     let temporary_root = create_task_directory(repository_root, "htree-interop")?;
     let verification = (|| -> TaskResult<()> {
+        verify_unsigned_htree(linux, &temporary_root)?;
         verify_large_directory_depth_two(linux, &temporary_root)?;
         verify_directory_enumeration_scaling(linux, &temporary_root)?;
         verify_locked_directory_enumeration(linux, &temporary_root)?;
@@ -360,6 +361,77 @@ pub(crate) fn verify_htree_interop(repository_root: &Path) -> TaskResult<()> {
     combine_verification_and_cleanup(verification, cleanup)?;
     println!("ext4-core HTree interoperability profiles: PASS");
     Ok(())
+}
+
+/// Checks unsigned routing, enumeration and mutation on an independently indexed UTF-8 namespace.
+/// # Errors
+/// Returns formatting, oracle, lookup, enumeration or mutation failures.
+fn verify_unsigned_htree(linux: LinuxEnvironment, temporary_root: &Path) -> TaskResult<()> {
+    let root = temporary_root.join("unsigned-hash");
+    fs::create_dir(&root)?;
+    let image = root.join("filesystem.img");
+    format_htree_image(linux, &image, 32 * 1024 * 1024, 4096, true, false, 4)?;
+    let requests = root.join("namespace.requests");
+    let mut text = String::from("set_super_value flags 2\n");
+    for index in 0..800 {
+        writeln!(&mut text, "write /dev/null /日本語{index:04}")?;
+    }
+    fs::write(&requests, text)?;
+    let mut populate = linux.command("debugfs");
+    populate.args([
+        "-w",
+        "-f",
+        &linux.tool_path(&requests)?,
+        &linux.tool_path(&image)?,
+    ]);
+    run_checked(populate, "unsigned directory population")?;
+    let mut optimize = linux.command("e2fsck");
+    optimize.args(["-f", "-y", "-D", &linux.tool_path(&image)?]);
+    let output = optimize.output()?;
+    if !matches!(output.status.code(), Some(0 | 1)) {
+        return Err(io::Error::other("unsigned directory indexing failed").into());
+    }
+    verify_internal_e2fsck_clean(linux, &image, "unsigned directory baseline")?;
+    let source = ext4_core::Ext4Name::new("日本語0000".as_bytes()).map_err(core_task_error)?;
+    let destination = ext4_core::Ext4Name::new("移動先".as_bytes()).map_err(core_task_error)?;
+    drive_internal_core_mutation(&image, |pass| {
+        let root = ext4_core::DirectoryNodeId::ROOT;
+        for index in [0, 423, 799] {
+            let name = format!("日本語{index:04}");
+            let name = ext4_core::Ext4Name::new(name.as_bytes())?;
+            if !matches!(
+                ext4_core::CommittedReadPass::lookup_child(pass, root, &name)?,
+                ext4_core::ChildLookup::Found(_)
+            ) {
+                return Err(ext4_core::Error::DirectoryEntryNotFound);
+            }
+        }
+        let mut reader =
+            ext4_core::DirectoryReader::new(root, ext4_core::DirectoryScanCursor::start());
+        let mut count = 0_usize;
+        while ext4_core::CommittedReadPass::next_directory_entry(pass, &mut reader)?.is_some() {
+            count = count
+                .checked_add(1)
+                .ok_or(ext4_core::Error::ArithmeticOverflow)?;
+        }
+        // Eight hundred created names, lost+found and the two dot entries.
+        if count != 803 {
+            return Err(ext4_core::Error::InvalidDirectoryEntry);
+        }
+        let root = pass.directory(root)?;
+        pass.rename_child(
+            root,
+            &source,
+            root,
+            &destination,
+            ext4_core::NamespaceDestination::Vacant,
+        )
+    })?;
+    if !debugfs_path_exists(linux, &image, "/移動先")? {
+        return Err(io::Error::other("unsigned directory rename is absent from the oracle").into());
+    }
+    debugfs_require_absent(linux, &image, "/日本語0000")?;
+    verify_internal_e2fsck_clean(linux, &image, "unsigned directory mutation")
 }
 
 /// Number of maximum-length names committed atomically by the HTree fault workflow.
@@ -611,6 +683,13 @@ fn verify_htree_mutation_profile(
     }
 
     if block_size == 4096 && metadata_checksum && !large_directory {
+        let stats = debugfs_request_output(linux, &image, "stats")?;
+        if !stats.contains("signed_directory_hash") {
+            return Err(io::Error::other(
+                "directory mutation did not persist its hash interpretation",
+            )
+            .into());
+        }
         verify_directory_read_faults(&image, ext4_core::DirectoryNodeId::ROOT)?;
     }
     let (mut published_names, mut published_cursor) = read_directory_request(

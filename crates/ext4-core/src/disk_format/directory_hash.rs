@@ -2,7 +2,9 @@
 
 use core::array;
 
-use crate::disk_format::superblock::{DirectoryHashSeed, DirectoryHashVersion};
+use crate::disk_format::superblock::{
+    DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
+};
 use crate::platform::name::Ext4Name;
 
 /// Seed prescribed by the ext4 format when every stored seed word is zero.
@@ -63,7 +65,11 @@ pub(crate) struct DirectoryHashScheme {
 impl DirectoryHashScheme {
     /// Builds the scheme selected by validated on-disk metadata.
     #[must_use]
-    pub(crate) fn from_metadata(seed: DirectoryHashSeed, version: DirectoryHashVersion) -> Self {
+    pub(crate) fn from_metadata(
+        seed: DirectoryHashSeed,
+        version: DirectoryHashVersion,
+        signedness: DirectoryHashSignedness,
+    ) -> Self {
         let words = seed.words();
         let effective = if words.iter().any(|word| *word != 0) {
             words
@@ -72,7 +78,7 @@ impl DirectoryHashScheme {
         };
         Self {
             seed: HashState::from_words(effective),
-            version,
+            version: version.effective(signedness),
         }
     }
 
@@ -354,12 +360,43 @@ mod tests {
     use alloc::vec;
 
     use super::{DirectoryHash, DirectoryHashScheme};
-    use crate::disk_format::superblock::{DirectoryHashSeed, DirectoryHashVersion};
+    use crate::disk_format::superblock::{
+        DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
+    };
     use crate::platform::name::Ext4Name;
 
     /// Seed supplied to the independent e2fsprogs `debugfs dx_hash` oracle.
     const ORACLE_SEED: DirectoryHashSeed =
         DirectoryHashSeed::from_words([0x0403_0201, 0x0807_0605, 0x0c0b_0a09, 0x100f_0e0d]);
+
+    /// # Errors
+    /// Returns an error when the independent high-byte name vector cannot be constructed.
+    /// # Panics
+    /// Fails if filesystem-wide unsigned selection does not match independent hash vectors.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare effective base versions with independent e2fsprogs hashes"
+    )]
+    fn filesystem_unsigned_selector_applies_to_base_versions() -> crate::Result<()> {
+        let name = Ext4Name::from_disk(&[0x80, b'x'])?;
+        for (version, major, minor) in [
+            (DirectoryHashVersion::Legacy, 0xf734_1b56, 0),
+            (DirectoryHashVersion::HalfMd4, 0xed95_09f8, 0x76dd_19a1),
+            (DirectoryHashVersion::Tea, 0xdfb6_ad00, 0xcd05_b7a7),
+        ] {
+            assert_eq!(
+                DirectoryHashScheme::from_metadata(
+                    ORACLE_SEED,
+                    version,
+                    DirectoryHashSignedness::Unsigned,
+                )
+                .hash(&name),
+                DirectoryHash { major, minor }
+            );
+        }
+        Ok(())
+    }
 
     /// # Panics
     ///
@@ -416,7 +453,12 @@ mod tests {
         ];
         for (version, expected) in cases {
             assert_eq!(
-                DirectoryHashScheme::from_metadata(ORACLE_SEED, version).hash(&name),
+                DirectoryHashScheme::from_metadata(
+                    ORACLE_SEED,
+                    version,
+                    DirectoryHashSignedness::Signed
+                )
+                .hash(&name),
                 expected,
                 "version {version:?}"
             );
@@ -443,7 +485,12 @@ mod tests {
                 return;
             };
             assert_eq!(
-                DirectoryHashScheme::from_metadata(ORACLE_SEED, version).hash(&name),
+                DirectoryHashScheme::from_metadata(
+                    ORACLE_SEED,
+                    version,
+                    DirectoryHashSignedness::Signed
+                )
+                .hash(&name),
                 DirectoryHash { major, minor },
                 "version {version:?}, length {length}"
             );
@@ -484,7 +531,12 @@ mod tests {
         ];
         for (version, expected) in cases {
             assert_eq!(
-                DirectoryHashScheme::from_metadata(ORACLE_SEED, version).hash(&name),
+                DirectoryHashScheme::from_metadata(
+                    ORACLE_SEED,
+                    version,
+                    DirectoryHashSignedness::Signed
+                )
+                .hash(&name),
                 expected
             );
         }

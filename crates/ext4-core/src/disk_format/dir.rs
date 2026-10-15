@@ -6,7 +6,9 @@ use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::directory_hash::DirectoryHashScheme;
 use crate::disk_format::inode::InodeId;
-use crate::disk_format::superblock::{ChecksumSeed, DirectoryHashSeed, DirectoryHashVersion};
+use crate::disk_format::superblock::{
+    ChecksumSeed, DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
+};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
 use crate::platform::name::Ext4Name;
@@ -536,6 +538,7 @@ impl HtreeRoot {
         bytes: &[u8],
         directory_inode: InodeId,
         hash_seed: DirectoryHashSeed,
+        hash_signedness: DirectoryHashSignedness,
         maximum_indirect_levels: u8,
         checksum: DirectoryChecksum,
     ) -> Result<Self> {
@@ -593,7 +596,7 @@ impl HtreeRoot {
         }
         let index = DxIndex::parse_at(bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
         Ok(Self {
-            hash: DirectoryHashScheme::from_metadata(hash_seed, hash_version),
+            hash: DirectoryHashScheme::from_metadata(hash_seed, hash_version, hash_signedness),
             dot_entries: {
                 let mut dot_entries = Vec::new();
                 dot_entries.try_push(dot)?;
@@ -1873,7 +1876,15 @@ mod tests {
             return;
         };
         assert!(
-            HtreeRoot::parse(&root, directory_inode, seed, 0, DirectoryChecksum::None,).is_ok()
+            HtreeRoot::parse(
+                &root,
+                directory_inode,
+                seed,
+                DirectoryHashSignedness::Signed,
+                0,
+                DirectoryChecksum::None,
+            )
+            .is_ok()
         );
 
         let mut excessive_depth = root.clone();
@@ -1893,6 +1904,7 @@ mod tests {
                 &excessive_depth,
                 directory_inode,
                 seed,
+                DirectoryHashSignedness::Signed,
                 0,
                 DirectoryChecksum::None,
             ),
@@ -1912,7 +1924,14 @@ mod tests {
         };
         *reserved_byte = 1;
         assert_eq!(
-            HtreeRoot::parse(&reserved, directory_inode, seed, 1, DirectoryChecksum::None,),
+            HtreeRoot::parse(
+                &reserved,
+                directory_inode,
+                seed,
+                DirectoryHashSignedness::Signed,
+                1,
+                DirectoryChecksum::None,
+            ),
             Err(Error::InvalidDirectoryEntry)
         );
 
@@ -1942,6 +1961,7 @@ mod tests {
                 &noncanonical_limit,
                 directory_inode,
                 seed,
+                DirectoryHashSignedness::Signed,
                 0,
                 DirectoryChecksum::None,
             ),
@@ -1962,6 +1982,7 @@ mod tests {
                 &wrong_self,
                 directory_inode,
                 seed,
+                DirectoryHashSignedness::Signed,
                 0,
                 DirectoryChecksum::None,
             ),
@@ -1986,7 +2007,17 @@ mod tests {
             return;
         };
         let seed = DirectoryHashSeed::from_words([0; 4]);
-        assert!(HtreeRoot::parse(&root, directory_inode, seed, 0, checksum).is_ok());
+        assert!(
+            HtreeRoot::parse(
+                &root,
+                directory_inode,
+                seed,
+                DirectoryHashSignedness::Signed,
+                0,
+                checksum
+            )
+            .is_ok()
+        );
         let route_offset = DX_ROOT_COUNT_OFFSET.checked_add(4);
         assert!(route_offset.is_some());
         let Some(route_offset) = route_offset else {
@@ -1999,7 +2030,14 @@ mod tests {
         };
         *route_byte ^= 0x40;
         assert_eq!(
-            HtreeRoot::parse(&root, directory_inode, seed, 0, checksum),
+            HtreeRoot::parse(
+                &root,
+                directory_inode,
+                seed,
+                DirectoryHashSignedness::Signed,
+                0,
+                checksum
+            ),
             Err(Error::ChecksumMismatch)
         );
     }
@@ -2056,14 +2094,31 @@ mod tests {
             return;
         };
         assert!(put_le_u32(&mut root, disk_offset(checksum_offset), expected).is_ok());
-        assert!(HtreeRoot::parse(&root, directory_inode, seed, 0, checksum).is_ok());
+        assert!(
+            HtreeRoot::parse(
+                &root,
+                directory_inode,
+                seed,
+                DirectoryHashSignedness::Signed,
+                0,
+                checksum
+            )
+            .is_ok()
+        );
 
         let Some(reserved) = root.get_mut(tail_offset) else {
             return;
         };
         *reserved ^= 1;
         assert_eq!(
-            HtreeRoot::parse(&root, directory_inode, seed, 0, checksum),
+            HtreeRoot::parse(
+                &root,
+                directory_inode,
+                seed,
+                DirectoryHashSignedness::Signed,
+                0,
+                checksum
+            ),
             Err(Error::ChecksumMismatch)
         );
     }
@@ -2159,6 +2214,7 @@ mod tests {
         let hash = DirectoryHashScheme::from_metadata(
             DirectoryHashSeed::from_words([1, 2, 3, 4]),
             DirectoryHashVersion::HalfMd4,
+            DirectoryHashSignedness::Signed,
         );
         let Some(first_inode) = test_value(inode(12)) else {
             return;

@@ -672,6 +672,7 @@ impl EpochReadView<'_, '_> {
                     root_block.bytes(),
                     inode.id(),
                     self.superblock.directory_hash_seed(),
+                    self.superblock.directory_hash_signedness(),
                     self.superblock.directory_indexing().require_supported()?,
                     checksum,
                 )?;

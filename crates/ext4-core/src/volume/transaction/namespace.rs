@@ -1144,6 +1144,7 @@ impl MutationResolvePass<'_, '_, '_> {
             root_block.bytes(),
             inode.id(),
             self.mutation.volume.superblock.directory_hash_seed(),
+            self.mutation.volume.superblock.directory_hash_signedness(),
             self.mutation
                 .volume
                 .superblock
@@ -1601,6 +1602,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .volume
                 .superblock
                 .default_directory_hash_version(),
+            self.mutation.volume.superblock.directory_hash_signedness(),
         );
         let mut children = Vec::new();
         for child in entries {

@@ -143,6 +143,12 @@ const DIRECTORY_HASH_SEED_OFFSET: usize = 236;
 const DIRECTORY_HASH_SEED_WORDS: usize = 4;
 /// Byte offset of `s_def_hash_version` inside the superblock.
 const DEFAULT_DIRECTORY_HASH_VERSION_OFFSET: usize = 252;
+/// Filesystem-wide directory hash byte interpretation in `s_flags`.
+const FILESYSTEM_FLAGS_OFFSET: usize = 0x160;
+/// Signed and unsigned directory hash selectors in `s_flags`.
+const SIGNED_DIRECTORY_HASH: u32 = 1;
+/// Unsigned interpretation takes precedence when the selector is present.
+const UNSIGNED_DIRECTORY_HASH: u32 = 2;
 
 /// Builds a typed superblock field offset.
 const fn disk_offset(offset: usize) -> DiskOffset {
@@ -874,7 +880,38 @@ pub(crate) enum DirectoryHashVersion {
     TeaUnsigned,
 }
 
+/// Filesystem-wide byte interpretation for base HTree hash versions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryHashSignedness {
+    /// Sign-extend name bytes before hashing.
+    Signed,
+    /// Zero-extend name bytes before hashing.
+    Unsigned,
+}
+
+impl DirectoryHashSignedness {
+    /// Selects the persisted interpretation; an unselected filesystem uses signed bytes.
+    const fn from_flags(flags: u32) -> Self {
+        if flags & UNSIGNED_DIRECTORY_HASH != 0 {
+            Self::Unsigned
+        } else {
+            Self::Signed
+        }
+    }
+}
+
 impl DirectoryHashVersion {
+    /// Resolves a base version using the filesystem selector. Explicit unsigned versions retain
+    /// their byte interpretation independently of the selector.
+    pub(crate) const fn effective(self, signedness: DirectoryHashSignedness) -> Self {
+        match (self, signedness) {
+            (Self::Legacy, DirectoryHashSignedness::Unsigned) => Self::LegacyUnsigned,
+            (Self::HalfMd4, DirectoryHashSignedness::Unsigned) => Self::HalfMd4Unsigned,
+            (Self::Tea, DirectoryHashSignedness::Unsigned) => Self::TeaUnsigned,
+            _ => self,
+        }
+    }
+
     /// Converts the on-disk version byte to a supported hash version.
     /// # Errors
     ///
@@ -1586,6 +1623,8 @@ pub struct Superblock {
     checksum_seed: ChecksumSeed,
     /// Seed used by indexed directory hashing.
     directory_hash_seed: DirectoryHashSeed,
+    /// Byte interpretation selected by the filesystem flags.
+    directory_hash_signedness: DirectoryHashSignedness,
     /// Default hash version used when an HTree root does not override it.
     default_directory_hash_version: DirectoryHashVersion,
     /// Feature bits validated for this mount policy.
@@ -1621,55 +1660,71 @@ impl Superblock {
 
     /// Recovers only a sector-prefix tear of a write-session transition.
     ///
-    /// Both feature words reside in the first sector, while the checksum resides in the second.
-    /// An active image may have replaced any admitted prior marker pair; a closed image can only
-    /// have replaced an active session. Every candidate must authenticate the entire old image.
+    /// Session markers and hash selection reside in the first sector; the checksum is in the
+    /// second. An active image may replace any admitted marker pair and select signed hashing
+    /// when no interpretation was recorded. A closed image can only replace an active session.
+    /// Every predecessor must authenticate against the unchanged checksum.
     /// # Errors
     /// Returns a checksum error unless one permitted previous image validates, or an allocation error.
     fn restore_torn_write_session(raw: [u8; SUPERBLOCK_SIZE]) -> Result<PrimarySuperblockRead> {
         let has_file = le_u32(&raw, disk_offset(92))? & COMPAT_ORPHAN_FILE != 0;
         let recovery = le_u32(&raw, disk_offset(96))? & INCOMPAT_RECOVER != 0;
         let present = le_u32(&raw, disk_offset(100))? & RO_COMPAT_ORPHAN_PRESENT != 0;
-        for (old_recovery, old_present) in
-            [(false, false), (true, false), (false, true), (true, true)]
+        let flags = le_u32(&raw, disk_offset(FILESYSTEM_FLAGS_OFFSET))?;
+        let active = recovery && (!has_file || present);
+        let unselected_flags = if active
+            && flags & (SIGNED_DIRECTORY_HASH | UNSIGNED_DIRECTORY_HASH) == SIGNED_DIRECTORY_HASH
         {
-            if !has_file && (present || old_present) {
-                continue;
-            }
-            let active = recovery && (!has_file || present);
-            let closed = !recovery && !present;
-            let prior_active = old_recovery && (!has_file || old_present);
-            if (!active && !(closed && prior_active))
-                || (recovery, present) == (old_recovery, old_present)
+            flags & !SIGNED_DIRECTORY_HASH
+        } else {
+            flags
+        };
+        for old_flags in [flags, unselected_flags] {
+            for (old_recovery, old_present) in
+                [(false, false), (true, false), (false, true), (true, true)]
             {
-                continue;
-            }
-            let mut candidate = raw;
-            let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
-            let ro_compat = le_u32(&raw, disk_offset(100))? & !RO_COMPAT_ORPHAN_PRESENT;
-            put_le_u32(
-                &mut candidate,
-                disk_offset(96),
-                incompat | if old_recovery { INCOMPAT_RECOVER } else { 0 },
-            )?;
-            put_le_u32(
-                &mut candidate,
-                disk_offset(100),
-                ro_compat
-                    | if old_present {
-                        RO_COMPAT_ORPHAN_PRESENT
-                    } else {
-                        0
-                    },
-            )?;
-            match Self::parse_read_write(&candidate) {
-                Ok(_) => {
-                    return Ok(PrimarySuperblockRead::TornWriteSession {
-                        repair: memory::copied_slice(&candidate)?,
-                    });
+                if !has_file && (present || old_present) {
+                    continue;
                 }
-                Err(Error::ChecksumMismatch) => {}
-                Err(error) => return Err(error),
+                let closed = !recovery && !present;
+                let prior_active = old_recovery && (!has_file || old_present);
+                if (!active && !(closed && prior_active))
+                    || (recovery, present, flags) == (old_recovery, old_present, old_flags)
+                {
+                    continue;
+                }
+                let mut candidate = raw;
+                let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
+                let ro_compat = le_u32(&raw, disk_offset(100))? & !RO_COMPAT_ORPHAN_PRESENT;
+                put_le_u32(
+                    &mut candidate,
+                    disk_offset(96),
+                    incompat | if old_recovery { INCOMPAT_RECOVER } else { 0 },
+                )?;
+                put_le_u32(
+                    &mut candidate,
+                    disk_offset(100),
+                    ro_compat
+                        | if old_present {
+                            RO_COMPAT_ORPHAN_PRESENT
+                        } else {
+                            0
+                        },
+                )?;
+                put_le_u32(
+                    &mut candidate,
+                    disk_offset(FILESYSTEM_FLAGS_OFFSET),
+                    old_flags,
+                )?;
+                match Self::parse_read_write(&candidate) {
+                    Ok(_) => {
+                        return Ok(PrimarySuperblockRead::TornWriteSession {
+                            repair: memory::copied_slice(&candidate)?,
+                        });
+                    }
+                    Err(Error::ChecksumMismatch) => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Err(Error::ChecksumMismatch)
@@ -1829,6 +1884,8 @@ impl Superblock {
             *raw.get(DEFAULT_DIRECTORY_HASH_VERSION_OFFSET)
                 .ok_or(Error::TruncatedStructure)?,
         )?;
+        let directory_hash_signedness =
+            DirectoryHashSignedness::from_flags(le_u32(raw, disk_offset(FILESYSTEM_FLAGS_OFFSET))?);
         let uuid = FilesystemUuid::from_bytes(uuid);
 
         Ok(Self {
@@ -1855,6 +1912,7 @@ impl Superblock {
             volume_label,
             checksum_seed,
             directory_hash_seed,
+            directory_hash_signedness,
             default_directory_hash_version,
             features,
         })
@@ -2011,6 +2069,11 @@ impl Superblock {
         self.directory_hash_seed
     }
 
+    /// Filesystem-wide byte interpretation applied to base hash versions.
+    pub(crate) const fn directory_hash_signedness(self) -> DirectoryHashSignedness {
+        self.directory_hash_signedness
+    }
+
     /// Default directory hash algorithm recorded by the superblock.
     #[must_use]
     pub(crate) const fn default_directory_hash_version(self) -> DirectoryHashVersion {
@@ -2084,7 +2147,7 @@ impl Superblock {
         self.last_orphan
     }
 
-    /// Prepares both write-session markers without issuing I/O.
+    /// Prepares write-session markers and persists an unselected hash interpretation before use.
     /// # Errors
     /// Returns an error when reading, validating, or checksumming the primary image fails.
     pub(crate) fn prepare_write_session(
@@ -2101,6 +2164,15 @@ impl Superblock {
         let mut ro_compat = le_u32(&raw, disk_offset(100))? & !RO_COMPAT_ORPHAN_PRESENT;
         if state == WriteSessionState::Active {
             incompat |= INCOMPAT_RECOVER;
+            let flags = le_u32(&raw, disk_offset(FILESYSTEM_FLAGS_OFFSET))?;
+            if flags & (SIGNED_DIRECTORY_HASH | UNSIGNED_DIRECTORY_HASH) == 0 {
+                // Persist the chosen interpretation before any directory mutation can publish.
+                put_le_u32(
+                    &mut raw,
+                    disk_offset(FILESYSTEM_FLAGS_OFFSET),
+                    flags | SIGNED_DIRECTORY_HASH,
+                )?;
+            }
             if superblock.orphan_file.is_some() {
                 ro_compat |= RO_COMPAT_ORPHAN_PRESENT;
             }
@@ -2408,28 +2480,39 @@ mod tests {
                 (true, true, false, true),
                 (true, true, true, false),
             ] {
-                let old = primary(has_file, old_recovery, old_present)?;
-                let next = primary(has_file, next_active, has_file && next_active)?;
-                let mut torn = old;
-                memory::copy_exact(
-                    torn.get_mut(..512).ok_or(Error::TruncatedStructure)?,
-                    next.get(..512).ok_or(Error::TruncatedStructure)?,
-                )?;
-                assert!(matches!(
-                    Superblock::parse_read_write(&torn),
-                    Err(Error::ChecksumMismatch)
-                ));
-                let PrimarySuperblockRead::TornWriteSession { repair } =
-                    Superblock::restore_torn_write_session(torn)?
-                else {
-                    return Err(Error::InvalidSuperblock);
-                };
-                assert_eq!(repair, old);
-                put_le_u32(&mut torn, disk_offset(264), 1)?;
-                assert!(matches!(
-                    Superblock::restore_torn_write_session(torn),
-                    Err(Error::ChecksumMismatch)
-                ));
+                for old_flags in [0, SIGNED_DIRECTORY_HASH, UNSIGNED_DIRECTORY_HASH] {
+                    let mut old = primary(has_file, old_recovery, old_present)?;
+                    put_le_u32(&mut old, disk_offset(FILESYSTEM_FLAGS_OFFSET), old_flags)?;
+                    Superblock::refresh_checksum(&mut old)?;
+                    let mut next = primary(has_file, next_active, has_file && next_active)?;
+                    let next_flags = if next_active && old_flags == 0 {
+                        SIGNED_DIRECTORY_HASH
+                    } else {
+                        old_flags
+                    };
+                    put_le_u32(&mut next, disk_offset(FILESYSTEM_FLAGS_OFFSET), next_flags)?;
+                    Superblock::refresh_checksum(&mut next)?;
+                    let mut torn = old;
+                    memory::copy_exact(
+                        torn.get_mut(..512).ok_or(Error::TruncatedStructure)?,
+                        next.get(..512).ok_or(Error::TruncatedStructure)?,
+                    )?;
+                    assert!(matches!(
+                        Superblock::parse_read_write(&torn),
+                        Err(Error::ChecksumMismatch)
+                    ));
+                    let PrimarySuperblockRead::TornWriteSession { repair } =
+                        Superblock::restore_torn_write_session(torn)?
+                    else {
+                        return Err(Error::InvalidSuperblock);
+                    };
+                    assert_eq!(repair, old);
+                    put_le_u32(&mut torn, disk_offset(264), 1)?;
+                    assert!(matches!(
+                        Superblock::restore_torn_write_session(torn),
+                        Err(Error::ChecksumMismatch)
+                    ));
+                }
             }
             let mut raw = primary(true, false, false)?;
             put_le_u32(&mut raw, disk_offset(1020), 0)?;
