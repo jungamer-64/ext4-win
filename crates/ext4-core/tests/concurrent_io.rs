@@ -11,6 +11,77 @@ use ext4_core::*;
 #[derive(Debug)]
 struct PlainCrypto;
 
+/// # Errors
+/// Returns storage, journal, or read failure while exercising the production commit protocol.
+/// # Panics
+/// Fails if journaled bytes reach home early or are absent from the published epoch overlay.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe physical storage and published reads across the commit boundary"
+)]
+fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    fixture
+        .disk
+        .encode_inode(NodeId::File(file), 0x0008_4000, None)?;
+    fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+    let mut byte = [0];
+    let (_read, request) = fixture.suspend_payload(file, &mut byte)?;
+    let home = usize::try_from(request.offset().ok_or(Error::DeviceRange)?.get())
+        .map_err(|_| Error::DeviceRange)?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        |pass| {
+            let target = pass.file(file)?;
+            pass.write_file_range(target, FileOffset::ZERO, b"J")?;
+            pass.write_file_range(target, FileOffset::ZERO, b"K")
+        },
+    )?;
+    let ready = resolved
+        .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+        .prepare_commit(
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+            CommitLease::granted(ticket),
+        )?;
+    let StorageRequestSequenceStep::Finished(ordered) = ready.start().advance() else {
+        return Err(Error::InvalidWriteRange);
+    };
+    fixture.disk.checked(ordered.flush_request())?;
+    let payload = fixture.disk.sequence(ordered.completed())?;
+    fixture.disk.checked(payload.flush_request())?;
+    let (request, durable) = payload.completed().submit();
+    fixture.disk.checked(request)?;
+    fixture.disk.checked(durable.flush_request())?;
+    assert_eq!(fixture.disk.filesystem.get(home), Some(&b'a'));
+    let (epoch, checkpoint) = durable
+        .completed()
+        .publish(&mut fixture.coordinator, VisibilityLease::granted(ticket))
+        .into_parts();
+    fixture.epoch = epoch;
+    fixture.cache.publish(&fixture.epoch);
+    fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut byte))?;
+    assert_eq!(byte, *b"K");
+    assert_eq!(fixture.disk.filesystem.get(home), Some(&b'a'));
+    let home_writes = fixture
+        .disk
+        .sequence(checkpoint.start(CheckpointLease::granted(fixture.epoch.sequence())))?;
+    fixture.disk.checked(home_writes.flush_request())?;
+    let (request, clean) = home_writes.completed().submit();
+    fixture.disk.checked(request)?;
+    fixture.disk.checked(clean.flush_request())?;
+    fixture.epoch = clean.completed(&mut fixture.coordinator);
+    assert_eq!(fixture.disk.filesystem.get(home), Some(&b'K'));
+    Ok(())
+}
+
 impl CryptographicOperation for PlainCrypto {
     fn fill_random(&mut self, _: &mut [u8]) -> Result<()> {
         Err(Error::CryptographicFailure)

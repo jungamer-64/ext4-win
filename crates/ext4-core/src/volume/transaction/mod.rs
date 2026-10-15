@@ -321,7 +321,7 @@ struct MetadataMutation<'storage, 'epoch> {
     xattr_updates: Vec<BlockImage>,
     /// Per-group allocation count deltas to fold into descriptors.
     group_deltas: Vec<GroupDelta>,
-    /// Ordered file data writes that must reach disk before metadata commit.
+    /// File data with an explicit ordered or journaled persistence protocol.
     file_writes: Vec<StagedFileWrite>,
     /// Staged cluster-reference changes to apply after journal commit.
     cluster_deltas: Vec<ClusterReferenceDelta>,
@@ -355,8 +355,8 @@ pub struct ResolvedMutation {
     node_metadata_updates: Vec<NodeMetadataSnapshot>,
     /// Ordered data images that must be durable before journal metadata is written.
     data_writes: Vec<RangeWrite>,
-    /// Complete metadata blocks supplied to JBD2 serialization.
-    metadata_blocks: Vec<MetadataBlock>,
+    /// Complete metadata and journaled data images supplied to JBD2 serialization.
+    journal_blocks: Vec<JournalBlock>,
     /// Cluster-reference changes merged into the latest disjoint committed epoch at commit grant.
     cluster_deltas: Vec<ClusterReferenceDelta>,
     /// Free-cluster counter change merged at commit grant.
@@ -1068,7 +1068,7 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
             extent_updates: Vec::new(),
             xattr_updates: Vec::new(),
             group_deltas: Vec::new(),
-            data_writes: Vec::new(),
+            file_writes: Vec::new(),
             cluster_deltas: Vec::new(),
             free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,

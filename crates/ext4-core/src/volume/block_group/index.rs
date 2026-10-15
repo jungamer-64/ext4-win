@@ -841,7 +841,7 @@ mod tests {
             Err(Error::OperationSuspended)
         );
         let mut request = delayed.take_pending_request()?;
-        let changed = crate::disk_format::journal::MetadataBlock::new(
+        let changed = crate::disk_format::journal::JournalBlock::new(
             BlockAddress::new(3),
             memory::repeated_vec(2_u8, 1024)?,
         );

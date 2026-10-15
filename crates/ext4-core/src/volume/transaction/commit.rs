@@ -141,7 +141,7 @@ impl MetadataMutation<'_, '_> {
     ///
     /// Returns an error when a metadata write does not fit within one block or an original metadata
     /// block cannot be read before patching.
-    pub(super) fn metadata_blocks(&mut self) -> Result<Vec<MetadataBlock>> {
+    pub(super) fn metadata_blocks(&mut self) -> Result<Vec<JournalBlock>> {
         let block_size = self.volume.superblock.block_size();
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
@@ -173,7 +173,7 @@ impl MetadataMutation<'_, '_> {
 
             let index = if let Some(index) = blocks
                 .iter()
-                .position(|metadata: &MetadataBlock| metadata.block() == block)
+                .position(|metadata: &JournalBlock| metadata.block() == block)
             {
                 index
             } else {
@@ -181,7 +181,7 @@ impl MetadataMutation<'_, '_> {
                 self.volume
                     .device
                     .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
-                blocks.try_push(MetadataBlock::new(block, bytes))?;
+                blocks.try_push(JournalBlock::new(block, bytes))?;
                 blocks
                     .len()
                     .checked_sub(1)
@@ -254,7 +254,14 @@ impl MetadataMutation<'_, '_> {
         if self.volume.epoch != Some(coordinator.published_epoch()) {
             return Err(Error::ClusterReferenceConflict);
         }
-        let metadata_blocks = self.metadata_blocks()?;
+        let mut journal_blocks = self.metadata_blocks()?;
+        let mut data_writes = Vec::new();
+        for write in core::mem::take(&mut self.file_writes) {
+            match write {
+                StagedFileWrite::Ordered(write) => data_writes.try_push(write)?,
+                StagedFileWrite::Journaled(block) => journal_blocks.try_push(block)?,
+            }
+        }
         let _validated_next_state = self.committed_cluster_state()?;
         let mut observed = ObservedResourceVersionSet::new(ticket);
         let key_version = self
@@ -263,8 +270,8 @@ impl MetadataMutation<'_, '_> {
             .map(|resource| coordinator.resource_version(resource));
         // Journaling replaces whole blocks, including neighboring inode records. Their base
         // image must therefore be versioned even when the semantic inode intents are disjoint.
-        for block in &metadata_blocks {
-            let resource = MutationResource::metadata_block(block.block());
+        for block in &journal_blocks {
+            let resource = MutationResource::journal_block(block.block());
             observed.include(resource, coordinator.resource_version(resource))?;
         }
         let mut node_metadata_updates = Vec::new();
@@ -304,8 +311,8 @@ impl MetadataMutation<'_, '_> {
             observed,
             key_version,
             node_metadata_updates,
-            data_writes: core::mem::take(&mut self.data_writes),
-            metadata_blocks,
+            data_writes,
+            journal_blocks,
             cluster_deltas: core::mem::take(&mut self.cluster_deltas),
             free_clusters_delta: self.free_clusters_delta,
             free_inodes_delta: self.free_inodes_delta,
@@ -370,7 +377,7 @@ impl ReservedMutation {
 
         let prepared = journal.prepare_commit(
             current_epoch.superblock.block_size(),
-            self.resolved.metadata_blocks,
+            self.resolved.journal_blocks,
         )?;
         let (
             planned_journal_writes,

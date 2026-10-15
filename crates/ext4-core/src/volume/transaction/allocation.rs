@@ -98,10 +98,13 @@ impl MetadataMutation<'_, '_> {
                 .ok_or(Error::ArithmeticOverflow)?,
         )
         .map_err(|_| Error::ArithmeticOverflow)?;
-        self.data_writes.try_push(RangeWrite {
-            offset: self.volume.superblock.block_size().offset_of(first_block)?,
-            bytes: memory::repeated_vec(0_u8, bytes)?,
-        })?;
+        self.stage_file_write(
+            FileDataPersistence::Ordered,
+            RangeWrite {
+                offset: self.volume.superblock.block_size().offset_of(first_block)?,
+                bytes: memory::repeated_vec(0_u8, bytes)?,
+            },
+        )?;
         Ok(())
     }
 

@@ -22,12 +22,13 @@ pub(super) use crate::disk_format::group::{AllocationBitmapInitialization, Block
 pub(super) use crate::disk_format::inode::{
     DirectoryEntryMutationCapability, DirectorySize, DirectoryStorageKind, EncodedInodeBlockCount,
     EncodedInodeSize, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times,
-    Ext4Timestamp, FileAllocationSize, FileOffset, FilePayloadMutationCapability, FileSize,
-    FileSizeMutationCapability, Inode, InodeBlockCountUnit, InodeDataEncoding, InodeFlags, InodeId,
-    InodeKind, InodeMode, InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata,
-    NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
+    Ext4Timestamp, FileAllocationSize, FileDataPersistence, FileOffset,
+    FilePayloadMutationCapability, FileSize, FileSizeMutationCapability, Inode,
+    InodeBlockCountUnit, InodeDataEncoding, InodeFlags, InodeId, InodeKind, InodeMode,
+    InodeStorage, LinkCountAfterDecrement, NewDirectoryMetadata, NewFileMetadata,
+    NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
-pub(super) use crate::disk_format::journal::{CleanJournal, DirtyJournal, Journal, MetadataBlock};
+pub(super) use crate::disk_format::journal::{CleanJournal, DirtyJournal, Journal, JournalBlock};
 pub(super) use crate::disk_format::superblock::{
     BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterCount,
     FreeClusterDelta, InodeTimestampEncoding, MetadataChecksum, SparseSuperblockLayout, Superblock,

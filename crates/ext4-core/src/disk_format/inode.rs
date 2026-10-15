@@ -41,6 +41,8 @@ const fn disk_offset(offset: usize) -> DiskOffset {
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 /// Inode flag selecting filesystem-block units for `i_blocks`.
 const EXT4_HUGE_FILE_FL: u32 = 0x0004_0000;
+/// File data must be included in the journal transaction.
+const EXT4_JOURNAL_DATA_FL: u32 = 0x0000_4000;
 /// Inode flag selecting indexed directory data.
 const EXT4_INDEX_FL: u32 = 0x0000_1000;
 /// Inode flag rejecting write-domain mutation.
@@ -1186,6 +1188,15 @@ impl InodeGeneration {
     }
 }
 
+/// File-data persistence selected by the inode, independently of mutation permission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FileDataPersistence {
+    /// Home data must precede metadata commit.
+    Ordered,
+    /// Data participates in journal commit and checkpoint.
+    Journaled,
+}
+
 /// ext4 inode flags decoded behind a typed capability boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InodeFlags(u32);
@@ -1709,6 +1720,15 @@ impl Inode {
     /// Returns an error when this inode's flags reject namespace or link-count changes.
     pub fn namespace_mutation(&self) -> Result<NamespaceMutationCapability> {
         self.data.flags.namespace_mutation()
+    }
+
+    /// Persistence protocol for this inode's physical data writes.
+    pub(crate) fn data_persistence(&self) -> FileDataPersistence {
+        if self.data.flags.as_u32() & EXT4_JOURNAL_DATA_FL != 0 {
+            FileDataPersistence::Journaled
+        } else {
+            FileDataPersistence::Ordered
+        }
     }
 
     /// Data storage selected by inode flags and node kind.

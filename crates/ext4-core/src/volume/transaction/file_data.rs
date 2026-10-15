@@ -113,6 +113,7 @@ impl MutationResolvePass<'_, '_, '_> {
         plan: InitializedOverwrite,
         bytes: &[u8],
     ) -> Result<()> {
+        let persistence = inode.data_persistence();
         let key = if inode.protection().is_encrypted() {
             Some(
                 self.mutation
@@ -136,6 +137,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     EncryptedBlockBase::ExistingPlaintext
                 };
                 self.stage_encrypted_file_block_update(
+                    persistence,
                     key,
                     block.logical,
                     block.physical,
@@ -149,10 +151,13 @@ impl MutationResolvePass<'_, '_, '_> {
                     .get()
                     .checked_add(block.in_block)
                     .ok_or(Error::ArithmeticOverflow)?;
-                self.mutation.data_writes.try_push(RangeWrite {
-                    offset: ByteOffset::new(offset),
-                    bytes: memory::copied_slice(payload)?,
-                })?;
+                self.mutation.stage_file_write(
+                    persistence,
+                    RangeWrite {
+                        offset: ByteOffset::new(offset),
+                        bytes: memory::copied_slice(payload)?,
+                    },
+                )?;
             }
         }
         Ok(())
@@ -212,7 +217,12 @@ impl MutationResolvePass<'_, '_, '_> {
                         bytes,
                     )?;
                 } else {
-                    self.stage_inode_stream_write(&mut tree, offset.bytes(), bytes)?;
+                    self.stage_inode_stream_write(
+                        inode.data_persistence(),
+                        &mut tree,
+                        offset.bytes(),
+                        bytes,
+                    )?;
                 }
                 self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
             }
@@ -350,6 +360,7 @@ impl MutationResolvePass<'_, '_, '_> {
         old_size: FileSize,
         write_offset: FileOffset,
     ) -> Result<()> {
+        let persistence = inode.data_persistence();
         let gap_start = old_size.bytes();
         let gap_end = write_offset.bytes();
         if gap_start >= gap_end {
@@ -387,6 +398,7 @@ impl MutationResolvePass<'_, '_, '_> {
             let zero_end = core::cmp::min(gap_end, extent_end);
             if zero_start < zero_end {
                 self.stage_zero_visible_extent_range(
+                    persistence,
                     extent,
                     zero_start,
                     zero_end,
@@ -405,6 +417,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// selected logical block, encryption fails, or zero writes cannot be staged.
     fn stage_zero_visible_extent_range(
         &mut self,
+        persistence: FileDataPersistence,
         extent: Extent,
         start: u64,
         end: u64,
@@ -436,6 +449,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 return Err(Error::InvalidExtentTree);
             };
             self.stage_zero_file_block_range(
+                persistence,
                 logical_block,
                 physical,
                 in_block,
@@ -454,6 +468,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// encrypted block staging fails.
     fn stage_zero_file_block_range(
         &mut self,
+        persistence: FileDataPersistence,
         logical_block: LogicalBlock,
         physical: BlockAddress,
         in_block: u64,
@@ -463,6 +478,7 @@ impl MutationResolvePass<'_, '_, '_> {
         let zeroes = memory::repeated_vec(0_u8, len)?;
         if let Some(contents_key) = encrypted_contents_key {
             return self.stage_encrypted_file_block_update(
+                persistence,
                 contents_key,
                 logical_block,
                 physical,
@@ -480,10 +496,13 @@ impl MutationResolvePass<'_, '_, '_> {
             .get()
             .checked_add(in_block)
             .ok_or(Error::ArithmeticOverflow)?;
-        self.mutation.data_writes.try_push(RangeWrite {
-            offset: ByteOffset::new(write_offset),
-            bytes: zeroes,
-        })?;
+        self.mutation.stage_file_write(
+            persistence,
+            RangeWrite {
+                offset: ByteOffset::new(write_offset),
+                bytes: zeroes,
+            },
+        )?;
         Ok(())
     }
 
@@ -542,8 +561,13 @@ impl MutationResolvePass<'_, '_, '_> {
     ///
     /// Returns an error when the plaintext base block cannot be obtained, `bytes` do not fit at
     /// `in_block`, encryption fails, or the physical write offset overflows.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the encryption key and logical coordinate, physical byte range, base image and inode persistence are independent inputs to one encrypted-block update"
+    )]
     fn stage_encrypted_file_block_update(
         &mut self,
+        persistence: FileDataPersistence,
         contents_key: &FscryptContentsKey,
         logical_block: LogicalBlock,
         physical: BlockAddress,
@@ -567,15 +591,18 @@ impl MutationResolvePass<'_, '_, '_> {
             .ok_or(Error::ArithmeticOverflow)?;
         memory::copy_exact(block.get_mut(start..end).ok_or(Error::DeviceRange)?, bytes)?;
         contents_key.encrypt_block(logical_block.as_u64(), &mut block, self.crypto)?;
-        self.mutation.data_writes.try_push(RangeWrite {
-            offset: self
-                .mutation
-                .volume
-                .superblock
-                .block_size()
-                .offset_of(physical)?,
-            bytes: block,
-        })?;
+        self.mutation.stage_file_write(
+            persistence,
+            RangeWrite {
+                offset: self
+                    .mutation
+                    .volume
+                    .superblock
+                    .block_size()
+                    .offset_of(physical)?,
+                bytes: block,
+            },
+        )?;
         Ok(())
     }
 
@@ -594,14 +621,23 @@ impl MutationResolvePass<'_, '_, '_> {
         let block_bytes =
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
         let block_offset = block_size.offset_of(physical)?;
-        let mut block = if let Some(staged) = self
-            .mutation
-            .data_writes
-            .iter()
-            .rev()
-            .find(|write| write.offset == block_offset && write.bytes.len() == block_bytes)
-        {
-            memory::copied_slice(&staged.bytes)?
+        let mut block = if let Some(staged) =
+            self.mutation
+                .file_writes
+                .iter()
+                .rev()
+                .find_map(|write| match write {
+                    StagedFileWrite::Ordered(write)
+                        if write.offset == block_offset && write.bytes.len() == block_bytes =>
+                    {
+                        Some(write.bytes.as_slice())
+                    }
+                    StagedFileWrite::Journaled(write) if write.block() == physical => {
+                        Some(write.bytes())
+                    }
+                    StagedFileWrite::Ordered(_) | StagedFileWrite::Journaled(_) => None,
+                }) {
+            memory::copied_slice(staged)?
         } else {
             let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
             self.mutation
@@ -645,6 +681,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Returns an error when logical range arithmetic fails, allocation fails, or a staged write slice cannot be represented.
     fn stage_inode_stream_write(
         &mut self,
+        persistence: FileDataPersistence,
         tree: &mut MutableExtentTree,
         offset: u64,
         bytes: &[u8],
@@ -693,12 +730,15 @@ impl MutationResolvePass<'_, '_, '_> {
                         .get()
                         .checked_add(in_block)
                         .ok_or(Error::ArithmeticOverflow)?;
-                    self.mutation.data_writes.try_push(RangeWrite {
-                        offset: ByteOffset::new(write_offset),
-                        bytes: memory::copied_slice(
-                            bytes.get(completed..end).ok_or(Error::DeviceRange)?,
-                        )?,
-                    })?;
+                    self.mutation.stage_file_write(
+                        persistence,
+                        RangeWrite {
+                            offset: ByteOffset::new(write_offset),
+                            bytes: memory::copied_slice(
+                                bytes.get(completed..end).ok_or(Error::DeviceRange)?,
+                            )?,
+                        },
+                    )?;
                 }
                 BlockMapping::Uninitialized | BlockMapping::Hole => {
                     let physical = if tree.allocated_block(logical_block)?.is_some() {
@@ -715,15 +755,18 @@ impl MutationResolvePass<'_, '_, '_> {
                         block.get_mut(start..block_end).ok_or(Error::DeviceRange)?,
                         bytes.get(completed..end).ok_or(Error::DeviceRange)?,
                     )?;
-                    self.mutation.data_writes.try_push(RangeWrite {
-                        offset: self
-                            .mutation
-                            .volume
-                            .superblock
-                            .block_size()
-                            .offset_of(physical)?,
-                        bytes: block,
-                    })?;
+                    self.mutation.stage_file_write(
+                        persistence,
+                        RangeWrite {
+                            offset: self
+                                .mutation
+                                .volume
+                                .superblock
+                                .block_size()
+                                .offset_of(physical)?,
+                            bytes: block,
+                        },
+                    )?;
                 }
             };
             completed = end;
@@ -743,6 +786,7 @@ impl MutationResolvePass<'_, '_, '_> {
         offset: u64,
         bytes: &[u8],
     ) -> Result<()> {
+        let persistence = inode.data_persistence();
         if bytes.is_empty() {
             return Ok(());
         }
@@ -794,6 +838,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 }
             };
             self.stage_encrypted_file_block_update(
+                persistence,
                 &contents_key,
                 logical_block,
                 physical,
@@ -866,7 +911,12 @@ impl MutationResolvePass<'_, '_, '_> {
                     block_size_u64,
                 )?;
             } else {
-                self.zero_truncated_tail(tree.extents(), new_size, block_size_u64)?;
+                self.zero_truncated_tail(
+                    inode.data_persistence(),
+                    tree.extents(),
+                    new_size,
+                    block_size_u64,
+                )?;
             }
         }
         raw_inode.set_encoded_size(encoded_size)?;
@@ -952,7 +1002,12 @@ impl MutationResolvePass<'_, '_, '_> {
                 &metadata,
             )?;
         } else {
-            self.stage_inode_stream_write(&mut tree, layout.merkle_tree_offset(), &metadata)?;
+            self.stage_inode_stream_write(
+                inode.data_persistence(),
+                &mut tree,
+                layout.merkle_tree_offset(),
+                &metadata,
+            )?;
         }
         raw_inode.mark_verity()?;
         raw_inode.set_timestamps(self.now)?;
@@ -1004,6 +1059,7 @@ impl MutationResolvePass<'_, '_, '_> {
     /// represented.
     fn zero_truncated_tail(
         &mut self,
+        persistence: FileDataPersistence,
         extents: &[Extent],
         new_size: FileSize,
         block_size: u64,
@@ -1033,13 +1089,16 @@ impl MutationResolvePass<'_, '_, '_> {
             .get()
             .checked_add(in_block)
             .ok_or(Error::ArithmeticOverflow)?;
-        self.mutation.data_writes.try_push(RangeWrite {
-            offset: ByteOffset::new(offset),
-            bytes: memory::repeated_vec(
-                0_u8,
-                usize::try_from(zero_len).map_err(|_| Error::ArithmeticOverflow)?,
-            )?,
-        })?;
+        self.mutation.stage_file_write(
+            persistence,
+            RangeWrite {
+                offset: ByteOffset::new(offset),
+                bytes: memory::repeated_vec(
+                    0_u8,
+                    usize::try_from(zero_len).map_err(|_| Error::ArithmeticOverflow)?,
+                )?,
+            },
+        )?;
         Ok(())
     }
 
@@ -1055,6 +1114,7 @@ impl MutationResolvePass<'_, '_, '_> {
         new_size: FileSize,
         block_size: u64,
     ) -> Result<()> {
+        let persistence = inode.data_persistence();
         let logical_block = new_size
             .bytes()
             .checked_div(block_size)
@@ -1080,6 +1140,7 @@ impl MutationResolvePass<'_, '_, '_> {
         .map_err(|_| Error::ArithmeticOverflow)?;
         let zeroes = memory::repeated_vec(0_u8, zero_len)?;
         self.stage_encrypted_file_block_update(
+            persistence,
             &contents_key,
             LogicalBlock::try_from(logical_block)?,
             physical,

@@ -98,16 +98,16 @@ const EXT4_SUPER_MAGIC: u16 = 0xEF53;
 const EXT4_FEATURE_INCOMPAT_JOURNAL_DEV: u32 = 0x0008;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Full filesystem metadata block supplied to the journal commit path.
-pub(crate) struct MetadataBlock {
+/// Complete filesystem block participating in a journal transaction.
+pub(crate) struct JournalBlock {
     /// Filesystem block address.
     block: BlockAddress,
-    /// Complete metadata block bytes.
+    /// Complete block bytes.
     bytes: Vec<u8>,
 }
 
-impl MetadataBlock {
-    /// Creates a complete metadata block image for a journal transaction.
+impl JournalBlock {
+    /// Creates a complete filesystem block image for a journal transaction.
     pub(crate) fn new(block: BlockAddress, bytes: Vec<u8>) -> Self {
         Self { block, bytes }
     }
@@ -117,12 +117,12 @@ impl MetadataBlock {
         self.block
     }
 
-    /// Returns the full metadata block bytes.
+    /// Returns the full block bytes.
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    /// Returns the mutable full metadata block bytes before commit encoding.
+    /// Returns mutable full block bytes before commit encoding.
     pub(crate) fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
     }
@@ -195,7 +195,7 @@ pub(crate) struct PreparedJournalCommit {
     /// Coordinator journal state after commit durability and before checkpoint completion.
     durable_journal: Journal<DirtyJournal>,
     /// Immutable metadata overlay published at commit durability.
-    overlay: Vec<MetadataBlock>,
+    overlay: Vec<JournalBlock>,
     /// Independent checkpoint work prepared before the first lower write.
     checkpoint: PreparedJournalCheckpoint,
 }
@@ -354,7 +354,7 @@ impl PreparedJournalCommit {
         PlannedStorageWrite,
         StorageTarget,
         Journal<DirtyJournal>,
-        Vec<MetadataBlock>,
+        Vec<JournalBlock>,
         PreparedJournalCheckpoint,
     ) {
         (
@@ -1448,7 +1448,7 @@ impl<State> Journal<State> {
     pub(crate) fn prepare_commit(
         &self,
         block_size: BlockSize,
-        metadata_blocks: Vec<MetadataBlock>,
+        metadata_blocks: Vec<JournalBlock>,
     ) -> Result<PreparedJournalCommit> {
         if self.superblock.start() != 0 {
             return Err(Error::JournalCorrupt);
@@ -1548,7 +1548,7 @@ impl<State> Journal<State> {
     fn prepare_metadata_transaction(
         &self,
         block_size: BlockSize,
-        metadata_blocks: &[MetadataBlock],
+        metadata_blocks: &[JournalBlock],
     ) -> Result<PreparedJournalTransaction> {
         let credits = self.journal_credits(metadata_blocks.len(), block_size)?;
         let block_bytes =
@@ -2009,7 +2009,7 @@ impl<State> Journal<State> {
     fn encode_descriptor_block(
         &self,
         sequence: JournalSequence,
-        metadata_blocks: &[MetadataBlock],
+        metadata_blocks: &[JournalBlock],
         data_blocks: &[Vec<u8>],
         block_size: BlockSize,
     ) -> Result<Vec<u8>> {
@@ -2049,7 +2049,7 @@ impl<State> Journal<State> {
         block: &mut [u8],
         offset: usize,
         sequence: JournalSequence,
-        metadata: &MetadataBlock,
+        metadata: &JournalBlock,
         data: &[u8],
         flags: u32,
     ) -> Result<usize> {
@@ -3275,9 +3275,9 @@ mod tests {
         JBD2_FEATURE_INCOMPAT_CSUM_V2, JBD2_FEATURE_INCOMPAT_CSUM_V3,
         JBD2_FEATURE_INCOMPAT_FAST_COMMIT, JBD2_FEATURE_INCOMPAT_REVOKE, JBD2_REVOKE_BLOCK,
         JBD2_TAG_FLAG_LAST_TAG, JBD2_TAG_FLAG_SAME_UUID, JOURNAL_COMMIT_CHECKSUM_OFFSET,
-        JOURNAL_HEADER_BYTES, JOURNAL_SUPERBLOCK_BYTES, Jbd2Header, Journal, JournalCursor,
-        JournalGeometry, JournalLocation, JournalProfile, JournalRecoveryOperation, JournalRing,
-        JournalSequence, JournalSuperblock, JournalSuperblockVersion, LoadedJournal, MetadataBlock,
+        JOURNAL_HEADER_BYTES, JOURNAL_SUPERBLOCK_BYTES, Jbd2Header, Journal, JournalBlock,
+        JournalCursor, JournalGeometry, JournalLocation, JournalProfile, JournalRecoveryOperation,
+        JournalRing, JournalSequence, JournalSuperblock, JournalSuperblockVersion, LoadedJournal,
         RecoveryPhase, RecoveryRevoke, journal_superblock_checksum,
     };
 
@@ -3532,8 +3532,8 @@ mod tests {
             let journal = test_external_journal::<LoadedJournal>(0, 0, 64, 7, 0, 3, 1_000)?;
             let block_size = journal.geometry.block_size;
             let metadata = [
-                MetadataBlock::new(BlockAddress::new(20), vec![0x11; 1024]),
-                MetadataBlock::new(BlockAddress::new(21), vec![0x22; 1024]),
+                JournalBlock::new(BlockAddress::new(20), vec![0x11; 1024]),
+                JournalBlock::new(BlockAddress::new(21), vec![0x22; 1024]),
             ];
             let data = [vec![0x11; 1024], vec![0x22; 1024]];
             let descriptor = journal.encode_descriptor_block(
@@ -3601,7 +3601,7 @@ mod tests {
                 let journal =
                     test_external_journal::<LoadedJournal>(0, incompat, 64, 7, 0, 3, 1_000)?;
                 assert_eq!(journal.descriptor_tag_size(), expected_tag_size);
-                let metadata = [MetadataBlock::new(BlockAddress::new(20), vec![0x5A; 1024])];
+                let metadata = [JournalBlock::new(BlockAddress::new(20), vec![0x5A; 1024])];
                 let data = [vec![0x5A; 1024]];
                 let descriptor = journal.encode_descriptor_block(
                     JournalSequence::new(8),
@@ -3712,7 +3712,7 @@ mod tests {
                 .map_err(|_| Error::OutOfMemory)?;
             for index in 0..payloads {
                 metadata
-                    .push_within_capacity(MetadataBlock::new(
+                    .push_within_capacity(JournalBlock::new(
                         BlockAddress::new(
                             100_u64
                                 .checked_add(
@@ -3755,7 +3755,7 @@ mod tests {
             let high_block = u64::from(u32::MAX)
                 .checked_add(1)
                 .ok_or(Error::ArithmeticOverflow)?;
-            let metadata = [MetadataBlock::new(
+            let metadata = [JournalBlock::new(
                 BlockAddress::new(high_block),
                 vec![0x5A; 1024],
             )];
@@ -3901,14 +3901,14 @@ mod tests {
         let outcome = (|| -> Result<()> {
             let external = test_external_journal::<LoadedJournal>(0, 0, 64, 7, 0, 3, 100)?;
             let duplicate = [
-                MetadataBlock::new(BlockAddress::new(10), vec![0; 1024]),
-                MetadataBlock::new(BlockAddress::new(10), vec![1; 1024]),
+                JournalBlock::new(BlockAddress::new(10), vec![0; 1024]),
+                JournalBlock::new(BlockAddress::new(10), vec![1; 1024]),
             ];
             assert_eq!(
                 external.prepare_metadata_transaction(external.geometry.block_size, &duplicate),
                 Err(Error::JournalCorrupt)
             );
-            let outside = [MetadataBlock::new(BlockAddress::new(100), vec![0; 1024])];
+            let outside = [JournalBlock::new(BlockAddress::new(100), vec![0; 1024])];
             assert_eq!(
                 external.prepare_metadata_transaction(external.geometry.block_size, &outside),
                 Err(Error::JournalCorrupt)
@@ -3931,7 +3931,7 @@ mod tests {
                 filesystem_blocks: 100,
                 state: PhantomData,
             };
-            let collision = [MetadataBlock::new(BlockAddress::new(45), vec![0; 1024])];
+            let collision = [JournalBlock::new(BlockAddress::new(45), vec![0; 1024])];
             assert_eq!(
                 internal.prepare_metadata_transaction(block_size, &collision),
                 Err(Error::JournalCorrupt)
@@ -4061,7 +4061,7 @@ mod tests {
                 3,
                 100,
             )?;
-            let metadata = [MetadataBlock::new(BlockAddress::new(10), vec![0x44; 1024])];
+            let metadata = [JournalBlock::new(BlockAddress::new(10), vec![0x44; 1024])];
             let data = [vec![0x44; 1024]];
             let descriptor = journal.encode_descriptor_block(
                 JournalSequence::new(17),

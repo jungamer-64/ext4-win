@@ -422,10 +422,13 @@ impl MutationResolvePass<'_, '_, '_> {
                     bytes.get_mut(..chunk.len()).ok_or(Error::DeviceRange)?,
                     chunk,
                 )?;
-                self.mutation.data_writes.try_push(RangeWrite {
-                    offset: block_size.offset_of(block)?,
-                    bytes,
-                })?;
+                self.mutation.stage_file_write(
+                    FileDataPersistence::Ordered,
+                    RangeWrite {
+                        offset: block_size.offset_of(block)?,
+                        bytes,
+                    },
+                )?;
                 tree.insert_or_extend_initialized(LogicalBlock::try_from(logical)?, block)?;
                 remaining = remainder;
                 if !remaining.is_empty() {

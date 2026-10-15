@@ -221,9 +221,9 @@ pub(in crate::volume) fn prepare_orphan_batch(
 /// Returns a read, allocation, or invalid metadata index error.
 fn metadata_image<'a>(
     volume: &mut EpochReadView<'_, '_>,
-    metadata: &'a mut Vec<MetadataBlock>,
+    metadata: &'a mut Vec<JournalBlock>,
     block: BlockAddress,
-) -> Result<&'a mut MetadataBlock> {
+) -> Result<&'a mut JournalBlock> {
     let index = match metadata.iter().position(|image| image.block() == block) {
         Some(index) => index,
         None => {
@@ -235,7 +235,7 @@ fn metadata_image<'a>(
             volume
                 .device
                 .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
-            metadata.try_push(MetadataBlock::new(block, bytes))?;
+            metadata.try_push(JournalBlock::new(block, bytes))?;
             metadata
                 .len()
                 .checked_sub(1)

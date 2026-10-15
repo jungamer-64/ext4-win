@@ -14,8 +14,8 @@ use crate::disk::storage::{
     OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
 };
 use crate::disk_format::journal::{
-    CleanJournal, ExternalJournalLoad, Journal, JournalRecoveryOperation, LoadedJournal,
-    MetadataBlock,
+    CleanJournal, ExternalJournalLoad, Journal, JournalBlock, JournalRecoveryOperation,
+    LoadedJournal,
 };
 use crate::disk_format::superblock::{
     ChecksumInvalidSuperblock, FilesystemUuid, JournalMode, JournalUuid, PrimarySuperblockRead,
@@ -42,15 +42,15 @@ enum MutationResourceDomain {
     VolumeMetadata,
     /// Mount-scoped fscrypt key snapshot.
     KeySet,
-    /// One complete filesystem metadata image written through the journal.
-    MetadataBlock,
+    /// One complete filesystem block image written through the journal.
+    JournalBlock,
 }
 
 impl MutationResource {
-    /// Names the physical unit preserved by a journal metadata image.
-    pub(crate) const fn metadata_block(block: BlockAddress) -> Self {
+    /// Names the physical unit preserved by a journal block image.
+    pub(crate) const fn journal_block(block: BlockAddress) -> Self {
         Self {
-            domain: MutationResourceDomain::MetadataBlock,
+            domain: MutationResourceDomain::JournalBlock,
             identity: block.get(),
         }
     }
@@ -203,7 +203,7 @@ impl ResourceVersionTable {
             MutationResourceDomain::BlockGroup => 2,
             MutationResourceDomain::VolumeMetadata => 3,
             MutationResourceDomain::KeySet => 4,
-            MutationResourceDomain::MetadataBlock => 5,
+            MutationResourceDomain::JournalBlock => 5,
         };
         let mut hash = resource.identity ^ domain.wrapping_mul(0x9e37_79b9_7f4a_7c15);
         hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -443,7 +443,7 @@ pub struct CommittedEpoch {
     /// Committed allocation-cluster ownership.
     pub(super) clusters: ClusterReferenceIndex,
     /// Durable journal metadata not yet copied to home blocks.
-    pub(super) overlay: Vec<MetadataBlock>,
+    pub(super) overlay: Vec<JournalBlock>,
 }
 
 impl CommittedEpoch {
@@ -468,7 +468,7 @@ impl CommittedEpoch {
         superblock: Superblock,
         fscrypt_keys: FscryptKeySet,
         clusters: ClusterReferenceIndex,
-        overlay: Vec<MetadataBlock>,
+        overlay: Vec<JournalBlock>,
     ) -> Self {
         Self {
             sequence,
