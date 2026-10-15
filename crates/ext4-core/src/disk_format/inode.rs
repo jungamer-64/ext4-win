@@ -1292,9 +1292,12 @@ impl InodeFlags {
     /// Creates a metadata mutation capability for these flags.
     ///
     /// # Errors
-    /// Returns an error when immutable or inline-data semantics reject writes.
+    /// Returns an error when immutable, append-only or inline-data semantics reject writes.
     pub fn metadata_mutation(self) -> Result<MetadataMutationCapability> {
         self.require_common_mutation()?;
+        if self.0 & EXT4_APPEND_FL != 0 {
+            return Err(Error::UnsupportedInodeMutation);
+        }
         Ok(MetadataMutationCapability { _private: () })
     }
 
@@ -2248,6 +2251,10 @@ mod tests {
         );
 
         let append_only = InodeFlags::from_u32(super::EXT4_APPEND_FL);
+        assert_eq!(
+            append_only.metadata_mutation(),
+            Err(Error::UnsupportedInodeMutation)
+        );
         assert_eq!(
             append_only.directory_entry_mutation(),
             Err(Error::UnsupportedInodeMutation)

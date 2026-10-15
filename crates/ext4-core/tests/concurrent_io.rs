@@ -2173,6 +2173,76 @@ fn ownership_mutation_retires_execution_privileges() -> Result<()> {
 }
 
 /// # Errors
+/// Returns fixture, flag encoding, metadata access or remount failures.
+/// # Panics
+/// Fails if retained node identities bypass append-only policy or a rejected edit reaches storage.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify mutation rejection and the unchanged persistent metadata endpoint"
+)]
+fn append_only_metadata_changes_are_rejected() -> Result<()> {
+    for operation in 0..3 {
+        let mut fixture = Fixture::new()?;
+        let file = fixture.a;
+        let name = XattrName::new(XattrNamespace::User, b"protected")?;
+        let node = fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, b"protected")?,
+                XattrValue::new(b"original")?,
+            )?;
+            Ok(node)
+        })?;
+        fixture
+            .disk
+            .encode_inode(NodeId::File(file), 0x0008_0020, None)?;
+        fixture.remount()?;
+        let before = fixture.read(|pass| {
+            let file = pass.load_file(file)?;
+            Ok((file.security(), file.times()))
+        })?;
+        assert_eq!(
+            fixture.mutate(|pass| match operation {
+                0 => pass.set_posix_security(
+                    node,
+                    Ext4Security::new(namespace_owner(), Ext4Permissions::new(0o777)?),
+                ),
+                1 => pass.set_xattr(
+                    node,
+                    XattrName::new(XattrNamespace::User, b"protected")?,
+                    XattrValue::new(b"changed")?,
+                ),
+                _ => pass.set_times(
+                    node,
+                    Ext4Times::new(
+                        Ext4Timestamp::from_seconds(9),
+                        Ext4Timestamp::from_seconds(9),
+                        Ext4Timestamp::from_seconds(9),
+                        None,
+                    ),
+                ),
+            }),
+            Err(Error::UnsupportedInodeMutation)
+        );
+        fixture.remount()?;
+        assert_eq!(
+            fixture.read(|pass| {
+                let file = pass.load_file(file)?;
+                Ok((file.security(), file.times()))
+            })?,
+            before
+        );
+        assert_eq!(
+            fixture.read(|pass| pass.read_xattr(NodeId::File(file), &name))?,
+            Some(XattrValue::new(b"original")?)
+        );
+    }
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, enumeration, exact lookup, unlink or recovery failures.
 /// # Panics
 /// Fails if any supported ciphertext length loses its keyless namespace identity.
