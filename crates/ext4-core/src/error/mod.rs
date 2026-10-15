@@ -102,7 +102,7 @@ pub enum Error {
     MissingEncryptionKey,
     /// The encrypted inode operation has no connected crypto data path yet.
     UnsupportedEncryption,
-    /// The verity inode read path has no connected verification data path yet.
+    /// The filesystem does not admit the requested fs-verity operation.
     UnsupportedVerity,
     /// The root directory cannot be removed.
     CannotRemoveRoot,
@@ -175,7 +175,9 @@ impl fmt::Display for Error {
             Self::UnsupportedInodeMutation => "unsupported ext4 inode mutation",
             Self::MissingEncryptionKey => "missing fscrypt encryption key",
             Self::UnsupportedEncryption => "unsupported ext4 encryption operation",
-            Self::UnsupportedVerity => "unsupported ext4 verity operation",
+            Self::UnsupportedVerity => {
+                "filesystem does not support the requested fs-verity operation"
+            }
             Self::CannotRemoveRoot => "cannot remove the ext4 root directory",
             Self::InvalidEncryptionContext => "invalid ext4 encryption context",
             Self::InvalidVerityMetadata => "invalid ext4 verity metadata",

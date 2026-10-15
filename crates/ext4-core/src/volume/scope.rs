@@ -49,8 +49,8 @@ pub(super) use crate::protection::fscrypt::{
     FscryptNoKeyName,
 };
 pub(super) use crate::protection::verity::{
-    Ext4VerityMetadataLayout, FSVERITY_DESCRIPTOR_BYTES, FsverityDescriptor, FsverityEnable,
-    FsverityMerkleTree, FsverityVerifier,
+    Ext4VerityMetadataLayout, FsverityDescriptor, FsverityEnable, FsverityMerkleTree,
+    FsverityVerifier,
 };
 
 pub(super) use super::block_group::{

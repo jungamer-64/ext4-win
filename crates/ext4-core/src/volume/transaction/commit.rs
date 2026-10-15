@@ -546,19 +546,6 @@ pub(super) fn map_extents(extents: &[Extent], logical_block: LogicalBlock) -> Bl
     BlockMapping::Hole
 }
 
-/// Returns descriptor plus signature byte count.
-/// # Errors
-///
-/// Returns an error when descriptor and signature lengths exceed the `u32` fs-verity field.
-pub(super) fn descriptor_byte_count(signature: &[u8]) -> Result<u32> {
-    u32::try_from(
-        FSVERITY_DESCRIPTOR_BYTES
-            .checked_add(signature.len())
-            .ok_or(Error::ArithmeticOverflow)?,
-    )
-    .map_err(|_| Error::ArithmeticOverflow)
-}
-
 /// Builds the ext4 post-EOF verity metadata byte image.
 /// # Errors
 ///
@@ -567,8 +554,7 @@ pub(super) fn descriptor_byte_count(signature: &[u8]) -> Result<u32> {
 pub(super) fn verity_metadata_image(
     layout: Ext4VerityMetadataLayout,
     merkle_tree: &[u8],
-    descriptor: &[u8; FSVERITY_DESCRIPTOR_BYTES],
-    signature: &[u8],
+    descriptor: &[u8],
 ) -> Result<Vec<u8>> {
     let metadata_bytes = usize::try_from(
         layout
@@ -593,22 +579,13 @@ pub(super) fn verity_metadata_image(
     )
     .map_err(|_| Error::ArithmeticOverflow)?;
     let descriptor_end = descriptor_offset
-        .checked_add(FSVERITY_DESCRIPTOR_BYTES)
+        .checked_add(descriptor.len())
         .ok_or(Error::ArithmeticOverflow)?;
     memory::copy_exact(
         image
             .get_mut(descriptor_offset..descriptor_end)
             .ok_or(Error::InvalidVerityMetadata)?,
         descriptor,
-    )?;
-    let signature_end = descriptor_end
-        .checked_add(signature.len())
-        .ok_or(Error::ArithmeticOverflow)?;
-    memory::copy_exact(
-        image
-            .get_mut(descriptor_end..signature_end)
-            .ok_or(Error::InvalidVerityMetadata)?,
-        signature,
     )?;
     let tail_offset = usize::try_from(
         layout
@@ -620,7 +597,7 @@ pub(super) fn verity_metadata_image(
     put_le_u32(
         &mut image,
         disk_offset(tail_offset),
-        descriptor_byte_count(signature)?,
+        u32::try_from(descriptor.len()).map_err(|_| Error::ArithmeticOverflow)?,
     )?;
     Ok(image)
 }

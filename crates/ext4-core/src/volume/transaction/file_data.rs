@@ -617,35 +617,7 @@ impl MutationResolvePass<'_, '_, '_> {
         logical_block: LogicalBlock,
         physical: BlockAddress,
     ) -> Result<Vec<u8>> {
-        let block_size = self.mutation.volume.superblock.block_size();
-        let block_bytes =
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        let block_offset = block_size.offset_of(physical)?;
-        let mut block = if let Some(staged) =
-            self.mutation
-                .file_writes
-                .iter()
-                .rev()
-                .find_map(|write| match write {
-                    StagedFileWrite::Ordered(write)
-                        if write.offset == block_offset && write.bytes.len() == block_bytes =>
-                    {
-                        Some(write.bytes.as_slice())
-                    }
-                    StagedFileWrite::Journaled(write) if write.block() == physical => {
-                        Some(write.bytes())
-                    }
-                    StagedFileWrite::Ordered(_) | StagedFileWrite::Journaled(_) => None,
-                }) {
-            memory::copied_slice(staged)?
-        } else {
-            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-            self.mutation
-                .volume
-                .device
-                .read_exact_at(block_offset, &mut bytes)?;
-            bytes
-        };
+        let mut block = self.mutation.file_block_bytes(physical)?;
         contents_key.decrypt_block(logical_block.as_u64(), &mut block, self.crypto)?;
         Ok(block)
     }
@@ -936,14 +908,16 @@ impl MutationResolvePass<'_, '_, '_> {
         Ok(())
     }
 
-    /// Enables fs-verity on a plain regular file by journal-staging ext4
+    /// Enables fs-verity on a regular file by journal-staging ext4
     /// post-EOF metadata and setting `EXT4_VERITY_FL`.
     ///
     /// # Errors
-    /// Returns an error when the inode is not a plain regular file, the file
-    /// cannot be read into the verification domain, metadata allocation fails,
-    /// or the extent tree cannot represent the post-EOF metadata.
+    /// Returns an error when the filesystem lacks the verity feature, the inode is protected from
+    /// mutation, the staged plaintext cannot be read, or the post-EOF metadata cannot be allocated
+    /// or represented. Merkle data covers the current transaction's file image, including writes
+    /// and size changes preceding this call.
     pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
+        self.mutation.volume.superblock.require_verity()?;
         let inode_index = self.mutation.ensure_inode_update(file.inode())?;
         let mut raw_inode = self.mutation.staged_live_inode(inode_index)?;
         let inode = raw_inode.parse()?;
@@ -961,16 +935,12 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         let _payload = inode.file_payload_mutation()?;
 
-        let mut plaintext = memory::repeated_vec(0_u8, inode.size().to_usize()?)?;
-        let read = self.mutation.volume.read_inode_plaintext_data(
-            &inode,
-            FileOffset::ZERO,
-            &mut plaintext,
-            self.crypto,
+        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
+        self.retain_file_allocation(
+            &mut tree,
+            FileAllocationSize::from_bytes(inode.size().bytes()),
         )?;
-        if read.as_usize() != plaintext.len() {
-            return Err(Error::InvalidVerityMetadata);
-        }
+        let plaintext = self.staged_file_plaintext(&inode, &tree)?;
         let merkle_tree = FsverityMerkleTree::build(
             &plaintext,
             enable.algorithm(),
@@ -985,25 +955,16 @@ impl MutationResolvePass<'_, '_, '_> {
             merkle_tree.root_hash(),
             enable.salt().try_clone()?,
         )?;
-        let descriptor_fixed = descriptor.to_bytes()?;
-        let descriptor_bytes = descriptor_byte_count(enable.signature().bytes())?;
+        let descriptor_image = descriptor.to_bytes(enable.signature())?;
+        let descriptor_bytes =
+            u32::try_from(descriptor_image.len()).map_err(|_| Error::ArithmeticOverflow)?;
         let layout = Ext4VerityMetadataLayout::new(
             inode.size(),
             self.mutation.volume.superblock.block_size(),
             u64::try_from(merkle_tree.blocks().len()).map_err(|_| Error::ArithmeticOverflow)?,
             descriptor_bytes,
         )?;
-        let metadata = verity_metadata_image(
-            layout,
-            merkle_tree.blocks(),
-            &descriptor_fixed,
-            enable.signature().bytes(),
-        )?;
-
-        let mut tree = self.mutation.mutable_extent_tree(&inode)?;
-        if tree.contains_uninitialized() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
+        let metadata = verity_metadata_image(layout, merkle_tree.blocks(), &descriptor_image)?;
         if inode.protection().is_encrypted() {
             self.stage_encrypted_inode_stream_write(
                 &inode,
@@ -1024,6 +985,59 @@ impl MutationResolvePass<'_, '_, '_> {
         self.mutation.stage_extent_tree(&mut raw_inode, tree)?;
         self.mutation.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
+    }
+
+    /// Reads the staged file image, preserving sparse and unwritten zero semantics before
+    /// decrypting initialized blocks. Bytes beyond the staged EOF never enter the Merkle input.
+    /// # Errors
+    /// Returns allocation, mapping, staged block read or decryption failures.
+    fn staged_file_plaintext(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+    ) -> Result<Vec<u8>> {
+        let mut plaintext = memory::repeated_vec(0_u8, inode.size().to_usize()?)?;
+        let block_size = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
+        let key = if inode.protection().is_encrypted() {
+            Some(
+                self.mutation
+                    .volume
+                    .fscrypt_contents_key_for_inode(inode, self.crypto)?,
+            )
+        } else {
+            None
+        };
+        let mut extents = tree.extents().iter().peekable();
+        let mut remaining = plaintext.as_mut_slice();
+        let mut index = 0_u64;
+        while !remaining.is_empty() {
+            let len = remaining.len().min(block_size);
+            let (target, next) = remaining
+                .split_at_mut_checked(len)
+                .ok_or(Error::DeviceRange)?;
+            let logical = LogicalBlock::try_from(index)?;
+            while extents
+                .peek()
+                .is_some_and(|extent| extent.end_logical() <= logical.as_u64())
+            {
+                extents.next();
+            }
+            let mapping = extents
+                .peek()
+                .map_or(BlockMapping::Hole, |extent| extent.map_logical(logical));
+            if let BlockMapping::Physical(physical) = mapping {
+                let mut block = self.mutation.file_block_bytes(physical)?;
+                if let Some(key) = &key {
+                    key.decrypt_block(logical.as_u64(), &mut block, self.crypto)?;
+                }
+                let len = target.len();
+                memory::copy_exact(target, block.get(..len).ok_or(Error::DeviceRange)?)?;
+            }
+            remaining = next;
+            index = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(plaintext)
     }
 
     /// Verifies file-data mutation policy with mount-scoped fscrypt keys.

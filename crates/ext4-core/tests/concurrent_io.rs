@@ -6,10 +6,118 @@ extern crate alloc;
 
 use alloc::{boxed::Box, vec::Vec};
 use ext4_core::*;
+use sha2::Digest as _;
 
-/// Independent HKDF oracle for key publication; fixture data must never invoke a cipher.
+/// Independent hashing and HKDF oracle; plaintext fixtures must never invoke a cipher.
 #[derive(Debug)]
 struct PlainCrypto;
+
+/// # Errors
+/// Returns fixture preparation, parameter construction or read failures.
+/// # Panics
+/// Fails if an undeclared filesystem feature can publish a verity inode or any storage effect.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe feature admission and unchanged physical storage"
+)]
+fn verity_requires_filesystem_feature_before_mutation() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    let enable = FsverityEnable::new(
+        FsverityHashAlgorithm::Sha256,
+        FsverityBlockSize::new(4096)?,
+        FsveritySalt::empty(),
+        FsveritySignature::empty(),
+    );
+    let before = (
+        fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+        fixture_crc32c(u32::MAX, &fixture.disk.journal),
+    );
+    assert_eq!(
+        fixture.mutate(|pass| {
+            let target = pass.file(file)?;
+            pass.enable_verity(target, &enable)
+        }),
+        Err(Error::UnsupportedVerity)
+    );
+    assert_eq!(
+        (
+            fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+            fixture_crc32c(u32::MAX, &fixture.disk.journal)
+        ),
+        before
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Returns feature fixture, transaction, Merkle generation or verified read failures.
+/// # Panics
+/// Fails if verity hashes a prior disk image, loses staged writes, or rejects its signed layout.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare published verified bytes with independent write inputs"
+)]
+fn verity_covers_staged_ordered_and_journaled_file_images() -> Result<()> {
+    for flags in [0x0008_0000, 0x0008_4000] {
+        let mut disk = Disk::fixture();
+        disk.enable_verity_feature()?;
+        let mut fixture = Fixture::from_disk(disk)?;
+        let file = fixture.a;
+        fixture.disk.encode_inode(NodeId::File(file), flags, None)?;
+        fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+        let enable = FsverityEnable::new(
+            FsverityHashAlgorithm::Sha256,
+            FsverityBlockSize::new(4096)?,
+            FsveritySalt::empty(),
+            FsveritySignature::new(&[0x30, 2, 5, 0])?,
+        );
+        let created = fixture.mutate(|pass| {
+            let target = pass.file(file)?;
+            pass.write_file_range(target, FileOffset::ZERO, b"old")?;
+            pass.write_file_range(target, FileOffset::from_bytes(1), b"XYZ")?;
+            pass.reserve_file_allocation(target, FileAllocationSize::from_bytes(12_288))?;
+            pass.enable_verity(target, &enable)?;
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            let created = pass.create_file(
+                root,
+                &Ext4Name::new(b"verified")?,
+                NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+            )?;
+            pass.reserve_file_allocation(created, FileAllocationSize::from_bytes(12_288))?;
+            pass.write_file_range(created, FileOffset::from_bytes(8192), b"created")?;
+            pass.extend_file(created, FileSize::from_bytes(16_384))?;
+            pass.enable_verity(created, &enable)?;
+            Ok(created.id())
+        })?;
+        let mut output = [0; 4];
+        assert_eq!(
+            fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut output))?,
+            ReadBytes::from_usize(4)
+        );
+        assert_eq!(&output, b"oXYZ");
+        let mut output = [0; 7];
+        assert_eq!(
+            fixture.read(|pass| pass.read_file(
+                created,
+                FileOffset::from_bytes(8192),
+                &mut output
+            ))?,
+            ReadBytes::from_usize(7)
+        );
+        assert_eq!(&output, b"created");
+        let mut zeroes = [0xff; 8];
+        for offset in [0, 4096, 12_288] {
+            fixture.read(|pass| {
+                pass.read_file(created, FileOffset::from_bytes(offset), &mut zeroes)
+            })?;
+            assert_eq!(zeroes, [0; 8]);
+        }
+    }
+    Ok(())
+}
 
 /// # Errors
 /// Returns mount, write, durability or read failures while recovering an interrupted extension.
@@ -161,11 +269,11 @@ impl CryptographicOperation for PlainCrypto {
     fn decrypt_aes_256_cbc_cs3(&mut self, _: &[u8; 32], _: &mut [u8]) -> Result<()> {
         Err(Error::CryptographicFailure)
     }
-    fn sha256(&mut self, _: &[u8]) -> Result<[u8; 32]> {
-        Err(Error::CryptographicFailure)
+    fn sha256(&mut self, bytes: &[u8]) -> Result<[u8; 32]> {
+        Ok(sha2::Sha256::digest(bytes).into())
     }
-    fn sha512(&mut self, _: &[u8]) -> Result<[u8; 64]> {
-        Err(Error::CryptographicFailure)
+    fn sha512(&mut self, bytes: &[u8]) -> Result<[u8; 64]> {
+        Ok(sha2::Sha512::digest(bytes).into())
     }
 }
 
@@ -177,6 +285,38 @@ struct Disk {
 }
 
 impl Disk {
+    /// Declares verity support using independent raw superblock fields before mounting.
+    /// # Errors
+    /// Returns an error when the fixture does not contain the declared superblock fields.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "checked four-byte fixture fields receive exactly four independently encoded bytes"
+    )]
+    fn enable_verity_feature(&mut self) -> Result<()> {
+        let features = u32::from_le_bytes(
+            self.filesystem
+                .get(1124..1128)
+                .ok_or(Error::InvalidSuperblock)?
+                .try_into()
+                .map_err(|_| Error::InvalidSuperblock)?,
+        );
+        self.filesystem
+            .get_mut(1124..1128)
+            .ok_or(Error::InvalidSuperblock)?
+            .copy_from_slice(&(features | 0x8000).to_le_bytes());
+        let checksum = fixture_crc32c(
+            u32::MAX,
+            self.filesystem
+                .get(1024..2044)
+                .ok_or(Error::InvalidSuperblock)?,
+        );
+        self.filesystem
+            .get_mut(2044..2048)
+            .ok_or(Error::InvalidSuperblock)?
+            .copy_from_slice(&checksum.to_le_bytes());
+        Ok(())
+    }
+
     /// Encodes flags and a private encryption xattr in the independent 4 KiB/256-byte fixture.
     /// Its inode-table address and CRC32C computation come from the disk format, not core encoders.
     /// # Errors
@@ -529,7 +669,13 @@ impl Fixture {
     /// # Errors
     /// Returns fixture mount, allocation, create, write, or commit failure.
     fn new() -> Result<Self> {
-        let mut disk = Disk::fixture();
+        Self::from_disk(Disk::fixture())
+    }
+
+    /// Mounts and populates an independently selected disk image.
+    /// # Errors
+    /// Returns fixture mount, namespace, payload or commit failure.
+    fn from_disk(mut disk: Disk) -> Result<Self> {
         let (profile, epoch, mut coordinator) = disk.mount()?.into_parts();
         let ticket = coordinator.admit_mutation()?;
         let (resolved, (a, b)) = disk.resolve(&profile, &epoch, &coordinator, ticket, |pass| {

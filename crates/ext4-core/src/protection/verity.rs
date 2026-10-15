@@ -37,8 +37,8 @@ const DESCRIPTOR_HASH_ALGORITHM_OFFSET: usize = 1;
 const DESCRIPTOR_LOG_BLOCKSIZE_OFFSET: usize = 2;
 /// Offset of descriptor salt size.
 const DESCRIPTOR_SALT_SIZE_OFFSET: usize = 3;
-/// Offset of descriptor reserved word at 0x04.
-const DESCRIPTOR_RESERVED_0X04_OFFSET: usize = 4;
+/// Offset of the appended signature byte count in the on-disk descriptor.
+const DESCRIPTOR_SIGNATURE_SIZE_OFFSET: usize = 4;
 /// Offset of descriptor data size.
 const DESCRIPTOR_DATA_SIZE_OFFSET: usize = 8;
 /// Offset of descriptor root hash bytes.
@@ -559,7 +559,10 @@ impl FsverityRootHash {
     }
 }
 
-/// Validated fs-verity descriptor without the optional signature blob.
+/// Validated Merkle parameters from an fs-verity descriptor.
+///
+/// Parsing validates the optional signature's framing. Merkle verification authenticates content
+/// against this root; signature trust and authorization are separate caller policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FsverityDescriptor {
     /// Hash algorithm.
@@ -597,12 +600,16 @@ impl FsverityDescriptor {
         })
     }
 
-    /// Parses a Linux `struct fsverity_descriptor` byte image.
+    /// Parses an on-disk descriptor including its optional appended signature.
     ///
     /// # Errors
     /// Returns an error when the descriptor is malformed or unsupported.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        require_exact_len(bytes, FSVERITY_DESCRIPTOR_BYTES)?;
+        if bytes.len() < FSVERITY_DESCRIPTOR_BYTES {
+            return Err(Error::TruncatedStructure);
+        }
+        let length = u32::try_from(bytes.len()).map_err(|_| Error::InvalidVerityMetadata)?;
+        let _validated_length = validated_descriptor_bytes(length)?;
         if byte(bytes, DESCRIPTOR_VERSION_OFFSET)? != FSVERITY_DESCRIPTOR_VERSION {
             return Err(Error::InvalidVerityMetadata);
         }
@@ -614,7 +621,15 @@ impl FsverityDescriptor {
         if salt_size > FSVERITY_MAX_SALT_BYTES {
             return Err(Error::InvalidVerityMetadata);
         }
-        if le_u32(bytes, DESCRIPTOR_RESERVED_0X04_OFFSET)? != 0 {
+        let signature_bytes = usize::try_from(le_u32(bytes, DESCRIPTOR_SIGNATURE_SIZE_OFFSET)?)
+            .map_err(|_| Error::InvalidVerityMetadata)?;
+        if signature_bytes > FSVERITY_MAX_SIGNATURE_BYTES
+            || signature_bytes
+                > bytes
+                    .len()
+                    .checked_sub(FSVERITY_DESCRIPTOR_BYTES)
+                    .ok_or(Error::InvalidVerityMetadata)?
+        {
             return Err(Error::InvalidVerityMetadata);
         }
         let data_size = le_u64(bytes, DESCRIPTOR_DATA_SIZE_OFFSET)?;
@@ -630,12 +645,15 @@ impl FsverityDescriptor {
         Self::new(algorithm, block_size, data_size, root_hash, salt)
     }
 
-    /// Serializes the descriptor in Linux `struct fsverity_descriptor` layout.
+    /// Serializes the on-disk descriptor and appended signature with their exact byte count.
     ///
     /// # Errors
     /// Returns an error when a field cannot fit the fixed descriptor layout.
-    pub fn to_bytes(&self) -> Result<[u8; FSVERITY_DESCRIPTOR_BYTES]> {
-        let mut bytes = [0_u8; FSVERITY_DESCRIPTOR_BYTES];
+    pub fn to_bytes(&self, signature: &FsveritySignature) -> Result<Vec<u8>> {
+        let length = FSVERITY_DESCRIPTOR_BYTES
+            .checked_add(signature.bytes().len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut bytes = memory::repeated_vec(0_u8, length)?;
         set_byte(
             &mut bytes,
             DESCRIPTOR_VERSION_OFFSET,
@@ -659,10 +677,18 @@ impl FsverityDescriptor {
         put_le_u64(&mut bytes, DESCRIPTOR_DATA_SIZE_OFFSET, self.data_size)?;
         copy_into(
             &mut bytes,
+            DESCRIPTOR_SIGNATURE_SIZE_OFFSET,
+            &u32::try_from(signature.bytes().len())
+                .map_err(|_| Error::InvalidVerityMetadata)?
+                .to_le_bytes(),
+        )?;
+        copy_into(
+            &mut bytes,
             DESCRIPTOR_ROOT_HASH_OFFSET,
             &self.root_hash.descriptor_bytes(),
         )?;
         copy_into(&mut bytes, DESCRIPTOR_SALT_OFFSET, self.salt.bytes())?;
+        copy_into(&mut bytes, FSVERITY_DESCRIPTOR_BYTES, signature.bytes())?;
         Ok(bytes)
     }
 
@@ -1252,19 +1278,6 @@ fn hash_bytes(
     }
 }
 
-/// Requires an exact serialized structure length.
-/// # Errors
-///
-/// Returns an error when `bytes` is shorter or longer than the expected serialized fs-verity
-/// structure.
-fn require_exact_len(bytes: &[u8], expected: usize) -> Result<()> {
-    match bytes.len().cmp(&expected) {
-        core::cmp::Ordering::Less => Err(Error::TruncatedStructure),
-        core::cmp::Ordering::Equal => Ok(()),
-        core::cmp::Ordering::Greater => Err(Error::InvalidVerityMetadata),
-    }
-}
-
 /// Reads one byte from a checked offset.
 /// # Errors
 ///
@@ -1469,9 +1482,57 @@ mod tests {
     #[test]
     fn fsverity_descriptor_round_trips_supported_layout() {
         let descriptor = must!(small_descriptor());
-        let bytes = must!(descriptor.to_bytes());
+        let bytes = must!(descriptor.to_bytes(&FsveritySignature::empty()));
 
         assert_eq!(FsverityDescriptor::parse(&bytes), Ok(descriptor));
+    }
+
+    /// # Errors
+    /// Returns parsing, signature construction or descriptor encoding failures.
+    /// # Panics
+    /// Fails if on-disk signature framing differs from the independent descriptor vector.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare a literal on-disk vector and its declared signature boundary"
+    )]
+    fn descriptor_signature_framing_matches_disk_vector() -> Result<()> {
+        let wire: [u8; 260] = core::array::from_fn(|offset| match offset {
+            0 | 1 => 1,
+            2 => 10,
+            3 => 3,
+            4 => 4,
+            8 => 11,
+            16..48 => SMALL_SHA256_ROOT
+                .get(offset.saturating_sub(16))
+                .copied()
+                .unwrap_or(0),
+            80..=82 => u8::try_from(offset.saturating_sub(79)).unwrap_or(0),
+            256 => 0x30,
+            257 => 2,
+            258 => 5,
+            _ => 0,
+        });
+        let descriptor = FsverityDescriptor::parse(&wire)?;
+        assert_eq!(descriptor.data_size(), 11);
+        assert_eq!(descriptor.root_digest_bytes()?, SMALL_SHA256_ROOT);
+        let signature = FsveritySignature::new(&[0x30, 2, 5, 0])?;
+        assert_eq!(descriptor.to_bytes(&signature)?, wire);
+        let mut oversized = wire;
+        copy_into(
+            &mut oversized,
+            DESCRIPTOR_SIGNATURE_SIZE_OFFSET,
+            &5_u32.to_le_bytes(),
+        )?;
+        assert_eq!(
+            FsverityDescriptor::parse(&oversized),
+            Err(Error::InvalidVerityMetadata)
+        );
+        assert_eq!(
+            FsverityDescriptor::parse(&[0; 255]),
+            Err(Error::TruncatedStructure)
+        );
+        Ok(())
     }
 
     /// # Panics
@@ -1479,18 +1540,8 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_descriptor_rejects_reserved_and_unused_salt_bytes() {
-        let mut reserved_word = must!(must!(small_descriptor()).to_bytes());
-        must!(put_le_u64(
-            &mut reserved_word,
-            DESCRIPTOR_RESERVED_0X04_OFFSET,
-            1
-        ));
-        assert_eq!(
-            FsverityDescriptor::parse(&reserved_word),
-            Err(Error::InvalidVerityMetadata)
-        );
-
-        let mut unused_salt = must!(must!(small_descriptor()).to_bytes());
+        let mut unused_salt =
+            must!(must!(small_descriptor()).to_bytes(&FsveritySignature::empty()));
         must!(set_byte(
             &mut unused_salt,
             some!(DESCRIPTOR_SALT_OFFSET.checked_add(4)),
@@ -1501,7 +1552,8 @@ mod tests {
             Err(Error::InvalidVerityMetadata)
         );
 
-        let mut trailing_reserved = must!(must!(small_descriptor()).to_bytes());
+        let mut trailing_reserved =
+            must!(must!(small_descriptor()).to_bytes(&FsveritySignature::empty()));
         must!(set_byte(
             &mut trailing_reserved,
             DESCRIPTOR_RESERVED_OFFSET,
@@ -1518,7 +1570,7 @@ mod tests {
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
     fn fsverity_descriptor_rejects_unsupported_algorithm_and_block_size() {
-        let mut algorithm = must!(must!(small_descriptor()).to_bytes());
+        let mut algorithm = must!(must!(small_descriptor()).to_bytes(&FsveritySignature::empty()));
         must!(set_byte(
             &mut algorithm,
             DESCRIPTOR_HASH_ALGORITHM_OFFSET,
@@ -1529,7 +1581,7 @@ mod tests {
             Err(Error::InvalidVerityMetadata)
         );
 
-        let mut block_size = must!(must!(small_descriptor()).to_bytes());
+        let mut block_size = must!(must!(small_descriptor()).to_bytes(&FsveritySignature::empty()));
         must!(set_byte(
             &mut block_size,
             DESCRIPTOR_LOG_BLOCKSIZE_OFFSET,

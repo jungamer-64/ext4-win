@@ -885,7 +885,10 @@ impl EpochReadView<'_, '_> {
             metadata_end,
             descriptor_bytes,
         )?;
-        let mut descriptor_image = memory::repeated_vec(0_u8, FSVERITY_DESCRIPTOR_BYTES)?;
+        let mut descriptor_image = memory::repeated_vec(
+            0_u8,
+            usize::try_from(descriptor_bytes).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
         self.read_prepared_plaintext_stream_range(
             contents_key,
             extent_tree,

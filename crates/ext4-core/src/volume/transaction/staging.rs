@@ -78,7 +78,105 @@ pub(super) enum StagedFileWrite {
     Journaled(JournalBlock),
 }
 
+impl StagedFileWrite {
+    /// Locates ordered ranges and journaled block images in the same device byte domain.
+    /// # Errors
+    /// Returns an error when a journaled block's byte offset overflows.
+    fn byte_range(&self, block_size: BlockSize) -> Result<(ByteOffset, &[u8])> {
+        match self {
+            Self::Ordered(write) => Ok((write.offset, &write.bytes)),
+            Self::Journaled(write) => Ok((block_size.offset_of(write.block())?, write.bytes())),
+        }
+    }
+}
+
 impl MetadataMutation<'_, '_> {
+    /// Reads the current transaction's physical block, applying staged data in operation order.
+    /// A staged image covering the whole block replaces the device read, including new allocation.
+    /// # Errors
+    /// Returns allocation, device read, arithmetic or invalid staged-range failures.
+    pub(super) fn file_block_bytes(&mut self, physical: BlockAddress) -> Result<Vec<u8>> {
+        let block_size = self.volume.superblock.block_size();
+        let width = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let offset = block_size.offset_of(physical)?;
+        let start = offset.get();
+        let end = start
+            .checked_add(u64::from(block_size.bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut bytes = memory::repeated_vec(0_u8, width)?;
+        let mut after_base = None;
+        for (index, write) in self.file_writes.iter().enumerate().rev() {
+            let (write_offset, payload) = write.byte_range(block_size)?;
+            let write_start = write_offset.get();
+            let write_end = write_start
+                .checked_add(u64::try_from(payload.len()).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if write_start <= start && write_end >= end {
+                let from = usize::try_from(
+                    start
+                        .checked_sub(write_start)
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+                .map_err(|_| Error::ArithmeticOverflow)?;
+                let to = from.checked_add(width).ok_or(Error::ArithmeticOverflow)?;
+                memory::copy_exact(
+                    &mut bytes,
+                    payload.get(from..to).ok_or(Error::InvalidWriteRange)?,
+                )?;
+                after_base = Some(index.checked_add(1).ok_or(Error::ArithmeticOverflow)?);
+                break;
+            }
+        }
+        if after_base.is_none() {
+            self.volume.device.read_exact_at(offset, &mut bytes)?;
+        }
+        for write in self.file_writes.iter().skip(after_base.unwrap_or(0)) {
+            let (write_offset, payload) = write.byte_range(block_size)?;
+            let write_start = write_offset.get();
+            let write_end = write_start
+                .checked_add(u64::try_from(payload.len()).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let overlap_start = start.max(write_start);
+            let overlap_end = end.min(write_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let target_start = usize::try_from(
+                overlap_start
+                    .checked_sub(start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let target_end = usize::try_from(
+                overlap_end
+                    .checked_sub(start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let source_start = usize::try_from(
+                overlap_start
+                    .checked_sub(write_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            let source_end = usize::try_from(
+                overlap_end
+                    .checked_sub(write_start)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::ArithmeticOverflow)?;
+            memory::copy_exact(
+                bytes
+                    .get_mut(target_start..target_end)
+                    .ok_or(Error::InvalidWriteRange)?,
+                payload
+                    .get(source_start..source_end)
+                    .ok_or(Error::InvalidWriteRange)?,
+            )?;
+        }
+        Ok(bytes)
+    }
+
     /// Stages data at the inode-selected persistence boundary before any lower write.
     /// Journaled partial writes retain a full committed or already staged block image.
     /// # Errors
@@ -129,10 +227,7 @@ impl MetadataMutation<'_, '_> {
         let bytes = if start == 0 && write.bytes.len() == block_bytes {
             write.bytes
         } else {
-            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-            self.volume
-                .device
-                .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+            let mut bytes = self.file_block_bytes(block)?;
             memory::copy_exact(
                 bytes.get_mut(start..end).ok_or(Error::InvalidWriteRange)?,
                 &write.bytes,

@@ -1307,6 +1307,8 @@ pub(crate) struct FeatureSet {
     checksum_seed_source: ChecksumSeedSource,
     /// Public xattr mutation capability.
     xattr_mutation: XattrMutationSupport,
+    /// Whether the filesystem declares that verity inodes may be stored.
+    verity: bool,
     /// File-size encoding supported by inode records.
     file_size_encoding: FileSizeEncoding,
     /// Directory-size encoding selected by the incompatible large-directory feature.
@@ -1477,6 +1479,7 @@ impl FeatureSet {
             } else {
                 XattrMutationSupport::Disabled
             },
+            verity: read_only_compat & RO_COMPAT_VERITY != 0,
             file_size_encoding: if read_only_compat & RO_COMPAT_LARGE_FILE != 0 {
                 FileSizeEncoding::LargeFile
             } else {
@@ -2090,6 +2093,17 @@ impl Superblock {
     #[must_use]
     pub(crate) const fn xattr_mutation(self) -> XattrMutationSupport {
         self.features.xattr_mutation()
+    }
+
+    /// Requires filesystem-level admission before creating a verity inode.
+    /// # Errors
+    /// Returns [`Error::UnsupportedVerity`] when the filesystem lacks `RO_COMPAT_VERITY`.
+    pub(crate) const fn require_verity(self) -> Result<()> {
+        if self.features.verity {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedVerity)
+        }
     }
 
     /// Returns the single mounted encoding for inode size and allocation fields.
