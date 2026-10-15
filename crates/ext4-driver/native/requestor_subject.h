@@ -16,6 +16,9 @@ static VOID ext4win_subject_destroy(PEXT4WIN_REQUESTOR_SUBJECT subject)
     ExFreePool(subject);
 }
 
+static IO_WORKITEM_ROUTINE ext4win_subject_release_worker;
+
+_Use_decl_annotations_
 static VOID ext4win_subject_release_worker(PDEVICE_OBJECT device, PVOID context)
 {
     UNREFERENCED_PARAMETER(device);

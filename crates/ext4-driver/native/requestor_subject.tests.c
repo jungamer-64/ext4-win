@@ -13,6 +13,7 @@
 #define DelayedWorkQueue 0
 #define PAGED_CODE() assert(irql == PASSIVE_LEVEL)
 #define VOID void
+#define _Use_decl_annotations_
 #define UNREFERENCED_PARAMETER(value) ((void)(value))
 typedef int NTSTATUS, KPROCESSOR_MODE, BOOLEAN;
 typedef unsigned ACCESS_MASK;
@@ -21,8 +22,9 @@ typedef struct { unsigned token; } SECURITY_SUBJECT_CONTEXT;
 typedef struct { unsigned identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct { int allowed; } SECURITY_DESCRIPTOR, *PSECURITY_DESCRIPTOR;
 typedef struct { int used; } PRIVILEGE_SET, *PPRIVILEGE_SET;
-typedef void (*WORKER)(PDEVICE_OBJECT, PVOID);
-typedef struct { WORKER routine; PVOID context; } IO_WORKITEM, *PIO_WORKITEM;
+typedef VOID IO_WORKITEM_ROUTINE(PDEVICE_OBJECT, PVOID);
+typedef IO_WORKITEM_ROUTINE *PIO_WORKITEM_ROUTINE;
+typedef struct { PIO_WORKITEM_ROUTINE routine; PVOID context; } IO_WORKITEM, *PIO_WORKITEM;
 static DEVICE_OBJECT device;
 static int irql, pools, works, subjects, locks, fail_pool, fail_work;
 static unsigned caller_token;
@@ -51,7 +53,7 @@ static PIO_WORKITEM IoAllocateWorkItem(PDEVICE_OBJECT observed)
     return &release_work;
 }
 static void IoFreeWorkItem(PIO_WORKITEM work) { assert(works == 1 && work == &release_work); works--; }
-static void IoQueueWorkItem(PIO_WORKITEM work, WORKER routine, int queue, PVOID context)
+static void IoQueueWorkItem(PIO_WORKITEM work, PIO_WORKITEM_ROUTINE routine, int queue, PVOID context)
 {
     assert(irql == DISPATCH_LEVEL && queue == DelayedWorkQueue && queued == NULL);
     work->routine = routine; work->context = context; queued = work;
