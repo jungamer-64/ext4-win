@@ -285,15 +285,6 @@ impl LiveInodeRecord {
         self.raw.set_permissions(permissions)
     }
 
-    /// Updates access, change, and modification timestamps.
-    /// # Errors
-    ///
-    /// Returns an error when inode timestamp fields or required extra timestamp storage cannot be
-    /// updated.
-    pub(super) fn set_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
-        self.raw.set_timestamps(now)
-    }
-
     /// Writes explicit ext4 inode timestamps.
     /// # Errors
     ///
@@ -455,42 +446,6 @@ impl LiveInodeRecord {
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.raw.set_extent_root_bytes(serialized.inode_root())?;
-        Ok(DeletedInodeRecord { raw: self.raw })
-    }
-
-    /// Serializes deletion state and refreshes timestamps for file final-unlink.
-    /// # Errors
-    ///
-    /// Returns an error when deletion fields, refreshed timestamps, or the empty extent root cannot
-    /// be serialized.
-    pub(super) fn delete_and_touch(
-        mut self,
-        now: Ext4Timestamp,
-        block_size: BlockSize,
-    ) -> Result<DeletedInodeRecord> {
-        let kind = self.parse()?.kind();
-        self.raw.set_deletion_time(now.base_seconds_bits()?)?;
-        self.raw.set_deleted_links_count()?;
-        let size = match kind {
-            InodeKind::Directory => self
-                .raw
-                .encoding
-                .encode_directory_size(DirectorySize::from_bytes(0))?,
-            InodeKind::File | InodeKind::Symlink => self
-                .raw
-                .encoding
-                .encode_file_size(FileSize::from_bytes(0))?,
-        };
-        self.raw.set_encoded_size(size)?;
-        let allocation_size = self
-            .raw
-            .encoding
-            .encode_allocation_size(FileAllocationSize::from_bytes(0))?;
-        self.raw.set_encoded_allocation_size(allocation_size)?;
-        let tree = MutableExtentTree::from_extents(Vec::new())?;
-        let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
-        self.raw.set_extent_root_bytes(serialized.inode_root())?;
-        self.raw.set_timestamps(now)?;
         Ok(DeletedInodeRecord { raw: self.raw })
     }
 }
@@ -849,21 +804,6 @@ impl RawInodeRecord<Vec<u8>> {
             InodeBlockCountUnit::FileSystemBlocks => self.flags()?.with_huge_file_blocks(),
         };
         self.set_flags(flags)
-    }
-
-    /// Updates access, change, and modification timestamps.
-    /// # Errors
-    ///
-    /// Returns an error when timestamp fields are truncated or the time needs an absent epoch field.
-    pub(super) fn set_timestamps(&mut self, now: Ext4Timestamp) -> Result<()> {
-        for (base, extra) in [
-            (INODE_ATIME_OFFSET, INODE_ATIME_EXTRA_OFFSET),
-            (INODE_CTIME_OFFSET, INODE_CTIME_EXTRA_OFFSET),
-            (INODE_MTIME_OFFSET, INODE_MTIME_EXTRA_OFFSET),
-        ] {
-            self.set_timestamp_field(now, base, extra)?;
-        }
-        Ok(())
     }
 
     /// Writes one time only within this inode's declared field storage.
