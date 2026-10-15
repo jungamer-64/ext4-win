@@ -337,10 +337,10 @@ pub(crate) fn verify_htree_interop(repository_root: &Path) -> TaskResult<()> {
     let linux = LinuxEnvironment::require(&manifest.e2fsprogs_version)?;
     let temporary_root = create_task_directory(repository_root, "htree-interop")?;
     let verification = (|| -> TaskResult<()> {
+        verify_locked_directory_enumeration(linux, &temporary_root)?;
         verify_unsigned_htree(linux, &temporary_root)?;
         verify_large_directory_depth_two(linux, &temporary_root)?;
         verify_directory_enumeration_scaling(linux, &temporary_root)?;
-        verify_locked_directory_enumeration(linux, &temporary_root)?;
         for block_size in [1_024_u32, 4_096] {
             for metadata_checksum in [false, true] {
                 for large_directory in [false, true] {
@@ -4153,6 +4153,10 @@ fn verify_locked_directory_enumeration(
     if !matches!(output.status.code(), Some(0 | 1)) {
         return Err(io::Error::other("locked HTree optimization failed").into());
     }
+    let tree = debugfs_request_output(linux, &image, "htree_dump /locked")?;
+    if !tree.contains("Hash Version:") {
+        return Err(io::Error::other("locked directory lacks the required HTree fixture").into());
+    }
     verify_internal_e2fsck_clean(linux, &image, "encrypted directory fixture")?;
     let directory = drive_internal_core_read_observed(&image, |pass| {
         let root =
@@ -4210,8 +4214,25 @@ fn verify_locked_directory_enumeration(
         Ok(())
     })?;
     let listing = debugfs_request_output(linux, &image, "ls -p /locked")?;
-    if raw_names.iter().any(|name| listing.contains(name)) {
-        return Err(io::Error::other("keyless unlink left an independently named file").into());
+    let mut live = alloc::collections::BTreeSet::new();
+    for line in listing.lines().filter(|line| line.starts_with('/')) {
+        let mut fields = line.split('/').skip(1);
+        let inode = fields
+            .next()
+            .ok_or_else(|| io::Error::other("missing oracle inode"))?
+            .parse::<u32>()?;
+        if inode != 0 {
+            let name = fields
+                .nth(3)
+                .ok_or_else(|| io::Error::other("missing oracle name"))?;
+            live.insert(name);
+        }
+    }
+    if live != alloc::collections::BTreeSet::from([".", ".."]) {
+        return Err(io::Error::other(format!(
+            "keyless unlink left unexpected live entries: {listing}"
+        ))
+        .into());
     }
     verify_internal_e2fsck_clean(linux, &image, "locked HTree unlink")?;
 
