@@ -918,6 +918,10 @@ pub fn verify_allocation_control(path: &Path) -> io::Result<()> {
     completed(result, file.close())
 }
 
+/// Native create dispositions and Rust file-reset contracts.
+mod file_reset;
+pub use file_reset::verify_existing_file_reset;
+
 /// Sets the requested signed Windows byte allocation on one retained synchronous handle.
 /// # Errors
 /// Returns native set-information failures.
@@ -1699,26 +1703,27 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
     /// # Panics
-    /// Panics if independent Windows timestamp observations disagree with the handle contract.
+    /// Panics if native reset, allocation or timestamp observations disagree with their contracts.
     #[test]
-    fn native_file_allocation_and_timestamp_contracts() {
+    fn native_file_reset_allocation_and_timestamp_contracts() {
         let result = (|| {
             let nonce = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_err(io::Error::other)?
                 .as_nanos();
-            let path = std::env::temp_dir()
+            let directory = std::env::temp_dir()
                 .join(format!("ext4win-times-{}-{nonce}.bin", std::process::id()));
-            let file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)?;
-            close_file(file)?;
+            std::fs::create_dir(&directory)?;
+            let path = directory.join("reset.bin");
             let result = (|| {
+                verify_existing_file_reset(&path)?;
                 verify_allocation_control(&path)?;
                 verify_timestamp_suppression(&path)
             })();
-            completed(result, std::fs::remove_file(&path))
+            completed(
+                result,
+                completed(std::fs::remove_file(&path), std::fs::remove_dir(&directory)),
+            )
         })();
         assert!(result.is_ok(), "{result:?}");
     }

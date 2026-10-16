@@ -596,60 +596,7 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
     )?;
     println!("live filesystem I/O: verify existing-file reset and creation attributes");
     let reset_path = root.join("reset.bin");
-    let reset = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .attributes(0x02)
-        .open(&reset_path)?;
-    windows_host::close_file(reset)?;
-    if fs::metadata(&reset_path)?.file_attributes() & 0x02 == 0 {
-        return Err(io::Error::other("create attributes were not applied").into());
-    }
-    for create_if_missing in [false, true] {
-        let mut payload_handle = OpenOptions::new().write(true).open(&reset_path)?;
-        let write = payload_handle
-            .write_all(b"existing payload")
-            .map_err(Into::into);
-        combine_verification_and_cleanup(
-            write,
-            windows_host::close_file(payload_handle).map_err(Into::into),
-        )?;
-        match OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(create_if_missing)
-            .open(&reset_path)
-        {
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {}
-            Err(error) => return Err(error.into()),
-            Ok(handle) => {
-                windows_host::close_file(handle)?;
-                return Err(
-                    io::Error::other("overwrite ignored the existing HIDDEN attribute").into(),
-                );
-            }
-        }
-        if fs::read(&reset_path)? != b"existing payload" {
-            return Err(io::Error::other("refused overwrite changed the existing payload").into());
-        }
-        let reset = OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(create_if_missing)
-            .attributes(0x02)
-            .open(&reset_path)?;
-        let verification = (|| {
-            if reset.metadata()?.len() == 0 {
-                Ok(())
-            } else {
-                Err(io::Error::other("overwrite did not reset EOF").into())
-            }
-        })();
-        combine_verification_and_cleanup(
-            verification,
-            windows_host::close_file(reset).map_err(Into::into),
-        )?;
-    }
+    windows_host::verify_existing_file_reset(&reset_path)?;
     println!("live filesystem I/O: verify allocation reservation and release");
     windows_host::verify_allocation_control(&reset_path)?;
     println!("live filesystem I/O: verify handle-local timestamp suppression");
