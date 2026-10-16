@@ -155,24 +155,47 @@ impl WindowsName {
     pub fn equals(&self, requested: &Self) -> bool {
         self.utf16 == requested.utf16
     }
-
-    /// Returns true for the v1 ASCII-only case-insensitive comparison.
-    #[must_use]
-    pub fn equals_ascii_case_insensitive(&self, requested: &Self) -> bool {
-        self.utf16.len() == requested.utf16.len()
-            && self
-                .utf16
-                .iter()
-                .zip(&requested.utf16)
-                .all(|(left, right)| fold_ascii_u16(*left) == fold_ascii_u16(*right))
-    }
 }
 
-/// Applies the Windows v1 ASCII-only case fold to one UTF-16 code unit.
-fn fold_ascii_u16(value: u16) -> u16 {
-    match value {
-        0x0041..=0x005A => value | 0x0020,
-        _ => value,
+/// Requested Windows-visible spelling and the caller's comparison authority.
+///
+/// Lookup first searches the exact ext4 spelling. An insensitive fallback uses the supplied
+/// UTF-16 uppercase mapping without Unicode normalization and rejects multiple matching entries.
+/// The mapping must remain deterministic throughout a restartable operation.
+#[derive(Clone, Copy, Debug)]
+pub enum WindowsNameLookup<'name> {
+    /// Accept only the supplied spelling.
+    Exact(&'name WindowsName),
+    /// Permit an insensitive fallback using the namespace owner's uppercase table.
+    CaseInsensitive {
+        /// Requested spelling, retained unchanged for the indexed exact lookup.
+        name: &'name WindowsName,
+        /// Uppercase mapping for one UTF-16 code unit.
+        upcase: fn(u16) -> u16,
+    },
+}
+
+impl<'name> WindowsNameLookup<'name> {
+    /// Borrows the original spelling independently of fallback comparison policy.
+    pub(crate) const fn name(self) -> &'name WindowsName {
+        match self {
+            Self::Exact(name) | Self::CaseInsensitive { name, .. } => name,
+        }
+    }
+
+    /// Compares fallback candidates using only the supplied namespace authority.
+    pub(crate) fn matches(self, candidate: &WindowsName) -> bool {
+        match self {
+            Self::Exact(name) => candidate.equals(name),
+            Self::CaseInsensitive { name, upcase } => {
+                candidate.utf16.len() == name.utf16.len()
+                    && candidate
+                        .utf16
+                        .iter()
+                        .zip(&name.utf16)
+                        .all(|(left, right)| upcase(*left) == upcase(*right))
+            }
+        }
     }
 }
 

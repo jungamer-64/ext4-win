@@ -39,7 +39,7 @@ pub use node::{
 };
 pub use operation::{
     CommittedReadPass, EpochReadOperation, EpochReadPass, MutationResolveOperation,
-    MutationResolveReady, MutationResolveTransition, ReadTransition, WindowsNameMatch,
+    MutationResolveReady, MutationResolveTransition, ReadTransition,
 };
 pub use transaction::{
     CheckpointOperation, CleanJournalDurability, CleanJournalRecordPhase, CommitDurability,

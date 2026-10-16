@@ -1136,11 +1136,10 @@ impl EpochReadView<'_, '_> {
     pub(super) fn lookup_windows_child(
         &mut self,
         parent: &DirectoryNode,
-        requested: &WindowsName,
-        name_match: super::operation::WindowsNameMatch,
+        lookup: WindowsNameLookup<'_>,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<ChildLookup> {
-        match self.lookup_windows_child_entry(parent, requested, name_match, crypto)? {
+        match self.lookup_windows_child_entry(parent, lookup, crypto)? {
             Some(entry) => Ok(ChildLookup::Found(entry.into_child(parent.id()))),
             None => Ok(ChildLookup::NotFound),
         }
@@ -1154,11 +1153,10 @@ impl EpochReadView<'_, '_> {
     pub(super) fn lookup_windows_child_entry(
         &mut self,
         parent: &DirectoryNode,
-        requested: &WindowsName,
-        name_match: super::operation::WindowsNameMatch,
+        lookup: WindowsNameLookup<'_>,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<Option<DirectoryEntry>> {
-        let visible_name = requested.to_ext4()?;
+        let visible_name = lookup.name().to_ext4()?;
         let exact_entry = if parent.protection().is_encrypted() {
             match self.encrypt_directory_child_name(parent.inode(), &visible_name, crypto) {
                 Ok(ciphertext) => self.find_raw_directory_entry(
@@ -1191,7 +1189,7 @@ impl EpochReadView<'_, '_> {
         if let Some(raw) = exact_entry {
             return Ok(Some(self.validate_directory_entry(raw, &visible_name)?));
         }
-        if matches!(name_match, super::operation::WindowsNameMatch::Exact) {
+        if matches!(lookup, WindowsNameLookup::Exact(_)) {
             return Ok(None);
         }
         let mut folded = None;
@@ -1201,7 +1199,7 @@ impl EpochReadView<'_, '_> {
             let Ok(name) = WindowsName::from_ext4(entry.name()) else {
                 continue;
             };
-            if name.equals_ascii_case_insensitive(requested) {
+            if lookup.matches(&name) {
                 if folded.is_some() {
                     return Err(Error::AmbiguousWindowsName);
                 }

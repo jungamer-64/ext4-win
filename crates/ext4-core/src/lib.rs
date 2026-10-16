@@ -39,7 +39,7 @@ pub use disk_format::superblock::{
 };
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
-pub use platform::name::{Ext4Name, WindowsName};
+pub use platform::name::{Ext4Name, WindowsName, WindowsNameLookup};
 pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay, WindowsSymlinkReparsePoint};
 pub use protection::crypto::CryptographicOperation;
 pub use protection::fscrypt::{
@@ -68,5 +68,4 @@ pub use volume::{
     StorageRequestSequence, StorageRequestSequenceStep, SymlinkNode, SymlinkNodeId,
     TransactionDirectory, TransactionFile, TransactionHardLinkSource, TransactionNode,
     TransactionSymlink, ValidatedExternalJournal, VisibilityLease, VolumeGeometry, VolumeIdentity,
-    WindowsNameMatch,
 };
