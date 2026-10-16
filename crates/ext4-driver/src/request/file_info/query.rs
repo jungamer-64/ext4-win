@@ -852,8 +852,7 @@ fn volume_relative_name(
             let visible_name = WindowsName::from_ext4(name)?;
             let child = match read.lookup_windows_child(
                 loaded.id(),
-                &visible_name,
-                ext4_core::WindowsNameMatch::Exact,
+                ext4_core::WindowsNameLookup::Exact(&visible_name),
             )? {
                 ChildLookup::Found(child) if *child.node() == node => child,
                 ChildLookup::Found(_) | ChildLookup::NotFound => {

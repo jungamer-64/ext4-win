@@ -29,13 +29,3 @@ NTSTATUS NTAPI ext4win_name_expression(
         return GetExceptionCode();
     }
 }
-
-/* FsRtl's insensitive expression contract requires an uppercase expression.
- * Capture folds owned input once, rather than allocating for each directory entry. */
-VOID NTAPI ext4win_upcase_expression(_Inout_updates_bytes_(length) WCHAR *units, USHORT length)
-{
-    USHORT index;
-    for (index = 0; index < length / sizeof(WCHAR); index++) {
-        units[index] = RtlUpcaseUnicodeChar(units[index]);
-    }
-}

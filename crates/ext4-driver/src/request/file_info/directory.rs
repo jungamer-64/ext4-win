@@ -1,6 +1,7 @@
 //! Directory query planning, wildcard matching, and record packing.
 
 use super::*;
+use crate::kernel::name_expression::NameCase;
 
 #[cfg(test)]
 #[path = "tests/directory.rs"]
@@ -604,9 +605,9 @@ impl DirectoryQuery {
             Some(request.with_active(|active| {
                 let file = active.current_stack()?.file_object()?;
                 Ok::<_, DriverError>(if file.flags() & wdk_sys::FO_OPENED_CASE_SENSITIVE != 0 {
-                    ext4_core::WindowsNameMatch::Exact
+                    NameCase::Exact
                 } else {
-                    ext4_core::WindowsNameMatch::CaseInsensitive
+                    NameCase::Insensitive
                 })
             })?)
         } else {

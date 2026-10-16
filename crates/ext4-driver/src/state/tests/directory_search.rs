@@ -15,10 +15,12 @@ fn directory_search_uses_opened_case_policy_for_literal_and_wildcard_names() {
                 WindowsName::from_utf16(&name.encode_utf16().collect::<alloc::vec::Vec<_>>())?;
             let insensitive = DirectoryNameExpression::from_utf16(
                 &units,
-                ext4_core::WindowsNameMatch::CaseInsensitive,
+                crate::kernel::name_expression::NameCase::Insensitive,
             )?;
-            let sensitive =
-                DirectoryNameExpression::from_utf16(&units, ext4_core::WindowsNameMatch::Exact)?;
+            let sensitive = DirectoryNameExpression::from_utf16(
+                &units,
+                crate::kernel::name_expression::NameCase::Exact,
+            )?;
             assert_eq!(insensitive.matches(&name), Ok(true));
             assert_eq!(sensitive.matches(&name), Ok(false));
         }
@@ -41,7 +43,7 @@ fn directory_wildcard_pattern_matches_long_windows_names() {
             u16::from(b'?'),
             u16::from(b't'),
         ],
-        ext4_core::WindowsNameMatch::Exact,
+        crate::kernel::name_expression::NameCase::Exact,
     );
     assert!(pattern.is_ok());
     let Ok(pattern) = pattern else {
@@ -87,14 +89,14 @@ fn directory_wildcard_pattern_rejects_non_name_units() {
     assert_eq!(
         super::DirectoryNameExpression::from_utf16(
             &[u16::from(b'a'), 0x005C, super::UTF16_ASTERISK,],
-            ext4_core::WindowsNameMatch::Exact
+            crate::kernel::name_expression::NameCase::Exact
         ),
         Err(DriverError::from(ext4_core::Error::InvalidName))
     );
     assert_eq!(
         super::DirectoryNameExpression::from_utf16(
             &[0xD800, super::UTF16_ASTERISK],
-            ext4_core::WindowsNameMatch::Exact
+            crate::kernel::name_expression::NameCase::Exact
         ),
         Err(DriverError::from(ext4_core::Error::InvalidName))
     );
@@ -121,7 +123,7 @@ fn prepared_directory_pattern_uses_owned_utf16_units() {
     );
     let pattern = super::DirectoryPattern::from_prepared(
         &crate::irp::PreparedDirectoryPattern::Name(units),
-        ext4_core::WindowsNameMatch::Exact,
+        crate::kernel::name_expression::NameCase::Exact,
     );
     assert!(matches!(
         pattern,
@@ -140,7 +142,7 @@ fn initial_search_expression_survives_restart_and_later_requests() {
         let original = search.capture_pattern(DirectoryPattern::Expression(
             DirectoryNameExpression::from_utf16(
                 selected.utf16(),
-                ext4_core::WindowsNameMatch::Exact,
+                crate::kernel::name_expression::NameCase::Exact,
             )?,
         ))?;
         let mut cursor = search.cursor();
@@ -212,7 +214,7 @@ fn directory_dos_expressions_match_native_vectors() {
             }
             let pattern = DirectoryPattern::from_prepared(
                 &PreparedDirectoryPattern::Name(units),
-                ext4_core::WindowsNameMatch::Exact,
+                crate::kernel::name_expression::NameCase::Exact,
             )?;
             let name = name.encode_utf16().collect::<alloc::vec::Vec<_>>();
             assert_eq!(

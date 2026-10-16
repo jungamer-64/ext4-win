@@ -1,6 +1,45 @@
 //! Native Windows expression semantics with request-local failure ownership.
 
 use crate::kernel::status::{DriverError, DriverResult};
+use ext4_core::{WindowsName, WindowsNameLookup};
+
+/// Case policy selected by the native open flags and retained by directory handles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NameCase {
+    /// Preserve every UTF-16 code unit during comparison.
+    Exact,
+    /// Compare using the current Windows uppercase table.
+    Insensitive,
+}
+
+impl NameCase {
+    /// Binds lookup to the same Windows uppercase table used by native expression matching.
+    /// Namespace resolve passes execute at PASSIVE_LEVEL, including after storage suspension.
+    pub(crate) const fn lookup(self, name: &WindowsName) -> WindowsNameLookup<'_> {
+        match self {
+            Self::Exact => WindowsNameLookup::Exact(name),
+            Self::Insensitive => WindowsNameLookup::CaseInsensitive { name, upcase },
+        }
+    }
+}
+
+/// Borrows Windows' scalar mapping without owning or reproducing its Unicode tables.
+#[expect(
+    unsafe_code,
+    reason = "namespace evaluation at PASSIVE_LEVEL supplies and receives one UTF-16 value"
+)]
+fn upcase(unit: u16) -> u16 {
+    #[cfg(not(test))]
+    unsafe {
+        // SAFETY: The native mapping accepts every UTF-16 code unit by value.
+        wdk_sys::ntddk::RtlUpcaseUnicodeChar(unit)
+    }
+    #[cfg(test)]
+    unsafe {
+        // SAFETY: ntdll exposes the same Windows scalar uppercase mapping to host tests.
+        RtlUpcaseUnicodeChar(unit)
+    }
+}
 
 /// Evaluates an expression without changing either input; insensitive expressions are uppercase.
 /// # Errors
@@ -54,26 +93,10 @@ pub(crate) fn matches(expression: &[u16], name: &[u16], ignore_case: bool) -> Dr
 /// Normalizes an owned insensitive expression once using the Windows uppercase table.
 /// # Errors
 /// Rejects strings that exceed the counted-string byte-length domain.
-#[expect(
-    unsafe_code,
-    reason = "the exclusive bounded slice owns every transformed UTF-16 unit"
-)]
 pub(crate) fn uppercase(units: &mut [u16]) -> DriverResult<()> {
-    let length = counted_length(units)?;
-    #[cfg(not(test))]
-    unsafe {
-        // SAFETY: Length fits USHORT and the exclusive slice retains the complete writable range.
-        ext4win_upcase_expression(units.as_mut_ptr(), length);
-    }
-    #[cfg(test)]
-    {
-        let _length = length;
-        for unit in units {
-            *unit = unsafe {
-                // SAFETY: ntdll accepts one value and returns the Windows UTF-16 uppercase mapping.
-                RtlUpcaseUnicodeChar(*unit)
-            };
-        }
+    counted_length(units)?;
+    for unit in units {
+        *unit = upcase(*unit);
     }
     Ok(())
 }
@@ -100,8 +123,6 @@ unsafe extern "system" {
         ignore_case: u8,
         matched: *mut u8,
     ) -> wdk_sys::NTSTATUS;
-    /// Uppercases the exclusive counted expression before insensitive FsRtl matching.
-    fn ext4win_upcase_expression(units: *mut u16, length: u16);
 }
 
 #[cfg(test)]
@@ -120,4 +141,56 @@ unsafe extern "system" {
         ignore_case: u8,
         upcase: *const u16,
     ) -> u8;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails if lookup folding disagrees with native expression matching for literal Unicode names.
+    #[test]
+    fn lookup_and_expression_use_the_same_windows_unicode_table() {
+        let result = (|| -> DriverResult<()> {
+            // Literal uppercase expressions let ntdll supply expected results without using
+            // the lookup callback to prepare the oracle's input or assuming a Unicode release.
+            for (requested, candidate) in [
+                ("É.TXT", "é.txt"),
+                ("Σ.TXT", "σ.txt"),
+                ("Σ.TXT", "ς.txt"),
+                ("ЁЖ.TXT", "ёж.txt"),
+                ("I.TXT", "ı.txt"),
+                ("İ.TXT", "i.txt"),
+                ("STRASSE.TXT", "straße.txt"),
+                ("É.TXT", "e\u{301}.txt"),
+            ] {
+                let requested = requested.encode_utf16().collect::<alloc::vec::Vec<_>>();
+                let candidate = candidate.encode_utf16().collect::<alloc::vec::Vec<_>>();
+                let name = WindowsName::from_utf16(&requested)?;
+                let WindowsNameLookup::CaseInsensitive { upcase, .. } =
+                    NameCase::Insensitive.lookup(&name)
+                else {
+                    return Err(DriverError::InternalInvariantViolation);
+                };
+                let folded = requested
+                    .iter()
+                    .copied()
+                    .map(upcase)
+                    .collect::<alloc::vec::Vec<_>>();
+                let folded_candidate = candidate
+                    .iter()
+                    .copied()
+                    .map(upcase)
+                    .collect::<alloc::vec::Vec<_>>();
+                let native = matches(&requested, &candidate, true)?;
+                assert_eq!(
+                    folded == folded_candidate,
+                    native,
+                    "requested={requested:x?} candidate={candidate:x?}"
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
 }

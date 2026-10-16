@@ -1021,7 +1021,7 @@ fn decoded_directory_views_share_publication_without_exclusive_references() {
         );
         let later = second_search.capture_pattern(DirectoryPattern::from_prepared(
             &later_input,
-            ext4_core::WindowsNameMatch::CaseInsensitive,
+            crate::kernel::name_expression::NameCase::Insensitive,
         )?)?;
         assert_eq!(original.get(), later.get());
         let mut cursor = first_search.cursor();

@@ -1,7 +1,8 @@
 use alloc::boxed::Box;
 use core::ffi::c_void;
 
-use ext4_core::{FileOffset, WindowsNameMatch};
+use crate::kernel::name_expression::NameCase;
+use ext4_core::FileOffset;
 use wdk_sys::{STATUS_ACCESS_DENIED, STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED};
 
 use super::{
@@ -1283,7 +1284,7 @@ fn create_stack_preserves_access_share_options_and_ea_length() {
                 wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE
             );
             assert_eq!(parameters.ea_length().as_usize(), 48);
-            assert_eq!(parameters.name_match(), WindowsNameMatch::Exact);
+            assert_eq!(parameters.name_case(), NameCase::Exact);
             assert_eq!(parameters.access_check(), CreateAccessCheck::ForceUserMode);
             assert_eq!(
                 parameters.target_selection(),
@@ -1532,7 +1533,7 @@ fn create_stack_decodes_no_intermediate_buffering() {
                 parameters.name_interpretation(),
                 CreateNameInterpretation::Path
             );
-            assert_eq!(parameters.name_match(), WindowsNameMatch::CaseInsensitive);
+            assert_eq!(parameters.name_case(), NameCase::Insensitive);
             assert_eq!(
                 parameters.access_check(),
                 CreateAccessCheck::HonorRequestorMode

@@ -742,21 +742,23 @@ fn verify_htree_mutation_profile(
         let exact_name = ext4_core::WindowsName::from_ext4(&source)?;
         let uppercase = ext4_core::Ext4Name::new(&source.bytes().to_ascii_uppercase())?;
         let uppercase_name = ext4_core::WindowsName::from_ext4(&uppercase)?;
-        for (requested, policy, should_exist) in [
-            (&exact_name, ext4_core::WindowsNameMatch::Exact, true),
-            (&uppercase_name, ext4_core::WindowsNameMatch::Exact, false),
+        for (lookup, should_exist) in [
+            (ext4_core::WindowsNameLookup::Exact(&exact_name), true),
+            (ext4_core::WindowsNameLookup::Exact(&uppercase_name), false),
             (
-                &uppercase_name,
-                ext4_core::WindowsNameMatch::CaseInsensitive,
+                ext4_core::WindowsNameLookup::CaseInsensitive {
+                    name: &uppercase_name,
+                    // This independent fixture profile contains ASCII names only.
+                    upcase: |unit| match unit {
+                        0x0061..=0x007a => unit & !0x0020,
+                        _ => unit,
+                    },
+                },
                 true,
             ),
         ] {
-            let found = ext4_core::CommittedReadPass::lookup_windows_child(
-                pass,
-                root.id(),
-                requested,
-                policy,
-            )?;
+            let found =
+                ext4_core::CommittedReadPass::lookup_windows_child(pass, root.id(), lookup)?;
             match found {
                 ext4_core::ChildLookup::Found(child) if should_exist && child.name() == &source => {
                 }
@@ -4185,7 +4187,7 @@ fn verify_locked_directory_enumeration(
             let visible =
                 ext4_core::WindowsName::from_ext4(entry.name()).map_err(core_task_error)?;
             let found = drive_internal_core_read(&image, |pass| {
-                pass.lookup_windows_child(directory, &visible, ext4_core::WindowsNameMatch::Exact)
+                pass.lookup_windows_child(directory, ext4_core::WindowsNameLookup::Exact(&visible))
             })?;
             if !matches!(found, ext4_core::ChildLookup::Found(child) if child.node() == entry.node())
             {

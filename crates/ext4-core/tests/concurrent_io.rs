@@ -13,6 +13,104 @@ use sha2::Digest as _;
 struct PlainCrypto;
 
 /// # Errors
+/// Returns fixture, Unicode namespace lookup, rename or commit failures.
+/// # Panics
+/// Fails if read and mutation lookup disagree on supplied folding, exact priority or ambiguity.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions check namespace identities and failures through actual ext4 read and mutation passes"
+)]
+fn windows_lookup_uses_supplied_unicode_mapping_in_read_and_mutation_passes() -> Result<()> {
+    /// Independent uppercase vectors; the portable core does not select a Unicode table.
+    fn upcase(unit: u16) -> u16 {
+        match unit {
+            0x00e9 => 0x00c9,
+            0x0061 => 0x0041,
+            _ => unit,
+        }
+    }
+    let mut fixture = Fixture::new()?;
+    let lower = Ext4Name::new("é".as_bytes())?;
+    let upper = Ext4Name::new("É".as_bytes())?;
+    let ambiguous = WindowsName::from_utf16(&[0x00e9, 0x0041])?;
+    let upper_query = WindowsName::from_ext4(&upper)?;
+    let lower_query = WindowsName::from_ext4(&lower)?;
+    let file = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let metadata = NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?);
+        let file = pass.create_file(root, &lower, metadata)?.id();
+        for name in ["éa", "ÉA"] {
+            pass.create_file(root, &Ext4Name::new(name.as_bytes())?, metadata)?;
+        }
+        Ok(file)
+    })?;
+    let lookup = WindowsNameLookup::CaseInsensitive {
+        name: &upper_query,
+        upcase,
+    };
+    assert!(matches!(
+        fixture.read(|pass| pass.lookup_windows_child(DirectoryNodeId::ROOT, lookup))?,
+        ChildLookup::Found(child) if *child.node() == NodeId::File(file) && child.name() == &lower
+    ));
+    assert!(matches!(
+        fixture.read(|pass| pass.lookup_windows_child(
+            DirectoryNodeId::ROOT,
+            WindowsNameLookup::Exact(&upper_query)
+        ))?,
+        ChildLookup::NotFound
+    ));
+    assert_eq!(
+        fixture
+            .read(|pass| pass.lookup_windows_child(
+                DirectoryNodeId::ROOT,
+                WindowsNameLookup::CaseInsensitive {
+                    name: &ambiguous,
+                    upcase
+                },
+            ))
+            .err(),
+        Some(Error::AmbiguousWindowsName)
+    );
+    fixture.mutate(|pass| {
+        let ChildLookup::Found(child) = pass.lookup_windows_child(DirectoryNodeId::ROOT, lookup)?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        assert_eq!(*child.node(), NodeId::File(file));
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.rename_child(
+            root,
+            child.name(),
+            root,
+            &upper,
+            NamespaceDestination::Vacant,
+        )
+    })?;
+    assert!(matches!(
+        fixture.read(|pass| pass.lookup_windows_child(
+            DirectoryNodeId::ROOT,
+            WindowsNameLookup::CaseInsensitive { name: &lower_query, upcase },
+        ))?,
+        ChildLookup::Found(child) if *child.node() == NodeId::File(file) && child.name() == &upper
+    ));
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.create_file(
+            root,
+            &lower,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        Ok(())
+    })?;
+    assert!(matches!(
+        fixture.read(|pass| pass.lookup_windows_child(DirectoryNodeId::ROOT, lookup))?,
+        ChildLookup::Found(child) if *child.node() == NodeId::File(file) && child.name() == &upper
+    ));
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, explicit timestamp, namespace, metadata or content mutation failures.
 /// # Panics
 /// Fails if metadata changes imply file access/content changes, or writes imply reads.
@@ -2293,8 +2391,9 @@ fn locked_long_names_support_lookup_and_unlink() -> Result<()> {
         }
         assert!(entry.name().bytes().len() <= 255);
         let visible = WindowsName::from_ext4(entry.name())?;
-        let found = fixture
-            .read(|pass| pass.lookup_windows_child(directory, &visible, WindowsNameMatch::Exact))?;
+        let found = fixture.read(|pass| {
+            pass.lookup_windows_child(directory, WindowsNameLookup::Exact(&visible))
+        })?;
         assert!(matches!(found, ChildLookup::Found(child) if child.node() == entry.node()));
         names.push(entry.name().try_to_owned_name()?);
     }

@@ -1,6 +1,7 @@
 //! File-information mutation planning, decoding, and publication.
 
 use super::*;
+use crate::kernel::name_expression::NameCase;
 
 /// Applies one supported set-file-information class.
 enum SetFilePlan {
@@ -1154,8 +1155,7 @@ fn prepare_hard_link_destination(
     let parent = read.load_directory(target_parent)?;
     let target = read.lookup_windows_child(
         parent.id(),
-        target_windows_name,
-        ext4_core::WindowsNameMatch::CaseInsensitive,
+        NameCase::Insensitive.lookup(target_windows_name),
     )?;
     let ChildLookup::Found(target) = target else {
         return Ok((
@@ -1410,8 +1410,7 @@ impl PreparedRenameMutation {
         let parent = read.load_directory(target_parent)?;
         let target = read.lookup_windows_child(
             parent.id(),
-            &WindowsName::from_ext4(&target_name)?,
-            ext4_core::WindowsNameMatch::CaseInsensitive,
+            NameCase::Insensitive.lookup(&WindowsName::from_ext4(&target_name)?),
         )?;
         let (destination, replaced_target) = match target {
             ChildLookup::NotFound => (PreparedNamespaceDestination::Vacant, None),
@@ -2150,11 +2149,8 @@ fn resolve_namespace_target(
         let parent = read
             .load_directory(parent_id)
             .map_err(|_| DriverError::ObjectPathNotFound)?;
-        let child = read.lookup_windows_child(
-            parent.id(),
-            component,
-            ext4_core::WindowsNameMatch::CaseInsensitive,
-        )?;
+        let child =
+            read.lookup_windows_child(parent.id(), NameCase::Insensitive.lookup(component))?;
         match child {
             ChildLookup::Found(child) => {
                 let NodeId::Directory(directory_id) = *child.node() else {

@@ -34,7 +34,7 @@ pub(crate) struct CreateParameters {
     /// I/O-stack access-check policy selected for this create.
     access_check: CreateAccessCheck,
     /// Windows-visible path-name comparison policy.
-    name_match: WindowsNameMatch,
+    name_case: NameCase,
     /// Whether the caller requests the named object or its containing directory.
     target_selection: CreateTargetSelection,
     /// Create flags whose semantics this filesystem does not implement.
@@ -78,10 +78,10 @@ impl CreateParameters {
             deletion: create_options.deletion(),
             ea_length,
             access_check: CreateAccessCheck::from_stack_flags(stack_flags),
-            name_match: if stack_flag(stack_flags, wdk_sys::SL_CASE_SENSITIVE) {
-                WindowsNameMatch::Exact
+            name_case: if stack_flag(stack_flags, wdk_sys::SL_CASE_SENSITIVE) {
+                NameCase::Exact
             } else {
-                WindowsNameMatch::CaseInsensitive
+                NameCase::Insensitive
             },
             target_selection: CreateTargetSelection::from_stack_flags(stack_flags),
             unsupported_flags: UnsupportedCreateFlags::from_stack_flags(stack_flags),
@@ -180,8 +180,8 @@ impl CreateParameters {
     }
 
     /// Returns Windows-visible path-name comparison policy.
-    pub(crate) const fn name_match(self) -> WindowsNameMatch {
-        self.name_match
+    pub(crate) const fn name_case(self) -> NameCase {
+        self.name_case
     }
 
     /// Returns the namespace object selected by this create.

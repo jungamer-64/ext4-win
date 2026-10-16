@@ -1,5 +1,6 @@
 //! Create/open dispatch and FILE_OBJECT context initialization.
 
+use crate::kernel::name_expression::NameCase;
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::num::NonZeroU32;
@@ -794,7 +795,7 @@ impl CreateFileObjectFlags {
     /// Projects FILE_OBJECT flags from decoded create parameters.
     const fn from_parameters(parameters: CreateParameters) -> Self {
         let mut raw = 0;
-        if matches!(parameters.name_match(), ext4_core::WindowsNameMatch::Exact) {
+        if matches!(parameters.name_case(), NameCase::Exact) {
             raw |= wdk_sys::FO_OPENED_CASE_SENSITIVE;
         }
         if matches!(parameters.write_commitment(), WriteCommitment::FlushThrough) {
@@ -2108,7 +2109,7 @@ fn resolve_path(
 ) -> DriverResult<CreateTargetLookup> {
     let parameters = owner.parameters();
     let reparse_point_mode = parameters.reparse_point_mode();
-    let name_match = parameters.name_match();
+    let name_case = parameters.name_case();
     let target_selection = parameters.target_selection();
     let (mut parent_id, mut parent_location) = anchor.into_directory_location();
     let components = name.components();
@@ -2133,7 +2134,8 @@ fn resolve_path(
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
-        let child = match read.lookup_windows_child(parent.id(), component.name(), name_match) {
+        let child = match read.lookup_windows_child(parent.id(), name_case.lookup(component.name()))
+        {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound)
                 if position == PathComponentPosition::Final

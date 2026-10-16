@@ -1,6 +1,7 @@
 //! Search expression and published continuation owned by one directory handle.
 
 use crate::irp::PreparedDirectoryPattern;
+use crate::kernel::name_expression::NameCase;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
 use core::cell::{Cell, OnceCell};
@@ -94,7 +95,7 @@ impl DirectoryPattern {
     /// Returns malformed UTF-16/name, counted-string overflow, or allocation failure.
     pub(crate) fn from_prepared(
         pattern: &PreparedDirectoryPattern,
-        matching: ext4_core::WindowsNameMatch,
+        matching: NameCase,
     ) -> DriverResult<Self> {
         let PreparedDirectoryPattern::Name(units) = pattern else {
             return Ok(Self::All);
@@ -122,14 +123,14 @@ pub(crate) struct DirectoryNameExpression {
     /// UTF-16 expression; insensitive expressions are uppercase as required by FsRtl.
     units: DriverVec<u16>,
     /// Immutable comparison mode from the directory FILE_OBJECT.
-    matching: ext4_core::WindowsNameMatch,
+    matching: NameCase,
 }
 
 impl DirectoryNameExpression {
     /// Captures a well-formed expression while preserving DOS wildcard syntax.
     /// # Errors
     /// Returns invalid-name for separators, NUL or malformed UTF-16, or preparation failure.
-    fn from_utf16(units: &[u16], matching: ext4_core::WindowsNameMatch) -> DriverResult<Self> {
+    fn from_utf16(units: &[u16], matching: NameCase) -> DriverResult<Self> {
         if units
             .iter()
             .any(|unit| matches!(*unit, 0 | 0x002F | 0x003A | 0x005C | 0x007C))
@@ -138,7 +139,7 @@ impl DirectoryNameExpression {
             return Err(DriverError::from(ext4_core::Error::InvalidName));
         }
         let mut units = DriverVec::try_copied_from_slice(units)?;
-        if matching == ext4_core::WindowsNameMatch::CaseInsensitive {
+        if matching == NameCase::Insensitive {
             crate::kernel::name_expression::uppercase(units.as_mut_slice())?;
         }
         Ok(Self { units, matching })
@@ -151,7 +152,7 @@ impl DirectoryNameExpression {
         crate::kernel::name_expression::matches(
             self.units.as_slice(),
             name.utf16(),
-            self.matching == ext4_core::WindowsNameMatch::CaseInsensitive,
+            self.matching == NameCase::Insensitive,
         )
     }
 }
