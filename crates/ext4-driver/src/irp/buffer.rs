@@ -565,7 +565,7 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         };
         let cursor_position = if stack_flag(stack.Flags, wdk_sys::SL_INDEX_SPECIFIED) {
             DirectoryCursorPosition::Index(DirectoryEntryIndex(query.FileIndex))
-        } else if stack_flag(stack.Flags, wdk_sys::SL_RESTART_SCAN) || !query.FileName.is_null() {
+        } else if stack_flag(stack.Flags, wdk_sys::SL_RESTART_SCAN) {
             DirectoryCursorPosition::Restart
         } else {
             DirectoryCursorPosition::Current

@@ -2845,6 +2845,49 @@ fn query_directory_stack_decodes_names_class() {
 }
 
 /// # Panics
+/// Fails if a repeated search expression restarts enumeration without an explicit scan flag.
+#[test]
+fn query_directory_search_expression_does_not_select_cursor_position() {
+    let result = (|| -> Result<(), DriverError> {
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        let mut name = wdk_sys::UNICODE_STRING::default();
+        for file_name in [core::ptr::null_mut(), core::ptr::addr_of_mut!(name)] {
+            for (flags, expected) in [
+                (0, DirectoryCursorPosition::Current),
+                (wdk_sys::SL_RESTART_SCAN, DirectoryCursorPosition::Restart),
+                (
+                    wdk_sys::SL_INDEX_SPECIFIED,
+                    DirectoryCursorPosition::Index(super::DirectoryEntryIndex(37)),
+                ),
+            ] {
+                let mut stack = wdk_sys::IO_STACK_LOCATION {
+                    FileObject: core::ptr::addr_of_mut!(file),
+                    Flags: u8::try_from(flags).map_err(|_| DriverError::InvalidParameter)?,
+                    ..wdk_sys::IO_STACK_LOCATION::default()
+                };
+                stack.Parameters.QueryDirectory =
+                    wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_6 {
+                        Length: 128,
+                        FileName: file_name,
+                        FileInformationClass:
+                            wdk_sys::_FILE_INFORMATION_CLASS::FileNamesInformation,
+                        __bindgen_padding_0: 0,
+                        FileIndex: 37,
+                    };
+                assert_eq!(
+                    current_stack_fixture(&mut stack)?
+                        .query_directory()?
+                        .cursor_position(),
+                    expected
+                );
+            }
+        }
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
 ///
 /// Panics when an identity-bearing directory class no longer enters its exact wire domain.
 #[test]
