@@ -4164,6 +4164,119 @@ impl MutationRequestOperation {
         Ok(result)
     }
 
+    /// Selects cache transfer or coherency work before a fresh core resolution attempt.
+    /// Oplock continuation and epoch restarts enter here; completed cache work resumes the
+    /// resolver directly. Native size/deletion gates retained across a restart already own
+    /// write coherency and must not reacquire the same stream preparation.
+    #[inline(never)]
+    fn prepare_resolution(
+        mut self: Box<Self>,
+        mut owned: OwnedIrp,
+        attempt: ResolutionAttempt,
+        access: &MountedVolumeAccess<'_>,
+    ) -> MutationStep {
+        let ResolutionAttempt {
+            epoch,
+            resolve,
+            size_changes,
+            deletion,
+        } = attempt;
+        if size_changes.is_none()
+            && deletion.is_none()
+            && let PreparedMutationRequest::DataWrite(authority) = &self.request
+        {
+            let plan = match crate::request::file_info::prepare_write_cache_plan(
+                owned.request(),
+                authority,
+                access,
+            ) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return MutationStep::Transition(self.complete_error(owned, error));
+                }
+            };
+            match plan {
+                crate::request::file_info::WriteCachePlan::Cached {
+                    file_object,
+                    offset,
+                    length,
+                    publication,
+                } => {
+                    self.state = MutationOperationState::CacheWriting { publication };
+                    return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                        work: crate::irp::PassiveWork::Write {
+                            file_object,
+                            owned,
+                            offset,
+                            length,
+                        },
+                        suspended: self,
+                    });
+                }
+                crate::request::file_info::WriteCachePlan::PurgeBeforeDirect(work) => {
+                    self.state = MutationOperationState::CachePurging {
+                        owned,
+                        epoch,
+                        resolve,
+                    };
+                    return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                        work,
+                        suspended: self,
+                    });
+                }
+                crate::request::file_info::WriteCachePlan::Direct => {}
+            }
+        }
+        if matches!(self.request, PreparedMutationRequest::SetInformation(_)) {
+            let work = owned.request().with_active(|active| {
+                let current = active.current_stack()?;
+                if current.set_file()?.operation() != crate::irp::SetFileOperation::Basic {
+                    return Ok(None);
+                }
+                let file = current.file_object()?;
+                let opened = crate::state::OpenedObject::decode(file)?;
+                if opened.file_attributes_write_access()
+                    != crate::irp::FileAttributesWriteAccess::Granted
+                {
+                    return Err(DriverError::AccessDenied);
+                }
+                if !matches!(opened.node(), ext4_core::NodeId::File(_)) {
+                    return Ok(None);
+                }
+                let lease = access.acquire_file_object_cache_lease(file)?;
+                Ok::<_, DriverError>(Some(crate::irp::PassiveWork::flush(lease.into_stream())))
+            });
+            match work {
+                Ok(Some(work)) => {
+                    self.state = MutationOperationState::MetadataFlushing {
+                        owned,
+                        epoch,
+                        resolve,
+                    };
+                    return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                        work,
+                        suspended: self,
+                    });
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    return MutationStep::Transition(self.complete_error(owned, error));
+                }
+            }
+        }
+        MutationStep::Resolve {
+            operation: self,
+            owned,
+            attempt: ResolutionAttempt {
+                epoch,
+                resolve,
+                size_changes,
+                deletion,
+            },
+            event: OperationEvent::Admitted,
+        }
+    }
+
     /// Reacquires the latest immutable epoch while retaining the original FIFO ticket.
     fn restart_resolution(
         self: Box<Self>,
@@ -4177,17 +4290,16 @@ impl MutationRequestOperation {
             Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
         };
         let resolve = MutationResolveOperation::new(access.mounted_profile());
-        MutationStep::Resolve {
-            operation: self,
+        self.prepare_resolution(
             owned,
-            attempt: ResolutionAttempt {
+            ResolutionAttempt {
                 epoch,
                 resolve,
                 size_changes,
                 deletion,
             },
-            event: OperationEvent::Admitted,
-        }
+            access,
+        )
     }
 
     /// Advances the second parent check or seals a fully checked namespace oplock authority.
@@ -5235,17 +5347,16 @@ impl MutationRequestOperation {
                                 self.cleanup_deferred_error = Some(error);
                             }
                         }
-                        MutationStep::Resolve {
-                            operation: self,
+                        self.prepare_resolution(
                             owned,
-                            attempt: ResolutionAttempt {
+                            ResolutionAttempt {
                                 epoch,
                                 resolve,
                                 size_changes: None,
                                 deletion: None,
                             },
-                            event: OperationEvent::Admitted,
-                        }
+                            access,
+                        )
                     }
                     OplockResume::RestartExistingCreate => {
                         if let Some(error) = oplock_error {
@@ -5307,105 +5418,23 @@ impl MutationRequestOperation {
                     .bugcheck()
             }
             MutationOperationState::Resolving {
-                mut owned,
+                owned,
                 epoch,
                 resolve,
                 size_changes,
                 deletion,
             } => {
-                if matches!(event, OperationEvent::Admitted)
-                    && size_changes.is_none()
-                    && deletion.is_none()
-                    && let PreparedMutationRequest::DataWrite(authority) = &self.request
-                {
-                    let plan = match crate::request::file_info::prepare_write_cache_plan(
-                        owned.request(),
-                        authority,
+                if matches!(event, OperationEvent::Admitted) {
+                    return self.prepare_resolution(
+                        owned,
+                        ResolutionAttempt {
+                            epoch,
+                            resolve,
+                            size_changes,
+                            deletion,
+                        },
                         access,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    };
-                    match plan {
-                        crate::request::file_info::WriteCachePlan::Cached {
-                            file_object,
-                            offset,
-                            length,
-                            publication,
-                        } => {
-                            self.state = MutationOperationState::CacheWriting { publication };
-                            return MutationStep::Transition(
-                                OperationTransition::SubmitPassiveWork {
-                                    work: crate::irp::PassiveWork::Write {
-                                        file_object,
-                                        owned,
-                                        offset,
-                                        length,
-                                    },
-                                    suspended: self,
-                                },
-                            );
-                        }
-                        crate::request::file_info::WriteCachePlan::PurgeBeforeDirect(work) => {
-                            self.state = MutationOperationState::CachePurging {
-                                owned,
-                                epoch,
-                                resolve,
-                            };
-                            return MutationStep::Transition(
-                                OperationTransition::SubmitPassiveWork {
-                                    work,
-                                    suspended: self,
-                                },
-                            );
-                        }
-                        crate::request::file_info::WriteCachePlan::Direct => {}
-                    }
-                }
-                if matches!(event, OperationEvent::Admitted)
-                    && matches!(self.request, PreparedMutationRequest::SetInformation(_))
-                {
-                    let work = owned.request().with_active(|active| {
-                        let current = active.current_stack()?;
-                        if current.set_file()?.operation() != crate::irp::SetFileOperation::Basic {
-                            return Ok(None);
-                        }
-                        let file = current.file_object()?;
-                        let opened = crate::state::OpenedObject::decode(file)?;
-                        if opened.file_attributes_write_access()
-                            != crate::irp::FileAttributesWriteAccess::Granted
-                        {
-                            return Err(DriverError::AccessDenied);
-                        }
-                        if !matches!(opened.node(), ext4_core::NodeId::File(_)) {
-                            return Ok(None);
-                        }
-                        let lease = access.acquire_file_object_cache_lease(file)?;
-                        Ok::<_, DriverError>(Some(crate::irp::PassiveWork::flush(
-                            lease.into_stream(),
-                        )))
-                    });
-                    match work {
-                        Ok(Some(work)) => {
-                            self.state = MutationOperationState::MetadataFlushing {
-                                owned,
-                                epoch,
-                                resolve,
-                            };
-                            return MutationStep::Transition(
-                                OperationTransition::SubmitPassiveWork {
-                                    work,
-                                    suspended: self,
-                                },
-                            );
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    }
+                    );
                 }
                 MutationStep::Resolve {
                     operation: self,

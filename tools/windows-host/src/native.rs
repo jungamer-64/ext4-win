@@ -949,7 +949,7 @@ fn set_file_allocation(file: &FileHandle, bound: i64) -> io::Result<()> {
     }
 }
 
-/// Exercises archive restoration, explicit basic times, handle-local suppression, and resumption.
+/// Exercises archive restoration, handle-local time policy, and assignment after cached writes.
 /// # Errors
 /// Returns native set/write/query/flush failures, timestamp disagreement, or explicit close failure.
 pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
@@ -1032,6 +1032,27 @@ pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
                 "resumed handle did not update its write timestamp",
             ));
         }
+        let raw = file.raw()?;
+        let positioned = unsafe {
+            // SAFETY: The retained synchronous handle remains live while its cursor is reset.
+            // No output position is requested or retained.
+            SetFilePointerEx(raw, 0, ptr::null_mut(), FILE_BEGIN)
+        };
+        if positioned == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        write_byte(&file)?;
+        // The in-EOF write may still be cached. Explicit assignment must follow its writeback.
+        set_basic_information(&file, &explicit)?;
+        flush_file(&file)?;
+        let assigned = file_information_query(&file, 4, 40, 0)?;
+        for offset in [8, 16, 24] {
+            if i64::from_le_bytes(field(&assigned, offset)?) != FIXED_TIME {
+                return Err(io::Error::other(
+                    "cached writeback replaced a subsequent explicit timestamp",
+                ));
+            }
+        }
         Ok(())
     })();
     completed(result, file.close())
@@ -1081,6 +1102,13 @@ fn write_byte(file: &FileHandle) -> io::Result<()> {
 /// Returns short-write, native write or flush failures.
 fn write_and_flush_byte(file: &FileHandle) -> io::Result<()> {
     write_byte(file)?;
+    flush_file(file)
+}
+
+/// Observes durable completion on a retained synchronous file handle.
+/// # Errors
+/// Returns native flush failure without claiming whether prior data reached storage.
+fn flush_file(file: &FileHandle) -> io::Result<()> {
     let raw = file.raw()?;
     let flushed = unsafe {
         // SAFETY: This borrowed handle remains live through synchronous flush completion.
