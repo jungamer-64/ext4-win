@@ -802,15 +802,6 @@ jobs:
             }
           }
 
-      - name: Stop job-owned Driver Verifier checks
-        if: always() && steps.live_io.outcome != 'skipped'
-        shell: powershell
-        run: |
-          verifier.exe /stop
-          if ($LASTEXITCODE -ne 0) {
-            throw "Driver Verifier stop failed: $LASTEXITCODE"
-          }
-
       - name: Upload live filesystem evidence
         if: always()
         uses: actions/upload-artifact@v7
@@ -852,3 +843,13 @@ jobs:
           path: target/verified-production/**
           if-no-files-found: error
           retention-days: 14
+
+      - name: Stop job-owned Driver Verifier checks
+        if: always() && steps.live_io.outcome != 'skipped'
+        timeout-minutes: 2
+        shell: powershell
+        run: |
+          verifier.exe /stop
+          if ($LASTEXITCODE -ne 0) {
+            throw "Driver Verifier stop failed: $LASTEXITCODE"
+          }
