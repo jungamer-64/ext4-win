@@ -310,6 +310,8 @@ impl SectionPreparation {
 pub(crate) enum SectionMutationOperation {
     /// Exact validated final cache dimensions select truncation and purge requirements.
     Resize(super::stream::StreamSizes),
+    /// An existing-file reset combines write-open image exclusion with final EOF/cache preparation.
+    Reset(super::stream::StreamSizes),
     /// Image and data sections must admit namespace removal.
     Delete,
     /// Executable image residency must admit a writable handle.

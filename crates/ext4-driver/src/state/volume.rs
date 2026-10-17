@@ -1243,7 +1243,8 @@ impl MountedVolumeAccess<'_> {
             .acquire_file_object_cache_lease(file_object, NonNull::from(self.volume))
     }
 
-    /// Preallocates native gates for every live regular-file cache-map size changed by one mutation.
+    /// Preallocates final size gates, combining image exclusion with any existing-file reset.
+    /// Resets require admission even when their cache dimensions are unchanged.
     /// # Errors
     ///
     /// Returns the exact allocation, stream-retention, or native size-snapshot failure before the
@@ -1252,10 +1253,11 @@ impl MountedVolumeAccess<'_> {
         &self,
         updates: &PreparedStreamMetadataPublications,
         deletion: Option<NodeId>,
+        reset: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
         self.volume
             .file_control_blocks
-            .prepare_stream_size_changes(updates, deletion)
+            .prepare_stream_size_changes(updates, deletion, reset)
     }
 
     /// Verifies that retained native gates still match the latest resolved size projection.
@@ -1267,10 +1269,11 @@ impl MountedVolumeAccess<'_> {
         updates: &PreparedStreamMetadataPublications,
         prepared: &PreparedStreamSizeChanges,
         deletion: Option<NodeId>,
+        reset: Option<NodeId>,
     ) -> DriverResult<bool> {
         self.volume
             .file_control_blocks
-            .prepared_stream_size_changes_match(updates, prepared, deletion)
+            .prepared_stream_size_changes_match(updates, prepared, deletion, reset)
     }
 
     /// Retains one exact cleanup FCB for native stream-deletion preparation.

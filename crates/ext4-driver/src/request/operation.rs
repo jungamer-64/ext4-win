@@ -5518,12 +5518,17 @@ impl MutationRequestOperation {
                     }
                 }
                 let deletion_node = deletion.as_ref().map(|prepared| prepared.node());
+                let reset_node = self
+                    .pending_existing_create
+                    .as_ref()
+                    .and_then(|pending| pending.reset_node());
                 let size_changes = match size_changes {
                     Some(prepared) => {
                         let matches = match access.prepared_stream_size_changes_match(
                             &stream_metadata,
                             &prepared,
                             deletion_node,
+                            reset_node,
                         ) {
                             Ok(matches) => matches,
                             Err(error) => {
@@ -5540,13 +5545,16 @@ impl MutationRequestOperation {
                     None => None,
                 };
                 if size_changes.is_none() {
-                    let mut plan =
-                        match access.prepare_stream_size_changes(&stream_metadata, deletion_node) {
-                            Ok(plan) => plan,
-                            Err(error) => {
-                                return MutationStep::Transition(self.complete_error(owned, error));
-                            }
-                        };
+                    let mut plan = match access.prepare_stream_size_changes(
+                        &stream_metadata,
+                        deletion_node,
+                        reset_node,
+                    ) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
+                    };
                     if let Some(stream) = plan.next() {
                         drop(stream_metadata);
                         drop(publication);

@@ -1584,8 +1584,13 @@ impl StreamContext {
                 let main = self.main_resource()?.exclusive();
                 self.ensure_storage()?;
                 match operation {
-                    SectionMutationOperation::Resize(sizes) => {
-                        if sizes.file_size() < self.sizes()?.file_size() {
+                    SectionMutationOperation::Resize(sizes)
+                    | SectionMutationOperation::Reset(sizes) => {
+                        let reset = matches!(operation, SectionMutationOperation::Reset(_));
+                        if reset && !self.flush_image(wdk_sys::_MMFLUSH_TYPE::MmFlushForWrite)? {
+                            return Err(DriverError::ShareAccessConflict);
+                        }
+                        if reset || sizes.file_size() < self.sizes()?.file_size() {
                             let mut allowed = 0;
                             let status = unsafe {
                                 // SAFETY: MainResource and the owning stream retain section storage through SEH.
@@ -1637,7 +1642,8 @@ impl StreamContext {
                 // Host stream publication uses the same unique admission/release state. Native
                 // section observations and Cc/MM rejection require the signed live-volume gate.
                 match operation {
-                    SectionMutationOperation::Resize(sizes) => {
+                    SectionMutationOperation::Resize(sizes)
+                    | SectionMutationOperation::Reset(sizes) => {
                         let _validated = sizes;
                     }
                     SectionMutationOperation::Delete

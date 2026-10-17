@@ -502,6 +502,41 @@ pub(crate) struct CompletedStreamCacheDrain {
     owner: NonNull<FileControlBlockLedger>,
 }
 
+/// Native work required by a final stream projection, independent of whether EOF changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamSizeChangeKind {
+    /// Only changed cache dimensions require admission.
+    Resize,
+    /// A reset also excludes executable images and checks truncation at unchanged EOF.
+    Reset,
+}
+
+impl StreamSizeChangeKind {
+    /// Selects the gate shared by preparation and post-worker revalidation.
+    fn select(
+        node: NodeId,
+        current: StreamSizes,
+        target: StreamSizes,
+        reset: Option<NodeId>,
+    ) -> Option<Self> {
+        if reset == Some(node) {
+            Some(Self::Reset)
+        } else if !current.same_cache_dimensions(target) {
+            Some(Self::Resize)
+        } else {
+            None
+        }
+    }
+
+    /// Projects the selected semantic requirement into one native section acquisition.
+    fn operation(self, sizes: StreamSizes) -> crate::kernel::section::SectionMutationOperation {
+        match self {
+            Self::Resize => crate::kernel::section::SectionMutationOperation::Resize(sizes),
+            Self::Reset => crate::kernel::section::SectionMutationOperation::Reset(sizes),
+        }
+    }
+}
+
 /// Captured stream and exact size-check semantics not yet submitted to Cc/MM.
 #[derive(Debug)]
 pub(crate) struct StreamSizeChangeLease {
@@ -511,31 +546,33 @@ pub(crate) struct StreamSizeChangeLease {
     node: NodeId,
     /// Final native cache-map size tuple selected from the mutation projection.
     target_sizes: StreamSizes,
+    /// Image and truncation semantics established by the resolving operation.
+    kind: StreamSizeChangeKind,
 }
 
 impl StreamSizeChangeLease {
     /// Acquires the native cache/section exclusion gate and returns its unique release authority.
     /// # Errors
     ///
-    /// Returns the exact cache failure or mapped-view truncation conflict.
+    /// Returns the exact cache failure, mapped-view truncation conflict, or executable-image sharing conflict.
     pub(crate) fn execute(self) -> DriverResult<PreparedStreamSizeChange> {
         let section = self
             .stream
             .stream()
             .stream_context
-            .prepare_section_mutation(crate::kernel::section::SectionMutationOperation::Resize(
-                self.target_sizes,
-            ))?;
+            .prepare_section_mutation(self.kind.operation(self.target_sizes))?;
         Ok(PreparedStreamSizeChange {
             _section: section,
             stream: self.stream,
             node: self.node,
             target_sizes: self.target_sizes,
+            kind: self.kind,
         })
     }
 }
 
-/// Preallocated regular-file size changes selected from the mutation's sole metadata projection.
+/// Preallocated size/reset gates selected from the mutation's sole metadata projection.
+/// A reset uses one permit for image exclusion and truncation, even at unchanged EOF.
 #[derive(Debug)]
 pub(crate) struct StreamSizeChangePlan {
     /// Ledger that granted every retained stream lease.
@@ -619,6 +656,8 @@ pub(crate) struct PreparedStreamSizeChange {
     node: NodeId,
     /// Exact final cache-map dimensions against which native truncation and purge were performed.
     target_sizes: StreamSizes,
+    /// Exact native work completed under this permit.
+    kind: StreamSizeChangeKind,
 }
 
 impl PreparedStreamSizeChange {
@@ -628,8 +667,10 @@ impl PreparedStreamSizeChange {
     }
 
     /// Returns whether this gate protects the exact final stream projection.
-    fn matches(&self, node: NodeId, target_sizes: StreamSizes) -> bool {
-        self.node == node && self.target_sizes.same_cache_dimensions(target_sizes)
+    fn matches(&self, node: NodeId, target_sizes: StreamSizes, kind: StreamSizeChangeKind) -> bool {
+        self.node == node
+            && self.target_sizes.same_cache_dimensions(target_sizes)
+            && self.kind == kind
     }
 }
 
@@ -2013,11 +2054,12 @@ impl FileControlBlockLedger {
         None
     }
 
-    /// Preallocates every live regular-file gate implied by the mutation's final size projection.
+    /// Preallocates every live regular-file gate implied by the final size projection and reset intent.
     ///
     /// Directory and symbolic-link metadata publications do not participate in mapped data-file
     /// truncation. A regular-file FCB that is not currently resident needs no native gate; future
-    /// opens initialize from the durable epoch after publication.
+    /// opens initialize from the durable epoch after publication. A reset requires admission even
+    /// at unchanged EOF; its provisional create claim retains the FCB until publication.
     /// # Errors
     ///
     /// Returns the exact allocation, finite lease, or native stream-snapshot failure before any
@@ -2030,7 +2072,15 @@ impl FileControlBlockLedger {
         &self,
         updates: &PreparedStreamMetadataPublications,
         deletion: Option<NodeId>,
+        reset: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
+        if let Some(node) = reset
+            && (!matches!(node, NodeId::File(_))
+                || deletion == Some(node)
+                || !updates.nodes.iter().any(|update| update.node() == node))
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
         let capacity = updates.nodes.len();
         let mut remaining: DriverVec<StreamSizeChangeLease> =
             DriverVec::try_with_capacity(capacity)?;
@@ -2070,9 +2120,11 @@ impl FileControlBlockLedger {
                         break;
                     }
                 };
-                if current.same_cache_dimensions(update.sizes()) {
+                let Some(kind) =
+                    StreamSizeChangeKind::select(update.node(), current, update.sizes(), reset)
+                else {
                     continue;
-                }
+                };
                 let mut state = ledger_file_control_block_open_state(table, fcb);
                 if let Err(error) = unsafe {
                     // SAFETY: The ledger resource uniquely serializes this open-state transition.
@@ -2092,6 +2144,7 @@ impl FileControlBlockLedger {
                     },
                     node: update.node(),
                     target_sizes: update.sizes(),
+                    kind,
                 };
                 if let Err(error) = remaining.push_reserved_owned(lease) {
                     let (error, lease) = error.into_parts();
@@ -2130,6 +2183,7 @@ impl FileControlBlockLedger {
         updates: &PreparedStreamMetadataPublications,
         prepared: &PreparedStreamSizeChanges,
         deletion: Option<NodeId>,
+        reset: Option<NodeId>,
     ) -> DriverResult<bool> {
         if prepared
             .prepared
@@ -2156,16 +2210,18 @@ impl FileControlBlockLedger {
                 fcb.as_ref()
             }
             .stream_sizes()?;
-            if current.same_cache_dimensions(update.sizes()) {
+            let Some(kind) =
+                StreamSizeChangeKind::select(update.node(), current, update.sizes(), reset)
+            else {
                 continue;
-            }
+            };
             expected = expected
                 .checked_add(1)
                 .ok_or(DriverError::InternalInvariantViolation)?;
             if !prepared
                 .prepared
                 .iter()
-                .any(|change| change.matches(update.node(), update.sizes()))
+                .any(|change| change.matches(update.node(), update.sizes(), kind))
             {
                 return Ok(false);
             }

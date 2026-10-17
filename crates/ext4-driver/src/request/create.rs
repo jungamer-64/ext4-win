@@ -1045,7 +1045,7 @@ struct ExistingNodeTarget {
 /// Native image-section work required before an existing handle claim may be published.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ExistingWriteOpenRequirement {
-    /// No older stream existed, or the requested handle has no regular-file data-write authority.
+    /// No standalone image gate: the stream is new, read-only, or covered by reset admission.
     NotRequired,
     /// A resident regular-file stream must exclude an executable image before attachment.
     FlushImageSection,
@@ -1337,12 +1337,13 @@ impl PendingExistingCreateOpen {
             policy.oplock_policy(),
         )?;
         let write_open = match node {
+            // Reset admission belongs to the final size plan: it checks image and data sections
+            // under one permit, including when the existing EOF is already zero.
+            NodeId::File(_) if matches!(intent, ExistingCreateIntent::Reset { .. }) => {
+                ExistingWriteOpenRequirement::NotRequired
+            }
             NodeId::File(_) => ExistingWriteOpenRequirement::for_regular_file(
-                if matches!(intent, ExistingCreateIntent::Reset { .. }) {
-                    RegularFileWriteAccess::Positional
-                } else {
-                    policy.regular_file_write_access()
-                },
+                policy.regular_file_write_access(),
                 admission.residency(),
             ),
             NodeId::Directory(_) | NodeId::Symlink(_) => ExistingWriteOpenRequirement::NotRequired,
@@ -1438,6 +1439,14 @@ impl PendingExistingCreateOpen {
             ExistingWriteOpenRequirement::FlushImageSection => {
                 Some((self.claim.file_control_block(), self.node))
             }
+        }
+    }
+
+    /// Selects the reset whose image and truncation checks share the final size-plan permit.
+    pub(crate) fn reset_node(&self) -> Option<NodeId> {
+        match self.intent {
+            ExistingCreateIntent::Reset { .. } => Some(self.node),
+            ExistingCreateIntent::Open(_) => None,
         }
     }
 
