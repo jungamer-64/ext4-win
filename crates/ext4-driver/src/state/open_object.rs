@@ -880,8 +880,6 @@ enum DirectoryNotificationName {
 pub(super) struct OpenedHandleState {
     /// Namespace interpretation selected when this handle was opened.
     node_mode: OpenedNodeMode,
-    /// Location used for namespace mutations on cleanup when available.
-    location: UnsafeCell<OpenedLocation>,
     /// One-way cleanup lifecycle shared with the synchronous control plane.
     lifecycle: HandleLifecycle,
     /// Delete authority and namespace lifecycle fixed when this handle was opened.
@@ -909,7 +907,6 @@ impl OpenedHandleState {
     ) -> Self {
         Self {
             node_mode,
-            location: UnsafeCell::new(location),
             lifecycle: HandleLifecycle::active(),
             deletion,
             data_transfer_mode,
@@ -944,19 +941,6 @@ impl OpenedHandleState {
         }
     }
 
-    /// Returns the opened location identity.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn location(&self) -> &OpenedLocation {
-        unsafe {
-            // SAFETY: The device operation lane serializes every location read and replacement.
-            // Cleanup accesses only the disjoint atomic lifecycle and never this cell.
-            &*self.location.get()
-        }
-    }
-
     /// Returns the namespace interpretation selected for this handle.
     const fn node_mode(&self) -> OpenedNodeMode {
         self.node_mode
@@ -978,19 +962,6 @@ impl OpenedHandleState {
     /// Returns retained `FILE_WRITE_ATTRIBUTES` authority.
     const fn file_attributes_write_access(&self) -> FileAttributesWriteAccess {
         self.deletion.file_attributes_write_access()
-    }
-
-    /// Replaces the opened location after a successful rename.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn replace_location(&self, location: OpenedLocation) {
-        unsafe {
-            // SAFETY: The device operation lane serializes rename with every other operation that
-            // reads or replaces this handle-local location.
-            *self.location.get() = location;
-        }
     }
 
     /// Returns data transfer buffering policy requested at create/open.
@@ -1287,39 +1258,6 @@ pub(crate) struct OpenedObject<'owner> {
     /// Per-handle context stored in FsContext2.
     handle: NonNull<OpenedHandle>,
 }
-
-/// Prevalidated, allocation-free update to one stable per-handle namespace location.
-#[derive(Debug)]
-pub(crate) struct PreparedOpenedLocationPublication {
-    /// Stable CCB allocated at create and retained until CLOSE.
-    handle: NonNull<OpenedHandle>,
-    /// Fully owned location prepared before the first lower write.
-    location: OpenedLocation,
-}
-
-impl PreparedOpenedLocationPublication {
-    /// Moves the prepared location into the live CCB without allocation or validation.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(crate) fn publish(self) {
-        let handle = unsafe {
-            // SAFETY: The originating top-level IRP retains the FILE_OBJECT/CCB through commit,
-            // and CLOSE is ordered behind that operation by the per-handle lane.
-            self.handle.as_ref()
-        };
-        handle.replace_location(self.location);
-    }
-}
-
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-// SAFETY: This token moves only through the reactor and completion envelopes. Its CCB is stable
-// from successful CREATE publication until the ordered CLOSE transition.
-unsafe impl Send for PreparedOpenedLocationPublication {}
 
 /// Exact CCB timestamp policy prepared before commit and published without allocation.
 #[derive(Debug)]
