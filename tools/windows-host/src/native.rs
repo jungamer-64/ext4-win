@@ -1839,6 +1839,111 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
+    /// # Errors
+    /// Returns native rename failure or a path exceeding this bounded oracle's buffer.
+    fn rename_open_file(file: &FileHandle, target: &Path) -> io::Result<()> {
+        #[repr(C)]
+        struct RenameRecord {
+            replace: u32,
+            root: HANDLE,
+            length: u32,
+            name: [u16; 512],
+        }
+        let name: Vec<_> = target.as_os_str().encode_wide().collect();
+        let length =
+            u32::try_from(core::mem::size_of_val(name.as_slice())).map_err(io::Error::other)?;
+        let mut record = RenameRecord {
+            replace: 0,
+            root: ptr::null_mut(),
+            length,
+            name: [0; 512],
+        };
+        let output = record
+            .name
+            .get_mut(..name.len())
+            .ok_or_else(|| io::Error::other("oracle rename path is too long"))?;
+        for (destination, unit) in output.iter_mut().zip(name) {
+            *destination = unit;
+        }
+        let size = u32::try_from(core::mem::offset_of!(RenameRecord, name))
+            .map_err(io::Error::other)?
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("rename length overflow"))?;
+        let success = unsafe {
+            // SAFETY: The aligned complete record and counted UTF-16 path remain live throughout
+            // this synchronous call; the retained handle permits DELETE and shares it with peers.
+            SetFileInformationByHandle(
+                file.raw()?,
+                FileRenameInfo,
+                core::ptr::from_ref(&record).cast(),
+                size,
+            )
+        };
+        if success == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// # Panics
+    /// Fails if a native rename invalidates another handle for the same link or moves another link.
+    #[test]
+    fn native_shared_link_handles_follow_cross_directory_rename() {
+        let result = (|| {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("ext4win-links-{}-{nonce}", std::process::id()));
+            std::fs::create_dir(&root)?;
+            let sub = root.join("sub");
+            let a = root.join("a");
+            let b = sub.join("b");
+            let c = root.join("c");
+            let other = root.join("other");
+            let result = (|| {
+                std::fs::create_dir(&sub)?;
+                std::fs::write(&a, b"retained inode")?;
+                std::fs::hard_link(&a, &other)?;
+                let first = FileHandle::open(&a, 0x0001_0080, 0)?;
+                let result = (|| {
+                    let second = FileHandle::open(&a, 0x0001_0080, 0)?;
+                    let result = (|| {
+                        rename_open_file(&first, &b)?;
+                        rename_open_file(&second, &c)?;
+                        if a.exists()
+                            || b.exists()
+                            || std::fs::read(&c)? != b"retained inode"
+                            || std::fs::read(&other)? != b"retained inode"
+                        {
+                            return Err(io::Error::other("rename changed the wrong selected link"));
+                        }
+                        Ok(())
+                    })();
+                    completed(result, second.close())
+                })();
+                completed(result, first.close())
+            })();
+            let cleanup = (|| {
+                for path in [&a, &b, &c, &other] {
+                    match std::fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                if sub.exists() {
+                    std::fs::remove_dir(&sub)?;
+                }
+                std::fs::remove_dir(&root)
+            })();
+            completed(result, cleanup)
+        })();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
     /// Checks real attribute-only volume queries, exact service absence and native GUID encoding.
     /// # Errors
     /// Returns host observation or field decoding failures.

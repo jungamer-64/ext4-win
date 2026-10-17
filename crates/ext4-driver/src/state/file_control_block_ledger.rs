@@ -1304,6 +1304,60 @@ impl NewFileControlBlockAdmission {
 }
 
 impl FileControlBlockLedger {
+    /// Interns one exact link while a create claim retains its FCB in this ledger.
+    /// # Errors
+    /// Returns allocation or reference exhaustion before handle publication.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource serializes membership and location interning"
+    )]
+    pub(super) fn acquire_opened_location(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        location: OpenedLocation,
+    ) -> DriverResult<OpenedLocationLease> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource retains the owning table throughout this lookup.
+            &*self.table.get()
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        let state = unsafe {
+            // SAFETY: Table membership is established and this resource exclusively owns the state.
+            state.as_mut()
+        };
+        state.locations.acquire(location)
+    }
+
+    /// Prepares a current destination link's spelling change without changing its identity.
+    /// # Errors
+    /// Returns finite reference exhaustion; an inode without a selected link needs no publication.
+    #[expect(
+        unsafe_code,
+        reason = "the actor and ledger resource serialize selected-link lookup"
+    )]
+    pub(super) fn prepare_link_rename(
+        &self,
+        node: NodeId,
+        source: &OpenedLocation,
+        destination: OpenedLocation,
+    ) -> DriverResult<Option<PreparedLinkRename>> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: This resource retains every indexed stream during the lookup.
+            &*self.table.get()
+        };
+        let Some(fcb) = find_file_control_block_in_table(table, node) else {
+            return Ok(None);
+        };
+        let state = ledger_file_control_block_open_state(table, fcb);
+        let state = unsafe {
+            // SAFETY: The owning table validated this address and the resource excludes mutation.
+            state.as_ref()
+        };
+        state.locations.prepare_rename(source, destination)
+    }
+
     /// Creates an empty synchronized FCB ledger and its native resource.
     /// # Errors
     ///

@@ -182,7 +182,7 @@ pub(crate) fn set_reparse_point(
             let opened = OpenedObject::decode(file_object)?;
             opened.require_reparse_write_access()?;
             let node = opened.node();
-            validate_mutable_reparse_node(opened.location(), node)?;
+            validate_mutable_reparse_node(&opened.location(), node)?;
             Ok::<_, DriverError>((reparse_point, node))
         })?
     };
@@ -209,7 +209,7 @@ pub(crate) fn delete_reparse_point(
             let opened = OpenedObject::decode(file_object)?;
             opened.require_reparse_write_access()?;
             let node = opened.node();
-            validate_mutable_reparse_node(opened.location(), node)?;
+            validate_mutable_reparse_node(&opened.location(), node)?;
             Ok::<_, DriverError>(node)
         })?
     };

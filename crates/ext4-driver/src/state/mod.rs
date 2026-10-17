@@ -61,6 +61,9 @@ pub(crate) use handle_times::{AutomaticTimeUpdate, HandleTimestampPolicy};
 mod kernel_object;
 mod mounted_volume_device;
 mod open_object;
+mod opened_location;
+use opened_location::OpenedLocations;
+pub(crate) use opened_location::{OpenedLocationLease, PreparedLinkRename};
 mod volume;
 mod volume_runtime;
 

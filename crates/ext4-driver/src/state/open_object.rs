@@ -1,6 +1,7 @@
 //! Opened-handle typestates, raw-volume authority, and file-object decoding.
 
 use super::*;
+use core::cell::Ref;
 
 /// Core-owned live-directory continuation stored directly in the CCB.
 pub(crate) type DirectoryCursor = DirectoryScanCursor;
@@ -184,7 +185,7 @@ pub(crate) enum FileCleanupDisposition {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-/// Opened location identity stored with a handle.
+/// Owned selected-link position used during create and in operation-local namespace snapshots.
 pub(crate) enum OpenedLocation {
     /// Mounted volume root.
     Root,
@@ -880,6 +881,8 @@ enum DirectoryNotificationName {
 pub(super) struct OpenedHandleState {
     /// Namespace interpretation selected when this handle was opened.
     node_mode: OpenedNodeMode,
+    /// Shared current identity of the namespace link selected by this handle.
+    location: OpenedLocationLease,
     /// One-way cleanup lifecycle shared with the synchronous control plane.
     lifecycle: HandleLifecycle,
     /// Delete authority and namespace lifecycle fixed when this handle was opened.
@@ -900,13 +903,14 @@ impl OpenedHandleState {
     /// Creates shared per-handle state.
     pub(super) const fn new(
         node_mode: OpenedNodeMode,
-        location: OpenedLocation,
+        location: OpenedLocationLease,
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
         normalized_name_access: NormalizedNameAccess,
     ) -> Self {
         Self {
             node_mode,
+            location,
             lifecycle: HandleLifecycle::active(),
             deletion,
             data_transfer_mode,
@@ -915,6 +919,11 @@ impl OpenedHandleState {
             ea_cursor: UnsafeCell::new(EaCursor::START),
             timestamps: HandleTimestampState::new(),
         }
+    }
+
+    /// Observes the shared link only within the current non-suspending actor step.
+    fn location(&self) -> Ref<'_, OpenedLocation> {
+        self.location.location()
     }
 
     /// Reads the current EA continuation under the per-FILE_OBJECT operation lane.
@@ -1070,7 +1079,7 @@ impl OpenedHandle {
     pub(crate) fn new(
         node: NodeId,
         node_mode: OpenedNodeMode,
-        location: OpenedLocation,
+        location: OpenedLocationLease,
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
         access: GrantedAccess,
@@ -1094,7 +1103,7 @@ impl OpenedHandle {
     fn from_parts(
         node: NodeId,
         node_mode: OpenedNodeMode,
-        location: OpenedLocation,
+        location: OpenedLocationLease,
         deletion: HandleDeletion,
         data_transfer_mode: DataTransferMode,
         access: GrantedAccess,
@@ -1126,7 +1135,7 @@ impl OpenedHandle {
     }
 
     /// Returns the opened location identity.
-    fn location(&self) -> &OpenedLocation {
+    fn location(&self) -> Ref<'_, OpenedLocation> {
         self.state.location()
     }
 
@@ -1190,11 +1199,6 @@ impl OpenedHandle {
         cleanup_complete: bool,
     ) -> CloseReleasePlan {
         self.state.close_release_plan(close_kind, cleanup_complete)
-    }
-
-    /// Replaces the opened location after a successful rename.
-    fn replace_location(&self, location: OpenedLocation) {
-        self.state.replace_location(location);
     }
 
     /// Returns the stable CCB-owned descriptor needed by FsRtl directory notifications.
@@ -1419,7 +1423,7 @@ impl<'owner> OpenedObject<'owner> {
     }
 
     /// Returns the opened location identity.
-    pub(crate) fn location(&self) -> &OpenedLocation {
+    pub(crate) fn location(&self) -> Ref<'_, OpenedLocation> {
         self.handle().location()
     }
 
@@ -1465,7 +1469,7 @@ impl<'owner> OpenedObject<'owner> {
     ///
     /// Returns cannot-delete for root or file-reference handles, or an allocation failure.
     pub(crate) fn prepare_pending_deletion(&self) -> DriverResult<PendingFileDeletion> {
-        PendingFileDeletion::try_from_disposition(self.location())
+        PendingFileDeletion::try_from_disposition(&self.location())
     }
 
     /// Cancels delete-pending for the shared FCB.
@@ -1501,15 +1505,14 @@ impl<'owner> OpenedObject<'owner> {
         self.fcb
     }
 
-    /// Prepares a post-commit handle-location update without retaining an active IRP borrow.
-    pub(crate) fn prepare_location_publication(
+    /// Prepares a shared-link successor without retaining an active IRP or location borrow.
+    /// # Errors
+    /// Returns reference exhaustion before any namespace write.
+    pub(crate) fn prepare_link_rename(
         &self,
         location: OpenedLocation,
-    ) -> PreparedOpenedLocationPublication {
-        PreparedOpenedLocationPublication {
-            handle: self.handle,
-            location,
-        }
+    ) -> DriverResult<PreparedLinkRename> {
+        self.handle().state.location.prepare_rename(location)
     }
 
     /// Returns data transfer buffering policy requested for this opened handle.

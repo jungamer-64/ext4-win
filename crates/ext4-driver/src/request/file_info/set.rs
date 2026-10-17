@@ -106,11 +106,16 @@ pub(crate) enum SetFilePublication {
     /// Handle-local automatic timestamp policy paired with committed basic metadata.
     Timestamps(PreparedHandleTimestampPublication),
     /// Ordered namespace notifications for a committed hard-link mutation.
-    HardLink(Box<HardLinkDirectoryChanges>),
-    /// Handle-location and notification moves for a committed rename.
+    HardLink {
+        /// Existing destination identity retained through a case-preserving replacement.
+        location: Option<PreparedLinkRename>,
+        /// Ordered namespace notifications allocated before commit.
+        notifications: Box<HardLinkDirectoryChanges>,
+    },
+    /// Shared-link location and notification moves for a committed rename.
     Rename {
-        /// Stable CCB update prepared before the first write.
-        location: PreparedOpenedLocationPublication,
+        /// Exact shared-link update prepared before the first write.
+        location: PreparedLinkRename,
         /// Fully allocated notification sequence.
         notifications: Box<RenameDirectoryNameChanges>,
     },
@@ -178,7 +183,15 @@ impl SetFilePublication {
         match self {
             Self::None => {}
             Self::Timestamps(publication) => publication.publish(),
-            Self::HardLink(changes) => (*changes).report(operations),
+            Self::HardLink {
+                location,
+                notifications,
+            } => {
+                if let Some(location) = location {
+                    location.publish();
+                }
+                (*notifications).report(operations);
+            }
             Self::Rename {
                 location,
                 notifications,
@@ -371,11 +384,12 @@ pub(super) fn set_file_information(
             if namespace_oplocks != Some(oplocks) {
                 return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
             }
-            let changes = prepared.apply(mutation)?;
+            let (location, changes) = prepared.apply(mutation)?;
             let changes = memory::boxed_try_with(move || Ok(changes))?;
-            return Ok(SetFileResolution::Mutation(SetFilePublication::HardLink(
-                changes,
-            )));
+            return Ok(SetFileResolution::Mutation(SetFilePublication::HardLink {
+                location,
+                notifications: changes,
+            }));
         }
         SetFilePlan::Rename {
             mutation: rename,
@@ -408,7 +422,7 @@ pub(super) fn set_file_information(
     Ok(SetFileResolution::Mutation(SetFilePublication::None))
 }
 
-/// Binds a preallocated rename location to the exact CCB retained by the pending request.
+/// Binds a preallocated rename successor to the selected link retained by the pending request.
 /// # Errors
 ///
 /// Returns an error when the active IRP stack or opened FILE_OBJECT identity is invalid.
@@ -416,7 +430,7 @@ fn request_location_publication(
     request: &mut PendingIrpLease<'_>,
     expected: crate::state::KernelFileObject,
     location: OpenedLocation,
-) -> DriverResult<PreparedOpenedLocationPublication> {
+) -> DriverResult<PreparedLinkRename> {
     request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
@@ -425,7 +439,7 @@ fn request_location_publication(
         if opened.file_object() != expected {
             return Err(DriverError::InternalInvariantViolation);
         }
-        Ok(opened.prepare_location_publication(location))
+        opened.prepare_link_rename(location)
     })
 }
 
@@ -835,7 +849,7 @@ fn disposition_plan(
                     DeletePendingPublication::Publish,
                 ),
                 FileDispositionTarget::CreateDeleteOnClose => (
-                    PendingFileDeletion::try_from_delete_on_close(opened.location())?,
+                    PendingFileDeletion::try_from_delete_on_close(&opened.location())?,
                     DeletePendingPublication::AlreadyPublishedByCreate,
                 ),
             };
@@ -946,7 +960,7 @@ impl HardLinkMutation {
         }
         let source = HardLinkNodeId::try_from(opened_file.node())
             .map_err(|_| DriverError::FileIsDirectory)?;
-        let source_parent = match opened_file.location() {
+        let source_parent = match &*opened_file.location() {
             OpenedLocation::DirectoryEntry { parent, .. } => *parent,
             OpenedLocation::Root => return Err(DriverError::FileIsDirectory),
             OpenedLocation::FileReference => return Err(DriverError::NotSupported),
@@ -1054,6 +1068,8 @@ struct PreparedHardLinkMutation {
     archive_overlay: Option<WindowsOverlay>,
     /// Fully allocated post-commit notification sequence.
     changes: HardLinkDirectoryChanges,
+    /// Shared location update needed only when an existing same-inode link changes spelling.
+    location: Option<PreparedLinkRename>,
 }
 
 impl PreparedHardLinkMutation {
@@ -1085,6 +1101,17 @@ impl PreparedHardLinkMutation {
             target_collision,
         )?;
         count_effect.validate(source_metadata.links_count)?;
+        let location = match (&destination, count_effect) {
+            (
+                PreparedNamespaceDestination::Replace { existing_name },
+                HardLinkCountEffect::Preserve,
+            ) if existing_name != &target_name => operations.prepare_link_rename(
+                source_node,
+                &OpenedLocation::try_directory_entry(target_parent, existing_name)?,
+                OpenedLocation::try_directory_entry(target_parent, &target_name)?,
+            )?,
+            _ => None,
+        };
         let archive_overlay = archive_overlay(source_metadata.overlay_attributes)?;
         Ok(Self {
             source,
@@ -1094,6 +1121,7 @@ impl PreparedHardLinkMutation {
             destination,
             archive_overlay,
             changes,
+            location,
         })
     }
 
@@ -1109,7 +1137,7 @@ impl PreparedHardLinkMutation {
     fn apply(
         self,
         mutation: &mut DriverMutationPass<'_, '_, '_>,
-    ) -> DriverResult<HardLinkDirectoryChanges> {
+    ) -> DriverResult<(Option<PreparedLinkRename>, HardLinkDirectoryChanges)> {
         let source = mutation.hard_link_source(self.source)?;
         let target_parent = mutation.directory(self.target_parent)?;
         if let Some(overlay) = self.archive_overlay {
@@ -1130,7 +1158,7 @@ impl PreparedHardLinkMutation {
                 NamespaceDestination::Replace { existing_name },
             )?,
         }
-        Ok(self.changes)
+        Ok((self.location, self.changes))
     }
 }
 
@@ -1319,7 +1347,7 @@ impl RenameMutation {
         if opened_file.delete_pending() {
             return Err(DriverError::DeletePending);
         }
-        let (source_parent, source_name) = match opened_file.location() {
+        let (source_parent, source_name) = match &*opened_file.location() {
             OpenedLocation::DirectoryEntry { parent, name } => (*parent, name.try_to_owned_name()?),
             OpenedLocation::Root => {
                 return Err(DriverError::from(ext4_core::Error::CannotRemoveRoot));

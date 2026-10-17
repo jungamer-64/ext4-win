@@ -1417,6 +1417,20 @@ impl MountedVolumeAccess<'_> {
         ledger.ensure_node_replaceable(node)
     }
 
+    /// Prepares an opened destination link's spelling change during hard-link replacement.
+    /// # Errors
+    /// Returns reference exhaustion before any namespace write.
+    pub(crate) fn prepare_link_rename(
+        &self,
+        node: NodeId,
+        source: &OpenedLocation,
+        destination: OpenedLocation,
+    ) -> DriverResult<Option<PreparedLinkRename>> {
+        self.volume
+            .file_control_blocks
+            .prepare_link_rename(node, source, destination)
+    }
+
     /// Publishes successful removal of the exact FCB-owned delete target.
     pub(crate) fn complete_file_delete(
         &mut self,

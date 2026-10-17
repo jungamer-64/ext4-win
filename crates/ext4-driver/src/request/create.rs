@@ -989,7 +989,7 @@ impl CreatePathAnchor {
             opened.volume(),
             opened.node(),
             opened.node_mode(),
-            opened.location(),
+            &opened.location(),
         )
     }
 
@@ -1312,19 +1312,6 @@ impl PendingExistingCreateOpen {
             return Err(DriverError::InternalInvariantViolation);
         }
         let validation_location = location.try_to_owned_location()?;
-        let normalized_name_access =
-            NormalizedNameAccess::for_open(&location, policy.granted_access());
-        let handle = memory::boxed_try_with(|| {
-            OpenedHandle::new(
-                node,
-                node_mode,
-                location,
-                policy.handle_deletion(),
-                policy.data_transfer_mode(),
-                policy.granted_access(),
-                normalized_name_access,
-            )
-        })?;
         let file_object =
             request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
         let admission = VolumeControlBlock::open_existing_file_control_block(
@@ -1336,6 +1323,11 @@ impl PendingExistingCreateOpen {
             policy.share_access(),
             policy.oplock_policy(),
         )?;
+        let claim = PendingFileControlBlockClaim {
+            fcb: admission.file_control_block(),
+            file_object,
+        };
+        let handle = claim.prepare_handle(node, node_mode, location, policy)?;
         let write_open = match node {
             // Reset admission belongs to the final size plan: it checks image and data sections
             // under one permit, including when the existing EOF is already zero.
@@ -1354,10 +1346,7 @@ impl PendingExistingCreateOpen {
             admission.open_count(),
         );
         Ok(Self {
-            claim: PendingFileControlBlockClaim {
-                fcb: admission.file_control_block(),
-                file_object,
-            },
+            claim,
             node,
             node_mode,
             validation_location,
@@ -1953,18 +1942,6 @@ fn create_missing_node(
     let mut creation = operations.begin_child_creation(mutation, parent, name, target)?;
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
-    let normalized_name_access = NormalizedNameAccess::for_open(&location, policy.granted_access());
-    let handle = memory::boxed_try_with(|| {
-        OpenedHandle::new(
-            node,
-            OpenedNodeMode::Direct,
-            location,
-            policy.handle_deletion(),
-            policy.data_transfer_mode(),
-            policy.granted_access(),
-            normalized_name_access,
-        )
-    })?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
     request.owner.metadata.apply(node, mutation)?;
     let staged_stream = StagedNodeStreamMetadata::try_from_staged_snapshot(
@@ -1977,11 +1954,8 @@ fn create_missing_node(
         creation,
         staged_stream,
         file_object,
-        desired_access: policy.granted_access(),
-        share_access: policy.share_access(),
-        oplock_policy: policy.oplock_policy(),
-        handle,
-        flags: policy.file_object_flags(),
+        policy,
+        location,
         pending_deletion,
         notification,
     })
@@ -2337,16 +2311,10 @@ pub(crate) struct PendingCreatePublication {
     staged_stream: StagedNodeStreamMetadata,
     /// Create-owned FILE_OBJECT identity retained by the top-level IRP.
     file_object: KernelFileObject,
-    /// Share-accounting access mask.
-    desired_access: GrantedAccess,
-    /// Share-accounting share mask.
-    share_access: ShareAccess,
-    /// Create-time oplock behavior retained until the new stream is reserved or published.
-    oplock_policy: crate::irp::OplockCreatePolicy,
-    /// Fully allocated per-handle context.
-    handle: Box<OpenedHandle>,
-    /// FILE_OBJECT flags fixed by create options.
-    flags: CreateFileObjectFlags,
+    /// Authorized policy used to prepare the first-open claim and its handle before commit.
+    policy: CreateHandlePolicy,
+    /// Selected namespace link interned when the staged FCB is admitted.
+    location: OpenedLocation,
     /// Optional delete-on-close publication.
     pending_deletion: Option<PendingFileDeletion>,
     /// Preallocated directory notification payload.
@@ -2367,26 +2335,29 @@ impl PendingCreatePublication {
             creation,
             staged_stream,
             file_object,
-            desired_access,
-            share_access,
-            oplock_policy,
-            handle,
-            flags,
+            policy,
+            location,
             pending_deletion,
             notification,
         } = self;
         let admission = creation.open_file_control_block(
             file_object,
-            desired_access,
-            share_access,
+            policy.granted_access(),
+            policy.share_access(),
             staged_stream,
         )?;
         let fcb = admission.file_control_block();
+        let claim = PendingFileControlBlockClaim { fcb, file_object };
+        let handle =
+            claim.prepare_handle(creation.node(), OpenedNodeMode::Direct, location, policy)?;
         Ok(PreparedCreatePublication {
-            claim: PendingFileControlBlockClaim { fcb, file_object },
-            oplock: NewCreateOplockState::from_policy(oplock_policy, admission.open_count()),
+            claim,
+            oplock: NewCreateOplockState::from_policy(
+                policy.oplock_policy(),
+                admission.open_count(),
+            ),
             handle,
-            flags,
+            flags: policy.file_object_flags(),
             pending_deletion,
             notification,
         })
@@ -2465,6 +2436,39 @@ struct PendingFileControlBlockClaim {
 }
 
 impl PendingFileControlBlockClaim {
+    /// Prepares a handle against this retained stream's selected-link authority.
+    /// # Errors
+    /// Returns shared-location or CCB allocation failure while this claim still owns rollback.
+    #[expect(
+        unsafe_code,
+        reason = "this unpublished create claim retains the exact FCB through preparation"
+    )]
+    fn prepare_handle(
+        &self,
+        node: NodeId,
+        mode: OpenedNodeMode,
+        location: OpenedLocation,
+        policy: CreateHandlePolicy,
+    ) -> DriverResult<Box<OpenedHandle>> {
+        let normalized = NormalizedNameAccess::for_open(&location, policy.granted_access());
+        let fcb = unsafe {
+            // SAFETY: The owned share/reference claim cannot retire before this borrow ends.
+            self.fcb.as_ref()
+        };
+        let location = fcb.acquire_opened_location(location)?;
+        memory::boxed_try_with(|| {
+            OpenedHandle::new(
+                node,
+                mode,
+                location,
+                policy.handle_deletion(),
+                policy.data_transfer_mode(),
+                policy.granted_access(),
+                normalized,
+            )
+        })
+    }
+
     /// Returns the exact FCB retained by this provisional share claim.
     const fn file_control_block(&self) -> NonNull<FileControlBlock> {
         self.fcb

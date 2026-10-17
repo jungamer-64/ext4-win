@@ -180,7 +180,9 @@ fn directory_handle(
 ) -> Option<OpenedHandle> {
     let state = super::OpenedHandleState::new(
         node_mode,
-        OpenedLocation::Root,
+        super::OpenedLocations::new()
+            .acquire(OpenedLocation::Root)
+            .ok()?,
         retained_handle_deletion(),
         data_transfer_mode,
         super::NormalizedNameAccess::Granted,
@@ -226,9 +228,12 @@ fn reparse_mutation_accepts_either_retained_write_right() {
         else {
             return;
         };
+        let location = super::OpenedLocations::new().acquire(OpenedLocation::Root);
+        assert!(location.is_ok());
+        let Ok(location) = location else { return };
         handle.state = super::OpenedHandleState::new(
             OpenedNodeMode::Direct,
-            OpenedLocation::Root,
+            location,
             HandleDeletion::Retain {
                 delete_access: DeleteAccess::Denied,
                 file_attributes_write_access: attributes,
@@ -1536,10 +1541,13 @@ fn regular_file_handle_retains_write_authority() {
         RegularFileWriteAccess::AppendOnly,
         RegularFileWriteAccess::Positional,
     ] {
+        let location = super::OpenedLocations::new().acquire(OpenedLocation::Root);
+        assert!(location.is_ok());
+        let Ok(location) = location else { return };
         let handle = OpenedHandle {
             state: super::OpenedHandleState::new(
                 OpenedNodeMode::Direct,
-                OpenedLocation::Root,
+                location,
                 retained_handle_deletion(),
                 DataTransferMode::Cached,
                 super::NormalizedNameAccess::Granted,

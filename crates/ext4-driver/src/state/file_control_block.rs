@@ -29,7 +29,8 @@ pub(crate) struct FileControlBlock {
 )]
 // SAFETY: `volume`, `owner`, and `node` are immutable after construction. FsRtl synchronizes its
 // opaque byte-range lock package, while `open_state` is accessed only under the owner ledger's
-// exclusive executive resource.
+// exclusive executive resource. Selected-link leases never leave the serialized volume reactor;
+// native callbacks touch only the stream and disjoint handle timestamp atomics, not link contents.
 unsafe impl Sync for FileControlBlock {}
 
 impl fmt::Debug for FileControlBlock {
@@ -46,6 +47,24 @@ impl fmt::Debug for FileControlBlock {
 }
 
 impl FileControlBlock {
+    /// Acquires the selected namespace identity while a create claim retains this FCB.
+    /// # Errors
+    /// Returns allocation or reference exhaustion before the handle becomes visible.
+    #[expect(
+        unsafe_code,
+        reason = "the retaining create claim keeps this FCB's owning ledger alive"
+    )]
+    pub(crate) fn acquire_opened_location(
+        &self,
+        location: OpenedLocation,
+    ) -> DriverResult<OpenedLocationLease> {
+        unsafe {
+            // SAFETY: Every FCB is owned by its ledger until the final FILE_OBJECT claim retires.
+            self.owner.as_ref()
+        }
+        .acquire_opened_location(NonNull::from(self), location)
+    }
+
     /// Creates an FCB boundary value for a mounted node with one open reference.
     /// # Errors
     ///
@@ -479,6 +498,8 @@ pub(super) struct FileControlBlockOpenState {
     pub(super) lifetime: StreamLifetimeState,
     /// One namespace deletion truth shared by every handle for this inode.
     pub(super) deletion: FileDeletionState,
+    /// Current selected-link identities, interned while the ledger resource is held.
+    pub(super) locations: OpenedLocations,
 }
 
 impl FileControlBlockOpenState {
@@ -491,6 +512,7 @@ impl FileControlBlockOpenState {
                 deferred_leases: 0,
             },
             deletion: FileDeletionState::Live,
+            locations: OpenedLocations::new(),
         }
     }
 

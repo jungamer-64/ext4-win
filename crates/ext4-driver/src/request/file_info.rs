@@ -28,7 +28,7 @@ use crate::state::{
     FileControlBlock, FileDeleteTarget, HandleTimestampPolicy, MountedVolumeAccess,
     MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation, OpenedObject,
     OpenedRegularFile, PagingStreamLease, PendingFileDeletion, PreparedFilePositionPublication,
-    PreparedHandleAdmission, PreparedHandleTimestampPublication, PreparedOpenedLocationPublication,
+    PreparedHandleAdmission, PreparedHandleTimestampPublication, PreparedLinkRename,
     PreparedStreamDeletion, RawVolumeOperationKind, RawVolumeTarget, VolumeHandleCleanup,
     VolumeRetirement, release_cancelled_file_control_block, release_file_control_block,
 };

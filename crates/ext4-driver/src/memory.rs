@@ -276,30 +276,21 @@ impl<T> DriverShared<T> {
     /// # Errors
     ///
     /// Returns insufficient resources when the finite reference count is exhausted.
+    pub(crate) fn try_acquire(&self) -> DriverResult<DriverSharedLease<T>> {
+        acquire_shared(self.inner)
+    }
+
+    /// Observes whether another owner retains this allocation, for owner-serialized reclamation.
     #[expect(
         unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        reason = "this owner retains the allocation during the atomic observation"
     )]
-    pub(crate) fn try_acquire(&self) -> DriverResult<DriverSharedLease<T>> {
+    pub(crate) fn has_leases(&self) -> bool {
         let references = unsafe {
-            // SAFETY: This owner holds one reference, so the allocation remains live throughout
-            // the atomic increment.
+            // SAFETY: This owner retains the counter throughout this observation.
             &self.inner.as_ref().references
         };
-        match references.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-            if current == 0 {
-                None
-            } else {
-                current.checked_add(1)
-            }
-        }) {
-            Ok(_) => Ok(DriverSharedLease {
-                inner: self.inner,
-                ownership: PhantomData,
-            }),
-            Err(0) => KernelWideInconsistency::shared_ownership_corruption().bugcheck(),
-            Err(_) => Err(DriverError::InsufficientResources),
-        }
+        references.load(Ordering::Acquire) != 1
     }
 
     /// Borrows the initialized shared value.
@@ -344,6 +335,12 @@ pub(crate) struct DriverSharedLease<T> {
 }
 
 impl<T> DriverSharedLease<T> {
+    /// Retains another lease without changing the finite reference budget contract.
+    /// # Errors
+    /// Returns insufficient resources when the reference count is exhausted.
+    pub(crate) fn try_acquire(&self) -> DriverResult<Self> {
+        acquire_shared(self.inner)
+    }
     /// Borrows the initialized value retained by this lease.
     #[expect(
         unsafe_code,
@@ -359,6 +356,34 @@ impl<T> DriverSharedLease<T> {
             // SAFETY: Every lease originates from an initialized `DriverShared` owner.
             inner.value.assume_init_ref()
         }
+    }
+}
+
+/// Increments a live owner's finite reference count before publishing another lease.
+/// # Errors
+/// Returns insufficient resources before changing ownership when the counter is exhausted.
+#[expect(
+    unsafe_code,
+    reason = "the private caller retains an owner or lease through this increment"
+)]
+fn acquire_shared<T>(inner: NonNull<DriverSharedInner<T>>) -> DriverResult<DriverSharedLease<T>> {
+    let references = unsafe {
+        // SAFETY: Both callers retain this allocation through their existing reference.
+        &inner.as_ref().references
+    };
+    match references.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        if current == 0 {
+            None
+        } else {
+            current.checked_add(1)
+        }
+    }) {
+        Ok(_) => Ok(DriverSharedLease {
+            inner,
+            ownership: PhantomData,
+        }),
+        Err(0) => KernelWideInconsistency::shared_ownership_corruption().bugcheck(),
+        Err(_) => Err(DriverError::InsufficientResources),
     }
 }
 
@@ -1066,11 +1091,11 @@ mod tests {
         let Ok(first) = owner.try_acquire() else {
             return;
         };
-        let Ok(second) = owner.try_acquire() else {
+        assert!(owner.has_leases());
+        drop(owner);
+        let Ok(second) = first.try_acquire() else {
             return;
         };
-
-        drop(owner);
         assert_eq!(drops.load(Ordering::Acquire), 0);
         drop(first);
         assert_eq!(drops.load(Ordering::Acquire), 0);
@@ -1106,9 +1131,13 @@ mod tests {
         let Ok(owner) = DriverShared::try_new(0xA5_u32) else {
             return;
         };
+        assert!(!owner.has_leases());
+        let Ok(lease) = owner.try_acquire() else {
+            return;
+        };
         let references = unsafe {
-            // SAFETY: This module-private test owns the only reference and restores the valid
-            // count before the owner is dropped.
+            // SAFETY: This test retains the owner and lease and restores both live references
+            // before either is dropped.
             &owner.inner.as_ref().references
         };
         references.store(usize::MAX, Ordering::Release);
@@ -1116,7 +1145,11 @@ mod tests {
             owner.try_acquire(),
             Err(DriverError::InsufficientResources)
         ));
+        assert!(matches!(
+            lease.try_acquire(),
+            Err(DriverError::InsufficientResources)
+        ));
         assert_eq!(references.load(Ordering::Acquire), usize::MAX);
-        references.store(1, Ordering::Release);
+        references.store(2, Ordering::Release);
     }
 }
