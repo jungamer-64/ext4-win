@@ -922,6 +922,88 @@ pub fn verify_allocation_control(path: &Path) -> io::Result<()> {
 mod file_reset;
 pub use file_reset::verify_existing_file_reset;
 
+/// Checks synchronous transfer cursors and explicit positioning of an overlapped handle.
+/// The caller owns the disposable regular file and its overwritten contents.
+/// # Errors
+/// Returns native transfer, position, query, or close failures, or contract disagreement.
+pub fn verify_file_positions(path: &Path) -> io::Result<()> {
+    std::fs::write(path, [0x5a_u8; 512])?;
+    let file = FileHandle::open(path, 0xc000_0000, 0)?;
+    let result = (|| {
+        let raw = file.raw()?;
+        let mut bytes = [0_u8; 32];
+        for expected in [32, 64] {
+            let mut transferred = 0;
+            let success = unsafe {
+                // SAFETY: This synchronous handle and exclusive output live through ReadFile.
+                ReadFile(
+                    raw,
+                    bytes.as_mut_ptr(),
+                    32,
+                    &mut transferred,
+                    ptr::null_mut(),
+                )
+            };
+            if success == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if transferred != 32 || bytes != [0x5a; 32] {
+                return Err(io::Error::other(
+                    "sequential read returned an incorrect range",
+                ));
+            }
+            verify_file_position(&file, expected)?;
+        }
+        for expected in [96, 128] {
+            let mut transferred = 0;
+            let success = unsafe {
+                // SAFETY: Synchronous write borrows the retained handle and initialized input.
+                WriteFile(raw, bytes.as_ptr(), 32, &mut transferred, ptr::null_mut())
+            };
+            if success == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if transferred != 32 {
+                return Err(io::Error::other(
+                    "sequential write returned a short transfer",
+                ));
+            }
+            verify_file_position(&file, expected)?;
+        }
+        Ok(())
+    })();
+    completed(result, file.close())?;
+    let file = FileHandle::open(path, 0xc000_0000, FILE_FLAG_OVERLAPPED)?;
+    let result = (|| {
+        let raw = file.raw()?;
+        for position in [7, 11] {
+            let success = unsafe {
+                // SAFETY: Setting a scalar position retains no asynchronous request storage.
+                SetFilePointerEx(raw, position, ptr::null_mut(), FILE_BEGIN)
+            };
+            if success == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            verify_file_position(&file, position)?;
+        }
+        Ok(())
+    })();
+    completed(result, file.close())
+}
+
+/// Observes FilePositionInformation independently from the setter's success acknowledgement.
+/// # Errors
+/// Returns native query failure or an unexpected current position.
+fn verify_file_position(file: &FileHandle, expected: i64) -> io::Result<()> {
+    let record = file_information_query(file, 14, 8, 0)?;
+    if i64::from_le_bytes(field(&record, 0)?) != expected {
+        return Err(io::Error::other(
+            "file position differs from completed transfer or explicit set",
+        ));
+    }
+    Ok(())
+}
+
 /// Sets the requested signed Windows byte allocation on one retained synchronous handle.
 /// # Errors
 /// Returns native set-information failures.
@@ -1746,7 +1828,8 @@ mod tests {
             let result = (|| {
                 verify_existing_file_reset(&path)?;
                 verify_allocation_control(&path)?;
-                verify_timestamp_suppression(&path)
+                verify_timestamp_suppression(&path)?;
+                verify_file_positions(&path)
             })();
             completed(
                 result,

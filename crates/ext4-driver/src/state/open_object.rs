@@ -1609,15 +1609,11 @@ impl<'owner> OpenedObject<'owner> {
         ))
     }
 
-    /// Replaces the synchronous FILE_OBJECT current position.
+    /// Explicitly replaces the FILE_OBJECT position, including on asynchronous handles.
     /// # Errors
     ///
-    /// Returns an error when the handle is asynchronous or the position exceeds signed Windows
-    /// range.
+    /// Returns an error when the position exceeds the signed Windows range.
     pub(crate) fn set_current_file_position(&mut self, position: FileOffset) -> DriverResult<()> {
-        if !self.has_synchronous_file_position() {
-            return Err(DriverError::InvalidParameter);
-        }
         self.write_current_file_position(position)
     }
 

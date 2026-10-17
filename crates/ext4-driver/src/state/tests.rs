@@ -1552,7 +1552,7 @@ fn regular_file_handle_retains_write_authority() {
 
 /// # Panics
 ///
-/// Panics when asynchronous or paging I/O changes the current-position field.
+/// Panics when asynchronous I/O changes an explicitly set position or paging advances it.
 #[test]
 #[expect(
     unsafe_code,
@@ -1579,7 +1579,7 @@ fn asynchronous_and_paging_io_do_not_advance_position() {
         );
         assert_eq!(
             opened.set_current_file_position(FileOffset::from_bytes(9)),
-            Err(DriverError::InvalidParameter)
+            Ok(())
         );
         assert_eq!(
             opened.update_current_file_position(
@@ -1610,7 +1610,7 @@ fn asynchronous_and_paging_io_do_not_advance_position() {
         // SAFETY: Tests consistently use the QuadPart LARGE_INTEGER arm.
         file.CurrentByteOffset.QuadPart
     };
-    assert_eq!(position, 7);
+    assert_eq!(position, 9);
 }
 
 /// # Panics

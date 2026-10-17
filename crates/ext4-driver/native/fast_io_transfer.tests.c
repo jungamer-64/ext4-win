@@ -6,15 +6,29 @@
 #define _Out_
 #define _Success_(condition)
 #define _Must_inspect_result_
+#define _Out_writes_bytes_(length)
+#define _In_reads_bytes_(length)
+#define NTAPI
+#define FO_SYNCHRONOUS_IO 2
+#define FO_WRITE_THROUGH 16
+#define NT_SUCCESS(status) ((status) >= 0)
+#define STATUS_SUCCESS 0
+#define STATUS_UNSUCCESSFUL (-3)
+#define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS 1
+#define EXT4WIN_TRACE_EVENT_FAST_IO_READ 1
+#define EXT4WIN_TRACE_EVENT_FAST_IO_WRITE 2
+#define GetExceptionCode() ((int)__exception_code())
 #define FALSE 0
 #define TRUE 1
 #define NULL ((void *)0)
 
 typedef int BOOLEAN;
 typedef unsigned long ULONG;
+typedef unsigned long long ULONG_PTR;
+typedef void *PVOID;
 typedef struct { long long QuadPart; } LARGE_INTEGER, *PLARGE_INTEGER;
 typedef struct { unsigned held; } ERESOURCE, *PERESOURCE;
-typedef struct { int Status; } IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
+typedef struct { int Status; ULONG_PTR Information; } IO_STATUS_BLOCK, *PIO_STATUS_BLOCK;
 typedef struct { unsigned identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct {
     ERESOURCE MainResource;
@@ -23,6 +37,9 @@ typedef struct {
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 typedef struct {
     PEXT4WIN_STREAM_CONTEXT stream;
+    ULONG Flags;
+    PVOID FsContext2;
+    LARGE_INTEGER CurrentByteOffset;
 } FILE_OBJECT, *PFILE_OBJECT;
 
 enum acquisition_change {
@@ -45,6 +62,40 @@ static unsigned acquisitions, releases, checks;
 static BOOLEAN expected_read;
 static BOOLEAN write_admitted;
 static unsigned write_checks;
+static BOOLEAN copy_handled, copy_raises;
+static int copy_status;
+static ULONG_PTR copy_length;
+static unsigned copies;
+static unsigned char buffer[32];
+
+__declspec(dllimport) void __stdcall RaiseException(ULONG, ULONG, ULONG, const ULONG_PTR *);
+
+static void ext4win_trace_selected(PEXT4WIN_STREAM_CONTEXT observed, unsigned event)
+{ assert(observed == &stream && event == (expected_read ? 1U : 2U)); }
+static void ext4win_trace_status(PEXT4WIN_STREAM_CONTEXT observed, unsigned event, int result)
+{ (void)result; ext4win_trace_selected(observed, event); }
+static void ext4win_trace_fallback(PEXT4WIN_STREAM_CONTEXT observed, unsigned event)
+{ ext4win_trace_selected(observed, event); }
+static BOOLEAN ext4win_handle_allows_cached_write(PVOID context)
+{ assert(context == &file); return TRUE; }
+
+static BOOLEAN CcCopyRead(PFILE_OBJECT observed, PLARGE_INTEGER position, ULONG length,
+    BOOLEAN wait, PVOID output, PIO_STATUS_BLOCK result)
+{
+    assert(observed == &file && position == &offset && length == 32 && wait);
+    assert(stream.MainResource.held == 1 && output == buffer);
+    copies++;
+    if (copy_raises) { RaiseException((ULONG)STATUS_UNSUCCESSFUL, 0, 0, NULL); }
+    result->Status = copy_status;
+    result->Information = copy_length;
+    return copy_handled;
+}
+static BOOLEAN CcCopyWrite(PFILE_OBJECT observed, PLARGE_INTEGER position, ULONG length,
+    BOOLEAN wait, PVOID input)
+{
+    IO_STATUS_BLOCK result;
+    return CcCopyRead(observed, position, length, wait, input, &result);
+}
 
 static BOOLEAN CcCanIWrite(PFILE_OBJECT observed_file, ULONG length, BOOLEAN wait, BOOLEAN retrying)
 {
@@ -115,10 +166,57 @@ static void reset(void)
     stream.oplock_possible = TRUE;
     replacement.eligible = TRUE;
     file.stream = &stream;
+    file.Flags = FO_SYNCHRONOUS_IO;
+    file.FsContext2 = &file;
+    file.CurrentByteOffset.QuadPart = 11;
     offset.QuadPart = 64;
     acquisitions = releases = checks = 0;
     write_admitted = TRUE;
     write_checks = 0;
+    copy_handled = TRUE;
+    copy_raises = FALSE;
+    copy_status = STATUS_SUCCESS;
+    copy_length = 32;
+    copies = 0;
+}
+
+static void verify_copy_completion(void)
+{
+    unsigned asynchronous, scenario;
+    for (expected_read = FALSE; expected_read <= TRUE; expected_read++) {
+        for (asynchronous = 0; asynchronous <= 1; asynchronous++) {
+            for (scenario = 0; scenario < 5; scenario++) {
+                BOOLEAN handled;
+                reset();
+                change = UNCHANGED;
+                if (asynchronous) { file.Flags = 0; }
+                switch (scenario) {
+                    case 1: change = CONFLICTING_LOCK; break;
+                    case 2: copy_handled = FALSE; break;
+                    case 3: copy_raises = TRUE; break;
+                    case 4: copy_length = 7; break;
+                    default: break;
+                }
+                handled = expected_read
+                    ? ext4win_fast_io_read(&file, &offset, 32, TRUE, 0x1234, buffer, &status, &device)
+                    : ext4win_fast_io_write(&file, &offset, 32, TRUE, 0x1234, buffer, &status, &device);
+                assert(handled == (scenario != 1 && scenario != 2));
+                assert(stream.MainResource.held == 0 && releases == 1);
+                assert(copies == (scenario == 1 ? 0U : 1U));
+                if (scenario == 0 || scenario == 4) {
+                    ULONG_PTR transferred = expected_read ? copy_length : 32;
+                    assert(status.Status == STATUS_SUCCESS && status.Information == transferred);
+                    assert(file.CurrentByteOffset.QuadPart ==
+                        (asynchronous ? 11 : 64 + (long long)transferred));
+                } else {
+                    assert(file.CurrentByteOffset.QuadPart == 11);
+                    if (scenario == 3) {
+                        assert(status.Status == STATUS_UNSUCCESSFUL && status.Information == 0);
+                    }
+                }
+            }
+        }
+    }
 }
 
 int main(void)
@@ -158,5 +256,6 @@ int main(void)
     assert(!ext4win_stream_acquire_fast_io_main(&file, &stream, &offset,
         32, TRUE, 0x1234, FALSE, &status, &device));
     assert(write_checks == 1 && acquisitions == 0 && releases == 0 && checks == 0);
+    verify_copy_completion();
     return 0;
 }

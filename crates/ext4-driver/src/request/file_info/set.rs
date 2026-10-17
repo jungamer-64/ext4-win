@@ -429,10 +429,10 @@ fn request_location_publication(
     })
 }
 
-/// Applies FILE_POSITION_INFORMATION to the synchronous FILE_OBJECT position.
+/// Applies FILE_POSITION_INFORMATION independently of automatic I/O position updates.
 /// # Errors
 ///
-/// Returns an error when the input is truncated, negative, asynchronous, or misaligned for a
+/// Returns an error when the input is truncated, negative, or misaligned for a
 /// no-intermediate-buffering handle.
 fn set_position_information(
     active: &ActiveIrp<'_>,
