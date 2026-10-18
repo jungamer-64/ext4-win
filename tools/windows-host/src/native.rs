@@ -1208,7 +1208,8 @@ pub fn verify_hard_link_lifecycle(directory: &Path) -> io::Result<()> {
 /// Returns native set/write/query/flush failures, timestamp disagreement, or explicit close failure.
 pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
     const FIXED_TIME: i64 = 125_911_584_000_000_000;
-    let file = FileHandle::open(path, 0x4000_0080, 0)?;
+    let file = FileHandle::open(path, 0x4000_0080, 0)
+        .inspect_err(|error| eprintln!("timestamp contract initial open: {error}"))?;
     let result = (|| {
         write_byte(&file)?;
         let old_change = FILE_BASIC_INFO {
@@ -1289,7 +1290,8 @@ pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
                 return Err(io::Error::other("suppressed handle changed a timestamp"));
             }
         }
-        let other = FileHandle::open(path, 0x4000_0080, 0)?;
+        let other = FileHandle::open(path, 0x4000_0080, 0)
+            .inspect_err(|error| eprintln!("timestamp contract independent open: {error}"))?;
         let changed = (|| {
             write_and_flush_byte(&other)?;
             let observed = file_information_query(&other, 4, 40, 0)?;
@@ -1324,7 +1326,9 @@ pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
             SetFilePointerEx(raw, 0, ptr::null_mut(), FILE_BEGIN)
         };
         if positioned == 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            eprintln!("timestamp contract SetFilePointerEx: {error}");
+            return Err(error);
         }
         write_byte(&file)?;
         // The in-EOF write may still be cached. Explicit assignment must follow its writeback.
@@ -1355,7 +1359,9 @@ fn set_basic_information(file: &FileHandle, info: &FILE_BASIC_INFO) -> io::Resul
         SetFileInformationByHandle(raw, FileBasicInfo, core::ptr::from_ref(info).cast(), size)
     };
     if success == 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        eprintln!("SetFileInformationByHandle(FileBasicInfo): {error}");
+        Err(error)
     } else {
         Ok(())
     }
@@ -1374,7 +1380,9 @@ fn write_byte(file: &FileHandle) -> io::Result<()> {
         WriteFile(raw, byte.as_ptr(), 1, &mut written, ptr::null_mut())
     };
     if success == 0 {
-        return Err(io::Error::last_os_error());
+        let error = io::Error::last_os_error();
+        eprintln!("timestamp contract WriteFile: {error}");
+        return Err(error);
     }
     if written != 1 {
         return Err(io::Error::other("native timestamp fixture short write"));
@@ -1400,7 +1408,9 @@ fn flush_file(file: &FileHandle) -> io::Result<()> {
         FlushFileBuffers(raw)
     };
     if flushed == 0 {
-        Err(io::Error::last_os_error())
+        let error = io::Error::last_os_error();
+        eprintln!("FlushFileBuffers: {error}");
+        Err(error)
     } else {
         Ok(())
     }
