@@ -464,6 +464,60 @@ fn verity_covers_staged_ordered_and_journaled_file_images() -> Result<()> {
 }
 
 /// # Errors
+/// Returns fixture, independent DAX flag encoding, remount or read failures.
+/// # Panics
+/// Fails if fs-verity enablement publishes a DAX/verity inode or issues any storage effect.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify the incompatible feature transition and unchanged durable storage"
+)]
+fn verity_rejects_dax_without_storage_effects() -> Result<()> {
+    let mut disk = Disk::fixture();
+    disk.enable_verity_feature()?;
+    let mut fixture = Fixture::from_disk(disk)?;
+    let file = fixture.a;
+    fixture
+        .disk
+        .encode_inode(NodeId::File(file), 0x0208_0000, None)?;
+    fixture.remount()?;
+    fixture.mutate(|pass| {
+        let target = pass.file(file)?;
+        pass.write_file_range(target, FileOffset::ZERO, b"DAX")
+    })?;
+    let before = (
+        fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+        fixture_crc32c(u32::MAX, &fixture.disk.journal),
+        fixture.disk.storage_effects,
+    );
+    let enable = FsverityEnable::new(
+        FsverityHashAlgorithm::Sha256,
+        FsverityBlockSize::new(4096)?,
+        FsveritySalt::empty(),
+        FsveritySignature::empty(),
+    );
+    assert_eq!(
+        fixture.mutate(|pass| {
+            let target = pass.file(file)?;
+            pass.enable_verity(target, &enable)
+        }),
+        Err(Error::UnsupportedInodeMutation)
+    );
+    assert_eq!(
+        (
+            fixture_crc32c(u32::MAX, &fixture.disk.filesystem),
+            fixture_crc32c(u32::MAX, &fixture.disk.journal),
+            fixture.disk.storage_effects,
+        ),
+        before
+    );
+    let mut output = [0; 3];
+    fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut output))?;
+    assert_eq!(&output, b"DAX");
+    Ok(())
+}
+
+/// # Errors
 /// Returns mount, write, durability or read failures while recovering an interrupted extension.
 /// # Panics
 /// Fails if data flushed without an EOF commit becomes visible through sparse extension.

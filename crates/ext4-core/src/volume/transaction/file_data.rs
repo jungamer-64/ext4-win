@@ -933,10 +933,10 @@ impl MutationResolvePass<'_, '_, '_> {
     /// post-EOF metadata and setting `EXT4_VERITY_FL`.
     ///
     /// # Errors
-    /// Returns an error when the filesystem lacks the verity feature, the inode is protected from
-    /// mutation, the staged plaintext cannot be read, or the post-EOF metadata cannot be allocated
-    /// or represented. Merkle data covers the current transaction's file image, including writes
-    /// and size changes preceding this call.
+    /// Returns an error when the filesystem lacks the verity feature, the inode has DAX set or is
+    /// protected from mutation, the staged plaintext cannot be read, or the post-EOF metadata cannot
+    /// be allocated or represented. Merkle data covers the current transaction's file image,
+    /// including writes and size changes preceding this call.
     pub fn enable_verity(&mut self, file: TransactionFile, enable: &FsverityEnable) -> Result<()> {
         self.edit(|pass| {
             pass.mutation.volume.superblock.require_verity()?;
@@ -956,6 +956,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 return Err(Error::InvalidVerityMetadata);
             }
             let _payload = inode.file_payload_mutation()?;
+            raw_inode.mark_verity()?;
 
             let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
             pass.retain_file_allocation(
@@ -1002,7 +1003,6 @@ impl MutationResolvePass<'_, '_, '_> {
                     &metadata,
                 )?;
             }
-            raw_inode.mark_verity()?;
             raw_inode.touch_metadata(pass.now)?;
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
             pass.mutation.replace_live_inode(inode_index, raw_inode)?;

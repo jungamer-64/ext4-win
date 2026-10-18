@@ -251,11 +251,10 @@ impl LiveInodeRecord {
     /// Marks this regular file inode as fs-verity protected.
     /// # Errors
     ///
-    /// Returns an error when the inode flags field cannot be read or rewritten with the verity bit
-    /// set.
+    /// Returns an error when DAX excludes fs-verity or the inode flags cannot be read or rewritten.
     pub(super) fn mark_verity(&mut self) -> Result<()> {
         let flags = self.raw.flags()?;
-        self.raw.set_flags(flags.with_verity())
+        self.raw.set_flags(flags.with_verity()?)
     }
 
     /// Marks this inode as fscrypt protected.

@@ -57,6 +57,8 @@ const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
 const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
 /// Inode flag selecting fs-verity authenticated file contents.
 const EXT4_VERITY_FL: u32 = 0x0010_0000;
+/// Persistent direct-access flag, incompatible with fs-verity.
+const EXT4_DAX_FL: u32 = 0x0200_0000;
 /// Largest regular-file size accepted without the large-file feature.
 const LEGACY_FILE_SIZE_LIMIT: u64 = 0x7fff_ffff;
 /// Largest legacy `i_blocks` sector count.
@@ -1254,10 +1256,15 @@ impl InodeFlags {
         Self(self.0 | EXT4_ENCRYPT_FL)
     }
 
-    /// Returns flags with the fs-verity bit set.
-    #[must_use]
-    pub const fn with_verity(self) -> Self {
-        Self(self.0 | EXT4_VERITY_FL)
+    /// Sets fs-verity while preserving its exclusion of persistent direct access.
+    /// # Errors
+    /// Returns [`Error::UnsupportedInodeMutation`] when the DAX flag is set.
+    pub const fn with_verity(self) -> Result<Self> {
+        if self.0 & EXT4_DAX_FL != 0 {
+            Err(Error::UnsupportedInodeMutation)
+        } else {
+            Ok(Self(self.0 | EXT4_VERITY_FL))
+        }
     }
 
     /// Returns whether the inode uses an extent tree.
