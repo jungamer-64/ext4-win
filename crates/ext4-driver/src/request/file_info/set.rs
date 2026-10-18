@@ -346,10 +346,17 @@ pub(super) fn set_file_information(
             publication,
             node,
         } => {
-            apply_basic_information(times, policy, attributes, node, mutation)?;
-            return Ok(SetFileResolution::Mutation(SetFilePublication::Timestamps(
-                publication,
-            )));
+            return Ok(
+                match apply_basic_information(times, policy, attributes, node, mutation)? {
+                    BasicMetadataEffect::Unchanged => {
+                        publication.publish();
+                        SetFileResolution::Complete(IrpCompletion::EMPTY)
+                    }
+                    BasicMetadataEffect::Staged => {
+                        SetFileResolution::Mutation(SetFilePublication::Timestamps(publication))
+                    }
+                },
+            );
         }
         SetFilePlan::EndOfFile { file, size } => set_regular_file_size(mutation, file, size)?,
         SetFilePlan::Allocation { file, size } => {
@@ -622,7 +629,16 @@ fn windows_timestamp(value: LARGE_INTEGER) -> DriverResult<Ext4Timestamp> {
     crate::kernel::time::ext4_timestamp(ticks)
 }
 
+/// Whether basic-information processing produced metadata that requires durable publication.
+enum BasicMetadataEffect {
+    /// Only the originating handle's automatic-update policy can change.
+    Unchanged,
+    /// At least one inode or overlay update has been staged.
+    Staged,
+}
+
 /// Applies attributes before final explicit timestamps so attribute setters cannot overwrite them.
+/// A handle-policy change without a metadata difference has no journal publication to await.
 /// # Errors
 /// Returns invalid attributes or ext4 metadata staging failures.
 fn apply_basic_information(
@@ -631,7 +647,7 @@ fn apply_basic_information(
     attributes: u32,
     node_id: NodeId,
     transaction: &mut DriverMutationPass<'_, '_, '_>,
-) -> DriverResult<()> {
+) -> DriverResult<BasicMetadataEffect> {
     let metadata = metadata_from_node(transaction, node_id)?;
     let attributes = set_basic_attributes(metadata, attributes)?;
     let node = transaction.node(node_id)?;
@@ -645,8 +661,13 @@ fn apply_basic_information(
     let times = update.times(metadata.times, staged_times, policy);
     if times != staged_times {
         transaction.set_times(node, times)?;
+        return Ok(BasicMetadataEffect::Staged);
     }
-    Ok(())
+    Ok(if attributes == BasicAttributeUpdate::empty() {
+        BasicMetadataEffect::Unchanged
+    } else {
+        BasicMetadataEffect::Staged
+    })
 }
 
 /// Restart-local timestamp preservation for one ordinary handle mutation.

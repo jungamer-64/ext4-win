@@ -1220,6 +1220,8 @@ pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
             FileAttributes: 0,
         };
         set_basic_information(&file, &old_change)?;
+        // Repeating an explicit assignment must succeed when no on-disk field changes.
+        set_basic_information(&file, &old_change)?;
         set_basic_information(
             &file,
             &FILE_BASIC_INFO {
