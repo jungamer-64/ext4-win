@@ -62,7 +62,7 @@ mod kernel_object;
 mod mounted_volume_device;
 mod open_object;
 mod opened_location;
-use opened_location::OpenedLocations;
+use opened_location::{LinkDeletionOutcome, OpenedLocations};
 pub(crate) use opened_location::{OpenedLocationLease, PreparedLinkRename};
 mod volume;
 mod volume_runtime;
@@ -85,8 +85,8 @@ pub(crate) use kernel_object::*;
 #[cfg(test)]
 use mounted_volume_device::shutdown_registration_status;
 pub(crate) use mounted_volume_device::*;
+use open_object::FileDeletionCause;
 pub(crate) use open_object::*;
-use open_object::{FileDeletionCause, FileDeletionState};
 #[cfg(test)]
 use open_object::{OpenedHandleKind, OpenedHandleState, select_close_release_plan};
 use volume::MountedVolumeRef;

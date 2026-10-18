@@ -240,9 +240,9 @@ pub(crate) struct StreamContext {
     /// Host equivalent of the native epoch-tagged Fast I/O query projection.
     #[cfg(test)]
     metadata: Mutex<Option<StreamMetadata>>,
-    /// Host equivalent of the ledger-derived native delete-pending projection.
+    /// Host equivalent of the ledger-derived native metadata query fallback gate.
     #[cfg(test)]
-    delete_pending: AtomicBool,
+    namespace_query_fallback: AtomicBool,
 }
 
 /// Stream-domain-specific Rust ownership retained until native destruction.
@@ -724,7 +724,7 @@ impl StreamContext {
                 section_objects: UnsafeCell::new(wdk_sys::SECTION_OBJECT_POINTERS::default()),
                 sizes: Mutex::new(sizes),
                 metadata: Mutex::new(metadata),
-                delete_pending: AtomicBool::new(false),
+                namespace_query_fallback: AtomicBool::new(false),
             })
         }
     }
@@ -1188,11 +1188,11 @@ impl StreamContext {
         }
     }
 
-    /// Updates the native projection derived from ledger-owned delete-pending state.
+    /// Selects IRP metadata queries while the namespace ledger has link-specific deletion state.
     /// # Errors
     ///
     /// Returns an invariant error when this is not a live node stream.
-    pub(crate) fn set_delete_pending(&self, pending: bool) -> DriverResult<()> {
+    pub(crate) fn set_namespace_query_fallback(&self, pending: bool) -> DriverResult<()> {
         if self.runtime.kind() != StreamOwnerKind::Node {
             return Err(DriverError::InternalInvariantViolation);
         }
@@ -1200,13 +1200,14 @@ impl StreamContext {
         {
             let status = unsafe {
                 // SAFETY: The ledger retains this FCB and serializes the authoritative transition.
-                ext4win_stream_set_delete_pending(self.header.as_ptr(), u8::from(pending))
+                ext4win_stream_set_namespace_query_fallback(self.header.as_ptr(), u8::from(pending))
             };
             native_status(status)
         }
         #[cfg(test)]
         {
-            self.delete_pending.store(pending, Ordering::Release);
+            self.namespace_query_fallback
+                .store(pending, Ordering::Release);
             Ok(())
         }
     }
@@ -2110,7 +2111,7 @@ unsafe extern "system" {
         cache_status_out: *mut NTSTATUS,
     ) -> NTSTATUS;
 
-    fn ext4win_stream_set_delete_pending(
+    fn ext4win_stream_set_namespace_query_fallback(
         stream_header: wdk_sys::PVOID,
         pending: wdk_sys::BOOLEAN,
     ) -> NTSTATUS;
@@ -2538,16 +2539,16 @@ mod tests {
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
-        reason = "fixture failures use Result; assertions check the delete projection"
+        reason = "fixture failures use Result; assertions check the metadata query fallback gate"
     )]
-    fn delete_pending_projection_tracks_each_requested_state() -> DriverResult<()> {
+    fn namespace_query_fallback_projection_tracks_each_requested_state() -> DriverResult<()> {
         let stream =
             StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
-        assert!(!stream.delete_pending.load(Ordering::Acquire));
-        stream.set_delete_pending(true)?;
-        assert!(stream.delete_pending.load(Ordering::Acquire));
-        stream.set_delete_pending(false)?;
-        assert!(!stream.delete_pending.load(Ordering::Acquire));
+        assert!(!stream.namespace_query_fallback.load(Ordering::Acquire));
+        stream.set_namespace_query_fallback(true)?;
+        assert!(stream.namespace_query_fallback.load(Ordering::Acquire));
+        stream.set_namespace_query_fallback(false)?;
+        assert!(!stream.namespace_query_fallback.load(Ordering::Acquire));
         Ok(())
     }
 

@@ -1628,7 +1628,7 @@ impl FileControlBlockLedger {
         )
     }
 
-    /// Releases a share claim and selects final-active-handle deletion while retaining the FCB.
+    /// Releases a share claim and selects ready link deletions while retaining the FCB.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -1637,6 +1637,7 @@ impl FileControlBlockLedger {
         &self,
         fcb: NonNull<FileControlBlock>,
         file_object: KernelFileObject,
+        location: &OpenedLocationLease,
     ) -> FileCleanupDisposition {
         let _guard = self.lock.acquire();
         let table = unsafe {
@@ -1650,170 +1651,99 @@ impl FileControlBlockLedger {
             state.as_mut()
         };
         state.remove_share_access(file_object);
-        state.cleanup_disposition()
+        location.cleanup();
+        state.locations.claim_deletion()
     }
 
-    /// Publishes a stable delete-pending target for one live FCB.
+    /// Mutates link authority under ledger exclusion and updates only the native query gate.
     #[expect(
         unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        reason = "the retained FCB and ledger guard own link mutation and its native projection"
     )]
+    fn with_opened_locations<R>(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        operation: impl FnOnce(&mut OpenedLocations) -> R,
+    ) -> R {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource retains and serializes its owning table.
+            &*self.table.get()
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        let state = unsafe {
+            // SAFETY: Membership was checked under this exclusive resource.
+            state.as_mut()
+        };
+        let result = operation(&mut state.locations);
+        let stream = unsafe {
+            // SAFETY: The owning table retains this FCB throughout publication.
+            &fcb.as_ref().stream_context
+        };
+        if stream
+            .set_namespace_query_fallback(state.locations.requires_query_fallback())
+            .is_err()
+        {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+        result
+    }
+    /// Publishes deletion on exactly the link named by the validated target.
     pub(super) fn set_delete_pending(
         &self,
         fcb: NonNull<FileControlBlock>,
         pending: PendingFileDeletion,
     ) {
-        let previous = {
-            let _guard = self.lock.acquire();
-            let table = unsafe {
-                // SAFETY: The executive resource serializes lookup and open-state mutation.
-                &*self.table.get()
-            };
-            let mut state = ledger_file_control_block_open_state(table, fcb);
-            let state = unsafe {
-                // SAFETY: The FCB was validated against the table while the resource is held.
-                state.as_mut()
-            };
-            let previous = state.set_delete_pending(pending);
-            if unsafe {
-                // SAFETY: The owning table retains this exact FCB while the resource is held.
-                fcb.as_ref()
-            }
-            .stream_context
-            .set_delete_pending(state.delete_pending())
-            .is_err()
-            {
-                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-            }
-            previous
-        };
-        drop(previous);
+        self.with_opened_locations(fcb, |links| links.set_pending(pending));
     }
-
-    /// Cancels delete-pending for one live FCB.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(super) fn clear_delete_pending(&self, fcb: NonNull<FileControlBlock>) {
-        let previous = {
-            let _guard = self.lock.acquire();
-            let table = unsafe {
-                // SAFETY: The executive resource serializes lookup and open-state mutation.
-                &*self.table.get()
-            };
-            let mut state = ledger_file_control_block_open_state(table, fcb);
-            let state = unsafe {
-                // SAFETY: The FCB was validated against the table while the resource is held.
-                state.as_mut()
-            };
-            let previous = state.clear_delete_pending();
-            if unsafe {
-                // SAFETY: The owning table retains this exact FCB while the resource is held.
-                fcb.as_ref()
-            }
-            .stream_context
-            .set_delete_pending(state.delete_pending())
-            .is_err()
-            {
-                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-            }
-            previous
-        };
-        drop(previous);
+    /// Cancels only this handle's mutable link disposition.
+    pub(super) fn clear_delete_pending(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        location: &OpenedLocationLease,
+    ) {
+        self.with_opened_locations(fcb, |_links| location.clear_pending());
     }
-
-    /// Returns whether one live FCB is delete-pending.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    pub(super) fn delete_pending(&self, fcb: NonNull<FileControlBlock>) -> bool {
-        let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The executive resource serializes table and open-state observation.
-            &*self.table.get()
-        };
-        let state = ledger_file_control_block_open_state(table, fcb);
-        unsafe {
-            // SAFETY: The FCB was validated against the table while the resource is held.
-            state.as_ref()
-        }
-        .delete_pending()
+    /// Counts accepted, unremoved namespace deletions for standard-link information.
+    pub(super) fn pending_link_count(&self, fcb: NonNull<FileControlBlock>) -> u32 {
+        self.with_opened_locations(fcb, |links| links.pending_links())
     }
-
-    /// Publishes committed removal of the exact pending target.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
+    /// Claims one inactive link, retaining the target in Removing state until its outcome.
+    pub(super) fn claim_file_delete(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+    ) -> FileCleanupDisposition {
+        self.with_opened_locations(fcb, |links| links.claim_deletion())
+    }
+    /// Publishes the durable removal of one claimed link.
     pub(super) fn complete_delete(
         &self,
         fcb: NonNull<FileControlBlock>,
         target: NonNull<FileDeleteTarget>,
     ) {
-        let completed = {
-            let _guard = self.lock.acquire();
-            let table = unsafe {
-                // SAFETY: The executive resource serializes lookup and open-state mutation.
-                &*self.table.get()
-            };
-            let mut state = ledger_file_control_block_open_state(table, fcb);
-            let state = unsafe {
-                // SAFETY: The FCB was validated against the table while the resource is held.
-                state.as_mut()
-            };
-            let completed = state.complete_delete(target);
-            if unsafe {
-                // SAFETY: The owning table retains this exact FCB while the resource is held.
-                fcb.as_ref()
-            }
-            .stream_context
-            .set_delete_pending(state.delete_pending())
-            .is_err()
-            {
-                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-            }
-            completed
-        };
-        drop(completed);
+        self.with_opened_locations(fcb, |links| {
+            links.finish_deletion(target, LinkDeletionOutcome::Removed)
+        });
     }
-
-    /// Cancels the exact final-cleanup deletion while no lower effect can be outstanding.
-    #[expect(
-        unsafe_code,
-        reason = "the ledger resource serializes the exact FCB-owned cleanup target transition"
-    )]
+    /// Restores one claimed link only after a known pre-effect failure.
     pub(super) fn abort_cleanup_delete(
         &self,
         fcb: NonNull<FileControlBlock>,
         target: NonNull<FileDeleteTarget>,
     ) {
-        let aborted = {
-            let _guard = self.lock.acquire();
-            let table = unsafe {
-                // SAFETY: The executive resource serializes lookup and deletion-state mutation.
-                &*self.table.get()
-            };
-            let mut state = ledger_file_control_block_open_state(table, fcb);
-            let state = unsafe {
-                // SAFETY: The FCB was identity-checked against the owning table while locked.
-                state.as_mut()
-            };
-            let aborted = state.abort_cleanup_delete(target);
-            if unsafe {
-                // SAFETY: The owning table retains this exact FCB while the resource is held.
-                fcb.as_ref()
-            }
-            .stream_context
-            .set_delete_pending(state.delete_pending())
-            .is_err()
-            {
-                KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-            }
-            aborted
-        };
-        drop(aborted);
+        self.with_opened_locations(fcb, |links| {
+            links.finish_deletion(target, LinkDeletionOutcome::Aborted)
+        });
+    }
+    /// Keeps deletion pending while a file-id handle still retains the last inode link.
+    pub(super) fn defer_cleanup_delete(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        target: NonNull<FileDeleteTarget>,
+    ) {
+        self.with_opened_locations(fcb, |links| {
+            links.finish_deletion(target, LinkDeletionOutcome::Deferred)
+        });
     }
 
     /// Atomically releases a share claim and the same FILE_OBJECT's final FCB reference.
@@ -2900,7 +2830,6 @@ impl FileControlBlockLedger {
     }
 
     /// Returns the current user-handle count for one table-owned FCB.
-    #[cfg(not(test))]
     #[expect(
         unsafe_code,
         reason = "the ledger resource serializes the exact FCB open-count observation"
@@ -2936,35 +2865,39 @@ impl FileControlBlockLedger {
         table_empty && mutations_empty
     }
 
-    /// Returns whether a currently open inode identity rejects new namespace traversal.
+    /// Checks a selected namespace link; omitted locations are only used for directories.
+    /// # Errors
+    /// Returns delete-pending when that exact link rejects namespace admission.
     #[expect(
         unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        reason = "the ledger resource owns namespace-link observation"
     )]
-    pub(super) fn node_delete_pending(&self, node: NodeId) -> bool {
+    pub(super) fn ensure_location_openable(
+        &self,
+        node: NodeId,
+        location: Option<&OpenedLocation>,
+    ) -> DriverResult<()> {
         let _guard = self.lock.acquire();
         let table = unsafe {
-            // SAFETY: The executive resource serializes table and open-state observation.
+            // SAFETY: The resource serializes table membership and open state.
             &*self.table.get()
         };
         let Some(fcb) = find_file_control_block_in_table(table, node) else {
-            return false;
+            return Ok(());
         };
-        let fcb = unsafe {
-            // SAFETY: The table owns this FCB and the resource remains held for the observation.
-            fcb.as_ref()
-        };
-        let state = unsafe {
-            // SAFETY: The ledger resource serializes this FCB open-state observation.
-            &*fcb.open_state.get()
-        };
-        state.delete_pending()
+        let state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: Membership was checked while the exclusive guard is held.
+            state.as_ref()
+        }
+        .locations
+        .ensure_openable(location)
     }
 
     /// Requires a currently open inode to permit ordinary namespace replacement.
     /// # Errors
     ///
-    /// Returns delete-pending or sharing-violation when the open state rejects replacement.
+    /// Returns sharing-violation while active inode handles reject replacement.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"

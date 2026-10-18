@@ -1394,17 +1394,46 @@ impl MountedVolumeAccess<'_> {
         self.runtime.authorize_durability()
     }
 
-    /// Rejects namespace traversal through an inode that is delete-pending.
+    /// Checks the unique directory link before namespace traversal.
     /// # Errors
-    ///
-    /// Returns delete-pending while an open FCB owns a deferred deletion for `node`.
-    pub(crate) fn ensure_node_openable(&self, node: NodeId) -> DriverResult<()> {
-        let ledger = &self.volume.file_control_blocks;
-        if ledger.node_delete_pending(node) {
-            Err(DriverError::DeletePending)
-        } else {
-            Ok(())
-        }
+    /// Returns delete-pending for a directory whose removal has been accepted.
+    pub(crate) fn ensure_directory_openable(&self, directory: DirectoryNodeId) -> DriverResult<()> {
+        self.volume
+            .file_control_blocks
+            .ensure_location_openable(NodeId::Directory(directory), None)
+    }
+    /// Checks an exact selected link without restricting the inode's other hard links.
+    /// # Errors
+    /// Returns delete-pending only for the selected namespace identity.
+    pub(crate) fn ensure_location_openable(
+        &self,
+        node: NodeId,
+        location: &OpenedLocation,
+    ) -> DriverResult<()> {
+        self.volume
+            .file_control_blocks
+            .ensure_location_openable(node, Some(location))
+    }
+    /// Whether another active inode handle prevents reclaiming its final link.
+    pub(crate) fn has_active_inode_handles(&self, fcb: NonNull<FileControlBlock>) -> bool {
+        self.volume.file_control_blocks.stream_open_count(fcb) != 0
+    }
+    /// Claims another inactive namespace link while this cleanup retains the inode stream.
+    pub(crate) fn claim_file_delete(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+    ) -> FileCleanupDisposition {
+        self.volume.file_control_blocks.claim_file_delete(fcb)
+    }
+    /// Defers one claimed deletion until the remaining inode handles have cleaned up.
+    pub(crate) fn defer_file_delete(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        target: NonNull<FileDeleteTarget>,
+    ) {
+        self.volume
+            .file_control_blocks
+            .defer_cleanup_delete(fcb, target);
     }
 
     /// Requires an existing replacement target to have no active handles.
@@ -1431,7 +1460,7 @@ impl MountedVolumeAccess<'_> {
             .prepare_link_rename(node, source, destination)
     }
 
-    /// Publishes successful removal of the exact FCB-owned delete target.
+    /// Publishes successful removal of the exact claimed link deletion target.
     pub(crate) fn complete_file_delete(
         &mut self,
         fcb: NonNull<FileControlBlock>,

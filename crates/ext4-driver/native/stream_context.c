@@ -44,7 +44,6 @@ typedef struct _EXT4WIN_FAST_IO_QUERY_SNAPSHOT {
     EXT4WIN_PUBLISHED_STREAM_METADATA Metadata;
     LARGE_INTEGER AllocationSize;
     LARGE_INTEGER EndOfFile;
-    BOOLEAN DeletePending;
 } EXT4WIN_FAST_IO_QUERY_SNAPSHOT, *PEXT4WIN_FAST_IO_QUERY_SNAPSHOT;
 
 typedef struct _EXT4WIN_FAST_IO_TRANSFER_OBSERVATION {
@@ -64,8 +63,7 @@ extern VOID NTAPI ext4win_fast_io_network_record(const EXT4WIN_FAST_IO_QUERY_SNA
 C_ASSERT(sizeof(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION) == 24);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION, Cached) == 12);
 C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_TRANSFER_OBSERVATION, Archive) == 20);
-C_ASSERT(sizeof(EXT4WIN_FAST_IO_QUERY_SNAPSHOT) == 80);
-C_ASSERT(FIELD_OFFSET(EXT4WIN_FAST_IO_QUERY_SNAPSHOT, DeletePending) == 72);
+C_ASSERT(sizeof(EXT4WIN_FAST_IO_QUERY_SNAPSHOT) == 72);
 
 typedef struct _EXT4WIN_STREAM_CONTEXT {
     FSRTL_ADVANCED_FCB_HEADER Header;
@@ -90,7 +88,7 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     REGHANDLE TraceRegistrationHandle;
     const VOID *SectionState;
     volatile LONG MetadataValid;
-    volatile LONG DeletePending;
+    volatile LONG NamespaceQueryFallback;
     ULONG Signature;
     ULONG Kind;
     BOOLEAN MainResourceInitialized;
@@ -786,7 +784,7 @@ _IRQL_requires_max_(APC_LEVEL)
 _Must_inspect_result_
 NTSTATUS
 NTAPI
-ext4win_stream_set_delete_pending(
+ext4win_stream_set_namespace_query_fallback(
     _In_ PVOID stream_header,
     _In_ BOOLEAN pending)
 {
@@ -796,7 +794,7 @@ ext4win_stream_set_delete_pending(
         ((pending != FALSE) && (pending != TRUE))) {
         return STATUS_INVALID_PARAMETER;
     }
-    InterlockedExchange(&stream->DeletePending, pending != FALSE);
+    InterlockedExchange(&stream->NamespaceQueryFallback, pending != FALSE);
     return STATUS_SUCCESS;
 }
 
@@ -1105,15 +1103,12 @@ ext4win_capture_fast_io_query_snapshot(
     BOOLEAN valid;
 
     ExAcquireFastMutex(&stream->HeaderMutex);
-    valid = stream->MetadataValid != FALSE;
+    valid = (stream->MetadataValid != FALSE) &&
+        (InterlockedCompareExchange(&stream->NamespaceQueryFallback, FALSE, FALSE) == FALSE);
     if (valid) {
         snapshot->Metadata = stream->PublishedMetadata;
         snapshot->AllocationSize.QuadPart = stream->AllocationCharge;
         snapshot->EndOfFile = stream->Header.FileSize;
-        snapshot->DeletePending = (BOOLEAN)(InterlockedCompareExchange(
-            &stream->DeletePending,
-            FALSE,
-            FALSE) != FALSE);
     }
     ExReleaseFastMutex(&stream->HeaderMutex);
     return valid;

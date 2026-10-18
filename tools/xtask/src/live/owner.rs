@@ -603,6 +603,8 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
     windows_host::verify_timestamp_suppression(&reset_path)?;
     println!("live filesystem I/O: verify native file positions");
     windows_host::verify_file_positions(&reset_path)?;
+    println!("live filesystem I/O: verify hard-link deletion and coalescing rename");
+    windows_host::verify_hard_link_lifecycle(&root)?;
     println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
     let descriptor = windows_host::file_security(&alpha)?;

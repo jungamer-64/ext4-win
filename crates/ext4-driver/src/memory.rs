@@ -280,19 +280,6 @@ impl<T> DriverShared<T> {
         acquire_shared(self.inner)
     }
 
-    /// Observes whether another owner retains this allocation, for owner-serialized reclamation.
-    #[expect(
-        unsafe_code,
-        reason = "this owner retains the allocation during the atomic observation"
-    )]
-    pub(crate) fn has_leases(&self) -> bool {
-        let references = unsafe {
-            // SAFETY: This owner retains the counter throughout this observation.
-            &self.inner.as_ref().references
-        };
-        references.load(Ordering::Acquire) != 1
-    }
-
     /// Borrows the initialized shared value.
     #[expect(
         unsafe_code,
@@ -1091,7 +1078,6 @@ mod tests {
         let Ok(first) = owner.try_acquire() else {
             return;
         };
-        assert!(owner.has_leases());
         drop(owner);
         let Ok(second) = first.try_acquire() else {
             return;
@@ -1131,7 +1117,6 @@ mod tests {
         let Ok(owner) = DriverShared::try_new(0xA5_u32) else {
             return;
         };
-        assert!(!owner.has_leases());
         let Ok(lease) = owner.try_acquire() else {
             return;
         };

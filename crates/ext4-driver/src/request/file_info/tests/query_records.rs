@@ -32,12 +32,34 @@ fn large_file_information_preserves_eof_and_inode_allocation_size() {
     };
 
     let mut standard = [0_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
-    assert!(super::pack_standard_information(&mut standard, metadata, false, stream_sizes).is_ok());
+    assert!(
+        super::pack_standard_information(
+            &mut standard,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            },
+            stream_sizes
+        )
+        .is_ok()
+    );
     assert_eq!(
         standard[core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending)],
         0
     );
-    assert!(super::pack_standard_information(&mut standard, metadata, true, stream_sizes).is_ok());
+    assert!(
+        super::pack_standard_information(
+            &mut standard,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: true,
+                pending_links: 1
+            },
+            stream_sizes
+        )
+        .is_ok()
+    );
     assert_eq!(
         standard[core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending)],
         1
@@ -84,11 +106,27 @@ fn file_information_uses_stream_sizes_and_rejects_short_buffers() -> Result<(), 
             .get_mut(..length)
             .ok_or(DriverError::InternalInvariantViolation)?;
         assert_eq!(
-            super::pack_standard_information(short, metadata, false, stream_sizes),
+            super::pack_standard_information(
+                short,
+                metadata,
+                crate::state::LinkDeletionInformation {
+                    selected_pending: false,
+                    pending_links: 0
+                },
+                stream_sizes
+            ),
             Err(DriverError::BufferTooSmall)
         );
     }
-    super::pack_standard_information(&mut standard, metadata, false, stream_sizes)?;
+    super::pack_standard_information(
+        &mut standard,
+        metadata,
+        crate::state::LinkDeletionInformation {
+            selected_pending: false,
+            pending_links: 0,
+        },
+        stream_sizes,
+    )?;
     assert_eq!(le_i64(&standard, 0), Some(4_096));
     assert_eq!(le_i64(&standard, 8), Some(8_193));
 
@@ -129,7 +167,14 @@ fn standard_link_information_projects_link_lifecycle_and_node_kind() {
 
     let mut live = vec![0_u8; size];
     assert_eq!(
-        super::pack_standard_link_information(&mut live, metadata, false),
+        super::pack_standard_link_information(
+            &mut live,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            }
+        ),
         IrpCompletion::from_usize(size)
     );
     assert_eq!(
@@ -166,7 +211,14 @@ fn standard_link_information_projects_link_lifecycle_and_node_kind() {
 
     let mut pending = vec![0_u8; size];
     assert_eq!(
-        super::pack_standard_link_information(&mut pending, metadata, true),
+        super::pack_standard_link_information(
+            &mut pending,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: true,
+                pending_links: 1
+            }
+        ),
         IrpCompletion::from_usize(size)
     );
     assert_eq!(
@@ -194,10 +246,77 @@ fn standard_link_information_projects_link_lifecycle_and_node_kind() {
         Some(1)
     );
 
+    for (pending_links, accessible, delete_pending) in [(2, 1, 0), (3, 0, 1)] {
+        let deletion = crate::state::LinkDeletionInformation {
+            selected_pending: false,
+            pending_links,
+        };
+        let mut link_information = vec![0_u8; size];
+        assert_eq!(
+            super::pack_standard_link_information(&mut link_information, metadata, deletion),
+            IrpCompletion::from_usize(size)
+        );
+        assert_eq!(
+            le_u32(
+                &link_information,
+                core::mem::offset_of!(
+                    wdk_sys::FILE_STANDARD_LINK_INFORMATION,
+                    NumberOfAccessibleLinks
+                )
+            ),
+            Some(accessible)
+        );
+        assert_eq!(
+            le_u32(
+                &link_information,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, TotalNumberOfLinks)
+            ),
+            Some(3)
+        );
+        assert_eq!(
+            byte_at(
+                &link_information,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_LINK_INFORMATION, DeletePending)
+            ),
+            Some(delete_pending)
+        );
+        let mut standard = vec![0_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
+        assert_eq!(
+            super::pack_standard_information(
+                &mut standard,
+                metadata,
+                deletion,
+                crate::kernel::stream::StreamSizes::EMPTY
+            ),
+            IrpCompletion::from_usize(standard.len())
+        );
+        assert_eq!(
+            le_u32(
+                &standard,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, NumberOfLinks)
+            ),
+            Some(accessible)
+        );
+        assert_eq!(
+            byte_at(
+                &standard,
+                core::mem::offset_of!(wdk_sys::FILE_STANDARD_INFORMATION, DeletePending)
+            ),
+            Some(delete_pending)
+        );
+    }
+
     metadata.links_count = Ext4LinkCount::ONE;
     let mut single_pending = vec![0_u8; size];
     assert_eq!(
-        super::pack_standard_link_information(&mut single_pending, metadata, true),
+        super::pack_standard_link_information(
+            &mut single_pending,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: true,
+                pending_links: 1
+            }
+        ),
         IrpCompletion::from_usize(size)
     );
     assert_eq!(
@@ -227,7 +346,14 @@ fn standard_link_information_projects_link_lifecycle_and_node_kind() {
     metadata.links_count = five_links;
     let mut directory = vec![0_u8; size];
     assert_eq!(
-        super::pack_standard_link_information(&mut directory, metadata, false),
+        super::pack_standard_link_information(
+            &mut directory,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            }
+        ),
         IrpCompletion::from_usize(size)
     );
     assert_eq!(
@@ -260,7 +386,10 @@ fn standard_link_information_projects_link_lifecycle_and_node_kind() {
         super::pack_standard_information(
             &mut standard,
             metadata,
-            false,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            },
             crate::kernel::stream::StreamSizes::EMPTY
         ),
         IrpCompletion::from_usize(standard.len())
@@ -277,7 +406,14 @@ fn standard_link_information_projects_link_lifecycle_and_node_kind() {
     metadata.links_count = three_links;
     let mut symlink = vec![0_u8; size];
     assert_eq!(
-        super::pack_standard_link_information(&mut symlink, metadata, false),
+        super::pack_standard_link_information(
+            &mut symlink,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            }
+        ),
         IrpCompletion::from_usize(size)
     );
     assert_eq!(

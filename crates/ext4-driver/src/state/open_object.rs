@@ -61,7 +61,7 @@ impl FileDeleteTarget {
     }
 }
 
-/// Heap-stable delete target owned by one FCB until deletion completes or is cancelled.
+/// Heap-stable delete target owned by one link until deletion completes or is cancelled.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct PendingFileDeletion {
     /// Stable target storage referenced by an actor-local cleanup plan across suspension.
@@ -71,7 +71,7 @@ pub(crate) struct PendingFileDeletion {
 }
 
 impl PendingFileDeletion {
-    /// Copies a normal disposition target into stable FCB-owned storage.
+    /// Copies a normal disposition target into stable link-owned storage.
     /// # Errors
     ///
     /// Returns cannot-delete for root and file-reference handles, or an allocation error when the
@@ -80,7 +80,7 @@ impl PendingFileDeletion {
         Self::try_from_location(location, FileDeletionCause::Disposition)
     }
 
-    /// Copies a mandatory delete-on-close target into stable FCB-owned storage.
+    /// Copies a mandatory delete-on-close target into stable link-owned storage.
     /// # Errors
     ///
     /// Returns cannot-delete for root and file-reference handles, or an allocation error when the
@@ -129,7 +129,7 @@ impl PendingFileDeletion {
     }
 }
 
-/// Origin of one shared FCB delete-pending state.
+/// Origin of one selected namespace link delete-pending state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FileDeletionCause {
     /// Set-information may later cancel this pending state.
@@ -138,41 +138,13 @@ pub(super) enum FileDeletionCause {
     DeleteOnClose,
 }
 
-/// Namespace deletion state shared by every FILE_OBJECT for one inode identity.
-#[derive(Debug, Eq, PartialEq)]
-pub(super) enum FileDeletionState {
-    /// The inode may be opened and no link has been selected for deletion.
-    Live,
-    /// New opens are rejected and the selected link is removed after the final active cleanup.
-    Pending(PendingFileDeletion),
-    /// The selected link has been removed; only terminal FILE_OBJECT close references remain.
-    Deleted,
-}
-
-impl FileDeletionState {
-    /// Rejects a new open after delete-pending has been published.
-    /// # Errors
-    ///
-    /// Returns delete-pending after the one-way namespace transition begins.
-    pub(super) const fn ensure_openable(&self) -> DriverResult<()> {
-        match self {
-            Self::Live => Ok(()),
-            Self::Pending(_) | Self::Deleted => Err(DriverError::DeletePending),
-        }
-    }
-
-    /// Returns whether Windows queries must expose `DeletePending`.
-    pub(super) const fn is_pending(&self) -> bool {
-        matches!(self, Self::Pending(_) | Self::Deleted)
-    }
-
-    /// Returns the stable target when the final active handle may perform deletion.
-    pub(super) fn cleanup_target(&self, active_handles: u32) -> Option<NonNull<FileDeleteTarget>> {
-        match self {
-            Self::Pending(pending) if active_handles == 0 => Some(pending.target()),
-            Self::Live | Self::Pending(_) | Self::Deleted => None,
-        }
-    }
+/// A coherent observation of the selected link and all accepted inode link deletions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LinkDeletionInformation {
+    /// Whether this selected link has entered deletion.
+    pub(crate) selected_pending: bool,
+    /// Accepted deletions of links still present in the committed namespace.
+    pub(crate) pending_links: u32,
 }
 
 /// Cleanup effect selected atomically with removal of one FILE_OBJECT share claim.
@@ -1464,7 +1436,7 @@ impl<'owner> OpenedObject<'owner> {
         self.handle().state.normalized_name_access.require()
     }
 
-    /// Copies this handle's exact deletable location into stable FCB-owned storage.
+    /// Copies this handle's exact deletable location into stable link-owned storage.
     /// # Errors
     ///
     /// Returns cannot-delete for root or file-reference handles, or an allocation failure.
@@ -1472,7 +1444,7 @@ impl<'owner> OpenedObject<'owner> {
         PendingFileDeletion::try_from_disposition(&self.location())
     }
 
-    /// Cancels delete-pending for the shared FCB.
+    /// Cancels delete-pending for the selected namespace link.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -1483,21 +1455,45 @@ impl<'owner> OpenedObject<'owner> {
             // SAFETY: This opened FILE_OBJECT keeps the FCB and its ledger owner live.
             owner.as_ref()
         }
-        .clear_delete_pending(self.fcb);
+        .clear_delete_pending(self.fcb, &self.handle().state.location);
     }
 
-    /// Returns whether the shared FCB is delete-pending.
+    /// Returns deletion state for this handle's selected link, independent of other hard links.
+    pub(crate) fn delete_pending(&self) -> bool {
+        self.handle().state.location.delete_pending()
+    }
+    /// Captures link-local deletion and the inode's accepted, unremoved link deletions.
+    pub(crate) fn link_deletion_information(&self) -> LinkDeletionInformation {
+        LinkDeletionInformation {
+            selected_pending: self.delete_pending(),
+            pending_links: self.pending_link_count(),
+        }
+    }
+    /// Returns accepted, unremoved link deletions for this inode.
     #[expect(
         unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        reason = "the opened FILE_OBJECT retains its FCB and ledger owner"
     )]
-    pub(crate) fn delete_pending(&self) -> bool {
+    fn pending_link_count(&self) -> u32 {
         let owner = file_control_block_owner(self.fcb);
         unsafe {
-            // SAFETY: This opened FILE_OBJECT keeps the FCB and its ledger owner live.
+            // SAFETY: This FILE_OBJECT retains the FCB and its immutable ledger owner.
             owner.as_ref()
         }
-        .delete_pending(self.fcb)
+        .pending_link_count(self.fcb)
+    }
+    /// Prepares coalescence with an existing destination link before namespace staging.
+    /// # Errors
+    /// Returns finite reference exhaustion before either link changes.
+    pub(crate) fn prepare_link_merge(
+        &self,
+        target: &OpenedLocation,
+        destination: OpenedLocation,
+    ) -> DriverResult<PreparedLinkRename> {
+        self.handle()
+            .state
+            .location
+            .prepare_merge(target, destination)
     }
 
     /// Returns the stable FCB address retained by this FILE_OBJECT.
@@ -1615,9 +1611,13 @@ impl<'owner> OpenedObject<'owner> {
         self.handle().begin_cleanup()
     }
 
-    /// Removes this handle's share claim and selects final-active-handle deletion.
+    /// Removes this handle's share claim and selects ready link deletions.
     pub(crate) fn release_share_access_for_cleanup(&self) -> FileCleanupDisposition {
-        release_file_share_access(self.fcb, self.file_object.address())
+        release_file_share_access(
+            self.fcb,
+            self.file_object.address(),
+            &self.handle().state.location,
+        )
     }
 
     /// Publishes lifecycle completion after every cleanup-owned release has finished.
@@ -2304,13 +2304,14 @@ pub(crate) fn release_file_control_block(fcb: NonNull<FileControlBlock>) {
 pub(crate) fn release_file_share_access(
     fcb: NonNull<FileControlBlock>,
     file_object: KernelFileObject,
+    location: &OpenedLocationLease,
 ) -> FileCleanupDisposition {
     let owner = file_control_block_owner(fcb);
     let owner = unsafe {
         // SAFETY: The retained FCB reference keeps its owner ledger live for cleanup.
         owner.as_ref()
     };
-    owner.release_share_access(fcb, file_object)
+    owner.release_share_access(fcb, file_object, location)
 }
 
 /// Aborts one exact final-cleanup deletion before any lower effect became uncertain.

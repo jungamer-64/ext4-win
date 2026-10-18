@@ -2116,9 +2116,9 @@ fn handle_deletion_requires_delete_authority_for_delete_on_close() {
 
 /// # Panics
 ///
-/// Panics when cancellation or non-directory-entry deletion targets become ambiguous.
+/// Panics when root or file-id handles acquire namespace deletion authority.
 #[test]
-fn pending_file_deletion_cancels_only_before_commit_and_requires_a_link() {
+fn pending_file_deletion_requires_a_namespace_link() {
     assert_eq!(
         super::PendingFileDeletion::try_from_disposition(&OpenedLocation::Root),
         Err(DriverError::CannotDelete)
@@ -2127,118 +2127,4 @@ fn pending_file_deletion_cancels_only_before_commit_and_requires_a_link() {
         super::PendingFileDeletion::try_from_disposition(&OpenedLocation::FileReference),
         Err(DriverError::CannotDelete)
     );
-
-    let name = Ext4Name::new(b"cancel");
-    assert!(name.is_ok());
-    let Ok(name) = name else {
-        return;
-    };
-    let location = OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &name);
-    assert!(location.is_ok());
-    let Ok(location) = location else {
-        return;
-    };
-    let pending = super::PendingFileDeletion::try_from_disposition(&location);
-    assert!(pending.is_ok());
-    let Ok(pending) = pending else {
-        return;
-    };
-    let mut state = FileControlBlockOpenState::new();
-    assert!(state.set_delete_pending(pending).is_none());
-    assert!(state.clear_delete_pending().is_some());
-    assert_eq!(state.deletion.ensure_openable(), Ok(()));
-    assert!(!state.delete_pending());
-}
-
-/// # Panics
-///
-/// Panics when a mandatory create-time delete target can be cancelled or replaced by a normal
-/// disposition request.
-#[test]
-fn delete_on_close_pending_cannot_be_cancelled_or_replaced() {
-    let mandatory_name = Ext4Name::new(b"mandatory");
-    assert!(mandatory_name.is_ok());
-    let Ok(mandatory_name) = mandatory_name else {
-        return;
-    };
-    let mandatory_location =
-        OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &mandatory_name);
-    assert!(mandatory_location.is_ok());
-    let Ok(mandatory_location) = mandatory_location else {
-        return;
-    };
-    let mandatory = super::PendingFileDeletion::try_from_delete_on_close(&mandatory_location);
-    assert!(mandatory.is_ok());
-    let Ok(mandatory) = mandatory else {
-        return;
-    };
-    let mandatory_target = mandatory.target();
-
-    let replacement_name = Ext4Name::new(b"replacement");
-    assert!(replacement_name.is_ok());
-    let Ok(replacement_name) = replacement_name else {
-        return;
-    };
-    let replacement_location =
-        OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &replacement_name);
-    assert!(replacement_location.is_ok());
-    let Ok(replacement_location) = replacement_location else {
-        return;
-    };
-    let replacement = super::PendingFileDeletion::try_from_disposition(&replacement_location);
-    assert!(replacement.is_ok());
-    let Ok(replacement) = replacement else {
-        return;
-    };
-    let replacement_target = replacement.target();
-
-    let mut state = FileControlBlockOpenState::new();
-    assert!(state.set_delete_pending(mandatory).is_none());
-    assert!(state.clear_delete_pending().is_none());
-    assert_eq!(
-        state.cleanup_disposition(),
-        super::FileCleanupDisposition::Delete(mandatory_target)
-    );
-    let displaced = state.set_delete_pending(replacement);
-    assert!(displaced.is_some());
-    let Some(displaced) = displaced else {
-        return;
-    };
-    assert_eq!(displaced.target(), replacement_target);
-    assert_eq!(
-        state.cleanup_disposition(),
-        super::FileCleanupDisposition::Delete(mandatory_target)
-    );
-}
-
-/// # Panics
-///
-/// Panics when a pre-effect cleanup failure cannot terminate mandatory deletion ownership without
-/// weakening ordinary disposition cancellation rules.
-#[test]
-fn final_cleanup_failure_can_abort_exact_delete_on_close_target() {
-    let name = Ext4Name::new(b"mapped-delete-on-close");
-    assert!(name.is_ok());
-    let Ok(name) = name else {
-        return;
-    };
-    let location = OpenedLocation::try_directory_entry(DirectoryNodeId::ROOT, &name);
-    assert!(location.is_ok());
-    let Ok(location) = location else {
-        return;
-    };
-    let pending = super::PendingFileDeletion::try_from_delete_on_close(&location);
-    assert!(pending.is_ok());
-    let Ok(pending) = pending else {
-        return;
-    };
-    let target = pending.target();
-    let mut state = FileControlBlockOpenState::new();
-
-    assert!(state.set_delete_pending(pending).is_none());
-    assert!(state.clear_delete_pending().is_none());
-    let aborted = state.abort_cleanup_delete(target);
-    assert!(aborted.is_some());
-    assert_eq!(state.deletion.ensure_openable(), Ok(()));
-    assert!(!state.delete_pending());
 }

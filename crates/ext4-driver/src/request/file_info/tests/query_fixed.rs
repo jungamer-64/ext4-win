@@ -60,7 +60,18 @@ fn fixed_query_information_packers_clear_every_padding_byte() {
     );
 
     let mut standard = vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_INFORMATION>()];
-    assert!(super::pack_standard_information(&mut standard, metadata, false, stream_sizes).is_ok());
+    assert!(
+        super::pack_standard_information(
+            &mut standard,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            },
+            stream_sizes
+        )
+        .is_ok()
+    );
     assert_padding_zero(
         &standard,
         &[
@@ -89,7 +100,17 @@ fn fixed_query_information_packers_clear_every_padding_byte() {
 
     let mut standard_link =
         vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_LINK_INFORMATION>()];
-    assert!(super::pack_standard_link_information(&mut standard_link, metadata, false).is_ok());
+    assert!(
+        super::pack_standard_link_information(
+            &mut standard_link,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            }
+        )
+        .is_ok()
+    );
     assert_padding_zero(
         &standard_link,
         &[

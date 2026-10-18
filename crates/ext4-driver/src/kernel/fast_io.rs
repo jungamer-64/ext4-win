@@ -43,8 +43,6 @@ struct QuerySnapshot {
     allocation: i64,
     /// Committed logical EOF.
     eof: i64,
-    /// Ledger-owned deletion projection.
-    delete_pending: u8,
 }
 
 #[cfg(not(test))]
@@ -52,8 +50,7 @@ const _: () = {
     assert!(core::mem::size_of::<TransferObservation>() == 24);
     assert!(core::mem::offset_of!(TransferObservation, cached) == 12);
     assert!(core::mem::offset_of!(TransferObservation, archive) == 20);
-    assert!(core::mem::size_of::<QuerySnapshot>() == 80);
-    assert!(core::mem::offset_of!(QuerySnapshot, delete_pending) == 72);
+    assert!(core::mem::size_of::<QuerySnapshot>() == 72);
 };
 
 /// Cached transfer admission requires independent media, close and section gates to be open.
@@ -308,7 +305,7 @@ unsafe extern "system" fn ext4win_fast_io_standard_record(
         allocation: snapshot.allocation,
         eof: snapshot.eof,
         links: snapshot.metadata.links,
-        delete_pending: snapshot.delete_pending != 0,
+        delete_pending: false,
         directory: snapshot.metadata.directory != 0,
     };
     unsafe {

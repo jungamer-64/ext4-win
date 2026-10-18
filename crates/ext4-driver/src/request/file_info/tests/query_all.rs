@@ -6,7 +6,10 @@ fn snapshot() -> Option<super::AllFileInformation> {
     let metadata = test_metadata(super::FileMetadataKind::File)?;
     Some(super::AllFileInformation {
         metadata,
-        delete_pending: false,
+        deletion: crate::state::LinkDeletionInformation {
+            selected_pending: false,
+            pending_links: 0,
+        },
         stream_sizes: crate::kernel::stream::StreamSizes::try_from_ext4(
             FileSize::from_bytes(8_193),
             FileAllocationSize::from_bytes(4_096),

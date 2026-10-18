@@ -77,8 +77,8 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "ext4win_stream_publish_metadata",
     ),
     (
-        "native delete-pending projection",
-        "ext4win_stream_set_delete_pending",
+        "native namespace metadata query fallback gate",
+        "ext4win_stream_set_namespace_query_fallback",
     ),
     ("native stream destruction", "ext4win_stream_destroy"),
     (
@@ -2378,7 +2378,7 @@ mod tests {
              ext4win_stream_section_objects\n\
              ext4win_stream_get_sizes\n\
              ext4win_stream_publish_metadata\n\
-             ext4win_stream_set_delete_pending\n\
+             ext4win_stream_set_namespace_query_fallback\n\
              ext4win_stream_destroy\n\
              ext4win_stream_cache_initialize\n\
              ext4win_cc_copy_read\n\

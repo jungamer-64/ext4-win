@@ -36,7 +36,7 @@ enum SetFilePlan {
     },
     /// Validate and publish one identity-bound delete-pending target.
     Disposition {
-        /// Stable FCB whose shared deletion state is selected.
+        /// Stable inode stream retaining the selected link's deletion state.
         fcb: NonNull<FileControlBlock>,
         /// Target ext4 inode identity.
         node: NodeId,
@@ -126,7 +126,7 @@ pub(crate) enum SetFilePublication {
 /// Fully allocated regular-file disposition retained while Cc/MM runs outside the actor.
 #[derive(Debug)]
 pub(crate) struct PendingDispositionDeletion {
-    /// Stable FCB whose shared deletion state will be published.
+    /// Stable inode stream retaining the selected link through deletion publication.
     fcb: NonNull<FileControlBlock>,
     /// Target ext4 inode identity.
     node: NodeId,
@@ -433,7 +433,7 @@ pub(super) fn set_file_information(
 fn request_location_publication(
     request: &mut PendingIrpLease<'_>,
     expected: crate::state::KernelFileObject,
-    location: OpenedLocation,
+    location: RenameLinkPublication,
 ) -> DriverResult<PreparedLinkRename> {
     request.with_active(|active| {
         let current = active.current_stack()?;
@@ -443,7 +443,13 @@ fn request_location_publication(
         if opened.file_object() != expected {
             return Err(DriverError::InternalInvariantViolation);
         }
-        opened.prepare_link_rename(location)
+        match location {
+            RenameLinkPublication::Move(destination) => opened.prepare_link_rename(destination),
+            RenameLinkPublication::Coalesce {
+                existing,
+                destination,
+            } => opened.prepare_link_merge(&existing, destination),
+        }
     })
 }
 
@@ -1109,7 +1115,7 @@ impl PreparedHardLinkMutation {
         } = request;
         let source_node = NodeId::from(source);
         let (target_parent, target_name) = resolve_namespace_target(read, &target)?;
-        operations.ensure_node_openable(NodeId::Directory(target_parent))?;
+        operations.ensure_directory_openable(target_parent)?;
         let source_metadata = metadata_from_node(read, source_node)?;
         let (destination, count_effect, changes) = prepare_hard_link_destination(
             operations,
@@ -1227,7 +1233,10 @@ fn prepare_hard_link_destination(
     if matches!(target_node, NodeId::Directory(_)) {
         return Err(DriverError::CannotDelete);
     }
-    operations.ensure_node_openable(target_node)?;
+    operations.ensure_location_openable(
+        target_node,
+        &OpenedLocation::try_directory_entry(target_parent, target.name())?,
+    )?;
     if target_node != source_node {
         operations.ensure_node_replaceable(target_node)?;
     }
@@ -1391,6 +1400,29 @@ impl RenameMutation {
     }
 }
 
+/// Namespace effect of a Windows rename, independent of the core's POSIX rename contract.
+enum RenameNamespaceAction {
+    /// Move a link into a vacant location or replace a different inode.
+    Move(PreparedNamespaceDestination),
+    /// Remove the source link while retaining an existing link to the same inode.
+    Coalesce {
+        /// Committed spelling of the surviving destination entry.
+        existing_name: Ext4Name,
+    },
+}
+/// Shared-link publication selected by the committed namespace effect.
+enum RenameLinkPublication {
+    /// Every source handle follows the moved link.
+    Move(OpenedLocation),
+    /// Source handles join the destination's existing shared identity.
+    Coalesce {
+        /// Existing identity retained by destination handles before this commit.
+        existing: OpenedLocation,
+        /// Committed spelling shared by source and destination handles after publication.
+        destination: OpenedLocation,
+    },
+}
+
 /// Result of a committed rename with mutually exclusive no-op and changed states.
 enum PreparedRename {
     /// The transaction preserved the existing handle location and emitted no notifications.
@@ -1398,7 +1430,7 @@ enum PreparedRename {
     /// The committed namespace move requires one handle-location update and exact notifications.
     Changed {
         /// New CCB location.
-        location: OpenedLocation,
+        location: RenameLinkPublication,
         /// Namespace notifications derived before commit.
         notifications: Box<RenameDirectoryNameChanges>,
     },
@@ -1414,12 +1446,14 @@ enum PreparedRenameMutation {
         source_parent: DirectoryNodeId,
         /// Exact source spelling retained by the opened handle.
         source_name: Ext4Name,
+        /// Exact inode whose source link is moved or removed.
+        source_node: NodeId,
         /// Destination directory resolved in the current epoch.
         target_parent: DirectoryNodeId,
         /// Exact destination spelling.
         target_name: Ext4Name,
         /// Exact occupied entry selected for replacement, or a verified vacant destination.
-        destination: PreparedNamespaceDestination,
+        destination: RenameNamespaceAction,
         /// Parent-directory oplock effects derived from the resolved target state.
         oplocks: NamespaceOplockPlan,
         /// New handle location published only after durable commit.
@@ -1450,8 +1484,8 @@ impl PreparedRenameMutation {
         } = request;
         validate_rename_source(read, source_parent, &source_name, source_node)?;
         let (target_parent, target_name) = resolve_namespace_target(read, &target)?;
-        operations.ensure_node_openable(NodeId::Directory(source_parent))?;
-        operations.ensure_node_openable(NodeId::Directory(target_parent))?;
+        operations.ensure_directory_openable(source_parent)?;
+        operations.ensure_directory_openable(target_parent)?;
         if source_parent == target_parent && source_name == target_name {
             return Ok(Self::Unchanged);
         }
@@ -1461,13 +1495,35 @@ impl PreparedRenameMutation {
             NameCase::Insensitive.lookup(&WindowsName::from_ext4(&target_name)?),
         )?;
         let (destination, replaced_target) = match target {
-            ChildLookup::NotFound => (PreparedNamespaceDestination::Vacant, None),
+            ChildLookup::NotFound => (
+                RenameNamespaceAction::Move(PreparedNamespaceDestination::Vacant),
+                None,
+            ),
             ChildLookup::Found(child) if *child.node() == source_node => {
+                let existing = OpenedLocation::try_directory_entry(target_parent, child.name())?;
+                operations.ensure_location_openable(source_node, &existing)?;
                 if source_parent != target_parent || child.name() != &source_name {
-                    return Ok(Self::Unchanged);
+                    (
+                        RenameNamespaceAction::Coalesce {
+                            existing_name: child.name().try_to_owned_name()?,
+                        },
+                        if child.name() != &target_name {
+                            Some(DirectoryChange::new(
+                                target_parent,
+                                child.name(),
+                                source_node,
+                                DirectoryChangeAction::Removed,
+                            )?)
+                        } else {
+                            None
+                        },
+                    )
+                } else {
+                    (
+                        RenameNamespaceAction::Move(PreparedNamespaceDestination::Vacant),
+                        None,
+                    )
                 }
-                // This is a spelling change of the source entry, rather than target replacement.
-                (PreparedNamespaceDestination::Vacant, None)
             }
             ChildLookup::Found(child) => {
                 if target_collision == RenameTargetPolicy::Reject {
@@ -1488,11 +1544,15 @@ impl PreparedRenameMutation {
                         .rename_subject()?
                         .require_write_attributes(descriptor.as_native())?;
                 }
+                operations.ensure_location_openable(
+                    *child.node(),
+                    &OpenedLocation::try_directory_entry(target_parent, child.name())?,
+                )?;
                 operations.ensure_node_replaceable(*child.node())?;
                 (
-                    PreparedNamespaceDestination::Replace {
+                    RenameNamespaceAction::Move(PreparedNamespaceDestination::Replace {
                         existing_name: child.name().try_to_owned_name()?,
-                    },
+                    }),
                     Some(DirectoryChange::new(
                         target_parent,
                         child.name(),
@@ -1508,14 +1568,31 @@ impl PreparedRenameMutation {
                 source_parent,
                 &source_name,
                 source_node,
-                DirectoryChangeAction::RenamedOldName,
+                if matches!(destination, RenameNamespaceAction::Coalesce { .. }) {
+                    DirectoryChangeAction::Removed
+                } else {
+                    DirectoryChangeAction::RenamedOldName
+                },
             )?,
-            new_source_name: DirectoryChange::new(
-                target_parent,
-                &target_name,
-                source_node,
-                DirectoryChangeAction::RenamedNewName,
-            )?,
+            new_source_name: match &destination {
+                RenameNamespaceAction::Coalesce { existing_name }
+                    if existing_name == &target_name =>
+                {
+                    None
+                }
+                RenameNamespaceAction::Coalesce { .. } => Some(DirectoryChange::new(
+                    target_parent,
+                    &target_name,
+                    source_node,
+                    DirectoryChangeAction::Added,
+                )?),
+                RenameNamespaceAction::Move(_) => Some(DirectoryChange::new(
+                    target_parent,
+                    &target_name,
+                    source_node,
+                    DirectoryChangeAction::RenamedNewName,
+                )?),
+            },
         };
         let target_effect = if notifications.replaced_target.is_some() {
             NamespaceParentOplockEffect::Removal
@@ -1528,6 +1605,7 @@ impl PreparedRenameMutation {
         Ok(Self::Changed {
             source_parent,
             source_name,
+            source_node,
             target_parent,
             target_name: target_name.try_to_owned_name()?,
             destination,
@@ -1556,6 +1634,7 @@ impl PreparedRenameMutation {
         let Self::Changed {
             source_parent,
             source_name,
+            source_node,
             target_parent,
             target_name,
             destination,
@@ -1566,20 +1645,49 @@ impl PreparedRenameMutation {
         else {
             return Ok(PreparedRename::Unchanged);
         };
+        let target_parent_id = target_parent;
         let source_parent = mutation.directory(source_parent)?;
         let target_parent = mutation.directory(target_parent)?;
-        mutation.rename_child(
-            source_parent,
-            &source_name,
-            target_parent,
-            &target_name,
-            match &destination {
-                PreparedNamespaceDestination::Vacant => NamespaceDestination::Vacant,
-                PreparedNamespaceDestination::Replace { existing_name } => {
-                    NamespaceDestination::Replace { existing_name }
+        let location = match destination {
+            RenameNamespaceAction::Move(destination) => {
+                mutation.rename_child(
+                    source_parent,
+                    &source_name,
+                    target_parent,
+                    &target_name,
+                    match &destination {
+                        PreparedNamespaceDestination::Vacant => NamespaceDestination::Vacant,
+                        PreparedNamespaceDestination::Replace { existing_name } => {
+                            NamespaceDestination::Replace { existing_name }
+                        }
+                    },
+                )?;
+                RenameLinkPublication::Move(location)
+            }
+            RenameNamespaceAction::Coalesce { existing_name } => {
+                match source_node {
+                    NodeId::File(_) => mutation.unlink_file(source_parent, &source_name)?,
+                    NodeId::Symlink(_) => mutation.remove_symlink(source_parent, &source_name)?,
+                    NodeId::Directory(_) => return Err(DriverError::InternalInvariantViolation),
                 }
-            },
-        )?;
+                if existing_name != target_name {
+                    mutation.rename_child(
+                        target_parent,
+                        &existing_name,
+                        target_parent,
+                        &target_name,
+                        NamespaceDestination::Vacant,
+                    )?;
+                }
+                RenameLinkPublication::Coalesce {
+                    existing: OpenedLocation::DirectoryEntry {
+                        parent: target_parent_id,
+                        name: existing_name,
+                    },
+                    destination: location,
+                }
+            }
+        };
         Ok(PreparedRename::Changed {
             location,
             notifications,
@@ -1595,7 +1703,7 @@ pub(crate) struct RenameDirectoryNameChanges {
     /// Source entry under its former name.
     old_source_name: DirectoryChange,
     /// Source entry under its new name.
-    new_source_name: DirectoryChange,
+    new_source_name: Option<DirectoryChange>,
 }
 
 impl RenameDirectoryNameChanges {
@@ -1605,7 +1713,9 @@ impl RenameDirectoryNameChanges {
             operations.report_directory_change(replaced_target);
         }
         operations.report_directory_change(self.old_source_name);
-        operations.report_directory_change(self.new_source_name);
+        if let Some(change) = self.new_source_name {
+            operations.report_directory_change(change);
+        }
     }
 }
 

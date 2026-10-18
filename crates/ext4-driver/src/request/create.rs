@@ -1557,7 +1557,7 @@ fn resume_existing_open<'a>(
         return Err(DriverError::InternalInvariantViolation);
     }
     operations.authorize_create()?;
-    operations.ensure_node_openable(pending.node)?;
+    operations.ensure_location_openable(pending.node, &pending.validation_location)?;
     revalidate_existing_open(pending, mutation)?;
     let owner = CreateCompletionOwner {
         creator,
@@ -2024,8 +2024,12 @@ fn resolve_target(
                 return Err(DriverError::InvalidParameter);
             }
             let target = resolve_file_reference(reference, read, parameters.reparse_point_mode())?;
-            if let CreateTargetLookup::Existing { node, .. } = &target {
-                operations.ensure_node_openable(*node)?;
+            if let CreateTargetLookup::Existing {
+                node: NodeId::Directory(directory),
+                ..
+            } = &target
+            {
+                operations.ensure_directory_openable(*directory)?;
             }
             Ok(target)
         }
@@ -2111,7 +2115,7 @@ fn resolve_path(
         } else {
             PathComponentPosition::Intermediate
         };
-        operations.ensure_node_openable(NodeId::Directory(parent_id))?;
+        operations.ensure_directory_openable(parent_id)?;
         owner.authorize_traverse(parent_id, read)?;
         let parent = match read.load_directory(parent_id) {
             Ok(directory) => directory,
@@ -2143,7 +2147,8 @@ fn resolve_path(
             Err(error) => return Err(DriverError::from(error)),
         };
         let child_node = *child.node();
-        operations.ensure_node_openable(child_node)?;
+        let child_location = OpenedLocation::try_directory_entry(child.parent(), child.name())?;
+        operations.ensure_location_openable(child_node, &child_location)?;
         if position == PathComponentPosition::Final
             && matches!(
                 target_selection,
@@ -2169,10 +2174,7 @@ fn resolve_path(
                     return Ok(CreateTargetLookup::Existing {
                         node: child_node,
                         node_mode: OpenedNodeMode::ReparsePoint,
-                        location: OpenedLocation::try_directory_entry(
-                            child.parent(),
-                            child.name(),
-                        )?,
+                        location: child_location,
                     });
                 }
             }
@@ -2181,13 +2183,13 @@ fn resolve_path(
             return Ok(CreateTargetLookup::Existing {
                 node: child_node,
                 node_mode: OpenedNodeMode::Direct,
-                location: OpenedLocation::try_directory_entry(child.parent(), child.name())?,
+                location: child_location,
             });
         }
         let NodeId::Directory(directory_id) = child_node else {
             return Err(DriverError::ObjectPathNotFound);
         };
-        parent_location = OpenedLocation::try_directory_entry(child.parent(), child.name())?;
+        parent_location = child_location;
         parent_id = directory_id;
     }
 

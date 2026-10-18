@@ -1031,6 +1031,178 @@ fn set_file_allocation(file: &FileHandle, bound: i64) -> io::Result<()> {
     }
 }
 
+/// # Errors
+/// Returns native rename failure or a path exceeding this bounded oracle's buffer.
+fn rename_file_link(file: &FileHandle, target: &Path, replace: bool) -> io::Result<()> {
+    #[repr(C)]
+    struct RenameRecord {
+        replace: u32,
+        root: HANDLE,
+        length: u32,
+        name: [u16; 512],
+    }
+    let name: Vec<_> = target.as_os_str().encode_wide().collect();
+    let length =
+        u32::try_from(core::mem::size_of_val(name.as_slice())).map_err(io::Error::other)?;
+    let mut record = RenameRecord {
+        replace: u32::from(replace),
+        root: ptr::null_mut(),
+        length,
+        name: [0; 512],
+    };
+    let output = record
+        .name
+        .get_mut(..name.len())
+        .ok_or_else(|| io::Error::other("oracle rename path is too long"))?;
+    for (destination, unit) in output.iter_mut().zip(name) {
+        *destination = unit;
+    }
+    let size = u32::try_from(core::mem::offset_of!(RenameRecord, name))
+        .map_err(io::Error::other)?
+        .checked_add(length)
+        .ok_or_else(|| io::Error::other("rename length overflow"))?;
+    let success = unsafe {
+        // SAFETY: The aligned complete record and counted UTF-16 path remain live throughout
+        // this synchronous call; the retained handle permits DELETE and shares it with peers.
+        SetFileInformationByHandle(
+            file.raw()?,
+            FileRenameInfo,
+            core::ptr::from_ref(&record).cast(),
+            size,
+        )
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Sets the Windows disposition of the selected link through a retained native handle.
+/// # Errors
+/// Returns the exact set-information failure.
+fn delete_file_link(file: &FileHandle) -> io::Result<()> {
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    let raw = file.raw()?;
+    let success = unsafe {
+        // SAFETY: The retained handle and fixed initialized input live through the synchronous call.
+        SetFileInformationByHandle(
+            raw,
+            FileDispositionInfo,
+            core::ptr::from_ref(&info).cast(),
+            u32::try_from(core::mem::size_of_val(&info)).map_err(io::Error::other)?,
+        )
+    };
+    if success == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Exercises independent hard-link dispositions and coalescing renames on disposable files.
+/// # Errors
+/// Returns native I/O, namespace or link-information disagreement, including explicit close failure.
+pub fn verify_hard_link_lifecycle(directory: &Path) -> io::Result<()> {
+    let root = directory.join("link-contract");
+    std::fs::create_dir(&root)?;
+    let a = root.join("a");
+    let b = root.join("b");
+    let c = root.join("c");
+    let d = root.join("d");
+    let operation = (|| {
+        std::fs::write(&a, b"surviving link")?;
+        std::fs::hard_link(&a, &b)?;
+        let first = FileHandle::open(&a, 0x0001_0080, 0)?;
+        let second = FileHandle::open(&b, 0x80, 0)?;
+        let result = completed(delete_file_link(&first), first.close());
+        let result = result.and_then(|()| {
+            if a.try_exists()? || std::fs::read(&b)? != b"surviving link" {
+                return Err(io::Error::other(
+                    "another hard-link handle delayed link cleanup",
+                ));
+            }
+            Ok(())
+        });
+        completed(result, second.close())?;
+        std::fs::remove_file(&b)?;
+        std::fs::write(&a, b"retained hard link")?;
+        std::fs::hard_link(&a, &b)?;
+        let first = FileHandle::open(&a, 0x0001_0080, 0)?;
+        let result = (|| {
+            let second = FileHandle::open(&b, 0x0001_0080, 0)?;
+            let result = (|| {
+                delete_file_link(&first)?;
+                let other = FileHandle::open(&b, 0x80, 0)?;
+                let result = (|| {
+                    let standard = file_information_query(&other, 5, 24, 0)?;
+                    let links = file_information_query(&other, 54, 12, 0)?;
+                    if u32::from_le_bytes(field(&standard, 16)?) != 1
+                        || standard.get(20) != Some(&0)
+                        || u32::from_le_bytes(field(&links, 0)?) != 1
+                        || u32::from_le_bytes(field(&links, 4)?) != 2
+                        || links.get(8) != Some(&0)
+                    {
+                        return Err(io::Error::other("deletion leaked to another hard link"));
+                    }
+                    Ok(())
+                })();
+                completed(result, other.close())?;
+                delete_file_link(&second)
+            })();
+            completed(result, second.close())
+        })();
+        completed(result, first.close())?;
+        if a.try_exists()? || b.try_exists()? {
+            return Err(io::Error::other(
+                "accepted hard-link deletion left a namespace entry",
+            ));
+        }
+        for replace in [false, true] {
+            std::fs::write(&a, b"retained hard link")?;
+            std::fs::hard_link(&a, &b)?;
+            let first = FileHandle::open(&a, 0x0001_0080, 0)?;
+            let result = (|| {
+                let second = FileHandle::open(&b, 0x0001_0080, 0)?;
+                let result = (|| {
+                    rename_file_link(&first, &b, replace)?;
+                    if a.try_exists()? || !b.try_exists()? {
+                        return Err(io::Error::other(
+                            "rename did not coalesce existing hard links",
+                        ));
+                    }
+                    rename_file_link(&second, &c, false)?;
+                    rename_file_link(&first, &d, false)?;
+                    if b.try_exists()?
+                        || c.try_exists()?
+                        || std::fs::read(&d)? != b"retained hard link"
+                    {
+                        return Err(io::Error::other(
+                            "coalesced handles lost their surviving link",
+                        ));
+                    }
+                    Ok(())
+                })();
+                completed(result, second.close())
+            })();
+            completed(result, first.close())?;
+            std::fs::remove_file(&d)?;
+        }
+        Ok(())
+    })();
+    let cleanup = (|| {
+        for path in [&a, &b, &c, &d] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        std::fs::remove_dir(&root)
+    })();
+    completed(operation, cleanup)
+}
+
 /// Exercises archive restoration, handle-local time policy, and assignment after cached writes.
 /// # Errors
 /// Returns native set/write/query/flush failures, timestamp disagreement, or explicit close failure.
@@ -1039,6 +1211,37 @@ pub fn verify_timestamp_suppression(path: &Path) -> io::Result<()> {
     let file = FileHandle::open(path, 0x4000_0080, 0)?;
     let result = (|| {
         write_byte(&file)?;
+        let old_change = FILE_BASIC_INFO {
+            CreationTime: 0,
+            LastAccessTime: 0,
+            LastWriteTime: 0,
+            ChangeTime: FIXED_TIME,
+            FileAttributes: 0,
+        };
+        set_basic_information(&file, &old_change)?;
+        set_basic_information(
+            &file,
+            &FILE_BASIC_INFO {
+                ChangeTime: -2,
+                ..old_change
+            },
+        )?;
+        let previous = file_information_query(&file, 4, 40, 0)?;
+        let attributes = u32::from_le_bytes(field(&previous, 32)?) ^ FILE_ATTRIBUTE_HIDDEN;
+        set_basic_information(
+            &file,
+            &FILE_BASIC_INFO {
+                ChangeTime: 0,
+                FileAttributes: attributes,
+                ..old_change
+            },
+        )?;
+        let changed = file_information_query(&file, 4, 40, 0)?;
+        if i64::from_le_bytes(field(&changed, 24)?) == FIXED_TIME {
+            return Err(io::Error::other(
+                "attribute mutation did not advance automatic change time",
+            ));
+        }
         let original = file_information_query(&file, 4, 40, 0)?;
         let attributes = u32::from_le_bytes(field(&original, 32)?) & !FILE_ATTRIBUTE_ARCHIVE;
         let explicit = FILE_BASIC_INFO {
@@ -1839,53 +2042,6 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
     }
 
-    /// # Errors
-    /// Returns native rename failure or a path exceeding this bounded oracle's buffer.
-    fn rename_open_file(file: &FileHandle, target: &Path) -> io::Result<()> {
-        #[repr(C)]
-        struct RenameRecord {
-            replace: u32,
-            root: HANDLE,
-            length: u32,
-            name: [u16; 512],
-        }
-        let name: Vec<_> = target.as_os_str().encode_wide().collect();
-        let length =
-            u32::try_from(core::mem::size_of_val(name.as_slice())).map_err(io::Error::other)?;
-        let mut record = RenameRecord {
-            replace: 0,
-            root: ptr::null_mut(),
-            length,
-            name: [0; 512],
-        };
-        let output = record
-            .name
-            .get_mut(..name.len())
-            .ok_or_else(|| io::Error::other("oracle rename path is too long"))?;
-        for (destination, unit) in output.iter_mut().zip(name) {
-            *destination = unit;
-        }
-        let size = u32::try_from(core::mem::offset_of!(RenameRecord, name))
-            .map_err(io::Error::other)?
-            .checked_add(length)
-            .ok_or_else(|| io::Error::other("rename length overflow"))?;
-        let success = unsafe {
-            // SAFETY: The aligned complete record and counted UTF-16 path remain live throughout
-            // this synchronous call; the retained handle permits DELETE and shares it with peers.
-            SetFileInformationByHandle(
-                file.raw()?,
-                FileRenameInfo,
-                core::ptr::from_ref(&record).cast(),
-                size,
-            )
-        };
-        if success == 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
     /// # Panics
     /// Fails if a native rename invalidates another handle for the same link or moves another link.
     #[test]
@@ -1911,8 +2067,8 @@ mod tests {
                 let result = (|| {
                     let second = FileHandle::open(&a, 0x0001_0080, 0)?;
                     let result = (|| {
-                        rename_open_file(&first, &b)?;
-                        rename_open_file(&second, &c)?;
+                        rename_file_link(&first, &b, false)?;
+                        rename_file_link(&second, &c, false)?;
                         if a.exists()
                             || b.exists()
                             || std::fs::read(&c)? != b"retained inode"
@@ -1940,6 +2096,26 @@ mod tests {
                 std::fs::remove_dir(&root)
             })();
             completed(result, cleanup)
+        })();
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    /// # Panics
+    /// Fails if Windows link-local deletion or coalescing rename differs from the expected contract.
+    #[test]
+    fn native_hard_link_deletion_and_coalescing_rename_contract() {
+        let result = (|| {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "ext4win-link-contract-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&root)?;
+            let result = verify_hard_link_lifecycle(&root);
+            completed(result, std::fs::remove_dir(&root))
         })();
         assert!(result.is_ok(), "{result:?}");
     }

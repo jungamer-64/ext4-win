@@ -43,7 +43,7 @@ pub(crate) fn prepare_handle_admission(
     })
 }
 
-/// Executes cleanup IRPs, including final-active-handle deferred deletion.
+/// Executes cleanup IRPs, including link-local deferred deletion.
 /// # Errors
 ///
 /// Returns an error when the IRP stack has no opened FILE_OBJECT, cleanup state is invalid, or a
@@ -64,26 +64,38 @@ pub(crate) fn cleanup(
 pub(crate) enum CleanupResolution {
     /// Cleanup released every handle-owned resource without a namespace mutation.
     Complete(IrpCompletion),
-    /// The final handle requires one journaled deletion before cleanup completes.
+    /// Cleanup owns ready link deletions that require a journaled namespace result.
     Delete(PendingCleanupDeletion),
 }
 
-/// Allocation-free driver publication paired with a committed cleanup deletion.
-#[derive(Debug)]
-pub(crate) struct PreparedCleanupPublication {
-    /// Shared FCB whose stable pending target becomes complete.
-    fcb: NonNull<FileControlBlock>,
-    /// FCB-owned target allocation consumed by the publication.
+/// One namespace removal whose storage and notification are prepared before irreversible I/O.
+#[derive(Clone, Copy, Debug)]
+struct CleanupLinkPublication {
+    /// Exact allocation claimed by this cleanup batch.
     target: NonNull<FileDeleteTarget>,
-    /// Preallocated namespace notification.
+    /// Namespace observation prepared before irreversible I/O.
     notification: DirectoryChange,
 }
-
+/// Allocation-free publication of all ready link deletions claimed by this cleanup.
+#[derive(Debug)]
+pub(crate) struct PreparedCleanupPublication {
+    /// The cleanup FILE_OBJECT retains this inode stream throughout the batch.
+    fcb: NonNull<FileControlBlock>,
+    /// Each claimed link has one post-commit outcome.
+    links: DriverVec<CleanupLinkPublication>,
+    /// Only the final remaining inode link can wait for active file-id handles.
+    deferred: Option<NonNull<FileDeleteTarget>>,
+}
 impl PreparedCleanupPublication {
-    /// Publishes the completed deletion and notification without allocation or ordinary failure.
+    /// Publishes the atomic namespace result and every prepared notification without allocation.
     pub(crate) fn publish(self, operations: &mut MountedVolumeAccess<'_>) -> IrpCompletion {
-        operations.complete_file_delete(self.fcb, self.target);
-        operations.report_directory_change(self.notification);
+        for link in self.links.iter() {
+            operations.complete_file_delete(self.fcb, link.target);
+            operations.report_directory_change(link.notification);
+        }
+        if let Some(target) = self.deferred {
+            operations.defer_file_delete(self.fcb, target);
+        }
         IrpCompletion::EMPTY
     }
 }
@@ -115,7 +127,7 @@ pub(crate) fn close(
 enum CleanupPlan {
     /// No namespace deletion became ready.
     Complete,
-    /// The final active handle must remove one exact FCB-owned namespace link.
+    /// Cleanup must finalize the claimed namespace links.
     Delete(PendingCleanupDeletion),
 }
 
@@ -126,9 +138,11 @@ pub(crate) struct PendingCleanupDeletion {
     fcb: NonNull<FileControlBlock>,
     /// Immutable opened inode identity.
     node: NodeId,
-    /// Stable FCB-owned target allocation.
+    /// Stable link-owned target allocation.
     target: NonNull<FileDeleteTarget>,
-    /// Whether dropping before a lower effect must restore the stream to the live namespace state.
+    /// Additional ready links, acquired before parent oplock checks and commit preparation.
+    additional: DriverVec<NonNull<FileDeleteTarget>>,
+    /// Whether a known pre-effect failure must restore the claimed links to live state.
     abort_on_drop: bool,
 }
 
@@ -146,22 +160,46 @@ impl PendingCleanupDeletion {
         self.fcb
     }
 
-    /// Returns the immutable inode selected by the shared delete-pending transition.
+    /// Returns the immutable inode shared by the claimed namespace links.
     pub(crate) const fn node(&self) -> NodeId {
         self.node
     }
 
-    /// Returns the exact parent directory from which final cleanup will remove the pending link.
+    /// Iterates uniquely claimed targets; their stable allocations belong to this batch's FCB.
+    fn targets(&self) -> impl Iterator<Item = NonNull<FileDeleteTarget>> + '_ {
+        core::iter::once(self.target).chain(self.additional.iter().copied())
+    }
+    /// Claims ready links so a final file-id cleanup cannot lose several deferred deletions.
+    /// # Errors
+    /// Returns allocation failure before external effects, restoring the unretained claim.
+    pub(crate) fn capture_ready(
+        &mut self,
+        operations: &MountedVolumeAccess<'_>,
+    ) -> DriverResult<()> {
+        while let FileCleanupDisposition::Delete(target) = operations.claim_file_delete(self.fcb) {
+            if let Err(error) = self.additional.try_push(target) {
+                crate::state::abort_cleanup_file_delete(self.fcb, target);
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+    /// Selects an exact parent whose removal protocol has not yet completed for this batch.
     #[expect(
         unsafe_code,
-        reason = "the cleanup FILE_OBJECT retains the FCB-owned target allocation"
+        reason = "the cleanup FILE_OBJECT retains every claimed target until its final outcome"
     )]
-    pub(crate) fn parent(&self) -> DirectoryNodeId {
-        unsafe {
-            // SAFETY: This cleanup plan retains the stable target in Pending state until publish,
-            // abort, or drop consumes the plan.
-            self.target.as_ref().parent()
-        }
+    pub(crate) fn unchecked_parent(
+        &self,
+        authorized: impl Fn(DirectoryNodeId) -> bool,
+    ) -> Option<DirectoryNodeId> {
+        self.targets().find_map(|target| {
+            let parent = unsafe {
+                // SAFETY: All targets are claimed in this FCB and retained through publication or abort.
+                target.as_ref().parent()
+            };
+            (!authorized(parent)).then_some(parent)
+        })
     }
 
     /// Prevents rollback after a lower write or flush can have an uncertain external effect.
@@ -172,7 +210,9 @@ impl PendingCleanupDeletion {
     /// Publishes a pre-effect cleanup failure before the failure completion becomes observable.
     pub(crate) fn abort_before_failure_completion(&mut self) {
         if self.abort_on_drop {
-            crate::state::abort_cleanup_file_delete(self.fcb, self.target);
+            for target in self.targets() {
+                crate::state::abort_cleanup_file_delete(self.fcb, target);
+            }
             self.abort_on_drop = false;
         }
     }
@@ -180,9 +220,7 @@ impl PendingCleanupDeletion {
 
 impl Drop for PendingCleanupDeletion {
     fn drop(&mut self) {
-        if self.abort_on_drop {
-            crate::state::abort_cleanup_file_delete(self.fcb, self.target);
-        }
+        self.abort_before_failure_completion();
     }
 }
 
@@ -241,54 +279,83 @@ fn cleanup_opened_node(
             fcb,
             node,
             target,
+            additional: DriverVec::new(),
             abort_on_drop: true,
         }),
     })
 }
 
-/// Removes an identity-checked pending link after the final active handle cleanup.
+/// Stages every claimed namespace removal atomically after its link handles have cleaned up.
 /// # Errors
 ///
 /// Returns an error when the target name no longer identifies the FCB inode, the directory is no
 /// longer empty, or the ext4 transaction cannot be committed.
 #[expect(
     unsafe_code,
-    reason = "the cleanup FILE_OBJECT retains the FCB-owned delete target until staged publication"
+    reason = "the cleanup FILE_OBJECT retains the inode and claimed link targets until staged publication"
 )]
 pub(crate) fn stage_cleanup_deletion(
-    plan: &PendingCleanupDeletion,
+    plan: &mut PendingCleanupDeletion,
+    operations: &MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
-) -> DriverResult<PreparedCleanupPublication> {
-    let target = unsafe {
-        // SAFETY: The cleanup FILE_OBJECT retains `fcb` until its later Close IRP. The FCB owns this
-        // stable allocation in Pending state, and the device actor cannot mutate that state until
-        // this function calls `complete_file_delete` after the final await.
-        plan.target.as_ref()
-    };
-    let parent = mutation.load_directory(target.parent())?;
-    match mutation.lookup_child(parent.id(), target.name())? {
-        ChildLookup::Found(child) if *child.node() == plan.node => {}
-        ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
-    }
-    let notification = DirectoryChange::new(
-        target.parent(),
-        target.name(),
-        plan.node,
-        DirectoryChangeAction::Removed,
+) -> DriverResult<Option<PreparedCleanupPublication>> {
+    let mut links = DriverVec::try_with_capacity(
+        plan.additional
+            .len()
+            .checked_add(1)
+            .ok_or(DriverError::InsufficientResources)?,
     )?;
-    let parent = mutation.directory(target.parent())?;
-    match plan.node {
-        NodeId::File(_) => mutation.unlink_file(parent, target.name())?,
-        NodeId::Directory(_) => {
-            mutation.remove_empty_directory(parent, target.name())?;
+    let mut deferred = None;
+    for target_pointer in plan.targets() {
+        let target = unsafe {
+            // SAFETY: The cleanup FILE_OBJECT retains the FCB; Removing state retains every exact
+            // target allocation until this batch commits, defers, or aborts before external effects.
+            target_pointer.as_ref()
+        };
+        let parent = mutation.load_directory(target.parent())?;
+        match mutation.lookup_child(parent.id(), target.name())? {
+            ChildLookup::Found(child) if *child.node() == plan.node => {}
+            ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
         }
-        NodeId::Symlink(_) => mutation.remove_symlink(parent, target.name())?,
+        let metadata = mutation.staged_node_metadata(plan.node)?;
+        if (matches!(plan.node, NodeId::Directory(_))
+            || metadata.links_count().on_disk_count() == 1)
+            && operations.has_active_inode_handles(plan.fcb)
+        {
+            if deferred.replace(target_pointer).is_some() {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+            continue;
+        }
+        let notification = DirectoryChange::new(
+            target.parent(),
+            target.name(),
+            plan.node,
+            DirectoryChangeAction::Removed,
+        )?;
+        let parent = mutation.directory(target.parent())?;
+        match plan.node {
+            NodeId::File(_) => mutation.unlink_file(parent, target.name())?,
+            NodeId::Directory(_) => mutation.remove_empty_directory(parent, target.name())?,
+            NodeId::Symlink(_) => mutation.remove_symlink(parent, target.name())?,
+        }
+        links.try_push(CleanupLinkPublication {
+            target: target_pointer,
+            notification,
+        })?;
     }
-    Ok(PreparedCleanupPublication {
+    if links.is_empty() {
+        for target in plan.targets() {
+            operations.defer_file_delete(plan.fcb, target);
+        }
+        plan.abort_on_drop = false;
+        return Ok(None);
+    }
+    Ok(Some(PreparedCleanupPublication {
         fcb: plan.fcb,
-        target: plan.target,
-        notification,
-    })
+        links,
+        deferred,
+    }))
 }
 
 /// Removes one direct-volume share claim during its cleanup barrier.

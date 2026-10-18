@@ -12,8 +12,8 @@ enum QueryFilePlan {
         node: NodeId,
         /// Selected namespace link.
         location: OpenedLocation,
-        /// Captured shared deletion state.
-        delete_pending: bool,
+        /// Selected-link deletion and inode pending-link count captured before metadata I/O.
+        deletion: LinkDeletionInformation,
         /// Native stream size authority.
         stream_sizes: crate::kernel::stream::StreamSizes,
         /// FILE_OBJECT position, including asynchronous opens.
@@ -45,8 +45,8 @@ enum QueryFilePlan {
         information_class: QueryFileInformationClass,
         /// Target ext4 node.
         node: NodeId,
-        /// Shared FCB deletion state captured before metadata I/O.
-        delete_pending: bool,
+        /// Selected-link deletion and inode pending-link count captured before metadata I/O.
+        deletion: LinkDeletionInformation,
         /// Coherent Windows size authority, not a projection from ext4 query metadata.
         stream_sizes: crate::kernel::stream::StreamSizes,
     },
@@ -104,7 +104,7 @@ pub(super) fn query_file_information(
                     length,
                     node: opened_file.node(),
                     location: opened_file.location().try_to_owned_location()?,
-                    delete_pending: opened_file.delete_pending(),
+                    deletion: opened_file.link_deletion_information(),
                     stream_sizes: opened_file.file_control_block().stream_sizes()?,
                     position: information_position(file_object),
                 });
@@ -151,24 +151,18 @@ pub(super) fn query_file_information(
             length,
             information_class,
             node: opened_file.node(),
-            delete_pending: opened_file.delete_pending(),
+            deletion: opened_file.link_deletion_information(),
             stream_sizes: opened_file.file_control_block().stream_sizes()?,
         })
     })?;
-    let (length, information_class, node, delete_pending, stream_sizes) = match plan {
+    let (length, information_class, node, deletion, stream_sizes) = match plan {
         QueryFilePlan::Metadata {
             length,
             information_class,
             node,
-            delete_pending,
+            deletion,
             stream_sizes,
-        } => (
-            length,
-            information_class,
-            node,
-            delete_pending,
-            stream_sizes,
-        ),
+        } => (length, information_class, node, deletion, stream_sizes),
         QueryFilePlan::Complete {
             length,
             output,
@@ -198,7 +192,7 @@ pub(super) fn query_file_information(
             length,
             node,
             location,
-            delete_pending,
+            deletion,
             stream_sizes,
             position,
         } => {
@@ -207,7 +201,7 @@ pub(super) fn query_file_information(
             let name = volume_relative_name(read, node, &location)?;
             let snapshot = AllFileInformation {
                 metadata,
-                delete_pending,
+                deletion,
                 stream_sizes,
                 position,
                 ea_size,
@@ -237,10 +231,10 @@ pub(super) fn query_file_information(
         match information_class {
             QueryFileInformationClass::Basic => pack_basic_information(buffer, metadata),
             QueryFileInformationClass::Standard => {
-                pack_standard_information(buffer, metadata, delete_pending, stream_sizes)
+                pack_standard_information(buffer, metadata, deletion, stream_sizes)
             }
             QueryFileInformationClass::StandardLink => {
-                pack_standard_link_information(buffer, metadata, delete_pending)
+                pack_standard_link_information(buffer, metadata, deletion)
             }
             QueryFileInformationClass::Internal => pack_internal_information(buffer, metadata),
             QueryFileInformationClass::NetworkOpen => {
@@ -568,10 +562,10 @@ pub(super) enum FileMetadataKind {
 struct WindowsLinkInformation {
     /// Links whose deletion has not been requested.
     accessible_links: wdk_sys::ULONG,
-    /// All namespace links, including the one selected for deferred deletion.
+    /// All namespace links, including every accepted deferred deletion.
     total_links: wdk_sys::ULONG,
-    /// Whether the FCB has selected one exact link for deferred deletion.
-    delete_pending: bool,
+    /// Whether this handle selected a link whose deletion has been accepted.
+    deletion: bool,
     /// Whether the inode is a directory rather than a file-like node.
     directory: bool,
 }
@@ -581,23 +575,25 @@ impl WindowsLinkInformation {
     ///
     /// # Errors
     ///
-    /// Returns an error when a delete-pending FCB lacks the one selected namespace link that its
-    /// lifecycle guarantees.
-    fn from_metadata(metadata: FileMetadata, delete_pending: bool) -> DriverResult<Self> {
+    /// Returns an error when accepted pending deletions exceed the committed namespace link count.
+    fn from_metadata(
+        metadata: FileMetadata,
+        deletion: LinkDeletionInformation,
+    ) -> DriverResult<Self> {
         let directory = metadata.kind == FileMetadataKind::Directory;
         let total_links = if directory {
             1
         } else {
             wdk_sys::ULONG::from(metadata.links_count.on_disk_count())
         };
-        let pending_links = wdk_sys::ULONG::from(delete_pending);
+        let pending_links = deletion.pending_links;
         let accessible_links = total_links
             .checked_sub(pending_links)
             .ok_or(DriverError::InternalInvariantViolation)?;
         Ok(Self {
             accessible_links,
             total_links,
-            delete_pending,
+            deletion: deletion.selected_pending || accessible_links == 0,
             directory,
         })
     }
@@ -680,15 +676,15 @@ fn pack_basic_information(
 fn pack_standard_information(
     output: &mut [u8],
     metadata: FileMetadata,
-    delete_pending: bool,
+    deletion: LinkDeletionInformation,
     stream_sizes: crate::kernel::stream::StreamSizes,
 ) -> DriverResult<IrpCompletion> {
-    let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
+    let links = WindowsLinkInformation::from_metadata(metadata, deletion)?;
     let record = crate::kernel::file_information::StandardInformation {
         allocation: stream_sizes.allocation_charge(),
         eof: stream_sizes.file_size(),
-        links: links.total_links,
-        delete_pending: links.delete_pending,
+        links: links.accessible_links,
+        delete_pending: links.deletion,
         directory: links.directory,
     };
     IrpCompletion::from_usize(record.write(output)?)
@@ -702,9 +698,9 @@ fn pack_standard_information(
 fn pack_standard_link_information(
     output: &mut [u8],
     metadata: FileMetadata,
-    delete_pending: bool,
+    deletion: LinkDeletionInformation,
 ) -> DriverResult<IrpCompletion> {
-    let links = WindowsLinkInformation::from_metadata(metadata, delete_pending)?;
+    let links = WindowsLinkInformation::from_metadata(metadata, deletion)?;
     let size = core::mem::size_of::<wdk_sys::FILE_STANDARD_LINK_INFORMATION>();
     let mut writer = fixed_record_writer(output, size)?;
     writer.write_u32(
@@ -726,7 +722,7 @@ fn pack_standard_link_information(
             wdk_sys::FILE_STANDARD_LINK_INFORMATION,
             DeletePending
         )),
-        boolean(links.delete_pending),
+        boolean(links.deletion),
     )?;
     writer.write_u8(
         WireOffset::new(core::mem::offset_of!(
@@ -1055,7 +1051,7 @@ struct AllFileInformation {
     /// Metadata from the selected committed epoch.
     metadata: FileMetadata,
     /// Native deletion state observed when the query starts.
-    delete_pending: bool,
+    deletion: LinkDeletionInformation,
     /// Authoritative Windows stream sizes.
     stream_sizes: crate::kernel::stream::StreamSizes,
     /// Current position of the FILE_OBJECT.
@@ -1089,7 +1085,7 @@ fn pack_all_information(
             core::mem::offset_of!(wdk_sys::FILE_ALL_INFORMATION, StandardInformation),
         )?,
         snapshot.metadata,
-        snapshot.delete_pending,
+        snapshot.deletion,
         snapshot.stream_sizes,
     )?;
     pack_internal_information(

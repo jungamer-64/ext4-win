@@ -27,7 +27,14 @@ fn standard_link_information_rejects_short_output() {
     let mut output =
         vec![0xA5_u8; core::mem::size_of::<wdk_sys::FILE_STANDARD_LINK_INFORMATION>() - 1];
     assert_eq!(
-        super::pack_standard_link_information(&mut output, metadata, false),
+        super::pack_standard_link_information(
+            &mut output,
+            metadata,
+            crate::state::LinkDeletionInformation {
+                selected_pending: false,
+                pending_links: 0
+            }
+        ),
         Err(DriverError::BufferTooSmall)
     );
     assert!(output.iter().all(|byte| *byte == 0xA5));
