@@ -566,7 +566,7 @@ impl FscryptMasterKey {
     ///
     /// # Errors
     /// Returns an error when operation-owned HKDF-SHA512 execution fails.
-    pub(crate) fn derive_contents_key(
+    fn derive_contents_key(
         &self,
         nonce: FscryptFileNonce,
         crypto: &mut dyn CryptographicOperation,
@@ -588,7 +588,7 @@ impl FscryptMasterKey {
     ///
     /// # Errors
     /// Returns an error when operation-owned HKDF-SHA512 execution fails.
-    pub(crate) fn derive_filenames_key(
+    fn derive_filenames_key(
         &self,
         nonce: FscryptFileNonce,
         crypto: &mut dyn CryptographicOperation,
@@ -630,6 +630,16 @@ pub struct FscryptKeySet {
 }
 
 impl FscryptKeySet {
+    /// Binds a selected inode context to its matching key in this immutable snapshot.
+    /// # Errors
+    /// Returns missing-key when the context's identifier is absent.
+    pub(crate) fn unlock(&self, context: FscryptContextV2) -> Result<FscryptInodeKey<'_>> {
+        let master = self
+            .get(context.policy().master_key_identifier())
+            .ok_or(Error::MissingEncryptionKey)?;
+        Ok(FscryptInodeKey { context, master })
+    }
+
     /// Creates an empty fscrypt key set.
     #[must_use]
     pub const fn empty() -> Self {
@@ -718,6 +728,67 @@ impl FscryptKeySet {
     #[must_use]
     pub fn get(&self, identifier: FscryptKeyIdentifier) -> Option<&FscryptMasterKey> {
         self.keys.iter().find(|key| key.identifier() == identifier)
+    }
+}
+
+/// A selected inode's context paired with its matching mount-key snapshot borrow.
+/// Selection of committed or staged inode storage belongs to the caller; this value
+/// fixes the nonce, policy and master-key relation for every cryptographic use.
+#[derive(Debug)]
+pub(crate) struct FscryptInodeKey<'keys> {
+    /// Validated context from the selected inode image.
+    context: FscryptContextV2,
+    /// Matching key borrowed from the operation's immutable mount snapshot.
+    master: &'keys FscryptMasterKey,
+}
+
+impl FscryptInodeKey<'_> {
+    /// Policy inherited by children or compared at namespace boundaries.
+    pub(crate) const fn policy(&self) -> FscryptPolicyV2 {
+        self.context.policy()
+    }
+
+    /// Derives the contents key for this selected inode's nonce.
+    /// # Errors
+    /// Returns cryptographic-provider or key-derivation failure.
+    pub(crate) fn contents_key(
+        &self,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<FscryptContentsKey> {
+        self.master
+            .derive_contents_key(self.context.nonce(), crypto)
+    }
+
+    /// Encodes a plaintext component using this directory's nonce and padding policy.
+    /// # Errors
+    /// Returns invalid component, allocation, key-derivation or cryptographic-provider failure.
+    pub(crate) fn encrypt_name(
+        &self,
+        name: &crate::Ext4Name,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<crate::Ext4Name> {
+        let key = self
+            .master
+            .derive_filenames_key(self.context.nonce(), crypto)?;
+        crate::Ext4Name::from_disk(&key.encrypt_filename(
+            name.bytes(),
+            self.policy().filename_padding(),
+            crypto,
+        )?)
+    }
+
+    /// Decodes one on-disk component using this directory's nonce.
+    /// # Errors
+    /// Returns invalid plaintext, allocation, key-derivation or cryptographic-provider failure.
+    pub(crate) fn decrypt_name(
+        &self,
+        name: &crate::Ext4Name,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<crate::Ext4Name> {
+        let key = self
+            .master
+            .derive_filenames_key(self.context.nonce(), crypto)?;
+        crate::Ext4Name::new(&key.decrypt_filename(name.bytes(), crypto)?)
     }
 }
 

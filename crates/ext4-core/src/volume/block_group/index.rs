@@ -1890,8 +1890,24 @@ mod tests {
                 mut images,
             } = stream_fixture()?;
             let mut crypto = StreamCrypto::default();
-            let key = FscryptMasterKey::from_raw(&[7; 32], &mut crypto)?
-                .derive_contents_key(FscryptFileNonce::new([9; 16]), &mut crypto)?;
+            let master = FscryptMasterKey::from_raw(&[7; 32], &mut crypto)?;
+            let mut context = [9_u8; 40];
+            memory::copy_exact(
+                context
+                    .get_mut(..8)
+                    .ok_or(Error::InvalidEncryptionContext)?,
+                &[2, 1, 4, 0, 0, 0, 0, 0],
+            )?;
+            memory::copy_exact(
+                context
+                    .get_mut(8..24)
+                    .ok_or(Error::InvalidEncryptionContext)?,
+                &master.identifier().bytes(),
+            )?;
+            let keys = FscryptKeySet::from_keys(vec![master])?;
+            let key = keys
+                .unlock(FscryptContextV2::parse(&context)?)?
+                .contents_key(&mut crypto)?;
             let bytes = &mut images
                 .iter_mut()
                 .find(|(block, _)| *block == 41)

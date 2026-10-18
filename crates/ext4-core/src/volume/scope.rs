@@ -47,9 +47,8 @@ pub(super) use crate::platform::name::{WindowsName, WindowsNameLookup};
 pub(super) use crate::platform::windows::{WindowsOverlay, WindowsSymlinkReparsePoint};
 pub(super) use crate::protection::crypto::CryptographicOperation;
 pub(super) use crate::protection::fscrypt::{
-    FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptFilenamePadding,
-    FscryptFilenamesKey, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
-    FscryptNoKeyName,
+    FscryptContentsKey, FscryptContextV2, FscryptFileNonce, FscryptInodeKey, FscryptKeyIdentifier,
+    FscryptKeyPresence, FscryptKeySet, FscryptMasterKey, FscryptNoKeyName,
 };
 pub(super) use crate::protection::verity::{
     Ext4VerityMetadataLayout, FsverityDescriptor, FsverityEnable, FsverityMerkleTree,

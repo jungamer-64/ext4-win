@@ -5,6 +5,7 @@ use super::scope::*;
 mod allocation;
 mod commit;
 mod file_data;
+mod fscrypt;
 mod namespace;
 mod orphan;
 mod staging;
@@ -948,7 +949,7 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::WrongInodeKind);
         }
         if inode.protection().is_encrypted() {
-            self.mutation.volume.require_encryption_key(inode)?;
+            let _key = self.mutation.fscrypt_key_for_inode(inode)?;
         }
         inode.directory_entry_mutation()
     }
@@ -1001,12 +1002,11 @@ impl MutationResolvePass<'_, '_, '_> {
         if !parent.protection().is_encrypted() {
             return Ok(None);
         }
-        let (parent_context, _master_key) =
-            self.mutation.volume.fscrypt_master_key_for_inode(parent)?;
+        let policy = self.mutation.fscrypt_key_for_inode(parent)?.policy();
         let mut nonce = [0_u8; 16];
         self.crypto.fill_random(&mut nonce)?;
         let nonce = FscryptFileNonce::new(nonce);
-        Ok(Some(FscryptContextV2::new(parent_context.policy(), nonce)))
+        Ok(Some(FscryptContextV2::new(policy, nonce)))
     }
 
     /// Stores an inherited fscrypt context on a newly-initialized live inode.

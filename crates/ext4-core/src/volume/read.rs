@@ -233,6 +233,26 @@ impl EpochReadView<'_, '_> {
         Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
     }
 
+    /// Resolves a context against the operation's key snapshot and records its freshness dependency.
+    /// # Errors
+    /// Returns resource-observation failure or a missing encryption key.
+    pub(super) fn fscrypt_key(&mut self, context: FscryptContextV2) -> Result<FscryptInodeKey<'_>> {
+        self.observe_resource(MutationResource::KEY_SET)?;
+        self.fscrypt_keys.unlock(context)
+    }
+
+    /// Selects the committed inode's context before binding its mount key.
+    /// # Errors
+    /// Returns malformed inode/xattr/context, storage, allocation or missing-key failure.
+    fn fscrypt_key_for_inode(&mut self, inode: &Inode) -> Result<FscryptInodeKey<'_>> {
+        let raw = self.read_live_inode_record(inode.id())?;
+        let xattrs = self.read_inode_xattrs_from_live(&raw)?;
+        let value = xattrs
+            .encryption_context()
+            .ok_or(Error::InvalidEncryptionContext)?;
+        self.fscrypt_key(FscryptContextV2::parse(value.bytes())?)
+    }
+
     /// Converts a plaintext child name to the on-disk name for a directory.
     /// # Errors
     ///
@@ -247,8 +267,8 @@ impl EpochReadView<'_, '_> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ext4Name::new(name.bytes());
         }
-        let (key, padding) = self.fscrypt_filenames_key_for_inode(parent, crypto)?;
-        Ext4Name::from_disk(&key.encrypt_filename(name.bytes(), padding, crypto)?)
+        self.fscrypt_key_for_inode(parent)?
+            .encrypt_name(name, crypto)
     }
 
     /// Converts an on-disk child name to plaintext for a directory.
@@ -265,8 +285,8 @@ impl EpochReadView<'_, '_> {
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
             return Ext4Name::new(name.bytes());
         }
-        let (key, _padding) = self.fscrypt_filenames_key_for_inode(parent, crypto)?;
-        Ext4Name::new(&key.decrypt_filename(name.bytes(), crypto)?)
+        self.fscrypt_key_for_inode(parent)?
+            .decrypt_name(name, crypto)
     }
 
     /// Rejects protected plaintext data access until crypto and verification paths exist.
@@ -279,7 +299,7 @@ impl EpochReadView<'_, '_> {
         inode: &Inode,
     ) -> Result<()> {
         if inode.protection().is_encrypted() {
-            self.require_encryption_key(inode)?;
+            let _key = self.fscrypt_key_for_inode(inode)?;
             return Err(Error::UnsupportedEncryption);
         }
         if inode.protection().is_verity() {
@@ -699,7 +719,10 @@ impl EpochReadView<'_, '_> {
         let mut extent_tree =
             ExtentMappingCursor::new(file.inode().extent_root()?, block_size, extent_context)?;
         let contents_key = if file.protection().is_encrypted() {
-            Some(self.fscrypt_contents_key_for_inode(file.inode(), crypto)?)
+            Some(
+                self.fscrypt_key_for_inode(file.inode())?
+                    .contents_key(crypto)?,
+            )
         } else {
             None
         };
@@ -1239,7 +1262,7 @@ impl EpochReadView<'_, '_> {
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<()> {
         if inode.protection().is_encrypted() {
-            let contents_key = self.fscrypt_contents_key_for_inode(inode, crypto)?;
+            let contents_key = self.fscrypt_key_for_inode(inode)?.contents_key(crypto)?;
             self.read_encrypted_inode_stream_range(&contents_key, extent_tree, offset, out, crypto)
         } else {
             self.read_inode_stream_range(extent_tree, offset, out)

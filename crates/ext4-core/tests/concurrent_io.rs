@@ -326,6 +326,7 @@ fn allocation_preserves_committed_owners_until_the_retirement_commit() -> Result
         &fixture.epoch,
         &fixture.coordinator,
         ticket,
+        &mut PlainCrypto,
         |pass| {
             let a = pass.file(a)?;
             let b = pass.file(b)?;
@@ -480,6 +481,7 @@ fn sparse_extension_zeroes_initialized_storage_after_interrupted_write() -> Resu
         &fixture.epoch,
         &fixture.coordinator,
         ticket,
+        &mut PlainCrypto,
         |pass| {
             let target = pass.file(file)?;
             pass.write_file_range(target, FileOffset::from_bytes(1), b"SECRET")
@@ -546,6 +548,7 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
         &fixture.epoch,
         &fixture.coordinator,
         ticket,
+        &mut PlainCrypto,
         |pass| {
             let target = pass.file(file)?;
             pass.write_file_range(target, FileOffset::ZERO, b"J")?;
@@ -618,6 +621,61 @@ impl CryptographicOperation for PlainCrypto {
     fn sha512(&mut self, bytes: &[u8]) -> Result<[u8; 64]> {
         Ok(sha2::Sha512::digest(bytes).into())
     }
+}
+
+/// Reversible cipher stand-in for inode-context routing, not a cryptographic conformance oracle.
+/// Its key- and data-unit-dependent bytes expose a stale nonce or incorrect key selection.
+#[derive(Debug)]
+struct ContextCrypto {
+    /// Distinct deterministic nonce supplied to each attempted inode construction.
+    nonce: u8,
+}
+
+impl CryptographicOperation for ContextCrypto {
+    fn fill_random(&mut self, bytes: &mut [u8]) -> Result<()> {
+        self.nonce = self.nonce.wrapping_add(1);
+        bytes.fill(self.nonce);
+        Ok(())
+    }
+    fn hkdf_sha512(&mut self, key: &[u8], info: &[u8], out: &mut [u8]) -> Result<()> {
+        PlainCrypto.hkdf_sha512(key, info, out)
+    }
+    fn encrypt_aes_256_xts(&mut self, key: &[u8; 64], unit: u64, bytes: &mut [u8]) -> Result<()> {
+        context_cipher(key, unit, bytes)
+    }
+    fn decrypt_aes_256_xts(&mut self, key: &[u8; 64], unit: u64, bytes: &mut [u8]) -> Result<()> {
+        context_cipher(key, unit, bytes)
+    }
+    fn encrypt_aes_256_cbc_cs3(&mut self, key: &[u8; 32], bytes: &mut [u8]) -> Result<()> {
+        context_cipher(key, 0, bytes)
+    }
+    fn decrypt_aes_256_cbc_cs3(&mut self, key: &[u8; 32], bytes: &mut [u8]) -> Result<()> {
+        context_cipher(key, 0, bytes)
+    }
+    fn sha256(&mut self, bytes: &[u8]) -> Result<[u8; 32]> {
+        PlainCrypto.sha256(bytes)
+    }
+    fn sha512(&mut self, bytes: &[u8]) -> Result<[u8; 64]> {
+        PlainCrypto.sha512(bytes)
+    }
+}
+
+/// Applies the test provider's reversible transform with independent key and unit coordinates.
+/// # Errors
+/// Returns an invalid provider key or arithmetic failure.
+fn context_cipher(key: &[u8], unit: u64, bytes: &mut [u8]) -> Result<()> {
+    let unit = unit.to_le_bytes();
+    for (position, byte) in bytes.iter_mut().enumerate() {
+        let key_position = position
+            .checked_rem(key.len())
+            .ok_or(Error::CryptographicFailure)?;
+        let unit_position = position
+            .checked_rem(unit.len())
+            .ok_or(Error::CryptographicFailure)?;
+        *byte ^= *key.get(key_position).ok_or(Error::CryptographicFailure)?
+            ^ *unit.get(unit_position).ok_or(Error::CryptographicFailure)?;
+    }
+    Ok(())
 }
 
 /// Only these private in-memory copies are mutated; tracked fixture images remain inputs.
@@ -922,6 +980,7 @@ impl Disk {
         epoch: &CommittedEpoch,
         coordinator: &MutationCoordinatorState,
         ticket: u64,
+        crypto: &mut dyn CryptographicOperation,
         mut mutate: F,
     ) -> Result<(ResolvedMutation, R)>
     where
@@ -935,13 +994,9 @@ impl Disk {
         loop {
             let mut ready = operation.accept(event)?;
             let mut output = None;
-            let mut crypto = PlainCrypto;
             let result = {
-                let mut pass = ready.begin_pass(
-                    cache.access(epoch),
-                    Ext4Timestamp::from_seconds(2),
-                    &mut crypto,
-                );
+                let mut pass =
+                    ready.begin_pass(cache.access(epoch), Ext4Timestamp::from_seconds(2), crypto);
                 mutate(&mut pass).and_then(|value| {
                     output = Some(value);
                     pass.resolve(ticket, coordinator)
@@ -961,13 +1016,14 @@ impl Disk {
 }
 
 /// One mount owns current publication, coordinator, and storage independently.
-#[derive(Debug)]
 struct Fixture {
     disk: Disk,
     profile: MountedProfile,
     epoch: CommittedEpoch,
     coordinator: MutationCoordinatorState,
     cache: MetadataCache,
+    /// Operation-owned provider; plaintext tests reject unexpected cipher execution.
+    crypto: Box<dyn CryptographicOperation>,
     a: FileNodeId,
     b: FileNodeId,
 }
@@ -1017,7 +1073,7 @@ impl Fixture {
                 event,
                 self.coordinator
                     .read_context(self.cache.access(&self.epoch))?,
-                &mut PlainCrypto,
+                self.crypto.as_mut(),
                 |pass| read(pass),
             ) {
                 ReadTransition::SubmitLower { request, suspended } => {
@@ -1041,18 +1097,25 @@ impl Fixture {
     fn from_disk(mut disk: Disk) -> Result<Self> {
         let (profile, epoch, mut coordinator) = disk.mount()?.into_parts();
         let ticket = coordinator.admit_mutation()?;
-        let (resolved, (a, b)) = disk.resolve(&profile, &epoch, &coordinator, ticket, |pass| {
-            let root = pass.directory(DirectoryNodeId::ROOT)?;
-            let metadata = NewFileMetadata::new(
-                Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(1000)),
-                Ext4Permissions::new(0o644)?,
-            );
-            let a = pass.create_file(root, &Ext4Name::new(b"concurrent-a")?, metadata)?;
-            let b = pass.create_file(root, &Ext4Name::new(b"concurrent-b")?, metadata)?;
-            pass.write_file_range(a, FileOffset::ZERO, b"a")?;
-            pass.write_file_range(b, FileOffset::ZERO, b"b")?;
-            Ok((a.id(), b.id()))
-        })?;
+        let (resolved, (a, b)) = disk.resolve(
+            &profile,
+            &epoch,
+            &coordinator,
+            ticket,
+            &mut PlainCrypto,
+            |pass| {
+                let root = pass.directory(DirectoryNodeId::ROOT)?;
+                let metadata = NewFileMetadata::new(
+                    Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(1000)),
+                    Ext4Permissions::new(0o644)?,
+                );
+                let a = pass.create_file(root, &Ext4Name::new(b"concurrent-a")?, metadata)?;
+                let b = pass.create_file(root, &Ext4Name::new(b"concurrent-b")?, metadata)?;
+                pass.write_file_range(a, FileOffset::ZERO, b"a")?;
+                pass.write_file_range(b, FileOffset::ZERO, b"b")?;
+                Ok((a.id(), b.id()))
+            },
+        )?;
         let mut cache = MetadataCache::try_new(&epoch)?;
         let ready = resolved
             .reserve(&coordinator, MutationLease::granted(ticket))?
@@ -1069,6 +1132,7 @@ impl Fixture {
             epoch,
             coordinator,
             cache,
+            crypto: Box::try_new(PlainCrypto).map_err(|_| Error::OutOfMemory)?,
             a,
             b,
         })
@@ -1088,6 +1152,7 @@ impl Fixture {
             &self.epoch,
             &self.coordinator,
             ticket,
+            self.crypto.as_mut(),
             mutate,
         )?;
         let ready = resolved
@@ -1118,7 +1183,7 @@ impl Fixture {
                 event,
                 self.coordinator
                     .read_context(self.cache.access(&self.epoch))?,
-                &mut PlainCrypto,
+                self.crypto.as_mut(),
                 |pass| pass.read_file(file, FileOffset::ZERO, output),
             ) {
                 ReadTransition::SubmitLower { request, suspended } if request.byte_count() == 1 => {
@@ -1157,6 +1222,7 @@ fn shared_metadata_images_revalidate_before_overwriting_neighbors() -> Result<()
         &fixture.epoch,
         &fixture.coordinator,
         ticket_a,
+        &mut PlainCrypto,
         |pass| {
             let file = pass.file(a)?;
             pass.write_file_range(file, FileOffset::from_bytes(1), b"AAA")
@@ -1167,6 +1233,7 @@ fn shared_metadata_images_revalidate_before_overwriting_neighbors() -> Result<()
         &fixture.epoch,
         &fixture.coordinator,
         ticket_b,
+        &mut PlainCrypto,
         |pass| {
             let file = pass.file(b)?;
             pass.write_file_range(file, FileOffset::from_bytes(1), b"BBB")
@@ -1443,6 +1510,7 @@ fn current_versions_reject_an_earlier_epoch_at_admission() -> Result<()> {
         &fixture.epoch,
         &fixture.coordinator,
         ticket,
+        &mut PlainCrypto,
         |pass| {
             let file = pass.file(a)?;
             pass.write_file_range(file, FileOffset::ZERO, b"A")
@@ -1473,6 +1541,7 @@ fn current_versions_reject_an_earlier_epoch_at_admission() -> Result<()> {
             &fixture.epoch,
             &fixture.coordinator,
             ticket,
+            &mut PlainCrypto,
             |pass| {
                 let file = pass.file(a)?;
                 pass.write_file_range(file, FileOffset::ZERO, b"a")
@@ -1502,6 +1571,7 @@ fn retained_directory_resolution_rejects_a_replacement_epoch() -> Result<()> {
         &fixture.epoch,
         &fixture.coordinator,
         ticket,
+        &mut PlainCrypto,
         |pass| pass.next_directory_entry(&mut reader),
     )?;
     fixture.mutate(|pass| {
@@ -1520,6 +1590,7 @@ fn retained_directory_resolution_rejects_a_replacement_epoch() -> Result<()> {
             &fixture.epoch,
             &fixture.coordinator,
             ticket,
+            &mut PlainCrypto,
             |pass| pass.next_directory_entry(&mut reader),
         ),
         Err(Error::ReadConflict)
@@ -1550,6 +1621,151 @@ fn namespace_context(identifier: u8) -> [u8; 40] {
         *destination = source;
     }
     bytes
+}
+
+/// Selects the routing provider and installs a matching key for an independently encoded parent.
+/// # Errors
+/// Returns fixture, mount, context encoding, or key publication failure.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the checked identifier field has the exact 16-byte source width"
+)]
+fn encrypted_namespace_fixture() -> Result<(Fixture, DirectoryNodeId)> {
+    let mut fixture = Fixture::new()?;
+    let parent = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.create_directory(
+            root,
+            &Ext4Name::new(b"encrypted")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )
+        .map(|directory| directory.id())
+    })?;
+    let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
+    let mut context = namespace_context(0x31);
+    context
+        .get_mut(8..24)
+        .ok_or(Error::InvalidEncryptionContext)?
+        .copy_from_slice(&key.identifier().bytes());
+    fixture
+        .disk
+        .encode_inode(NodeId::Directory(parent), 0x80800, Some(&context))?;
+    fixture.disk.enable_verity_feature()?;
+    fixture.remount()?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let change = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, key)?;
+    fixture.publish_keys(change)?;
+    fixture.crypto = Box::try_new(ContextCrypto { nonce: 0x50 }).map_err(|_| Error::OutOfMemory)?;
+    Ok((fixture, parent))
+}
+
+/// # Errors
+/// Returns fixture, namespace, allocation, encryption, commit, or read failure.
+/// # Panics
+/// Fails if staged contexts cannot support child creation, external-xattr movement, or data reads.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare committed names and plaintext after staged-context mutations"
+)]
+fn encrypted_creation_uses_staged_contexts_for_names_links_and_contents() -> Result<()> {
+    let (mut fixture, parent) = encrypted_namespace_fixture()?;
+    let (directory, file) = fixture.mutate(|pass| {
+        let parent = pass.directory(parent)?;
+        let directory = pass.create_directory(
+            parent,
+            &Ext4Name::new(b"sub")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )?;
+        let file = pass.create_file(
+            directory,
+            &Ext4Name::new(b"payload")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        pass.reserve_file_allocation(file, FileAllocationSize::from_bytes(8192))?;
+        let node = pass.node(NodeId::File(file.id()))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"large")?,
+            XattrValue::new(&[b'X'; 512])?,
+        )?;
+        pass.write_file_range(file, FileOffset::from_bytes(5), b"secret")?;
+        let source = pass.hard_link_source(HardLinkNodeId::File(file.id()))?;
+        pass.create_hard_link(
+            source,
+            directory,
+            &Ext4Name::new(b"link")?,
+            NamespaceDestination::Vacant,
+        )?;
+        pass.rename_child(
+            directory,
+            &Ext4Name::new(b"payload")?,
+            directory,
+            &Ext4Name::new(b"renamed")?,
+            NamespaceDestination::Vacant,
+        )?;
+        Ok((directory.id(), file.id()))
+    })?;
+    // Remount discards keys. The new snapshot must reacquire the same master key explicitly.
+    fixture.remount()?;
+    let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    fixture.publish_keys(ResolvedKeyChange::add(
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        key,
+    )?)?;
+    for name in [b"renamed".as_slice(), b"link".as_slice()] {
+        let name = WindowsName::from_ext4(&Ext4Name::new(name)?)?;
+        let found = fixture
+            .read(|pass| pass.lookup_windows_child(directory, WindowsNameLookup::Exact(&name)))?;
+        assert!(matches!(found, ChildLookup::Found(child) if *child.node() == NodeId::File(file)));
+    }
+    let mut bytes = [0xff; 11];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?,
+        ReadBytes::from_usize(11)
+    );
+    assert_eq!(&bytes, b"\0\0\0\0\0secret");
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, context selection, verity preparation, commit or verified-read failure.
+/// # Panics
+/// Fails if new encrypted inode contexts cannot cover staged data and post-EOF verity metadata.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare verified plaintext after same-transaction creation and verity enablement"
+)]
+fn new_encrypted_inode_can_enable_verity_in_its_creation_transaction() -> Result<()> {
+    let (mut fixture, parent) = encrypted_namespace_fixture()?;
+    let enable = FsverityEnable::new(
+        FsverityHashAlgorithm::Sha256,
+        FsverityBlockSize::new(1024)?,
+        FsveritySalt::empty(),
+        FsveritySignature::empty(),
+    );
+    let file = fixture.mutate(|pass| {
+        let parent = pass.directory(parent)?;
+        let file = pass.create_file(
+            parent,
+            &Ext4Name::new(b"verified")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        pass.write_file_range(file, FileOffset::from_bytes(8192), b"verified")?;
+        pass.enable_verity(file, &enable)?;
+        Ok(file.id())
+    })?;
+    let mut bytes = [0; 8];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(file, FileOffset::from_bytes(8192), &mut bytes))?,
+        ReadBytes::from_usize(8)
+    );
+    assert_eq!(&bytes, b"verified");
+    Ok(())
 }
 
 /// # Errors
@@ -1782,6 +1998,7 @@ fn key_removal_revokes_encrypted_reads_and_resolved_mutations() -> Result<()> {
         &fixture.epoch,
         &fixture.coordinator,
         pending_ticket,
+        &mut PlainCrypto,
         |pass| {
             let file = pass.file(a)?;
             pass.truncate_file(file, FileSize::from_bytes(0))
@@ -1793,6 +2010,7 @@ fn key_removal_revokes_encrypted_reads_and_resolved_mutations() -> Result<()> {
         &fixture.epoch,
         &fixture.coordinator,
         reserved_ticket,
+        &mut PlainCrypto,
         |pass| {
             let file = pass.file(a)?;
             pass.truncate_file(file, FileSize::from_bytes(0))
@@ -2086,6 +2304,7 @@ fn directory_moves_revalidate_destination_ancestry() -> Result<()> {
         &fixture.epoch,
         &fixture.coordinator,
         ticket,
+        &mut PlainCrypto,
         |pass| {
             let root = pass.directory(DirectoryNodeId::ROOT)?;
             let destination = pass.directory(c)?;

@@ -280,16 +280,8 @@ impl MutationResolvePass<'_, '_, '_> {
         ) {
             (_, false) => Ok(()),
             (true, true) => {
-                let source_context = self
-                    .mutation
-                    .volume
-                    .read_inode_fscrypt_context(source.id())?
-                    .ok_or(Error::InvalidEncryptionContext)?;
-                let target_context = self
-                    .mutation
-                    .volume
-                    .read_inode_fscrypt_context(target_parent.id())?
-                    .ok_or(Error::InvalidEncryptionContext)?;
+                let source_context = self.mutation.fscrypt_context_for_inode(source)?;
+                let target_context = self.mutation.fscrypt_context_for_inode(target_parent)?;
                 if source_context.policy() == target_context.policy() {
                     Ok(())
                 } else {
@@ -773,7 +765,6 @@ impl MutationResolvePass<'_, '_, '_> {
     fn directory_lookup_name(&mut self, directory: &Inode, name: &Ext4Name) -> Result<Ext4Name> {
         match self
             .mutation
-            .volume
             .encrypt_directory_child_name(directory, name, self.crypto)
         {
             Err(Error::MissingEncryptionKey) => {
@@ -813,7 +804,6 @@ impl MutationResolvePass<'_, '_, '_> {
         self.require_directory_entry_create_mutation_for_inode(&parent_inode)?;
         let disk_name =
             self.mutation
-                .volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         if self
             .directory_entry_location(&parent_inode, DirectoryLookup::Exact(&disk_name))?
@@ -956,16 +946,12 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_rename_mutation_for_inode(&parent_inode)?;
-        let old_disk_name = self.mutation.volume.encrypt_directory_child_name(
-            &parent_inode,
-            old_name,
-            self.crypto,
-        )?;
-        let new_disk_name = self.mutation.volume.encrypt_directory_child_name(
-            &parent_inode,
-            new_name,
-            self.crypto,
-        )?;
+        let old_disk_name =
+            self.mutation
+                .encrypt_directory_child_name(&parent_inode, old_name, self.crypto)?;
+        let new_disk_name =
+            self.mutation
+                .encrypt_directory_child_name(&parent_inode, new_name, self.crypto)?;
         if self
             .directory_entry_location(&parent_inode, DirectoryLookup::Exact(&new_disk_name))?
             .is_some()
@@ -1077,7 +1063,6 @@ impl MutationResolvePass<'_, '_, '_> {
         self.require_directory_entry_replace_mutation_for_inode(&parent_inode)?;
         let disk_name =
             self.mutation
-                .volume
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         let Some(mut location) =
             self.directory_entry_location(&parent_inode, DirectoryLookup::Exact(&disk_name))?

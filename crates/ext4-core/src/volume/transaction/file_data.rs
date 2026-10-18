@@ -117,8 +117,8 @@ impl MutationResolvePass<'_, '_, '_> {
         let key = if inode.protection().is_encrypted() {
             Some(
                 self.mutation
-                    .volume
-                    .fscrypt_contents_key_for_inode(inode, self.crypto)?,
+                    .fscrypt_key_for_inode(inode)?
+                    .contents_key(self.crypto)?,
             )
         } else {
             None
@@ -382,8 +382,8 @@ impl MutationResolvePass<'_, '_, '_> {
         let encrypted_contents_key = if inode.protection().is_encrypted() {
             Some(
                 self.mutation
-                    .volume
-                    .fscrypt_contents_key_for_inode(inode, self.crypto)?,
+                    .fscrypt_key_for_inode(inode)?
+                    .contents_key(self.crypto)?,
             )
         } else {
             None
@@ -776,8 +776,8 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         let contents_key = self
             .mutation
-            .volume
-            .fscrypt_contents_key_for_inode(inode, self.crypto)?;
+            .fscrypt_key_for_inode(inode)?
+            .contents_key(self.crypto)?;
         let block_size_u64 = u64::from(self.mutation.volume.superblock.block_size().bytes());
         let mut completed = 0_usize;
         while completed < bytes.len() {
@@ -947,7 +947,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 return Err(Error::WrongInodeKind);
             }
             if inode.protection().is_encrypted() {
-                pass.mutation.volume.require_encryption_key(&inode)?;
+                let _key = pass.mutation.fscrypt_key_for_inode(&inode)?;
             }
             if inode.protection().is_verity() {
                 return Err(Error::UnsupportedInodeMutation);
@@ -1025,8 +1025,8 @@ impl MutationResolvePass<'_, '_, '_> {
         let key = if inode.protection().is_encrypted() {
             Some(
                 self.mutation
-                    .volume
-                    .fscrypt_contents_key_for_inode(inode, self.crypto)?,
+                    .fscrypt_key_for_inode(inode)?
+                    .contents_key(self.crypto)?,
             )
         } else {
             None
@@ -1073,7 +1073,7 @@ impl MutationResolvePass<'_, '_, '_> {
         inode: &Inode,
     ) -> Result<FilePayloadMutationCapability> {
         if inode.protection().is_encrypted() {
-            self.mutation.volume.require_encryption_key(inode)?;
+            let _key = self.mutation.fscrypt_key_for_inode(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
@@ -1091,7 +1091,7 @@ impl MutationResolvePass<'_, '_, '_> {
         inode: &Inode,
     ) -> Result<FileSizeMutationCapability> {
         if inode.protection().is_encrypted() {
-            self.mutation.volume.require_encryption_key(inode)?;
+            let _key = self.mutation.fscrypt_key_for_inode(inode)?;
             if inode.kind() != InodeKind::File || inode.protection().is_verity() {
                 return Err(Error::UnsupportedEncryption);
             }
@@ -1177,8 +1177,8 @@ impl MutationResolvePass<'_, '_, '_> {
         };
         let contents_key = self
             .mutation
-            .volume
-            .fscrypt_contents_key_for_inode(inode, self.crypto)?;
+            .fscrypt_key_for_inode(inode)?
+            .contents_key(self.crypto)?;
         let zero_len = usize::try_from(
             block_size
                 .checked_sub(in_block)
