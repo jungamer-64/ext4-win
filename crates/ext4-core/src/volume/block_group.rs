@@ -65,11 +65,7 @@ pub(super) fn materialize_uninitialized_block_bitmap(
 ) -> Result<Vec<u8>> {
     let mut bytes = empty_allocation_bitmap(superblock)?;
     let clusters_in_group = superblock.clusters_in_group(group)?;
-    reserve_bitmap_padding(
-        &mut bytes,
-        clusters_in_group,
-        superblock.clusters_per_group().as_u32(),
-    )?;
+    reserve_bitmap_padding(&mut bytes, clusters_in_group)?;
 
     if group_has_superblock(superblock, group) {
         let superblock_block = group_start_block(superblock, group)?;
@@ -111,11 +107,7 @@ pub(super) fn materialize_uninitialized_inode_bitmap(
 ) -> Result<Vec<u8>> {
     let mut bytes = empty_allocation_bitmap(superblock)?;
     let inodes_in_group = inode_count_in_group(superblock, group)?;
-    reserve_bitmap_padding(
-        &mut bytes,
-        inodes_in_group,
-        superblock.inodes_per_group().as_u32(),
-    )?;
+    reserve_bitmap_padding(&mut bytes, inodes_in_group)?;
     if group.as_u32() == 0 {
         let reserved = superblock
             .first_inode()
@@ -168,16 +160,29 @@ fn mark_metadata_range(
     Ok(())
 }
 
-/// Marks bitmap bits outside the populated tail of a partial group as unavailable.
+/// Marks every stored bit beyond the group's populated domain as unavailable.
 /// # Errors
 ///
 /// Returns an error when the bitmap domain exceeds its allocated byte image.
-fn reserve_bitmap_padding(bytes: &mut [u8], populated: u32, capacity: u32) -> Result<()> {
-    if populated > capacity {
-        return Err(Error::InvalidSuperblock);
-    }
-    for bit in populated..capacity {
-        set_bitmap_bit(bytes, bit, BitmapBitState::Used)?;
+fn reserve_bitmap_padding(bytes: &mut [u8], populated: u32) -> Result<()> {
+    let complete_bytes = usize::try_from(
+        populated
+            .checked_div(u8::BITS)
+            .ok_or(Error::ArithmeticOverflow)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    let partial_bits = populated
+        .checked_rem(u8::BITS)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let (_, padding) = bytes
+        .split_at_mut_checked(complete_bytes)
+        .ok_or(Error::InvalidSuperblock)?;
+    if partial_bits == 0 {
+        padding.fill(u8::MAX);
+    } else {
+        let (partial, padding) = padding.split_first_mut().ok_or(Error::InvalidSuperblock)?;
+        *partial |= u8::MAX << partial_bits;
+        padding.fill(u8::MAX);
     }
     Ok(())
 }
@@ -228,10 +233,33 @@ fn parse_resize_pointer_block(bytes: &[u8]) -> Result<Vec<BlockAddress>> {
 mod tests {
     use alloc::vec;
 
-    use super::parse_resize_pointer_block;
+    use super::{parse_resize_pointer_block, reserve_bitmap_padding};
     use crate::disk::block::BlockAddress;
     use crate::disk::endian::{DiskOffset, put_le_u32};
     use crate::error::Error;
+
+    /// # Panics
+    /// Fails if bitmap padding changes populated bits or leaves storage-tail bits available.
+    #[test]
+    fn allocation_bitmap_padding_preserves_populated_bits() {
+        for (populated, expected) in [
+            (0, [0xff, 0xff]),
+            (3, [0xfd, 0xff]),
+            (8, [0xa5, 0xff]),
+            (16, [0xa5, 0x5a]),
+        ] {
+            let mut bytes = [0xa5, 0x5a];
+            assert_eq!(reserve_bitmap_padding(&mut bytes, populated), Ok(()));
+            assert_eq!(bytes, expected);
+        }
+        let mut bytes = [0xa5, 0x5a];
+        assert_eq!(
+            reserve_bitmap_padding(&mut bytes, 17),
+            Err(Error::InvalidSuperblock)
+        );
+        assert_eq!(bytes, [0xa5, 0x5a]);
+        assert_eq!(reserve_bitmap_padding(&mut [], 0), Ok(()));
+    }
 
     /// # Panics
     ///

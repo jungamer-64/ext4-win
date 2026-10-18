@@ -11,6 +11,7 @@ pub(super) fn verify_inode_contracts(
 ) -> TaskResult<()> {
     let root = temporary_root.join("inode-contracts");
     fs::create_dir(&root)?;
+    verify_bitmap_publication(linux, &root)?;
     verify_64k_directories(linux, &root)?;
     let image = root.join("filesystem.img");
     format_htree_image(linux, &image, 32 * 1024 * 1024, 4096, true, false, 4)?;
@@ -32,6 +33,94 @@ pub(super) fn verify_inode_contracts(
     verify_inode_retirement(linux, &root, &image)?;
     verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
+    Ok(())
+}
+
+/// Publishes derived inode and block bitmaps whose semantic domains occupy only part of a block.
+/// # Errors
+/// Returns fixture, initialization-transition, production allocation or independent fsck failures.
+fn verify_bitmap_publication(linux: LinuxEnvironment, root: &Path) -> TaskResult<()> {
+    for metadata_checksum in [false, true] {
+        let image = root.join(format!("bitmap-publication-csum{metadata_checksum}.img"));
+        File::create(&image)?.set_len(32 * 1024 * 1024)?;
+        let checksum = if metadata_checksum {
+            "metadata_csum,^uninit_bg"
+        } else {
+            "^metadata_csum,uninit_bg"
+        };
+        let features = format!("{checksum},^metadata_csum_seed,^orphan_file,^sparse_super2");
+        let mut format = linux.command("mke2fs");
+        format.args([
+            "-q",
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "4096",
+            "-g",
+            "1024",
+            "-N",
+            "256",
+            "-O",
+            &features,
+            "-E",
+            "lazy_itable_init=0,lazy_journal_init=0",
+            "-J",
+            "size=4",
+            &linux.tool_path(&image)?,
+        ]);
+        run_checked(format, "bitmap publication image format")?;
+        verify_internal_e2fsck_clean(linux, &image, "derived bitmap baseline")?;
+        require_bitmap_initialization_flags(&image, true)?;
+        drive_internal_core_mutation(&image, |pass| {
+            let parent = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            let file = pass.create_file(
+                parent,
+                &ext4_core::Ext4Name::new(b"preallocated")?,
+                mutation_file_metadata()?,
+            )?;
+            pass.reserve_file_allocation(
+                file,
+                ext4_core::FileAllocationSize::from_bytes(8 * 1024 * 1024),
+            )?;
+            for index in 0..24 {
+                let name = format!("bitmap-{index}");
+                pass.create_file(
+                    parent,
+                    &ext4_core::Ext4Name::new(name.as_bytes())?,
+                    mutation_file_metadata()?,
+                )?;
+            }
+            Ok(())
+        })?;
+        require_bitmap_initialization_flags(&image, false)?;
+        verify_internal_e2fsck_clean(linux, &image, "derived bitmap publication")?;
+    }
+    Ok(())
+}
+
+/// Checks that group one's inode bitmap and group two's block bitmap cross the tested boundary.
+/// Descriptor offsets follow the fixture's independent 4 KiB/64-byte disk layout.
+/// # Errors
+/// Returns image-read failure or an initialization state that does not exercise the contract.
+fn require_bitmap_initialization_flags(image: &Path, uninitialized: bool) -> TaskResult<()> {
+    let descriptors = read_image_block(&mut File::open(image)?, 1, 4096)?;
+    for (offset, flag) in [(82_usize, 1_u16), (146, 2)] {
+        let end = offset
+            .checked_add(2)
+            .ok_or_else(|| io::Error::other("descriptor offset overflow"))?;
+        let flags = u16::from_le_bytes(
+            descriptors
+                .get(offset..end)
+                .ok_or_else(|| io::Error::other("missing bitmap descriptor flags"))?
+                .try_into()?,
+        );
+        if (flags & flag != 0) != uninitialized {
+            return Err(
+                io::Error::other("bitmap initialization boundary was not exercised").into(),
+            );
+        }
+    }
     Ok(())
 }
 
