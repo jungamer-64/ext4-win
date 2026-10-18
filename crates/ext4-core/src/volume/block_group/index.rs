@@ -50,6 +50,13 @@ enum IndexPhase {
         /// One bounded read-ahead window from the immutable recovered inode tables.
         table: Option<InodeTableWindow>,
     },
+    /// Physical ownership is complete; each external xattr must authenticate its owner count.
+    Xattrs {
+        /// Cluster projection and exact singleton xattr ownership from the same physical scan.
+        inventory: AllocationInventory,
+        /// First external xattr whose header has not been authenticated.
+        next: usize,
+    },
     /// The validated index has been consumed; this builder cannot be resumed.
     Finished,
 }
@@ -117,6 +124,24 @@ struct AllocationRange {
     end: BlockAddress,
     /// Determines whether an overlap is a legitimate shared xattr.
     ownership: BlockOwnership,
+}
+
+/// Mount-private physical ownership, retained until external xattr counts agree with its scan.
+#[derive(Debug, Eq, PartialEq)]
+struct AllocationInventory {
+    /// Cluster counts published only after every xattr header has been checked.
+    clusters: ClusterReferenceIndex,
+    /// Sorted singleton block owners; discarded before mount publication.
+    xattrs: Vec<XattrOwnerCount>,
+}
+
+/// Number of allocated inodes pointing at one external xattr block, independent of BIGALLOC.
+#[derive(Debug, Eq, PartialEq)]
+struct XattrOwnerCount {
+    /// Physical singleton block shared by these inode records.
+    block: BlockAddress,
+    /// Checked positive count accumulated from the inode scan.
+    owners: u32,
 }
 
 impl AllocationRange {
@@ -282,13 +307,13 @@ impl AllocationIndexBuild {
             } => {
                 if matches!(scan, InodeAllocationScan::Next) {
                     let Some(snapshot) = allocation.groups.get(*group) else {
-                        let index = finish_ranges(
+                        let inventory = finish_ranges(
                             core::mem::take(&mut self.ranges),
                             superblock,
                             allocation,
                         )?;
-                        self.phase = IndexPhase::Finished;
-                        return Ok(Some(index));
+                        self.phase = IndexPhase::Xattrs { inventory, next: 0 };
+                        return Ok(None);
                     };
                     let count = inode_count_in_group(superblock, snapshot.group)?;
                     while *bit < count {
@@ -309,6 +334,31 @@ impl AllocationIndexBuild {
                     *bit = 0;
                 } else {
                     advance_inode_scan(scan, reader, superblock, &mut self.ranges)?;
+                }
+            }
+            IndexPhase::Xattrs { inventory, next } => {
+                if let Some(xattr) = inventory.xattrs.get(*next) {
+                    let mut bytes = memory::repeated_vec(
+                        0_u8,
+                        usize::try_from(superblock.block_size().bytes())
+                            .map_err(|_| Error::ArithmeticOverflow)?,
+                    )?;
+                    reader.read_metadata_exact_at(
+                        superblock.block_size().offset_of(xattr.block)?,
+                        &mut bytes,
+                    )?;
+                    xattr_storage::validate_external_xattr_ownership(
+                        &bytes,
+                        xattr.block,
+                        superblock,
+                        xattr.owners,
+                    )?;
+                    *next = next.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                } else {
+                    let index =
+                        core::mem::replace(&mut inventory.clusters, ClusterReferenceIndex::new());
+                    self.phase = IndexPhase::Finished;
+                    return Ok(Some(index));
                 }
             }
             IndexPhase::Finished => return Err(Error::DeviceIo),
@@ -437,18 +487,19 @@ fn append_static_ranges(
     Ok(())
 }
 
-/// Checks physical ownership once, then emits monotonically ordered cluster counts.
-/// Mount-only conflict evidence is discarded instead of being cloned with every epoch.
+/// Checks physical ownership once and derives cluster and external-xattr owner counts.
+/// Exact xattr counts remain private until their disk headers have been authenticated.
 /// # Errors
 /// Returns overlapping/free/out-of-range allocation, count overflow, or allocation errors.
 fn finish_ranges(
     mut ranges: Vec<AllocationRange>,
     superblock: &Superblock,
     allocation: &MountedAllocationSnapshot,
-) -> Result<ClusterReferenceIndex> {
+) -> Result<AllocationInventory> {
     memory::heap_sort_by(&mut ranges, |left, right| left.start.cmp(&right.start))?;
     let mut previous = None;
     let mut index = ClusterReferenceIndex::new();
+    let mut xattrs: Vec<XattrOwnerCount> = Vec::new();
     for range in ranges {
         if previous.is_some_and(|previous| !range.can_follow(previous)) {
             return Err(Error::ClusterReferenceConflict);
@@ -469,8 +520,26 @@ fn finish_ranges(
         );
         allocation.require_allocated_clusters(superblock, first_cluster, end_cluster)?;
         append_range_counts(&mut index, superblock, range, first_cluster, last_cluster)?;
+        if range.ownership == BlockOwnership::SharedXattr {
+            if let Some(xattr) = xattrs.last_mut()
+                && xattr.block == range.start
+            {
+                xattr.owners = xattr
+                    .owners
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+            } else {
+                xattrs.try_push(XattrOwnerCount {
+                    block: range.start,
+                    owners: 1,
+                })?;
+            }
+        }
     }
-    Ok(index)
+    Ok(AllocationInventory {
+        clusters: index,
+        xattrs,
+    })
 }
 
 /// A physical range contributes at most two partial clusters and one uniform interior.
@@ -1358,7 +1427,15 @@ mod tests {
                 ownership,
             )?)?;
         }
-        let index = finish_ranges(ranges, &superblock, &allocation)?;
+        let inventory = finish_ranges(ranges, &superblock, &allocation)?;
+        let index = inventory.clusters;
+        assert_eq!(
+            inventory.xattrs,
+            vec![XattrOwnerCount {
+                block: BlockAddress::new(9),
+                owners: 2
+            }]
+        );
         assert_eq!(index.count(ClusterAddress::new(0)), 3);
         assert_eq!(index.count(ClusterAddress::new(1)), 3);
         assert_eq!(index.count(ClusterAddress::new(2)), 2);

@@ -494,6 +494,23 @@ pub(crate) fn ensure_external_xattrs_fit(set: &InodeXattrSet, block_size: usize)
     )
 }
 
+/// Authenticates the block's recorded sharing against its recovered inode owners.
+/// # Errors
+///
+/// Returns an error for an invalid header, checksum mismatch, or inconsistent owner count.
+pub(crate) fn validate_external_xattr_ownership(
+    bytes: &[u8],
+    block: BlockAddress,
+    superblock: &Superblock,
+    owners: u32,
+) -> Result<()> {
+    validate_external_xattr_block(bytes, block, superblock)?;
+    if external_xattr_refcount(bytes)? != owners {
+        return Err(Error::InvalidXattr);
+    }
+    Ok(())
+}
+
 /// Reads the external xattr block reference count.
 /// # Errors
 ///
