@@ -327,12 +327,20 @@ impl ActiveIrp<'_> {
     /// Returns the buffered I/O system-buffer address.
     /// # Errors
     ///
-    /// Returns an error when the active IRP has no system buffer.
+    /// Returns an error when the union holds a master IRP or there is no system buffer.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn associated_system_buffer(&self) -> Result<NonNull<u8>, DriverError> {
+        let flags = unsafe {
+            // SAFETY: The active owner retains these dispatch-stable flags. Associated requests
+            // use MasterIrp, so their union must never be interpreted as a data-buffer pointer.
+            (*self.irp.as_ptr()).Flags
+        };
+        if flags & wdk_sys::IRP_ASSOCIATED_IRP != 0 {
+            return Err(DriverError::InvalidParameter);
+        }
         let associated = unsafe {
             // SAFETY: The active owner retains this dispatch-stable associated-IRP storage. The
             // narrow borrow excludes the independently mutable cancellation and driver slots.
@@ -351,24 +359,30 @@ impl ActiveIrp<'_> {
     /// Returns a system-mapped read/write data-buffer address.
     /// # Errors
     ///
-    /// Returns an error when neither a system buffer nor a valid mapped MDL covers `length`.
+    /// An MDL supplies the direct-I/O extent, including for associated requests. Without one,
+    /// only IRP_BUFFERED_IO establishes the SystemBuffer arm for data transfer.
+    /// Returns an error when the selected buffer is absent or the MDL is shorter than `length`.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
     fn data_buffer_address(&self, length: IrpBufferLength) -> Result<NonNull<u8>, DriverError> {
-        if let Ok(system_buffer) = self.associated_system_buffer() {
-            return Ok(system_buffer);
-        }
-
         let mdl = unsafe {
             // SAFETY: The completion owner remains borrowed for this view's entire lifetime.
             (*self.irp.as_ptr()).MdlAddress
         };
-        let Some(mdl) = NonNull::new(mdl) else {
-            return Err(DriverError::InvalidParameter);
+        if let Some(mdl) = NonNull::new(mdl) {
+            return mdl_data_buffer_address(mdl, length);
+        }
+        let flags = unsafe {
+            // SAFETY: The active owner retains these immutable transfer flags. A non-null
+            // AssociatedIrp union value alone does not establish a buffered-I/O allocation.
+            (*self.irp.as_ptr()).Flags
         };
-        mdl_data_buffer_address(mdl, length)
+        if flags & wdk_sys::IRP_BUFFERED_IO == 0 {
+            return Err(DriverError::InvalidParameter);
+        }
+        self.associated_system_buffer()
     }
 
     /// Captures an opaque requestor buffer without creating a Rust reference to its bytes.

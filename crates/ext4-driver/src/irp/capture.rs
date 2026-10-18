@@ -2115,7 +2115,10 @@ mod tests {
                 let mut file = wdk_sys::FILE_OBJECT::default();
                 let mut bytes = [0_u8; 8];
                 let address = core::ptr::NonNull::new(core::ptr::addr_of_mut!(bytes).cast::<u8>());
-                let mut irp = wdk_sys::IRP::default();
+                let mut irp = wdk_sys::IRP {
+                    Flags: wdk_sys::IRP_BUFFERED_IO,
+                    ..wdk_sys::IRP::default()
+                };
                 irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(bytes).cast::<u8>().cast();
                 let mut stack = wdk_sys::IO_STACK_LOCATION {
                     FileObject: core::ptr::addr_of_mut!(file),
@@ -2233,7 +2236,7 @@ mod tests {
         let mut file_object = wdk_sys::FILE_OBJECT::default();
         let mut output = [0xAA_u8; 32];
         let mut irp = wdk_sys::IRP {
-            Flags: wdk_sys::IRP_NOCACHE,
+            Flags: wdk_sys::IRP_NOCACHE | wdk_sys::IRP_BUFFERED_IO,
             ..wdk_sys::IRP::default()
         };
         irp.AssociatedIrp.SystemBuffer = core::ptr::addr_of_mut!(output)
@@ -2313,7 +2316,7 @@ mod tests {
         let mut input = [0xAA_u8; 32];
         let input_address = core::ptr::addr_of_mut!(input).cast::<u8>();
         let mut irp = wdk_sys::IRP {
-            Flags: wdk_sys::IRP_NOCACHE,
+            Flags: wdk_sys::IRP_NOCACHE | wdk_sys::IRP_BUFFERED_IO,
             ..wdk_sys::IRP::default()
         };
         irp.AssociatedIrp.SystemBuffer = input_address.cast::<c_void>();

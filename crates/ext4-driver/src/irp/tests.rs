@@ -163,6 +163,99 @@ fn current_stack_fixture(
     })
 }
 
+/// # Errors
+/// Returns fixture decoding or length conversion failure.
+/// # Panics
+/// Fails if an associated request uses its master as data or bypasses its MDL's extent.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify direct-I/O selection while fixture construction remains fallible"
+)]
+fn associated_data_requests_use_their_bounded_mdl() -> Result<(), DriverError> {
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut master = wdk_sys::IRP::default();
+    let mut bytes = [0_u8; 16];
+    let expected = NonNull::from(&mut bytes).cast::<u8>();
+    let mut mdl = wdk_sys::MDL {
+        MdlFlags: i16::try_from(wdk_sys::MDL_MAPPED_TO_SYSTEM_VA)
+            .map_err(|_| DriverError::InvalidParameter)?,
+        ByteCount: 16,
+        MappedSystemVa: expected.as_ptr().cast(),
+        ..wdk_sys::MDL::default()
+    };
+    let mut irp = wdk_sys::IRP {
+        Flags: wdk_sys::IRP_ASSOCIATED_IRP,
+        MdlAddress: core::ptr::addr_of_mut!(mdl),
+        ..wdk_sys::IRP::default()
+    };
+    irp.AssociatedIrp.MasterIrp = core::ptr::addr_of_mut!(master);
+    let mut received = received_irp_fixture(&mut device, &mut irp)?;
+    received.with_active(|active| -> Result<(), DriverError> {
+        let length = IrpBufferLength::from_ulong(16)?;
+        assert_eq!(active.data_input_address(length)?, expected);
+        assert_eq!(active.data_output_address(length)?, expected);
+        let excess = IrpBufferLength::from_ulong(17)?;
+        assert_eq!(
+            active.data_input_address(excess),
+            Err(DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            active.data_output_address(excess),
+            Err(DriverError::InvalidParameter)
+        );
+        Ok(())
+    })
+}
+
+/// # Errors
+/// Returns fixture decoding or length conversion failure.
+/// # Panics
+/// Fails if a non-buffered union value or associated master becomes a data buffer.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify the native union discriminator without making fixture setup infallible"
+)]
+fn data_without_mdl_requires_the_buffered_union_arm() -> Result<(), DriverError> {
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut master = wdk_sys::IRP::default();
+    let mut bytes = [0_u8; 16];
+    let expected = NonNull::from(&mut bytes).cast::<u8>();
+    for (flags, accepted) in [
+        (wdk_sys::IRP_BUFFERED_IO, true),
+        (0, false),
+        (wdk_sys::IRP_ASSOCIATED_IRP, false),
+        (
+            wdk_sys::IRP_BUFFERED_IO | wdk_sys::IRP_ASSOCIATED_IRP,
+            false,
+        ),
+    ] {
+        let mut irp = wdk_sys::IRP {
+            Flags: flags,
+            ..wdk_sys::IRP::default()
+        };
+        if flags & wdk_sys::IRP_ASSOCIATED_IRP == 0 {
+            irp.AssociatedIrp.SystemBuffer = expected.as_ptr().cast();
+        } else {
+            irp.AssociatedIrp.MasterIrp = core::ptr::addr_of_mut!(master);
+        }
+        let mut received = received_irp_fixture(&mut device, &mut irp)?;
+        received.with_active(|active| -> Result<(), DriverError> {
+            let length = IrpBufferLength::from_ulong(16)?;
+            let expected = if accepted {
+                Ok(expected)
+            } else {
+                Err(DriverError::InvalidParameter)
+            };
+            assert_eq!(active.data_input_address(length), expected);
+            assert_eq!(active.data_output_address(length), expected);
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
 /// # Panics
 ///
 /// Panics when buffered output becomes a Rust slice before the complete declared range has
