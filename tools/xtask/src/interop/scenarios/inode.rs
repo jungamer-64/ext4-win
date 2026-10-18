@@ -29,9 +29,51 @@ pub(super) fn verify_inode_contracts(
     verify_internal_e2fsck_clean(linux, &image, "journal-data baseline")?;
     verify_data_cuts(linux, &root, &image)?;
     verify_block_retirement(linux, &root, &image)?;
+    verify_inode_retirement(linux, &root, &image)?;
     verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
     Ok(())
+}
+
+/// Checks committed and transaction-local inode retirement against independent namespace and fsck observations.
+/// # Errors
+/// Returns image copy, production mutation, oracle content or allocation-consistency failures.
+fn verify_inode_retirement(
+    linux: LinuxEnvironment,
+    root: &Path,
+    baseline: &Path,
+) -> TaskResult<()> {
+    let image = root.join("inode-retirement.img");
+    fs::copy(baseline, &image)?;
+    drive_internal_core_mutation(&image, |pass| {
+        let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        pass.unlink_file(root, &ext4_core::Ext4Name::new(b"payload")?)?;
+        let transient = pass.create_file(
+            root,
+            &ext4_core::Ext4Name::new(b"transient")?,
+            mutation_file_metadata()?,
+        )?;
+        pass.write_file_range(transient, ext4_core::FileOffset::ZERO, b"temporary")?;
+        pass.unlink_file(root, &ext4_core::Ext4Name::new(b"transient")?)?;
+        let replacement = pass.create_file(
+            root,
+            &ext4_core::Ext4Name::new(b"replacement")?,
+            mutation_file_metadata()?,
+        )?;
+        pass.write_file_range(replacement, ext4_core::FileOffset::ZERO, b"replacement")
+    })?;
+    debugfs_require_absent(linux, &image, "/payload")?;
+    debugfs_require_absent(linux, &image, "/transient")?;
+    debugfs_require_file(
+        linux,
+        root,
+        &image,
+        "/replacement",
+        b"replacement",
+        1,
+        "inode-retirement",
+    )?;
+    verify_internal_e2fsck_clean(linux, &image, "inode retirement")
 }
 
 /// Checks namespace admission using the metadata identities assigned by e2fsprogs.

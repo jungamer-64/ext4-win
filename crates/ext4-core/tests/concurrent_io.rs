@@ -2884,6 +2884,59 @@ fn fixture_inode_offset(disk: &Disk, node: NodeId) -> Result<usize> {
         .ok_or(Error::ArithmeticOverflow)
 }
 
+/// # Errors
+/// Returns fixture, inode allocation, namespace, commit, remount or payload-read failure.
+/// # Panics
+/// Fails if retiring committed or newly created inodes prevents an atomic replacement.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe the replacement namespace and contents after commit and remount"
+)]
+fn transaction_inode_retirement_preserves_replacement_and_next_transaction_allocation() -> Result<()>
+{
+    let mut fixture = Fixture::new()?;
+    let replacement = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.unlink_file(root, &Ext4Name::new(b"concurrent-a")?)?;
+        let metadata = NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?);
+        let transient = pass.create_file(root, &Ext4Name::new(b"transient")?, metadata)?;
+        pass.write_file_range(transient, FileOffset::ZERO, b"temporary")?;
+        pass.unlink_file(root, &Ext4Name::new(b"transient")?)?;
+        let replacement = pass.create_file(root, &Ext4Name::new(b"replacement")?, metadata)?;
+        pass.write_file_range(replacement, FileOffset::ZERO, b"replacement")?;
+        Ok(replacement.id())
+    })?;
+    fixture.remount()?;
+    let mut bytes = [0; 11];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(replacement, FileOffset::ZERO, &mut bytes))?,
+        ReadBytes::from_usize(11)
+    );
+    assert_eq!(&bytes, b"replacement");
+    for name in [b"concurrent-a".as_slice(), b"transient".as_slice()] {
+        assert!(matches!(
+            fixture.read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(name)?))?,
+            ChildLookup::NotFound
+        ));
+    }
+    let next = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let next = pass.create_file(
+            root,
+            &Ext4Name::new(b"next")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        pass.write_file_range(next, FileOffset::ZERO, b"next")?;
+        Ok(next.id())
+    })?;
+    fixture.remount()?;
+    let mut bytes = [0; 4];
+    fixture.read(|pass| pass.read_file(next, FileOffset::ZERO, &mut bytes))?;
+    assert_eq!(&bytes, b"next");
+    Ok(())
+}
+
 /// Shares one independently encoded external attribute block between two fixture inodes.
 /// Header and inode checksums authenticate the requested count, even when it disagrees with owners.
 /// # Errors

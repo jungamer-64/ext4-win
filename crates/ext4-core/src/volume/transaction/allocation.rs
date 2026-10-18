@@ -242,11 +242,13 @@ impl MetadataMutation<'_, '_> {
         }
     }
 
-    /// Allocates the first non-reserved inode visible in inode bitmaps.
+    /// Allocates the first free inode not already represented by this transaction.
+    /// Deleted records retain their identities until the transaction is consumed, so an
+    /// earlier typed selection cannot silently bind to a new inode within the same pass.
     /// # Errors
     ///
-    /// Returns an error when no free non-reserved inode exists, inode bitmap staging fails, or free
-    /// inode counters cannot be updated.
+    /// Returns no-free-inode when no unreserved identity remains, or an error when bitmap staging
+    /// or inode accounting fails. Retirement reservations do not survive publication or abandonment.
     pub(super) fn allocate_inode(&mut self) -> Result<AllocatedInodeRecord> {
         let groups = self.volume.superblock.block_group_count()?;
         for group in 0..groups.as_u32() {
@@ -273,6 +275,10 @@ impl MetadataMutation<'_, '_> {
                     .ok_or(Error::InvalidSuperblock)?;
                 if inode_bitmap_bit_state(bitmap.bytes.as_slice(), position)?
                     == BitmapBitState::Free
+                    && !self
+                        .inode_updates
+                        .iter()
+                        .any(|record| record.id() == inode_id)
                 {
                     set_inode_bitmap_bit(
                         bitmap.bytes.as_mut_slice(),

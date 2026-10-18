@@ -324,7 +324,8 @@ enum MutationState {
 struct MetadataMutation<'storage, 'epoch> {
     /// Ephemeral view of the selected committed epoch and operation transcript.
     volume: EpochReadView<'storage, 'epoch>,
-    /// Inode records staged for rewrite at commit.
+    /// Unique inode identities staged for rewrite; deleted records reserve their identity
+    /// until this transaction is published or discarded.
     inode_updates: Vec<StagedInodeRecord>,
     /// Block bitmap images staged for allocation changes.
     block_bitmap_updates: Vec<BlockImage>,

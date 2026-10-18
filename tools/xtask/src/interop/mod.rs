@@ -7,6 +7,7 @@ use std::{
     io::{self, Read as _, Seek as _, Write as _},
     path::Path,
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 /// Owns independent JBD2, HTree, crash-cut, and fixture-provenance scenarios.
@@ -1207,6 +1208,14 @@ where
         &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
     ) -> ext4_core::Result<R>,
 {
+    // Match the host-clock epoch used by the independent filesystem tools. Capture it once so
+    // suspended resolve passes serialize the same mutation time, including inode deletion time.
+    let now = ext4_core::Ext4Timestamp::from_seconds(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)?
+            .as_secs()
+            .try_into()?,
+    );
     let mut cache = ext4_core::MetadataCache::try_new(epoch).unwrap_or_default();
     let mut operation = ext4_core::MutationResolveOperation::new(profile);
     let mut event = ext4_core::OperationEvent::Admitted;
@@ -1215,11 +1224,7 @@ where
         let mut pass_output = None;
         let result = {
             let mut crypto = UnkeyedCryptographicOperation;
-            let mut pass = ready.begin_pass(
-                cache.access(epoch),
-                ext4_core::Ext4Timestamp::from_seconds(1),
-                &mut crypto,
-            );
+            let mut pass = ready.begin_pass(cache.access(epoch), now, &mut crypto);
             match mutate(&mut pass) {
                 Ok(output) => {
                     pass_output = Some(output);
