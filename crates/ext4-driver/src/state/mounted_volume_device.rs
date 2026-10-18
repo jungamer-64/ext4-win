@@ -66,6 +66,42 @@ impl PreparedVpbLabelPublication {
 }
 
 impl MountedVolumeDevice {
+    /// Associates an uninitialized create FILE_OBJECT with this mount's original VPB.
+    ///
+    /// The I/O Manager owns the create's VPB reference and releases it after the FILE_OBJECT
+    /// closes. This records its identity without acquiring another reference. Dismount can
+    /// replace the real device's current VPB, so the association comes from the mounted device.
+    /// It remains on the FILE_OBJECT after filesystem contexts retire.
+    /// # Errors
+    /// Returns invalid parameter for a missing mounted association, or not-same-device if the
+    /// I/O Manager supplied a different VPB. No association changes on failure.
+    #[expect(
+        unsafe_code,
+        reason = "the create owner retains the unpublished FILE_OBJECT and the VPB lock protects its mount association"
+    )]
+    pub(crate) fn bind_create_vpb(
+        device: KernelDevice,
+        file_object: &mut UninitializedFileObject<'_>,
+    ) -> DriverResult<()> {
+        VpbSpinLock::with_mounted(device, |vpb| {
+            let file = file_object.kernel_file_object();
+            let vpb = core::ptr::from_mut(vpb);
+            let current = unsafe {
+                // SAFETY: The active create retains this FILE_OBJECT before filesystem attachment.
+                (*file.as_ptr()).Vpb
+            };
+            if !current.is_null() && current != vpb {
+                return Err(DriverError::NotSameDevice);
+            }
+            unsafe {
+                // SAFETY: This mount retains its original VPB and the create owns publication
+                // of the FILE_OBJECT association. The I/O Manager owns the routing reference.
+                (*file.as_ptr()).Vpb = vpb;
+            }
+            Ok(())
+        })?
+    }
+
     /// Initializes an IoCreateDevice-created mounted device and takes ownership
     /// of the VCB.
     /// # Errors
@@ -1242,6 +1278,88 @@ mod tests {
             drop(current);
             Ok(())
         }
+    }
+
+    /// Decodes one retained create request before associating its unpublished file object.
+    /// # Errors
+    /// Returns create-view or mounted-VPB admission failure.
+    #[expect(
+        unsafe_code,
+        reason = "the synchronous fixture retains the device, IRP, stack and FILE_OBJECT throughout decoding"
+    )]
+    fn associate_create(device: KernelDevice, file: &mut wdk_sys::FILE_OBJECT) -> DriverResult<()> {
+        let mut stack = wdk_sys::IO_STACK_LOCATION {
+            FileObject: core::ptr::from_mut(file),
+            ..wdk_sys::IO_STACK_LOCATION::default()
+        };
+        let mut irp = wdk_sys::IRP::default();
+        irp.Tail
+            .Overlay
+            .__bindgen_anon_2
+            .__bindgen_anon_1
+            .CurrentStackLocation = core::ptr::from_mut(&mut stack);
+        let mut request = unsafe {
+            // SAFETY: The fixture retains all native allocations until the active view returns.
+            crate::irp::ReceivedIrp::decode(device.as_ptr(), core::ptr::from_mut(&mut irp))
+        }?;
+        request.with_active(|active| {
+            let file = active.current_stack()?.file_object()?;
+            let mut file = UninitializedFileObject::decode(file)?;
+            MountedVolumeDevice::bind_create_vpb(device, &mut file)
+        })
+    }
+
+    /// # Errors
+    /// Returns native fixture construction, create admission or retirement failure.
+    /// # Panics
+    /// Fails if file objects lose their mounted identity or association changes reference ownership.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible native setup and retirement surround FILE_OBJECT identity assertions"
+    )]
+    fn create_association_retains_original_vpb_without_duplicating_routing_references()
+    -> DriverResult<()> {
+        let mut fixture = VpbFixture::new()?;
+        fixture.original(|vpb| vpb.ReferenceCount = 2)?;
+        let original = fixture.real.Vpb;
+        let publication = fixture.publish()?;
+        let device = fixture.device()?;
+        let mut first = wdk_sys::FILE_OBJECT::default();
+        let mut second = wdk_sys::FILE_OBJECT::default();
+        associate_create(device, &mut first)?;
+        associate_create(device, &mut second)?;
+        associate_create(device, &mut first)?;
+        assert_eq!(first.Vpb, original);
+        assert_eq!(second.Vpb, original);
+        fixture.original(|vpb| assert_eq!(vpb.ReferenceCount, 3))?;
+
+        let mut foreign = wdk_sys::VPB::default();
+        let mut mismatched = wdk_sys::FILE_OBJECT {
+            Vpb: core::ptr::from_mut(&mut foreign),
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        assert_eq!(
+            associate_create(device, &mut mismatched),
+            Err(DriverError::NotSameDevice)
+        );
+        assert_eq!(mismatched.Vpb, core::ptr::from_mut(&mut foreign));
+
+        publication.publish_dismount();
+        assert_ne!(fixture.real.Vpb, original);
+        assert_eq!(first.Vpb, original);
+        assert_eq!(second.Vpb, original);
+        fixture.original(|vpb| {
+            assert_eq!(vpb.ReferenceCount, 3);
+            vpb.ReferenceCount -= 2;
+        })?;
+        drop(
+            publication
+                .begin_retirement()
+                .try_finish()
+                .map_err(|_| DriverError::DeviceBusy)?,
+        );
+        fixture.finish()
     }
 
     /// # Errors

@@ -30,10 +30,10 @@ use crate::{
     state::{
         ChildCreationTarget, CommittedNodeStreamMetadata, DataTransferMode, DirectoryChange,
         DirectoryChangeAction, ExistingStreamResidency, FileControlBlock, HandleDeletion,
-        KernelDevice, KernelFileObject, MountedVolumeAccess, NoIntermediateTransfer,
-        NodeStreamMetadata, NormalizedNameAccess, OpenedHandle, OpenedLocation, OpenedNodeMode,
-        OpenedObject, OpenedVolumeHandle, PendingChildCreation, PendingFileDeletion,
-        PreparedStreamWriteOpen, RawVolumeAccess, StagedNodeStreamMetadata,
+        KernelDevice, KernelFileObject, MountedVolumeAccess, MountedVolumeDevice,
+        NoIntermediateTransfer, NodeStreamMetadata, NormalizedNameAccess, OpenedHandle,
+        OpenedLocation, OpenedNodeMode, OpenedObject, OpenedVolumeHandle, PendingChildCreation,
+        PendingFileDeletion, PreparedStreamWriteOpen, RawVolumeAccess, StagedNodeStreamMetadata,
         UninitializedFileObject, VolumeControlBlock, WriteCommitment, abandon_file_control_block,
     },
 };
@@ -211,8 +211,9 @@ impl<'a> PreparedCreateRequest<'a> {
             let stack = current.create()?;
             let parameters = stack.parameters();
             parameters.validate_supported_flags()?;
-            let file_object = UninitializedFileObject::decode(file_object)?;
+            let mut file_object = UninitializedFileObject::decode(file_object)?;
             let device = active.device();
+            MountedVolumeDevice::bind_create_vpb(device, &mut file_object)?;
             Ok::<_, DriverError>((
                 device,
                 parameters,
