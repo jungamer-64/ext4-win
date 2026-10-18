@@ -249,13 +249,8 @@ impl AllocationIndexBuild {
                     match read {
                         BitmapRead::Block => {
                             let bytes = match descriptor.block_bitmap_initialization() {
-                                AllocationBitmapInitialization::Initialized => {
-                                    read_allocation_bitmap(
-                                        reader,
-                                        superblock,
-                                        descriptor.block_bitmap(),
-                                    )?
-                                }
+                                AllocationBitmapInitialization::Initialized => descriptor
+                                    .read_bitmap(reader, superblock, AllocationBitmapKind::Block)?,
                                 AllocationBitmapInitialization::Uninitialized => {
                                     materialize_uninitialized_block_bitmap(
                                         superblock, *group, layouts,
@@ -266,13 +261,8 @@ impl AllocationIndexBuild {
                         }
                         BitmapRead::Inode(block_bitmap) => {
                             let inode_bitmap = match descriptor.inode_bitmap_initialization() {
-                                AllocationBitmapInitialization::Initialized => {
-                                    read_allocation_bitmap(
-                                        reader,
-                                        superblock,
-                                        descriptor.inode_bitmap(),
-                                    )?
-                                }
+                                AllocationBitmapInitialization::Initialized => descriptor
+                                    .read_bitmap(reader, superblock, AllocationBitmapKind::Inode)?,
                                 AllocationBitmapInitialization::Uninitialized => {
                                     materialize_uninitialized_inode_bitmap(superblock, *group)?
                                 }
@@ -336,9 +326,13 @@ fn begin_inode_scan(
     orphans: &ValidatedOrphanInventory,
     ranges: &mut Vec<AllocationRange>,
 ) -> Result<InodeAllocationScan> {
-    if raw.mode()? == 0 {
+    // Reserved bitmap slots can denote entirely uninitialized inode records.
+    if raw.id.as_u32() < superblock.first_inode().as_u32()
+        && raw.bytes.as_ref().iter().all(|byte| *byte == 0)
+    {
         return Ok(InodeAllocationScan::Next);
     }
+    raw.verify_checksum(superblock)?;
     if superblock.is_resize_inode(raw.id) {
         let root = raw.resize_inode_block_map()?.double_indirect();
         ranges.try_push(AllocationRange::new(root, 1, BlockOwnership::Exclusive)?)?;

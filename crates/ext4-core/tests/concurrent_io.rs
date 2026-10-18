@@ -625,6 +625,8 @@ impl CryptographicOperation for PlainCrypto {
 struct Disk {
     filesystem: Vec<u8>,
     journal: Vec<u8>,
+    /// Submitted writes and flushes, including requests made before mount publication.
+    storage_effects: usize,
 }
 
 impl Disk {
@@ -770,12 +772,19 @@ impl Disk {
                 "../../../tools/xtask/fixtures/journal/external-4k-v3-64.journal.img"
             )
             .to_vec(),
+            storage_effects: 0,
         }
     }
 
     /// # Errors
     /// Returns an invalid device range before copying a malformed transfer.
     fn complete(&mut self, mut request: StorageRequest) -> Result<StorageCompletion> {
+        if !matches!(request, StorageRequest::Read { .. }) {
+            self.storage_effects = self
+                .storage_effects
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
         let image = match request.target() {
             StorageTarget::Filesystem => &mut self.filesystem,
             StorageTarget::ExternalJournal => &mut self.journal,
@@ -2619,4 +2628,153 @@ fn empty_acl_values_remove_the_reserved_slot() -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Reads a little-endian fixture field independently of the production parser.
+/// # Errors
+/// Returns a malformed fixture range or field width.
+fn fixture_u32(image: &[u8], offset: usize) -> Result<u32> {
+    let end = offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?;
+    Ok(u32::from_le_bytes(
+        image
+            .get(offset..end)
+            .ok_or(Error::DeviceRange)?
+            .try_into()
+            .map_err(|_| Error::TruncatedStructure)?,
+    ))
+}
+
+/// Locates a group-zero inode in the independently generated 4 KiB/256-byte fixture.
+/// # Errors
+/// Returns malformed geometry or an out-of-range inode coordinate.
+fn fixture_inode_offset(disk: &Disk, node: NodeId) -> Result<usize> {
+    let table = usize::try_from(fixture_u32(&disk.filesystem, 4104)?)
+        .map_err(|_| Error::ArithmeticOverflow)?;
+    let slot = usize::try_from(
+        node.file_index()
+            .checked_sub(1)
+            .ok_or(Error::InvalidInode)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    table
+        .checked_mul(4096)
+        .and_then(|base| {
+            slot.checked_mul(256)
+                .and_then(|delta| base.checked_add(delta))
+        })
+        .ok_or(Error::ArithmeticOverflow)
+}
+
+/// # Errors
+/// Returns fixture construction or geometry failures.
+/// # Panics
+/// Fails if corrupted ownership or allocation can reach mount publication or a storage effect.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify rejection before any mount write or flush"
+)]
+fn persisted_metadata_checksums_precede_mount_authority() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let inode = fixture_inode_offset(&fixture.disk, NodeId::File(fixture.a))?;
+    let block_bitmap = usize::try_from(fixture_u32(&fixture.disk.filesystem, 4096)?)
+        .map_err(|_| Error::ArithmeticOverflow)?
+        .checked_mul(4096)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let inode_bitmap = usize::try_from(fixture_u32(&fixture.disk.filesystem, 4100)?)
+        .map_err(|_| Error::ArithmeticOverflow)?
+        .checked_mul(4096)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let slot = usize::try_from(
+        NodeId::File(fixture.a)
+            .file_index()
+            .checked_sub(1)
+            .ok_or(Error::InvalidInode)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    for (offset, mask) in [
+        (inode.checked_add(2).ok_or(Error::ArithmeticOverflow)?, 1_u8),
+        (inode.checked_add(124).ok_or(Error::ArithmeticOverflow)?, 1),
+        (block_bitmap, 1),
+        (
+            inode_bitmap
+                .checked_add(slot / 8)
+                .ok_or(Error::ArithmeticOverflow)?,
+            1_u8.checked_shl(u32::try_from(slot % 8).map_err(|_| Error::ArithmeticOverflow)?)
+                .ok_or(Error::ArithmeticOverflow)?,
+        ),
+    ] {
+        let mut disk = Disk {
+            filesystem: fixture.disk.filesystem.to_vec(),
+            journal: fixture.disk.journal.to_vec(),
+            storage_effects: 0,
+        };
+        *disk.filesystem.get_mut(offset).ok_or(Error::DeviceRange)? ^= mask;
+        assert_eq!(
+            disk.mount().err(),
+            Some(Error::ChecksumMismatch),
+            "offset={offset}"
+        );
+        assert_eq!(disk.storage_effects, 0, "offset={offset}");
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture construction, geometry or cache allocation failures.
+/// # Panics
+/// Fails if a disk inode can confer read or mutation authority without its checksum.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions exercise ordinary read and mutation boundaries after a corrupt storage read"
+)]
+fn persisted_inode_checksums_precede_access_and_mutation() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::File(a))?
+        .checked_add(2)
+        .ok_or(Error::ArithmeticOverflow)?;
+    *fixture
+        .disk
+        .filesystem
+        .get_mut(offset)
+        .ok_or(Error::DeviceRange)? ^= 1;
+    fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+    assert_eq!(
+        fixture.read(|pass| pass.load_access(NodeId::File(a))).err(),
+        Some(Error::ChecksumMismatch)
+    );
+    let effects = fixture.disk.storage_effects;
+    assert_eq!(
+        fixture
+            .mutate(|pass| {
+                let file = pass.file(a)?;
+                pass.write_file_range(file, FileOffset::ZERO, b"replacement")
+            })
+            .err(),
+        Some(Error::ChecksumMismatch)
+    );
+    assert_eq!(fixture.disk.storage_effects, effects);
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture construction or wire-field range failures.
+/// # Panics
+/// Fails if clearing a required JBD2 CRC permits recovery or any storage effect.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions exercise the external journal probe and mount protocol on an independently generated journal"
+)]
+fn journal_checksum_zero_does_not_disable_authentication() -> Result<()> {
+    let mut disk = Disk::fixture();
+    disk.journal
+        .get_mut(4348..4352)
+        .ok_or(Error::DeviceRange)?
+        .fill(0);
+    assert_eq!(disk.mount().err(), Some(Error::ChecksumMismatch));
+    assert_eq!(disk.storage_effects, 0);
+    Ok(())
 }

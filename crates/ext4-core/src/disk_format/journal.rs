@@ -2941,10 +2941,7 @@ impl JournalSuperblock {
             &mut first_user,
             bytes.get(0x100..0x110).ok_or(Error::TruncatedStructure)?,
         )?;
-        if be_u32(bytes, disk_offset(0xFC))? != 0 {
-            verify_journal_superblock_checksum(bytes)?;
-        }
-        Ok(Self {
+        let superblock = Self {
             raw: memory::copied_slice(bytes)?,
             version,
             block_size: be_u32(bytes, disk_offset(0x0C))?,
@@ -2961,7 +2958,11 @@ impl JournalSuperblock {
             head: be_u32(bytes, disk_offset(0x58))?,
             nr_users: be_u32(bytes, disk_offset(0x40))?,
             first_user,
-        })
+        };
+        if superblock.has_superblock_checksum() {
+            verify_journal_superblock_checksum(bytes)?;
+        }
+        Ok(superblock)
     }
 
     /// Encodes a superblock image with updated sequence and start fields.
@@ -2987,7 +2988,7 @@ impl JournalSuperblock {
         if self.version == JournalSuperblockVersion::V2 {
             put_be_u32(&mut block, disk_offset(0x58), head)?;
         }
-        if self.has_superblock_checksum()? {
+        if self.has_superblock_checksum() {
             refresh_journal_superblock_checksum(&mut block)?;
         }
         Ok(block)
@@ -3051,12 +3052,10 @@ impl JournalSuperblock {
         &self.uuid
     }
 
-    /// Returns whether the journal superblock checksum field is populated.
-    /// # Errors
-    ///
-    /// Returns an error when the checksum field is outside the retained raw superblock image.
-    fn has_superblock_checksum(&self) -> Result<bool> {
-        Ok(be_u32(&self.raw, disk_offset(0xFC))? != 0)
+    /// Checksum presence belongs to the wire profile, including when its stored CRC is zero.
+    fn has_superblock_checksum(&self) -> bool {
+        self.version == JournalSuperblockVersion::V2
+            && self.incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3) != 0
     }
 }
 
@@ -3430,6 +3429,52 @@ mod tests {
             journal_superblock_checksum(&[0_u8; JOURNAL_SUPERBLOCK_BYTES]),
             Ok(0x1151_2183)
         );
+    }
+
+    /// # Errors
+    /// Returns a fixture-range, wire-field or journal parsing failure.
+    /// # Panics
+    /// Fails if checksum features do not control both validation and subsequent state encoding.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare Linux-generated v2/v3 superblocks and checksum-free wire profiles"
+    )]
+    fn journal_superblock_checksum_follows_the_feature_profile() -> Result<()> {
+        let v2 = include_bytes!(
+            "../../../../tools/xtask/fixtures/journal/external-1k-v2-32.journal.img"
+        );
+        let v3 = include_bytes!(
+            "../../../../tools/xtask/fixtures/journal/external-4k-v3-64.journal.img"
+        );
+        for (image, start, width) in [(&v2[..], 2048_usize, 1024_usize), (&v3[..], 4096, 4096)] {
+            let end = start.checked_add(width).ok_or(Error::ArithmeticOverflow)?;
+            let mut bytes = crate::memory::copied_slice(
+                image.get(start..end).ok_or(Error::TruncatedStructure)?,
+            )?;
+            let parsed = JournalSuperblock::parse(&bytes)?;
+            assert!(parsed.has_superblock_checksum());
+            put_be_u32(&mut bytes, DiskOffset::new(0xfc), 0)?;
+            assert_eq!(
+                JournalSuperblock::parse(&bytes),
+                Err(Error::ChecksumMismatch)
+            );
+
+            // Legacy journals carry no superblock checksum, even if unused bytes are nonzero.
+            put_be_u32(&mut bytes, DiskOffset::new(0x28), 0)?;
+            put_be_u32(&mut bytes, DiskOffset::new(0xfc), 0x1234_5678)?;
+            let parsed = JournalSuperblock::parse(&bytes)?;
+            assert!(!parsed.has_superblock_checksum());
+            let encoded = parsed.encode_with_state(
+                BlockSize::from_superblock_log(if width == 1024 { 0 } else { 2 })?,
+                JournalSequence::new(100),
+                0,
+                parsed.first,
+            )?;
+            assert_eq!(JournalSuperblock::parse(&encoded)?.sequence.get(), 100);
+            assert_eq!(super::be_u32(&encoded, DiskOffset::new(0xfc))?, 0x1234_5678);
+        }
+        Ok(())
     }
 
     /// # Panics

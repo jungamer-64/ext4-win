@@ -1503,7 +1503,7 @@ impl EpochReadView<'_, '_> {
     /// # Errors
     ///
     /// Returns an error when `inode_id` is outside the filesystem inode range, its table offset
-    /// cannot be computed, or the record cannot be read.
+    /// cannot be computed, or the record cannot be read or authenticated.
     pub(super) fn read_raw_inode_record(
         &mut self,
         inode_id: InodeId,
@@ -1519,12 +1519,14 @@ impl EpochReadView<'_, '_> {
             memory::repeated_vec(0_u8, usize::from(self.superblock.inode_size().as_u16()))?;
         self.device
             .read_metadata_exact_at(inode_offset, &mut bytes)?;
-        Ok(RawInodeRecord {
+        let record = RawInodeRecord {
             id: inode_id,
             offset: inode_offset,
             bytes,
             encoding: self.superblock.inode_data_encoding(),
-        })
+        };
+        record.verify_checksum(&self.superblock)?;
+        Ok(record)
     }
 
     /// Reads and parses a typed inode record.

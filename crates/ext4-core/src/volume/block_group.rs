@@ -193,20 +193,6 @@ fn empty_allocation_bitmap(superblock: &Superblock) -> Result<Vec<u8>> {
     )
 }
 
-/// Reads one initialized allocation bitmap block into a fallibly allocated image.
-/// # Errors
-///
-/// Returns an error when the bitmap byte count cannot be represented or the block cannot be read.
-pub(super) fn read_allocation_bitmap(
-    reader: &mut OperationDevice<'_>,
-    superblock: &Superblock,
-    block: BlockAddress,
-) -> Result<Vec<u8>> {
-    let mut bytes = empty_allocation_bitmap(superblock)?;
-    reader.read_exact_at(superblock.block_size().offset_of(block)?, &mut bytes)?;
-    Ok(bytes)
-}
-
 /// Converts a resize-inode pointer block into its nonzero physical block addresses.
 /// # Errors
 ///

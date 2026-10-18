@@ -19,7 +19,9 @@ pub(super) use crate::disk_format::extent::{
     BlockMapping, Extent, ExtentBlockRun, ExtentInitialization, ExtentLength, ExtentMappingCursor,
     ExtentTreeContext, LogicalBlock, MutableExtentTree, SerializedExtentTree,
 };
-pub(super) use crate::disk_format::group::{AllocationBitmapInitialization, BlockGroupDescriptor};
+pub(super) use crate::disk_format::group::{
+    AllocationBitmapInitialization, AllocationBitmapKind, BlockGroupDescriptor,
+};
 pub(super) use crate::disk_format::inode::{
     DirectoryEntryMutationCapability, DirectorySize, DirectoryStorageKind, EncodedInodeBlockCount,
     EncodedInodeSize, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times,
@@ -58,8 +60,7 @@ pub(super) use super::block_group::{
     BitmapBitState, ClusterBitmapPosition, ClusterReferenceDelta, ClusterReferenceIndex,
     InodeBitmapPosition, cluster_bitmap_bit_state, inode_bitmap_bit_state, inode_offset_on_device,
     materialize_uninitialized_block_bitmap, materialize_uninitialized_inode_bitmap,
-    read_allocation_bitmap, read_group_metadata_layouts, round_up_div, set_cluster_bitmap_bit,
-    set_inode_bitmap_bit,
+    read_group_metadata_layouts, round_up_div, set_cluster_bitmap_bit, set_inode_bitmap_bit,
 };
 pub(super) use super::directory::{
     DirectoryCursorName, DirectoryLookup, DirectoryScanCursor, DirectoryScanPosition,

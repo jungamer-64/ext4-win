@@ -334,10 +334,10 @@ impl MetadataMutation<'_, '_> {
             return Ok(index);
         }
         let bytes = match descriptor.block_bitmap_initialization() {
-            AllocationBitmapInitialization::Initialized => read_allocation_bitmap(
+            AllocationBitmapInitialization::Initialized => descriptor.read_bitmap(
                 &mut self.volume.device,
                 &self.volume.superblock,
-                bitmap_block,
+                AllocationBitmapKind::Block,
             )?,
             AllocationBitmapInitialization::Uninitialized => {
                 let layouts =
@@ -380,10 +380,10 @@ impl MetadataMutation<'_, '_> {
             return Ok(index);
         }
         let bytes = match descriptor.inode_bitmap_initialization() {
-            AllocationBitmapInitialization::Initialized => read_allocation_bitmap(
+            AllocationBitmapInitialization::Initialized => descriptor.read_bitmap(
                 &mut self.volume.device,
                 &self.volume.superblock,
-                bitmap_block,
+                AllocationBitmapKind::Inode,
             )?,
             AllocationBitmapInitialization::Uninitialized => {
                 let bytes = materialize_uninitialized_inode_bitmap(&self.volume.superblock, group)?;

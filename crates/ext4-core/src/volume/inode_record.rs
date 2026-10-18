@@ -1028,64 +1028,6 @@ impl RawInodeRecord<Vec<u8>> {
         Ok(())
     }
 
-    /// Authenticates inode storage before a tracker can confer recovery authority.
-    /// # Errors
-    /// Returns a checksum mismatch or a malformed record error; no bytes are modified.
-    pub(super) fn verify_checksum(&self, superblock: &Superblock) -> Result<()> {
-        if superblock.metadata_checksum() != MetadataChecksum::Crc32c {
-            return Ok(());
-        }
-        let (mut expected, high) = self.checksum(superblock)?;
-        let mut stored = u32::from(le_u16(&self.bytes, disk_offset(INODE_CHECKSUM_LO_OFFSET))?);
-        if high {
-            stored |= u32::from(le_u16(&self.bytes, disk_offset(INODE_CHECKSUM_HI_OFFSET))?) << 16;
-        } else {
-            expected &= u32::from(u16::MAX);
-        }
-        if stored == expected {
-            Ok(())
-        } else {
-            Err(Error::ChecksumMismatch)
-        }
-    }
-
-    /// Calculates the inode CRC with only checksum fields excluded, preserving extra-isize.
-    /// # Errors
-    /// Returns an error for a truncated or out-of-range extra-inode layout.
-    fn checksum(&self, superblock: &Superblock) -> Result<(u32, bool)> {
-        let high = InodeRecordLayout::parse(&self.bytes)?.contains(INODE_CHECKSUM_HI_OFFSET, 2);
-        let seed = ext4_crc32c(
-            superblock.checksum_seed().as_u32(),
-            &self.id.as_u32().to_le_bytes(),
-        );
-        let seed = ext4_crc32c(
-            seed,
-            &le_u32(&self.bytes, disk_offset(INODE_GENERATION_OFFSET))?.to_le_bytes(),
-        );
-        let mut checksum = ext4_crc32c(
-            seed,
-            self.bytes.get(..124).ok_or(Error::TruncatedStructure)?,
-        );
-        checksum = ext4_crc32c(checksum, &[0, 0]);
-        if high {
-            checksum = ext4_crc32c(
-                checksum,
-                self.bytes.get(126..130).ok_or(Error::TruncatedStructure)?,
-            );
-            checksum = ext4_crc32c(checksum, &[0, 0]);
-            checksum = ext4_crc32c(
-                checksum,
-                self.bytes.get(132..).ok_or(Error::TruncatedStructure)?,
-            );
-        } else {
-            checksum = ext4_crc32c(
-                checksum,
-                self.bytes.get(126..).ok_or(Error::TruncatedStructure)?,
-            );
-        }
-        Ok((checksum, high))
-    }
-
     /// Establishes extra-field storage in a newly zeroed inode record.
     /// # Errors
     ///
@@ -1541,6 +1483,83 @@ impl RecoverableOrphanInode {
 }
 
 impl<Bytes: AsRef<[u8]>> RawInodeRecord<Bytes> {
+    /// Authenticates persisted inode bytes before interpreting ownership or storage.
+    /// # Errors
+    /// Returns a checksum mismatch or a malformed record error; no bytes are modified.
+    pub(super) fn verify_checksum(&self, superblock: &Superblock) -> Result<()> {
+        if superblock.metadata_checksum() != MetadataChecksum::Crc32c {
+            return Ok(());
+        }
+        let (mut expected, high) = self.checksum(superblock)?;
+        let mut stored = u32::from(le_u16(
+            self.bytes.as_ref(),
+            disk_offset(INODE_CHECKSUM_LO_OFFSET),
+        )?);
+        if high {
+            stored |= u32::from(le_u16(
+                self.bytes.as_ref(),
+                disk_offset(INODE_CHECKSUM_HI_OFFSET),
+            )?) << 16;
+        } else {
+            expected &= u32::from(u16::MAX);
+        }
+        if stored == expected {
+            Ok(())
+        } else {
+            Err(Error::ChecksumMismatch)
+        }
+    }
+
+    /// Calculates the inode CRC with only checksum fields excluded, preserving extra-isize.
+    /// # Errors
+    /// Returns an error for a truncated or out-of-range extra-inode layout.
+    fn checksum(&self, superblock: &Superblock) -> Result<(u32, bool)> {
+        let high =
+            InodeRecordLayout::parse(self.bytes.as_ref())?.contains(INODE_CHECKSUM_HI_OFFSET, 2);
+        let seed = ext4_crc32c(
+            superblock.checksum_seed().as_u32(),
+            &self.id.as_u32().to_le_bytes(),
+        );
+        let seed = ext4_crc32c(
+            seed,
+            &le_u32(self.bytes.as_ref(), disk_offset(INODE_GENERATION_OFFSET))?.to_le_bytes(),
+        );
+        let mut checksum = ext4_crc32c(
+            seed,
+            self.bytes
+                .as_ref()
+                .get(..124)
+                .ok_or(Error::TruncatedStructure)?,
+        );
+        checksum = ext4_crc32c(checksum, &[0, 0]);
+        if high {
+            checksum = ext4_crc32c(
+                checksum,
+                self.bytes
+                    .as_ref()
+                    .get(126..130)
+                    .ok_or(Error::TruncatedStructure)?,
+            );
+            checksum = ext4_crc32c(checksum, &[0, 0]);
+            checksum = ext4_crc32c(
+                checksum,
+                self.bytes
+                    .as_ref()
+                    .get(132..)
+                    .ok_or(Error::TruncatedStructure)?,
+            );
+        } else {
+            checksum = ext4_crc32c(
+                checksum,
+                self.bytes
+                    .as_ref()
+                    .get(126..)
+                    .ok_or(Error::TruncatedStructure)?,
+            );
+        }
+        Ok((checksum, high))
+    }
+
     /// Returns the raw inode mode field without imposing a supported kind.
     /// # Errors
     ///

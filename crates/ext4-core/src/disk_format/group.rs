@@ -84,6 +84,15 @@ pub(crate) enum AllocationBitmapInitialization {
     Uninitialized,
 }
 
+/// Allocation domain whose address, checksum fields and bit count belong to a descriptor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AllocationBitmapKind {
+    /// Allocation clusters.
+    Block,
+    /// Inode slots.
+    Inode,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Decoded block group descriptor backed by its writable raw bytes.
 pub(crate) struct BlockGroupDescriptor {
@@ -112,6 +121,56 @@ pub(crate) struct BlockGroupDescriptor {
 }
 
 impl BlockGroupDescriptor {
+    /// Reads and authenticates one initialized bitmap before its bits can grant allocation.
+    /// Uninitialized bitmaps must instead be derived from filesystem geometry.
+    /// # Errors
+    /// Returns I/O, allocation, invalid initialization, or checksum failures.
+    pub(crate) fn read_bitmap(
+        &self,
+        reader: &mut OperationDevice<'_>,
+        superblock: &Superblock,
+        kind: AllocationBitmapKind,
+    ) -> Result<Vec<u8>> {
+        let (block, initialization, bits, low, high) = match kind {
+            AllocationBitmapKind::Block => (
+                self.block_bitmap,
+                self.block_bitmap_initialization,
+                superblock.clusters_per_group().as_u32(),
+                BG_BLOCK_BITMAP_CSUM_LO_OFFSET,
+                BG_BLOCK_BITMAP_CSUM_HI_OFFSET,
+            ),
+            AllocationBitmapKind::Inode => (
+                self.inode_bitmap,
+                self.inode_bitmap_initialization,
+                superblock.inodes_per_group().as_u32(),
+                BG_INODE_BITMAP_CSUM_LO_OFFSET,
+                BG_INODE_BITMAP_CSUM_HI_OFFSET,
+            ),
+        };
+        if initialization != AllocationBitmapInitialization::Initialized {
+            return Err(Error::InvalidSuperblock);
+        }
+        let mut bytes = memory::repeated_vec(
+            0_u8,
+            usize::try_from(superblock.block_size().bytes())
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        reader.read_exact_at(superblock.block_size().offset_of(block)?, &mut bytes)?;
+        if superblock.descriptor_checksum() == BlockGroupDescriptorChecksum::MetadataCrc32c {
+            let mut actual = bitmap_checksum(superblock, &bytes, bits)?;
+            let mut expected = u32::from(le_u16(&self.bytes, disk_offset(low))?);
+            if superblock.descriptor_layout().has_high_fields() {
+                expected |= u32::from(le_u16(&self.bytes, disk_offset(high))?) << 16;
+            } else {
+                actual &= u32::from(u16::MAX);
+            }
+            if actual != expected {
+                return Err(Error::ChecksumMismatch);
+            }
+        }
+        Ok(bytes)
+    }
+
     /// Reads, verifies, and decodes a descriptor for one block group.
     /// # Errors
     ///

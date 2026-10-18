@@ -321,17 +321,15 @@ pub(super) fn read_allocated_inode(
     let position = InodeBitmapPosition::from_inode(&volume.superblock, inode)?;
     let descriptor =
         BlockGroupDescriptor::read_from(&mut volume.device, &volume.superblock, position.group())?;
-    let bytes = read_allocation_bitmap(
+    let bytes = descriptor.read_bitmap(
         &mut volume.device,
         &volume.superblock,
-        descriptor.inode_bitmap(),
+        AllocationBitmapKind::Inode,
     )?;
     if inode_bitmap_bit_state(&bytes, position)? != BitmapBitState::Used {
         return Err(Error::InvalidOrphanTracking);
     }
-    let raw = volume.read_raw_inode_record(inode)?;
-    raw.verify_checksum(&volume.superblock)?;
-    Ok(raw)
+    volume.read_raw_inode_record(inode)
 }
 
 /// Extent checksum identity available without granting live namespace access.
