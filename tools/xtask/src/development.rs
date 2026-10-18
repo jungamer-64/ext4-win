@@ -102,6 +102,22 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
             ),
             "native backup and restore privilege authority",
         )?;
+        run_checked(
+            cargo_command(
+                root,
+                &[
+                    "test",
+                    "--locked",
+                    "-p",
+                    "windows-host",
+                    "native::identity::access_tests::native_restore_namespace_contract",
+                    "--",
+                    "--ignored",
+                    "--exact",
+                ],
+            ),
+            "native restore-privilege namespace contract",
+        )?;
         println!("native Windows host contracts: PASS");
         Ok(())
     }

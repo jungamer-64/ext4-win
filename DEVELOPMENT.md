@@ -301,7 +301,11 @@ driver substitutes a Basic Data partition type to obtain a mount point.
 
 The live scenario requires file create, read, write, rename, hard link,
 patterned enumeration, durable flush, clean dismount, driver unload, package
-removal, and VHDX removal to succeed. Lifecycle side effects are preceded by a
+removal, and VHDX removal to succeed. The hard-link deletion and rename scenario
+uses backup-intent handles with SeRestorePrivilege enabled on a private thread;
+ordinary opens are separately required to refuse namespace DELETE authority.
+The elevated host gate checks the same privileged namespace operations before
+the live volume is attached. Lifecycle side effects are preceded by a
 durably flushed immutable JSON phase record. An intent records uncertain
 acceptance; only a subsequent observation records completion. Cleanup reloads
 the latest committed record and revalidates the verified bundle

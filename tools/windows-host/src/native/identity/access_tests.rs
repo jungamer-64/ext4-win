@@ -5,53 +5,7 @@ use ext4_security::{
     AccessDecision, Components, Descriptor, GroupMapping, IdentityMap, MAXIMUM_ALLOWED,
     UserMapping, WRITE_RIGHTS, evaluate_access,
 };
-use windows_sys::Win32::System::Threading::SetThreadToken;
 
-/// Opens a process token with explicit duplication authority for the oracle.
-/// # Errors
-/// Returns native token admission failure.
-fn process_token() -> io::Result<OwnedHandle> {
-    let process = unsafe {
-        // SAFETY: The current-process pseudo handle is borrowed and never closed.
-        GetCurrentProcess()
-    };
-    let mut token = ptr::null_mut();
-    let success = unsafe {
-        // SAFETY: Output is initialized writable handle storage.
-        OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token)
-    };
-    if success == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe {
-        // SAFETY: Success transfers one uniquely owned native token handle.
-        OwnedHandle::from_raw_handle(token)
-    })
-}
-/// Produces the impersonation-token form required by AccessCheck.
-/// # Errors
-/// Returns a native duplication failure.
-fn impersonation(token: &OwnedHandle) -> io::Result<OwnedHandle> {
-    let mut result = ptr::null_mut();
-    let success = unsafe {
-        // SAFETY: Input is retained; output receives a distinct owned token.
-        DuplicateTokenEx(
-            token.as_raw_handle(),
-            TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ADJUST_PRIVILEGES,
-            ptr::null(),
-            SecurityImpersonation,
-            TokenImpersonation,
-            &mut result,
-        )
-    };
-    if success == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(unsafe {
-        // SAFETY: Successful duplication transfers one owned handle.
-        OwnedHandle::from_raw_handle(result)
-    })
-}
 /// Copies an independently encoded descriptor into naturally aligned native storage.
 /// # Errors
 /// Returns invalid fixture layout.
@@ -255,48 +209,6 @@ fn native_owner_group_priority_and_maximum_rights() -> io::Result<()> {
     Ok(())
 }
 
-/// Selects enabled state for exactly one privilege on a private duplicated token.
-/// # Errors
-/// Returns lookup, adjustment or privilege-not-assigned failure.
-fn set_privilege(token: &OwnedHandle, name: &str, enabled: bool) -> io::Result<()> {
-    let name = wide(OsStr::new(name))?;
-    let mut luid = windows_sys::Win32::Foundation::LUID::default();
-    let found = unsafe {
-        // SAFETY: The terminated privilege name and writable LUID live throughout the call.
-        LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut luid)
-    };
-    if found == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let privileges = TOKEN_PRIVILEGES {
-        PrivilegeCount: 1,
-        Privileges: [LUID_AND_ATTRIBUTES {
-            Luid: luid,
-            Attributes: if enabled { SE_PRIVILEGE_ENABLED } else { 0 },
-        }],
-    };
-    unsafe {
-        // SAFETY: Clears this thread's last-error observation before the adjustment API.
-        windows_sys::Win32::Foundation::SetLastError(0);
-    }
-    let adjusted = unsafe {
-        // SAFETY: Only the private duplicate token is adjusted; input includes its one complete privilege.
-        AdjustTokenPrivileges(
-            token.as_raw_handle(),
-            0,
-            &privileges,
-            0,
-            ptr::null_mut(),
-            ptr::null_mut(),
-        )
-    };
-    let error = io::Error::last_os_error();
-    if adjusted == 0 || error.raw_os_error() == Some(1300) {
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
 /// # Errors
 /// Requires an elevated token containing SeTakeOwnershipPrivilege and SeSecurityPrivilege.
 /// # Panics
@@ -377,6 +289,71 @@ fn native_backup_restore_privileges_contract() -> io::Result<()> {
             assert_eq!(granted != 0, enabled);
         }
     }
+    Ok(())
+}
+
+/// # Errors
+/// Requires an elevated token containing SeRestorePrivilege.
+/// # Panics
+/// Fails if the namespace scenario fails, the private token lacks restore authority, or an
+/// operation failure loses its native error code or changes the caller's effective identity.
+#[test]
+#[ignore = "requires an elevated Windows token with restore privilege"]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "native privilege admission and filesystem failures propagate before contract assertions"
+)]
+fn native_restore_namespace_contract() -> io::Result<()> {
+    let caller = effective_identity()?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "ext4win-restore-contract-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root)?;
+    let operation =
+        crate::verify_hard_link_lifecycle(&root, crate::NamespaceAccess::RestorePrivilege);
+    completed(operation, std::fs::remove_dir(&root))?;
+    let result: io::Result<()> = with_restore_privilege(|| {
+        let token = effective_token()?;
+        let mut luid = windows_sys::Win32::Foundation::LUID::default();
+        let name = wide(OsStr::new("SeRestorePrivilege"))?;
+        if unsafe {
+            // SAFETY: The terminated name and exclusive native output remain live during lookup.
+            LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut luid)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let mut required = PRIVILEGE_SET {
+            PrivilegeCount: 1,
+            Control: 1,
+            Privilege: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: 0,
+            }],
+        };
+        let mut held = 0;
+        if unsafe {
+            // SAFETY: The effective private token and complete aligned privilege record are retained.
+            PrivilegeCheck(token.as_raw_handle(), &mut required, &mut held)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        assert_ne!(held, 0);
+        Err(io::Error::from_raw_os_error(1234))
+    });
+    assert_eq!(
+        result.err().and_then(|error| error.raw_os_error()),
+        Some(1234)
+    );
+    let after = effective_identity()?;
+    assert_eq!(after.user, caller.user);
+    assert_eq!(after.primary_group, caller.primary_group);
     Ok(())
 }
 

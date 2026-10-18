@@ -1100,10 +1100,40 @@ fn delete_file_link(file: &FileHandle) -> io::Result<()> {
     }
 }
 
+/// Authority used to admit namespace operations in the native filesystem scenario.
+#[derive(Clone, Copy, Debug)]
+pub enum NamespaceAccess {
+    /// Requests rights from the filesystem's descriptor under the caller's token.
+    Descriptor,
+    /// Enables SeRestorePrivilege on a private thread and requests backup-intent handles.
+    RestorePrivilege,
+}
+
 /// Exercises independent hard-link dispositions and coalescing renames on disposable files.
 /// # Errors
+/// Returns token admission, native I/O, namespace or link-information disagreement, including
+/// explicit close and impersonation-reversion failure. RestorePrivilege requires an elevated
+/// token containing SeRestorePrivilege; it does not change the caller's effective token.
+pub fn verify_hard_link_lifecycle(directory: &Path, access: NamespaceAccess) -> io::Result<()> {
+    match access {
+        NamespaceAccess::Descriptor => hard_link_lifecycle(directory),
+        NamespaceAccess::RestorePrivilege => {
+            identity::with_restore_privilege(|| hard_link_lifecycle(directory))
+        }
+    }
+}
+
+/// Removes one namespace link with explicitly requested backup-intent deletion authority.
+/// # Errors
+/// Returns open, disposition or explicit close failure.
+fn remove_namespace_link(path: &Path) -> io::Result<()> {
+    let file = FileHandle::open(path, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
+    completed(delete_file_link(&file), file.close())
+}
+
+/// # Errors
 /// Returns native I/O, namespace or link-information disagreement, including explicit close failure.
-pub fn verify_hard_link_lifecycle(directory: &Path) -> io::Result<()> {
+fn hard_link_lifecycle(directory: &Path) -> io::Result<()> {
     let root = directory.join("link-contract");
     std::fs::create_dir(&root)?;
     let a = root.join("a");
@@ -1113,7 +1143,7 @@ pub fn verify_hard_link_lifecycle(directory: &Path) -> io::Result<()> {
     let operation = (|| {
         std::fs::write(&a, b"surviving link")?;
         std::fs::hard_link(&a, &b)?;
-        let first = FileHandle::open(&a, 0x0001_0080, 0)?;
+        let first = FileHandle::open(&a, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
         let second = FileHandle::open(&b, 0x80, 0)?;
         let result = completed(delete_file_link(&first), first.close());
         let result = result.and_then(|()| {
@@ -1125,12 +1155,12 @@ pub fn verify_hard_link_lifecycle(directory: &Path) -> io::Result<()> {
             Ok(())
         });
         completed(result, second.close())?;
-        std::fs::remove_file(&b)?;
+        remove_namespace_link(&b)?;
         std::fs::write(&a, b"retained hard link")?;
         std::fs::hard_link(&a, &b)?;
-        let first = FileHandle::open(&a, 0x0001_0080, 0)?;
+        let first = FileHandle::open(&a, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
         let result = (|| {
-            let second = FileHandle::open(&b, 0x0001_0080, 0)?;
+            let second = FileHandle::open(&b, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
             let result = (|| {
                 delete_file_link(&first)?;
                 let other = FileHandle::open(&b, 0x80, 0)?;
@@ -1161,9 +1191,9 @@ pub fn verify_hard_link_lifecycle(directory: &Path) -> io::Result<()> {
         for replace in [false, true] {
             std::fs::write(&a, b"retained hard link")?;
             std::fs::hard_link(&a, &b)?;
-            let first = FileHandle::open(&a, 0x0001_0080, 0)?;
+            let first = FileHandle::open(&a, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
             let result = (|| {
-                let second = FileHandle::open(&b, 0x0001_0080, 0)?;
+                let second = FileHandle::open(&b, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
                 let result = (|| {
                     rename_file_link(&first, &b, replace)?;
                     if a.try_exists()? || !b.try_exists()? {
@@ -1186,19 +1216,19 @@ pub fn verify_hard_link_lifecycle(directory: &Path) -> io::Result<()> {
                 completed(result, second.close())
             })();
             completed(result, first.close())?;
-            std::fs::remove_file(&d)?;
+            remove_namespace_link(&d)?;
         }
         Ok(())
     })();
     let cleanup = (|| {
         for path in [&a, &b, &c, &d] {
-            match std::fs::remove_file(path) {
+            match remove_namespace_link(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
-        std::fs::remove_dir(&root)
+        remove_namespace_link(&root)
     })();
     completed(operation, cleanup)
 }
@@ -2126,7 +2156,7 @@ mod tests {
                 std::process::id()
             ));
             std::fs::create_dir(&root)?;
-            let result = verify_hard_link_lifecycle(&root);
+            let result = verify_hard_link_lifecycle(&root, NamespaceAccess::Descriptor);
             completed(result, std::fs::remove_dir(&root))
         })();
         assert!(result.is_ok(), "{result:?}");

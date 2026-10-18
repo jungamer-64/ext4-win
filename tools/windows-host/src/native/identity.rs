@@ -16,7 +16,9 @@ use windows_sys::Win32::{
     Security::*,
     System::{
         IO::DeviceIoControl,
-        Threading::{GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken},
+        Threading::{
+            GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
+        },
     },
 };
 
@@ -390,6 +392,134 @@ pub fn replace_identity(replacement: Replacement) -> Result<MappingState, Identi
         Ok(()) => Ok(state),
         Err(source) => Err(IdentityControlError::Release { state, source }),
     }
+}
+
+/// Opens the process token with authority to derive a private impersonation token.
+/// # Errors
+/// Returns native token admission failure.
+fn process_token() -> io::Result<OwnedHandle> {
+    let process = unsafe {
+        // SAFETY: The current-process pseudo handle is borrowed and never closed.
+        GetCurrentProcess()
+    };
+    let mut token = ptr::null_mut();
+    let success = unsafe {
+        // SAFETY: Output is initialized writable handle storage.
+        OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut token)
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe {
+        // SAFETY: Success transfers one uniquely owned native token handle.
+        OwnedHandle::from_raw_handle(token)
+    })
+}
+/// Derives a private token whose privileges can change without altering the process token.
+/// # Errors
+/// Returns a native duplication failure.
+fn impersonation(token: &OwnedHandle) -> io::Result<OwnedHandle> {
+    let mut result = ptr::null_mut();
+    let success = unsafe {
+        // SAFETY: Input is retained; output receives a distinct owned token.
+        DuplicateTokenEx(
+            token.as_raw_handle(),
+            TOKEN_QUERY | TOKEN_IMPERSONATE | TOKEN_ADJUST_PRIVILEGES,
+            ptr::null(),
+            SecurityImpersonation,
+            TokenImpersonation,
+            &mut result,
+        )
+    };
+    if success == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe {
+        // SAFETY: Successful duplication transfers one owned handle.
+        OwnedHandle::from_raw_handle(result)
+    })
+}
+/// Selects enabled state for exactly one privilege on a private duplicated token.
+/// # Errors
+/// Returns lookup, adjustment or privilege-not-assigned failure.
+fn set_privilege(token: &OwnedHandle, name: &str, enabled: bool) -> io::Result<()> {
+    let name = wide(OsStr::new(name))?;
+    let mut luid = windows_sys::Win32::Foundation::LUID::default();
+    let found = unsafe {
+        // SAFETY: The terminated privilege name and writable LUID live throughout the call.
+        LookupPrivilegeValueW(ptr::null(), name.as_ptr(), &mut luid)
+    };
+    if found == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let privileges = TOKEN_PRIVILEGES {
+        PrivilegeCount: 1,
+        Privileges: [LUID_AND_ATTRIBUTES {
+            Luid: luid,
+            Attributes: if enabled { SE_PRIVILEGE_ENABLED } else { 0 },
+        }],
+    };
+    unsafe {
+        // SAFETY: Clears this thread's last-error observation before the adjustment API.
+        windows_sys::Win32::Foundation::SetLastError(0);
+    }
+    let adjusted = unsafe {
+        // SAFETY: Only the private duplicate token is adjusted; input includes its one complete privilege.
+        AdjustTokenPrivileges(
+            token.as_raw_handle(),
+            0,
+            &privileges,
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+        )
+    };
+    let error = io::Error::last_os_error();
+    if adjusted == 0 || error.raw_os_error() == Some(1300) {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+/// Runs synchronous filesystem work with SeRestorePrivilege on a private, joined thread.
+///
+/// The process token is duplicated before enabling the privilege. The caller's token is never
+/// replaced. Explicit reversion precedes success; thread termination also ends impersonation
+/// when the operation panics or reversion fails.
+/// # Errors
+/// Returns token admission, absent privilege, operation, reversion or thread failure.
+pub(super) fn with_restore_privilege<T: Send>(
+    work: impl FnOnce() -> io::Result<T> + Send,
+) -> io::Result<T> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                let source = process_token()?;
+                let token = impersonation(&source)?;
+                set_privilege(&token, "SeRestorePrivilege", true)?;
+                let assigned = unsafe {
+                    // SAFETY: This newly created thread has no earlier impersonation; the private
+                    // token remains retained through explicit reversion and thread completion.
+                    SetThreadToken(ptr::null(), token.as_raw_handle())
+                };
+                if assigned == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let result = work();
+                let reverted = unsafe {
+                    // SAFETY: Only this private thread's preceding impersonation is removed.
+                    SetThreadToken(ptr::null(), ptr::null_mut())
+                };
+                let reversion = if reverted == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                };
+                completed(result, reversion)
+            })?
+            .join()
+            .map_err(|_| io::Error::other("restore-privilege filesystem thread panicked"))?
+    })
 }
 
 mod file_security;
