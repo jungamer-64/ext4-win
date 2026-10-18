@@ -257,6 +257,76 @@ fn data_without_mdl_requires_the_buffered_union_arm() -> Result<(), DriverError>
 }
 
 /// # Panics
+/// Fails if native shared-memory access corrupts a checked window or its adjacent guard byte.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "joined native copies share opaque UnsafeCell storage; Rust only borrows independent snapshots"
+)]
+fn requestor_copies_preserve_windows_during_native_updates() {
+    use core::{
+        cell::UnsafeCell,
+        sync::atomic::{AtomicPtr, Ordering},
+    };
+    use std::sync::Barrier;
+
+    let shared = UnsafeCell::new([0xE7_u8; 65]);
+    let address = AtomicPtr::new(shared.get().cast::<u8>());
+    let start = Barrier::new(2);
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            start.wait();
+            // A finite writer always joins, including when an assertion in the reader fails.
+            for _ in 0..1024 {
+                for source in [[0x55_u8; 64], [0xAA; 64]] {
+                    unsafe {
+                        // SAFETY: The scope retains this 64-byte mapping in UnsafeCell and the
+                        // independent source through the native shared-memory copy. No Rust
+                        // reference to the mapped bytes exists during either thread's access.
+                        crate::kernel::ffi::RtlCopyVolatileMemory(
+                            address.load(Ordering::Relaxed).cast(),
+                            source.as_ptr().cast(),
+                            source.len(),
+                        );
+                    }
+                }
+            }
+        });
+        start.wait();
+        for _ in 0..1024 {
+            let mapping = NonNull::new(address.load(Ordering::Relaxed));
+            let mut snapshot = [0_u8; 64];
+            let copied = unsafe {
+                // SAFETY: The joined scope retains the mapping; the snapshot is disjoint and
+                // uniquely borrowed. The native copy permits the writer's concurrent changes.
+                super::copy_requestor_input_window(mapping, 64, 0, &mut snapshot)
+            };
+            assert_eq!(copied, Ok(()));
+            // The copy need not observe one coherent version of the whole shared window.
+            assert!(
+                snapshot
+                    .iter()
+                    .all(|byte| matches!(byte, 0xE7 | 0x55 | 0xAA | 0x3C))
+            );
+            let published = unsafe {
+                // SAFETY: The live checked mapping and this independent immutable source do
+                // not overlap; native publication may race with the external writer.
+                super::copy_requestor_output_window(mapping, 64, 8, &[0x3C; 16])
+            };
+            assert_eq!(published, Ok(()));
+            let rejected = unsafe {
+                // SAFETY: The mapping remains live; this request exceeds only its declared
+                // window. Rejection must precede any native write to the adjacent guard byte.
+                super::copy_requestor_output_window(mapping, 64, 64, &[1])
+            };
+            assert_eq!(rejected, Err(DriverError::InternalInvariantViolation));
+        }
+        assert!(writer.join().is_ok());
+    });
+    assert_eq!(shared.into_inner().last(), Some(&0xE7));
+}
+
+/// # Panics
 ///
 /// Panics when buffered output becomes a Rust slice before the complete declared range has
 /// been initialized.

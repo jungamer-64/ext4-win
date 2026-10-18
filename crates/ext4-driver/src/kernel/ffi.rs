@@ -1,5 +1,17 @@
 //! I/O Manager symbols used by the driver boundary.
 
+pub(crate) use wdk_sys::ntddk::RtlCopyVolatileMemory;
+
+// The WDK copy has an external shared-memory contract and is not a compiler memcpy intrinsic.
+// Host tests execute the corresponding user-mode implementation of that same platform contract.
+#[cfg_attr(not(test), link(name = "volatileaccessk", kind = "static"))]
+#[cfg_attr(test, link(name = "volatileaccessu", kind = "static"))]
+#[expect(
+    unsafe_code,
+    reason = "the platform copy binding must link the library matching the kernel or host execution domain"
+)]
+unsafe extern "C" {}
+
 pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::IoCompleteRequest;

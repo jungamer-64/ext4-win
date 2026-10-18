@@ -489,6 +489,9 @@ impl RequestorOutput<'_> {
 }
 
 /// Copies one checked requestor-input window into driver-owned storage.
+///
+/// The requestor may change mapped bytes concurrently. The native copy confines all external
+/// reads to this call; the resulting owned bytes are stable but are not an atomic snapshot.
 /// # Safety
 ///
 /// A nonempty `address` must remain readable for `total_length` bytes during the call, with valid
@@ -519,15 +522,22 @@ pub(super) unsafe fn copy_requestor_input_window(
     isize::try_from(total_length).map_err(|_| DriverError::InternalInvariantViolation)?;
     let source = address.as_ptr().wrapping_add(offset);
     unsafe {
-        // SAFETY: The active or pending IRP owns `address` for `total_length`; checked arithmetic
-        // selects an in-range source window, and the caller guarantees non-overlap with the
-        // initialized driver-owned destination.
-        core::ptr::copy_nonoverlapping(source, destination.as_mut_ptr(), destination.len());
+        // SAFETY: The IRP retains the mapping and the checked window is readable and disjoint
+        // from the exclusive destination. The WDK routine supports concurrently changing shared
+        // memory without exposing it to Rust references or compiler memcpy optimizations.
+        crate::kernel::ffi::RtlCopyVolatileMemory(
+            destination.as_mut_ptr().cast(),
+            source.cast(),
+            destination.len(),
+        );
     }
     Ok(())
 }
 
 /// Copies driver-owned bytes into one checked requestor-output window.
+///
+/// The requestor may observe or change the mapping during publication. All external writes
+/// occur within the native call, without promising atomic visibility of the whole window.
 /// # Safety
 ///
 /// A nonempty `address` must remain writable for `total_length` bytes during the call, with valid
@@ -558,10 +568,14 @@ pub(super) unsafe fn copy_requestor_output_window(
     isize::try_from(total_length).map_err(|_| DriverError::InternalInvariantViolation)?;
     let destination = address.as_ptr().wrapping_add(offset);
     unsafe {
-        // SAFETY: The active or pending IRP owns `address` for `total_length`; checked arithmetic
-        // selects an in-range destination window, and the caller guarantees non-overlap with the
-        // initialized driver-owned source.
-        core::ptr::copy_nonoverlapping(source.as_ptr(), destination, source.len());
+        // SAFETY: The IRP retains the writable checked window, disjoint from the borrowed source.
+        // The WDK shared-memory copy permits external access without creating a Rust reference
+        // to requestor bytes and cannot move memory accesses beyond this native call.
+        crate::kernel::ffi::RtlCopyVolatileMemory(
+            destination.cast(),
+            source.as_ptr().cast(),
+            source.len(),
+        );
     }
     Ok(())
 }

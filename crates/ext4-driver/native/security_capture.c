@@ -128,7 +128,7 @@ ext4win_measure_relative_sid(
         if (requestor_mode == UserMode) {
             ProbeForRead(prefix_address, prefix_length, TYPE_ALIGNMENT(UCHAR));
         }
-        RtlCopyMemory(&prefix, prefix_address, prefix_length);
+        RtlCopyVolatileMemory(&prefix, prefix_address, prefix_length);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
@@ -188,7 +188,7 @@ ext4win_measure_relative_acl(
         if (requestor_mode == UserMode) {
             ProbeForRead(header_address, header_length, TYPE_ALIGNMENT(UCHAR));
         }
-        RtlCopyMemory(&header, header_address, header_length);
+        RtlCopyVolatileMemory(&header, header_address, header_length);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
@@ -245,7 +245,7 @@ ext4win_measure_relative_security_descriptor(
         if (requestor_mode == UserMode) {
             ProbeForRead(source, header_length, TYPE_ALIGNMENT(UCHAR));
         }
-        RtlCopyMemory(&header, source, header_length);
+        RtlCopyVolatileMemory(&header, source, header_length);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
@@ -455,7 +455,7 @@ ext4win_copy_requestor_output(
         (output->Mdl == NULL) || (output->SystemAddress == NULL)) {
         status = STATUS_INVALID_PARAMETER;
     } else {
-        RtlCopyMemory(output->SystemAddress, owned_source, source_length);
+        RtlCopyVolatileMemory(output->SystemAddress, owned_source, source_length);
         status = STATUS_SUCCESS;
     }
 
@@ -490,7 +490,7 @@ ext4win_capture_starting_vcn(_In_ PIRP irp, _Out_ PLONGLONG value)
     if (source == NULL) { return STATUS_INVALID_USER_BUFFER; }
     __try {
         if (irp->RequestorMode == UserMode) { ProbeForRead(source, sizeof(*value), TYPE_ALIGNMENT(LONGLONG)); }
-        RtlCopyMemory(value, source, sizeof(*value));
+        RtlCopyVolatileMemory(value, source, sizeof(*value));
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
@@ -574,7 +574,7 @@ ext4win_capture_set_security_descriptor(
         if (requestor_mode == UserMode) {
             ProbeForRead(source, candidate_length, TYPE_ALIGNMENT(UCHAR));
         }
-        RtlCopyMemory(snapshot, source, candidate_length);
+        RtlCopyVolatileMemory(snapshot, source, candidate_length);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
@@ -677,7 +677,7 @@ ext4win_capture_bounded_input(
         if (access_mode == UserMode) {
             ProbeForRead(source, length, alignment);
         }
-        RtlCopyMemory(snapshot, source, length);
+        RtlCopyVolatileMemory(snapshot, source, length);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
@@ -741,7 +741,7 @@ ext4win_capture_io_manager_directory_pattern(
     status = STATUS_SUCCESS;
     __try {
         /* NtQueryDirectoryFile has already captured this descriptor for the IRP. */
-        RtlCopyMemory(&header, source, sizeof(header));
+        RtlCopyVolatileMemory(&header, source, sizeof(header));
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = ext4win_normalize_buffer_exception(GetExceptionCode());
