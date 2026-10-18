@@ -496,8 +496,6 @@ pub(super) struct FileControlBlockOpenState {
     pub(super) shares: FileObjectShares,
     /// Explicit stream lifetime across handle and cache/mapping residency domains.
     pub(super) lifetime: StreamLifetimeState,
-    /// One namespace deletion truth shared by every handle for this inode.
-    pub(super) deletion: FileDeletionState,
     /// Current selected-link identities, interned while the ledger resource is held.
     pub(super) locations: OpenedLocations,
 }
@@ -511,7 +509,6 @@ impl FileControlBlockOpenState {
                 handles: NonZeroU32::MIN,
                 deferred_leases: 0,
             },
-            deletion: FileDeletionState::Live,
             locations: OpenedLocations::new(),
         }
     }
@@ -526,7 +523,6 @@ impl FileControlBlockOpenState {
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<NonZeroU32> {
-        self.deletion.ensure_openable()?;
         if let FileControlBlockShareCheck::ExistingNode {
             operation_access,
             oplock_policy,
@@ -548,22 +544,11 @@ impl FileControlBlockOpenState {
         self.shares.cleanup(file_object);
     }
 
-    /// Selects deferred deletion after one share claim has been removed.
-    pub(super) fn cleanup_disposition(&self) -> FileCleanupDisposition {
-        self.deletion
-            .cleanup_target(self.shares.active_handle_count())
-            .map_or(
-                FileCleanupDisposition::Retained,
-                FileCleanupDisposition::Delete,
-            )
-    }
-
     /// Requires ordinary replacement to respect deletion state and open-inode lifetime.
     /// # Errors
     ///
     /// Returns delete-pending or sharing-violation when the current open state rejects replacement.
     pub(super) fn ensure_namespace_replaceable(&self) -> DriverResult<()> {
-        self.deletion.ensure_openable()?;
         if self.shares.active_handle_count() == 0 {
             Ok(())
         } else {
@@ -585,94 +570,6 @@ impl FileControlBlockOpenState {
                 ..
             }
         )
-    }
-
-    /// Publishes a shared delete-pending target and returns displaced storage.
-    ///
-    /// A create-time delete-on-close target is mandatory and therefore cannot be replaced by a
-    /// later, cancellable disposition request from another already-open handle.
-    pub(super) fn set_delete_pending(
-        &mut self,
-        pending: PendingFileDeletion,
-    ) -> Option<PendingFileDeletion> {
-        if matches!(
-            &self.deletion,
-            FileDeletionState::Pending(existing)
-                if existing.cause() == FileDeletionCause::DeleteOnClose
-        ) {
-            return Some(pending);
-        }
-        match core::mem::replace(&mut self.deletion, FileDeletionState::Pending(pending)) {
-            FileDeletionState::Live => None,
-            FileDeletionState::Pending(previous) => Some(previous),
-            FileDeletionState::Deleted => {
-                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
-            }
-        }
-    }
-
-    /// Cancels a disposition-originated delete-pending before final active cleanup.
-    ///
-    /// Create-time delete-on-close is mandatory and is intentionally unaffected.
-    pub(super) fn clear_delete_pending(&mut self) -> Option<PendingFileDeletion> {
-        if matches!(
-            &self.deletion,
-            FileDeletionState::Pending(existing)
-                if existing.cause() == FileDeletionCause::DeleteOnClose
-        ) {
-            return None;
-        }
-        match core::mem::replace(&mut self.deletion, FileDeletionState::Live) {
-            FileDeletionState::Live => None,
-            FileDeletionState::Pending(previous) => Some(previous),
-            FileDeletionState::Deleted => {
-                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
-            }
-        }
-    }
-
-    /// Returns whether the inode has crossed into delete-pending.
-    pub(super) const fn delete_pending(&self) -> bool {
-        self.deletion.is_pending()
-    }
-
-    /// Publishes successful removal of the exact target selected by cleanup.
-    pub(super) fn complete_delete(
-        &mut self,
-        target: NonNull<FileDeleteTarget>,
-    ) -> PendingFileDeletion {
-        match core::mem::replace(&mut self.deletion, FileDeletionState::Deleted) {
-            FileDeletionState::Pending(pending) if pending.target() == target => pending,
-            FileDeletionState::Live
-            | FileDeletionState::Pending(_)
-            | FileDeletionState::Deleted => {
-                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
-            }
-        }
-    }
-
-    /// Aborts the exact final-cleanup deletion before any lower write can have taken effect.
-    ///
-    /// This is distinct from a disposition cancellation: it is legal for create-time
-    /// delete-on-close as well, but only after the last active handle has entered cleanup and the
-    /// deletion attempt itself failed before an uncertain external effect.
-    pub(super) fn abort_cleanup_delete(
-        &mut self,
-        target: NonNull<FileDeleteTarget>,
-    ) -> Option<PendingFileDeletion> {
-        if self.shares.active_handle_count() != 0 {
-            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
-        }
-        match core::mem::replace(&mut self.deletion, FileDeletionState::Live) {
-            FileDeletionState::Pending(pending) if pending.target() == target => Some(pending),
-            FileDeletionState::Deleted => {
-                self.deletion = FileDeletionState::Deleted;
-                None
-            }
-            FileDeletionState::Live | FileDeletionState::Pending(_) => {
-                KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck()
-            }
-        }
     }
 
     /// Computes one additional FILE_OBJECT reference without mutating state.
