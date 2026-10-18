@@ -2036,6 +2036,22 @@ impl Superblock {
         self.features.has_resize_inode() && inode.as_u32() == EXT4_RESIZE_INODE_ID
     }
 
+    /// Keeps filesystem-owned metadata outside the user namespace, including file-ID opens.
+    /// Root is the only namespace inode below `s_first_ino`; configured journal and orphan
+    /// inodes remain private even when their numbers are in the ordinary allocation range.
+    /// # Errors
+    /// Returns invalid inode for a reserved, metadata-owned, or out-of-volume identity.
+    pub(crate) fn require_namespace_inode(self, inode: InodeId) -> Result<()> {
+        if (inode != InodeId::ROOT && inode.as_u32() < self.first_inode.as_u32())
+            || inode.as_u32() > self.inode_count.as_u32()
+            || self.journal_mode == JournalMode::Internal(inode)
+            || self.orphan_file.is_some_and(|file| file.inode == inode)
+        {
+            return Err(Error::InvalidInode);
+        }
+        Ok(())
+    }
+
     /// Block group descriptor size in bytes.
     #[must_use]
     pub const fn descriptor_size(self) -> BlockGroupDescriptorSize {
@@ -2479,6 +2495,34 @@ mod tests {
         put_le_u16(&mut bytes, disk_offset(88), 256)?;
         Superblock::refresh_checksum(&mut bytes)?;
         Ok(bytes)
+    }
+
+    /// # Errors
+    /// Returns fixture construction or parsing failures.
+    /// # Panics
+    /// Fails if metadata-owned inodes become namespace nodes or root/ordinary admission is lost.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions exercise namespace identity ownership independently of inode contents"
+    )]
+    fn namespace_admission_excludes_filesystem_metadata() -> Result<()> {
+        let mut bytes = primary(true, false, false)?;
+        put_le_u32(&mut bytes, disk_offset(224), 31)?;
+        Superblock::refresh_checksum(&mut bytes)?;
+        let superblock = Superblock::parse_read_write(&bytes)?;
+        assert_eq!(superblock.require_namespace_inode(InodeId::ROOT), Ok(()));
+        assert_eq!(
+            superblock.require_namespace_inode(InodeId::try_from(11)?),
+            Ok(())
+        );
+        for number in [7, 12, 31, 129] {
+            assert_eq!(
+                superblock.require_namespace_inode(InodeId::try_from(number)?),
+                Err(Error::InvalidInode),
+            );
+        }
+        Ok(())
     }
 
     /// # Panics

@@ -210,7 +210,7 @@ pub(super) fn verify_orphan_recovery(linux: LinuxEnvironment, root: &Path) -> Ta
         }
         format.arg(&image_path);
         run_checked(format, &name)?;
-        drive_core_mount_and_clean_close(&image)?;
+        inode::verify_metadata_inode_isolation(&image)?;
         verify_internal_e2fsck_clean(linux, &image, &format!("{name} empty orphan file"))?;
 
         let payload = directory.join("payload.bin");

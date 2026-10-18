@@ -374,9 +374,10 @@ impl EpochReadView<'_, '_> {
     /// Reads and classifies one inode as a typed node.
     ///
     /// # Errors
-    /// Returns an error when the inode number is outside the volume or the inode
-    /// table cannot be read and parsed.
+    /// Returns an error when the inode belongs to filesystem metadata, is outside the volume,
+    /// or its record cannot be read and authenticated.
     pub(super) fn load_inode_node(&mut self, inode_id: InodeId) -> Result<LoadedNode> {
+        self.superblock.require_namespace_inode(inode_id)?;
         Ok(LoadedNode::from_inode(self.read_inode_record(inode_id)?))
     }
 

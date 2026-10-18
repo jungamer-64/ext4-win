@@ -14,6 +14,7 @@ pub(super) fn verify_inode_contracts(
     verify_64k_directories(linux, &root)?;
     let image = root.join("filesystem.img");
     format_htree_image(linux, &image, 32 * 1024 * 1024, 4096, true, false, 4)?;
+    verify_metadata_inode_isolation(&image)?;
     let payload = root.join("payload.bin");
     fs::write(&payload, [0x11_u8; 8192])?;
     request(
@@ -31,6 +32,37 @@ pub(super) fn verify_inode_contracts(
     verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
     Ok(())
+}
+
+/// Checks namespace admission using the metadata identities assigned by e2fsprogs.
+/// # Errors
+/// Returns malformed fixture fields, mount/read/close failures, or exposed filesystem metadata.
+pub(super) fn verify_metadata_inode_isolation(image: &Path) -> TaskResult<()> {
+    let primary = read_image_block(&mut File::open(image)?, 1, 1024)?;
+    let field = |offset: usize| -> TaskResult<u32> {
+        let end = offset
+            .checked_add(4)
+            .ok_or_else(|| io::Error::other("field overflow"))?;
+        Ok(u32::from_le_bytes(
+            primary
+                .get(offset..end)
+                .ok_or_else(|| io::Error::other("missing inode field"))?
+                .try_into()?,
+        ))
+    };
+    let journal = field(224)?;
+    let orphan = field(0x280)?;
+    drive_internal_core_read(image, |pass| {
+        pass.load_directory(ext4_core::DirectoryNodeId::ROOT)?;
+        for inode in [journal, orphan].into_iter().filter(|inode| *inode != 0) {
+            match pass.load_node_by_file_index(inode) {
+                Err(ext4_core::Error::InvalidInode) => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(ext4_core::Error::InvalidInode),
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Executes one independent debugfs request against a task-owned image.
