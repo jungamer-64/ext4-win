@@ -11,6 +11,8 @@ enum SetFilePlan {
     Basic {
         /// Validated timestamp assignments and handle-local update selections.
         times: BasicTimeUpdates,
+        /// Automatic change-time policy retained by the originating handle.
+        policy: HandleTimestampPolicy,
         /// Caller attribute selection.
         attributes: u32,
         /// Exact CCB publication prepared while the IRP retains it.
@@ -250,6 +252,7 @@ pub(super) fn set_file_information(
                 let times = BasicTimeUpdates::decode(info)?;
                 SetFilePlan::Basic {
                     times,
+                    policy: opened_file.timestamp_policy(),
                     attributes: info.FileAttributes,
                     publication: opened_file.prepare_timestamp_publication(
                         times.policy(opened_file.timestamp_policy()),
@@ -338,11 +341,12 @@ pub(super) fn set_file_information(
         }
         SetFilePlan::Basic {
             times,
+            policy,
             attributes,
             publication,
             node,
         } => {
-            apply_basic_information(times, attributes, node, mutation)?;
+            apply_basic_information(times, policy, attributes, node, mutation)?;
             return Ok(SetFileResolution::Mutation(SetFilePublication::Timestamps(
                 publication,
             )));
@@ -563,13 +567,27 @@ impl BasicTimeUpdates {
         })
     }
 
-    /// Retains zero/sentinel values across attribute changes in the same basic-information request.
-    fn times(self, current: Ext4Times) -> Ext4Times {
+    /// Explicit assignments override metadata side effects; only the selected handle's
+    /// change-time suppression can discard the change caused by an attribute mutation.
+    fn times(
+        self,
+        before: Ext4Times,
+        after: Ext4Times,
+        policy: HandleTimestampPolicy,
+    ) -> Ext4Times {
+        let changed = match self.changed {
+            BasicTimeUpdate::Keep | BasicTimeUpdate::Resume
+                if self.changed.automatic(policy.changed) == AutomaticTimeUpdate::Enabled =>
+            {
+                after.changed()
+            }
+            _ => self.changed.value(before.changed()),
+        };
         Ext4Times::new(
-            self.accessed.value(current.accessed()),
-            self.modified.value(current.modified()),
-            self.changed.value(current.changed()),
-            self.created.or(current.created()),
+            self.accessed.value(before.accessed()),
+            self.modified.value(before.modified()),
+            changed,
+            self.created.or(before.created()),
         )
     }
 
@@ -603,12 +621,12 @@ fn windows_timestamp(value: LARGE_INTEGER) -> DriverResult<Ext4Timestamp> {
 /// Returns invalid attributes or ext4 metadata staging failures.
 fn apply_basic_information(
     update: BasicTimeUpdates,
+    policy: HandleTimestampPolicy,
     attributes: u32,
     node_id: NodeId,
     transaction: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<()> {
     let metadata = metadata_from_node(transaction, node_id)?;
-    let times = update.times(metadata.times);
     let attributes = set_basic_attributes(metadata, attributes)?;
     let node = transaction.node(node_id)?;
     if let Some(security) = attributes.security() {
@@ -617,7 +635,9 @@ fn apply_basic_information(
     if let Some(overlay) = attributes.overlay() {
         transaction.set_windows_overlay(node, overlay)?;
     }
-    if times != transaction.staged_node_metadata(node_id)?.times() {
+    let staged_times = transaction.staged_node_metadata(node_id)?.times();
+    let times = update.times(metadata.times, staged_times, policy);
+    if times != staged_times {
         transaction.set_times(node, times)?;
     }
     Ok(())

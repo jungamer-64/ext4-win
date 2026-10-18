@@ -1,4 +1,43 @@
 use crate::request::file_info::test_support::*;
+use ext4_core::{Ext4Times, Ext4Timestamp};
+
+/// # Panics
+/// Fails if attribute side effects overwrite explicit times or lose an unsuppressed change time.
+#[test]
+fn attribute_changes_preserve_only_explicit_or_suppressed_change_time() {
+    use crate::state::{AutomaticTimeUpdate, HandleTimestampPolicy};
+    let old = Ext4Timestamp::from_seconds(10);
+    let changed = Ext4Timestamp::from_seconds(20);
+    let before = Ext4Times::new(old, old, old, Some(old));
+    let after = Ext4Times::new(old, old, changed, Some(old));
+    let mut update = super::BasicTimeUpdates {
+        created: None,
+        accessed: super::BasicTimeUpdate::Keep,
+        modified: super::BasicTimeUpdate::Keep,
+        changed: super::BasicTimeUpdate::Keep,
+    };
+    assert_eq!(
+        update.times(before, after, HandleTimestampPolicy::AUTOMATIC),
+        after
+    );
+    let suppressed = HandleTimestampPolicy {
+        changed: AutomaticTimeUpdate::Suppressed,
+        ..HandleTimestampPolicy::AUTOMATIC
+    };
+    assert_eq!(update.times(before, after, suppressed), before);
+    update.changed = super::BasicTimeUpdate::Suppress;
+    assert_eq!(
+        update.times(before, after, HandleTimestampPolicy::AUTOMATIC),
+        before
+    );
+    update.changed = super::BasicTimeUpdate::Resume;
+    assert_eq!(update.times(before, after, suppressed), after);
+    update.changed = super::BasicTimeUpdate::Set(old);
+    assert_eq!(
+        update.times(before, after, HandleTimestampPolicy::AUTOMATIC),
+        before
+    );
+}
 
 /// # Panics
 ///
