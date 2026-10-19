@@ -533,18 +533,7 @@ impl<Next> StorageRequestSequence<Next> {
         }
     }
 
-    /// Advances to one concrete request or the next phase without allocation.
-    #[must_use]
-    pub fn advance(mut self) -> StorageRequestSequenceStep<Next> {
-        if let Some(request) = self.remaining.next() {
-            StorageRequestSequenceStep::Submit {
-                request,
-                suspended: self,
-            }
-        } else {
-            StorageRequestSequenceStep::Finished(self.next)
-        }
-    }
+
 }
 
 /// Continuation that requires filesystem durability after ordered data writes.
@@ -565,11 +554,7 @@ impl OrderedDataDurability {
         }
     }
 
-    /// Consumes a successful filesystem flush into the journal-payload sequence.
-    #[must_use]
-    pub fn completed(self) -> StorageRequestSequence<JournalPayloadDurability> {
-        StorageRequestSequence::new(self.journal_writes, self.next)
-    }
+
 }
 
 /// Continuation that requires journal durability after descriptor and payload writes.
@@ -592,15 +577,7 @@ impl JournalPayloadDurability {
         }
     }
 
-    /// Consumes a successful payload flush into the single commit-record phase.
-    #[must_use]
-    pub fn completed(self) -> CommitRecordPhase {
-        CommitRecordPhase {
-            request: self.commit_write,
-            journal_target: self.journal_target,
-            durable: self.durable,
-        }
-    }
+
 }
 
 /// Single commit-record write preceding the commit durability flush.
@@ -646,11 +623,7 @@ impl CommitDurability {
         }
     }
 
-    /// Reveals the durable mutation after a successful commit flush.
-    #[must_use]
-    pub fn completed(self) -> DurableMutation {
-        self.durable
-    }
+
 }
 
 /// Continuation requiring a filesystem flush after all home blocks complete.
@@ -675,16 +648,7 @@ impl HomeBlockDurability {
         }
     }
 
-    /// Consumes the successful home-block flush into the clean-record phase.
-    #[must_use]
-    pub fn completed(self) -> CleanJournalRecordPhase {
-        CleanJournalRecordPhase {
-            request: self.clean_write,
-            journal_target: self.journal_target,
-            clean_journal: self.clean_journal,
-            checkpointed_epoch: self.checkpointed_epoch,
-        }
-    }
+
 }
 
 /// Single clean-journal superblock write.

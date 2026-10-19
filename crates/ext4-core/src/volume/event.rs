@@ -54,11 +54,7 @@ pub struct MutationLease {
 }
 
 impl MutationLease {
-    /// Issues the lease after the scheduler atomically acquired the complete resource set.
-    #[must_use]
-    pub const fn granted(ticket: u64) -> Self {
-        Self { ticket }
-    }
+
 
     /// Observes the scheduler ticket without duplicating the one-shot lease.
     #[must_use]
@@ -81,11 +77,7 @@ pub struct CommitLease {
 }
 
 impl CommitLease {
-    /// Issues the lease after journal-space and checkpoint constraints are satisfied.
-    #[must_use]
-    pub const fn granted(ticket: u64) -> Self {
-        Self { ticket }
-    }
+
 
     /// Observes the scheduler ticket without duplicating the one-shot lease.
     #[must_use]
@@ -108,11 +100,7 @@ pub struct VisibilityLease {
 }
 
 impl VisibilityLease {
-    /// Issues the lease after the visibility gate becomes exclusively available.
-    #[must_use]
-    pub const fn granted(ticket: u64) -> Self {
-        Self { ticket }
-    }
+
 
     /// Observes the scheduler ticket without duplicating the one-shot lease.
     #[must_use]
@@ -135,11 +123,7 @@ pub struct CheckpointLease {
 }
 
 impl CheckpointLease {
-    /// Issues the lease for one published overlay epoch.
-    #[must_use]
-    pub const fn granted(epoch: super::EpochSequence) -> Self {
-        Self { epoch }
-    }
+
 
     /// Consumes the lease into the checkpointed epoch sequence.
     #[must_use]
