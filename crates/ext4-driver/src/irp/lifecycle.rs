@@ -2,6 +2,14 @@
 
 use super::*;
 
+mod capture;
+pub(crate) use capture::{
+    CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
+    PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory, PreparedQueryEa, PreparedRead,
+    PreparedRequest, PreparedWrite,
+};
+use capture::{QueueContext, QueueContextOwnership};
+
 /// Cache policy requested by this IRP independently of its FILE_OBJECT.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DataCachePolicy {
@@ -881,20 +889,12 @@ unsafe extern "system" {
 #[must_use]
 pub(super) struct PendingIrp {
     /// Dispatch target whose completion authority transfers with queue insertion.
-    pub(super) target: DispatchTarget,
+    target: DispatchTarget,
     /// Requestor-context capture transferred through `DriverContext[0]` before insertion.
-    pub(super) context: QueueContextOwnership,
+    context: QueueContextOwnership,
 }
 
 impl PendingIrp {
-    /// Joins the received completion authority with its fully captured queue context.
-    pub(super) fn from_received(received: ReceivedIrp, context: QueueContextOwnership) -> Self {
-        Self {
-            target: received.target,
-            context,
-        }
-    }
-
     /// Publishes the context into `DriverContext[0]` and transfers queue ownership.
     pub(super) fn publish(self) -> PIRP {
         self.target.irp.publish_queue_context(self.context);
@@ -1771,7 +1771,7 @@ impl KernelIrp {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(super) fn publish_queue_context(self, context: QueueContextOwnership) {
+    fn publish_queue_context(self, context: QueueContextOwnership) {
         let mut slots = self.driver_context_slots();
         let driver_context = unsafe {
             // SAFETY: Before CSQ insertion, queue preparation uniquely owns these driver slots.
@@ -1796,7 +1796,7 @@ impl KernelIrp {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(super) fn take_queue_context(self) -> QueueContextOwnership {
+    fn take_queue_context(self) -> QueueContextOwnership {
         let mut slots = self.driver_context_slots();
         let driver_context = unsafe {
             // SAFETY: Atomic CSQ removal transferred these driver slots to the completion owner;

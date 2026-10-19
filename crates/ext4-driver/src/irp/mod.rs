@@ -21,7 +21,6 @@ use crate::wire::{LittleEndianInput, WireOffset};
 
 mod buffer;
 mod cancel;
-mod capture;
 mod completion;
 mod control;
 mod create;
@@ -42,12 +41,6 @@ mod stack;
 
 pub(crate) use buffer::*;
 use buffer::{mdl_data_buffer_address, stack_flag};
-pub(crate) use capture::{
-    CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
-    PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory, PreparedQueryEa, PreparedRead,
-    PreparedRequest, PreparedWrite,
-};
-use capture::{QueueContext, QueueContextOwnership};
 #[cfg(not(test))]
 use completion::IO_NO_INCREMENT_PRIORITY;
 pub(crate) use completion::*;

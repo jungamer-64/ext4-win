@@ -1235,39 +1235,6 @@ pub(crate) struct OpenedObject<'owner> {
     handle: NonNull<OpenedHandle>,
 }
 
-/// Exact CCB timestamp policy prepared before commit and published without allocation.
-#[derive(Debug)]
-pub(crate) struct PreparedHandleTimestampPublication {
-    /// CCB retained by the originating IRP and its ordered handle lane.
-    handle: NonNull<OpenedHandle>,
-    /// Complete successor policy.
-    policy: HandleTimestampPolicy,
-}
-
-impl PreparedHandleTimestampPublication {
-    /// Publishes the successor after metadata durability; native cached-write admission sees it atomically.
-    #[expect(
-        unsafe_code,
-        reason = "the IRP retains its stable CCB until this publication completes"
-    )]
-    pub(crate) fn publish(self) {
-        let handle = unsafe {
-            // SAFETY: The originating IRP and its handle lane retain this CCB through commit;
-            // CLOSE cannot consume it before the operation completes.
-            self.handle.as_ref()
-        };
-        handle.state.timestamps.publish(self.policy);
-    }
-}
-
-#[expect(
-    unsafe_code,
-    reason = "the publication moves within the reactor-owned operation retaining the CCB"
-)]
-// SAFETY: The originating IRP retains the stable CCB through ordered completion; publication
-// touches only atomic state and carries no thread-local borrow.
-unsafe impl Send for PreparedHandleTimestampPublication {}
-
 /// Observes native cached-write admission from the exact FILE_OBJECT-local CCB.
 /// # Safety
 /// A non-null context must be the live driver-published FsContext2 of a node FILE_OBJECT,
@@ -1519,17 +1486,6 @@ impl<'owner> OpenedObject<'owner> {
     /// Observes the policy of this exact handle without changing any other handle on the inode.
     pub(crate) fn timestamp_policy(&self) -> HandleTimestampPolicy {
         self.handle().state.timestamps.policy()
-    }
-
-    /// Prepares one exact-handle policy update while the pending IRP retains its CCB.
-    pub(crate) fn prepare_timestamp_publication(
-        &self,
-        policy: HandleTimestampPolicy,
-    ) -> PreparedHandleTimestampPublication {
-        PreparedHandleTimestampPublication {
-            handle: self.handle,
-            policy,
-        }
     }
 
     /// Returns the synchronous FILE_OBJECT current position.
