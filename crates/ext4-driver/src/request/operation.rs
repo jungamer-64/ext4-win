@@ -3712,6 +3712,13 @@ enum DriverResolveDisposition {
 /// Resolution resumes in the same reactor turn and reuses the admitted operation allocation.
 /// Returning a step prevents commit/checkpoint dispatch frames and repeated epoch retries from
 /// accumulating beneath filesystem traversal or native completion calls.
+#[cfg_attr(
+    test,
+    expect(
+        clippy::large_enum_variant,
+        reason = "the resolve step carries owned event and transcript state by value without allocating on each synchronous scheduling transition"
+    )
+)]
 enum MutationStep {
     /// One externally scheduled action or terminal completion.
     Transition(OperationTransition),

@@ -4177,11 +4177,12 @@ fn verify_locked_directory_enumeration(
     })?
     .0;
     let mut expected = alloc::collections::BTreeSet::new();
-    let mut reader =
-        ext4_core::DirectoryReader::new(directory, ext4_core::DirectoryScanCursor::start());
-    while let Some(entry) =
-        drive_internal_core_read(&image, |pass| pass.next_directory_entry(&mut reader))?
-    {
+    let mut cursor = ext4_core::DirectoryScanCursor::start();
+    while let Some(entry) = drive_internal_core_read(&image, |pass| {
+        let mut reader = ext4_core::DirectoryReader::new(directory, cursor);
+        pass.next_directory_entry(&mut reader)
+    })? {
+        cursor = *entry.next_cursor();
         let entry = entry.into_entry();
         if !matches!(entry.name().bytes(), b"." | b"..") {
             let visible =
