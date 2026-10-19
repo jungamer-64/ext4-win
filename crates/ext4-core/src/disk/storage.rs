@@ -198,6 +198,8 @@ impl StorageCompletion {
 /// Allocation-free identity retained while one owned request is in the lower stack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StorageRequestIdentity {
+    /// Operation whose completion may advance this request.
+    kind: TransferKind,
     /// Device selected for the request.
     target: StorageTarget,
     /// Data-transfer offset, absent for flushes.
@@ -206,10 +208,26 @@ pub struct StorageRequestIdentity {
     byte_count: usize,
 }
 
+/// Storage operations with distinct completion semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferKind {
+    /// Bytes read from storage.
+    Read,
+    /// Bytes accepted for writing.
+    Write,
+    /// Device durability barrier.
+    Flush,
+}
+
 impl StorageRequestIdentity {
     /// Captures the fields required to validate the matching completion.
     pub fn from_request(request: &StorageRequest) -> Self {
         Self {
+            kind: match request {
+                StorageRequest::Read { .. } => TransferKind::Read,
+                StorageRequest::Write { .. } => TransferKind::Write,
+                StorageRequest::Flush { .. } => TransferKind::Flush,
+            },
             target: request.target(),
             offset: request.offset(),
             byte_count: request.byte_count(),
@@ -236,20 +254,21 @@ impl StorageRequestIdentity {
     ) -> Result<CompletedStorageTransfer> {
         let (transfer, information, result) = completion.into_parts();
         result?;
-        let (target, offset, byte_count) = match &transfer {
+        let (kind, target, offset, byte_count) = match &transfer {
             CompletedStorageTransfer::Read {
                 target,
                 offset,
                 buffer,
-            }
-            | CompletedStorageTransfer::Write {
+            } => (TransferKind::Read, *target, Some(*offset), buffer.len()),
+            CompletedStorageTransfer::Write {
                 target,
                 offset,
                 buffer,
-            } => (*target, Some(*offset), buffer.len()),
-            CompletedStorageTransfer::Flush { target } => (*target, None, 0),
+            } => (TransferKind::Write, *target, Some(*offset), buffer.len()),
+            CompletedStorageTransfer::Flush { target } => (TransferKind::Flush, *target, None, 0),
         };
-        if target == self.target
+        if kind == self.kind
+            && target == self.target
             && offset == self.offset
             && byte_count == self.byte_count
             && information == self.byte_count
@@ -625,5 +644,38 @@ fn validate_device_range(
         Ok(())
     } else {
         Err(Error::DeviceRange)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails if bytes read can acknowledge a write or a matching write is rejected.
+    #[test]
+    fn completion_kind_is_part_of_the_transfer_identity() {
+        let request = || StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(4096),
+            buffer: Vec::new(),
+        };
+        let wrong = CompletedStorageTransfer::Read {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(4096),
+            buffer: Vec::new(),
+        };
+        assert_eq!(
+            StorageRequestIdentity::from_request(&request())
+                .complete(StorageCompletion::success(wrong, 0)),
+            Err(Error::DeviceIo),
+        );
+        assert_eq!(
+            StorageRequestIdentity::from_request(&request()).complete(StorageCompletion::success(
+                CompletedStorageTransfer::from_request(request()),
+                0,
+            )),
+            Ok(()),
+        );
     }
 }
