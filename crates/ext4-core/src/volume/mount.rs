@@ -2361,6 +2361,7 @@ mod tests {
                                 return Err(Error::DeviceIo);
                             }
                             let mut primary = [0_u8; 1024];
+                            put_le_u32(&mut primary, DiskOffset::new(76), 1)?;
                             for (offset, value) in [
                                 (0, 128),
                                 (4, 4096),

@@ -1761,6 +1761,10 @@ impl Superblock {
         if le_u16(raw, disk_offset(56))? != EXT4_SUPER_MAGIC {
             return Err(Error::InvalidMagic);
         }
+        // Feature fields and dynamic inode geometry are defined by revision one.
+        if le_u32(raw, disk_offset(76))? != 1 {
+            return Err(Error::UnsupportedWriteFeature);
+        }
         if le_u16(raw, disk_offset(58))? & EXT4_VALID_FS == 0 {
             return Err(Error::DirtyVolume);
         }
@@ -1784,6 +1788,11 @@ impl Superblock {
             le_u32(raw, disk_offset(96))?,
             le_u32(raw, disk_offset(100))?,
         )?;
+        if features.metadata_checksum() == MetadataChecksum::Crc32c
+            && *raw.get(0x175).ok_or(Error::TruncatedStructure)? != 1
+        {
+            return Err(Error::UnsupportedWriteFeature);
+        }
         let raw_descriptor_size = if features.has_64bit() {
             let raw_size = le_u16(raw, disk_offset(254))?;
             if raw_size == 0 {
@@ -2472,6 +2481,7 @@ mod tests {
             (32, 8192),
             (36, 8192),
             (40, 128),
+            (76, 1),
             (84, 11),
             (224, 8),
             (0x280, 12),
@@ -2493,6 +2503,7 @@ mod tests {
         put_le_u16(&mut bytes, disk_offset(56), EXT4_SUPER_MAGIC)?;
         put_le_u16(&mut bytes, disk_offset(58), EXT4_VALID_FS)?;
         put_le_u16(&mut bytes, disk_offset(88), 256)?;
+        *bytes.get_mut(0x175).ok_or(Error::TruncatedStructure)? = 1;
         Superblock::refresh_checksum(&mut bytes)?;
         Ok(bytes)
     }

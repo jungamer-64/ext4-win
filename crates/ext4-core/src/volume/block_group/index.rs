@@ -1221,6 +1221,7 @@ mod tests {
         inodes_per_group: u32,
     ) -> Result<(Superblock, MountedAllocationSnapshot)> {
         let mut primary = [0_u8; 1024];
+        put_le_u32(&mut primary, DiskOffset::new(76), 1)?;
         let inodes = blocks
             .checked_sub(1)
             .ok_or(Error::InvalidSuperblock)?

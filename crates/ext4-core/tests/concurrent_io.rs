@@ -3261,3 +3261,36 @@ fn journal_checksum_zero_does_not_disable_authentication() -> Result<()> {
     assert_eq!(disk.storage_effects, 0);
     Ok(())
 }
+
+/// # Errors
+/// Returns fixture encoding failures.
+/// # Panics
+/// Fails if an unsupported format selector reaches journal replay or mount writes.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions check mount rejection and absence of external storage effects"
+)]
+fn mount_rejects_unsupported_format_selectors_before_storage_effects() -> Result<()> {
+    for (offset, bytes) in [(1100, [2, 0, 0, 0].as_slice()), (1397, [2].as_slice())] {
+        let mut disk = Disk::fixture();
+        for (target, byte) in disk.filesystem.iter_mut().skip(offset).zip(bytes) {
+            *target = *byte;
+        }
+        let checksum = fixture_crc32c(
+            u32::MAX,
+            disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+        );
+        for (target, byte) in disk
+            .filesystem
+            .iter_mut()
+            .skip(2044)
+            .zip(checksum.to_le_bytes())
+        {
+            *target = byte;
+        }
+        assert_eq!(disk.mount().err(), Some(Error::UnsupportedWriteFeature));
+        assert_eq!(disk.storage_effects, 0);
+    }
+    Ok(())
+}
