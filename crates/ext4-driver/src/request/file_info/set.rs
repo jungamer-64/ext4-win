@@ -206,10 +206,14 @@ impl SetFilePublication {
 }
 
 /// Applies one supported set-file-information class.
+///
+/// Namespace decoding owns bounded name records in an independent frame so the shared mutation
+/// dispatcher does not reserve that scratch while executing create or data I/O.
 /// # Errors
 ///
 /// Returns an error when the selected set-information class has invalid input or its ext4 metadata
 /// mutation cannot be committed.
+#[inline(never)]
 pub(super) fn set_file_information(
     mut request: PendingIrpLease<'_>,
     operations: &mut MountedVolumeAccess<'_>,
