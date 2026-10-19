@@ -1725,7 +1725,7 @@ mod tests {
         QueueContextOwnership, decode_directory_pattern,
     };
     use crate::irp::{
-        DispatchMajor, FileSystemControlMinorFunction, IrpCompletion, KernelIrp,
+        DispatchMajor, FileSystemControlMinorFunction, IrpCompletion, KernelIrp, PendingIrp,
         PreparedDirectoryControl, ReceivedIrp,
     };
 
@@ -1764,15 +1764,66 @@ mod tests {
         }
     }
 
-    /// Captures one prepared request through its lifetime-bound active IRP view.
     /// # Errors
-    ///
-    /// Returns the exact immediate completion when requestor input capture fails.
-    fn capture_context(
-        received: &mut ReceivedIrp,
-        major: DispatchMajor,
-    ) -> Result<QueueContextOwnership, IrpCompletion> {
-        received.with_active(|active| QueueContext::capture(active, major))
+    /// Returns a fixture boundary failure before capture.
+    /// # Panics
+    /// Fails if capture failure or prequeue rejection loses status, marks pending, or writes output.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the fixture retains device, IRP, stack and output through consuming completion"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture construction propagates errors while assertions check completion semantics"
+    )]
+    fn capture_and_prequeue_rejection_complete_without_publication()
+    -> Result<(), crate::kernel::status::DriverError> {
+        use crate::kernel::status::DriverError;
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        let mut output = [0xA5_u8; 1];
+        for buffer in [core::ptr::null_mut(), output.as_mut_ptr().cast::<c_void>()] {
+            let mut irp = wdk_sys::IRP {
+                Flags: wdk_sys::IRP_BUFFERED_IO,
+                ..Default::default()
+            };
+            irp.AssociatedIrp.SystemBuffer = buffer;
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: u8::try_from(wdk_sys::IRP_MJ_READ)
+                    .map_err(|_| DriverError::InvalidParameter)?,
+                FileObject: &raw mut file,
+                ..Default::default()
+            };
+            stack.Parameters.Read.Length = 1;
+            let received = unsafe {
+                // SAFETY: Every published fixture allocation remains live through completion.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            }
+            .ok_or(DriverError::InvalidParameter)?;
+            let expected = if buffer.is_null() {
+                DriverError::InvalidParameter
+            } else {
+                DriverError::InsufficientResources
+            }
+            .ntstatus();
+            let status = match PendingIrp::capture(received, DispatchMajor::Read) {
+                Ok(pending) => pending.reject(DriverError::InsufficientResources),
+                Err(status) => status,
+            };
+            assert_eq!(status, expected);
+            assert_eq!(
+                unsafe {
+                    // SAFETY: Consuming completion initialized the status arm of this retained IRP.
+                    irp.IoStatus.__bindgen_anon_1.Status
+                },
+                expected
+            );
+            assert_eq!(irp.IoStatus.Information, 0);
+            assert_eq!(stack.Control, 0);
+        }
+        assert_eq!(output, [0xA5]);
+        Ok(())
     }
 
     /// # Panics
@@ -1805,11 +1856,9 @@ mod tests {
                 )
             };
             assert!(target.is_some());
-            if let Some(mut target) = target {
+            if let Some(target) = target {
                 assert_eq!(
-                    capture_context(&mut target, DispatchMajor::FileSystemControl)
-                        .err()
-                        .map(|completion| completion.status()),
+                    PendingIrp::capture(target, DispatchMajor::FileSystemControl).err(),
                     Some(expected)
                 );
             }
@@ -1831,7 +1880,7 @@ mod tests {
     )]
     fn mdl_requests_are_captured_before_ordinary_byte_buffer_mapping()
     -> Result<(), crate::kernel::status::DriverError> {
-        use crate::irp::{MdlTransfer, MdlTransferRequest, OwnedIrp, PendingIrp};
+        use crate::irp::{MdlTransfer, MdlTransferRequest, OwnedIrp};
         use crate::kernel::status::DriverError;
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file_object = wdk_sys::FILE_OBJECT::default();
@@ -1846,20 +1895,20 @@ mod tests {
                 ..wdk_sys::IO_STACK_LOCATION::default()
             };
             stack.Parameters.Read.Length = 8192;
-            let mut target = unsafe {
+            let target = unsafe {
                 // SAFETY: Local fixture allocations and their buffers outlive every request use.
                 build_target(&raw mut device, &raw mut irp, &raw mut stack)
             }
             .ok_or(DriverError::InvalidParameter)?;
             let device = target.device();
-            let captured = capture_context(&mut target, major)
-                .map_err(|completion| DriverError::CacheManagerFailure(completion.status()))?;
+            let captured =
+                PendingIrp::capture(target, major).map_err(DriverError::CacheManagerFailure)?;
             assert!(matches!(
-                &captured,
+                &captured.context,
                 QueueContextOwnership::Captured(context)
                     if matches!(context.prepared, PreparedRequest::Mdl(action) if action == expected)
             ));
-            let raw = PendingIrp::from_received(target, captured).publish();
+            let raw = captured.publish();
             let mut owned = unsafe {
                 // SAFETY: The fixture exclusively removes its published IRP and retains all native
                 // backing objects until this owner is completed below.
@@ -1931,11 +1980,11 @@ mod tests {
                 build_target(&raw mut device, &raw mut irp, &raw mut stack)
             };
             assert!(target.is_some());
-            if let Some(mut target) = target {
-                let context = capture_context(&mut target, major);
+            if let Some(target) = target {
+                let context = PendingIrp::capture(target, major);
                 assert!(context.is_ok());
                 assert!(matches!(
-                    (context, expected),
+                    (context.as_ref().map(|pending| &pending.context), expected),
                     (
                         Ok(QueueContextOwnership::Cleanup),
                         QueueContextOwnership::Cleanup
@@ -1971,10 +2020,14 @@ mod tests {
             build_target(&raw mut device, &raw mut irp, &raw mut stack)
         };
         assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::LockControl);
+        if let Some(target) = target {
+            let context = PendingIrp::capture(target, DispatchMajor::LockControl);
             assert!(context.is_ok());
-            if let Ok(QueueContextOwnership::Captured(context)) = context {
+            if let Ok(PendingIrp {
+                context: QueueContextOwnership::Captured(ref context),
+                ..
+            }) = context
+            {
                 assert!(matches!(context.prepared(), PreparedRequest::LockControl));
                 assert!(context.matches_cancellation_context(
                     core::ptr::addr_of_mut!(file_object).cast::<c_void>()
@@ -2009,10 +2062,11 @@ mod tests {
             build_target(&raw mut device, &raw mut irp, &raw mut stack)
         };
         assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::Read);
+        if let Some(target) = target {
+            let context = PendingIrp::capture(target, DispatchMajor::Read);
             assert!(context.is_ok());
             if let Ok(context) = context {
+                let context = &context.context;
                 stack.MajorFunction = u8::try_from(wdk_sys::IRP_MJ_WRITE).unwrap_or_default();
                 assert_eq!(u32::from(stack.MajorFunction), wdk_sys::IRP_MJ_WRITE);
                 assert!(matches!(
@@ -2042,10 +2096,11 @@ mod tests {
             build_target(&raw mut device, &raw mut irp, &raw mut stack)
         };
         assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::DirectoryControl);
+        if let Some(target) = target {
+            let context = PendingIrp::capture(target, DispatchMajor::DirectoryControl);
             assert!(context.is_ok());
             if let Ok(context) = context {
+                let context = &context.context;
                 stack.MinorFunction = u8::MAX;
                 assert_eq!(stack.MinorFunction, u8::MAX);
                 assert!(matches!(
@@ -2072,10 +2127,11 @@ mod tests {
             build_target(&raw mut device, &raw mut irp, &raw mut stack)
         };
         assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::FileSystemControl);
+        if let Some(target) = target {
+            let context = PendingIrp::capture(target, DispatchMajor::FileSystemControl);
             assert!(context.is_ok());
             if let Ok(context) = context {
+                let context = &context.context;
                 stack.MinorFunction = u8::MAX;
                 assert_eq!(stack.MinorFunction, u8::MAX);
                 assert!(matches!(
@@ -2144,15 +2200,15 @@ mod tests {
                     _ => return Err(DriverError::InternalInvariantViolation),
                 }
                 let stack_address = &raw mut stack;
-                let mut received = unsafe {
+                let received = unsafe {
                     // SAFETY: Local fixture allocations and their buffers outlive every request use.
                     build_target(&raw mut device, &raw mut irp, stack_address)
                 }
                 .ok_or(DriverError::InvalidParameter)?;
                 let device = received.device();
-                let context = capture_context(&mut received, major)
-                    .map_err(|completion| DriverError::CacheManagerFailure(completion.status()))?;
-                let raw = PendingIrp::from_received(received, context).publish();
+                let context = PendingIrp::capture(received, major)
+                    .map_err(DriverError::CacheManagerFailure)?;
+                let raw = context.publish();
                 let mut owned = unsafe {
                     // SAFETY: The fixture exclusively removes the just-published IRP and retains
                     // all of its backing objects until the returned owner is completed below.
@@ -2261,10 +2317,11 @@ mod tests {
             build_target(&raw mut device, irp_address, stack_address)
         };
         assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::Read);
+        if let Some(target) = target {
+            let context = PendingIrp::capture(target, DispatchMajor::Read);
             assert!(context.is_ok());
             if let Ok(mut context) = context {
+                let context = &mut context.context;
                 let read = unsafe {
                     // SAFETY: No request borrow remains; project the fixture's published Read arm.
                     core::ptr::addr_of_mut!((*stack_address).Parameters.Read)
@@ -2339,10 +2396,11 @@ mod tests {
             build_target(&raw mut device, irp_address, stack_address)
         };
         assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::Write);
+        if let Some(target) = target {
+            let context = PendingIrp::capture(target, DispatchMajor::Write);
             assert!(context.is_ok());
             if let Ok(context) = context {
+                let context = &context.context;
                 let write = unsafe {
                     // SAFETY: No request borrow remains; project the fixture's published Write arm.
                     core::ptr::addr_of_mut!((*stack_address).Parameters.Write)
@@ -2449,18 +2507,19 @@ mod tests {
                 build_target(&raw mut device, &raw mut irp, &raw mut stack)
             };
             assert!(target.is_some());
-            if let Some(mut target) = target {
-                let context = capture_context(&mut target, DispatchMajor::Write);
+            if let Some(target) = target {
+                let context = PendingIrp::capture(target, DispatchMajor::Write);
                 match expected_status {
                     Some(expected_status) => {
                         assert!(context.is_err());
                         if let Err(completion) = context {
-                            assert_eq!(completion.status(), expected_status);
+                            assert_eq!(completion, expected_status);
                         }
                     }
                     None => {
                         assert!(context.is_ok());
                         if let Ok(context) = context {
+                            let context = &context.context;
                             let prepared = context.write();
                             assert!(prepared.is_ok());
                             if let Ok(prepared) = prepared {
@@ -2506,12 +2565,13 @@ mod tests {
                 build_target(&raw mut device, &raw mut irp, &raw mut stack)
             };
             assert!(target.is_some());
-            if let Some(mut target) = target {
-                let context = capture_context(&mut target, DispatchMajor::Write);
+            if let Some(target) = target {
+                let context = PendingIrp::capture(target, DispatchMajor::Write);
                 match expected_status {
                     None => {
                         assert!(context.is_ok());
                         if let Ok(context) = context {
+                            let context = &context.context;
                             let prepared = context.write();
                             assert!(prepared.is_ok());
                             if let Ok(prepared) = prepared {
@@ -2522,7 +2582,7 @@ mod tests {
                     Some(expected_status) => {
                         assert!(context.is_err());
                         if let Err(completion) = context {
-                            assert_eq!(completion.status(), expected_status);
+                            assert_eq!(completion, expected_status);
                         }
                     }
                 }
@@ -2578,10 +2638,14 @@ mod tests {
             build_target(&raw mut device, &raw mut irp, &raw mut stack)
         };
         assert!(target.is_some());
-        if let Some(mut target) = target {
-            let context = capture_context(&mut target, DispatchMajor::Create);
+        if let Some(target) = target {
+            let context = PendingIrp::capture(target, DispatchMajor::Create);
             assert!(context.is_ok());
-            if let Ok(QueueContextOwnership::Captured(context)) = context {
+            if let Ok(PendingIrp {
+                context: QueueContextOwnership::Captured(ref context),
+                ..
+            }) = context
+            {
                 assert!(context.matches_cancellation_context(
                     core::ptr::addr_of_mut!(file_object).cast::<c_void>()
                 ));
@@ -2606,10 +2670,14 @@ mod tests {
                 build_target(&raw mut device, &raw mut irp, &raw mut stack)
             };
             assert!(target.is_some());
-            if let Some(mut target) = target {
-                let context = capture_context(&mut target, major);
+            if let Some(target) = target {
+                let context = PendingIrp::capture(target, major);
                 assert!(context.is_ok());
-                if let Ok(QueueContextOwnership::Captured(context)) = context {
+                if let Ok(PendingIrp {
+                    context: QueueContextOwnership::Captured(ref context),
+                    ..
+                }) = context
+                {
                     assert!(!context.matches_cancellation_context(
                         core::ptr::addr_of_mut!(file_object).cast::<c_void>()
                     ));
@@ -2655,7 +2723,7 @@ mod tests {
             MajorFunction: u8::try_from(wdk_sys::IRP_MJ_CREATE).unwrap_or_default(),
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
-        let mut target = unsafe {
+        let target = unsafe {
             // SAFETY: Local fixture allocations and their buffers outlive every request use.
             build_target(&raw mut device, &raw mut irp, &raw mut stack)
         };
@@ -2664,13 +2732,11 @@ mod tests {
             KernelIrp::from_raw(core::ptr::addr_of_mut!(irp))
         };
         assert!(kernel_irp.is_some());
-        let context = target
-            .as_mut()
-            .map(|target| capture_context(target, DispatchMajor::Create));
+        let context = target.map(|target| PendingIrp::capture(target, DispatchMajor::Create));
         let context = context.transpose();
         assert!(context.is_ok());
         if let (Some(kernel_irp), Ok(Some(context))) = (kernel_irp, context) {
-            kernel_irp.publish_queue_context(context);
+            let _raw = context.publish();
             let queued = kernel_irp.take_queue_context();
             assert!(matches!(
                 queued,

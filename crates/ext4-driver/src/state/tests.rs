@@ -1046,6 +1046,51 @@ fn decoded_directory_views_share_publication_without_exclusive_references() {
 }
 
 /// # Panics
+/// Fails if a policy update changes another open of the same inode or loses its atomic successor.
+#[test]
+fn timestamp_policy_publication_targets_the_borrowed_file_object() {
+    use super::{AutomaticTimeUpdate, HandleTimestampPolicy};
+    let fixture = test_file_control_block(
+        NonNull::<VolumeControlBlock>::dangling(),
+        NodeId::Directory(DirectoryNodeId::ROOT),
+    );
+    let Some(mut first) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached) else {
+        return;
+    };
+    let Some(mut second) = directory_handle(OpenedNodeMode::Direct, DataTransferMode::Cached)
+    else {
+        return;
+    };
+    let mut first_file = file_object_with_contexts(
+        fixture.0.stream_header().as_ptr(),
+        core::ptr::addr_of_mut!(first).cast(),
+    );
+    let mut second_file = file_object_with_contexts(
+        fixture.0.stream_header().as_ptr(),
+        core::ptr::addr_of_mut!(second).cast(),
+    );
+    let policy = HandleTimestampPolicy {
+        accessed: AutomaticTimeUpdate::Suppressed,
+        modified: AutomaticTimeUpdate::Enabled,
+        changed: AutomaticTimeUpdate::Suppressed,
+    };
+    let result = with_active_file_object(&mut first_file, |file| {
+        let opened = OpenedObject::decode(file)?;
+        assert_eq!(opened.timestamp_policy(), HandleTimestampPolicy::AUTOMATIC);
+        opened.publish_timestamp_policy(policy);
+        assert_eq!(OpenedObject::decode(file)?.timestamp_policy(), policy);
+        Ok(())
+    });
+    assert_eq!(result, Ok(()));
+    assert_eq!(
+        with_active_file_object(&mut second_file, |file| {
+            Ok(OpenedObject::decode(file)?.timestamp_policy())
+        }),
+        Ok(HandleTimestampPolicy::AUTOMATIC)
+    );
+}
+
+/// # Panics
 /// Fails if create publication loses OS flags or observations borrow mutable native fields.
 #[test]
 #[expect(

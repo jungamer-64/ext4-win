@@ -20,6 +20,7 @@ use crate::irp::reactor::{
 use crate::irp::{
     AtomicOplockReservation, CreateCompletion, IrpCompletion, NamespaceOplockPlan,
     NamespaceParentOplock, NamespaceParentOplockEffect, OplockCheck, OplockContinuation, OwnedIrp,
+    PendingIrpLease,
 };
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
@@ -3215,6 +3216,7 @@ impl PreparedDriverEffect {
     /// Applies only moves and prevalidated pointer/state updates after commit durability.
     fn publish(
         self,
+        request: PendingIrpLease<'_>,
         operations: &mut crate::state::MountedVolumeAccess<'_>,
         existing: impl FnOnce(&mut crate::state::MountedVolumeAccess<'_>) -> CreateCompletion,
     ) -> TopLevelCompletion {
@@ -3225,7 +3227,7 @@ impl PreparedDriverEffect {
             Self::ExistingCreate => TopLevelCompletion::Create(existing(operations)),
             Self::Write(publication) => TopLevelCompletion::Normal(publication.publish()),
             Self::SetFile(publication) => {
-                publication.publish(operations);
+                publication.publish(request, operations);
                 TopLevelCompletion::Normal(IrpCompletion::EMPTY)
             }
             Self::Cleanup(publication) => {
@@ -5938,7 +5940,7 @@ impl InfalliblePublication for MutationRequestOperation {
                 visibility,
             } => {
                 let CommitContext {
-                    owned,
+                    mut owned,
                     publication,
                     durable_slot,
                     checkpoint_slot,
@@ -5957,7 +5959,7 @@ impl InfalliblePublication for MutationRequestOperation {
                     stream_metadata,
                 );
                 let (pending, stream_projection) = publication.into_parts();
-                let completion = effect.publish(access, |access| {
+                let completion = effect.publish(owned.request(), access, |access| {
                     crate::request::create::publish_existing_mutation(
                         &mut self.pending_existing_create,
                         self.write_open.as_ref(),

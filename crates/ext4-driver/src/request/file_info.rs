@@ -28,10 +28,9 @@ use crate::state::{
     FileControlBlock, FileDeleteTarget, HandleTimestampPolicy, LinkDeletionInformation,
     MountedVolumeAccess, MountedVolumeDevice, OpenedDirectory, OpenedFileObject, OpenedLocation,
     OpenedObject, OpenedRegularFile, PagingStreamLease, PendingFileDeletion,
-    PreparedFilePositionPublication, PreparedHandleAdmission, PreparedHandleTimestampPublication,
-    PreparedLinkRename, PreparedStreamDeletion, RawVolumeOperationKind, RawVolumeTarget,
-    VolumeHandleCleanup, VolumeRetirement, release_cancelled_file_control_block,
-    release_file_control_block,
+    PreparedFilePositionPublication, PreparedHandleAdmission, PreparedLinkRename,
+    PreparedStreamDeletion, RawVolumeOperationKind, RawVolumeTarget, VolumeHandleCleanup,
+    VolumeRetirement, release_cancelled_file_control_block, release_file_control_block,
 };
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
 

@@ -43,8 +43,8 @@ pub(crate) use super::scheduler::{
 };
 use super::scheduler::{ExecutionClass, Phase, Scheduler, SlotId};
 use super::{
-    ActiveCancelEnvelope, DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, QueueContext,
-    ReceivedIrp, lower::CompletionRundown,
+    ActiveCancelEnvelope, DispatchMajor, KernelIrp, OwnedIrp, PendingIrp, ReceivedIrp,
+    lower::CompletionRundown,
 };
 #[cfg(not(test))]
 use crate::kernel::storage::{
@@ -1625,24 +1625,23 @@ impl CompletionReactor {
     }
 
     /// Captures a request under the device owner's dispatch lease and emits its admission event.
-    pub(crate) fn receive(&self, mut received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
+    pub(crate) fn receive(&self, received: ReceivedIrp, major: DispatchMajor) -> NTSTATUS {
         if self.state() != ReactorState::Running {
             return received.complete_result(Err(DriverError::InvalidDeviceRequest));
         }
-        let context = match received.with_active(|active| QueueContext::capture(active, major)) {
-            Ok(context) => context,
-            Err(completion) => return received.complete(completion),
+        let pending = match PendingIrp::capture(received, major) {
+            Ok(pending) => pending,
+            Err(status) => return status,
         };
-        let class = context.execution_class();
+        let class = pending.execution_class();
         let reservation = if class == ExecutionClass::Finalization {
             None
         } else {
             match OperationReservation::acquire(self.pending_budget(class)) {
                 Ok(reservation) => Some(reservation),
-                Err(error) => return received.complete_result(Err(error)),
+                Err(error) => return pending.reject(error),
             }
         };
-        let pending = PendingIrp::from_received(received, context);
         let status = pending.dispatch_status();
         self.enqueue(pending, reservation, class);
         status
@@ -1685,7 +1684,6 @@ impl CompletionReactor {
         reservation: Option<OperationReservation<'_>>,
         class: ExecutionClass,
     ) {
-        pending.target.irp.mark_pending();
         let irp = pending.publish();
         if let Some(reservation) = reservation {
             reservation.publish();

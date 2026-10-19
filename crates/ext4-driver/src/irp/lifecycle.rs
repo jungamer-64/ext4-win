@@ -895,8 +895,40 @@ pub(super) struct PendingIrp {
 }
 
 impl PendingIrp {
+    /// Captures requestor state while consuming the sole received completion owner.
+    ///
+    /// Captured mappings remain private to this owner through queue publication and reclamation.
+    /// # Errors
+    /// Returns the completed dispatch status after capture failure; the IRP has already completed.
+    pub(super) fn capture(
+        mut received: ReceivedIrp,
+        major: DispatchMajor,
+    ) -> Result<Self, NTSTATUS> {
+        let context = match received.with_active(|active| QueueContext::capture(active, major)) {
+            Ok(context) => context,
+            Err(completion) => return Err(received.complete(completion)),
+        };
+        Ok(Self {
+            target: received.target,
+            context,
+        })
+    }
+
+    /// Selects the admission budget from the captured request's progress responsibility.
+    pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
+        self.context.execution_class()
+    }
+
+    /// Releases captures before completing a request rejected prior to queue publication.
+    pub(super) fn reject(self, error: DriverError) -> NTSTATUS {
+        let Self { target, context } = self;
+        drop(context);
+        target.irp.complete(IrpCompletion::from_error(error))
+    }
+
     /// Publishes the context into `DriverContext[0]` and transfers queue ownership.
     pub(super) fn publish(self) -> PIRP {
+        self.target.irp.mark_pending();
         self.target.irp.publish_queue_context(self.context);
         self.target.irp.as_ptr()
     }
@@ -1166,12 +1198,13 @@ impl<'a> PendingIrpLease<'a> {
         self.owner.context.read()
     }
 
-    /// Mutably borrows the read payload captured before queue insertion.
+    /// Copies driver-owned bytes into this retained request's checked read-output window.
     /// # Errors
     ///
-    /// Returns an invariant error when this pending request is not a read.
-    pub(crate) fn prepared_read_mut(&mut self) -> DriverResult<&mut PreparedRead> {
-        self.owner.context.read_mut()
+    /// Returns an invariant error for another request kind or an out-of-range output window,
+    /// or preserves native copy failure. Capture storage cannot be replaced through this API.
+    pub(crate) fn copy_read_output(&mut self, offset: usize, source: &[u8]) -> DriverResult<()> {
+        self.owner.context.read_mut()?.copy_window(offset, source)
     }
 
     /// Borrows the write contract captured before queue insertion.

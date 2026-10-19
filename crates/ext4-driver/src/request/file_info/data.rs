@@ -609,7 +609,7 @@ pub(crate) fn finish_raw_volume_read(
     publication: RawVolumeTransferPublication,
     buffer: &[u8],
 ) -> DriverResult<IrpCompletion> {
-    request.prepared_read_mut()?.copy_window(0, buffer)?;
+    request.copy_read_output(0, buffer)?;
     Ok(publication.publish())
 }
 
@@ -902,9 +902,7 @@ fn read_regular_file_direct(
         let source = chunk
             .get(..chunk_read)
             .ok_or(DriverError::InternalInvariantViolation)?;
-        request
-            .prepared_read_mut()?
-            .copy_window(window.offset(), source)?;
+        request.copy_read_output(window.offset(), source)?;
         bytes_read = bytes_read
             .checked_add(chunk_read)
             .ok_or(DriverError::InternalInvariantViolation)?;

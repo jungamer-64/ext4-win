@@ -15,8 +15,6 @@ enum SetFilePlan {
         policy: HandleTimestampPolicy,
         /// Caller attribute selection.
         attributes: u32,
-        /// Exact CCB publication prepared while the IRP retains it.
-        publication: PreparedHandleTimestampPublication,
         /// Target ext4 node.
         node: NodeId,
     },
@@ -106,7 +104,7 @@ pub(crate) enum SetFilePublication {
     /// No driver-visible state changes after commit.
     None,
     /// Handle-local automatic timestamp policy paired with committed basic metadata.
-    Timestamps(PreparedHandleTimestampPublication),
+    Timestamps(HandleTimestampPolicy),
     /// Ordered namespace notifications for a committed hard-link mutation.
     HardLink {
         /// Existing destination identity retained through a case-preserving replacement.
@@ -180,11 +178,16 @@ impl PendingDispositionDeletion {
 }
 
 impl SetFilePublication {
-    /// Publishes prepared driver state without allocation or ordinary failure.
-    pub(crate) fn publish(self, operations: &MountedVolumeAccess<'_>) {
+    /// Publishes prepared driver state while borrowing the still-owned originating request.
+    /// Timestamp state carries only the policy; its CCB is borrowed from this request at publication.
+    pub(crate) fn publish(
+        self,
+        mut request: PendingIrpLease<'_>,
+        operations: &MountedVolumeAccess<'_>,
+    ) {
         match self {
             Self::None => {}
-            Self::Timestamps(publication) => publication.publish(),
+            Self::Timestamps(policy) => publish_timestamp_policy(&mut request, policy),
             Self::HardLink {
                 location,
                 notifications,
@@ -203,6 +206,22 @@ impl SetFilePublication {
             }
         }
     }
+}
+
+/// Publishes to the retained request's CCB without creating an independently usable pointer.
+/// The set-information plan validated this context before commit; losing it while the request is
+/// retained is an ownership inconsistency, not an ordinary post-commit failure.
+fn publish_timestamp_policy(request: &mut PendingIrpLease<'_>, policy: HandleTimestampPolicy) {
+    request
+        .with_active(|active| {
+            let file = active.current_stack()?.file_object()?;
+            OpenedObject::decode(file)?.publish_timestamp_policy(policy);
+            Ok::<_, DriverError>(())
+        })
+        .unwrap_or_else(|_| {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck()
+        });
 }
 
 /// Applies one supported set-file-information class.
@@ -258,9 +277,6 @@ pub(super) fn set_file_information(
                     times,
                     policy: opened_file.timestamp_policy(),
                     attributes: info.FileAttributes,
-                    publication: opened_file.prepare_timestamp_publication(
-                        times.policy(opened_file.timestamp_policy()),
-                    ),
                     node: opened_file.node(),
                 }
             }
@@ -347,18 +363,17 @@ pub(super) fn set_file_information(
             times,
             policy,
             attributes,
-            publication,
             node,
         } => {
             return Ok(
                 match apply_basic_information(times, policy, attributes, node, mutation)? {
                     BasicMetadataEffect::Unchanged => {
-                        publication.publish();
+                        publish_timestamp_policy(&mut request, times.policy(policy));
                         SetFileResolution::Complete(IrpCompletion::EMPTY)
                     }
-                    BasicMetadataEffect::Staged => {
-                        SetFileResolution::Mutation(SetFilePublication::Timestamps(publication))
-                    }
+                    BasicMetadataEffect::Staged => SetFileResolution::Mutation(
+                        SetFilePublication::Timestamps(times.policy(policy)),
+                    ),
                 },
             );
         }

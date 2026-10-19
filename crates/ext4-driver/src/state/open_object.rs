@@ -1488,6 +1488,11 @@ impl<'owner> OpenedObject<'owner> {
         self.handle().state.timestamps.policy()
     }
 
+    /// Publishes the committed policy while this active request borrows and retains its CCB.
+    pub(crate) fn publish_timestamp_policy(&self, policy: HandleTimestampPolicy) {
+        self.handle().state.timestamps.publish(policy);
+    }
+
     /// Returns the synchronous FILE_OBJECT current position.
     /// # Errors
     ///

@@ -50,7 +50,7 @@ pub(crate) use control::*;
 pub(crate) use create::*;
 pub(crate) use dispatch::*;
 pub(crate) use lifecycle::*;
-use lifecycle::{KernelIrp, PendingIrp, copy_requestor_input_window, copy_requestor_output_window};
+use lifecycle::{KernelIrp, PendingIrp};
 pub(crate) use oplock::{
     AtomicOplockReservation, CleanupOplock, NamespaceOplockPlan, NamespaceParentOplock,
     NamespaceParentOplockEffect, OplockCheck, OplockContinuation,
