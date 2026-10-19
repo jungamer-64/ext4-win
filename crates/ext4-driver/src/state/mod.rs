@@ -16,7 +16,7 @@ use core::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use ext4_core::{
-    ByteOffset, CleanJournalDurability, ClusterSize, CommitLease, CommitReadyMutation,
+    ByteOffset, CheckpointPublication, ClusterSize, CommitLease, CommitReadyMutation,
     CompletedMount, DeviceLength, DirectoryNodeId, DirectoryScanCursor, DurableMutation, Ext4Name,
     FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile,
     MutationLease, MutationResolvePass, NewDirectoryMetadata, NewFileMetadata, NodeId,

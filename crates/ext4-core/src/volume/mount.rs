@@ -22,6 +22,34 @@ use crate::disk_format::superblock::{
     WriteSessionState,
 };
 
+/// Allocation identity shared only by values from one completed mount attempt.
+/// UUIDs identify disk contents; this identity also distinguishes remounts and cloned images.
+#[derive(Clone, Debug)]
+pub(super) struct MountIdentity(alloc::sync::Arc<()>);
+
+impl MountIdentity {
+    /// Allocates a fresh identity before any mount publication write.
+    /// # Errors
+    /// Returns allocation failure without publishing a mount.
+    fn new() -> Result<Self> {
+        alloc::sync::Arc::try_new(())
+            .map(Self)
+            .map_err(|_| Error::OutOfMemory)
+    }
+
+    /// Address usable in internal copyable stamps while the operation and cache retain owners.
+    pub(super) fn stamp(&self) -> usize {
+        alloc::sync::Arc::as_ptr(&self.0).addr()
+    }
+}
+
+impl PartialEq for MountIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for MountIdentity {}
+
 /// Opaque resource identity used by scheduler intent arbitration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MutationResource {
@@ -115,6 +143,8 @@ struct ObservedResourceVersion {
 /// Resource set and versions recorded by one resolved mutation.
 #[derive(Debug)]
 pub struct ObservedResourceVersionSet {
+    /// Origin retained independently of on-disk UUID and local sequence numbers.
+    pub(super) mount: MountIdentity,
     /// FIFO ticket retained across version-mismatch re-resolution.
     ticket: u64,
     /// Unique resources in discovery order.
@@ -123,8 +153,9 @@ pub struct ObservedResourceVersionSet {
 
 impl ObservedResourceVersionSet {
     /// Starts an empty observed set for one stable FIFO ticket.
-    pub(crate) const fn new(ticket: u64) -> Self {
+    pub(super) fn new(ticket: u64, mount: &MountIdentity) -> Self {
         Self {
+            mount: mount.clone(),
             ticket,
             entries: Vec::new(),
         }
@@ -154,7 +185,8 @@ impl ObservedResourceVersionSet {
 
     /// Returns true when both sets describe the same resources, independent of discovery order.
     pub fn has_same_resources(&self, other: &Self) -> bool {
-        self.entries.len() == other.entries.len()
+        self.mount == other.mount
+            && self.entries.len() == other.entries.len()
             && self.entries.iter().all(|left| {
                 other
                     .entries
@@ -390,6 +422,8 @@ impl EpochSequence {
 /// Immutable feature, geometry, device, and journal identity established at mount.
 #[derive(Debug)]
 pub struct MountedProfile {
+    /// Origin retained independently of on-disk UUID and local sequence numbers.
+    pub(super) mount: MountIdentity,
     /// Validated feature and fixed geometry fields.
     superblock: Superblock,
     /// Filesystem device length validated at the storage boundary.
@@ -400,12 +434,14 @@ pub struct MountedProfile {
 
 impl MountedProfile {
     /// Builds the immutable profile after replay has established a supported filesystem.
-    pub(crate) const fn new(
+    pub(super) fn new(
+        mount: &MountIdentity,
         superblock: Superblock,
         filesystem_length: DeviceLength,
         journal_target: StorageTarget,
     ) -> Self {
         Self {
+            mount: mount.clone(),
             superblock,
             filesystem_length,
             journal_target,
@@ -434,6 +470,8 @@ impl MountedProfile {
 /// Immutable state visible to readers after one commit publication.
 #[derive(Debug)]
 pub struct CommittedEpoch {
+    /// Origin retained independently of on-disk UUID and local sequence numbers.
+    pub(super) mount: MountIdentity,
     /// Monotonic registry identity.
     sequence: EpochSequence,
     /// Current counters, label, and checksum policy source.
@@ -448,22 +486,26 @@ pub struct CommittedEpoch {
 
 impl CommittedEpoch {
     /// Builds the initial committed epoch after successful replay and mount validation.
-    pub(super) const fn initial(
+    /// # Errors
+    /// Returns allocation failure before any mount publication write.
+    pub(super) fn initial(
         superblock: Superblock,
         fscrypt_keys: FscryptKeySet,
         clusters: ClusterReferenceIndex,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
+            mount: MountIdentity::new()?,
             sequence: EpochSequence::INITIAL,
             superblock,
             fscrypt_keys,
             clusters,
             overlay: Vec::new(),
-        }
+        })
     }
 
     /// Builds a post-commit epoch from values allocated before the first lower write.
-    pub(super) const fn prepared(
+    pub(super) fn prepared(
+        current: &Self,
         sequence: EpochSequence,
         superblock: Superblock,
         fscrypt_keys: FscryptKeySet,
@@ -471,6 +513,7 @@ impl CommittedEpoch {
         overlay: Vec<JournalBlock>,
     ) -> Self {
         Self {
+            mount: current.mount.clone(),
             sequence,
             superblock,
             fscrypt_keys,
@@ -737,8 +780,13 @@ struct ReadObservation<'pass, 'state> {
 }
 
 /// Mutable journal cursor, resource versions, and allocation reservations.
+///
+/// The owning scheduler arbitrates gates before issuing grants through this coordinator.
+/// Each grant belongs to this mount session and is consumed even when a transition rejects it.
 #[derive(Debug)]
 pub struct MutationCoordinatorState {
+    /// Origin retained independently of on-disk UUID and local sequence numbers.
+    pub(super) mount: MountIdentity,
     /// Current journal phase.
     pub(crate) journal: JournalCoordinatorState,
     /// Monotonic FIFO ticket assigned to the next mutation admission.
@@ -753,11 +801,12 @@ impl MutationCoordinatorState {
         self.journal.epoch()
     }
     /// Builds coordinator state after mount replay has produced a clean journal.
-    pub(crate) const fn new(journal: Journal<CleanJournal>, uuid: FilesystemUuid) -> Self {
+    pub(crate) fn new(journal: Journal<CleanJournal>, current: &CommittedEpoch) -> Self {
         Self {
+            mount: current.mount.clone(),
             journal: JournalCoordinatorState::Ready {
                 journal,
-                epoch: (uuid, EpochSequence::INITIAL),
+                epoch: (current.identity().uuid(), current.sequence()),
             },
             next_ticket: 0,
             resource_versions: ResourceVersionTable::empty(),
@@ -772,7 +821,9 @@ impl MutationCoordinatorState {
         cache: crate::MetadataCacheAccess<'state>,
     ) -> Result<CommittedReadContext<'state>> {
         let epoch = cache.epoch();
-        if self.journal.epoch() != (epoch.identity().uuid(), epoch.sequence()) {
+        if self.mount != epoch.mount
+            || self.journal.epoch() != (epoch.identity().uuid(), epoch.sequence())
+        {
             return Err(Error::StaleReadContext);
         }
         Ok(CommittedReadContext {
@@ -794,6 +845,34 @@ impl MutationCoordinatorState {
         Ok(ticket)
     }
 
+    /// Issues a mount-scoped intent grant after the owning scheduler acquires its gate.
+    /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
+    #[must_use]
+    pub fn grant_intent(&mut self, ticket: u64) -> super::MutationLease {
+        super::MutationLease::new(self.mount.clone(), ticket)
+    }
+
+    /// Issues a mount-scoped commit grant after the owning scheduler acquires its gate.
+    /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
+    #[must_use]
+    pub fn grant_commit(&mut self, ticket: u64) -> super::CommitLease {
+        super::CommitLease::new(self.mount.clone(), ticket)
+    }
+
+    /// Issues a mount-scoped visibility grant after the owning scheduler acquires its gate.
+    /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
+    #[must_use]
+    pub fn grant_visibility(&mut self, ticket: u64) -> super::VisibilityLease {
+        super::VisibilityLease::new(self.mount.clone(), ticket)
+    }
+
+    /// Issues a mount-scoped checkpoint grant after the owning scheduler acquires its gate.
+    /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
+    #[must_use]
+    pub fn grant_checkpoint(&mut self, epoch: EpochSequence) -> super::CheckpointLease {
+        super::CheckpointLease::new(self.mount.clone(), epoch)
+    }
+
     /// Current committed version of one resource.
     pub(crate) fn resource_version(&self, resource: MutationResource) -> ResourceVersion {
         self.resource_versions.version(resource)
@@ -801,10 +880,11 @@ impl MutationCoordinatorState {
 
     /// Revalidates every resource observed by a resolved mutation.
     pub(crate) fn revalidate(&self, observed: &ObservedResourceVersionSet) -> bool {
-        observed
-            .entries
-            .iter()
-            .all(|entry| self.resource_versions.version(entry.resource) == entry.version)
+        self.mount == observed.mount
+            && observed
+                .entries
+                .iter()
+                .all(|entry| self.resource_versions.version(entry.resource) == entry.version)
     }
 
     /// Reserves the index and computes only changed versions while failure is harmless.
@@ -864,6 +944,8 @@ pub(super) struct EpochReadView<'storage, 'epoch> {
     pub(super) fscrypt_keys: &'epoch FscryptKeySet,
     /// Identity of the immutable snapshot; absent before mount has committed.
     pub(super) epoch: Option<(FilesystemUuid, EpochSequence)>,
+    /// Session identity borrowed from the selected epoch.
+    pub(super) mount: Option<&'epoch MountIdentity>,
     /// Allocation ownership snapshot used only by mutation resolution.
     pub(super) clusters: Option<&'epoch ClusterReferenceIndex>,
 }
@@ -882,6 +964,7 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
             fscrypt_keys: &epoch.fscrypt_keys,
             clusters: Some(&epoch.clusters),
             epoch: Some((epoch.identity().uuid(), epoch.sequence())),
+            mount: Some(&epoch.mount),
         }
     }
 
@@ -899,6 +982,7 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
             fscrypt_keys,
             clusters: None,
             epoch: None,
+            mount: None,
         }
     }
 
@@ -1490,12 +1574,10 @@ enum MountState {
     },
     /// An effect-bearing batch cannot be canceled while one transfer is pending.
     OrphanWritePending {
-        /// Private mount and prospective queue state.
+        /// Mount state retained until the exact recovery write completes.
         mount: UnpublishedMount,
-        /// Remaining requests, resumed only after this exact completion succeeds.
-        sequence: StorageRequestSequence<OrphanBatchCompletion>,
-        /// Identity of the one outstanding transfer.
-        expected: StorageRequestIdentity,
+        /// Only a matching completion reveals the remaining recovery sequence.
+        pending: crate::PendingStorageTransfer<StorageRequestSequence<OrphanBatchCompletion>>,
     },
     /// Write-session markers are durable and the completed mount may be published.
     Published(Box<CompletedMount>),
@@ -1717,12 +1799,8 @@ impl MountOperation {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::RecoveringOrphans(mount);
             }
-            MountState::OrphanWritePending {
-                mount,
-                sequence,
-                expected,
-            } => {
-                expected.complete(completion)?;
+            MountState::OrphanWritePending { mount, pending } => {
+                let sequence = pending.complete(completion)?;
                 self.state = MountState::OrphanWrites { mount, sequence };
             }
             MountState::Indexing(publication) => {
@@ -2022,17 +2100,23 @@ impl MountOperation {
                                 Some(keys) => keys,
                                 None => return MountTransition::Complete(Err(Error::DeviceIo)),
                             };
+                            let epoch =
+                                match CommittedEpoch::initial(marked, keys, indexed.clusters) {
+                                    Ok(epoch) => epoch,
+                                    Err(error) => return MountTransition::Complete(Err(error)),
+                                };
                             let completed = CompletedMount {
                                 profile: MountedProfile::new(
+                                    &epoch.mount,
                                     marked,
                                     self.filesystem.len(),
                                     indexed.publication.journal_target,
                                 ),
-                                epoch: CommittedEpoch::initial(marked, keys, indexed.clusters),
                                 coordinator: MutationCoordinatorState::new(
                                     indexed.publication.journal,
-                                    marked.uuid(),
+                                    &epoch,
                                 ),
+                                epoch,
                             };
                             let completed = match memory::try_box(completed) {
                                 Ok(completed) => completed,
@@ -2143,11 +2227,9 @@ impl MountOperation {
                     sequence,
                 } => match sequence.advance() {
                     StorageRequestSequenceStep::Submit { request, suspended } => {
-                        let expected = StorageRequestIdentity::from_request(&request);
                         self.state = MountState::OrphanWritePending {
                             mount,
-                            sequence: suspended,
-                            expected,
+                            pending: suspended,
                         };
                         return MountTransition::SubmitLower {
                             request,

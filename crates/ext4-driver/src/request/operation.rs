@@ -2,13 +2,15 @@
 
 use alloc::boxed::Box;
 use ext4_core::{
-    CleanCloseOperation, CleanCloseTransition, CleanJournalDurability, CommitDurability,
-    CommitReadyMutation, CompletedStorageTransfer, DurableMutation, EpochReadOperation, Error,
+    CheckpointPublication, CleanCloseOperation, CleanCloseTransition, CleanJournalDurability,
+    CleanJournalRecordPhase, CommitDurability, CommitReadyMutation, CommitRecordPhase,
+    CompletedStorageTransfer, DurableMutation, EpochReadOperation, Error,
     ExternalJournalProbeOperation, ExternalJournalProbeOutcome, ExternalJournalProbeTransition,
     ExternalJournalRequirement, FscryptKeySet, HomeBlockDurability, JournalPayloadDurability,
     MountOperation, MountTransition, MutationResolveOperation, MutationResolveTransition,
-    OperationEvent, OrderedDataDurability, ReadTransition, ReservedMutation, ResolvedMutation,
-    StorageRequest, StorageRequestIdentity, StorageRequestSequence, StorageRequestSequenceStep,
+    OperationEvent, OrderedDataDurability, PendingStorageTransfer, ReadTransition,
+    ReservedMutation, ResolvedMutation, StorageRequest, StorageRequestIdentity,
+    StorageRequestSequence, StorageRequestSequenceStep,
 };
 use wdk_sys::STATUS_SUCCESS;
 
@@ -3275,80 +3277,60 @@ struct ResolutionAttempt {
 /// Exact write/flush phase awaiting one matching lower completion.
 #[derive(Debug)]
 enum CommitIoPhase {
-    /// One ordered data write is in flight; `remaining` owns the rest.
+    /// Matching lower completion reveals the next OrderedWrite protocol state.
     OrderedWrite {
-        /// Identity of the exact in-flight lower write.
-        expected: StorageRequestIdentity,
-        /// Remaining ordered writes and their durability continuation.
-        remaining: StorageRequestSequence<OrderedDataDurability>,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<StorageRequestSequence<OrderedDataDurability>>,
     },
-    /// Filesystem flush after every ordered data write.
+    /// Matching lower completion reveals the next OrderedFlush protocol state.
     OrderedFlush {
-        /// Identity of the in-flight filesystem flush.
-        expected: StorageRequestIdentity,
-        /// Continuation revealed after ordered-data durability.
-        next: OrderedDataDurability,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<StorageRequestSequence<JournalPayloadDurability>>,
     },
-    /// One journal descriptor/payload write is in flight.
+    /// Matching lower completion reveals the next JournalWrite protocol state.
     JournalWrite {
-        /// Identity of the exact in-flight journal write.
-        expected: StorageRequestIdentity,
-        /// Remaining journal writes and their durability continuation.
-        remaining: StorageRequestSequence<JournalPayloadDurability>,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<StorageRequestSequence<JournalPayloadDurability>>,
     },
-    /// Journal payload durability flush preceding the commit record.
+    /// Matching lower completion reveals the next JournalFlush protocol state.
     JournalFlush {
-        /// Identity of the in-flight journal-device flush.
-        expected: StorageRequestIdentity,
-        /// Commit-record continuation revealed after the flush.
-        next: JournalPayloadDurability,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<CommitRecordPhase>,
     },
-    /// Single commit record write.
+    /// Matching lower completion reveals the next CommitWrite protocol state.
     CommitWrite {
-        /// Identity of the in-flight commit-record write.
-        expected: StorageRequestIdentity,
-        /// Commit durability continuation retained through the write.
-        next: CommitDurability,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<CommitDurability>,
     },
-    /// Flush that establishes commit durability.
+    /// Matching lower completion reveals the next CommitFlush protocol state.
     CommitFlush {
-        /// Identity of the in-flight commit durability flush.
-        expected: StorageRequestIdentity,
-        /// Durable mutation revealed only by successful completion.
-        next: CommitDurability,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<DurableMutation>,
     },
 }
 
-/// Exact checkpoint write/flush phase after the top-level mutation is already visible.
+/// Detached checkpoint transfer awaiting its exact completion.
 #[derive(Debug)]
 enum CheckpointIoPhase {
-    /// One home-block write is in flight.
+    /// Matching lower completion reveals the next HomeWrite protocol state.
     HomeWrite {
-        /// Identity of the exact in-flight home-block write.
-        expected: StorageRequestIdentity,
-        /// Remaining home writes and clean-journal continuation.
-        remaining: StorageRequestSequence<HomeBlockDurability>,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<StorageRequestSequence<HomeBlockDurability>>,
     },
-    /// Filesystem durability flush after home-block writes.
+    /// Matching lower completion reveals the next HomeFlush protocol state.
     HomeFlush {
-        /// Identity of the in-flight home-block durability flush.
-        expected: StorageRequestIdentity,
-        /// Clean-journal continuation revealed after the flush.
-        next: HomeBlockDurability,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<CleanJournalRecordPhase>,
     },
-    /// Clean journal-superblock write.
+    /// Matching lower completion reveals the next CleanWrite protocol state.
     CleanWrite {
-        /// Identity of the in-flight clean journal write.
-        expected: StorageRequestIdentity,
-        /// Clean journal durability continuation retained through the write.
-        next: CleanJournalDurability,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<CleanJournalDurability>,
     },
-    /// Flush that makes the clean journal state durable.
+    /// Matching lower completion reveals the next CleanFlush protocol state.
     CleanFlush {
-        /// Identity of the in-flight clean journal flush.
-        expected: StorageRequestIdentity,
-        /// Overlay-free epoch publication revealed by successful completion.
-        next: CleanJournalDurability,
+        /// Owned continuation bound to its exact transfer.
+        pending: PendingStorageTransfer<CheckpointPublication>,
     },
 }
 
@@ -3610,7 +3592,7 @@ enum MutationOperationState {
     /// Clean journal and overlay-free epoch await infallible publication.
     PublishingCheckpoint {
         /// Core clean-journal durability state.
-        durability: CleanJournalDurability,
+        durability: CheckpointPublication,
         /// Pre-reserved overlay-free epoch storage.
         publication: EpochPublicationSlot,
         /// Visible overlay epoch whose checkpoint is complete.
@@ -4409,7 +4391,14 @@ impl MutationRequestOperation {
         let resolved = {
             let request = &self.request;
             let mut pass =
-                ready.begin_pass(cache.access(epoch.epoch()), self.now, &mut self.crypto);
+                match ready.begin_pass(cache.access(epoch.epoch()), self.now, &mut self.crypto) {
+                    Ok(pass) => pass,
+                    Err(error) => {
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::from(error)),
+                        );
+                    }
+                };
             match Self::execute_resolve(
                 request,
                 DriverResolveState {
@@ -4790,23 +4779,17 @@ impl MutationRequestOperation {
         sequence: StorageRequestSequence<OrderedDataDurability>,
     ) -> OperationTransition {
         match sequence.advance() {
-            StorageRequestSequenceStep::Submit { request, suspended } => {
-                let expected = StorageRequestIdentity::from_request(&request);
-                self.submit_commit_request(
+            StorageRequestSequenceStep::Submit { request, suspended } => self
+                .submit_commit_request(
                     context,
-                    CommitIoPhase::OrderedWrite {
-                        expected,
-                        remaining: suspended,
-                    },
+                    CommitIoPhase::OrderedWrite { pending: suspended },
                     request,
-                )
-            }
+                ),
             StorageRequestSequenceStep::Finished(next) => {
-                let request = next.flush_request();
-                let expected = StorageRequestIdentity::from_request(&request);
+                let (request, pending) = next.submit();
                 self.submit_commit_request(
                     context,
-                    CommitIoPhase::OrderedFlush { expected, next },
+                    CommitIoPhase::OrderedFlush { pending },
                     request,
                 )
             }
@@ -4820,23 +4803,17 @@ impl MutationRequestOperation {
         sequence: StorageRequestSequence<JournalPayloadDurability>,
     ) -> OperationTransition {
         match sequence.advance() {
-            StorageRequestSequenceStep::Submit { request, suspended } => {
-                let expected = StorageRequestIdentity::from_request(&request);
-                self.submit_commit_request(
+            StorageRequestSequenceStep::Submit { request, suspended } => self
+                .submit_commit_request(
                     context,
-                    CommitIoPhase::JournalWrite {
-                        expected,
-                        remaining: suspended,
-                    },
+                    CommitIoPhase::JournalWrite { pending: suspended },
                     request,
-                )
-            }
+                ),
             StorageRequestSequenceStep::Finished(next) => {
-                let request = next.flush_request();
-                let expected = StorageRequestIdentity::from_request(&request);
+                let (request, pending) = next.submit();
                 self.submit_commit_request(
                     context,
-                    CommitIoPhase::JournalFlush { expected, next },
+                    CommitIoPhase::JournalFlush { pending },
                     request,
                 )
             }
@@ -4847,15 +4824,10 @@ impl MutationRequestOperation {
     fn submit_commit_record(
         self: Box<Self>,
         context: CommitContext,
-        payload: JournalPayloadDurability,
+        payload: CommitRecordPhase,
     ) -> OperationTransition {
-        let (request, next) = payload.completed().submit();
-        let expected = StorageRequestIdentity::from_request(&request);
-        self.submit_commit_request(
-            context,
-            CommitIoPhase::CommitWrite { expected, next },
-            request,
-        )
+        let (request, pending) = payload.submit();
+        self.submit_commit_request(context, CommitIoPhase::CommitWrite { pending }, request)
     }
 
     /// Submits the flush that makes the commit record durable.
@@ -4864,13 +4836,8 @@ impl MutationRequestOperation {
         context: CommitContext,
         next: CommitDurability,
     ) -> OperationTransition {
-        let request = next.flush_request();
-        let expected = StorageRequestIdentity::from_request(&request);
-        self.submit_commit_request(
-            context,
-            CommitIoPhase::CommitFlush { expected, next },
-            request,
-        )
+        let (request, pending) = next.submit();
+        self.submit_commit_request(context, CommitIoPhase::CommitFlush { pending }, request)
     }
 
     /// Converts a commit-path lower failure into a recovery-required terminal result.
@@ -4914,35 +4881,28 @@ impl MutationRequestOperation {
             return self.fail_commit_path(context, Error::DeviceIo, access);
         };
         match phase {
-            CommitIoPhase::OrderedWrite {
-                expected,
-                remaining,
-            } => match expected.complete(completion) {
-                Ok(()) => self.observed_write().drive_ordered(context, remaining),
+            CommitIoPhase::OrderedWrite { pending } => match pending.complete(completion) {
+                Ok(remaining) => self.observed_write().drive_ordered(context, remaining),
                 Err(error) => self.fail_commit_path(context, error, access),
             },
-            CommitIoPhase::OrderedFlush { expected, next } => match expected.complete(completion) {
-                Ok(()) => self.drive_journal(context, next.completed()),
+            CommitIoPhase::OrderedFlush { pending } => match pending.complete(completion) {
+                Ok(next) => self.drive_journal(context, next),
                 Err(error) => self.fail_commit_path(context, error, access),
             },
-            CommitIoPhase::JournalWrite {
-                expected,
-                remaining,
-            } => match expected.complete(completion) {
-                Ok(()) => self.observed_write().drive_journal(context, remaining),
+            CommitIoPhase::JournalWrite { pending } => match pending.complete(completion) {
+                Ok(remaining) => self.observed_write().drive_journal(context, remaining),
                 Err(error) => self.fail_commit_path(context, error, access),
             },
-            CommitIoPhase::JournalFlush { expected, next } => match expected.complete(completion) {
-                Ok(()) => self.submit_commit_record(context, next),
+            CommitIoPhase::JournalFlush { pending } => match pending.complete(completion) {
+                Ok(next) => self.submit_commit_record(context, next),
                 Err(error) => self.fail_commit_path(context, error, access),
             },
-            CommitIoPhase::CommitWrite { expected, next } => match expected.complete(completion) {
-                Ok(()) => self.observed_write().submit_commit_flush(context, next),
+            CommitIoPhase::CommitWrite { pending } => match pending.complete(completion) {
+                Ok(next) => self.observed_write().submit_commit_flush(context, next),
                 Err(error) => self.fail_commit_path(context, error, access),
             },
-            CommitIoPhase::CommitFlush { expected, next } => match expected.complete(completion) {
-                Ok(()) => {
-                    let durable = next.completed();
+            CommitIoPhase::CommitFlush { pending } => match pending.complete(completion) {
+                Ok(durable) => {
                     let ticket = self.ticket;
                     let mut this = self;
                     this.state = MutationOperationState::AwaitingVisibility { context, durable };
@@ -4984,23 +4944,17 @@ impl MutationRequestOperation {
         epoch: ext4_core::EpochSequence,
     ) -> OperationTransition {
         match sequence.advance() {
-            StorageRequestSequenceStep::Submit { request, suspended } => {
-                let expected = StorageRequestIdentity::from_request(&request);
-                self.submit_checkpoint_request(
-                    CheckpointIoPhase::HomeWrite {
-                        expected,
-                        remaining: suspended,
-                    },
+            StorageRequestSequenceStep::Submit { request, suspended } => self
+                .submit_checkpoint_request(
+                    CheckpointIoPhase::HomeWrite { pending: suspended },
                     publication,
                     epoch,
                     request,
-                )
-            }
+                ),
             StorageRequestSequenceStep::Finished(next) => {
-                let request = next.flush_request();
-                let expected = StorageRequestIdentity::from_request(&request);
+                let (request, pending) = next.submit();
                 self.submit_checkpoint_request(
-                    CheckpointIoPhase::HomeFlush { expected, next },
+                    CheckpointIoPhase::HomeFlush { pending },
                     publication,
                     epoch,
                     request,
@@ -5012,14 +4966,13 @@ impl MutationRequestOperation {
     /// Submits the clean journal-superblock write after home-block durability.
     fn submit_clean_record(
         self: Box<Self>,
-        next: HomeBlockDurability,
+        next: CleanJournalRecordPhase,
         publication: EpochPublicationSlot,
         epoch: ext4_core::EpochSequence,
     ) -> OperationTransition {
-        let (request, next) = next.completed().submit();
-        let expected = StorageRequestIdentity::from_request(&request);
+        let (request, pending) = next.submit();
         self.submit_checkpoint_request(
-            CheckpointIoPhase::CleanWrite { expected, next },
+            CheckpointIoPhase::CleanWrite { pending },
             publication,
             epoch,
             request,
@@ -5033,10 +4986,9 @@ impl MutationRequestOperation {
         publication: EpochPublicationSlot,
         epoch: ext4_core::EpochSequence,
     ) -> OperationTransition {
-        let request = next.flush_request();
-        let expected = StorageRequestIdentity::from_request(&request);
+        let (request, pending) = next.submit();
         self.submit_checkpoint_request(
-            CheckpointIoPhase::CleanFlush { expected, next },
+            CheckpointIoPhase::CleanFlush { pending },
             publication,
             epoch,
             request,
@@ -5080,49 +5032,38 @@ impl MutationRequestOperation {
             );
         };
         match phase {
-            CheckpointIoPhase::HomeWrite {
-                expected,
-                remaining,
-            } => match expected.complete(completion) {
-                Ok(()) => self.drive_checkpoint_home(remaining, publication, epoch),
+            CheckpointIoPhase::HomeWrite { pending } => match pending.complete(completion) {
+                Ok(remaining) => self.drive_checkpoint_home(remaining, publication, epoch),
                 Err(_) => self.fail_checkpoint(publication, StorageFailureClass::Terminal, access),
             },
-            CheckpointIoPhase::HomeFlush { expected, next } => {
-                match expected.complete(completion) {
-                    Ok(()) => self.submit_clean_record(next, publication, epoch),
-                    Err(_) => {
-                        self.fail_checkpoint(publication, StorageFailureClass::Terminal, access)
-                    }
-                }
-            }
-            CheckpointIoPhase::CleanWrite { expected, next } => {
-                match expected.complete(completion) {
-                    Ok(()) => self.submit_clean_flush(next, publication, epoch),
-                    Err(_) => self.fail_checkpoint(
+            CheckpointIoPhase::HomeFlush { pending } => match pending.complete(completion) {
+                Ok(next) => self.submit_clean_record(next, publication, epoch),
+                Err(_) => self.fail_checkpoint(publication, StorageFailureClass::Terminal, access),
+            },
+            CheckpointIoPhase::CleanWrite { pending } => match pending.complete(completion) {
+                Ok(next) => self.submit_clean_flush(next, publication, epoch),
+                Err(_) => self.fail_checkpoint(
+                    publication,
+                    StorageFailureClass::DurabilityUnknown { completed: 0 },
+                    access,
+                ),
+            },
+            CheckpointIoPhase::CleanFlush { pending } => match pending.complete(completion) {
+                Ok(next) => {
+                    let mut this = self;
+                    this.state = MutationOperationState::PublishingCheckpoint {
+                        durability: next,
                         publication,
-                        StorageFailureClass::DurabilityUnknown { completed: 0 },
-                        access,
-                    ),
+                        epoch,
+                    };
+                    OperationTransition::Publish { publication: this }
                 }
-            }
-            CheckpointIoPhase::CleanFlush { expected, next } => {
-                match expected.complete(completion) {
-                    Ok(()) => {
-                        let mut this = self;
-                        this.state = MutationOperationState::PublishingCheckpoint {
-                            durability: next,
-                            publication,
-                            epoch,
-                        };
-                        OperationTransition::Publish { publication: this }
-                    }
-                    Err(_) => self.fail_checkpoint(
-                        publication,
-                        StorageFailureClass::DurabilityUnknown { completed: 0 },
-                        access,
-                    ),
-                }
-            }
+                Err(_) => self.fail_checkpoint(
+                    publication,
+                    StorageFailureClass::DurabilityUnknown { completed: 0 },
+                    access,
+                ),
+            },
         }
     }
 }
@@ -5761,7 +5702,10 @@ impl MutationRequestOperation {
                 OperationEvent::CheckpointGranted(checkpoint) => {
                     let (operation, publication, epoch) = pending.into_parts();
                     MutationStep::Transition(self.drive_checkpoint_home(
-                        operation.start(checkpoint),
+                        match operation.start(checkpoint) {
+                            Ok(sequence) => sequence,
+                            Err(_) => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+                        },
                         publication,
                         epoch,
                     ))

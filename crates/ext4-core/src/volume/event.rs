@@ -49,22 +49,30 @@ impl RetryPermit {
 /// Exclusive ownership of every resource intent requested by one resolved mutation.
 #[derive(Debug)]
 pub struct MutationLease {
+    /// Mount whose scheduler issued this authority.
+    mount: super::mount::MountIdentity,
     /// FIFO mutation ticket retained across stale-plan re-resolution.
     ticket: u64,
 }
 
 impl MutationLease {
-
+    /// Constructed only by the owning coordinator after external gate arbitration.
+    pub(super) fn new(mount: super::mount::MountIdentity, ticket: u64) -> Self {
+        Self { mount, ticket }
+    }
+    /// Consumes a grant only in its issuing session.
+    /// # Errors
+    /// Returns a conflict if the grant belongs to another mount.
+    pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<u64> {
+        if &self.mount != mount {
+            return Err(crate::Error::ClusterReferenceConflict);
+        }
+        Ok(self.ticket)
+    }
 
     /// Observes the scheduler ticket without duplicating the one-shot lease.
     #[must_use]
     pub const fn ticket(&self) -> u64 {
-        self.ticket
-    }
-
-    /// Consumes the lease into its stable FIFO ticket.
-    #[must_use]
-    pub const fn into_ticket(self) -> u64 {
         self.ticket
     }
 }
@@ -72,22 +80,30 @@ impl MutationLease {
 /// Exclusive authority to occupy the current journal commit slot.
 #[derive(Debug)]
 pub struct CommitLease {
+    /// Mount whose scheduler issued this authority.
+    mount: super::mount::MountIdentity,
     /// FIFO mutation ticket selected by commit arbitration.
     ticket: u64,
 }
 
 impl CommitLease {
-
+    /// Constructed only by the owning coordinator after external gate arbitration.
+    pub(super) fn new(mount: super::mount::MountIdentity, ticket: u64) -> Self {
+        Self { mount, ticket }
+    }
+    /// Consumes a grant only in its issuing session.
+    /// # Errors
+    /// Returns a conflict if the grant belongs to another mount.
+    pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<u64> {
+        if &self.mount != mount {
+            return Err(crate::Error::ClusterReferenceConflict);
+        }
+        Ok(self.ticket)
+    }
 
     /// Observes the scheduler ticket without duplicating the one-shot lease.
     #[must_use]
     pub const fn ticket(&self) -> u64 {
-        self.ticket
-    }
-
-    /// Consumes the lease into its FIFO mutation ticket.
-    #[must_use]
-    pub const fn into_ticket(self) -> u64 {
         self.ticket
     }
 }
@@ -95,22 +111,30 @@ impl CommitLease {
 /// Short exclusive authority to swap one durable epoch into reader visibility.
 #[derive(Debug)]
 pub struct VisibilityLease {
+    /// Mount whose scheduler issued this authority.
+    mount: super::mount::MountIdentity,
     /// FIFO mutation ticket whose durable values may be published.
     ticket: u64,
 }
 
 impl VisibilityLease {
-
+    /// Constructed only by the owning coordinator after external gate arbitration.
+    pub(super) fn new(mount: super::mount::MountIdentity, ticket: u64) -> Self {
+        Self { mount, ticket }
+    }
+    /// Consumes a grant only in its issuing session.
+    /// # Errors
+    /// Returns a conflict if the grant belongs to another mount.
+    pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<u64> {
+        if &self.mount != mount {
+            return Err(crate::Error::ClusterReferenceConflict);
+        }
+        Ok(self.ticket)
+    }
 
     /// Observes the scheduler ticket without duplicating the one-shot lease.
     #[must_use]
     pub const fn ticket(&self) -> u64 {
-        self.ticket
-    }
-
-    /// Consumes the lease into its FIFO mutation ticket.
-    #[must_use]
-    pub const fn into_ticket(self) -> u64 {
         self.ticket
     }
 }
@@ -118,17 +142,28 @@ impl VisibilityLease {
 /// Exclusive authority to use the journal checkpoint slot independently of visibility.
 #[derive(Debug)]
 pub struct CheckpointLease {
+    /// Mount whose scheduler issued this authority.
+    mount: super::mount::MountIdentity,
     /// Sequence of the visible epoch whose overlay is being checkpointed.
     epoch: super::EpochSequence,
 }
 
 impl CheckpointLease {
-
-
-    /// Consumes the lease into the checkpointed epoch sequence.
-    #[must_use]
-    pub const fn into_epoch(self) -> super::EpochSequence {
-        self.epoch
+    /// Constructed only by the owning coordinator after external gate arbitration.
+    pub(super) fn new(mount: super::mount::MountIdentity, epoch: super::EpochSequence) -> Self {
+        Self { mount, epoch }
+    }
+    /// Consumes a grant only in its issuing session.
+    /// # Errors
+    /// Returns a conflict if the grant belongs to another mount.
+    pub(super) fn consume(
+        self,
+        mount: &super::mount::MountIdentity,
+    ) -> crate::Result<super::EpochSequence> {
+        if &self.mount != mount {
+            return Err(crate::Error::ClusterReferenceConflict);
+        }
+        Ok(self.epoch)
     }
 }
 

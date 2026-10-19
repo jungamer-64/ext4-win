@@ -24,8 +24,8 @@ mod volume;
 
 pub use disk::block::{BlockSize, ByteOffset, DeviceLength};
 pub use disk::storage::{
-    CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageRequestIdentity,
-    StorageTarget,
+    CompletedStorageTransfer, PendingStorageTransfer, StorageCompletion, StorageRequest,
+    StorageRequestIdentity, StorageTarget,
 };
 pub use disk_format::acl::{AclGroup, AclPermissions, AclUser, Ext4Access, PosixAcl};
 pub use disk_format::inode::{
@@ -49,11 +49,11 @@ pub use protection::verity::{
     FsverityBlockSize, FsverityEnable, FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 pub use volume::{
-    BarrierPermit, CheckpointLease, CheckpointOperation, ChildLookup, CleanCloseDurability,
-    CleanCloseOperation, CleanCloseTransition, CleanJournalDurability, CleanJournalRecordPhase,
-    CommitDurability, CommitLease, CommitReadyMutation, CommitRecordPhase, CommittedEpoch,
-    CommittedReadContext, CommittedReadPass, CompletedMount, DataAllocationRun, DirectoryChild,
-    DirectoryEntry, DirectoryNode, DirectoryNodeId, DirectoryReadOperation,
+    BarrierPermit, CheckpointLease, CheckpointOperation, CheckpointPublication, ChildLookup,
+    CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CleanJournalDurability,
+    CleanJournalRecordPhase, CommitDurability, CommitLease, CommitReadyMutation, CommitRecordPhase,
+    CommittedEpoch, CommittedReadContext, CommittedReadPass, CompletedMount, DataAllocationRun,
+    DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, DirectoryReadOperation,
     DirectoryReadTransition, DirectoryReader, DirectoryScanCursor, DurableMutation,
     EpochReadOperation, EpochReadPass, EpochSequence, ExternalJournalProbeOperation,
     ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,

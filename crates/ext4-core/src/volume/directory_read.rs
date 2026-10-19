@@ -151,19 +151,19 @@ enum ReaderState {
 }
 
 /// Admission identity of decoded directory progress.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum DirectoryReadBinding {
     /// A committed reader can continue through unrelated publications on the same filesystem.
     Observed {
         /// Filesystem whose directory mapping was decoded.
-        filesystem: crate::FilesystemUuid,
+        filesystem: super::mount::MountIdentity,
         /// Directory version established by coordinator read admission.
         version: ResourceVersion,
     },
     /// Resolution has no committed version recorder; decoded progress belongs to its exact epoch.
     Resolution {
         /// Filesystem whose directory mapping was decoded.
-        filesystem: crate::FilesystemUuid,
+        filesystem: super::mount::MountIdentity,
         /// Snapshot supplying all metadata interpreted by this resolution.
         epoch: super::EpochSequence,
     },
@@ -241,19 +241,36 @@ impl DirectoryReader {
             return Err(error);
         }
         view.observe_inode(self.directory.inode())?;
-        let (filesystem, epoch) = view.epoch.ok_or(Error::DeviceIo)?;
-        let binding = match view.inode_version(self.directory.inode()) {
-            Some(version) => DirectoryReadBinding::Observed {
-                filesystem,
-                version,
-            },
-            None => DirectoryReadBinding::Resolution { filesystem, epoch },
-        };
-        if self.binding.is_some_and(|expected| expected != binding) {
-            self.state = ReaderState::Failed(Error::ReadConflict);
-            return Err(Error::ReadConflict);
+        let (_, epoch) = view.epoch.ok_or(Error::DeviceIo)?;
+        let filesystem = view.mount.ok_or(Error::DeviceIo)?;
+        let version = view.inode_version(self.directory.inode());
+        if let Some(binding) = &self.binding {
+            let matches = match binding {
+                DirectoryReadBinding::Observed {
+                    filesystem: origin,
+                    version: expected,
+                } => origin == filesystem && Some(*expected) == version,
+                DirectoryReadBinding::Resolution {
+                    filesystem: origin,
+                    epoch: expected,
+                } => origin == filesystem && version.is_none() && *expected == epoch,
+            };
+            if !matches {
+                self.state = ReaderState::Failed(Error::ReadConflict);
+                return Err(Error::ReadConflict);
+            }
+        } else {
+            self.binding = Some(match version {
+                Some(version) => DirectoryReadBinding::Observed {
+                    filesystem: filesystem.clone(),
+                    version,
+                },
+                None => DirectoryReadBinding::Resolution {
+                    filesystem: filesystem.clone(),
+                    epoch,
+                },
+            });
         }
-        self.binding = Some(binding);
         if let ReaderState::Opening(id) = self.state {
             let directory = view.load_directory(id)?;
             if directory.protection().is_verity() {
@@ -736,6 +753,8 @@ pub enum DirectoryReadTransition {
 /// used for a newly admitted walk. Unrelated publications preserve decoded progress.
 #[derive(Debug)]
 pub struct DirectoryReadOperation {
+    /// Session that owns retained namespace and entry dependencies.
+    mount: MountIdentity,
     /// Dependencies of decoded progress and unfinished entry projection.
     observed: ReadObservations,
     /// Provenance against which this walk last retired raw whole-block metadata.
@@ -759,6 +778,9 @@ impl DirectoryReadOperation {
         profile: &MountedProfile,
         node: NodeId,
     ) -> Result<super::EpochReadOperation> {
+        if profile.mount != self.mount {
+            return Err(Error::ReadConflict);
+        }
         Ok(super::EpochReadOperation::entry(
             profile,
             self.observed.entry(self.reader.directory, node)?,
@@ -766,12 +788,13 @@ impl DirectoryReadOperation {
     }
     /// Creates a read at a caller's committed cursor.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         profile: &MountedProfile,
         directory: DirectoryNodeId,
         cursor: DirectoryScanCursor,
     ) -> Self {
         Self {
+            mount: profile.mount.clone(),
             observed: ReadObservations::new(),
             metadata_stamp: None,
             reader: DirectoryReader::new(directory, cursor),
@@ -789,6 +812,9 @@ impl DirectoryReadOperation {
     ) -> DirectoryReadTransition {
         let mut cache = context.cache;
         let epoch = cache.epoch();
+        if self.mount != epoch.mount {
+            return DirectoryReadTransition::Complete(Err(Error::ReadConflict));
+        }
         if matches!(event, super::OperationEvent::Admitted) {
             self.observed.retain_directory(self.reader.directory);
         }

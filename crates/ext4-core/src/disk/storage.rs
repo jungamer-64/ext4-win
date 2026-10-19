@@ -280,6 +280,34 @@ impl StorageRequestIdentity {
     }
 }
 
+/// Successor owned by exactly one outstanding storage transfer.
+///
+/// A failed completion consumes this continuation. A write or flush may already have affected
+/// storage; the owner must reconcile its journal/device before acquiring another mutation.
+#[derive(Debug)]
+pub struct PendingStorageTransfer<Next> {
+    /// Exact operation and range whose successful completion reveals the successor.
+    expected: StorageRequestIdentity,
+    /// Inaccessible until the matching storage transfer completes successfully.
+    next: Next,
+}
+
+impl<Next> PendingStorageTransfer<Next> {
+    /// Transfers the request while retaining its only success continuation.
+    pub(crate) fn submit(request: StorageRequest, next: Next) -> (StorageRequest, Self) {
+        let expected = StorageRequestIdentity::from_request(&request);
+        (request, Self { expected, next })
+    }
+
+    /// Consumes one exact successful completion before exposing the successor.
+    /// # Errors
+    /// Returns failed, short or mismatched transfer errors, consuming the successor.
+    pub fn complete(self, completion: StorageCompletion) -> Result<Next> {
+        self.expected.complete(completion)?;
+        Ok(self.next)
+    }
+}
+
 /// One exact completed read retained by a restartable operation resolve pass.
 #[derive(Debug)]
 struct CompletedRead {
@@ -650,6 +678,50 @@ fn validate_device_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns fixture allocation failure.
+    /// # Panics
+    /// Fails if a short or failed transfer reveals its successor, or a successful one loses it.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions check completion outcomes after fallible buffer construction"
+    )]
+    fn pending_transfer_exposes_successor_only_after_complete_success() -> Result<()> {
+        let request = || {
+            Ok(StorageRequest::Write {
+                target: StorageTarget::Filesystem,
+                offset: ByteOffset::new(4096),
+                buffer: memory::repeated_vec(0x5a, 512)?,
+            })
+        };
+        let (transfer, pending) = PendingStorageTransfer::submit(request()?, 7_u8);
+        assert_eq!(
+            pending.complete(StorageCompletion::success(
+                CompletedStorageTransfer::from_request(transfer),
+                511
+            )),
+            Err(Error::DeviceIo)
+        );
+        let (transfer, pending) = PendingStorageTransfer::submit(request()?, 7_u8);
+        assert_eq!(
+            pending.complete(StorageCompletion::failure(
+                CompletedStorageTransfer::from_request(transfer),
+                Error::OperationCancelled
+            )),
+            Err(Error::OperationCancelled)
+        );
+        let (transfer, pending) = PendingStorageTransfer::submit(request()?, 7_u8);
+        assert_eq!(
+            pending.complete(StorageCompletion::success(
+                CompletedStorageTransfer::from_request(transfer),
+                512
+            )),
+            Ok(7)
+        );
+        Ok(())
+    }
 
     /// # Panics
     /// Fails if bytes read can acknowledge a write or a matching write is rejected.

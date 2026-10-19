@@ -8,6 +8,202 @@ use alloc::{boxed::Box, vec::Vec};
 use ext4_core::*;
 use sha2::Digest as _;
 
+/// # Errors
+/// Returns fixture construction or mutation resolution failures.
+/// # Panics
+/// Fails if equal disk UUIDs and local counters let one mount consume another mount's state.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe session isolation through production boundaries"
+)]
+fn mount_sessions_isolate_plans_grants_and_read_provenance() -> Result<()> {
+    let mut origin = Fixture::new()?;
+    let mut other = Fixture::new()?;
+    assert_eq!(
+        origin.epoch.identity().uuid(),
+        other.epoch.identity().uuid()
+    );
+    assert_eq!(origin.epoch.sequence(), other.epoch.sequence());
+    assert!(matches!(
+        other
+            .coordinator
+            .read_context(other.cache.access(&origin.epoch)),
+        Err(Error::StaleReadContext)
+    ));
+    let ticket = origin.coordinator.admit_mutation()?;
+    let resolve = |fixture: &mut Fixture| {
+        fixture
+            .disk
+            .resolve(
+                &fixture.profile,
+                &fixture.epoch,
+                &fixture.coordinator,
+                ticket,
+                &mut PlainCrypto,
+                |pass| pass.set_volume_label(Ext4VolumeLabel::new(b"scoped")?),
+            )
+            .map(|(resolved, ())| resolved)
+    };
+    let resolved = resolve(&mut origin)?;
+    assert!(matches!(
+        resolved.reserve(other.coordinator.grant_intent(ticket), &other.coordinator),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    let resolved = resolve(&mut origin)?;
+    assert!(matches!(
+        resolved.reserve(other.coordinator.grant_intent(ticket), &origin.coordinator),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    let reserved = resolve(&mut origin)?
+        .reserve(origin.coordinator.grant_intent(ticket), &origin.coordinator)?;
+    assert!(matches!(
+        reserved.prepare_commit(
+            other.coordinator.grant_commit(ticket),
+            &mut origin.coordinator,
+            &origin.epoch,
+            &mut origin.cache
+        ),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    let old_read = EpochReadOperation::new(&origin.profile);
+    let old_directory = DirectoryReadOperation::new(
+        &origin.profile,
+        DirectoryNodeId::ROOT,
+        DirectoryScanCursor::start(),
+    );
+    let old_resolver = MutationResolveOperation::new(&origin.profile);
+    let stale_plan = resolve(&mut origin)?;
+    origin.remount()?;
+    assert!(matches!(
+        stale_plan.reserve(origin.coordinator.grant_intent(ticket), &origin.coordinator),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    assert!(matches!(
+        old_read.run(
+            OperationEvent::Admitted,
+            origin
+                .coordinator
+                .read_context(origin.cache.access(&origin.epoch))?,
+            &mut PlainCrypto,
+            |_| Ok(())
+        ),
+        ReadTransition::Complete(Err(Error::ReadConflict))
+    ));
+    assert!(matches!(
+        old_directory.advance(
+            OperationEvent::Admitted,
+            origin
+                .coordinator
+                .read_context(origin.cache.access(&origin.epoch))?,
+            &mut PlainCrypto
+        ),
+        DirectoryReadTransition::Complete(Err(Error::ReadConflict))
+    ));
+    let mut ready = old_resolver.accept(OperationEvent::Admitted)?;
+    assert!(matches!(
+        ready.begin_pass(
+            origin.cache.access(&origin.epoch),
+            Ext4Timestamp::from_seconds(2),
+            &mut PlainCrypto
+        ),
+        Err(Error::StaleReadContext)
+    ));
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, storage, or journal transition failures.
+/// # Panics
+/// Fails if rejected publication loses the durable mutation or accepts another mount or ticket.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify durable-state retention and publication through real storage"
+)]
+fn durable_publications_retain_state_after_mismatched_authority() -> Result<()> {
+    let mut origin = Fixture::new()?;
+    let mut other = Fixture::new()?;
+    let ticket = origin.coordinator.admit_mutation()?;
+    let (resolved, ()) = origin.disk.resolve(
+        &origin.profile,
+        &origin.epoch,
+        &origin.coordinator,
+        ticket,
+        &mut PlainCrypto,
+        |pass| pass.set_volume_label(Ext4VolumeLabel::new(b"scoped")?),
+    )?;
+    let prepared = resolved
+        .reserve(origin.coordinator.grant_intent(ticket), &origin.coordinator)?
+        .prepare_commit(
+            origin.coordinator.grant_commit(ticket),
+            &mut origin.coordinator,
+            &origin.epoch,
+            &mut origin.cache,
+        )?;
+    let ordered = origin.disk.sequence(prepared.start())?;
+    let sequence = origin.disk.transfer(ordered.submit())?;
+    let payload = origin.disk.sequence(sequence)?;
+    let record = origin.disk.transfer(payload.submit())?;
+    let barrier = origin.disk.transfer(record.submit())?;
+    let durable = origin.disk.transfer(barrier.submit())?;
+    let effects = origin.disk.storage_effects;
+    let (error, durable) = durable
+        .publish(
+            other.coordinator.grant_visibility(ticket),
+            &mut other.coordinator,
+        )
+        .err()
+        .ok_or(Error::DeviceIo)?;
+    assert_eq!(error, Error::ClusterReferenceConflict);
+    let wrong_ticket = origin.coordinator.admit_mutation()?;
+    let (error, durable) = durable
+        .publish(
+            origin.coordinator.grant_visibility(wrong_ticket),
+            &mut origin.coordinator,
+        )
+        .err()
+        .ok_or(Error::DeviceIo)?;
+    assert_eq!(error, Error::ClusterReferenceConflict);
+    let (epoch, checkpoint) = durable
+        .publish(
+            origin.coordinator.grant_visibility(ticket),
+            &mut origin.coordinator,
+        )
+        .map_err(|(error, _durable)| error)?
+        .into_parts();
+    assert_eq!(origin.disk.storage_effects, effects);
+    assert_eq!(epoch.identity().label(), Ext4VolumeLabel::new(b"scoped")?);
+    let (error, checkpoint) = checkpoint
+        .start(other.coordinator.grant_checkpoint(epoch.sequence()))
+        .err()
+        .ok_or(Error::DeviceIo)?;
+    assert_eq!(error, Error::ClusterReferenceConflict);
+    let sequence = checkpoint
+        .start(origin.coordinator.grant_checkpoint(epoch.sequence()))
+        .map_err(|(error, _checkpoint)| error)?;
+    let home = origin.disk.sequence(sequence)?;
+    let record = origin.disk.transfer(home.submit())?;
+    let barrier = origin.disk.transfer(record.submit())?;
+    let publication = origin.disk.transfer(barrier.submit())?;
+    let effects = origin.disk.storage_effects;
+    let (error, publication) = publication
+        .publish(&mut other.coordinator)
+        .err()
+        .ok_or(Error::DeviceIo)?;
+    assert_eq!(error, Error::ClusterReferenceConflict);
+    origin.epoch = publication
+        .publish(&mut origin.coordinator)
+        .map_err(|(error, _publication)| error)?;
+    assert_eq!(origin.disk.storage_effects, effects);
+    origin.remount()?;
+    assert_eq!(
+        origin.epoch.identity().label(),
+        Ext4VolumeLabel::new(b"scoped")?
+    );
+    Ok(())
+}
+
 /// Independent hashing and HKDF oracle; plaintext fixtures must never invoke a cipher.
 #[derive(Debug)]
 struct PlainCrypto;
@@ -337,16 +533,19 @@ fn allocation_preserves_committed_owners_until_the_retirement_commit() -> Result
         },
     )?;
     let prepared = resolved
-        .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+        .reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?
         .prepare_commit(
+            fixture.coordinator.grant_commit(ticket),
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
-            CommitLease::granted(ticket),
         )?;
     let ordered = fixture.disk.sequence(prepared.start())?;
-    fixture.disk.checked(ordered.flush_request())?;
-    drop(ordered);
+    let payload_sequence = fixture.disk.transfer(ordered.submit())?;
+    drop(payload_sequence);
     fixture.remount()?;
     for (file, expected) in [(a, b'a'), (b, b'b')] {
         let mut output = [0; 1];
@@ -542,16 +741,19 @@ fn sparse_extension_zeroes_initialized_storage_after_interrupted_write() -> Resu
         },
     )?;
     let prepared = resolved
-        .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+        .reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?
         .prepare_commit(
+            fixture.coordinator.grant_commit(ticket),
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
-            CommitLease::granted(ticket),
         )?;
     {
         let ordered = fixture.disk.sequence(prepared.start())?;
-        fixture.disk.checked(ordered.flush_request())?;
+        let _payload_sequence = fixture.disk.transfer(ordered.submit())?;
         // A crash loses preparation and publication state after data reaches its home block.
     }
     let (profile, epoch, coordinator) = fixture.disk.mount()?.into_parts();
@@ -610,40 +812,52 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
         },
     )?;
     let ready = resolved
-        .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+        .reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?
         .prepare_commit(
+            fixture.coordinator.grant_commit(ticket),
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
-            CommitLease::granted(ticket),
         )?;
     let StorageRequestSequenceStep::Finished(ordered) = ready.start().advance() else {
         return Err(Error::InvalidWriteRange);
     };
-    fixture.disk.checked(ordered.flush_request())?;
-    let payload = fixture.disk.sequence(ordered.completed())?;
-    fixture.disk.checked(payload.flush_request())?;
-    let (request, durable) = payload.completed().submit();
-    fixture.disk.checked(request)?;
-    fixture.disk.checked(durable.flush_request())?;
+    let payload_sequence = fixture.disk.transfer(ordered.submit())?;
+    let payload = fixture.disk.sequence(payload_sequence)?;
+    let commit_record = fixture.disk.transfer(payload.submit())?;
+    let durability = fixture.disk.transfer(commit_record.submit())?;
+    let durable = fixture.disk.transfer(durability.submit())?;
     assert_eq!(fixture.disk.filesystem.get(home), Some(&b'a'));
     let (epoch, checkpoint) = durable
-        .completed()
-        .publish(&mut fixture.coordinator, VisibilityLease::granted(ticket))
+        .publish(
+            fixture.coordinator.grant_visibility(ticket),
+            &mut fixture.coordinator,
+        )
+        .map_err(|(error, _durable)| error)?
         .into_parts();
     fixture.epoch = epoch;
     fixture.cache.publish(&fixture.epoch);
     fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut byte))?;
     assert_eq!(byte, *b"K");
     assert_eq!(fixture.disk.filesystem.get(home), Some(&b'a'));
-    let home_writes = fixture
-        .disk
-        .sequence(checkpoint.start(CheckpointLease::granted(fixture.epoch.sequence())))?;
-    fixture.disk.checked(home_writes.flush_request())?;
-    let (request, clean) = home_writes.completed().submit();
-    fixture.disk.checked(request)?;
-    fixture.disk.checked(clean.flush_request())?;
-    fixture.epoch = clean.completed(&mut fixture.coordinator);
+    let home_writes = fixture.disk.sequence(
+        checkpoint
+            .start(
+                fixture
+                    .coordinator
+                    .grant_checkpoint(fixture.epoch.sequence()),
+            )
+            .map_err(|(error, _checkpoint)| error)?,
+    )?;
+    let clean_record = fixture.disk.transfer(home_writes.submit())?;
+    let clean_durability = fixture.disk.transfer(clean_record.submit())?;
+    let clean = fixture.disk.transfer(clean_durability.submit())?;
+    fixture.epoch = clean
+        .publish(&mut fixture.coordinator)
+        .map_err(|(error, _publication)| error)?;
     assert_eq!(fixture.disk.filesystem.get(home), Some(&b'K'));
     Ok(())
 }
@@ -977,8 +1191,11 @@ impl Disk {
 
     /// # Errors
     /// Returns a transfer validation failure without hiding I/O progress.
-    fn checked(&mut self, request: StorageRequest) -> Result<()> {
-        StorageRequestIdentity::from_request(&request).complete(self.complete(request)?)
+    fn transfer<N>(
+        &mut self,
+        (request, pending): (StorageRequest, PendingStorageTransfer<N>),
+    ) -> Result<N> {
+        pending.complete(self.complete(request)?)
     }
 
     /// # Errors
@@ -987,8 +1204,7 @@ impl Disk {
         loop {
             match sequence.advance() {
                 StorageRequestSequenceStep::Submit { request, suspended } => {
-                    self.checked(request)?;
-                    sequence = suspended;
+                    sequence = suspended.complete(self.complete(request)?)?;
                 }
                 StorageRequestSequenceStep::Finished(next) => return Ok(next),
             }
@@ -1005,23 +1221,27 @@ impl Disk {
         prepared: CommitReadyMutation,
     ) -> Result<CommittedEpoch> {
         let ordered = self.sequence(prepared.start())?;
-        self.checked(ordered.flush_request())?;
-        let payload = self.sequence(ordered.completed())?;
-        self.checked(payload.flush_request())?;
-        let (request, durable) = payload.completed().submit();
-        self.checked(request)?;
-        self.checked(durable.flush_request())?;
+        let payload_sequence = self.transfer(ordered.submit())?;
+        let payload = self.sequence(payload_sequence)?;
+        let commit_record = self.transfer(payload.submit())?;
+        let durability = self.transfer(commit_record.submit())?;
+        let durable = self.transfer(durability.submit())?;
         let (epoch, checkpoint) = durable
-            .completed()
-            .publish(coordinator, VisibilityLease::granted(ticket))
+            .publish(coordinator.grant_visibility(ticket), coordinator)
+            .map_err(|(error, _durable)| error)?
             .into_parts();
         cache.publish(&epoch);
-        let home = self.sequence(checkpoint.start(CheckpointLease::granted(epoch.sequence())))?;
-        self.checked(home.flush_request())?;
-        let (request, clean) = home.completed().submit();
-        self.checked(request)?;
-        self.checked(clean.flush_request())?;
-        let epoch = clean.completed(coordinator);
+        let home = self.sequence(
+            checkpoint
+                .start(coordinator.grant_checkpoint(epoch.sequence()))
+                .map_err(|(error, _checkpoint)| error)?,
+        )?;
+        let clean_record = self.transfer(home.submit())?;
+        let clean_durability = self.transfer(clean_record.submit())?;
+        let clean = self.transfer(clean_durability.submit())?;
+        let epoch = clean
+            .publish(coordinator)
+            .map_err(|(error, _publication)| error)?;
         cache.publish(&epoch);
         Ok(epoch)
     }
@@ -1049,8 +1269,11 @@ impl Disk {
             let mut ready = operation.accept(event)?;
             let mut output = None;
             let result = {
-                let mut pass =
-                    ready.begin_pass(cache.access(epoch), Ext4Timestamp::from_seconds(2), crypto);
+                let mut pass = ready.begin_pass(
+                    cache.access(epoch),
+                    Ext4Timestamp::from_seconds(2),
+                    crypto,
+                )?;
                 mutate(&mut pass).and_then(|value| {
                     output = Some(value);
                     pass.resolve(ticket, coordinator)
@@ -1100,13 +1323,16 @@ impl Fixture {
     fn publish_keys(&mut self, change: ResolvedKeyChange) -> Result<()> {
         let ticket = change.observed_resources().ticket();
         let prepared = change
-            .reserve(&self.coordinator, MutationLease::granted(ticket))?
+            .reserve(self.coordinator.grant_intent(ticket), &self.coordinator)?
             .prepare(
+                self.coordinator.grant_commit(ticket),
                 &mut self.coordinator,
                 &self.epoch,
-                CommitLease::granted(ticket),
             )?;
-        self.epoch = prepared.publish(&mut self.coordinator, VisibilityLease::granted(ticket))?;
+        self.epoch = prepared.publish(
+            self.coordinator.grant_visibility(ticket),
+            &mut self.coordinator,
+        )?;
         self.cache.publish(&self.epoch);
         Ok(())
     }
@@ -1172,12 +1398,12 @@ impl Fixture {
         )?;
         let mut cache = MetadataCache::try_new(&epoch)?;
         let ready = resolved
-            .reserve(&coordinator, MutationLease::granted(ticket))?
+            .reserve(coordinator.grant_intent(ticket), &coordinator)?
             .prepare_commit(
+                coordinator.grant_commit(ticket),
                 &mut coordinator,
                 &epoch,
                 &mut cache,
-                CommitLease::granted(ticket),
             )?;
         let epoch = disk.commit(&mut coordinator, &mut cache, ticket, ready)?;
         Ok(Self {
@@ -1210,12 +1436,12 @@ impl Fixture {
             mutate,
         )?;
         let ready = resolved
-            .reserve(&self.coordinator, MutationLease::granted(ticket))?
+            .reserve(self.coordinator.grant_intent(ticket), &self.coordinator)?
             .prepare_commit(
+                self.coordinator.grant_commit(ticket),
                 &mut self.coordinator,
                 &self.epoch,
                 &mut self.cache,
-                CommitLease::granted(ticket),
             )?;
         self.epoch = self
             .disk
@@ -1304,12 +1530,15 @@ fn shared_metadata_images_revalidate_before_overwriting_neighbors() -> Result<()
             .any(|resource| a_resources.contains(&resource))
     );
     let ready = a_update
-        .reserve(&fixture.coordinator, MutationLease::granted(ticket_a))?
+        .reserve(
+            fixture.coordinator.grant_intent(ticket_a),
+            &fixture.coordinator,
+        )?
         .prepare_commit(
+            fixture.coordinator.grant_commit(ticket_a),
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
-            CommitLease::granted(ticket_a),
         )?;
     fixture.epoch = fixture.disk.commit(
         &mut fixture.coordinator,
@@ -1318,7 +1547,10 @@ fn shared_metadata_images_revalidate_before_overwriting_neighbors() -> Result<()
         ready,
     )?;
     assert!(matches!(
-        b_update.reserve(&fixture.coordinator, MutationLease::granted(ticket_b)),
+        b_update.reserve(
+            fixture.coordinator.grant_intent(ticket_b),
+            &fixture.coordinator
+        ),
         Err(Error::ClusterReferenceConflict)
     ));
     fixture.mutate(|pass| {
@@ -1571,12 +1803,15 @@ fn current_versions_reject_an_earlier_epoch_at_admission() -> Result<()> {
         },
     )?;
     let ready = resolved
-        .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+        .reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?
         .prepare_commit(
+            fixture.coordinator.grant_commit(ticket),
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
-            CommitLease::granted(ticket),
         )?;
     let current =
         fixture
@@ -1858,11 +2093,14 @@ fn mount_keys_publish_without_storage_and_disappear_on_remount() -> Result<()> {
     let ticket = fixture.coordinator.admit_mutation()?;
     let abandoned =
         ResolvedKeyChange::remove(&fixture.epoch, &fixture.coordinator, ticket, identifier)?
-            .reserve(&fixture.coordinator, MutationLease::granted(ticket))?
+            .reserve(
+                fixture.coordinator.grant_intent(ticket),
+                &fixture.coordinator,
+            )?
             .prepare(
+                fixture.coordinator.grant_commit(ticket),
                 &mut fixture.coordinator,
                 &fixture.epoch,
-                CommitLease::granted(ticket),
             )?;
     drop(abandoned);
     assert_eq!(fixture.epoch.sequence(), published);
@@ -1924,7 +2162,10 @@ fn key_publication_revalidates_keys_and_retains_independent_file_commits() -> Re
     let stale = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, stale_ticket, second)?;
     fixture.publish_keys(first)?;
     assert!(matches!(
-        stale.reserve(&fixture.coordinator, MutationLease::granted(stale_ticket)),
+        stale.reserve(
+            fixture.coordinator.grant_intent(stale_ticket),
+            &fixture.coordinator
+        ),
         Err(Error::ClusterReferenceConflict)
     ));
     let ticket = fixture.coordinator.admit_mutation()?;
@@ -2071,23 +2312,26 @@ fn key_removal_revokes_encrypted_reads_and_resolved_mutations() -> Result<()> {
         },
     )?;
     let reserved = reserved.reserve(
+        fixture.coordinator.grant_intent(reserved_ticket),
         &fixture.coordinator,
-        MutationLease::granted(reserved_ticket),
     )?;
     let ticket = fixture.coordinator.admit_mutation()?;
     let removal =
         ResolvedKeyChange::remove(&fixture.epoch, &fixture.coordinator, ticket, identifier)?;
     fixture.publish_keys(removal)?;
     assert!(matches!(
-        pending.reserve(&fixture.coordinator, MutationLease::granted(pending_ticket)),
+        pending.reserve(
+            fixture.coordinator.grant_intent(pending_ticket),
+            &fixture.coordinator
+        ),
         Err(Error::ClusterReferenceConflict)
     ));
     assert!(matches!(
         reserved.prepare_commit(
+            fixture.coordinator.grant_commit(reserved_ticket),
             &mut fixture.coordinator,
             &fixture.epoch,
-            &mut fixture.cache,
-            CommitLease::granted(reserved_ticket)
+            &mut fixture.cache
         ),
         Err(Error::ClusterReferenceConflict)
     ));
@@ -2383,7 +2627,10 @@ fn directory_moves_revalidate_destination_ancestry() -> Result<()> {
         )
     })?;
     assert!(matches!(
-        resolved.reserve(&fixture.coordinator, MutationLease::granted(ticket)),
+        resolved.reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator
+        ),
         Err(Error::ClusterReferenceConflict)
     ));
     assert!(matches!(

@@ -52,10 +52,12 @@ impl ResolvedKeyChange {
         coordinator: &MutationCoordinatorState,
         ticket: u64,
     ) -> Result<Self> {
-        if coordinator.published_epoch() != (epoch.identity().uuid(), epoch.sequence()) {
+        if coordinator.mount != epoch.mount
+            || coordinator.published_epoch() != (epoch.identity().uuid(), epoch.sequence())
+        {
             return Err(Error::StaleReadContext);
         }
-        let mut observed = ObservedResourceVersionSet::new(ticket);
+        let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount);
         observed.include(
             MutationResource::KEY_SET,
             coordinator.resource_version(MutationResource::KEY_SET),
@@ -77,10 +79,11 @@ impl ResolvedKeyChange {
     /// Returns a mismatched ticket or a changed key set before reserving publication authority.
     pub fn reserve(
         self,
-        coordinator: &MutationCoordinatorState,
         intent: MutationLease,
+        coordinator: &MutationCoordinatorState,
     ) -> Result<ReservedKeyChange> {
-        if intent.into_ticket() != self.observed.ticket() || !coordinator.revalidate(&self.observed)
+        if intent.consume(&coordinator.mount)? != self.observed.ticket()
+            || !coordinator.revalidate(&self.observed)
         {
             return Err(Error::ClusterReferenceConflict);
         }
@@ -104,13 +107,18 @@ impl ReservedKeyChange {
     /// Returns mismatched grants, stale keys/epoch, a pending checkpoint, or allocation failure.
     pub fn prepare(
         self,
+        commit: CommitLease,
         coordinator: &mut MutationCoordinatorState,
         current: &CommittedEpoch,
-        commit: CommitLease,
     ) -> Result<PreparedKeyChange> {
         let ticket = self.resolved.observed.ticket();
-        if commit.into_ticket() != ticket || !coordinator.revalidate(&self.resolved.observed) {
+        if commit.consume(&coordinator.mount)? != ticket
+            || !coordinator.revalidate(&self.resolved.observed)
+        {
             return Err(Error::ClusterReferenceConflict);
+        }
+        if coordinator.mount != current.mount {
+            return Err(Error::StaleReadContext);
         }
         let expected_epoch = (current.identity().uuid(), current.sequence());
         match &coordinator.journal {
@@ -119,6 +127,7 @@ impl ReservedKeyChange {
         }
         let versions = coordinator.prepare_version_publication(&self.resolved.observed)?;
         let epoch = CommittedEpoch::prepared(
+            current,
             current.sequence().next()?,
             current.superblock,
             self.resolved.keys,
@@ -153,10 +162,12 @@ impl PreparedKeyChange {
     /// Returns a mismatched visibility grant or intervening epoch change before any publication.
     pub fn publish(
         self,
-        coordinator: &mut MutationCoordinatorState,
         visibility: VisibilityLease,
+        coordinator: &mut MutationCoordinatorState,
     ) -> Result<CommittedEpoch> {
-        if visibility.into_ticket() != self.ticket {
+        if visibility.consume(&coordinator.mount)? != self.ticket
+            || coordinator.mount != self.epoch.mount
+        {
             return Err(Error::ClusterReferenceConflict);
         }
         let JournalCoordinatorState::Ready { epoch, .. } = &mut coordinator.journal else {

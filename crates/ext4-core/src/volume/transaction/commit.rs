@@ -251,7 +251,9 @@ impl MetadataMutation<'_, '_> {
         ticket: u64,
         coordinator: &MutationCoordinatorState,
     ) -> Result<ResolvedMutation> {
-        if self.volume.epoch != Some(coordinator.published_epoch()) {
+        if self.volume.mount != Some(&coordinator.mount)
+            || self.volume.epoch != Some(coordinator.published_epoch())
+        {
             return Err(Error::ClusterReferenceConflict);
         }
         let mut journal_blocks = self.metadata_blocks()?;
@@ -265,7 +267,7 @@ impl MetadataMutation<'_, '_> {
             }
         }
         let _validated_next_state = self.committed_cluster_state()?;
-        let mut observed = ObservedResourceVersionSet::new(ticket);
+        let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount);
         let key_version = self
             .volume
             .key_dependency()
@@ -333,22 +335,25 @@ impl ReservedMutation {
     /// any pre-publication allocation fails.
     pub fn prepare_commit(
         self,
+        commit: super::super::CommitLease,
         coordinator: &mut MutationCoordinatorState,
         current_epoch: &CommittedEpoch,
         cache: &mut crate::MetadataCache,
-        commit: super::super::CommitLease,
     ) -> Result<CommitReadyMutation> {
-        if commit.into_ticket() != self.resolved.observed.ticket()
+        if commit.consume(&coordinator.mount)? != self.resolved.observed.ticket()
             || !self.resolved.is_current(coordinator)
         {
             return Err(Error::ClusterReferenceConflict);
         }
+        let ticket = self.resolved.observed.ticket();
         let version_publication =
             coordinator.prepare_version_publication(&self.resolved.observed)?;
         let JournalCoordinatorState::Ready { journal, epoch } = &coordinator.journal else {
             return Err(Error::JournalCorrupt);
         };
-        if *epoch != (current_epoch.identity().uuid(), current_epoch.sequence()) {
+        if coordinator.mount != current_epoch.mount
+            || *epoch != (current_epoch.identity().uuid(), current_epoch.sequence())
+        {
             return Err(Error::ClusterReferenceConflict);
         }
 
@@ -408,6 +413,7 @@ impl ReservedMutation {
         let durable_sequence = current_epoch.sequence().next()?;
         let checkpoint_sequence = durable_sequence.next()?;
         let durable_epoch = CommittedEpoch::prepared(
+            current_epoch,
             durable_sequence,
             superblock,
             durable_keys,
@@ -415,6 +421,7 @@ impl ReservedMutation {
             overlay,
         );
         let checkpointed_epoch = CommittedEpoch::prepared(
+            current_epoch,
             checkpoint_sequence,
             superblock,
             checkpoint_keys,
@@ -436,6 +443,7 @@ impl ReservedMutation {
                 .chain(core::iter::once(&checkpoint.clean_write)),
         )?;
         Ok(CommitReadyMutation {
+            ticket,
             ordered_data_writes,
             journal_writes,
             commit_write,
@@ -453,6 +461,7 @@ impl CommitReadyMutation {
     #[must_use]
     pub fn start(self) -> StorageRequestSequence<OrderedDataDurability> {
         let durable = DurableMutation {
+            ticket: self.ticket,
             durable_journal: self.durable_journal,
             durable_epoch: self.durable_epoch,
             checkpoint: self.checkpoint,
@@ -475,14 +484,26 @@ impl CommitReadyMutation {
 impl DurableMutation {
     /// Publishes a durable commit using moves and fixed-table replacement only.
     ///
-    /// This transition performs no allocation and cannot return an ordinary error.
-    #[must_use]
+    /// Rejection retains the already durable mutation for publication with the correct grant.
+    /// No storage I/O is repeated. This transition performs no allocation.
+    /// # Errors
+    /// Returns the error and reusable durable state when the grant or current epoch mismatches.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejection must return owned durable state without allocating after commit"
+    )]
     pub fn publish(
         self,
-        coordinator: &mut MutationCoordinatorState,
         visibility: super::super::VisibilityLease,
-    ) -> PublishedMutation {
-        let _ticket = visibility.into_ticket();
+        coordinator: &mut MutationCoordinatorState,
+    ) -> core::result::Result<PublishedMutation, (Error, Self)> {
+        let valid = visibility.consume(&coordinator.mount) == Ok(self.ticket)
+            && coordinator.mount == self.durable_epoch.mount
+            && matches!(coordinator.journal, JournalCoordinatorState::Ready { .. })
+            && coordinator.published_epoch().1.next() == Ok(self.durable_epoch.sequence());
+        if !valid {
+            return Err((Error::ClusterReferenceConflict, self));
+        }
         let _durable_journal = self.durable_journal;
         coordinator.journal = JournalCoordinatorState::CheckpointPending {
             epoch: (
@@ -491,23 +512,34 @@ impl DurableMutation {
             ),
         };
         coordinator.publish_versions(self.version_publication);
-        PublishedMutation {
+        Ok(PublishedMutation {
             epoch: self.durable_epoch,
             checkpoint: self.checkpoint,
-        }
+        })
     }
 }
 
 impl CheckpointOperation {
     /// Starts checkpoint home-block I/O while sealing clean publication state.
-    #[must_use]
+    /// # Errors
+    /// Returns the error and reusable checkpoint when its mount or visible epoch mismatches.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejection preserves owned checkpoint authority without allocating after commit"
+    )]
     pub fn start(
         self,
         checkpoint: super::super::CheckpointLease,
-    ) -> StorageRequestSequence<HomeBlockDurability> {
-        let _epoch = checkpoint.into_epoch();
+    ) -> core::result::Result<StorageRequestSequence<HomeBlockDurability>, (Error, Self)> {
+        if checkpoint
+            .consume(&self.checkpointed_epoch.mount)
+            .and_then(|epoch| epoch.next())
+            != Ok(self.checkpointed_epoch.sequence())
+        {
+            return Err((Error::ClusterReferenceConflict, self));
+        }
         let journal_target = self.clean_write.target();
-        StorageRequestSequence::new(
+        Ok(StorageRequestSequence::new(
             self.home_writes,
             HomeBlockDurability {
                 clean_write: self.clean_write,
@@ -515,16 +547,33 @@ impl CheckpointOperation {
                 clean_journal: self.clean_journal,
                 checkpointed_epoch: self.checkpointed_epoch,
             },
-        )
+        ))
     }
 }
 
-impl CleanJournalDurability {
+impl CheckpointPublication {
     /// Publishes prebuilt clean journal and overlay-free epoch after the final flush.
     ///
-    /// This transition performs no allocation and cannot return an ordinary error.
-    #[must_use]
-    pub fn completed(self, coordinator: &mut MutationCoordinatorState) -> CommittedEpoch {
+    /// This transition performs no allocation. Rejection retains the completed checkpoint proof.
+    /// # Errors
+    /// Returns the error and reusable publication when the coordinator is not its pending epoch.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejection preserves completed checkpoint state without allocating after durability"
+    )]
+    pub fn publish(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+    ) -> core::result::Result<CommittedEpoch, (Error, Self)> {
+        if coordinator.mount != self.checkpointed_epoch.mount
+            || !matches!(
+                coordinator.journal,
+                JournalCoordinatorState::CheckpointPending { .. }
+            )
+            || coordinator.published_epoch().1.next() != Ok(self.checkpointed_epoch.sequence())
+        {
+            return Err((Error::ClusterReferenceConflict, self));
+        }
         coordinator.journal = JournalCoordinatorState::Ready {
             journal: self.clean_journal,
             epoch: (
@@ -532,7 +581,7 @@ impl CleanJournalDurability {
                 self.checkpointed_epoch.sequence(),
             ),
         };
-        self.checkpointed_epoch
+        Ok(self.checkpointed_epoch)
     }
 }
 

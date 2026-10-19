@@ -1588,7 +1588,7 @@ impl MountedVolumeAccess<'_> {
         change: ext4_core::ResolvedKeyChange,
         intent: MutationLease,
     ) -> DriverResult<ext4_core::ReservedKeyChange> {
-        Ok(change.reserve(self.runtime.coordinator(), intent)?)
+        Ok(change.reserve(intent, self.runtime.coordinator())?)
     }
 
     /// Reserves one immutable slot for a key-only publication.
@@ -1617,7 +1617,7 @@ impl MountedVolumeAccess<'_> {
         resolved: ResolvedMutation,
         intent: MutationLease,
     ) -> Result<ReservedMutation, ext4_core::Error> {
-        resolved.reserve(self.runtime.coordinator(), intent)
+        resolved.reserve(intent, self.runtime.coordinator())
     }
 
     /// Prepares a commit from the coordinator and current immutable epoch authorities.
@@ -1639,6 +1639,12 @@ impl MountedVolumeAccess<'_> {
     /// allocated.
     pub(crate) fn reserve_epoch_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
         self.runtime.reserve_epoch_publication()
+    }
+
+    /// Issues the session-bound intent after the reactor scheduler acquired the resource set.
+    #[cfg(not(test))]
+    pub(crate) fn grant_intent(&mut self, ticket: u64) -> MutationLease {
+        self.runtime.grant_intent(ticket)
     }
 
     /// Grants the serialized commit lane when its runtime preconditions are satisfied.
@@ -1709,7 +1715,7 @@ impl MountedVolumeAccess<'_> {
     /// Publishes an overlay-free checkpoint and releases journal space.
     pub(crate) fn publish_checkpoint(
         &mut self,
-        durability: CleanJournalDurability,
+        durability: CheckpointPublication,
         publication: EpochPublicationSlot,
         epoch: ext4_core::EpochSequence,
     ) {

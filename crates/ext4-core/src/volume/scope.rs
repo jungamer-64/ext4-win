@@ -71,7 +71,7 @@ pub(super) use super::inode_record::{
     RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
 pub(super) use super::mount::{
-    CommittedEpoch, EpochReadView, JournalCoordinatorState, MountedProfile,
+    CommittedEpoch, EpochReadView, JournalCoordinatorState, MountIdentity, MountedProfile,
     MutationCoordinatorState, MutationResource, ObservedResourceVersionSet, ReadObservations,
     ResourceVersion, ResourceVersionPublication,
 };

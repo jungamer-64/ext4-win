@@ -2815,7 +2815,7 @@ impl CompletionReactor {
                         SlotPayload::Operation {
                             operation: suspended,
                             event: Some(CompletionEvent::Core(OperationEvent::IntentGranted(
-                                ext4_core::MutationLease::granted(ticket),
+                                self.with_mounted_access(|access| access.grant_intent(ticket)),
                             ))),
                         },
                     ),
@@ -4161,7 +4161,7 @@ impl CompletionReactor {
                 identity.index(),
                 operation,
                 CompletionEvent::Core(OperationEvent::IntentGranted(
-                    ext4_core::MutationLease::granted(ticket),
+                    self.with_mounted_access(|access| access.grant_intent(ticket)),
                 )),
             );
         }

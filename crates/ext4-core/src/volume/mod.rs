@@ -42,8 +42,8 @@ pub use operation::{
     MutationResolveReady, MutationResolveTransition, ReadTransition,
 };
 pub use transaction::{
-    CheckpointOperation, CleanJournalDurability, CleanJournalRecordPhase, CommitDurability,
-    CommitReadyMutation, CommitRecordPhase, DurableMutation, HomeBlockDurability,
+    CheckpointOperation, CheckpointPublication, CleanJournalDurability, CleanJournalRecordPhase,
+    CommitDurability, CommitReadyMutation, CommitRecordPhase, DurableMutation, HomeBlockDurability,
     JournalPayloadDurability, MutationResolvePass, NamespaceDestination, OrderedDataDurability,
     PublishedMutation, ReservedMutation, ResolvedMutation, StorageRequestSequence,
     StorageRequestSequenceStep, TransactionDirectory, TransactionFile, TransactionHardLinkSource,

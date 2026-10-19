@@ -853,7 +853,7 @@ mod tests {
             superblock,
             crate::FscryptKeySet::empty(),
             ClusterReferenceIndex::new(),
-        );
+        )?;
         let mut cache = crate::MetadataCache::try_new(&initial)?;
         let transcript = || {
             StorageTranscript::new(
@@ -909,6 +909,7 @@ mod tests {
             memory::repeated_vec(2_u8, 1024)?,
         );
         let durable = crate::CommittedEpoch::prepared(
+            &initial,
             initial.sequence().next()?,
             superblock,
             crate::FscryptKeySet::empty(),
@@ -1009,6 +1010,7 @@ mod tests {
         );
         assert_eq!(out, [7; 64]);
         let checkpoint = crate::CommittedEpoch::prepared(
+            &durable,
             durable.sequence().next()?,
             superblock,
             crate::FscryptKeySet::empty(),
@@ -1762,7 +1764,7 @@ mod tests {
                 superblock,
                 FscryptKeySet::empty(),
                 ClusterReferenceIndex::new(),
-            );
+            )?;
             let mut root = [0_u8; 60];
             for (offset, value) in [(0, 0xf30a), (2, 3), (4, 4), (6, 1)] {
                 put_le_u16(&mut root, disk_offset(offset), value)?;

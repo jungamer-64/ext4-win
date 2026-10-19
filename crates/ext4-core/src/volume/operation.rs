@@ -427,6 +427,8 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
 /// requires fresh admission. Unrelated publications preserve owned buffers across suspension.
 #[derive(Debug)]
 pub struct EpochReadOperation {
+    /// Mount session that owns every retained read buffer.
+    mount: MountIdentity,
     /// Completed and in-flight reads for the filesystem device.
     filesystem: StorageTranscript,
     /// Inode and key versions establishing the interpretation of retained storage bytes.
@@ -439,6 +441,7 @@ impl EpochReadOperation {
     /// Opens an entry projection with the dependencies of the traversal that identified it.
     pub(super) fn entry(profile: &MountedProfile, observed: ReadObservations) -> Self {
         Self {
+            mount: profile.mount.clone(),
             filesystem: StorageTranscript::new(
                 StorageTarget::Filesystem,
                 profile.filesystem_length(),
@@ -449,8 +452,9 @@ impl EpochReadOperation {
     }
     /// Creates an empty read transcript for one mounted filesystem device.
     #[must_use]
-    pub const fn new(profile: &MountedProfile) -> Self {
+    pub fn new(profile: &MountedProfile) -> Self {
         Self {
+            mount: profile.mount.clone(),
             observed: ReadObservations::new(),
             metadata_stamp: None,
             filesystem: StorageTranscript::new(
@@ -475,6 +479,9 @@ impl EpochReadOperation {
     ) -> ReadTransition<T> {
         let cache = context.cache;
         let epoch = cache.epoch();
+        if self.mount != epoch.mount {
+            return ReadTransition::Complete(Err(Error::ReadConflict));
+        }
         match event {
             super::OperationEvent::Admitted => {}
             super::OperationEvent::StorageCompleted(completion) => {
@@ -528,6 +535,10 @@ impl EpochReadOperation {
 /// Owned mutation resolver after its event has been integrated and before one synchronous pass.
 #[derive(Debug)]
 pub struct MutationResolveReady {
+    /// Immutable epoch selected for the entire resolve transcript.
+    epoch: Option<super::EpochSequence>,
+    /// Mount session that owns every retained read buffer.
+    mount: MountIdentity,
     /// Operation-owned filesystem transcript.
     filesystem: StorageTranscript,
 }
@@ -535,6 +546,10 @@ pub struct MutationResolveReady {
 /// Owned mutation resolver suspended only on concrete storage completions.
 #[derive(Debug)]
 pub struct MutationResolveOperation {
+    /// Immutable epoch selected for the entire resolve transcript.
+    epoch: Option<super::EpochSequence>,
+    /// Mount session that owns every retained read buffer.
+    mount: MountIdentity,
     /// Operation-owned filesystem transcript.
     filesystem: StorageTranscript,
 }
@@ -556,8 +571,10 @@ pub enum MutationResolveTransition {
 impl MutationResolveOperation {
     /// Creates an empty mutation read transcript.
     #[must_use]
-    pub const fn new(profile: &MountedProfile) -> Self {
+    pub fn new(profile: &MountedProfile) -> Self {
         Self {
+            mount: profile.mount.clone(),
+            epoch: None,
             filesystem: StorageTranscript::new(
                 StorageTarget::Filesystem,
                 profile.filesystem_length(),
@@ -585,6 +602,8 @@ impl MutationResolveOperation {
             | super::OperationEvent::BarrierReleased(_) => return Err(Error::DeviceIo),
         }
         Ok(MutationResolveReady {
+            mount: self.mount,
+            epoch: self.epoch,
             filesystem: self.filesystem,
         })
     }
@@ -595,16 +614,29 @@ impl MutationResolveReady {
     ///
     /// The returned pass cannot enter a completion envelope. It must be consumed by
     /// [`MutationResolvePass::resolve`] before [`Self::finish`] moves this owned resolver.
-    #[must_use]
+    /// # Errors
+    /// Rejects a different mount or epoch before interpreting retained lower buffers.
     pub fn begin_pass<'pass>(
         &'pass mut self,
         cache: crate::MetadataCacheAccess<'pass>,
         now: Ext4Timestamp,
         crypto: &'pass mut dyn CryptographicOperation,
-    ) -> MutationResolvePass<'pass, 'pass, 'pass> {
+    ) -> Result<MutationResolvePass<'pass, 'pass, 'pass>> {
         let epoch = cache.epoch();
+        if self.mount != epoch.mount
+            || self
+                .epoch
+                .is_some_and(|sequence| sequence != epoch.sequence())
+        {
+            return Err(Error::StaleReadContext);
+        }
+        self.epoch = Some(epoch.sequence());
         let device = OperationDevice::with_overlay(&mut self.filesystem, epoch, Some(cache));
-        MutationResolvePass::begin(EpochReadView::committed(device, epoch), now, crypto)
+        Ok(MutationResolvePass::begin(
+            EpochReadView::committed(device, epoch),
+            now,
+            crypto,
+        ))
     }
 
     /// Converts one consumed pass result into a lower submit or terminal resolved mutation.
@@ -615,6 +647,8 @@ impl MutationResolveReady {
                 Ok(request) => MutationResolveTransition::SubmitLower {
                     request,
                     suspended: MutationResolveOperation {
+                        mount: self.mount,
+                        epoch: self.epoch,
                         filesystem: self.filesystem,
                     },
                 },

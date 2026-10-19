@@ -409,10 +409,12 @@ impl ResolvedMutation {
     /// Returns an error when a resource version changed after resolution.
     pub fn reserve(
         self,
-        coordinator: &MutationCoordinatorState,
         intent: super::MutationLease,
+        coordinator: &MutationCoordinatorState,
     ) -> Result<ReservedMutation> {
-        if intent.into_ticket() != self.observed.ticket() || !self.is_current(coordinator) {
+        if intent.consume(&coordinator.mount)? != self.observed.ticket()
+            || !self.is_current(coordinator)
+        {
             return Err(Error::ClusterReferenceConflict);
         }
         Ok(ReservedMutation { resolved: self })
@@ -440,6 +442,8 @@ impl ReservedMutation {
 /// All lower-write, epoch-publication, version, and checkpoint allocations prepared up front.
 #[derive(Debug)]
 pub struct CommitReadyMutation {
+    /// Scheduler ticket whose commit and visibility grants protect this publication.
+    ticket: u64,
     /// Ordered data writes before journal descriptor/data records.
     ordered_data_writes: Vec<crate::StorageRequest>,
     /// Dirty-superblock, descriptor, and journal payload writes.
@@ -461,6 +465,8 @@ pub struct CommitReadyMutation {
 /// Commit whose record and required flush are durable but not yet visible to readers.
 #[derive(Debug)]
 pub struct DurableMutation {
+    /// Scheduler ticket whose commit and visibility grants protect this publication.
+    ticket: u64,
     /// Dirty journal coordinator value.
     durable_journal: Journal<DirtyJournal>,
     /// Overlay epoch ready for an allocation-free swap.
@@ -518,7 +524,7 @@ pub enum StorageRequestSequenceStep<Next> {
         /// Owned request transferred into the lower completion envelope.
         request: crate::StorageRequest,
         /// Suspended sequence resumed only by that request's completion.
-        suspended: StorageRequestSequence<Next>,
+        suspended: crate::PendingStorageTransfer<StorageRequestSequence<Next>>,
     },
     /// Every request completed and the next typestate is available.
     Finished(Next),
@@ -533,7 +539,16 @@ impl<Next> StorageRequestSequence<Next> {
         }
     }
 
-
+    /// Transfers one request; its remaining sequence requires that exact completion.
+    #[must_use]
+    pub fn advance(mut self) -> StorageRequestSequenceStep<Next> {
+        if let Some(request) = self.remaining.next() {
+            let (request, suspended) = crate::PendingStorageTransfer::submit(request, self);
+            StorageRequestSequenceStep::Submit { request, suspended }
+        } else {
+            StorageRequestSequenceStep::Finished(self.next)
+        }
+    }
 }
 
 /// Continuation that requires filesystem durability after ordered data writes.
@@ -546,15 +561,22 @@ pub struct OrderedDataDurability {
 }
 
 impl OrderedDataDurability {
-    /// Filesystem flush required before journal metadata can be submitted.
+    /// Issues the filesystem durability barrier before any journal payload write.
     #[must_use]
-    pub const fn flush_request(&self) -> crate::StorageRequest {
-        crate::StorageRequest::Flush {
+    pub fn submit(
+        self,
+    ) -> (
+        crate::StorageRequest,
+        crate::PendingStorageTransfer<StorageRequestSequence<JournalPayloadDurability>>,
+    ) {
+        let request = crate::StorageRequest::Flush {
             target: crate::StorageTarget::Filesystem,
-        }
+        };
+        crate::PendingStorageTransfer::submit(
+            request,
+            StorageRequestSequence::new(self.journal_writes, self.next),
+        )
     }
-
-
 }
 
 /// Continuation that requires journal durability after descriptor and payload writes.
@@ -569,15 +591,24 @@ pub struct JournalPayloadDurability {
 }
 
 impl JournalPayloadDurability {
-    /// Flush required before the commit record can be submitted.
+    /// Issues the journal barrier protecting the descriptor and payloads before commit.
     #[must_use]
-    pub const fn flush_request(&self) -> crate::StorageRequest {
-        crate::StorageRequest::Flush {
+    pub fn submit(
+        self,
+    ) -> (
+        crate::StorageRequest,
+        crate::PendingStorageTransfer<CommitRecordPhase>,
+    ) {
+        let request = crate::StorageRequest::Flush {
             target: self.journal_target,
-        }
+        };
+        let next = CommitRecordPhase {
+            request: self.commit_write,
+            journal_target: self.journal_target,
+            durable: self.durable,
+        };
+        crate::PendingStorageTransfer::submit(request, next)
     }
-
-
 }
 
 /// Single commit-record write preceding the commit durability flush.
@@ -592,16 +623,19 @@ pub struct CommitRecordPhase {
 }
 
 impl CommitRecordPhase {
-    /// Moves the commit record into lower-I/O ownership and returns its suspended continuation.
+    /// Transfers the commit record; its flush continuation requires successful write completion.
     #[must_use]
-    pub fn submit(self) -> (crate::StorageRequest, CommitDurability) {
-        (
-            self.request,
-            CommitDurability {
-                journal_target: self.journal_target,
-                durable: self.durable,
-            },
-        )
+    pub fn submit(
+        self,
+    ) -> (
+        crate::StorageRequest,
+        crate::PendingStorageTransfer<CommitDurability>,
+    ) {
+        let next = CommitDurability {
+            journal_target: self.journal_target,
+            durable: self.durable,
+        };
+        crate::PendingStorageTransfer::submit(self.request, next)
     }
 }
 
@@ -615,15 +649,19 @@ pub struct CommitDurability {
 }
 
 impl CommitDurability {
-    /// Flush that establishes commit durability.
+    /// Issues the barrier whose successful completion establishes commit durability.
     #[must_use]
-    pub const fn flush_request(&self) -> crate::StorageRequest {
-        crate::StorageRequest::Flush {
+    pub fn submit(
+        self,
+    ) -> (
+        crate::StorageRequest,
+        crate::PendingStorageTransfer<DurableMutation>,
+    ) {
+        let request = crate::StorageRequest::Flush {
             target: self.journal_target,
-        }
+        };
+        crate::PendingStorageTransfer::submit(request, self.durable)
     }
-
-
 }
 
 /// Continuation requiring a filesystem flush after all home blocks complete.
@@ -640,15 +678,25 @@ pub struct HomeBlockDurability {
 }
 
 impl HomeBlockDurability {
-    /// Filesystem flush that makes every checkpointed home block durable.
+    /// Issues the home-block durability barrier before the clean journal record.
     #[must_use]
-    pub const fn flush_request(&self) -> crate::StorageRequest {
-        crate::StorageRequest::Flush {
+    pub fn submit(
+        self,
+    ) -> (
+        crate::StorageRequest,
+        crate::PendingStorageTransfer<CleanJournalRecordPhase>,
+    ) {
+        let request = crate::StorageRequest::Flush {
             target: crate::StorageTarget::Filesystem,
-        }
+        };
+        let next = CleanJournalRecordPhase {
+            request: self.clean_write,
+            journal_target: self.journal_target,
+            clean_journal: self.clean_journal,
+            checkpointed_epoch: self.checkpointed_epoch,
+        };
+        crate::PendingStorageTransfer::submit(request, next)
     }
-
-
 }
 
 /// Single clean-journal superblock write.
@@ -665,17 +713,20 @@ pub struct CleanJournalRecordPhase {
 }
 
 impl CleanJournalRecordPhase {
-    /// Moves the clean record into lower-I/O ownership and returns its continuation.
+    /// Transfers the clean record while retaining its final durability barrier.
     #[must_use]
-    pub fn submit(self) -> (crate::StorageRequest, CleanJournalDurability) {
-        (
-            self.request,
-            CleanJournalDurability {
-                journal_target: self.journal_target,
-                clean_journal: self.clean_journal,
-                checkpointed_epoch: self.checkpointed_epoch,
-            },
-        )
+    pub fn submit(
+        self,
+    ) -> (
+        crate::StorageRequest,
+        crate::PendingStorageTransfer<CleanJournalDurability>,
+    ) {
+        let next = CleanJournalDurability {
+            journal_target: self.journal_target,
+            clean_journal: self.clean_journal,
+            checkpointed_epoch: self.checkpointed_epoch,
+        };
+        crate::PendingStorageTransfer::submit(self.request, next)
     }
 }
 
@@ -691,13 +742,32 @@ pub struct CleanJournalDurability {
 }
 
 impl CleanJournalDurability {
-    /// Flush that makes the clean journal superblock durable.
+    /// Issues the final journal barrier; publication becomes available only after completion.
     #[must_use]
-    pub const fn flush_request(&self) -> crate::StorageRequest {
-        crate::StorageRequest::Flush {
+    pub fn submit(
+        self,
+    ) -> (
+        crate::StorageRequest,
+        crate::PendingStorageTransfer<CheckpointPublication>,
+    ) {
+        let request = crate::StorageRequest::Flush {
             target: self.journal_target,
-        }
+        };
+        let next = CheckpointPublication {
+            clean_journal: self.clean_journal,
+            checkpointed_epoch: self.checkpointed_epoch,
+        };
+        crate::PendingStorageTransfer::submit(request, next)
     }
+}
+
+/// Checkpoint whose home blocks and clean journal record have completed all durability barriers.
+#[derive(Debug)]
+pub struct CheckpointPublication {
+    /// Journal space released only by publication into its owning coordinator.
+    clean_journal: Journal<CleanJournal>,
+    /// Overlay-free epoch corresponding to the completed home-block checkpoint.
+    checkpointed_epoch: CommittedEpoch,
 }
 
 impl MutationResolvePass<'_, '_, '_> {

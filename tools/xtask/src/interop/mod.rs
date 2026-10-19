@@ -1024,47 +1024,58 @@ fn run_prepared_mutation_until_boundary(
         BoundarySequence::Stopped => return Ok(controller.stopped()),
         BoundarySequence::Finished(ordered) => ordered,
     };
-    if !complete_boundary_request(storage, &mut controller, ordered.flush_request())? {
+    let Some(payload_sequence) =
+        complete_boundary_transfer(storage, &mut controller, ordered.submit())?
+    else {
         return Ok(controller.stopped());
-    }
-    let payloads = match complete_boundary_sequence(storage, &mut controller, ordered.completed())?
-    {
+    };
+    let payloads = match complete_boundary_sequence(storage, &mut controller, payload_sequence)? {
         BoundarySequence::Stopped => return Ok(controller.stopped()),
         BoundarySequence::Finished(payloads) => payloads,
     };
-    if !complete_boundary_request(storage, &mut controller, payloads.flush_request())? {
+    let Some(commit_record) =
+        complete_boundary_transfer(storage, &mut controller, payloads.submit())?
+    else {
         return Ok(controller.stopped());
-    }
-    let (commit_request, commit_durability) = payloads.completed().submit();
-    if !complete_boundary_request(storage, &mut controller, commit_request)? {
+    };
+    let Some(commit_durability) =
+        complete_boundary_transfer(storage, &mut controller, commit_record.submit())?
+    else {
         return Ok(controller.stopped());
-    }
-    if !complete_boundary_request(storage, &mut controller, commit_durability.flush_request())? {
+    };
+    let Some(durable) =
+        complete_boundary_transfer(storage, &mut controller, commit_durability.submit())?
+    else {
         return Ok(controller.stopped());
-    }
-    let published = commit_durability
-        .completed()
-        .publish(coordinator, ext4_core::VisibilityLease::granted(ticket));
+    };
+    let published = durable
+        .publish(coordinator.grant_visibility(ticket), coordinator)
+        .map_err(|(error, _durable)| core_task_error(error))?;
     let (epoch, checkpoint) = published.into_parts();
-    let home = match complete_boundary_sequence(
-        storage,
-        &mut controller,
-        checkpoint.start(ext4_core::CheckpointLease::granted(epoch.sequence())),
-    )? {
+    let sequence = checkpoint
+        .start(coordinator.grant_checkpoint(epoch.sequence()))
+        .map_err(|(error, _checkpoint)| core_task_error(error))?;
+    let home = match complete_boundary_sequence(storage, &mut controller, sequence)? {
         BoundarySequence::Stopped => return Ok(controller.stopped()),
         BoundarySequence::Finished(home) => home,
     };
-    if !complete_boundary_request(storage, &mut controller, home.flush_request())? {
+    let Some(clean_record) = complete_boundary_transfer(storage, &mut controller, home.submit())?
+    else {
         return Ok(controller.stopped());
-    }
-    let (clean_request, clean_durability) = home.completed().submit();
-    if !complete_boundary_request(storage, &mut controller, clean_request)? {
+    };
+    let Some(clean_durability) =
+        complete_boundary_transfer(storage, &mut controller, clean_record.submit())?
+    else {
         return Ok(controller.stopped());
-    }
-    if !complete_boundary_request(storage, &mut controller, clean_durability.flush_request())? {
+    };
+    let Some(publication) =
+        complete_boundary_transfer(storage, &mut controller, clean_durability.submit())?
+    else {
         return Ok(controller.stopped());
-    }
-    let _checkpointed_epoch = clean_durability.completed(coordinator);
+    };
+    let _checkpointed_epoch = publication
+        .publish(coordinator)
+        .map_err(|(error, _publication)| core_task_error(error))?;
     storage.materialize_durable()?;
     Ok(controller.completed())
 }
@@ -1082,10 +1093,12 @@ fn complete_boundary_sequence<Next>(
     loop {
         match sequence.advance() {
             ext4_core::StorageRequestSequenceStep::Submit { request, suspended } => {
-                if !complete_boundary_request(storage, controller, request)? {
+                let Some(next) =
+                    complete_boundary_transfer(storage, controller, (request, suspended))?
+                else {
                     return Ok(BoundarySequence::Stopped);
-                }
-                sequence = suspended;
+                };
+                sequence = next;
             }
             ext4_core::StorageRequestSequenceStep::Finished(next) => {
                 return Ok(BoundarySequence::Finished(next));
@@ -1099,17 +1112,21 @@ fn complete_boundary_sequence<Next>(
 /// # Errors
 ///
 /// Returns an error for host I/O or a mismatching lower completion identity.
-fn complete_boundary_request(
+fn complete_boundary_transfer<Next>(
     storage: &mut CrashStorageAdapter,
     controller: &mut EffectBoundaryController,
-    request: ext4_core::StorageRequest,
-) -> TaskResult<bool> {
-    let identity = ext4_core::StorageRequestIdentity::from_request(&request);
+    (request, pending): (
+        ext4_core::StorageRequest,
+        ext4_core::PendingStorageTransfer<Next>,
+    ),
+) -> TaskResult<Option<Next>> {
     let Some(completion) = controller.complete(storage, request)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    identity.complete(completion).map_err(core_task_error)?;
-    Ok(true)
+    Ok(pending
+        .complete(completion)
+        .map(Some)
+        .map_err(core_task_error)?)
 }
 
 /// Executes the public production mount/recovery and clean-close protocols against one image file.
@@ -1224,7 +1241,9 @@ where
         let mut pass_output = None;
         let result = {
             let mut crypto = UnkeyedCryptographicOperation;
-            let mut pass = ready.begin_pass(cache.access(epoch), now, &mut crypto);
+            let mut pass = ready
+                .begin_pass(cache.access(epoch), now, &mut crypto)
+                .map_err(core_task_error)?;
             match mutate(&mut pass) {
                 Ok(output) => {
                     pass_output = Some(output);
@@ -1250,14 +1269,14 @@ where
         }
     };
     let reserved = resolved
-        .reserve(coordinator, ext4_core::MutationLease::granted(ticket))
+        .reserve(coordinator.grant_intent(ticket), coordinator)
         .map_err(core_task_error)?;
     let prepared = reserved
         .prepare_commit(
+            coordinator.grant_commit(ticket),
             coordinator,
             epoch,
             &mut cache,
-            ext4_core::CommitLease::granted(ticket),
         )
         .map_err(core_task_error)?;
     Ok((prepared, output))
@@ -1309,25 +1328,25 @@ fn complete_prepared_mutation<S: HostStorage>(
     prepared: ext4_core::CommitReadyMutation,
 ) -> TaskResult<ext4_core::CommittedEpoch> {
     let ordered = complete_storage_sequence(storage, prepared.start())?;
-    complete_file_request_checked(storage, ordered.flush_request())?;
-    let payloads = complete_storage_sequence(storage, ordered.completed())?;
-    complete_file_request_checked(storage, payloads.flush_request())?;
-    let (commit_request, commit_durability) = payloads.completed().submit();
-    complete_file_request_checked(storage, commit_request)?;
-    complete_file_request_checked(storage, commit_durability.flush_request())?;
-    let published = commit_durability
-        .completed()
-        .publish(coordinator, ext4_core::VisibilityLease::granted(ticket));
+    let payload_sequence = complete_file_transfer(storage, ordered.submit())?;
+    let payloads = complete_storage_sequence(storage, payload_sequence)?;
+    let commit_record = complete_file_transfer(storage, payloads.submit())?;
+    let commit_durability = complete_file_transfer(storage, commit_record.submit())?;
+    let durable = complete_file_transfer(storage, commit_durability.submit())?;
+    let published = durable
+        .publish(coordinator.grant_visibility(ticket), coordinator)
+        .map_err(|(error, _durable)| core_task_error(error))?;
     let (epoch, checkpoint) = published.into_parts();
-    let home = complete_storage_sequence(
-        storage,
-        checkpoint.start(ext4_core::CheckpointLease::granted(epoch.sequence())),
-    )?;
-    complete_file_request_checked(storage, home.flush_request())?;
-    let (clean_request, clean_durability) = home.completed().submit();
-    complete_file_request_checked(storage, clean_request)?;
-    complete_file_request_checked(storage, clean_durability.flush_request())?;
-    Ok(clean_durability.completed(coordinator))
+    let sequence = checkpoint
+        .start(coordinator.grant_checkpoint(epoch.sequence()))
+        .map_err(|(error, _checkpoint)| core_task_error(error))?;
+    let home = complete_storage_sequence(storage, sequence)?;
+    let clean_record = complete_file_transfer(storage, home.submit())?;
+    let clean_durability = complete_file_transfer(storage, clean_record.submit())?;
+    let publication = complete_file_transfer(storage, clean_durability.submit())?;
+    Ok(publication
+        .publish(coordinator)
+        .map_err(|(error, _publication)| core_task_error(error))?)
 }
 
 /// Executes one typed mutation against a mounted image and cleanly closes the volume.
@@ -1478,13 +1497,11 @@ fn drive_core_commit_without_checkpoint(image: &Path, label: &[u8]) -> TaskResul
     let (prepared, _coordinator, _ticket) =
         prepare_volume_label_commit(&mut storage, completed, label)?;
     let ordered = complete_storage_sequence(&mut storage, prepared.start())?;
-    complete_file_request_checked(&mut storage, ordered.flush_request())?;
-    let payloads = complete_storage_sequence(&mut storage, ordered.completed())?;
-    complete_file_request_checked(&mut storage, payloads.flush_request())?;
-    let (commit_request, commit_durability) = payloads.completed().submit();
-    complete_file_request_checked(&mut storage, commit_request)?;
-    complete_file_request_checked(&mut storage, commit_durability.flush_request())?;
-    let _durable_uncheckpointed = commit_durability.completed();
+    let payload_sequence = complete_file_transfer(&mut storage, ordered.submit())?;
+    let payloads = complete_storage_sequence(&mut storage, payload_sequence)?;
+    let commit_record = complete_file_transfer(&mut storage, payloads.submit())?;
+    let commit_durability = complete_file_transfer(&mut storage, commit_record.submit())?;
+    let _durable_uncheckpointed = complete_file_transfer(&mut storage, commit_durability.submit())?;
     Ok(())
 }
 
@@ -1500,8 +1517,7 @@ fn complete_storage_sequence<S: HostStorage, Next>(
     loop {
         match sequence.advance() {
             ext4_core::StorageRequestSequenceStep::Submit { request, suspended } => {
-                complete_file_request_checked(storage, request)?;
-                sequence = suspended;
+                sequence = complete_file_transfer(storage, (request, suspended))?;
             }
             ext4_core::StorageRequestSequenceStep::Finished(next) => return Ok(next),
         }
@@ -1513,14 +1529,15 @@ fn complete_storage_sequence<S: HostStorage, Next>(
 /// # Errors
 ///
 /// Returns an error for host I/O or a mismatched completion identity.
-fn complete_file_request_checked(
+fn complete_file_transfer<Next>(
     storage: &mut impl HostStorage,
-    request: ext4_core::StorageRequest,
-) -> TaskResult<()> {
-    let identity = ext4_core::StorageRequestIdentity::from_request(&request);
+    (request, pending): (
+        ext4_core::StorageRequest,
+        ext4_core::PendingStorageTransfer<Next>,
+    ),
+) -> TaskResult<Next> {
     let completion = complete_file_request(storage, request)?;
-    identity.complete(completion).map_err(core_task_error)?;
-    Ok(())
+    Ok(pending.complete(completion).map_err(core_task_error)?)
 }
 
 /// Hash-capable boundary for unencrypted and locked-namespace interoperability passes.
