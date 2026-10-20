@@ -1152,12 +1152,6 @@ impl CompletionReactor {
         core::ptr::addr_of!(self.csq).cast_mut()
     }
 
-    /// Returns the exclusively owned embedded CSQ address during initialization.
-    #[cfg(not(test))]
-    fn csq_mut_ptr(&mut self) -> PIO_CSQ {
-        core::ptr::addr_of_mut!(self.csq)
-    }
-
     /// Initializes one reactor directly in stable device-extension storage.
     /// # Safety
     ///
@@ -1497,8 +1491,6 @@ impl CompletionReactor {
             retry_timers: _,
             cancel_envelopes: _,
         } = reactor;
-        #[cfg(not(test))]
-        let reactor_address = NonNull::from(&mut *reactor);
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
             initialize_list_head(reactor.pending_head.get());

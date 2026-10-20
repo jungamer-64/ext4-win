@@ -1049,7 +1049,7 @@ impl Drop for FileControlBlockLedger {
 struct FileControlBlockLedgerLock {
     /// Native resource initialized only after this allocation reaches its final pinned address.
     #[cfg(not(test))]
-    native: Pin<Box<UnsafeCell<MaybeUninit<wdk_sys::ERESOURCE>>>>,
+    native: memory::NativeAllocation<UnsafeCell<MaybeUninit<wdk_sys::ERESOURCE>>>,
     /// Host mutex with the same exclusive RAII ownership model as the native resource.
     #[cfg(test)]
     native: Mutex<()>,
