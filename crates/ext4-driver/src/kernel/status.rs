@@ -232,7 +232,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::CannotRemoveRoot => STATUS_CANNOT_DELETE,
         Error::MissingEncryptionKey => STATUS_ACCESS_DENIED,
         Error::DirtyVolume => STATUS_VOLUME_DIRTY,
-        Error::OutOfMemory => STATUS_INSUFFICIENT_RESOURCES,
+        Error::OutOfMemory | Error::MountIdentityExhausted => STATUS_INSUFFICIENT_RESOURCES,
         Error::OperationCancelled => STATUS_CANCELLED,
         Error::OperationSuspended => STATUS_INTERNAL_ERROR,
         Error::ReadConflict => wdk_sys::STATUS_RETRY,
@@ -347,6 +347,10 @@ mod tests {
         );
         assert_eq!(
             DriverError::from(Error::OutOfMemory).ntstatus(),
+            wdk_sys::STATUS_INSUFFICIENT_RESOURCES
+        );
+        assert_eq!(
+            DriverError::from(Error::MountIdentityExhausted).ntstatus(),
             wdk_sys::STATUS_INSUFFICIENT_RESOURCES
         );
         assert_eq!(

@@ -42,7 +42,9 @@ impl MountIdentitySequence {
     fn issue(&self) -> Result<MountIdentity> {
         // Only uniqueness is shared here; no mounted data is published through this counter.
         self.0
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                next.checked_add(1)
+            })
             .map(MountIdentity)
             .map_err(|_| Error::MountIdentityExhausted)
     }
@@ -162,7 +164,7 @@ impl ObservedResourceVersionSet {
     /// Starts an empty observed set for one stable FIFO ticket.
     pub(super) fn new(ticket: u64, mount: &MountIdentity) -> Self {
         Self {
-            mount: mount.clone(),
+            mount: *mount,
             ticket,
             entries: Vec::new(),
         }
@@ -448,7 +450,7 @@ impl MountedProfile {
         journal_target: StorageTarget,
     ) -> Self {
         Self {
-            mount: mount.clone(),
+            mount: *mount,
             superblock,
             filesystem_length,
             journal_target,
@@ -494,7 +496,7 @@ pub struct CommittedEpoch {
 impl CommittedEpoch {
     /// Builds the initial committed epoch after successful replay and mount validation.
     /// # Errors
-    /// Returns allocation failure before any mount publication write.
+    /// Returns mount identity exhaustion before any mount publication write.
     pub(super) fn initial(
         superblock: Superblock,
         fscrypt_keys: FscryptKeySet,
@@ -520,7 +522,7 @@ impl CommittedEpoch {
         overlay: Vec<JournalBlock>,
     ) -> Self {
         Self {
-            mount: current.mount.clone(),
+            mount: current.mount,
             sequence,
             superblock,
             fscrypt_keys,
@@ -810,7 +812,7 @@ impl MutationCoordinatorState {
     /// Builds coordinator state after mount replay has produced a clean journal.
     pub(crate) fn new(journal: Journal<CleanJournal>, current: &CommittedEpoch) -> Self {
         Self {
-            mount: current.mount.clone(),
+            mount: current.mount,
             journal: JournalCoordinatorState::Ready {
                 journal,
                 epoch: (current.identity().uuid(), current.sequence()),
@@ -856,28 +858,28 @@ impl MutationCoordinatorState {
     /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
     #[must_use]
     pub fn grant_intent(&mut self, ticket: u64) -> super::MutationLease {
-        super::MutationLease::new(self.mount.clone(), ticket)
+        super::MutationLease::new(self.mount, ticket)
     }
 
     /// Issues a mount-scoped commit grant after the owning scheduler acquires its gate.
     /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
     #[must_use]
     pub fn grant_commit(&mut self, ticket: u64) -> super::CommitLease {
-        super::CommitLease::new(self.mount.clone(), ticket)
+        super::CommitLease::new(self.mount, ticket)
     }
 
     /// Issues a mount-scoped visibility grant after the owning scheduler acquires its gate.
     /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
     #[must_use]
     pub fn grant_visibility(&mut self, ticket: u64) -> super::VisibilityLease {
-        super::VisibilityLease::new(self.mount.clone(), ticket)
+        super::VisibilityLease::new(self.mount, ticket)
     }
 
     /// Issues a mount-scoped checkpoint grant after the owning scheduler acquires its gate.
     /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
     #[must_use]
     pub fn grant_checkpoint(&mut self, epoch: EpochSequence) -> super::CheckpointLease {
-        super::CheckpointLease::new(self.mount.clone(), epoch)
+        super::CheckpointLease::new(self.mount, epoch)
     }
 
     /// Current committed version of one resource.
@@ -2356,6 +2358,32 @@ mod tests {
 
     use super::{CleanCloseOperation, CleanCloseTransition};
     use crate::volume::OperationEvent;
+
+    /// # Panics
+    /// Panics if the final identity cannot be issued or exhaustion reopens admission.
+    #[test]
+    fn mount_identity_exhaustion_is_permanent() {
+        let sequence = super::MountIdentitySequence(super::AtomicUsize::new(usize::MAX - 1));
+        let last = sequence.issue();
+        assert_eq!(last, Ok(super::MountIdentity(usize::MAX - 1)));
+        for _ in 0..2 {
+            assert_eq!(sequence.issue(), Err(Error::MountIdentityExhausted));
+        }
+    }
+
+    /// # Panics
+    /// Panics if simultaneous mount attempts receive the same origin or cannot be joined.
+    #[test]
+    fn concurrent_mounts_receive_distinct_origins() {
+        std::thread::scope(|scope| {
+            let background = scope.spawn(super::MountIdentity::new);
+            let foreground = super::MountIdentity::new();
+            assert!(matches!(
+                (background.join(), foreground),
+                (Ok(Ok(left)), Ok(right)) if left != right
+            ));
+        });
+    }
 
     /// # Panics
     /// Panics if distinct resources are capped or a delta changes unrelated versions.

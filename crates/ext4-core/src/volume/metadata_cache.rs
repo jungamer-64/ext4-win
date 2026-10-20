@@ -64,7 +64,7 @@ pub struct MetadataCache {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct CacheReadStamp {
     /// Logical snapshot selected before issuing the read.
-    epoch: (usize, EpochSequence),
+    epoch: (MountIdentity, EpochSequence),
     /// Cache invalidation generation at request creation.
     generation: u64,
 }
@@ -134,7 +134,7 @@ impl MetadataCache {
         }
         Ok(Self {
             storage: Some(storage),
-            epoch: Some((epoch.mount.clone(), epoch.sequence())),
+            epoch: Some((epoch.mount, epoch.sequence())),
             generation: 0,
             admission: Admission::Open,
         })
@@ -146,7 +146,7 @@ impl MetadataCache {
         epoch: &'pass CommittedEpoch,
     ) -> MetadataCacheAccess<'pass> {
         let stamp = CacheReadStamp {
-            epoch: (epoch.mount.stamp(), epoch.sequence()),
+            epoch: (epoch.mount, epoch.sequence()),
             generation: self.generation,
         };
         MetadataCacheAccess {
@@ -218,7 +218,7 @@ impl MetadataCache {
         {
             self.storage = None;
         }
-        self.epoch = Some((epoch.mount.clone(), epoch.sequence()));
+        self.epoch = Some((epoch.mount, epoch.sequence()));
         self.admission = Admission::Open;
         if let Some(storage) = &mut self.storage {
             for image in &epoch.overlay {
@@ -261,13 +261,7 @@ impl<'cache> MetadataCacheAccess<'cache> {
         range: core::ops::Range<usize>,
         out: &mut [u8],
     ) -> bool {
-        if self
-            .cache
-            .epoch
-            .as_ref()
-            .map(|(mount, sequence)| (mount.stamp(), *sequence))
-            != Some(self.stamp.epoch)
-        {
+        if self.cache.epoch != Some(self.stamp.epoch) {
             return false;
         }
         self.cache
@@ -277,12 +271,7 @@ impl<'cache> MetadataCacheAccess<'cache> {
     }
     /// Registers only complete, current, pre-invalidation reads after overlay application.
     pub(crate) fn insert(&mut self, block: BlockAddress, bytes: &[u8], stamp: CacheReadStamp) {
-        if self
-            .cache
-            .epoch
-            .as_ref()
-            .map(|(mount, sequence)| (mount.stamp(), *sequence))
-            != Some(stamp.epoch)
+        if self.cache.epoch != Some(stamp.epoch)
             || self.stamp != stamp
             || self.cache.generation != stamp.generation
             || !matches!(self.cache.admission, Admission::Open)

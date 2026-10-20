@@ -262,11 +262,11 @@ impl DirectoryReader {
         } else {
             self.binding = Some(match version {
                 Some(version) => DirectoryReadBinding::Observed {
-                    filesystem: filesystem.clone(),
+                    filesystem: *filesystem,
                     version,
                 },
                 None => DirectoryReadBinding::Resolution {
-                    filesystem: filesystem.clone(),
+                    filesystem: *filesystem,
                     epoch,
                 },
             });
@@ -794,7 +794,7 @@ impl DirectoryReadOperation {
         cursor: DirectoryScanCursor,
     ) -> Self {
         Self {
-            mount: profile.mount.clone(),
+            mount: profile.mount,
             observed: ReadObservations::new(),
             metadata_stamp: None,
             reader: DirectoryReader::new(directory, cursor),

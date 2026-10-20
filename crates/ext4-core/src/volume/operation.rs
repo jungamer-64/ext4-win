@@ -441,7 +441,7 @@ impl EpochReadOperation {
     /// Opens an entry projection with the dependencies of the traversal that identified it.
     pub(super) fn entry(profile: &MountedProfile, observed: ReadObservations) -> Self {
         Self {
-            mount: profile.mount.clone(),
+            mount: profile.mount,
             filesystem: StorageTranscript::new(
                 StorageTarget::Filesystem,
                 profile.filesystem_length(),
@@ -454,7 +454,7 @@ impl EpochReadOperation {
     #[must_use]
     pub fn new(profile: &MountedProfile) -> Self {
         Self {
-            mount: profile.mount.clone(),
+            mount: profile.mount,
             observed: ReadObservations::new(),
             metadata_stamp: None,
             filesystem: StorageTranscript::new(
@@ -573,7 +573,7 @@ impl MutationResolveOperation {
     #[must_use]
     pub fn new(profile: &MountedProfile) -> Self {
         Self {
-            mount: profile.mount.clone(),
+            mount: profile.mount,
             epoch: None,
             filesystem: StorageTranscript::new(
                 StorageTarget::Filesystem,
