@@ -422,7 +422,9 @@ impl MutationResolvePass<'_, '_, '_> {
                     let (chunk, remainder) = remaining
                         .split_at_checked(chunk_len)
                         .ok_or(Error::InvalidWriteRange)?;
-                    let block = pass.mutation.allocate_cluster()?;
+                    let block = pass
+                        .mutation
+                        .allocate_extent_block(&tree, LogicalBlock::try_from(logical)?)?;
                     let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                     memory::copy_exact(
                         bytes.get_mut(..chunk.len()).ok_or(Error::DeviceRange)?,
@@ -859,8 +861,8 @@ impl MutationResolvePass<'_, '_, '_> {
             );
         }
 
-        let new_physical = self.mutation.allocate_cluster()?;
         let logical_block = LogicalBlock::try_from(block_count)?;
+        let new_physical = self.mutation.allocate_extent_block(&tree, logical_block)?;
         tree.insert_or_extend_initialized(logical_block, new_physical)?;
 
         let mut block = DirectoryBlock::empty(
@@ -1720,8 +1722,9 @@ impl MutationResolvePass<'_, '_, '_> {
     ) -> Result<(u32, BlockAddress)> {
         let logical = u32::try_from(*next_logical).map_err(|_| Error::DirectoryIndexFull)?;
         DxEntry::new(0, logical)?;
-        let physical = self.mutation.allocate_cluster()?;
-        tree.insert_or_extend_initialized(LogicalBlock::try_from(*next_logical)?, physical)?;
+        let logical_block = LogicalBlock::try_from(*next_logical)?;
+        let physical = self.mutation.allocate_extent_block(tree, logical_block)?;
+        tree.insert_or_extend_initialized(logical_block, physical)?;
         *next_logical = next_logical
             .checked_add(1)
             .ok_or(Error::ArithmeticOverflow)?;

@@ -312,14 +312,15 @@ fn verify_internal_mutation_profiles(
     let regular_root = temporary_root.join("mutation-4k");
     fs::create_dir(&regular_root)?;
     let regular_image = regular_root.join("filesystem.img");
-    format_mutation_image(linux, &regular_image, None)?;
+    format_mutation_image(linux, &regular_image, None, true)?;
     verify_regular_mutation_profile(linux, &regular_root, &regular_image)?;
 
     let bigalloc_root = temporary_root.join("mutation-bigalloc-16k");
     fs::create_dir(&bigalloc_root)?;
     let bigalloc_image = bigalloc_root.join("filesystem.img");
-    format_mutation_image(linux, &bigalloc_image, Some(16_384))?;
+    format_mutation_image(linux, &bigalloc_image, Some(16_384), true)?;
     verify_bigalloc_mutation_profile(linux, &bigalloc_root, &bigalloc_image)?;
+    verify_bigalloc_directory_growth(linux, &bigalloc_root)?;
 
     println!("ext4-core fresh-image mutation profiles: PASS");
     Ok(())
@@ -1130,6 +1131,7 @@ fn format_mutation_image(
     linux: LinuxEnvironment,
     image: &Path,
     cluster_bytes: Option<u32>,
+    directory_indexing: bool,
 ) -> TaskResult<()> {
     const IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -1140,6 +1142,14 @@ fn format_mutation_image(
     } else {
         "metadata_csum,64bit,^metadata_csum_seed"
     };
+    let features = format!(
+        "{features},{}",
+        if directory_indexing {
+            "dir_index"
+        } else {
+            "^dir_index"
+        }
+    );
     let mut mke2fs = linux.command("mke2fs");
     mke2fs.args([
         "-q",
@@ -1149,7 +1159,7 @@ fn format_mutation_image(
         "-b",
         "4096",
         "-O",
-        features,
+        &features,
         "-E",
         "lazy_itable_init=0,lazy_journal_init=0",
         "-J",
@@ -1624,6 +1634,98 @@ fn verify_bigalloc_mutation_profile(
         "BIGALLOC",
     )?;
     verify_internal_e2fsck_clean(linux, image, "BIGALLOC mutation profile")
+}
+
+/// Grows linear and indexed directories across BIGALLOC cluster boundaries, then releases them.
+/// # Errors
+/// Returns format, mutation, enumeration, allocation-accounting, or independent fsck failures.
+fn verify_bigalloc_directory_growth(linux: LinuxEnvironment, root: &Path) -> TaskResult<()> {
+    const ENTRIES: usize = 96;
+    const BATCH: usize = 24;
+    for indexed in [false, true] {
+        let image = root.join(format!("directory-indexed-{indexed}.img"));
+        format_mutation_image(linux, &image, Some(16_384), indexed)?;
+        let baseline = debugfs_free_space(linux, &image)?;
+        let directory_name = ext4_core::Ext4Name::new(b"grown").map_err(core_task_error)?;
+        let source_name = ext4_core::Ext4Name::new(b"source").map_err(core_task_error)?;
+        let (directory, source) = drive_internal_core_mutation(&image, |pass| {
+            let parent = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            let source = pass.create_file(parent, &source_name, mutation_file_metadata()?)?;
+            let directory = pass.create_directory(
+                parent,
+                &directory_name,
+                ext4_core::NewDirectoryMetadata::new(
+                    mutation_file_metadata()?.owner(),
+                    ext4_core::Ext4Permissions::new(0o755)?,
+                ),
+            )?;
+            Ok((directory.id(), source.id()))
+        })?;
+        let names = (0..ENTRIES)
+            .map(|index| {
+                ext4_core::Ext4Name::new(format!("entry-{index:03}-{}", "x".repeat(200)).as_bytes())
+            })
+            .collect::<ext4_core::Result<Vec<_>>>()
+            .map_err(core_task_error)?;
+        for batch in names.chunks(BATCH) {
+            drive_internal_core_mutation(&image, |pass| {
+                let parent = pass.directory(directory)?;
+                let source = pass.hard_link_source(ext4_core::HardLinkNodeId::File(source))?;
+                for name in batch {
+                    pass.create_hard_link(
+                        source,
+                        parent,
+                        name,
+                        ext4_core::NamespaceDestination::Vacant,
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        let size = drive_internal_core_read(&image, |pass| {
+            Ok(
+                ext4_core::CommittedReadPass::load_directory(pass, directory)?
+                    .size()
+                    .bytes(),
+            )
+        })?;
+        if size <= 16_384 {
+            return Err(
+                io::Error::other("BIGALLOC directory did not cross a logical cluster").into(),
+            );
+        }
+        let mut expected = alloc::collections::BTreeSet::new();
+        expected.insert(b".".to_vec());
+        expected.insert(b"..".to_vec());
+        for name in &names {
+            expected.insert(name.bytes().to_vec());
+        }
+        drive_directory_enumeration(&image, directory, &mut expected)?;
+        verify_internal_e2fsck_clean(linux, &image, "BIGALLOC directory growth")?;
+        for batch in names.chunks(BATCH) {
+            drive_internal_core_mutation(&image, |pass| {
+                let parent = pass.directory(directory)?;
+                for name in batch {
+                    pass.unlink_file(parent, name)?;
+                }
+                Ok(())
+            })?;
+        }
+        drive_internal_core_mutation(&image, |pass| {
+            let parent = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            pass.remove_empty_directory(parent, &directory_name)?;
+            pass.unlink_file(parent, &source_name)
+        })?;
+        require_free_space_delta(
+            baseline,
+            debugfs_free_space(linux, &image)?,
+            0,
+            0,
+            "BIGALLOC directory release",
+        )?;
+        verify_internal_e2fsck_clean(linux, &image, "BIGALLOC directory release")?;
+    }
+    Ok(())
 }
 
 /// Returns deterministic POSIX metadata used by interoperability-created regular files.

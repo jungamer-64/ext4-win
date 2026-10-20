@@ -270,7 +270,7 @@ impl MutationResolvePass<'_, '_, '_> {
             while offset.bytes() < bound.bytes() {
                 let logical = offset.logical_block(block_size)?;
                 if matches!(tree.map_logical(logical), BlockMapping::Hole) {
-                    let physical = pass.physical_block_for_hole(&tree, logical)?;
+                    let physical = pass.mutation.allocate_extent_block(&tree, logical)?;
                     tree.insert_uninitialized(logical, physical)?;
                 }
                 offset = offset.checked_add_len(width)?;
@@ -653,7 +653,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     let physical = if tree.allocated_block(logical_block)?.is_some() {
                         tree.initialize_block(logical_block)?
                     } else {
-                        let physical = self.physical_block_for_hole(tree, logical_block)?;
+                        let physical = self.mutation.allocate_extent_block(tree, logical_block)?;
                         tree.insert_or_extend_initialized(logical_block, physical)?;
                         physical
                     };
@@ -741,7 +741,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     EncryptedBlockBase::ZeroedPlaintext,
                 ),
                 BlockMapping::Hole => {
-                    let physical = self.physical_block_for_hole(tree, logical_block)?;
+                    let physical = self.mutation.allocate_extent_block(tree, logical_block)?;
                     tree.insert_or_extend_initialized(logical_block, physical)?;
                     (physical, EncryptedBlockBase::ZeroedPlaintext)
                 }

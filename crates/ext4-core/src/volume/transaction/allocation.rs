@@ -3,6 +3,65 @@
 use super::*;
 
 impl MetadataMutation<'_, '_> {
+    /// Allocates an unmapped logical block in its extent stream's physical cluster.
+    /// Existing mappings in the same logical cluster select both the physical cluster and the
+    /// offset within it. The caller records the extent's initialized or unwritten state.
+    /// # Errors
+    /// Returns invalid geometry, reference-accounting, arithmetic, or cluster-allocation failures.
+    pub(super) fn allocate_extent_block(
+        &mut self,
+        tree: &MutableExtentTree,
+        logical_block: LogicalBlock,
+    ) -> Result<BlockAddress> {
+        let blocks_per_cluster = u64::from(self.volume.superblock.blocks_per_cluster().as_u32());
+        let logical = logical_block.as_u64();
+        let cluster_offset = logical
+            .checked_rem(blocks_per_cluster)
+            .ok_or(Error::InvalidClusterGeometry)?;
+        let logical_cluster_start = logical
+            .checked_sub(cluster_offset)
+            .ok_or(Error::ArithmeticOverflow)?;
+        for offset in 0..blocks_per_cluster {
+            let probe = logical_cluster_start
+                .checked_add(offset)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if probe > u64::from(u32::MAX) {
+                break;
+            }
+            let Some(physical) = tree.allocated_block(LogicalBlock::try_from(probe)?)? else {
+                continue;
+            };
+            let cluster = self.volume.superblock.cluster_of_block(physical)?;
+            let physical = self.physical_block_in_cluster(cluster, cluster_offset)?;
+            self.record_cluster_reference_delta(cluster, 1)?;
+            return Ok(physical);
+        }
+        let first_block = self.allocate_cluster()?;
+        let cluster = self.volume.superblock.cluster_of_block(first_block)?;
+        self.physical_block_in_cluster(cluster, cluster_offset)
+    }
+
+    /// Converts a cluster-relative block offset within the mounted geometry.
+    /// # Errors
+    /// Returns invalid geometry for an absent offset, or physical-address overflow.
+    fn physical_block_in_cluster(
+        &self,
+        cluster: ClusterAddress,
+        offset: u64,
+    ) -> Result<BlockAddress> {
+        if offset >= u64::from(self.volume.superblock.blocks_in_cluster(cluster)?) {
+            return Err(Error::InvalidClusterGeometry);
+        }
+        Ok(BlockAddress::new(
+            self.volume
+                .superblock
+                .first_block_of_cluster(cluster)?
+                .get()
+                .checked_add(offset)
+                .ok_or(Error::ArithmeticOverflow)?,
+        ))
+    }
+
     /// Releases terminal inode ownership after all data and extent-node references are staged away.
     /// # Errors
     /// Returns an error for invalid xattr ownership, allocation bitmaps, or directory accounting.
