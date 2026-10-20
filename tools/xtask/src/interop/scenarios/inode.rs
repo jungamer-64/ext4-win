@@ -28,12 +28,76 @@ pub(super) fn verify_inode_contracts(
     verify_ownership_privileges(linux, &root, &image)?;
     request(linux, &image, "set_inode_field /payload flags 0x84000")?;
     verify_internal_e2fsck_clean(linux, &image, "journal-data baseline")?;
-    verify_data_cuts(linux, &root, &image)?;
+    let inherited = verify_flag_inheritance(linux, &root)?;
+    verify_data_cuts(linux, &root, &inherited)?;
     verify_block_retirement(linux, &root, &image)?;
     verify_inode_retirement(linux, &root, &image)?;
     verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
     Ok(())
+}
+
+/// Observes child-kind inheritance through debugfs and returns the journaled file crash fixture.
+/// # Errors
+/// Returns formatting, mutation, inherited-flag mismatch, or independent fsck failures.
+fn verify_flag_inheritance(linux: LinuxEnvironment, root: &Path) -> TaskResult<std::path::PathBuf> {
+    let image = root.join("inherited-flags.img");
+    format_htree_image(linux, &image, 32 * 1024 * 1024, 4096, true, false, 4)?;
+    request(linux, &image, "set_inode_field / flags 0x940c8")?;
+    verify_internal_e2fsck_clean(linux, &image, "inode inheritance baseline")?;
+    drive_internal_core_mutation(&image, |pass| {
+        let parent = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+        let metadata = mutation_file_metadata()?;
+        let file = pass.create_file(parent, &ext4_core::Ext4Name::new(b"payload")?, metadata)?;
+        pass.write_file_range(file, ext4_core::FileOffset::ZERO, &[0x11; 8192])?;
+        let directory = pass.create_directory(
+            parent,
+            &ext4_core::Ext4Name::new(b"policy-directory")?,
+            ext4_core::NewDirectoryMetadata::new(
+                metadata.owner(),
+                ext4_core::Ext4Permissions::new(0o755)?,
+            ),
+        )?;
+        pass.create_file(directory, &ext4_core::Ext4Name::new(b"nested")?, metadata)?;
+        for (name, target) in [
+            (b"inline".as_slice(), b"target".as_slice()),
+            (b"extent".as_slice(), &[b'x'; 61]),
+        ] {
+            pass.create_symlink(
+                parent,
+                &ext4_core::Ext4Name::new(name)?,
+                &ext4_core::SymlinkTarget::new(target)?,
+                ext4_core::NewSymlinkMetadata::new(
+                    metadata.owner(),
+                    ext4_core::Ext4Permissions::new(0o777)?,
+                ),
+            )?;
+        }
+        Ok(())
+    })?;
+    for (path, expected) in [
+        ("/payload", 0x840c8),
+        ("/policy-directory", 0x940c8),
+        ("/policy-directory/nested", 0x840c8),
+        ("/inline", 0xc0),
+        ("/extent", 0x800c0),
+    ] {
+        let stat = request(linux, &image, &format!("stat {path}"))?;
+        let raw = stat
+            .split_once("Flags: ")
+            .and_then(|(_, tail)| tail.split_whitespace().next())
+            .and_then(|value| value.strip_prefix("0x"))
+            .ok_or_else(|| io::Error::other("debugfs omitted inode flags"))?;
+        let observed = u32::from_str_radix(raw, 16)?;
+        if observed != expected {
+            return Err(io::Error::other(format!(
+                "{path} inherited flags {observed:#x}, expected {expected:#x}"
+            ))
+            .into());
+        }
+    }
+    verify_internal_e2fsck_clean(linux, &image, "inode flag inheritance")?;
+    Ok(image)
 }
 
 /// Publishes derived inode and block bitmaps whose semantic domains occupy only part of a block.

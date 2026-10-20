@@ -129,6 +129,7 @@ impl MutationResolvePass<'_, '_, '_> {
             let allocated_inode = pass.mutation.allocate_inode()?;
             let mut raw_inode = allocated_inode.initialize_file(
                 metadata,
+                parent_inode.flags(),
                 pass.now,
                 pass.mutation.volume.superblock.block_size(),
                 pass.mutation.volume.superblock.inode_timestamp_encoding(),
@@ -327,6 +328,7 @@ impl MutationResolvePass<'_, '_, '_> {
             );
             let mut raw_inode = allocated_inode.initialize_directory(
                 metadata,
+                parent_inode.flags(),
                 pass.now,
                 block_size,
                 block,
@@ -396,6 +398,7 @@ impl MutationResolvePass<'_, '_, '_> {
             let raw_inode = if target.is_inline() {
                 allocated_inode.initialize_inline_symlink(
                     metadata,
+                    parent_inode.flags(),
                     pass.now,
                     target,
                     pass.mutation.volume.superblock.inode_timestamp_encoding(),
@@ -404,6 +407,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 let block_size = pass.mutation.volume.superblock.block_size();
                 let mut raw_inode = allocated_inode.initialize_extent_symlink(
                     metadata,
+                    parent_inode.flags(),
                     pass.now,
                     block_size,
                     target,

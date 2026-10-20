@@ -1217,9 +1217,6 @@ pub(crate) enum FileDataPersistence {
 pub struct InodeFlags(u32);
 
 impl InodeFlags {
-    /// No inode flags.
-    pub const EMPTY: Self = Self(0);
-
     /// Selects the parent's policy applicable to the child's inode kind.
     pub(crate) const fn inherited_by(self, kind: InodeKind) -> Self {
         let mask = match kind {
@@ -2170,7 +2167,7 @@ mod tests {
             encoding.decode_allocation_size(
                 wide_sector_encoded.low(),
                 wide_sector_encoded.high(),
-                InodeFlags::EMPTY,
+                InodeFlags::from_u32(0),
             ),
             Ok(FileAllocationSize::from_bytes(
                 largest_block_aligned_wide_sectors * 512
@@ -2189,7 +2186,7 @@ mod tests {
             encoding.decode_allocation_size(
                 block_encoded.low(),
                 block_encoded.high(),
-                InodeFlags::EMPTY.with_huge_file_blocks(),
+                InodeFlags::from_u32(0).with_huge_file_blocks(),
             ),
             Ok(FileAllocationSize::from_bytes(first_block_unit_bytes))
         );
@@ -2235,11 +2232,11 @@ mod tests {
             Err(Error::UnsupportedInodeMutation)
         );
         assert_eq!(
-            encoding.decode_allocation_size(0, 1, InodeFlags::EMPTY),
+            encoding.decode_allocation_size(0, 1, InodeFlags::from_u32(0)),
             Err(Error::InvalidInode)
         );
         assert_eq!(
-            encoding.decode_allocation_size(1, 0, InodeFlags::EMPTY.with_huge_file_blocks(),),
+            encoding.decode_allocation_size(1, 0, InodeFlags::from_u32(0).with_huge_file_blocks(),),
             Err(Error::InvalidInode)
         );
     }

@@ -198,8 +198,13 @@ impl AllocatedInodeRecord {
         target: &SymlinkTarget,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<LiveInodeRecord> {
-        self.raw
-            .initialize_inline_symlink(metadata, parent_flags, now, target, timestamp_encoding)?;
+        self.raw.initialize_inline_symlink(
+            metadata,
+            parent_flags,
+            now,
+            target,
+            timestamp_encoding,
+        )?;
         self.raw.into_live()
     }
 
@@ -569,7 +574,11 @@ impl RawInodeRecord<Vec<u8>> {
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
-        self.set_flags(parent_flags.inherited_by(InodeKind::File).with_extent_tree())?;
+        self.set_flags(
+            parent_flags
+                .inherited_by(InodeKind::File)
+                .with_extent_tree(),
+        )?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
@@ -611,7 +620,11 @@ impl RawInodeRecord<Vec<u8>> {
         self.set_links_count(Ext4LinkCount::TWO)?;
         self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
-        self.set_flags(parent_flags.inherited_by(InodeKind::Directory).with_extent_tree())?;
+        self.set_flags(
+            parent_flags
+                .inherited_by(InodeKind::Directory)
+                .with_extent_tree(),
+        )?;
         let mut extents = Vec::new();
         extents.try_push(Extent::initialized(
             LogicalBlock::from_u32(0),
@@ -692,7 +705,11 @@ impl RawInodeRecord<Vec<u8>> {
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
-        self.set_flags(parent_flags.inherited_by(InodeKind::Symlink).with_extent_tree())?;
+        self.set_flags(
+            parent_flags
+                .inherited_by(InodeKind::Symlink)
+                .with_extent_tree(),
+        )?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
@@ -1171,6 +1188,7 @@ mod tests {
     fn initialized_file(value: u32) -> Result<LiveInodeRecord> {
         raw_record(value)?.into_allocated().initialize_file(
             NewFileMetadata::new(owner(), permissions()?),
+            InodeFlags::from_u32(0),
             now(),
             block_size()?,
             InodeTimestampEncoding::LegacySeconds,
@@ -1200,6 +1218,7 @@ mod tests {
         let directory = raw_record(12).and_then(|record| {
             record.into_allocated().initialize_directory(
                 NewDirectoryMetadata::new(owner(), permissions()?),
+                InodeFlags::from_u32(0),
                 now(),
                 block_size()?,
                 BlockAddress::new(8),
@@ -1229,6 +1248,7 @@ mod tests {
         let symlink = SymlinkTarget::new(b"target").and_then(|target| {
             raw_record(13)?.into_allocated().initialize_inline_symlink(
                 NewSymlinkMetadata::new(owner(), permissions()?),
+                InodeFlags::from_u32(0),
                 now(),
                 &target,
                 InodeTimestampEncoding::LegacySeconds,
@@ -1294,7 +1314,7 @@ mod tests {
             return;
         };
         assert_eq!(
-            record.set_flags(InodeFlags::EMPTY.with_huge_file_blocks()),
+            record.set_flags(InodeFlags::from_u32(0).with_huge_file_blocks()),
             Ok(())
         );
         assert_eq!(
