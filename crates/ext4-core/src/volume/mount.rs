@@ -2,6 +2,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::block_group::AllocationIndexBuild;
 use super::orphan::{OrphanRecoveryQueue, ValidatedOrphanInventory};
@@ -22,33 +23,39 @@ use crate::disk_format::superblock::{
     WriteSessionState,
 };
 
-/// Allocation identity shared only by values from one completed mount attempt.
-/// UUIDs identify disk contents; this identity also distinguishes remounts and cloned images.
-#[derive(Clone, Debug)]
-pub(super) struct MountIdentity(alloc::sync::Arc<()>);
+/// Process-local origin of one mount attempt, independent of UUIDs and allocation lifetimes.
+/// Copying this identity grants no access to mounted state and performs no allocation or counting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MountIdentity(usize);
+
+/// Sole issuer for all mount attempts in this loaded core image. Issued values are never recycled.
+static MOUNT_IDENTITIES: MountIdentitySequence = MountIdentitySequence(AtomicUsize::new(0));
+
+/// Monotonic identity issuance; `usize::MAX` permanently seals the exhausted sequence.
+#[derive(Debug)]
+struct MountIdentitySequence(AtomicUsize);
+
+impl MountIdentitySequence {
+    /// Reserves one distinct origin without publishing or retaining any mounted resource.
+    /// # Errors
+    /// Returns [`Error::MountIdentityExhausted`] once this image's identity space is exhausted.
+    fn issue(&self) -> Result<MountIdentity> {
+        // Only uniqueness is shared here; no mounted data is published through this counter.
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+            .map(MountIdentity)
+            .map_err(|_| Error::MountIdentityExhausted)
+    }
+}
 
 impl MountIdentity {
-    /// Allocates a fresh identity before any mount publication write.
+    /// Reserves a fresh origin before any mount publication write.
     /// # Errors
-    /// Returns allocation failure without publishing a mount.
+    /// Returns [`Error::MountIdentityExhausted`] without publishing a mount.
     fn new() -> Result<Self> {
-        alloc::sync::Arc::try_new(())
-            .map(Self)
-            .map_err(|_| Error::OutOfMemory)
-    }
-
-    /// Address usable in internal copyable stamps while the operation and cache retain owners.
-    pub(super) fn stamp(&self) -> usize {
-        alloc::sync::Arc::as_ptr(&self.0).addr()
+        MOUNT_IDENTITIES.issue()
     }
 }
-
-impl PartialEq for MountIdentity {
-    fn eq(&self, other: &Self) -> bool {
-        alloc::sync::Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-impl Eq for MountIdentity {}
 
 /// Opaque resource identity used by scheduler intent arbitration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
