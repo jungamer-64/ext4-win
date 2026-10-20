@@ -518,56 +518,6 @@ impl MutationResolvePass<'_, '_, '_> {
         Ok(())
     }
 
-    /// Selects a physical block for a sparse logical block using logical-cluster placement.
-    /// # Errors
-    ///
-    /// Returns an error when cluster geometry is invalid, a matching physical cluster cannot be
-    /// referenced, or a new cluster cannot be allocated.
-    fn physical_block_for_hole(
-        &mut self,
-        tree: &MutableExtentTree,
-        logical_block: LogicalBlock,
-    ) -> Result<BlockAddress> {
-        let blocks_per_cluster = u64::from(
-            self.mutation
-                .volume
-                .superblock
-                .blocks_per_cluster()
-                .as_u32(),
-        );
-        let logical = logical_block.as_u64();
-        let cluster_offset = logical
-            .checked_rem(blocks_per_cluster)
-            .ok_or(Error::InvalidClusterGeometry)?;
-        let logical_cluster_start = logical
-            .checked_sub(cluster_offset)
-            .ok_or(Error::ArithmeticOverflow)?;
-
-        for offset in 0..blocks_per_cluster {
-            let probe = logical_cluster_start
-                .checked_add(offset)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if probe > u64::from(u32::MAX) {
-                break;
-            }
-            let Some(physical) = tree.allocated_block(LogicalBlock::try_from(probe)?)? else {
-                continue;
-            };
-            let cluster = self.mutation.volume.superblock.cluster_of_block(physical)?;
-            let physical = self.physical_block_in_cluster(cluster, cluster_offset)?;
-            self.mutation.record_cluster_reference_delta(cluster, 1)?;
-            return Ok(physical);
-        }
-
-        let first_block = self.mutation.allocate_cluster()?;
-        let cluster = self
-            .mutation
-            .volume
-            .superblock
-            .cluster_of_block(first_block)?;
-        self.physical_block_in_cluster(cluster, cluster_offset)
-    }
-
     /// Merges plaintext bytes into one encrypted file block and stages ciphertext.
     /// # Errors
     ///
@@ -632,31 +582,6 @@ impl MutationResolvePass<'_, '_, '_> {
         let mut block = self.mutation.file_block_bytes(physical)?;
         contents_key.decrypt_block(logical_block.as_u64(), &mut block, self.crypto)?;
         Ok(block)
-    }
-
-    /// Returns a block at `cluster_offset` inside a fully present physical cluster.
-    /// # Errors
-    ///
-    /// Returns an error when `cluster_offset` is outside the cluster or physical block arithmetic
-    /// overflows.
-    fn physical_block_in_cluster(
-        &self,
-        cluster: ClusterAddress,
-        cluster_offset: u64,
-    ) -> Result<BlockAddress> {
-        if cluster_offset >= u64::from(self.mutation.volume.superblock.blocks_in_cluster(cluster)?)
-        {
-            return Err(Error::InvalidClusterGeometry);
-        }
-        Ok(BlockAddress::new(
-            self.mutation
-                .volume
-                .superblock
-                .first_block_of_cluster(cluster)?
-                .get()
-                .checked_add(cluster_offset)
-                .ok_or(Error::ArithmeticOverflow)?,
-        ))
     }
 
     /// Stages a write into an inode extent stream without applying EOF limits.
