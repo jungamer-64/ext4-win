@@ -1045,9 +1045,9 @@ impl Drop for FileControlBlockLedger {
     }
 }
 
-/// Stable-address WDK executive resource dedicated to the FCB ledger.
+/// WDK executive resource whose allocation remains shared with the native resource registry.
 struct FileControlBlockLedgerLock {
-    /// Native resource initialized only after this allocation reaches its final pinned address.
+    /// Native registration starts after Box ownership ends and retires before allocation release.
     #[cfg(not(test))]
     native: memory::NativeAllocation<UnsafeCell<MaybeUninit<wdk_sys::ERESOURCE>>>,
     /// Host mutex with the same exclusive RAII ownership model as the native resource.
@@ -1059,8 +1059,9 @@ struct FileControlBlockLedgerLock {
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-// SAFETY: Production access uses only the executive-resource routines against pinned initialized
-// storage. The host backend is a `Mutex`. Both provide exclusive guard ownership.
+// SAFETY: Production access uses executive-resource routines against initialized storage whose
+// owner moves without invalidating native pointers. The host backend is a `Mutex`. Both provide
+// exclusive guard ownership.
 unsafe impl Sync for FileControlBlockLedgerLock {}
 
 impl fmt::Debug for FileControlBlockLedgerLock {
@@ -1096,14 +1097,14 @@ impl FileControlBlockLedgerLock {
     fn try_new() -> DriverResult<Self> {
         #[cfg(not(test))]
         {
-            let native = memory::boxed_try_with(|| {
+            let native = memory::NativeAllocation::from_box(memory::boxed_try_with(|| {
                 Ok(UnsafeCell::new(MaybeUninit::<wdk_sys::ERESOURCE>::uninit()))
-            })?;
-            let native = Box::into_pin(native);
+            })?);
             let status = unsafe {
-                // SAFETY: `native` is pinned at its final nonpaged address. The storage is not
-                // exposed or dropped as an initialized ERESOURCE unless initialization succeeds.
-                ffi::ExInitializeResourceLite(native.as_ref().get_ref().get().cast())
+                // SAFETY: The nonpaged allocation is owned without Box aliasing authority before
+                // native registration retains its pointers. Only the UnsafeCell contents mutate;
+                // failure releases uninitialized storage without native resource destruction.
+                ffi::ExInitializeResourceLite(native.get().get().cast())
             };
             if status < STATUS_SUCCESS {
                 return Err(DriverError::InsufficientResources);
@@ -1129,7 +1130,7 @@ impl FileControlBlockLedgerLock {
     fn acquire(&self) -> FileControlBlockLedgerGuard<'_> {
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: The resource was initialized at this pinned address. This combined routine
+            // SAFETY: The resource was initialized in its retained allocation. This combined routine
             // retains PASSIVE_LEVEL while disabling normal kernel APC delivery, and guard Drop
             // releases it on the acquiring thread.
             ffi::ExEnterCriticalRegionAndAcquireResourceExclusive(self.native_ptr());
@@ -1151,7 +1152,7 @@ impl FileControlBlockLedgerLock {
     /// Returns the initialized native resource pointer.
     #[cfg(not(test))]
     fn native_ptr(&self) -> *mut wdk_sys::ERESOURCE {
-        self.native.as_ref().get_ref().get().cast()
+        self.native.get().get().cast()
     }
 }
 

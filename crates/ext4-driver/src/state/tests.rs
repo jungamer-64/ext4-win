@@ -1,5 +1,5 @@
 use alloc::boxed::Box;
-use core::cell::Cell;
+use core::cell::{Cell, UnsafeCell};
 use core::mem::MaybeUninit;
 use core::num::NonZeroU32;
 use core::pin::Pin;
@@ -97,11 +97,11 @@ fn retired_device_header_rejects_actor_access_and_retains_its_tag() -> Result<()
         KernelDevice::from_raw(core::ptr::addr_of_mut!(raw_device))
     }
     .ok_or(DriverError::InternalInvariantViolation)?;
-    let mut storage = MaybeUninit::<super::DeviceExtensionHeader>::uninit();
+    let storage = UnsafeCell::new(MaybeUninit::<super::DeviceExtensionHeader>::uninit());
     unsafe {
         // SAFETY: The unpublished header remains at this address through retirement.
         super::DeviceExtensionHeader::initialize_at(
-            storage.as_mut_ptr(),
+            storage.get().cast(),
             DeviceExtensionKind::CONTROL,
             device,
             super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
@@ -110,9 +110,34 @@ fn retired_device_header_rejects_actor_access_and_retains_its_tag() -> Result<()
     }
     let header = unsafe {
         // SAFETY: Successful initialization established a complete header at this address.
-        storage.assume_init_ref()
+        &*storage.get().cast::<super::DeviceExtensionHeader>()
     };
     assert_eq!(header.with_reactor(41, |value, _| value + 1), Ok(42));
+    let mut raw_file = wdk_sys::FILE_OBJECT::default();
+    let mut raw_irp = wdk_sys::IRP::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        FileObject: core::ptr::addr_of_mut!(raw_file),
+        MajorFunction: u8::try_from(crate::irp::DispatchMajor::Create.table_index())
+            .map_err(|_| DriverError::InternalInvariantViolation)?,
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    raw_irp
+        .Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = core::ptr::addr_of_mut!(stack);
+    let received = unsafe {
+        // SAFETY: These native fixture records stay live and fixed until retirement drains the IRP.
+        crate::irp::ReceivedIrp::decode(device.as_ptr(), core::ptr::addr_of_mut!(raw_irp))
+    }?;
+    // Queue links must remain usable across later shared header borrows and terminal drain.
+    let status = header
+        .with_reactor(received, |received, reactor| {
+            reactor.receive(received, crate::irp::DispatchMajor::Create)
+        })
+        .unwrap_or_else(|received| received.complete_result(Err(DriverError::DeviceRemoved)));
+    assert_eq!(status, wdk_sys::STATUS_PENDING);
     let target = unsafe {
         // SAFETY: This fixture owns the sole retirement call and no actor borrow is live.
         header.retire()

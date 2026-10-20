@@ -63,7 +63,7 @@ pub(crate) fn copy_exact<T: Copy>(destination: &mut [T], source: &[T]) -> Driver
 pub(crate) struct InPlaceInitialization<T> {
     /// Initialized destination uniquely owned until publication.
     destination: NonNull<T>,
-    /// Mutable access must preserve the exact `T`, including every retained reference lifetime.
+    /// Destruction responsibility retains the exact `T`, including every reference lifetime.
     invariant: PhantomData<core::cell::Cell<T>>,
     /// True while guard drop must roll the value back.
     rollback: bool,
@@ -85,18 +85,6 @@ impl<T> InPlaceInitialization<T> {
             destination,
             invariant: PhantomData,
             rollback: true,
-        }
-    }
-
-    /// Returns exclusive access before the value is published to another observer.
-    #[expect(
-        unsafe_code,
-        reason = "the unpublished guard retains unique access to the initialized destination"
-    )]
-    pub(crate) fn get_mut(&mut self) -> &mut T {
-        unsafe {
-            // SAFETY: An armed guard uniquely owns the initialized destination.
-            self.destination.as_mut()
         }
     }
 

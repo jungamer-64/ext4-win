@@ -244,12 +244,17 @@ impl DeviceExtensionHeader {
             // SAFETY: Rundown has no observers until initialization and device publication.
             dispatch.write(DeviceDispatchRundown::new());
         }
-        let mut initialization = unsafe {
+        let initialization = unsafe {
             // SAFETY: kind and dispatch are initialized. UnsafeCell<MaybeUninit<CompletionReactor>>
             // accepts uninitialized bytes, so its large storage needs no by-value write.
             InPlaceInitialization::assume_init(destination)
         };
-        let header = initialization.get_mut();
+        let header = unsafe {
+            // SAFETY: kind and dispatch are initialized and the actor slot admits uninitialized
+            // bytes. Shared access keeps every retained native pointer rooted in the allocation;
+            // initialization mutates only the rundown and actor interior-mutable storage.
+            destination.as_ref()
+        };
         // New fields must be included in the initialization proof before borrowing Self.
         let Self {
             kind: _,

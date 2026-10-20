@@ -107,6 +107,8 @@ mod tests {
     use crate::{kernel::status::DriverResult, memory::boxed_try_with};
     use alloc::boxed::Box;
     use core::{
+        cell::UnsafeCell,
+        mem::MaybeUninit,
         ptr::NonNull,
         sync::atomic::{AtomicUsize, Ordering},
     };
@@ -137,6 +139,76 @@ mod tests {
     fn publish<T>(owner: NativeAllocation<T>) -> PublishedContext<T> {
         let address = owner.address();
         PublishedContext { address, owner }
+    }
+
+    /// Native registry storage retaining its own allocation pointer through ownership transfers.
+    struct NativeLink {
+        /// Link retained by native initialization rather than reconstructed by later access.
+        successor: *mut Self,
+        /// Native mutation behind the enclosing interior-mutable storage.
+        value: usize,
+    }
+
+    /// # Errors
+    /// Returns allocation failure before native registration.
+    /// # Panics
+    /// Fails if native self-links lose access after owner moves or destruction transfer.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the test returns allocation errors while assertions check retained native access"
+    )]
+    #[expect(
+        unsafe_code,
+        reason = "the native self-link accesses only retained interior-mutable storage until terminal release"
+    )]
+    fn native_links_survive_publication_and_destruction_transfer() -> DriverResult<()> {
+        let owner = NativeAllocation::from_box(boxed_try_with(|| {
+            Ok(UnsafeCell::new(MaybeUninit::<NativeLink>::uninit()))
+        })?);
+        let native = owner.get().get().cast::<NativeLink>();
+        unsafe {
+            // SAFETY: The unpublished allocation exclusively owns this uninitialized cell.
+            native.write(NativeLink {
+                successor: native,
+                value: 0,
+            });
+        }
+        let published = publish(owner);
+        let shared = published.owner.get();
+        let retained = unsafe {
+            // SAFETY: Native initialization wrote the complete link, and the moved owner retains it.
+            (*shared.get().cast::<NativeLink>()).successor
+        };
+        unsafe {
+            // SAFETY: The retained native pointer still identifies the owned UnsafeCell contents.
+            (*retained).value = 7;
+        }
+        assert_eq!(
+            unsafe {
+                // SAFETY: This shared observation reads the initialized cell after native mutation.
+                (*shared.get().cast::<NativeLink>()).value
+            },
+            7
+        );
+
+        let allocation = published.owner.into_raw();
+        unsafe {
+            // SAFETY: Destruction transfer preserves the allocation and its original native link.
+            (*retained).value = 9;
+        }
+        assert_eq!(
+            unsafe {
+                // SAFETY: The original link remains initialized until terminal allocation release.
+                (*native).value
+            },
+            9
+        );
+        unsafe {
+            // SAFETY: Native access ended; restore and release the sole matching allocation owner.
+            drop(Box::from_raw(allocation.as_ptr()));
+        }
+        Ok(())
     }
 
     /// # Errors

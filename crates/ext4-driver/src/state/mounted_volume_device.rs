@@ -188,28 +188,46 @@ impl MountedVolumeDevice {
             // SAFETY: Initialize the publisher before borrowing any typed extension value.
             removal_slot.write(removal);
         }
-        let extension = unsafe {
-            // SAFETY: The I/O Manager zeroed extension storage; all non-null fields are now valid.
-            &mut *extension_pointer.as_ptr()
+        let retirement_slot = unsafe {
+            // SAFETY: The unpublished allocation contains this disjoint writable field.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).retirement_work_item)
         };
-        extension.retirement_work_item = core::ptr::null_mut();
-        extension.shutdown_registered = AtomicU8::new(0);
-        extension.vpb = UnsafeCell::new(MaybeUninit::uninit());
+        unsafe {
+            // SAFETY: Mount owns initial construction of this unqueued work-item slot.
+            retirement_slot.write(core::ptr::null_mut());
+        }
+        let shutdown_slot = unsafe {
+            // SAFETY: The unpublished allocation contains this disjoint registration field.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).shutdown_registered)
+        };
+        unsafe {
+            // SAFETY: No registration observer exists before device publication.
+            shutdown_slot.write(AtomicU8::new(0));
+        }
+        let publication_slot = unsafe {
+            // SAFETY: Mount exclusively owns this disjoint, unpublished VPB storage.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).vpb)
+        };
+        unsafe {
+            // SAFETY: This initializes the cell without constructing a VPB publication owner.
+            publication_slot.write(UnsafeCell::new(MaybeUninit::uninit()));
+        }
+        let header_slot = unsafe {
+            // SAFETY: Project from the allocation pointer without an exclusive extension borrow
+            // that could invalidate retained pointers after actor initialization.
+            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).header)
+        };
         unsafe {
             // SAFETY: The extension is stable device-owned storage for this
             // just-created mounted volume device.
             DeviceExtensionHeader::initialize_at(
-                core::ptr::addr_of_mut!(extension.header),
+                header_slot,
                 DeviceExtensionKind::MOUNTED_VOLUME,
                 device,
                 ReactorTarget::MountedVolume(binding),
                 trace,
             )?;
         }
-        let header_slot = unsafe {
-            // SAFETY: The initialized header occupies this field at its final address.
-            core::ptr::addr_of!((*extension_pointer.as_ptr()).header)
-        };
         let header = unsafe {
             // SAFETY: The complete header is independently synchronized after final placement.
             &*header_slot
@@ -223,10 +241,6 @@ impl MountedVolumeDevice {
             }
             return Err(error);
         }
-        let shutdown_slot = unsafe {
-            // SAFETY: Project the initialized atomic independently of the header and work item.
-            core::ptr::addr_of!((*extension_pointer.as_ptr()).shutdown_registered)
-        };
         let shutdown_registered = unsafe {
             // SAFETY: Registration ownership uses this disjoint atomic at its final address.
             &*shutdown_slot
@@ -249,10 +263,6 @@ impl MountedVolumeDevice {
             }
             return Err(DriverError::InsufficientResources);
         }
-        let retirement_slot = unsafe {
-            // SAFETY: Project the work-item slot independently of the header and atomic leases.
-            core::ptr::addr_of_mut!((*extension_pointer.as_ptr()).retirement_work_item)
-        };
         unsafe {
             // SAFETY: The device remains unpublished and the work item cannot yet be queued.
             retirement_slot.write(retirement_work_item);
@@ -298,10 +308,6 @@ impl MountedVolumeDevice {
                     return Err(error);
                 }
             };
-        let publication_slot = unsafe {
-            // SAFETY: Project only this disjoint, unpublished native-lifetime owner field.
-            core::ptr::addr_of!((*extension_pointer.as_ptr()).vpb)
-        };
         let publication_destination = unsafe {
             // SAFETY: The projected UnsafeCell field is initialized and disjoint from actor storage.
             (*publication_slot).get()

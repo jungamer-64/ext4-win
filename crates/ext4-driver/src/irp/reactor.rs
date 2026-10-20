@@ -1450,11 +1450,41 @@ impl CompletionReactor {
             // SAFETY: The projected field has not been initialized and remains exclusively owned.
             notification_destination.write(notifications);
         }
-        let mut initialization = unsafe {
+        let initialization = unsafe {
             // SAFETY: Every field and array element now holds a valid value at its final address.
             InPlaceInitialization::assume_init(reactor_storage)
         };
-        let reactor = initialization.get_mut();
+        #[cfg(not(test))]
+        {
+            let csq = unsafe {
+                // SAFETY: Initialization exclusively owns this field before any shared reactor
+                // reference or native callback is published.
+                core::ptr::addr_of_mut!((*reactor_storage.as_ptr()).csq)
+            };
+            let status = unsafe {
+                // SAFETY: The CSQ field is exclusively writable. Registration installs callbacks
+                // without invoking them; no request can reach this unpublished device yet.
+                ffi::IoCsqInitialize(
+                    csq,
+                    Some(csq_insert_irp),
+                    Some(csq_remove_irp),
+                    Some(csq_peek_next_irp),
+                    Some(csq_acquire_lock),
+                    Some(csq_release_lock),
+                    Some(csq_complete_canceled_irp),
+                )
+            };
+            if status < STATUS_SUCCESS {
+                return Err(DriverError::InsufficientResources);
+            }
+        }
+        let reactor = unsafe {
+            // SAFETY: Initialization is complete for every non-interior-mutable field. From this
+            // point native setup and callbacks share the original allocation pointer; no exclusive
+            // reactor reborrow may invalidate their retained pointers. Guard rollback still owns
+            // destruction until the infallible handoff after successful thread creation.
+            reactor_storage.as_ref()
+        };
         // Keep this check exhaustive: new fields need an explicit initialization proof above.
         let Self {
             csq: _,
@@ -1523,20 +1553,20 @@ impl CompletionReactor {
         for timer in &reactor.retry_timers {
             unsafe {
                 // SAFETY: Every timer and the reactor itself are now at their final addresses.
-                timer.initialize(reactor_address);
+                timer.initialize(reactor_storage);
             }
         }
         #[cfg(not(test))]
         unsafe {
             // SAFETY: The shared timer and reactor have both reached their final addresses.
-            reactor.delayed_close_timer.initialize(reactor_address);
+            reactor.delayed_close_timer.initialize(reactor_storage);
         }
         #[cfg(not(test))]
         for envelope in &reactor.cancel_envelopes {
             let destination = unsafe {
                 // SAFETY: Reactor storage is now final-address and remains live through drain.
                 ActiveCancelDestination::new(
-                    reactor_address.cast::<c_void>(),
+                    reactor_storage.cast::<c_void>(),
                     publish_active_cancel,
                 )
             };
@@ -1551,21 +1581,6 @@ impl CompletionReactor {
             unsafe {
                 // SAFETY: Stable reactor-owned spin-lock storage.
                 ffi::KeInitializeSpinLock(reactor.lock.get());
-            }
-            let status = unsafe {
-                // SAFETY: First-field CSQ and callbacks share this stable reactor lifetime.
-                ffi::IoCsqInitialize(
-                    reactor.csq_mut_ptr(),
-                    Some(csq_insert_irp),
-                    Some(csq_remove_irp),
-                    Some(csq_peek_next_irp),
-                    Some(csq_acquire_lock),
-                    Some(csq_release_lock),
-                    Some(csq_complete_canceled_irp),
-                )
-            };
-            if status < STATUS_SUCCESS {
-                return Err(DriverError::InsufficientResources);
             }
             unsafe {
                 // SAFETY: Stable event storage initialized before thread publication.
@@ -1591,7 +1606,7 @@ impl CompletionReactor {
                     core::ptr::null_mut(),
                     core::ptr::null_mut(),
                     Some(completion_reactor_thread),
-                    reactor_address.as_ptr().cast::<c_void>(),
+                    reactor_storage.as_ptr().cast::<c_void>(),
                 )
             };
             if status < STATUS_SUCCESS {
@@ -1603,12 +1618,7 @@ impl CompletionReactor {
             if thread_handle.is_null() {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
-            let published_reactor = unsafe {
-                // SAFETY: Successful creation may start the thread, so only shared atomic access is
-                // used from this point until rollback ownership is discharged.
-                reactor_address.as_ref()
-            };
-            published_reactor
+            reactor
                 .thread_handle
                 .store(thread_handle.cast::<c_void>(), Ordering::Release);
         }
@@ -4777,6 +4787,7 @@ unsafe fn queued_irp_matches_context(irp: PIRP, context: PVOID) -> bool {
 #[cfg(test)]
 mod tests {
     use alloc::boxed::Box;
+    use core::cell::UnsafeCell;
     use core::mem::MaybeUninit;
     use core::ptr::NonNull;
     use core::sync::atomic::Ordering;
@@ -4821,11 +4832,11 @@ mod tests {
             KernelFileObject::from_raw(core::ptr::from_mut(&mut raw_file))
         }
         .expect("fixture owns a non-null kernel identity");
-        let mut storage = MaybeUninit::<CompletionReactor>::uninit();
+        let storage = UnsafeCell::new(MaybeUninit::<CompletionReactor>::uninit());
         let result = unsafe {
             // SAFETY: The fixture holds reactor storage at this address until final release.
             CompletionReactor::initialize_at(
-                storage.as_mut_ptr(),
+                storage.get().cast(),
                 device,
                 super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
                 OperationalTrace::host_test(),
@@ -4837,7 +4848,7 @@ mod tests {
         }
         let reactor = unsafe {
             // SAFETY: Successful initialization wrote every field in final-address storage.
-            &*storage.as_ptr()
+            &*storage.get().cast::<CompletionReactor>()
         };
         let mut irps = [wdk_sys::IRP::default(); MAX_OPERATIONS + 3];
         let mut stacks = [wdk_sys::IO_STACK_LOCATION::default(); MAX_OPERATIONS + 3];
@@ -4908,7 +4919,7 @@ mod tests {
         assert!(reactor.remove_next_irp(Some(&selection)).is_null());
         unsafe {
             // SAFETY: Terminal FIFO is empty; teardown cancels the remaining normal queue and joins owners.
-            CompletionReactor::release_at(storage.as_mut_ptr());
+            CompletionReactor::release_at(storage.get().cast());
         }
     }
 
@@ -5227,11 +5238,11 @@ mod tests {
         }) else {
             return;
         };
-        let mut storage = MaybeUninit::<CompletionReactor>::uninit();
+        let storage = UnsafeCell::new(MaybeUninit::<CompletionReactor>::uninit());
         let initialized = unsafe {
             // SAFETY: Stack storage stays fixed until `release_at` destroys the reactor in place.
             CompletionReactor::initialize_at(
-                storage.as_mut_ptr(),
+                storage.get().cast(),
                 device,
                 super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
                 OperationalTrace::host_test(),
@@ -5243,7 +5254,7 @@ mod tests {
         }
         let reactor = unsafe {
             // SAFETY: Initialization wrote a complete reactor value.
-            &*storage.as_ptr()
+            &*storage.get().cast::<CompletionReactor>()
         };
         let index = reactor.reserve_active_slot(ExecutionClass::Ordinary);
         assert_eq!(index, Ok(0));
@@ -5299,11 +5310,11 @@ mod tests {
         unsafe {
             // SAFETY: No pending, active, or completion-owned work remains, and the stable test
             // storage remains live after this quiesce boundary.
-            CompletionReactor::quiesce_at(storage.as_mut_ptr());
+            CompletionReactor::quiesce_at(storage.get().cast());
         }
         let target = unsafe {
             // SAFETY: The preceding transition quiesced the reactor at this stable address.
-            CompletionReactor::release_quiesced_at(storage.as_mut_ptr())
+            CompletionReactor::release_quiesced_at(storage.get().cast())
         };
         assert!(matches!(target, super::ReactorTarget::ControlDevice(_)));
     }
