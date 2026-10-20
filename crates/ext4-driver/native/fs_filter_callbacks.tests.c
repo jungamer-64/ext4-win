@@ -108,8 +108,13 @@ static BOOLEAN ext4win_section_acquire_paging(const VOID *state, PERESOURCE reso
     BOOLEAN exclusive, BOOLEAN wait)
 {
     (void)state;
-    assert(!exclusive && wait && resource->held == 0);
-    if (resource == &stream.PagingIoResource && !paging_available) { return FALSE; }
+    assert(!exclusive);
+    if (resource == &stream.PagingIoResource) {
+        assert(!wait);
+        if (!paging_available || resource->held != 0) { return FALSE; }
+    } else {
+        assert(resource == &stream.MainResource && wait && resource->held == 0);
+    }
     resource->held++;
     return TRUE;
 }
@@ -181,10 +186,17 @@ static void exercise_callbacks(BOOLEAN supply_context)
     assert(stream.PagingIoResource.held == 0);
 
     paging_available = FALSE;
+    paging_resource = &stream.MainResource;
     data.Parameters.AcquireForModifiedPageWriter.ResourceToRelease = &paging_resource;
     invoke(registered.PreAcquireForModifiedPageWriter, &data, supply_context, STATUS_CANT_WAIT);
-    assert(stream.PagingIoResource.held == 0);
+    assert(paging_resource == NULL && stream.PagingIoResource.held == 0);
     paging_available = TRUE;
+
+    stream.PagingIoResource.held = 1;
+    paging_resource = &stream.MainResource;
+    invoke(registered.PreAcquireForModifiedPageWriter, &data, supply_context, STATUS_CANT_WAIT);
+    assert(paging_resource == NULL && stream.PagingIoResource.held == 1);
+    stream.PagingIoResource.held = 0;
 
     invoke(registered.PreAcquireForCcFlush, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);

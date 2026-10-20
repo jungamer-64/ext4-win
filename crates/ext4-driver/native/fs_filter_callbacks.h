@@ -51,12 +51,17 @@ ext4win_pre_acquire_mod_write(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOI
     if (context != NULL) {
         *context = NULL;
     }
+    if (resource_to_release != NULL) {
+        *resource_to_release = NULL;
+    }
     if ((resource_to_release == NULL) ||
         !ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
     }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE);
-    if (!ext4win_section_acquire_paging(stream->SectionState, &stream->PagingIoResource, FALSE, TRUE)) {
+    /* The writer can hold MM state needed by a flushing or sealing stream owner.
+     * Defer this write on contention instead of blocking that owner's progress. */
+    if (!ext4win_section_acquire_paging(stream->SectionState, &stream->PagingIoResource, FALSE, FALSE)) {
         ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_MAPPED_WRITE, STATUS_CANT_WAIT);
         return STATUS_CANT_WAIT;
     }
