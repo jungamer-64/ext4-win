@@ -59,6 +59,12 @@ const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
 const EXT4_VERITY_FL: u32 = 0x0010_0000;
 /// Persistent direct-access flag, incompatible with fs-verity.
 const EXT4_DAX_FL: u32 = 0x0200_0000;
+/// Creation inherits policy and hints, excluding mapping and per-inode protection state.
+const INHERITABLE_INODE_FLAGS: u32 = 0x6201_C4CF;
+/// Directory-specific inheritance: dirsync, project inheritance, and casefolding.
+const DIRECTORY_INHERITANCE_FLAGS: u32 = 0x6001_0000;
+/// Symbolic links inherit only the no-dump and no-atime hints.
+const SYMLINK_INHERITANCE_FLAGS: u32 = 0x0000_00C0;
 /// Largest regular-file size accepted without the large-file feature.
 const LEGACY_FILE_SIZE_LIMIT: u64 = 0x7fff_ffff;
 /// Largest legacy `i_blocks` sector count.
@@ -1214,6 +1220,16 @@ impl InodeFlags {
     /// No inode flags.
     pub const EMPTY: Self = Self(0);
 
+    /// Selects the parent's policy applicable to the child's inode kind.
+    pub(crate) const fn inherited_by(self, kind: InodeKind) -> Self {
+        let mask = match kind {
+            InodeKind::Directory => INHERITABLE_INODE_FLAGS,
+            InodeKind::File => INHERITABLE_INODE_FLAGS & !DIRECTORY_INHERITANCE_FLAGS,
+            InodeKind::Symlink => SYMLINK_INHERITANCE_FLAGS,
+        };
+        Self(self.0 & mask)
+    }
+
     /// Creates flags from the on-disk `i_flags` field.
     #[must_use]
     pub const fn from_u32(value: u32) -> Self {
@@ -1640,6 +1656,11 @@ impl Inode {
     #[must_use]
     pub const fn kind(&self) -> InodeKind {
         self.data.mode.kind()
+    }
+
+    /// Storage and inheritance policy encoded by this inode.
+    pub(crate) const fn flags(&self) -> InodeFlags {
+        self.data.flags
     }
 
     /// File size in bytes.

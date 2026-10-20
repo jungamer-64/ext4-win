@@ -144,12 +144,13 @@ impl AllocatedInodeRecord {
     pub(super) fn initialize_file(
         mut self,
         metadata: NewFileMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         block_size: BlockSize,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<LiveInodeRecord> {
         self.raw
-            .initialize_file(metadata, now, block_size, timestamp_encoding)?;
+            .initialize_file(metadata, parent_flags, now, block_size, timestamp_encoding)?;
         self.raw.into_live()
     }
 
@@ -158,9 +159,14 @@ impl AllocatedInodeRecord {
     ///
     /// Returns an error when the directory extent for `first_block`, directory size, timestamps, or
     /// allocated sector count cannot be represented in the inode record.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "directory initialization combines inherited policy, metadata, time, geometry and its allocated storage"
+    )]
     pub(super) fn initialize_directory(
         mut self,
         metadata: NewDirectoryMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         block_size: BlockSize,
         first_block: BlockAddress,
@@ -169,6 +175,7 @@ impl AllocatedInodeRecord {
     ) -> Result<LiveInodeRecord> {
         self.raw.initialize_directory(
             metadata,
+            parent_flags,
             now,
             block_size,
             first_block,
@@ -186,12 +193,13 @@ impl AllocatedInodeRecord {
     pub(super) fn initialize_inline_symlink(
         mut self,
         metadata: NewSymlinkMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         target: &SymlinkTarget,
         timestamp_encoding: InodeTimestampEncoding,
     ) -> Result<LiveInodeRecord> {
         self.raw
-            .initialize_inline_symlink(metadata, now, target, timestamp_encoding)?;
+            .initialize_inline_symlink(metadata, parent_flags, now, target, timestamp_encoding)?;
         self.raw.into_live()
     }
 
@@ -203,6 +211,7 @@ impl AllocatedInodeRecord {
     pub(super) fn initialize_extent_symlink(
         mut self,
         metadata: NewSymlinkMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         block_size: BlockSize,
         target: &SymlinkTarget,
@@ -210,6 +219,7 @@ impl AllocatedInodeRecord {
     ) -> Result<LiveInodeRecord> {
         self.raw.initialize_extent_symlink(
             metadata,
+            parent_flags,
             now,
             block_size,
             target,
@@ -543,6 +553,7 @@ impl RawInodeRecord<Vec<u8>> {
     pub(super) fn initialize_file(
         &mut self,
         metadata: NewFileMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         block_size: BlockSize,
         timestamp_encoding: InodeTimestampEncoding,
@@ -558,7 +569,7 @@ impl RawInodeRecord<Vec<u8>> {
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
-        self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
+        self.set_flags(parent_flags.inherited_by(InodeKind::File).with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
@@ -573,9 +584,14 @@ impl RawInodeRecord<Vec<u8>> {
     ///
     /// Returns an error when the first directory extent, timestamps, directory size, or allocated
     /// sector count cannot be serialized.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "directory initialization combines inherited policy, metadata, time, geometry and its allocated storage"
+    )]
     pub(super) fn initialize_directory(
         &mut self,
         metadata: NewDirectoryMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         block_size: BlockSize,
         first_block: BlockAddress,
@@ -595,7 +611,7 @@ impl RawInodeRecord<Vec<u8>> {
         self.set_links_count(Ext4LinkCount::TWO)?;
         self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
-        self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
+        self.set_flags(parent_flags.inherited_by(InodeKind::Directory).with_extent_tree())?;
         let mut extents = Vec::new();
         extents.try_push(Extent::initialized(
             LogicalBlock::from_u32(0),
@@ -617,6 +633,7 @@ impl RawInodeRecord<Vec<u8>> {
     pub(super) fn initialize_inline_symlink(
         &mut self,
         metadata: NewSymlinkMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         target: &SymlinkTarget,
         timestamp_encoding: InodeTimestampEncoding,
@@ -637,7 +654,7 @@ impl RawInodeRecord<Vec<u8>> {
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
-        self.set_flags(InodeFlags::EMPTY)?;
+        self.set_flags(parent_flags.inherited_by(InodeKind::Symlink))?;
         self.set_inline_target(target.bytes())?;
         let allocation_size = self
             .encoding
@@ -653,6 +670,7 @@ impl RawInodeRecord<Vec<u8>> {
     pub(super) fn initialize_extent_symlink(
         &mut self,
         metadata: NewSymlinkMetadata,
+        parent_flags: InodeFlags,
         now: Ext4Timestamp,
         block_size: BlockSize,
         target: &SymlinkTarget,
@@ -674,7 +692,7 @@ impl RawInodeRecord<Vec<u8>> {
         self.set_links_count(Ext4LinkCount::ONE)?;
         self.initialize_timestamps(now)?;
         self.set_deletion_time(0)?;
-        self.set_flags(InodeFlags::EMPTY.with_extent_tree())?;
+        self.set_flags(parent_flags.inherited_by(InodeKind::Symlink).with_extent_tree())?;
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.set_extent_root_bytes(serialized.inode_root())?;
