@@ -45,7 +45,7 @@ jobs:
 
   ext4-interop:
     name: ext4 interoperability
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
