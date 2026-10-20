@@ -1667,7 +1667,12 @@ fn verify_bigalloc_directory_growth(linux: LinuxEnvironment, root: &Path) -> Tas
             })
             .collect::<ext4_core::Result<Vec<_>>>()
             .map_err(core_task_error)?;
-        for batch in names.chunks(BATCH) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the fixture's fixed batch width is nonzero, so chunk construction cannot panic"
+        )]
+        let batches = names.chunks(BATCH);
+        for batch in batches {
             drive_internal_core_mutation(&image, |pass| {
                 let parent = pass.directory(directory)?;
                 let source = pass.hard_link_source(ext4_core::HardLinkNodeId::File(source))?;
@@ -1702,7 +1707,12 @@ fn verify_bigalloc_directory_growth(linux: LinuxEnvironment, root: &Path) -> Tas
         }
         drive_directory_enumeration(&image, directory, &mut expected)?;
         verify_internal_e2fsck_clean(linux, &image, "BIGALLOC directory growth")?;
-        for batch in names.chunks(BATCH) {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the fixture's fixed batch width is nonzero, so chunk construction cannot panic"
+        )]
+        let batches = names.chunks(BATCH);
+        for batch in batches {
             drive_internal_core_mutation(&image, |pass| {
                 let parent = pass.directory(directory)?;
                 for name in batch {
