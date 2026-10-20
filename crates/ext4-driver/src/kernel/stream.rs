@@ -1613,13 +1613,15 @@ impl StreamContext {
                         ))?;
                     }
                     SectionMutationOperation::Delete => {
-                        if !self.flush_image(wdk_sys::_MMFLUSH_TYPE::MmFlushForDelete)? {
+                        let status = unsafe {
+                            // SAFETY: MainResource excludes new mappings; preparation admits paging
+                            // while the retained native section set is checked and invalidated.
+                            ext4win_stream_prepare_deletion(self.header.as_ptr())
+                        };
+                        if status == wdk_sys::STATUS_CANNOT_DELETE {
                             return Err(DriverError::CannotDelete);
                         }
-                        self.purge_preparing_sections(DriverError::CannotDelete)?;
-                        if self.section_residency() & 5 != 0 {
-                            return Err(DriverError::CannotDelete);
-                        }
+                        cache_status(status)?;
                     }
                     SectionMutationOperation::WriteOpen => {
                         if !self.flush_image(wdk_sys::_MMFLUSH_TYPE::MmFlushForWrite)? {
@@ -2145,6 +2147,7 @@ unsafe extern "system" {
         operation: wdk_sys::MMFLUSH_TYPE,
         flushed: *mut u8,
     ) -> NTSTATUS;
+    fn ext4win_stream_prepare_deletion(header: *mut c_void) -> NTSTATUS;
     fn ext4win_cc_purge_sections(header: *mut c_void) -> NTSTATUS;
 
     fn ext4win_stream_cache_uninitialize(

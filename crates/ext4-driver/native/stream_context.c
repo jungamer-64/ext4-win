@@ -11,6 +11,7 @@
 #include "cache_mdl.h"
 #include "cache_close.h"
 #include "data_protection.h"
+#include "section_deletion.h"
 #include "irp_forward.h"
 #include "directory_notification.h"
 
@@ -1735,6 +1736,14 @@ NTSTATUS NTAPI ext4win_stream_prepare_verity_data(PVOID header)
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
     if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
     __try { return ext4win_prepare_verified_data(&stream->SectionObjects); }
+    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
+}
+
+NTSTATUS NTAPI ext4win_stream_prepare_deletion(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
+    __try { return ext4win_prepare_section_deletion(&stream->SectionObjects); }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
 }
 

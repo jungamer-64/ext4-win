@@ -261,6 +261,11 @@ fn verify_cache_manager(root: &Path) -> TaskResult<()> {
             "native verified-data coherence and mapping admission contract",
         ),
         (
+            "section-deletion",
+            "section_deletion.tests.c",
+            "native deletion mapping admission and retained cache residency contract",
+        ),
+        (
             "cache-mdl",
             "cache_mdl.tests.c",
             "native MDL ownership contract",
