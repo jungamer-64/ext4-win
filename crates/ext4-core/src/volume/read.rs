@@ -201,38 +201,6 @@ impl EpochReadView<'_, '_> {
             .transpose()
     }
 
-    /// Reads Windows overlay metadata isolated in `user.ext4win.*` xattrs.
-    ///
-    /// # Errors
-    /// Returns an error when the overlay xattr payload is malformed.
-    pub(super) fn read_inode_windows_overlay(
-        &mut self,
-        inode_id: InodeId,
-    ) -> Result<Option<WindowsOverlay>> {
-        let Some(value) =
-            self.read_inode_xattr(inode_id, &WindowsOverlay::attributes_xattr_name()?)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(WindowsOverlay::parse(&value)?))
-    }
-
-    /// Reads Windows symbolic-link reparse metadata from its private xattr.
-    ///
-    /// # Errors
-    /// Returns an error when the backing xattr or its payload is malformed.
-    pub(super) fn read_inode_windows_symlink_reparse_point(
-        &mut self,
-        inode_id: InodeId,
-    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        let Some(value) =
-            self.read_inode_xattr(inode_id, &WindowsSymlinkReparsePoint::xattr_name()?)?
-        else {
-            return Ok(None);
-        };
-        Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
-    }
-
     /// Resolves a context against the operation's key snapshot and records its freshness dependency.
     /// # Errors
     /// Returns resource-observation failure or a missing encryption key.

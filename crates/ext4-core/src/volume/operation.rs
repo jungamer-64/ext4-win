@@ -41,35 +41,14 @@ pub trait CommittedReadPass {
         security: Ext4Security,
     ) -> Result<Ext4Access>;
 
-    /// Reads complete stream metadata from one committed inode and its Windows xattrs.
+    /// Reads complete inode metadata from the pass's coherent ext4 view.
     /// # Errors
-    ///
-    /// Returns an error when the inode kind differs from `node`, storage cannot be read, or a
-    /// Windows metadata xattr is malformed.
+    /// Returns an inode-kind mismatch, storage failure or malformed inode.
     fn load_node_metadata(&mut self, node: NodeId) -> Result<super::NodeMetadataSnapshot> {
-        let overlay = self.read_windows_overlay(node)?;
-        let has_reparse_xattr = match node {
-            NodeId::Symlink(_) => false,
-            NodeId::File(_) | NodeId::Directory(_) => {
-                self.read_windows_symlink_reparse_point(node)?.is_some()
-            }
-        };
         let snapshot = match node {
-            NodeId::File(id) => super::NodeMetadataSnapshot::from_inode(
-                self.load_file(id)?.inode(),
-                overlay,
-                has_reparse_xattr,
-            ),
-            NodeId::Directory(id) => super::NodeMetadataSnapshot::from_inode(
-                self.load_directory(id)?.inode(),
-                overlay,
-                has_reparse_xattr,
-            ),
-            NodeId::Symlink(id) => super::NodeMetadataSnapshot::from_inode(
-                self.load_symlink(id)?.inode(),
-                overlay,
-                has_reparse_xattr,
-            ),
+            NodeId::File(id) => super::NodeMetadataSnapshot::from_inode(self.load_file(id)?.inode()),
+            NodeId::Directory(id) => super::NodeMetadataSnapshot::from_inode(self.load_directory(id)?.inode()),
+            NodeId::Symlink(id) => super::NodeMetadataSnapshot::from_inode(self.load_symlink(id)?.inode()),
         };
         Ok(snapshot)
     }
@@ -104,19 +83,6 @@ pub trait CommittedReadPass {
     ///
     /// Returns an error when attributes cannot be read or the selected value cannot be copied.
     fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>>;
-    /// Reads Windows overlay metadata.
-    /// # Errors
-    ///
-    /// Returns an error when the overlay attribute is malformed or cannot be read.
-    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>>;
-    /// Reads Windows symbolic-link reparse metadata.
-    /// # Errors
-    ///
-    /// Returns an error when the reparse attribute is malformed or cannot be read.
-    fn read_windows_symlink_reparse_point(
-        &mut self,
-        node: NodeId,
-    ) -> Result<Option<WindowsSymlinkReparsePoint>>;
     /// Reads regular-file bytes into an exact caller-owned range.
     /// # Errors
     ///
@@ -237,26 +203,6 @@ impl EpochReadPass<'_, '_, '_> {
         self.view.read_inode_xattr(node.inode(), name)
     }
 
-    /// Reads Windows overlay metadata from the ext4 xattr boundary.
-    /// # Errors
-    ///
-    /// Returns an error when storage is incomplete or the overlay is invalid.
-    pub fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
-        self.view.read_inode_windows_overlay(node.inode())
-    }
-
-    /// Reads Windows symbolic-link reparse metadata from the ext4 xattr boundary.
-    /// # Errors
-    ///
-    /// Returns an error when storage is incomplete or the payload is invalid.
-    pub fn read_windows_symlink_reparse_point(
-        &mut self,
-        node: NodeId,
-    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        self.view
-            .read_inode_windows_symlink_reparse_point(node.inode())
-    }
-
     /// Reads regular-file bytes into an exact caller-owned range.
     /// # Errors
     ///
@@ -347,17 +293,6 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
 
     fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
         self.read_xattr(node, name)
-    }
-
-    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
-        self.read_windows_overlay(node)
-    }
-
-    fn read_windows_symlink_reparse_point(
-        &mut self,
-        node: NodeId,
-    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        self.read_windows_symlink_reparse_point(node)
     }
 
     fn read_file(

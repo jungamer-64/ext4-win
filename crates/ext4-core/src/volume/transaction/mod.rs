@@ -798,7 +798,7 @@ impl MutationResolvePass<'_, '_, '_> {
         result
     }
 
-    /// Observes this pass's latest staged inode and Windows xattrs.
+    /// Observes this pass's latest staged inode metadata.
     ///
     /// This is distinct from `CommittedReadPass`: callers use it to prepare post-commit state,
     /// never to acknowledge the uncommitted mutation to another observer.
@@ -1099,21 +1099,6 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
 
     fn read_xattr(&mut self, node: NodeId, name: &XattrName) -> Result<Option<XattrValue>> {
         self.mutation.volume.read_inode_xattr(node.inode(), name)
-    }
-
-    fn read_windows_overlay(&mut self, node: NodeId) -> Result<Option<WindowsOverlay>> {
-        self.mutation
-            .volume
-            .read_inode_windows_overlay(node.inode())
-    }
-
-    fn read_windows_symlink_reparse_point(
-        &mut self,
-        node: NodeId,
-    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        self.mutation
-            .volume
-            .read_inode_windows_symlink_reparse_point(node.inode())
     }
 
     fn read_file(

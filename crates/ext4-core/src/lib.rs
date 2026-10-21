@@ -18,7 +18,6 @@ mod disk;
 mod disk_format;
 mod error;
 mod memory;
-mod platform;
 mod protection;
 mod volume;
 
@@ -40,7 +39,6 @@ pub use disk_format::superblock::{
 };
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
-pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay, WindowsSymlinkReparsePoint};
 pub use protection::crypto::CryptographicOperation;
 pub use protection::fscrypt::{
     FscryptFileNonce, FscryptKeyIdentifier, FscryptKeyPresence, FscryptKeySet, FscryptMasterKey,
@@ -61,7 +59,7 @@ pub use volume::{
     JournalPayloadDurability, MetadataCache, MetadataCacheAccess, MountOperation, MountTransition,
     MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveOperation,
     MutationResolvePass, MutationResolveReady, MutationResolveTransition, MutationResource,
-    NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot, NodeReparsePoint,
+    NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot,
     ObservedResourceVersionSet, OperationEvent, OperationId, OrderedDataDurability,
     PreparedKeyChange, PublishedMutation, ReadTransition, ReservedKeyChange, ReservedMutation,
     ResolvedKeyChange, ResolvedMutation, ResourceVersion, RetryPermit, ScannedDirectoryEntry,

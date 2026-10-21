@@ -2,17 +2,6 @@
 
 use super::*;
 
-/// Rejects xattr reparse storage on a native ext4 symbolic link.
-/// # Errors
-///
-/// Returns an error when the typed node is a symbolic link instead of a file or directory.
-fn require_windows_reparse_storage_node(node: TransactionNode) -> Result<()> {
-    match node.id() {
-        NodeId::File(_) | NodeId::Directory(_) => Ok(()),
-        NodeId::Symlink(_) => Err(Error::WrongInodeKind),
-    }
-}
-
 impl MutationResolvePass<'_, '_, '_> {
     /// Sets or replaces one ext4 extended attribute.
     /// Access ACL values synchronize inode rwx; a header-only ACL removes either reserved ACL slot.
@@ -57,63 +46,6 @@ impl MutationResolvePass<'_, '_, '_> {
         })
     }
 
-    /// Sets Windows overlay metadata in `user.ext4win.*` xattrs.
-    ///
-    /// # Errors
-    /// Returns an error when the overlay cannot be serialized or stored.
-    pub fn set_windows_overlay(
-        &mut self,
-        node: TransactionNode,
-        overlay: WindowsOverlay,
-    ) -> Result<()> {
-        self.edit(|pass| {
-            pass.set_xattr(
-                node,
-                WindowsOverlay::attributes_xattr_name()?,
-                overlay.to_xattr_value()?,
-            )
-        })
-    }
-
-    /// Sets Windows symbolic-link reparse metadata on a regular file or directory.
-    ///
-    /// # Errors
-    /// Returns an error when the node is a native symbolic link or the reparse
-    /// xattr cannot be serialized or stored.
-    pub fn set_windows_symlink_reparse_point(
-        &mut self,
-        node: TransactionNode,
-        reparse_point: WindowsSymlinkReparsePoint,
-    ) -> Result<()> {
-        self.edit(|pass| {
-            require_windows_reparse_storage_node(node)?;
-            pass.set_xattr(
-                node,
-                WindowsSymlinkReparsePoint::xattr_name()?,
-                reparse_point.to_xattr_value()?,
-            )
-        })
-    }
-
-    /// Removes Windows symbolic-link reparse metadata from a regular file or directory.
-    ///
-    /// # Errors
-    /// Returns an error when the node is a native symbolic link or the stored
-    /// xattr payload is malformed.
-    pub fn remove_windows_symlink_reparse_point(
-        &mut self,
-        node: TransactionNode,
-    ) -> Result<Option<WindowsSymlinkReparsePoint>> {
-        self.edit(|pass| {
-            require_windows_reparse_storage_node(node)?;
-            let Some(value) =
-                pass.remove_xattr(node, &WindowsSymlinkReparsePoint::xattr_name()?)?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(WindowsSymlinkReparsePoint::parse(&value)?))
-        })
-    }
 }
 
 impl MetadataMutation<'_, '_> {
@@ -179,36 +111,12 @@ impl MetadataMutation<'_, '_> {
     /// Builds the exact post-mutation metadata projection for one staged live inode.
     /// # Errors
     ///
-    /// Returns an error when the inode, xattr storage, or either Windows xattr payload is invalid.
+    /// Returns an error when the inode, xattr storage, is invalid.
     pub(super) fn node_metadata_snapshot(
         &mut self,
         raw_inode: &LiveInodeRecord,
     ) -> Result<NodeMetadataSnapshot> {
-        let inode = raw_inode.parse()?;
-        let xattrs = self.xattr_set_for_raw_inode(raw_inode)?;
-        let overlay_name = WindowsOverlay::attributes_xattr_name()?;
-        let overlay = xattrs
-            .public()
-            .get(&overlay_name)
-            .map(WindowsOverlay::parse)
-            .transpose()?;
-        let has_reparse_xattr = match inode.kind() {
-            InodeKind::Symlink => false,
-            InodeKind::File | InodeKind::Directory => {
-                let reparse_name = WindowsSymlinkReparsePoint::xattr_name()?;
-                xattrs
-                    .public()
-                    .get(&reparse_name)
-                    .map(WindowsSymlinkReparsePoint::parse)
-                    .transpose()?
-                    .is_some()
-            }
-        };
-        Ok(NodeMetadataSnapshot::from_inode(
-            &inode,
-            overlay,
-            has_reparse_xattr,
-        ))
+        Ok(NodeMetadataSnapshot::from_inode(&raw_inode.parse()?))
     }
 
     /// Stages the latest image for a mutated external xattr block.
