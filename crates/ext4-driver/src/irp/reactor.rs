@@ -5220,6 +5220,9 @@ mod tests {
                     crate::irp::PassiveWorkCompletion::Retry(work) => {
                         drop(work);
                     }
+                    crate::irp::PassiveWorkCompletion::OpenExternalJournal(result) => {
+                        drop(result);
+                    }
                     crate::irp::PassiveWorkCompletion::Identity(bytes) => {
                         let _bytes = bytes;
                     }

@@ -360,7 +360,11 @@ impl MountRequestOperation {
                 Err(error) => return Self::complete(owned, Err(error)),
             };
             self.state = MountRequestState::OpeningExternalJournal {
-                owned, admission, devices, mount, requirement,
+                owned,
+                admission,
+                devices,
+                mount,
+                requirement,
             };
             OperationTransition::SubmitPassiveWork {
                 work: crate::irp::PassiveWork::OpenExternalJournal(selected),
@@ -634,6 +638,14 @@ impl ControlDeviceOperation for MountRequestOperation {
                 let transition = probe.advance(event);
                 self.drive_shared_external_probe(context, candidate, transition)
             }
+            MountRequestState::OpeningExternalJournal { owned, .. } => {
+                let error = if matches!(event, OperationEvent::CancelRequested) {
+                    DriverError::from(Error::OperationCancelled)
+                } else {
+                    DriverError::InternalInvariantViolation
+                };
+                Self::complete(owned, Err(error))
+            }
             MountRequestState::QueryExclusiveJournalLength {
                 owned,
                 admission,
@@ -689,12 +701,50 @@ impl ControlDeviceOperation for MountRequestOperation {
 
 impl CompletionOperation for MountRequestOperation {
     fn advance(
-        self: Box<Self>,
+        mut self: Box<Self>,
         event: CompletionEvent,
         target: &mut ReactorTarget,
     ) -> OperationTransition {
         target.require_control_device();
-        self.advance_control(event.into_core(), target.control_catalog().directory_mut())
+        if let CompletionEvent::PassiveCompleted(
+            crate::irp::PassiveWorkCompletion::OpenExternalJournal(result),
+        ) = event
+        {
+            let state = core::mem::replace(&mut self.state, MountRequestState::Terminal);
+            let MountRequestState::OpeningExternalJournal {
+                owned,
+                admission,
+                devices,
+                mount,
+                requirement,
+            } = state
+            else {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
+                )
+                .bugcheck();
+            };
+            let external = match result {
+                Ok(external) => external,
+                Err(error) => return Self::complete(owned, Err(error)),
+            };
+            let completion_owner = admission.file_system_device();
+            let target = external.device();
+            self.state = MountRequestState::QueryExclusiveJournalLength {
+                owned,
+                admission,
+                devices,
+                mount,
+                requirement,
+                external,
+            };
+            OperationTransition::QueryDeviceLength {
+                completion_owner,
+                target,
+                suspended: self,
+            }
+        } else {
+            self.advance_control(event.into_core(), target.control_catalog().directory_mut())
+        }
     }
 
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {

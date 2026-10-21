@@ -35,6 +35,8 @@ use super::scheduler::SlotId;
 /// One captured native call whose resource lease owns every identity through worker completion.
 #[derive(Debug)]
 pub(crate) enum PassiveWork {
+    /// Mount-owned exclusive open may reenter the filesystem through native volume recognition.
+    OpenExternalJournal(crate::kernel::external_journal::SelectedExternalJournal),
     /// Retained UUID update or reconciliation, owned through worker completion.
     Identity(alloc::boxed::Box<crate::identity::IdentityWork>),
     /// Read sector geometry without blocking the actor or retaining its mounted-state borrow.
@@ -137,6 +139,8 @@ pub(crate) enum PassiveWork {
 /// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// Exclusive journal handle, retained until the mount consumes or releases it.
+    OpenExternalJournal(DriverResult<crate::kernel::external_journal::ExclusiveExternalJournal>),
     /// No native effect occurred; the executor retains this request for bounded admission retry.
     Retry(PassiveWork),
     /// Fully prepared response after persistence and publication finish.
@@ -201,7 +205,10 @@ impl PassiveWork {
         authorize: impl FnOnce() -> DriverResult<()>,
     ) -> DriverResult<()> {
         match self {
-            Self::Identity(_) | Self::Uninitialize { .. } | Self::CleanupOplock { .. } => Ok(()),
+            Self::OpenExternalJournal(_)
+            | Self::Identity(_)
+            | Self::Uninitialize { .. }
+            | Self::CleanupOplock { .. } => Ok(()),
             Self::SectorSize { .. }
             | Self::Mdl { .. }
             | Self::Read { .. }
@@ -280,6 +287,9 @@ impl PassiveWork {
     /// Executes the sole native call selected before the actor suspended.
     pub(super) fn execute(self, retrying: bool) -> PassiveWorkCompletion {
         match self {
+            Self::OpenExternalJournal(selected) => PassiveWorkCompletion::OpenExternalJournal(
+                crate::kernel::external_journal::ExclusiveExternalJournal::open(selected),
+            ),
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).execute()),
             Self::SectorSize {
                 query,
@@ -370,6 +380,7 @@ impl PassiveWork {
     /// Preserves the selected operation kind when worker preparation fails before queueing.
     pub(super) fn failed(self, error: DriverError) -> PassiveWorkCompletion {
         match self {
+            Self::OpenExternalJournal(_) => PassiveWorkCompletion::OpenExternalJournal(Err(error)),
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).failed(error)),
             Self::SectorSize { .. } => PassiveWorkCompletion::SectorSize(Err(error)),
             Self::Mdl { owned, .. } => PassiveWorkCompletion::Mdl {
