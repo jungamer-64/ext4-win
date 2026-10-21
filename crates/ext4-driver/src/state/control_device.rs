@@ -346,6 +346,8 @@ pub(super) enum ControlDevicePhase {
     Retiring = 2,
     /// Actor resources and alias are gone; the owner has committed to device deletion.
     Retired = 3,
+    /// Discovery admission is closed; its retained I/O must finish before unregistration.
+    StoppingDiscovery = 4,
 }
 
 impl ControlDevicePhase {
@@ -356,6 +358,7 @@ impl ControlDevicePhase {
             Self::Registered => 1,
             Self::Retiring => 2,
             Self::Retired => 3,
+            Self::StoppingDiscovery => 4,
         }
     }
 
@@ -366,6 +369,7 @@ impl ControlDevicePhase {
             1 => Some(Self::Registered),
             2 => Some(Self::Retiring),
             3 => Some(Self::Retired),
+            4 => Some(Self::StoppingDiscovery),
             _ => None,
         }
     }
@@ -423,25 +427,40 @@ impl ControlDeviceLifecycle {
     /// Returns a busy error while another request owns the transition, or an invariant error when
     /// an unpublished device receives a lifecycle request.
     pub(super) fn begin_retirement(&self) -> DriverResult<RetirementAdmission> {
-        match self.state.compare_exchange(
-            ControlDevicePhase::Registered.as_raw(),
-            ControlDevicePhase::Retiring.as_raw(),
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
+        match self
+            .state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |raw| {
+                matches!(
+                    ControlDevicePhase::from_raw(raw),
+                    Some(ControlDevicePhase::Registered | ControlDevicePhase::StoppingDiscovery)
+                )
+                .then_some(ControlDevicePhase::Retiring.as_raw())
+            }) {
             Ok(_) => Ok(RetirementAdmission::Acquired),
-            Err(raw) if ControlDevicePhase::from_raw(raw) == Some(ControlDevicePhase::Retired) => {
-                Ok(RetirementAdmission::AlreadyRetired)
-            }
-            Err(raw) if ControlDevicePhase::from_raw(raw) == Some(ControlDevicePhase::Retiring) => {
-                Err(DriverError::DeviceBusy)
-            }
-            Err(raw)
-                if ControlDevicePhase::from_raw(raw) == Some(ControlDevicePhase::Unpublished) =>
-            {
-                Err(DriverError::InternalInvariantViolation)
-            }
-            Err(_) => KernelWideInconsistency::driver_device_teardown_corruption().bugcheck(),
+            Err(raw) => match ControlDevicePhase::from_raw(raw) {
+                Some(ControlDevicePhase::Retired) => Ok(RetirementAdmission::AlreadyRetired),
+                Some(ControlDevicePhase::Retiring) => Err(DriverError::DeviceBusy),
+                Some(ControlDevicePhase::Unpublished) => {
+                    Err(DriverError::InternalInvariantViolation)
+                }
+                _ => KernelWideInconsistency::driver_device_teardown_corruption().bugcheck(),
+            },
+        }
+    }
+
+    /// Preserves registration while an explicitly closed discovery owner retains pending I/O.
+    pub(super) fn defer_retirement(&self) {
+        if self
+            .state
+            .compare_exchange(
+                ControlDevicePhase::Retiring.as_raw(),
+                ControlDevicePhase::StoppingDiscovery.as_raw(),
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
         }
     }
 
@@ -769,14 +788,27 @@ impl ControlDevice {
             return Ok(());
         }
         #[cfg(not(test))]
-        unsafe {
-            // SAFETY: Retirement has one owner. Drop unregisters PnP and joins discovery I/O while
-            // the filesystem and reactor can still service any in-flight mount.
-            extension
-                .discovery
-                .get()
-                .cast::<crate::kernel::volume_discovery::VolumeDiscovery>()
-                .drop_in_place();
+        {
+            let discovery = unsafe {
+                // SAFETY: Retirement owns the initialized discovery; registration and reactor
+                // retain its context until explicit stop confirms worker completion.
+                &*extension
+                    .discovery
+                    .get()
+                    .cast::<crate::kernel::volume_discovery::VolumeDiscovery>()
+            };
+            if discovery.stop().is_err() {
+                extension.lifecycle.defer_retirement();
+                return Err(DriverError::DeviceBusy);
+            }
+            unsafe {
+                // SAFETY: Explicit stop joined the worker and closed all callback observers.
+                extension
+                    .discovery
+                    .get()
+                    .cast::<crate::kernel::volume_discovery::VolumeDiscovery>()
+                    .drop_in_place();
+            }
         }
         unsafe {
             // SAFETY: This request exclusively consumed the Registered state, so it owns the sole

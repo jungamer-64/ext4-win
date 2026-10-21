@@ -179,6 +179,12 @@ fn control_retirement_has_one_recoverable_transition() {
         registration.begin_retirement(),
         Err(DriverError::DeviceBusy)
     );
+    registration.defer_retirement();
+    assert_eq!(registration.state(), ControlDevicePhase::StoppingDiscovery);
+    assert_eq!(
+        registration.begin_retirement(),
+        Ok(RetirementAdmission::Acquired)
+    );
     registration.finish_retirement();
     assert_eq!(registration.state(), ControlDevicePhase::Retired);
     assert_eq!(

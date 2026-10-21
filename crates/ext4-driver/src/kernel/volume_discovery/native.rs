@@ -158,6 +158,62 @@ impl VolumeDiscovery {
         Ok(discovery)
     }
 
+    /// Closes discovery admission and observes completion for at most one second.
+    /// A busy result retains the thread, callback storage and lower-I/O buffers for a later stop.
+    /// # Errors
+    /// Returns STATUS_DEVICE_BUSY while lower I/O or thread completion remains pending.
+    #[expect(
+        unsafe_code,
+        reason = "retirement retains pinned worker storage until a successful bounded join"
+    )]
+    pub(crate) fn stop(&self) -> Result<(), NTSTATUS> {
+        let context = self.context.as_ref().get_ref();
+        context
+            .phase
+            .store(DiscoveryPhase::Stopping.raw(), Ordering::Release);
+        let registration = context
+            .notification
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !registration.is_null() {
+            let status = unsafe {
+                // SAFETY: The sole retirement owner consumes the registration; callbacks only wake.
+                wdk_sys::ntddk::IoUnregisterPlugPlayNotificationEx(registration)
+            };
+            if status < STATUS_SUCCESS {
+                KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+            }
+        }
+        context.wake();
+        let thread = context.thread.load(Ordering::Acquire);
+        if thread.is_null() {
+            return Ok(());
+        }
+        let mut timeout = wdk_sys::LARGE_INTEGER {
+            QuadPart: -10_000_000,
+        };
+        let status = unsafe {
+            // SAFETY: Retirement retains the handle and pinned context throughout the bounded wait.
+            ffi::ZwWaitForSingleObject(thread, 0, &raw mut timeout)
+        };
+        if status == wdk_sys::STATUS_TIMEOUT {
+            return Err(wdk_sys::STATUS_DEVICE_BUSY);
+        }
+        if status != STATUS_SUCCESS {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        if context.thread.swap(core::ptr::null_mut(), Ordering::AcqRel) != thread {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        let status = unsafe {
+            // SAFETY: Completion was observed and this owner consumes the sole thread handle.
+            ffi::ZwClose(thread)
+        };
+        if status < STATUS_SUCCESS {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        Ok(())
+    }
+
     /// Grants the worker publication authority after successful filesystem registration.
     pub(crate) fn activate(&self) {
         if self
@@ -184,9 +240,12 @@ impl Drop for VolumeDiscovery {
     )]
     fn drop(&mut self) {
         let context = self.context.as_ref().get_ref();
-        context
+        let previous_phase = context
             .phase
-            .store(DiscoveryPhase::Stopping.raw(), Ordering::Release);
+            .swap(DiscoveryPhase::Stopping.raw(), Ordering::AcqRel);
+        if previous_phase == DiscoveryPhase::Running.raw() {
+            KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
         let registration = context
             .notification
             .swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -202,8 +261,12 @@ impl Drop for VolumeDiscovery {
         context.wake();
         let thread = context.thread.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !thread.is_null() {
+            if previous_phase != DiscoveryPhase::Dormant.raw() {
+                KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+            }
             let status = unsafe {
-                // SAFETY: Sole kernel handle; context remains live until the nonalertable join.
+                // SAFETY: Only dormant initialization rollback can retain a thread here; it cannot
+                // enter lower I/O. Running discovery must finish explicit stop before destruction.
                 ffi::ZwWaitForSingleObject(thread, 0, core::ptr::null_mut())
             };
             if status < STATUS_SUCCESS {
