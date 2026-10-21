@@ -107,67 +107,6 @@ impl WriteAdmission {
         accepted != 0
     }
 
-    /// Joins each deferred callback before returning or releasing its stack-resident event.
-    /// # Safety
-    /// The PASSIVE_LEVEL worker retains file and holds no filesystem resource through this call.
-    #[expect(
-        unsafe_code,
-        reason = "the nonalertable native wait retains callback storage and the work envelope retains file"
-    )]
-    #[cfg(not(test))]
-    pub(super) unsafe fn wait(&mut self, file: wdk_sys::PFILE_OBJECT, length: u32) {
-        while !unsafe {
-            // SAFETY: The caller retains file and permits blocking outside filesystem resources.
-            self.accepted(file, length, true)
-        } {
-            let ready = core::cell::UnsafeCell::new(wdk_sys::KEVENT::default());
-            unsafe {
-                // SAFETY: The local event has a stable address until the joined callback completes.
-                super::ffi::KeInitializeEvent(
-                    ready.get(),
-                    wdk_sys::_EVENT_TYPE::NotificationEvent,
-                    0,
-                );
-            }
-            unsafe {
-                // SAFETY: Both non-null contexts remain retained through the nonalertable wait;
-                // immediate callback delivery is preserved by the notification event.
-                wdk_sys::ntddk::CcDeferWrite(
-                    file,
-                    Some(write_ready),
-                    ready.get().cast(),
-                    file.cast(),
-                    length,
-                    u8::from(self.deferring()),
-                );
-            }
-            unsafe {
-                // SAFETY: No cancellation or timeout can release event storage while Cc owns the callback.
-                let _wait_status = super::ffi::KeWaitForSingleObject(
-                    ready.get().cast(),
-                    wdk_sys::_KWAIT_REASON::Executive,
-                    0,
-                    0,
-                    core::ptr::null_mut(),
-                );
-            }
-        }
-    }
-}
-
-/// Completes the sole native use of request-local write notification storage.
-/// # Safety
-/// Cc supplies the retained event context registered by WriteAdmission::wait.
-#[cfg(not(test))]
-#[expect(
-    unsafe_code,
-    reason = "the worker's nonalertable wait retains this event until callback signaling"
-)]
-unsafe extern "C" fn write_ready(context: *mut core::ffi::c_void, _file: *mut core::ffi::c_void) {
-    unsafe {
-        // SAFETY: The originating work owner retains this event through the nonalertable wait.
-        super::ffi::KeSetEvent(context.cast(), 0, 0);
-    }
 }
 
 #[cfg(test)]
