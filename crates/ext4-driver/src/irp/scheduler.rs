@@ -5,6 +5,7 @@
 
 use ext4_core::{EpochSequence, MutationResource};
 
+use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 
 /// Fixed execution storage on one device, partitioned to preserve paging and finalization progress.
@@ -48,14 +49,16 @@ impl NativeAdmissionBudget {
     pub(crate) const fn retrying(&self) -> bool {
         self.0 != 3000
     }
-    /// Reserves one further attempt, or reports exhaustion without wrapping.
-    pub(crate) fn defer(&mut self) -> bool {
+    /// Reserves one further attempt without consuming native effect authority.
+    /// # Errors
+    /// Returns policy exhaustion before any native effect, separately from Cc/MM failure.
+    pub(crate) fn defer(&mut self) -> DriverResult<()> {
         match self.0.checked_sub(1) {
             Some(remaining) => {
                 self.0 = remaining;
-                true
+                Ok(())
             }
-            None => false,
+            None => Err(DriverError::NativeAdmissionExhausted),
         }
     }
 }
@@ -1024,11 +1027,17 @@ mod tests {
         let mut budget = super::NativeAdmissionBudget::new();
         assert!(!budget.retrying());
         for _ in 0..3000 {
-            assert!(budget.defer());
+            assert_eq!(budget.defer(), Ok(()));
         }
         assert!(budget.retrying());
-        assert!(!budget.defer());
-        assert!(!budget.defer());
+        assert_eq!(
+            budget.defer(),
+            Err(crate::kernel::status::DriverError::NativeAdmissionExhausted)
+        );
+        assert_eq!(
+            budget.defer(),
+            Err(crate::kernel::status::DriverError::NativeAdmissionExhausted)
+        );
     }
 
     use ext4_core::MutationResource;

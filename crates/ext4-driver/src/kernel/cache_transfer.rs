@@ -46,7 +46,7 @@ pub(super) fn validate_copy_range(offset: i64, length: u32, eof: i64) -> DriverR
     }
 }
 
-/// Cache checks and callback posting have independent retry observations.
+/// Whether this request has already encountered native cache backpressure.
 #[derive(Clone, Copy)]
 enum WriteAttempt {
     /// No cache check has occurred.
@@ -89,15 +89,10 @@ impl WriteAdmission {
         reason = "only the retained native FILE_OBJECT and scalar write count cross this call"
     )]
     #[cfg(not(test))]
-    pub(super) unsafe fn accepted(
-        &mut self,
-        file: wdk_sys::PFILE_OBJECT,
-        length: u32,
-        wait: bool,
-    ) -> bool {
+    pub(super) unsafe fn accepted(&mut self, file: wdk_sys::PFILE_OBJECT, length: u32) -> bool {
         let accepted = unsafe {
             // SAFETY: The work owner retains file; no requestor memory is accessed.
-            wdk_sys::ntddk::CcCanIWrite(file, length, u8::from(wait), u8::from(self.checking()))
+            wdk_sys::ntddk::CcCanIWrite(file, length, 0, u8::from(self.checking()))
         };
         accepted != 0
     }

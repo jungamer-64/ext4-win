@@ -307,7 +307,7 @@ impl PassiveWork {
                 transfer,
             } => {
                 let result = file_object.mdl(owned.request(), transfer, retrying);
-                if result == Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT)) {
+                if result == Err(DriverError::NativeAdmissionDenied) {
                     return PassiveWorkCompletion::Retry(Self::Mdl {
                         file_object,
                         owned,
@@ -332,7 +332,7 @@ impl PassiveWork {
                 length,
             } => {
                 let result = file_object.write(owned.request(), offset, length, retrying);
-                if result == Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT)) {
+                if result == Err(DriverError::NativeAdmissionDenied) {
                     return PassiveWorkCompletion::Retry(Self::Write {
                         file_object,
                         owned,
@@ -647,11 +647,11 @@ impl PassiveWorkEnvelope {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
         let completion = if let PassiveWorkCompletion::Retry(work) = completion {
-            if envelope.retries.defer() {
+            if envelope.retries.defer().is_ok() {
                 envelope.state = PassiveState::Prepared(job, work);
                 return PassiveReclaim::Deferred(envelope);
             }
-            work.failed(DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_TIMEOUT))
+            work.failed(DriverError::NativeAdmissionExhausted)
         } else {
             completion
         };

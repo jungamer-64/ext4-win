@@ -1870,16 +1870,26 @@ impl ByteRangeLockOperation {
     ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
         let check = match owned.request().with_active(|active| {
             let _file_control_block = crate::request::file_info::lock_control(active)?;
-            let file_object = active.current_stack()?.file_object()?;
+            let stack = active.current_stack()?;
+            if stack.releases_byte_range_lock() {
+                return Ok(None);
+            }
+            let file_object = stack.file_object()?;
             access
                 .acquire_oplock_stream_lease(file_object)
-                .map(OplockCheck::ordinary)
+                .map(|stream| Some(OplockCheck::ordinary(stream)))
         }) {
             Ok(check) => check,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         match memory::boxed_try_map((owned, check), |(owned, check)| Self {
-            state: ByteRangeLockOperationState::CheckingOplock { owned, check },
+            state: match check {
+                Some(check) => ByteRangeLockOperationState::CheckingOplock { owned, check },
+                None => ByteRangeLockOperationState::OplockReady {
+                    owned,
+                    status: STATUS_SUCCESS,
+                },
+            },
             admission: crate::irp::NativeAdmissionBudget::new(),
         }) {
             Ok(operation) => Ok(operation),
@@ -1906,7 +1916,7 @@ impl ByteRangeLockOperation {
         };
         match owned.delegate_byte_range_lock(file_control_block) {
             Ok(_) => OperationTransition::Retired,
-            Err(owned) if self.admission.defer() => {
+            Err(owned) if self.admission.defer().is_ok() => {
                 self.state = ByteRangeLockOperationState::OplockReady {
                     owned,
                     status: STATUS_SUCCESS,
@@ -2092,7 +2102,7 @@ impl OplockControlOperation {
         }
         match owned.delegate_oplock_control(expected) {
             Ok(_) => OperationTransition::Retired,
-            Err(owned) if self.admission.defer() => {
+            Err(owned) if self.admission.defer().is_ok() => {
                 self.state = OplockControlOperationState::Ready {
                     owned,
                     file_control_block: expected,

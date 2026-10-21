@@ -61,6 +61,10 @@ pub(crate) enum DriverError {
     DeletePending,
     /// CLEANUP closed ordinary admission for this FILE_OBJECT.
     FileClosed,
+    /// A native pre-effect resource or cache check denied immediate admission.
+    NativeAdmissionDenied,
+    /// The finite native-admission retry policy ended before any native effect.
+    NativeAdmissionExhausted,
     /// Another caller owns the non-repeatable device lifecycle transition.
     DeviceBusy,
     /// A raw write or its required flush reached an outcome that cannot be retried safely.
@@ -162,6 +166,8 @@ impl DriverError {
             | Self::RegistryFailure(status) => status,
             Self::DeletePending => ntstatus(0xC000_0056),
             Self::FileClosed => ntstatus(0xC000_0128),
+            Self::NativeAdmissionDenied => wdk_sys::STATUS_CANT_WAIT,
+            Self::NativeAdmissionExhausted => wdk_sys::STATUS_IO_TIMEOUT,
             Self::DeviceBusy => ntstatus(0xC000_009E),
             Self::RawOutcomeUncertain => STATUS_DEVICE_DATA_ERROR,
             Self::CannotDelete => STATUS_CANNOT_DELETE,

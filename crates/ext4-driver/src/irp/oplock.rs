@@ -711,7 +711,7 @@ impl OplockEnvelope {
                 // SAFETY: No native delegation occurred; this actor still owns the allocation.
                 Box::from_raw(raw)
             };
-            if envelope.retries.defer() {
+            if envelope.retries.defer().is_ok() {
                 let delegated = envelope.delegated.take().unwrap_or_else(|| {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
                 });

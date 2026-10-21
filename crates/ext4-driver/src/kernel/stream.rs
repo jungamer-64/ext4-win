@@ -970,11 +970,12 @@ impl StreamContext {
         irp: NonNull<wdk_sys::IRP>,
         open_count: u32,
     ) -> NTSTATUS {
-        unsafe {
+        self.with_control_resource(irp, |irp| unsafe {
             // SAFETY: The caller retains the exact stream, IRP, and admitted handle-count
             // authorities documented above for this synchronous call.
             ext4win_stream_oplock_fsctrl(self.header.as_ptr(), irp.as_ptr(), open_count, 0)
-        }
+        })
+        .unwrap_or(wdk_sys::STATUS_OPLOCK_NOT_GRANTED)
     }
 
     /// Delegates one break-causing IRP to the stream-owned FsRtl oplock package.
@@ -1323,11 +1324,9 @@ impl StreamContext {
                 let mut admission = super::cache_transfer::WriteAdmission::new(_retrying);
                 {
                     unsafe {
-                        // SAFETY: The passive work owner retains file while backpressure waits outside resources.
-                        if !admission.accepted(transfer.file_object().as_ptr(), _length, false) {
-                            return Err(DriverError::CacheManagerFailure(
-                                wdk_sys::STATUS_CANT_WAIT,
-                            ));
+                        // SAFETY: The passive work owner retains file through this nonblocking Cc check.
+                        if !admission.accepted(transfer.file_object().as_ptr(), _length) {
+                            return Err(DriverError::NativeAdmissionDenied);
                         }
                     }
                     let main = self.main_resource()?.ordinary_shared(self.sections.get());
@@ -1339,10 +1338,10 @@ impl StreamContext {
                     }
                     if !unsafe {
                         // SAFETY: The same retained request rechecks Cc without waiting under MainResource.
-                        admission.accepted(transfer.file_object().as_ptr(), _length, false)
+                        admission.accepted(transfer.file_object().as_ptr(), _length)
                     } {
                         drop(main);
-                        return Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT));
+                        return Err(DriverError::NativeAdmissionDenied);
                     }
                     super::cache_transfer::validate_copy_range(
                         _offset,
@@ -1426,10 +1425,8 @@ impl StreamContext {
                 if request.action() == crate::irp::MdlTransfer::Write {
                     unsafe {
                         // SAFETY: The passive owner retains file; no filesystem resource is held while waiting.
-                        if !admission.accepted(_file_object.as_ptr(), request.length(), false) {
-                            return Err(DriverError::CacheManagerFailure(
-                                wdk_sys::STATUS_CANT_WAIT,
-                            ));
+                        if !admission.accepted(_file_object.as_ptr(), request.length()) {
+                            return Err(DriverError::NativeAdmissionDenied);
                         }
                     }
                 }
@@ -1441,11 +1438,11 @@ impl StreamContext {
                 if request.action() == crate::irp::MdlTransfer::Write
                     && !unsafe {
                         // SAFETY: The same retained request rechecks admission without waiting under MainResource.
-                        admission.accepted(_file_object.as_ptr(), request.length(), false)
+                        admission.accepted(_file_object.as_ptr(), request.length())
                     }
                 {
                     drop(_main);
-                    return Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT));
+                    return Err(DriverError::NativeAdmissionDenied);
                 }
                 let length =
                     super::cache_transfer::bounded_length(request, self.sizes()?.file_size())?;
