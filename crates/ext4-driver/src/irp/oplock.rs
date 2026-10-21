@@ -359,8 +359,8 @@ impl AtomicOplockReservation {
     /// Reverts the reservation before the matching create IRP is completed with failure.
     /// # Errors
     ///
-    /// Returns the exact native status and consumes the reservation even if FsRtl leaves the
-    /// outcome uncertain; callers must not retry with the same authority.
+    /// NativeAdmissionDenied retains the reservation before native entry and permits retry.
+    /// Every native return consumes it, including an uncertain failure that must not be retried.
     #[cfg_attr(
         not(test),
         expect(
@@ -368,25 +368,17 @@ impl AtomicOplockReservation {
             reason = "the one-shot reservation and live create IRP cross the audited FsRtl backout boundary"
         )
     )]
-    pub(crate) fn backout(mut self, owned: &OwnedIrp) -> Result<(), DriverError> {
-        let stream = self
-            .stream
-            .take()
-            .ok_or(DriverError::InternalInvariantViolation)?;
+    pub(crate) fn backout(&mut self, owned: &OwnedIrp) -> Result<(), DriverError> {
+        let stream = self.stream.as_ref().ok_or(DriverError::InternalInvariantViolation)?;
         #[cfg(not(test))]
-        let status = unsafe {
-            // SAFETY: This token retains the exact stream and is consumed with the same live create
-            // IRP before its provisional share claim or completion authority is released.
-            stream
-                .stream_context()
-                .backout_atomic_oplock(owned.external_irp_identity())
-        };
+        let status = stream.stream_context().with_control_resource(owned.external_irp_identity(), |irp| unsafe {
+            // SAFETY: The retained reservation, create IRP and same-thread exclusive resource
+            // enclose this one native backout. Denial leaves the reservation unconsumed.
+            stream.stream_context().backout_atomic_oplock(irp)
+        }).map_err(|_| DriverError::NativeAdmissionDenied)?;
         #[cfg(test)]
-        let status = {
-            let _: &OwnedIrp = owned;
-            wdk_sys::STATUS_SUCCESS
-        };
-        drop(stream);
+        let status = { let _retained = (stream, owned); wdk_sys::STATUS_SUCCESS };
+        drop(self.stream.take());
         classify_atomic_oplock_status(status)
     }
 }
