@@ -928,7 +928,9 @@ impl MutationCoordinatorState {
         }
     }
 
-    /// Issues visibility authority only for the current completed preparation.
+    /// Issues visibility authority only once for the current completed preparation.
+    /// A dropped or consumed lease is never reissued; an unstarted preparation can be explicitly
+    /// aborted through its owning value, while a started commit requires mount recovery.
     #[must_use]
     pub fn acquire_visibility(&mut self, ticket: u64) -> Option<super::VisibilityLease> {
         let JournalCoordinatorState::Ready { admission, .. } = &mut self.journal else {
@@ -945,6 +947,7 @@ impl MutationCoordinatorState {
     }
 
     /// Acquires checkpoint authority exactly once for the currently visible dirty epoch.
+    /// A dropped or consumed lease is never reissued; its owner must complete or recover the mount.
     #[must_use]
     pub fn acquire_checkpoint(
         &mut self,

@@ -526,8 +526,10 @@ impl CommitReadyMutation {
 impl DurableMutation {
     /// Publishes a durable commit using moves and fixed-table replacement only.
     ///
-    /// Rejection retains the already durable mutation for publication with the correct grant.
-    /// No storage I/O is repeated. This transition performs no allocation.
+    /// Rejection consumes the supplied visibility lease and retains the durable mutation.
+    /// Publication can be retried only if its matching acquisition still has unissued visibility
+    /// authority; otherwise the mount owner must recover. No storage I/O is repeated, and this
+    /// transition performs no allocation.
     /// # Errors
     /// Returns the error and reusable durable state when the grant or current epoch mismatches.
     #[expect(
@@ -565,7 +567,9 @@ impl DurableMutation {
 impl CheckpointOperation {
     /// Starts checkpoint home-block I/O while sealing clean publication state.
     /// # Errors
-    /// Returns the error and reusable checkpoint when its mount or visible epoch mismatches.
+    /// Consumes the supplied lease on either outcome. Rejection returns the checkpoint, which can
+    /// start only if its matching acquisition still has unissued checkpoint authority; otherwise
+    /// the mount owner must recover.
     #[expect(
         clippy::result_large_err,
         reason = "rejection preserves owned checkpoint authority without allocating after commit"

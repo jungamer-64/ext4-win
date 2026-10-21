@@ -637,8 +637,8 @@ fn delimited_oracle_section<'output>(
 ///
 /// # Errors
 ///
-/// Returns an error when formatting, batched mutation, bounded enumeration, exact/case-insensitive
-/// lookup, rename, debugfs inspection, or e2fsck validation fails.
+/// Returns an error when formatting, batched mutation, bounded enumeration, exact lookup,
+/// rename, debugfs inspection, or e2fsck validation fails.
 fn verify_htree_mutation_profile(
     linux: LinuxEnvironment,
     temporary_root: &Path,

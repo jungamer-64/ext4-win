@@ -16,7 +16,7 @@ impl MutationLease {
     pub(super) fn new(mount: super::mount::MountIdentity, ticket: u64) -> Self {
         Self { mount, ticket }
     }
-    /// Consumes a grant only in its issuing session.
+    /// Checks the issuing session; either outcome consumes this lease.
     /// # Errors
     /// Returns a conflict if the grant belongs to another mount.
     pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<u64> {
@@ -56,7 +56,7 @@ impl CommitLease {
     pub(super) fn new(mount: super::mount::MountIdentity, claim: CommitClaim) -> Self {
         Self { mount, claim }
     }
-    /// Consumes a grant only in its issuing session.
+    /// Checks the issuing session; either outcome consumes this lease.
     /// # Errors
     /// Returns a conflict if the grant belongs to another mount.
     pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<CommitClaim> {
@@ -87,7 +87,7 @@ impl VisibilityLease {
     pub(super) fn new(mount: super::mount::MountIdentity, claim: CommitClaim) -> Self {
         Self { mount, claim }
     }
-    /// Consumes a grant only in its issuing session.
+    /// Checks the issuing session; either outcome consumes this lease.
     /// # Errors
     /// Returns a conflict if the grant belongs to another mount.
     pub(super) fn consume(self, mount: &super::mount::MountIdentity) -> crate::Result<CommitClaim> {
@@ -118,7 +118,7 @@ impl CheckpointLease {
     pub(super) fn new(mount: super::mount::MountIdentity, epoch: super::EpochSequence) -> Self {
         Self { mount, epoch }
     }
-    /// Consumes a grant only in its issuing session.
+    /// Checks the issuing session; either outcome consumes this lease.
     /// # Errors
     /// Returns a conflict if the grant belongs to another mount.
     pub(super) fn consume(
