@@ -42,8 +42,7 @@ pub(super) use crate::disk_format::xattr::{
 };
 pub(super) use crate::error::{Error, Result};
 pub(super) use crate::memory::{self, FallibleVec};
-pub(super) use crate::platform::name::Ext4Name;
-pub(super) use crate::platform::name::{WindowsName, WindowsNameLookup};
+pub(super) use crate::disk_format::name::Ext4Name;
 pub(super) use crate::platform::windows::{WindowsOverlay, WindowsSymlinkReparsePoint};
 pub(super) use crate::protection::crypto::CryptographicOperation;
 pub(super) use crate::protection::fscrypt::{

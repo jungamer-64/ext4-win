@@ -2,7 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::memory;
-use crate::platform::name::Ext4Name;
+use crate::disk_format::name::Ext4Name;
 
 use super::node::DirectoryEntry;
 

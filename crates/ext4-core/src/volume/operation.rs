@@ -152,15 +152,7 @@ pub trait CommittedReadPass {
     ///
     /// Returns an error when the directory is invalid or its storage cannot be searched.
     fn lookup_child(&mut self, parent: DirectoryNodeId, name: &Ext4Name) -> Result<ChildLookup>;
-    /// Looks up one unambiguous Windows-visible child name.
-    /// # Errors
-    ///
-    /// Returns an error when directory traversal, name decoding, or ambiguity validation fails.
-    fn lookup_windows_child(
-        &mut self,
-        parent: DirectoryNodeId,
-        lookup: WindowsNameLookup<'_>,
-    ) -> Result<ChildLookup>;
+
 }
 
 /// Ephemeral synchronous read pass reconstructed from one operation transcript and epoch.
@@ -321,19 +313,7 @@ impl EpochReadPass<'_, '_, '_> {
         self.view.lookup_child(&parent, name, self.crypto)
     }
 
-    /// Looks up one unambiguous Windows-visible child name.
-    /// # Errors
-    ///
-    /// Returns an error when storage is incomplete, the directory is invalid, or the projected
-    /// name is ambiguous.
-    pub fn lookup_windows_child(
-        &mut self,
-        parent: DirectoryNodeId,
-        lookup: WindowsNameLookup<'_>,
-    ) -> Result<ChildLookup> {
-        let parent = self.view.load_directory(parent)?;
-        self.view.lookup_windows_child(&parent, lookup, self.crypto)
-    }
+
 }
 
 impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
@@ -411,13 +391,7 @@ impl CommittedReadPass for EpochReadPass<'_, '_, '_> {
         self.lookup_child(parent, name)
     }
 
-    fn lookup_windows_child(
-        &mut self,
-        parent: DirectoryNodeId,
-        lookup: WindowsNameLookup<'_>,
-    ) -> Result<ChildLookup> {
-        self.lookup_windows_child(parent, lookup)
-    }
+
 }
 
 /// Operation-owned transcript and dependency versions for one logical read.

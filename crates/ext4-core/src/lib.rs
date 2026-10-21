@@ -39,7 +39,7 @@ pub use disk_format::superblock::{
 };
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
-pub use platform::name::{Ext4Name, WindowsName, WindowsNameLookup};
+pub use disk_format::name::Ext4Name;
 pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay, WindowsSymlinkReparsePoint};
 pub use protection::crypto::CryptographicOperation;
 pub use protection::fscrypt::{

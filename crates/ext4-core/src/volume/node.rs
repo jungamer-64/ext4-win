@@ -8,7 +8,7 @@ use crate::disk_format::inode::{
     InodeKind, InodeProtection,
 };
 use crate::error::{Error, Result};
-use crate::platform::name::Ext4Name;
+use crate::disk_format::name::Ext4Name;
 use crate::platform::windows::{Ext4WindowsAttributes, WindowsOverlay};
 
 /// Typed regular-file inode identity.

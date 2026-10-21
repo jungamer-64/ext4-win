@@ -11,7 +11,7 @@ use crate::disk_format::superblock::{
 };
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
-use crate::platform::name::Ext4Name;
+use crate::disk_format::name::Ext4Name;
 
 /// Bytes occupied by the fixed header of an ext4 directory record.
 const DIRENT_HEADER_SIZE: usize = 8;

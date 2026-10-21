@@ -1153,16 +1153,7 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
             .lookup_child(&parent, name, self.crypto)
     }
 
-    fn lookup_windows_child(
-        &mut self,
-        parent: DirectoryNodeId,
-        lookup: WindowsNameLookup<'_>,
-    ) -> Result<ChildLookup> {
-        let parent = self.mutation.volume.load_directory(parent)?;
-        self.mutation
-            .volume
-            .lookup_windows_child(&parent, lookup, self.crypto)
-    }
+
 }
 
 impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
