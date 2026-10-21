@@ -141,7 +141,7 @@ pub(crate) enum PassiveWork {
 pub(crate) enum PassiveWorkCompletion {
     /// Exclusive journal handle, retained until the mount consumes or releases it.
     OpenExternalJournal(DriverResult<crate::kernel::external_journal::ExclusiveExternalJournal>),
-    /// No native effect occurred; the executor retains this request for bounded admission retry.
+    /// No transfer was admitted; the executor retains this request for bounded admission retry.
     Retry(PassiveWork),
     /// Fully prepared response after persistence and publication finish.
     Identity(alloc::vec::Vec<u8>),

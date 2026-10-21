@@ -3245,10 +3245,11 @@ impl PreparedDriverPublication {
     /// Consumes any atomic create backout authority before a failed top-level completion.
     /// # Errors
     ///
-    /// Returns the exact native backout failure after all publication state is consumed.
-    fn abort(self, owned: &OwnedIrp) -> DriverResult<()> {
-        match self.effect {
-            PreparedDriverEffect::Create(publication) => (*publication).abort(owned),
+    /// Denied admission retains publication state for retry; native failure consumes its
+    /// backout authority and must not cause a second native submission.
+    fn abort(&mut self, owned: &OwnedIrp) -> DriverResult<()> {
+        match &mut self.effect {
+            PreparedDriverEffect::Create(publication) => publication.abort(owned),
             PreparedDriverEffect::ExistingCreate
             | PreparedDriverEffect::Write(_)
             | PreparedDriverEffect::SetFile(_)
@@ -3518,9 +3519,32 @@ impl CleanupParentOplockAuthority {
     }
 }
 
+/// Continuation after every retained atomic oplock has been backed out.
+#[derive(Debug)]
+enum CreateAbortContinuation {
+    /// Report the original failure unless native backout supplies a more specific failure.
+    Complete(DriverError),
+    /// Revalidate a provisional existing-open claim against a fresh epoch.
+    Restart,
+}
+
 /// Explicit ownership phase of one journaled mutation operation.
 #[derive(Debug)]
 enum MutationOperationState {
+    /// Main-resource admission yielded before consuming mandatory native backout authority.
+    AbortingCreate {
+        /// Create IRP retains the FILE_OBJECT through all resource admission attempts.
+        owned: OwnedIrp,
+        /// A staged publication retained until backout can complete; existing claims live in the operation.
+        publication: Option<PreparedDriverPublication>,
+        /// Completion or fresh resolution selected before yielding.
+        continuation: CreateAbortContinuation,
+    },
+    /// Atomic backout completed; the next actor event may restart resolution or honor cancellation.
+    RestartingAfterAbort {
+        /// Original create completion owner.
+        owned: OwnedIrp,
+    },
     /// A handle mutation is ready to transfer its IRP to the stream oplock package.
     CheckingOplock {
         /// Unique top-level completion authority before FsRtl delegation.
@@ -4020,10 +4044,64 @@ impl MutationRequestOperation {
     }
 
     /// Completes one top-level failure while respecting create auxiliary-buffer ownership.
-    fn complete_error(
+    fn complete_error(self: Box<Self>, owned: OwnedIrp, error: DriverError) -> OperationTransition {
+        self.abort_create(owned, None, CreateAbortContinuation::Complete(error))
+    }
+
+    /// Keeps provisional claims alive until native backout is admitted. Cancellation cannot
+    /// abandon an established atomic oplock; only pre-entry resource denial may be retried.
+    fn abort_create(
         mut self: Box<Self>,
         owned: OwnedIrp,
-        mut error: DriverError,
+        mut publication: Option<PreparedDriverPublication>,
+        continuation: CreateAbortContinuation,
+    ) -> OperationTransition {
+        if let Some(prepared) = publication.as_mut() {
+            let result = prepared.abort(&owned);
+            if result == Err(DriverError::NativeAdmissionDenied) {
+                self.state = MutationOperationState::AbortingCreate {
+                    owned,
+                    publication,
+                    continuation,
+                };
+                return OperationTransition::DeferOperation { suspended: self };
+            }
+            drop(publication.take());
+            if let Err(error) = result {
+                return self.complete_error(owned, error);
+            }
+        }
+        let result = self
+            .pending_existing_create
+            .as_mut()
+            .map_or(Ok(()), |pending| pending.abort(&owned));
+        if result == Err(DriverError::NativeAdmissionDenied) {
+            self.state = MutationOperationState::AbortingCreate {
+                owned,
+                publication,
+                continuation,
+            };
+            return OperationTransition::DeferOperation { suspended: self };
+        }
+        drop(publication);
+        drop(self.pending_existing_create.take());
+        match (continuation, result) {
+            (_, Err(error)) | (CreateAbortContinuation::Complete(error), Ok(())) => {
+                self.finish_error(owned, error)
+            }
+            (CreateAbortContinuation::Restart, Ok(())) => {
+                drop(self.write_open.take());
+                self.state = MutationOperationState::RestartingAfterAbort { owned };
+                OperationTransition::DeferOperation { suspended: self }
+            }
+        }
+    }
+
+    /// Emits failure only after all one-shot backout authority and provisional claims are gone.
+    fn finish_error(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        error: DriverError,
     ) -> OperationTransition {
         if self.request.is_paging() {
             self.trace.record(
@@ -4031,11 +4109,6 @@ impl MutationRequestOperation {
                 error.ntstatus(),
                 OperationalOutcome::Failed,
             );
-        }
-        if let Some(pending) = self.pending_existing_create.take()
-            && let Err(backout_error) = pending.abort(&owned)
-        {
-            error = backout_error;
         }
         drop(self.write_open.take());
         if let Some(deletion) = self.cleanup_deletion.as_mut() {
@@ -4793,15 +4866,11 @@ impl MutationRequestOperation {
                         && self.pending_existing_create.is_some() =>
                 {
                     drop(pass);
-                    let pending = self.pending_existing_create.take().unwrap_or_else(|| {
-                        crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                            .bugcheck()
-                    });
-                    if let Err(error) = pending.abort(&owned) {
-                        return MutationStep::Transition(self.complete_error(owned, error));
-                    }
-                    drop(self.write_open.take());
-                    return self.restart_resolution(owned, None, None, operations);
+                    return MutationStep::Transition(self.abort_create(
+                        owned,
+                        None,
+                        CreateAbortContinuation::Restart,
+                    ));
                 }
                 Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
             }
@@ -4953,11 +5022,11 @@ impl MutationRequestOperation {
         let CommitContext {
             owned, publication, ..
         } = context;
-        let mut error = DriverError::from(error);
-        if let Err(backout_error) = publication.abort(&owned) {
-            error = backout_error;
-        }
-        self.complete_error(owned, error)
+        self.abort_create(
+            owned,
+            Some(publication),
+            CreateAbortContinuation::Complete(DriverError::from(error)),
+        )
     }
 
     /// Records one successfully completed pre-visibility write.
@@ -5362,6 +5431,21 @@ impl MutationRequestOperation {
         };
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
         match state {
+            MutationOperationState::AbortingCreate {
+                owned,
+                publication,
+                continuation,
+            } => MutationStep::Transition(self.abort_create(owned, publication, continuation)),
+            MutationOperationState::RestartingAfterAbort { owned } => {
+                if matches!(event, OperationEvent::CancelRequested) {
+                    MutationStep::Transition(
+                        self.complete_error(owned, DriverError::from(Error::OperationCancelled)),
+                    )
+                } else {
+                    self.restart_resolution(owned, None, None, access)
+                }
+            }
+
             MutationOperationState::CheckingOplock {
                 owned,
                 check,
@@ -5913,6 +5997,8 @@ impl MountedVolumeOperation for MutationRequestOperation {
             )
             | (
                 MutationOperationState::AwaitingIntent { .. }
+                | MutationOperationState::AbortingCreate { .. }
+                | MutationOperationState::RestartingAfterAbort { .. }
                 | MutationOperationState::CheckingOplock { .. }
                 | MutationOperationState::OplockDelegated { .. }
                 | MutationOperationState::OplockReady { .. }
@@ -5945,7 +6031,9 @@ impl InfalliblePublication for MutationRequestOperation {
             MutationOperationState::PublishingCheckpoint { epoch, .. } => {
                 PublicationAuthority::Checkpoint { epoch: *epoch }
             }
-            MutationOperationState::CacheWriting { .. }
+            MutationOperationState::AbortingCreate { .. }
+            | MutationOperationState::RestartingAfterAbort { .. }
+            | MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CheckingOplock { .. }
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }
@@ -6053,7 +6141,9 @@ impl InfalliblePublication for MutationRequestOperation {
                 self.state = MutationOperationState::Terminal;
                 None
             }
-            MutationOperationState::CacheWriting { .. }
+            MutationOperationState::AbortingCreate { .. }
+            | MutationOperationState::RestartingAfterAbort { .. }
+            | MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CheckingOplock { .. }
             | MutationOperationState::OplockDelegated { .. }
             | MutationOperationState::OplockReady { .. }

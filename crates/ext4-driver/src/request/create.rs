@@ -1162,13 +1162,17 @@ impl NewCreateOplockState {
     /// Consumes one-shot backout authority before a failed create completion.
     /// # Errors
     ///
-    /// Returns the exact native backout failure after consuming the reservation.
+    /// Denied resource admission retains the claim and reservation for retry; a native result
+    /// consumes backout authority even when it reports failure.
     fn abort(&mut self, owned: &crate::irp::OwnedIrp) -> DriverResult<()> {
-        let oplock = core::mem::replace(self, Self::Ready);
-        match oplock {
+        let result = match self {
             Self::Reserved(reservation) => reservation.backout(owned),
             Self::Ready | Self::Reserve(_) => Ok(()),
+        };
+        if result != Err(DriverError::NativeAdmissionDenied) {
+            *self = Self::Ready;
         }
+        result
     }
 
     /// Consumes the reservation after the committed handle becomes publishable.
@@ -1407,19 +1411,23 @@ impl PendingExistingCreateOpen {
         self.oplock = ExistingCreateOplockState::Reserved(reservation);
     }
 
-    /// Consumes this unpublished claim, backing out any established atomic oplock first.
+    /// Backs out an atomic oplock while retaining the unpublished claim on denied admission.
     /// # Errors
     ///
-    /// Returns the exact native backout failure after consuming its one-shot authority.
-    pub(crate) fn abort(mut self, owned: &crate::irp::OwnedIrp) -> DriverResult<()> {
-        let oplock = core::mem::replace(&mut self.oplock, ExistingCreateOplockState::Ready);
-        match oplock {
+    /// NativeAdmissionDenied retains one-shot authority for retry; native entry consumes it
+    /// even when FsRtl reports failure.
+    pub(crate) fn abort(&mut self, owned: &crate::irp::OwnedIrp) -> DriverResult<()> {
+        let result = match &mut self.oplock {
             ExistingCreateOplockState::Reserved(reservation) => reservation.backout(owned),
             ExistingCreateOplockState::Ready
             | ExistingCreateOplockState::BreakInProgress
             | ExistingCreateOplockState::Check(_)
             | ExistingCreateOplockState::Reserve(_) => Ok(()),
+        };
+        if result != Err(DriverError::NativeAdmissionDenied) {
+            self.oplock = ExistingCreateOplockState::Ready;
         }
+        result
     }
 
     /// Returns the exact resident stream that needs native image-section exclusion.
@@ -2400,11 +2408,12 @@ impl PreparedCreatePublication {
             .accept(reservation, self.claim.file_control_block());
     }
 
-    /// Backs out a sealed atomic oplock before failure completion and drops the unpublished claim.
+    /// Backs out a sealed atomic oplock while retaining the unpublished claim until native return.
     /// # Errors
     ///
-    /// Returns the exact one-shot native backout failure after consuming the reservation.
-    pub(crate) fn abort(mut self, owned: &crate::irp::OwnedIrp) -> DriverResult<()> {
+    /// Denied resource admission retains the claim and reservation for retry; a native result
+    /// consumes backout authority even when it reports failure.
+    pub(crate) fn abort(&mut self, owned: &crate::irp::OwnedIrp) -> DriverResult<()> {
         self.oplock.abort(owned)
     }
 

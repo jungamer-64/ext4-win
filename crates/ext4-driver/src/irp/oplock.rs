@@ -369,15 +369,24 @@ impl AtomicOplockReservation {
         )
     )]
     pub(crate) fn backout(&mut self, owned: &OwnedIrp) -> Result<(), DriverError> {
-        let stream = self.stream.as_ref().ok_or(DriverError::InternalInvariantViolation)?;
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or(DriverError::InternalInvariantViolation)?;
         #[cfg(not(test))]
-        let status = stream.stream_context().with_control_resource(owned.external_irp_identity(), |irp| unsafe {
-            // SAFETY: The retained reservation, create IRP and same-thread exclusive resource
-            // enclose this one native backout. Denial leaves the reservation unconsumed.
-            stream.stream_context().backout_atomic_oplock(irp)
-        }).map_err(|_| DriverError::NativeAdmissionDenied)?;
+        let status = stream
+            .stream_context()
+            .with_control_resource(owned.external_irp_identity(), |irp| unsafe {
+                // SAFETY: The retained reservation, create IRP and same-thread exclusive resource
+                // enclose this one native backout. Denial leaves the reservation unconsumed.
+                stream.stream_context().backout_atomic_oplock(irp)
+            })
+            .map_err(|_| DriverError::NativeAdmissionDenied)?;
         #[cfg(test)]
-        let status = { let _retained = (stream, owned); wdk_sys::STATUS_SUCCESS };
+        let status = {
+            let _retained = (stream, owned);
+            wdk_sys::STATUS_SUCCESS
+        };
         drop(self.stream.take());
         classify_atomic_oplock_status(status)
     }
