@@ -1269,8 +1269,8 @@ impl StreamContext {
     }
 
     /// Accepts one within-EOF write into the FILE_OBJECT cache map.
-    /// Passive work retains all identities while Cc admission waits outside filesystem resources.
-    /// It joins deferred callbacks before returning; storage and EOF are revalidated before copy.
+    /// Cache pressure returns CANT_WAIT before copying; the retaining executor retries with
+    /// cancellation and a finite admission budget. Storage and EOF are revalidated before copy.
     /// # Errors
     ///
     /// Returns the exact Cache Manager status or an input representation failure.
@@ -1278,6 +1278,7 @@ impl StreamContext {
         &self,
         _offset: i64,
         transfer: crate::irp::CacheWriteTransfer<'_>,
+        _retrying: bool,
     ) -> DriverResult<()> {
         let length = transfer.length();
         if length == 0 {
@@ -1296,11 +1297,15 @@ impl StreamContext {
             );
             let result = (|| {
                 self.initialize_cache(transfer.file_object())?;
-                let mut admission = super::cache_transfer::WriteAdmission::new();
-                loop {
+                let mut admission = super::cache_transfer::WriteAdmission::new(_retrying);
+                {
                     unsafe {
                         // SAFETY: The passive work owner retains file while backpressure waits outside resources.
-                        admission.wait(transfer.file_object().as_ptr(), _length);
+                        if !admission.accepted(transfer.file_object().as_ptr(), _length, false) {
+                            return Err(DriverError::CacheManagerFailure(
+                                wdk_sys::STATUS_CANT_WAIT,
+                            ));
+                        }
                     }
                     let main = self.main_resource()?.ordinary_shared(self.sections.get());
                     self.ensure_ordinary_io(true)?;
@@ -1314,7 +1319,7 @@ impl StreamContext {
                         admission.accepted(transfer.file_object().as_ptr(), _length, false)
                     } {
                         drop(main);
-                        continue;
+                        return Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT));
                     }
                     super::cache_transfer::validate_copy_range(
                         _offset,
@@ -1331,7 +1336,7 @@ impl StreamContext {
                             _input.as_ptr().cast(),
                         )
                     };
-                    return cache_status(status);
+                    cache_status(status)
                 }
             })();
             self.trace
@@ -1363,6 +1368,7 @@ impl StreamContext {
     pub(crate) fn cached_mdl(
         &self,
         _transfer: crate::irp::CacheMdlTransfer<'_>,
+        _retrying: bool,
     ) -> DriverResult<usize> {
         let _file_object = _transfer.file_object();
         let _irp = _transfer.irp();
@@ -1392,12 +1398,16 @@ impl StreamContext {
                 ext4win_prepare_mdl_completion(self.runtime.as_ptr(), _file_object.as_ptr())
             };
             cache_status(status)?;
-            let mut admission = super::cache_transfer::WriteAdmission::new();
-            loop {
+            let mut admission = super::cache_transfer::WriteAdmission::new(_retrying);
+            {
                 if request.action() == crate::irp::MdlTransfer::Write {
                     unsafe {
                         // SAFETY: The passive owner retains file; no filesystem resource is held while waiting.
-                        admission.wait(_file_object.as_ptr(), request.length());
+                        if !admission.accepted(_file_object.as_ptr(), request.length(), false) {
+                            return Err(DriverError::CacheManagerFailure(
+                                wdk_sys::STATUS_CANT_WAIT,
+                            ));
+                        }
                     }
                 }
                 let _main = self.main_resource()?.ordinary_shared(self.sections.get());
@@ -1412,7 +1422,7 @@ impl StreamContext {
                     }
                 {
                     drop(_main);
-                    continue;
+                    return Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT));
                 }
                 let length =
                     super::cache_transfer::bounded_length(request, self.sizes()?.file_size())?;
@@ -1445,7 +1455,7 @@ impl StreamContext {
                     },
                 };
                 cache_status(status)?;
-                return Ok(information);
+                Ok(information)
             }
         }
         #[cfg(test)]

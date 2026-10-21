@@ -49,24 +49,26 @@ pub(super) fn validate_copy_range(offset: i64, length: u32, eof: i64) -> DriverR
 /// Cache checks and callback posting have independent retry observations.
 #[derive(Clone, Copy)]
 enum WriteAttempt {
-    /// Neither a cache check nor deferred posting has occurred.
+    /// No cache check has occurred.
     First,
-    /// Cache checks have occurred but no deferred callback has been posted.
+    /// A prior nonblocking cache check denied admission.
     Checked,
-    /// Both subsequent checks and deferred postings must carry their retry flags.
-    Deferred,
 }
 
-/// Request-local backpressure state; no filesystem resource is held while waiting for Cc.
+/// Request-local state for nonblocking Cache Manager admission.
 pub(super) struct WriteAdmission {
-    /// Distinguishes first check, repeated check and repeated deferred posting.
+    /// Distinguishes the first check from later admission attempts.
     attempt: WriteAttempt,
 }
 impl WriteAdmission {
-    /// No check or deferred callback has occurred for this write request.
-    pub(super) const fn new() -> Self {
+    /// Carries whether an earlier attempt denied this write request.
+    pub(super) const fn new(retrying: bool) -> Self {
         Self {
-            attempt: WriteAttempt::First,
+            attempt: if retrying {
+                WriteAttempt::Checked
+            } else {
+                WriteAttempt::First
+            },
         }
     }
 
@@ -76,13 +78,6 @@ impl WriteAdmission {
         if !retrying {
             self.attempt = WriteAttempt::Checked;
         }
-        retrying
-    }
-
-    /// Records deferred posting independently of check retries.
-    fn deferring(&mut self) -> bool {
-        let retrying = matches!(self.attempt, WriteAttempt::Deferred);
-        self.attempt = WriteAttempt::Deferred;
         retrying
     }
 
@@ -106,7 +101,6 @@ impl WriteAdmission {
         };
         accepted != 0
     }
-
 }
 
 #[cfg(test)]
@@ -117,13 +111,12 @@ mod tests {
     /// # Panics
     /// Fails if repeated checks are mistaken for repeated callback posting.
     #[test]
-    fn checks_and_deferred_postings_have_independent_retry_state() {
-        let mut admission = WriteAdmission::new();
+    fn repeated_cache_checks_preserve_retry_state() {
+        let mut admission = WriteAdmission::new(false);
         assert!(!admission.checking());
         assert!(admission.checking());
-        assert!(!admission.deferring());
         assert!(admission.checking());
-        assert!(admission.deferring());
+        assert!(WriteAdmission::new(true).checking());
     }
 
     /// # Panics

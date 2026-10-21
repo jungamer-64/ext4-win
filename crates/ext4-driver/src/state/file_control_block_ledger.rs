@@ -935,12 +935,16 @@ impl FileObjectCacheLease {
         &self,
         request: crate::irp::PendingIrpLease<'_>,
         transfer: crate::irp::MdlTransferRequest,
+        retrying: bool,
     ) -> DriverResult<usize> {
         let transfer = request.cache_mdl_transfer(transfer)?;
         if transfer.file_object() != self.file_object.as_non_null() {
             return Err(DriverError::InternalInvariantViolation);
         }
-        self.stream.stream().stream_context.cached_mdl(transfer)
+        self.stream
+            .stream()
+            .stream_context
+            .cached_mdl(transfer, retrying)
     }
     /// Attenuates this FILE_OBJECT authority to the shared stream cache only.
     pub(crate) fn into_stream(self) -> StreamCacheLease {
@@ -976,6 +980,7 @@ impl FileObjectCacheLease {
         request: crate::irp::PendingIrpLease<'_>,
         offset: i64,
         length: usize,
+        retrying: bool,
     ) -> DriverResult<()> {
         let transfer = request.cache_write_transfer(length)?;
         if transfer.file_object() != self.file_object.as_non_null() {
@@ -984,7 +989,7 @@ impl FileObjectCacheLease {
         self.stream
             .stream()
             .stream_context
-            .cached_write(offset, transfer)
+            .cached_write(offset, transfer, retrying)
     }
 
     /// Releases this FILE_OBJECT's private cache map.

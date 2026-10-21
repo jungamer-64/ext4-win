@@ -640,6 +640,9 @@ enum SlotPayload {
     /// One retry command retaining its original operation.
     #[cfg(not(test))]
     Retry(RetryingStorageCommand<ScheduledStorageOperation>),
+    /// Retained native admission, with no system worker occupied while its timer waits.
+    #[cfg(not(test))]
+    PassiveRetry(Box<PassiveWorkEnvelope>),
     /// Completion envelope owning lower lifetime and cancellation identity.
     #[cfg(not(test))]
     Lower(PublishedReactorLower),
@@ -656,6 +659,8 @@ impl fmt::Debug for SlotPayload {
             Self::Operation { event: None, .. } => formatter.write_str("SuspendedOperation"),
             #[cfg(not(test))]
             Self::Retry(_) => formatter.write_str("Retry"),
+            #[cfg(not(test))]
+            Self::PassiveRetry(_) => formatter.write_str("PassiveRetry"),
             #[cfg(not(test))]
             Self::Lower(_) => formatter.write_str("Lower"),
             #[cfg(not(test))]
@@ -3843,7 +3848,28 @@ impl CompletionReactor {
                 // SAFETY: Inbox removal and exact slot-generation validation grant unique ownership.
                 Box::from_raw(envelope.as_ptr())
             };
-            let (suspended, completion, reserve) = PassiveWorkEnvelope::reclaim(envelope);
+            let (suspended, completion, reserve) = match PassiveWorkEnvelope::reclaim(envelope) {
+                super::passive::PassiveReclaim::Completed {
+                    operation,
+                    completion,
+                    reserve,
+                } => (operation, completion, reserve),
+                super::passive::PassiveReclaim::Deferred(envelope) => {
+                    if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry))
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    self.install_payload(index, SlotPayload::PassiveRetry(envelope));
+                    self.retry_timers
+                        .get(index)
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        })
+                        .arm(identity.generation(), StorageRetryDelay::TenMilliseconds);
+                    continue;
+                }
+            };
             if let Some(reserve) = reserve {
                 unsafe {
                     // SAFETY: The sole actor reclaims its finalization reserve after exact generation validation.
@@ -4104,16 +4130,35 @@ impl CompletionReactor {
             if !self.with_scheduler(|scheduler| scheduler.enter_retry(identity)) {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
-            let retry = self.with_payloads(|payloads| {
+            let payload = self.with_payloads(|payloads| {
                 let Some(slot) = payloads.get_mut(index) else {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 };
-                let payload = core::mem::replace(&mut slot.payload, SlotPayload::Empty);
-                let SlotPayload::Retry(retry) = payload else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                retry
+                core::mem::replace(&mut slot.payload, SlotPayload::Empty)
             });
+            let retry = match payload {
+                SlotPayload::Retry(retry) => retry,
+                SlotPayload::PassiveRetry(envelope) => {
+                    if self.cancellation_is_pending(index) {
+                        let (work, suspended) = PassiveWorkEnvelope::cancel_before_queue(envelope);
+                        self.set_ready_operation_event(
+                            index,
+                            suspended,
+                            work.cancel_before_execution(),
+                        );
+                    } else {
+                        if !self.with_scheduler(|scheduler| {
+                            scheduler.set_phase(identity, Phase::Passive)
+                        }) {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck();
+                        }
+                        PassiveWorkEnvelope::queue(envelope);
+                    }
+                    continue;
+                }
+                _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            };
             if retry.suspended().cancellation == EffectCancellation::AbortBeforeEffect
                 && self.cancellation_is_pending(index)
             {
@@ -5071,12 +5116,15 @@ mod tests {
                     crate::irp::PassiveWork,
                     DriverError,
                 ) -> crate::irp::PassiveWorkCompletion = crate::irp::PassiveWork::failed;
-                let completion = work.execute();
+                let completion = work.execute(false);
                 let event = CompletionEvent::PassiveCompleted(completion);
                 let CompletionEvent::PassiveCompleted(completion) = event else {
                     return;
                 };
                 match completion {
+                    crate::irp::PassiveWorkCompletion::Retry(work) => {
+                        drop(work);
+                    }
                     crate::irp::PassiveWorkCompletion::Identity(bytes) => {
                         let _bytes = bytes;
                     }
@@ -5124,8 +5172,11 @@ mod tests {
                 drop(suspended);
             }
             OperationTransition::SubmitPassiveWorkAfterIntentRelease { work, suspended } => {
-                let completion = work.execute();
+                let completion = work.execute(false);
                 match completion {
+                    crate::irp::PassiveWorkCompletion::Retry(work) => {
+                        drop(work);
+                    }
                     crate::irp::PassiveWorkCompletion::PrepareSizeChange(result) => {
                         let _result = result;
                     }

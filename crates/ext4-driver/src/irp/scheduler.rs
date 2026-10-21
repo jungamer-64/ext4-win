@@ -32,6 +32,31 @@ impl ExecutionClass {
     }
 }
 
+/// Native admission polls yield between attempts and never consume effect authority.
+/// Three thousand ten-millisecond deferrals bound one admission's retry policy.
+#[derive(Debug)]
+pub(crate) struct NativeAdmissionBudget(u16);
+impl NativeAdmissionBudget {
+    /// Starts one native admission independently from lower-storage retries.
+    pub(crate) const fn new() -> Self {
+        Self(3000)
+    }
+    /// Whether a prior denial consumed this admission budget.
+    pub(crate) const fn retrying(&self) -> bool {
+        self.0 != 3000
+    }
+    /// Reserves one further attempt, or reports exhaustion without wrapping.
+    pub(crate) fn defer(&mut self) -> bool {
+        match self.0.checked_sub(1) {
+            Some(remaining) => {
+                self.0 = remaining;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 /// Scheduler-local identity for the per-handle CLEANUP terminal barrier.
 pub(crate) const CLEANUP_HANDLE_BARRIER: u64 = 2;
 /// Scheduler-local identity for the terminal CLOSE drain.
@@ -989,6 +1014,20 @@ fn earlier_queued_intent_conflicts(
 
 #[cfg(test)]
 mod tests {
+    /// # Panics
+    /// Exhaustion remains terminal rather than wrapping into a fresh retry budget.
+    #[test]
+    fn native_admission_has_a_finite_retry_budget() {
+        let mut budget = super::NativeAdmissionBudget::new();
+        assert!(!budget.retrying());
+        for _ in 0..3000 {
+            assert!(budget.defer());
+        }
+        assert!(budget.retrying());
+        assert!(!budget.defer());
+        assert!(!budget.defer());
+    }
+
     use ext4_core::MutationResource;
 
     use crate::memory::DriverVec;

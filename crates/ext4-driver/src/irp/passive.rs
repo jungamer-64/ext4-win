@@ -137,6 +137,8 @@ pub(crate) enum PassiveWork {
 /// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// No native effect occurred; the executor retains this request for bounded admission retry.
+    Retry(PassiveWork),
     /// Fully prepared response after persistence and publication finish.
     Identity(alloc::vec::Vec<u8>),
     /// Native sector observation, including its exact failure status.
@@ -276,7 +278,7 @@ impl PassiveWork {
     }
 
     /// Executes the sole native call selected before the actor suspended.
-    pub(super) fn execute(self) -> PassiveWorkCompletion {
+    pub(super) fn execute(self, retrying: bool) -> PassiveWorkCompletion {
         match self {
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).execute()),
             Self::SectorSize {
@@ -294,7 +296,14 @@ impl PassiveWork {
                 mut owned,
                 transfer,
             } => {
-                let result = file_object.mdl(owned.request(), transfer);
+                let result = file_object.mdl(owned.request(), transfer, retrying);
+                if result == Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT)) {
+                    return PassiveWorkCompletion::Retry(Self::Mdl {
+                        file_object,
+                        owned,
+                        transfer,
+                    });
+                }
                 PassiveWorkCompletion::Mdl { owned, result }
             }
             Self::Read {
@@ -312,7 +321,15 @@ impl PassiveWork {
                 offset,
                 length,
             } => {
-                let result = file_object.write(owned.request(), offset, length);
+                let result = file_object.write(owned.request(), offset, length, retrying);
+                if result == Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_CANT_WAIT)) {
+                    return PassiveWorkCompletion::Retry(Self::Write {
+                        file_object,
+                        owned,
+                        offset,
+                        length,
+                    });
+                }
                 PassiveWorkCompletion::Write { owned, result }
             }
             Self::Flush { stream } => PassiveWorkCompletion::Flush(stream.flush()),
@@ -424,6 +441,24 @@ pub(super) struct PassiveWorkEnvelope {
     lifetime: PassiveLifetime,
     /// The payload cannot be both a pending native call and a published completion.
     state: PassiveState,
+    /// Finite count of unsuccessful native admissions, separated from native effects.
+    retries: super::scheduler::NativeAdmissionBudget,
+}
+
+/// Native completion either returns resources or retains the exact admission for another attempt.
+#[cfg(not(test))]
+pub(super) enum PassiveReclaim {
+    /// Native work ended; finalization can recover its dormant storage.
+    Completed {
+        /// Original operation consuming the native result.
+        operation: Box<dyn CompletionOperation>,
+        /// Authoritative result, including transferred IRP ownership.
+        completion: PassiveWorkCompletion,
+        /// Terminal execution storage, absent for ordinary work.
+        reserve: Option<Box<PassiveWorkEnvelope>>,
+    },
+    /// No native effect occurred and callback storage remains prepared.
+    Deferred(Box<PassiveWorkEnvelope>),
 }
 
 /// Finalization keeps its lease while dormant; ordinary work releases it on reclamation.
@@ -488,6 +523,7 @@ impl PassiveWorkEnvelope {
             device,
             lifetime,
             state: PassiveState::Dormant,
+            retries: super::scheduler::NativeAdmissionBudget::new(),
         }) {
             Ok(envelope) => Ok(envelope),
             Err(failure) => {
@@ -543,10 +579,6 @@ impl PassiveWorkEnvelope {
     }
 
     /// Consumes ordinary work before submission; finalization reserves are non-cancellable.
-    #[expect(
-        clippy::boxed_local,
-        reason = "the consuming Box owns native callback storage and its one deallocation obligation"
-    )]
     pub(super) fn cancel_before_queue(
         mut envelope: Box<Self>,
     ) -> (PassiveWork, Box<dyn CompletionOperation>) {
@@ -597,24 +629,31 @@ impl PassiveWorkEnvelope {
         job.identity
     }
     /// Returns native completion ownership and restores finalization storage to its dormant reserve.
-    pub(super) fn reclaim(
-        mut envelope: Box<Self>,
-    ) -> (
-        Box<dyn CompletionOperation>,
-        PassiveWorkCompletion,
-        Option<Box<Self>>,
-    ) {
+    pub(super) fn reclaim(mut envelope: Box<Self>) -> PassiveReclaim {
         let PassiveState::Completed(job, completion) =
             core::mem::replace(&mut envelope.state, PassiveState::Dormant)
         else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let completion = if let PassiveWorkCompletion::Retry(work) = completion {
+            if envelope.retries.defer() {
+                envelope.state = PassiveState::Prepared(job, work);
+                return PassiveReclaim::Deferred(envelope);
+            }
+            work.failed(DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_TIMEOUT))
+        } else {
+            completion
         };
         let reserve = if matches!(envelope.lifetime, PassiveLifetime::Reserve(_)) {
             Some(envelope)
         } else {
             None
         };
-        (job.suspended, completion, reserve)
+        PassiveReclaim::Completed {
+            operation: job.suspended,
+            completion,
+            reserve,
+        }
     }
 }
 
@@ -671,7 +710,7 @@ unsafe extern "C" fn passive_work_item(device: wdk_sys::PDEVICE_OBJECT, context:
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
     let reactor = job.reactor;
-    envelope.state = PassiveState::Completed(job, work.execute());
+    envelope.state = PassiveState::Completed(job, work.execute(envelope.retries.retrying()));
     unsafe {
         // SAFETY: The completed envelope retains this destination until publication takes its
         // own lease, then transfers the unique unlinked node without borrowing its payload.
