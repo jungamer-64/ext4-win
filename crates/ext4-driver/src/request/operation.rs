@@ -4505,7 +4505,11 @@ impl MutationRequestOperation {
         self.restart_resolution(owned, None, None, access)
     }
 
-    /// Integrates one resolution event and emits only its matching next action.
+    /// Integrates one resolution event outside the event-dispatch frame.
+    ///
+    /// Keeping resolution scratch out of the trampoline also keeps it off commit/checkpoint
+    /// call paths, where the event and storage-phase frames already occupy the kernel stack.
+    #[inline(never)]
     fn advance_resolution(
         self: Box<Self>,
         owned: OwnedIrp,
