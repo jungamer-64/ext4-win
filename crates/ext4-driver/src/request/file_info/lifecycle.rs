@@ -234,9 +234,7 @@ fn begin_cleanup_file_object(
     let file_object = active.current_stack()?.file_object()?;
     let opened_file = OpenedFileObject::decode(file_object)?;
     match opened_file {
-        OpenedFileObject::Node(opened_file) => {
-            cleanup_opened_node(active, file_object, opened_file)
-        }
+        OpenedFileObject::Node(opened_file) => Ok(cleanup_opened_node(file_object, opened_file)),
         OpenedFileObject::Volume(opened_volume) => {
             cleanup_opened_volume(active.device(), file_object, opened_volume, operations)?;
             Ok(CleanupPlan::Complete)
@@ -245,34 +243,26 @@ fn begin_cleanup_file_object(
 }
 
 /// Releases cleanup-owned state for one namespace-node FILE_OBJECT.
-/// # Errors
-///
-/// Returns an error when the requestor process identity is unavailable.
 fn cleanup_opened_node(
-    active: &ActiveIrp<'_>,
     file_object: ActiveFileObject<'_>,
     opened_file: OpenedObject<'_>,
-) -> DriverResult<CleanupPlan> {
-    let requestor = active.requestor_process()?;
+) -> CleanupPlan {
     let cleanup_was_published = file_object.cleanup_complete();
     match (opened_file.begin_cleanup(), cleanup_was_published) {
         (CleanupStart::First, false) => {}
-        (CleanupStart::AlreadyComplete, true) => return Ok(CleanupPlan::Complete),
+        (CleanupStart::AlreadyComplete, true) => return CleanupPlan::Complete,
         (CleanupStart::First, true) | (CleanupStart::AlreadyComplete, false) => {
             crate::kernel::fatal::KernelWideInconsistency::file_object_lifecycle_corruption()
                 .bugcheck();
         }
     }
     cleanup_directory_notification(&opened_file);
-    opened_file
-        .file_control_block()
-        .release_handle_byte_range_locks(requestor, file_object.address());
     let cleanup = opened_file.release_share_access_for_cleanup();
     let fcb = opened_file.file_control_block_address();
     let node = opened_file.node();
     opened_file.finish_cleanup();
     file_object.mark_cleanup_complete();
-    Ok(match cleanup {
+    match cleanup {
         FileCleanupDisposition::Retained => CleanupPlan::Complete,
         FileCleanupDisposition::Delete(target) => CleanupPlan::Delete(PendingCleanupDeletion {
             fcb,
@@ -281,7 +271,7 @@ fn cleanup_opened_node(
             additional: DriverVec::new(),
             abort_on_drop: true,
         }),
-    })
+    }
 }
 
 /// Stages every claimed namespace removal atomically after its link handles have cleaned up.

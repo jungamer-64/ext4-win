@@ -120,7 +120,7 @@ pub(crate) enum PassiveWork {
         /// Exact stream allocation retained independently from its requesting handle.
         stream: crate::state::StreamVerityLease,
     },
-    /// Notify FsRtl of non-cancellable handle cleanup without asynchronous continuation allocation.
+    /// Release byte-range locks and notify FsRtl of cleanup outside the actor.
     CleanupOplock {
         /// Exact retained stream and create-time deletion semantics.
         check: super::CleanupOplock,

@@ -358,13 +358,6 @@ impl OplockStreamLease {
     }
 
     /// Returns the retained stream boundary containing the FsRtl oplock package.
-    #[cfg_attr(
-        test,
-        expect(
-            dead_code,
-            reason = "host tests cannot enter the native FsRtl consumer"
-        )
-    )]
     #[expect(
         unsafe_code,
         reason = "the deferred ledger lease retains the exact FCB behind this raw stable identity"

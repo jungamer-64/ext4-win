@@ -34,10 +34,18 @@ pub(super) struct CleanupOperation {
 
 /// Oplock release and grant exclusion retain distinct native and mutation responsibilities.
 struct PreparedCleanupOplock {
-    /// Exact native stream release to run outside the actor.
+    /// Native lock release retained through the cleanup IRP's worker ownership.
     check: crate::irp::CleanupOplock,
-    /// Prevents grant races until mandatory release or optional namespace deletion completes.
-    mutation: crate::state::OplockMutationLease,
+    /// Failure to reserve a grant barrier cannot suppress mandatory native releases.
+    exclusion: CleanupGrantExclusion,
+}
+
+/// Whether cleanup retained a grant barrier or must report its admission failure after release.
+enum CleanupGrantExclusion {
+    /// New grants remain excluded until cleanup or namespace deletion completes.
+    Reserved(crate::state::OplockMutationLease),
+    /// Mandatory releases proceed under a plain stream lease.
+    Rejected(DriverError),
 }
 
 impl CleanupOperation {
@@ -86,14 +94,25 @@ impl CleanupOperation {
             match crate::state::OpenedFileObject::decode(file_object)? {
                 crate::state::OpenedFileObject::Node(opened) => {
                     let deletion = opened.create_deletion();
-                    access
-                        .acquire_oplock_mutation(file_object)
-                        .map(|(mutation, stream)| {
-                            Some(PreparedCleanupOplock {
-                                check: crate::irp::CleanupOplock::new(stream, deletion),
-                                mutation,
-                            })
-                        })
+                    let requestor = active.requestor_process()?;
+                    let (stream, exclusion) = match access.acquire_oplock_mutation(file_object) {
+                        Ok((mutation, stream)) => {
+                            (stream, CleanupGrantExclusion::Reserved(mutation))
+                        }
+                        Err(error) => (
+                            access.acquire_oplock_stream_lease(file_object)?,
+                            CleanupGrantExclusion::Rejected(error),
+                        ),
+                    };
+                    Ok(Some(PreparedCleanupOplock {
+                        check: crate::irp::CleanupOplock::new(
+                            stream,
+                            deletion,
+                            file_object.address(),
+                            requestor,
+                        ),
+                        exclusion,
+                    }))
                 }
                 crate::state::OpenedFileObject::Volume(_) => Ok(None),
             }
@@ -205,7 +224,14 @@ impl MountedVolumeOperation for CleanupOperation {
                 }
                 match Self::prepare_oplock(&mut owned, access) {
                     Ok(Some(prepared)) => {
-                        self.mutation = Some(prepared.mutation);
+                        match prepared.exclusion {
+                            CleanupGrantExclusion::Reserved(mutation) => {
+                                self.mutation = Some(mutation)
+                            }
+                            CleanupGrantExclusion::Rejected(error) => {
+                                self.record_failure(Err(error))
+                            }
+                        }
                         let work = owned.request().with_active(|active| {
                             crate::irp::PassiveWork::cleanup_oplock(prepared.check, active)
                         });

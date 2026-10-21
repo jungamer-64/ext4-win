@@ -293,8 +293,6 @@ impl FileControlBlock {
         self.byte_range_locks
             .permits_write(requestor, file_object, start, length, key)
     }
-
-
 }
 
 /// Complete identity-bound Windows stream projection derived from one coherent core snapshot.

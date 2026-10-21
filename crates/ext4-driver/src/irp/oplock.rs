@@ -201,18 +201,32 @@ impl OplockCheck {
     }
 }
 
-/// Cleanup breaks its handle oplock without waiting for client acknowledgment or delegating IRP ownership.
+/// Cleanup releases handle byte locks and its oplock outside the actor, retaining IRP ownership.
 #[derive(Debug)]
 pub(crate) struct CleanupOplock {
     /// The native call retains the stream while the terminal IRP retains the FILE_OBJECT.
     stream: OplockStreamLease,
     /// Create-time deletion is independent of later disposition changes.
     deletion: CreateDeletion,
+    /// Exact handle identity retained by the suspended cleanup IRP.
+    file: crate::state::KernelFileObject,
+    /// Original requestor identity used by FsRtl byte-range locks.
+    requestor: super::RequestorProcess,
 }
 impl CleanupOplock {
     /// Captures the exact cleanup release authority before native worker transfer.
-    pub(crate) const fn new(stream: OplockStreamLease, deletion: CreateDeletion) -> Self {
-        Self { stream, deletion }
+    pub(crate) const fn new(
+        stream: OplockStreamLease,
+        deletion: CreateDeletion,
+        file: crate::state::KernelFileObject,
+        requestor: super::RequestorProcess,
+    ) -> Self {
+        Self {
+            stream,
+            deletion,
+            file,
+            requestor,
+        }
     }
     /// Native cleanup requires no acknowledgment and preserves driver completion ownership.
     /// # Errors
@@ -225,6 +239,10 @@ impl CleanupOplock {
         )
     )]
     pub(super) fn execute(self, irp: NonNull<wdk_sys::IRP>) -> Result<(), DriverError> {
+        let unlocked = self
+            .stream
+            .stream_context()
+            .unlock_all(self.file.as_non_null(), self.requestor.as_non_null());
         let flags = cleanup_oplock_flags(self.deletion);
         #[cfg(not(test))]
         let status = unsafe {
@@ -241,7 +259,7 @@ impl CleanupOplock {
         } else if status < wdk_sys::STATUS_SUCCESS {
             Err(DriverError::OplockFailure(status))
         } else {
-            Ok(())
+            unlocked
         }
     }
 }
