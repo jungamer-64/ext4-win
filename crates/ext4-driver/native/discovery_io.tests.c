@@ -9,6 +9,8 @@
 #define _In_reads_bytes_opt_(length)
 #define _Outptr_result_nullonfailure_
 #define _Success_(condition)
+#define _Use_decl_annotations_
+#define NT_ASSERT_ASSUME(condition) assert(condition)
 #define NULL ((void *)0)
 #define TRUE 1
 #define FALSE 0
@@ -59,7 +61,8 @@ typedef struct {
     } Parameters;
 } IO_STACK_LOCATION, *PIO_STACK_LOCATION;
 typedef struct _IRP IRP, *PIRP;
-typedef NTSTATUS (*COMPLETION)(PDEVICE_OBJECT, PIRP, PVOID);
+typedef NTSTATUS IO_COMPLETION_ROUTINE(PDEVICE_OBJECT, PIRP, PVOID);
+typedef IO_COMPLETION_ROUTINE *PIO_COMPLETION_ROUTINE;
 struct _IRP {
     PMDL MdlAddress;
     UCHAR RequestorMode;
@@ -68,7 +71,7 @@ struct _IRP {
     PVOID UserBuffer;
     IO_STATUS_BLOCK IoStatus;
     IO_STACK_LOCATION Stack;
-    COMPLETION Completion;
+    PIO_COMPLETION_ROUTINE Completion;
     PVOID Context;
 };
 
@@ -98,7 +101,7 @@ static VOID IoFreeMdl(PMDL mdl) { ExFreePoolWithTag(mdl, 0); }
 static VOID MmUnlockPages(PMDL mdl) { mdl->MdlFlags &= ~MDL_PAGES_LOCKED; }
 static VOID MmBuildMdlForNonPagedPool(PMDL mdl) { assert(mdl->MdlFlags == 0); }
 static PIO_STACK_LOCATION IoGetNextIrpStackLocation(PIRP irp) { return &irp->Stack; }
-static NTSTATUS IoSetCompletionRoutineEx(PDEVICE_OBJECT owner, PIRP irp, COMPLETION completion,
+static NTSTATUS IoSetCompletionRoutineEx(PDEVICE_OBJECT owner, PIRP irp, PIO_COMPLETION_ROUTINE completion,
     PVOID context, BOOLEAN success, BOOLEAN error, BOOLEAN cancel);
 static NTSTATUS IoCallDriver(PDEVICE_OBJECT device, PIRP irp);
 static BOOLEAN IoCancelIrp(PIRP irp);
@@ -169,7 +172,7 @@ static PMDL IoAllocateMdl(PVOID buffer, ULONG size, BOOLEAN secondary, BOOLEAN c
     if (mdl != NULL) { mdl->Buffer = buffer; irp->MdlAddress = mdl; }
     return mdl;
 }
-static NTSTATUS IoSetCompletionRoutineEx(PDEVICE_OBJECT device, PIRP irp, COMPLETION completion,
+static NTSTATUS IoSetCompletionRoutineEx(PDEVICE_OBJECT device, PIRP irp, PIO_COMPLETION_ROUTINE completion,
     PVOID context, BOOLEAN success, BOOLEAN error, BOOLEAN cancel) {
     assert(device == &owner && success && error && cancel);
     if (fail_registration) { return STATUS_INSUFFICIENT_RESOURCES; }

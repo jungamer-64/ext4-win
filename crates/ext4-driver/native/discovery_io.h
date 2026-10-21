@@ -78,11 +78,16 @@ static VOID ext4win_discovery_cancel_request(EXT4WIN_DISCOVERY_REQUEST *request)
     }
 }
 
+static IO_COMPLETION_ROUTINE ext4win_discovery_complete;
+
+_Use_decl_annotations_
 static NTSTATUS NTAPI ext4win_discovery_complete(
     PDEVICE_OBJECT device, PIRP irp, PVOID context)
 {
     EXT4WIN_DISCOVERY_REQUEST *request = context;
     (VOID)device;
+    /* Registration always supplies its retained request as the callback context. */
+    NT_ASSERT_ASSUME(request != NULL);
     request->Result = irp->IoStatus;
     InterlockedExchange(&request->State, EXT4WIN_DISCOVERY_COMPLETED);
     KeSetEvent(&request->Completed, IO_NO_INCREMENT, FALSE);
@@ -149,7 +154,7 @@ BOOLEAN NTAPI ext4win_discovery_channel_destroy(EXT4WIN_DISCOVERY_CHANNEL *chann
     return TRUE;
 }
 
-_Success_(return == STATUS_SUCCESS)
+_Success_(NT_SUCCESS(return))
 static NTSTATUS ext4win_discovery_prepare(
     _In_ PDEVICE_OBJECT device, UCHAR major, ULONG code,
     _In_reads_bytes_opt_(input_length) const VOID *input,
