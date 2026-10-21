@@ -108,13 +108,11 @@ static BOOLEAN ext4win_section_acquire_paging(const VOID *state, PERESOURCE reso
     BOOLEAN exclusive, BOOLEAN wait)
 {
     (void)state;
-    assert(!exclusive);
-    if (resource == &stream.PagingIoResource) {
-        assert(!wait);
-        if (!paging_available || resource->held != 0) { return FALSE; }
-    } else {
-        assert(resource == &stream.MainResource && wait && resource->held == 0);
+    assert(!exclusive && resource == &stream.PagingIoResource);
+    if (!wait && (!paging_available || resource->held != 0)) {
+        return FALSE;
     }
+    assert(resource->held == 0);
     resource->held++;
     return TRUE;
 }
@@ -198,12 +196,17 @@ static void exercise_callbacks(BOOLEAN supply_context)
     assert(paging_resource == NULL && stream.PagingIoResource.held == 1);
     stream.PagingIoResource.held = 0;
 
+    /* Preparation may retain MainResource while Cc reenters flush. All writeback
+     * must participate in the independent paging drain without reacquiring main. */
+    stream.MainResource.held = 1;
     invoke(registered.PreAcquireForCcFlush, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
-    assert(stream.MainResource.held == 1);
+    assert(stream.PagingIoResource.held == 1 && stream.MainResource.held == 1);
     invoke(registered.PreReleaseForCcFlush, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
-    assert(stream.MainResource.held == 0);
+    assert(stream.PagingIoResource.held == 0);
+    assert(stream.MainResource.held == 1);
+    stream.MainResource.held = 0;
 
     data.FileObject = NULL;
     invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context, STATUS_SUCCESS);

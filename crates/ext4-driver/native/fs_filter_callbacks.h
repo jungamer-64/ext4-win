@@ -103,7 +103,9 @@ ext4win_pre_acquire_cc_flush(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID
     if (!ext4win_stream_fast_io_stream(file_object, &stream)) {
         return STATUS_INVALID_PARAMETER;
     }
-    (VOID)ext4win_section_acquire_paging(stream->SectionState, &stream->MainResource, FALSE, TRUE);
+    /* Flush and modified-page writeback share the paging drain. MainResource belongs
+     * to section creation and ordinary transfers, so paging never inverts main->paging. */
+    (VOID)ext4win_section_acquire_paging(stream->SectionState, &stream->PagingIoResource, FALSE, TRUE);
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
@@ -121,7 +123,7 @@ ext4win_pre_release_cc_flush(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID
         ((stream = ext4win_stream_from_header(file_object->FsContext)) == NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ext4win_release_resource(&stream->MainResource);
+    ext4win_release_resource(&stream->PagingIoResource);
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 

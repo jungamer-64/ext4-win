@@ -1,10 +1,10 @@
 //! Stream mutation ownership and callback admission. C only borrows the native resources.
 //!
-//! Preparation permits paging needed by Cc/MM. Sealing follows paging-resource drainage and
+//! Preparation permits paging needed by Cc/MM. Sealing drains both main and paging resources and
 //! excludes further paging until the unique permit is released. Kernel section exclusion only
 //! acquires its resource and remains available for Cc reentry; it grants no paging or creation
-//! authority. State publication and wakeup
-//! share one transition lock, so an earlier release cannot signal a successor preparation.
+//! authority. Each admission class has a level-triggered notification projected under the phase
+//! transition lock. Preparing closes ordinary admission while keeping paging signaled.
 
 use super::status::{DriverError, DriverResult};
 use crate::memory::{DriverShared, DriverSharedLease};
@@ -30,15 +30,13 @@ pub(super) struct SectionSynchronization {
     /// Serializes state publication with resetting and signaling the notification.
     #[cfg(not(test))]
     lock: UnsafeCell<wdk_sys::KSPIN_LOCK>,
-    /// Address-stable kernel notification retained through every waiter.
-    #[cfg(not(test))]
-    released: UnsafeCell<wdk_sys::KEVENT>,
+    /// Signaled exactly while ordinary acquisitions are admitted.
+    ordinary: AdmissionNotification,
+    /// Signaled while paging is admitted, including successor preparations.
+    paging: AdmissionNotification,
     /// Host counterpart of the transition lock.
     #[cfg(test)]
     lock: std::sync::Mutex<()>,
-    /// Host waiters recheck the authoritative phase under the transition lock.
-    #[cfg(test)]
-    released: std::sync::Condvar,
 }
 
 impl core::fmt::Debug for SectionSynchronization {
@@ -58,28 +56,13 @@ impl SectionSynchronization {
             phase: AtomicU8::new(0),
             #[cfg(not(test))]
             lock: UnsafeCell::new(0),
-            #[cfg(not(test))]
-            released: UnsafeCell::new(wdk_sys::KEVENT::default()),
+            ordinary: AdmissionNotification::new(),
+            paging: AdmissionNotification::new(),
             #[cfg(test)]
             lock: std::sync::Mutex::new(()),
-            #[cfg(test)]
-            released: std::sync::Condvar::new(),
         })?;
-        #[cfg(not(test))]
-        {
-            #[expect(
-                unsafe_code,
-                reason = "the unpublished shared allocation has its final address before event initialization"
-            )]
-            unsafe {
-                // SAFETY: No observer exists yet and the owner retains the event's stable storage.
-                super::ffi::KeInitializeEvent(
-                    owner.get().released.get(),
-                    wdk_sys::_EVENT_TYPE::NotificationEvent,
-                    1,
-                );
-            }
-        }
+        owner.get().ordinary.initialize();
+        owner.get().paging.initialize();
         Ok(owner)
     }
 
@@ -121,23 +104,12 @@ impl SectionSynchronization {
     }
 
     /// Begins only after the previous owner published Idle and signaled its notification.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "notification reset precedes preparing publication under the transition lock"
-        )
-    )]
     fn try_begin(&self) -> bool {
         self.transition(|| {
             if self.phase() != SectionPhase::Idle {
                 return false;
             }
-            #[cfg(not(test))]
-            unsafe {
-                // SAFETY: Transition ownership serializes reset with every release/signal.
-                wdk_sys::ntddk::KeClearEvent(self.released.get());
-            }
+            self.ordinary.publish(false);
             self.phase.store(1, Ordering::Release);
             true
         })
@@ -157,59 +129,21 @@ impl SectionSynchronization {
     }
 
     /// Releases the unique owner before waking waiters or admitting a successor.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "Idle publication precedes notification under the same transition lock"
-        )
-    )]
     fn release(&self) {
         self.transition(|| {
             self.phase.store(0, Ordering::Release);
-            #[cfg(not(test))]
-            unsafe {
-                // SAFETY: This lock serializes signaling with successor admission/reset.
-                super::ffi::KeSetEvent(self.released.get(), 0, 0);
-            }
-            #[cfg(test)]
-            self.released.notify_all();
+            self.ordinary.publish(true);
+            self.paging.publish(true);
         });
     }
 
     /// Waits for admission; a native callback may hold no filesystem resource during this wait.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "the nonalertable wait retains shared event storage through completion"
-        )
-    )]
     fn wait(&self, admission: SectionAdmission) {
-        #[cfg(not(test))]
         while !admission.accepts(self.phase()) {
-            unsafe {
-                // SAFETY: The caller retains the shared state; this indefinite KernelMode wait
-                // finishes before its borrowed event storage or callback owner can retire.
-                let _wait_status = super::ffi::KeWaitForSingleObject(
-                    self.released.get().cast(),
-                    wdk_sys::_KWAIT_REASON::Executive,
-                    0,
-                    0,
-                    core::ptr::null_mut(),
-                );
-            }
-        }
-        #[cfg(test)]
-        {
-            let mut guard = self.lock.lock().unwrap_or_else(|_| {
-                super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption()
-                    .bugcheck()
-            });
-            while !admission.accepts(self.phase()) {
-                guard = self.released.wait(guard).unwrap_or_else(|_| {
-                    super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
-                });
+            match admission {
+                SectionAdmission::Ordinary => self.ordinary.wait(),
+                SectionAdmission::Paging => self.paging.wait(),
+                SectionAdmission::ResourceOnly => return,
             }
         }
     }
@@ -218,6 +152,123 @@ impl SectionSynchronization {
     pub(super) fn idle(&self) -> bool {
         self.phase() == SectionPhase::Idle
     }
+}
+
+/// Manual-reset notification; host tests exercise the same set/reset/wait protocol as the kernel.
+struct AdmissionNotification {
+    /// Initialized only after the retaining shared allocation reaches its final address.
+    #[cfg(not(test))]
+    event: UnsafeCell<wdk_sys::KEVENT>,
+    /// Host event state, independent of the admission predicate just as a native event is.
+    #[cfg(test)]
+    signaled: std::sync::Mutex<bool>,
+    /// Host event notification, retained with its state through every waiter.
+    #[cfg(test)]
+    changed: std::sync::Condvar,
+}
+
+impl AdmissionNotification {
+    /// Constructs unpublished storage without exposing an uninitialized native event.
+    fn new() -> Self {
+        Self {
+            #[cfg(not(test))]
+            event: UnsafeCell::new(wdk_sys::KEVENT::default()),
+            #[cfg(test)]
+            signaled: std::sync::Mutex::new(true),
+            #[cfg(test)]
+            changed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Initializes the final-address event before the stream or mutation owner is published.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "unpublished shared storage retains the final event address"
+        )
+    )]
+    fn initialize(&self) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The constructor owns final-address storage with no callbacks or waiters.
+            super::ffi::KeInitializeEvent(
+                self.event.get(),
+                wdk_sys::_EVENT_TYPE::NotificationEvent,
+                1,
+            );
+        }
+    }
+
+    /// Projects one admission predicate while its phase transition lock is held.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the retaining owner serializes event projection with phase transitions"
+        )
+    )]
+    fn publish(&self, signaled: bool) {
+        #[cfg(not(test))]
+        if signaled {
+            unsafe {
+                // SAFETY: The shared owner retains this initialized event under its transition lock.
+                super::ffi::KeSetEvent(self.event.get(), 0, 0);
+            }
+        } else {
+            unsafe {
+                // SAFETY: The same transition lock serializes reset against notification publication.
+                wdk_sys::ntddk::KeClearEvent(self.event.get());
+            }
+        }
+        #[cfg(test)]
+        {
+            let mut state = self.signaled.lock().unwrap_or_else(|_| corruption());
+            *state = signaled;
+            if signaled {
+                self.changed.notify_all();
+            }
+        }
+    }
+
+    /// Waits on event state even when the caller's predicate observation preceded a transition.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the callback retains the initialized notification through its nonalertable wait"
+        )
+    )]
+    fn wait(&self) {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The shared owner retains nonpaged event storage until this waiter returns.
+                super::ffi::KeWaitForSingleObject(
+                    self.event.get().cast(),
+                    wdk_sys::_KWAIT_REASON::Executive,
+                    0,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+            if status != wdk_sys::STATUS_SUCCESS {
+                corruption();
+            }
+        }
+        #[cfg(test)]
+        {
+            let mut state = self.signaled.lock().unwrap_or_else(|_| corruption());
+            while !*state {
+                state = self.changed.wait(state).unwrap_or_else(|_| corruption());
+            }
+        }
+    }
+}
+
+/// Terminates on corruption of native stream ownership or synchronization state.
+fn corruption() -> ! {
+    super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
 }
 
 #[cfg(not(test))]
@@ -284,17 +335,22 @@ pub(super) struct SectionPreparation {
     ownership: MutationOwnership,
 }
 impl SectionPreparation {
-    /// Seals admission only while the caller has drained paging-resource owners.
+    /// Seals admission while the native caller retains both main and paging exclusion.
     /// # Errors
     /// Returns an invariant violation if this unique preparation lost its phase.
     pub(super) fn seal(self) -> DriverResult<SealedSectionMutation> {
         let sealed = self.ownership.state.get().transition(|| {
-            self.ownership
+            let sealed = self
+                .ownership
                 .state
                 .get()
                 .phase
                 .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
+                .is_ok();
+            if sealed {
+                self.ownership.state.get().paging.publish(false);
+            }
+            sealed
         });
         if !sealed {
             return Err(DriverError::InternalInvariantViolation);
@@ -638,6 +694,54 @@ unsafe extern "system" fn ext4win_section_acquire_paging(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns allocation, channel or worker failures while retaining every waiter until joined.
+    /// # Panics
+    /// Fails if a successor preparation loses paging readiness or admits an ordinary waiter.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture failures propagate while assertions check both admission notifications"
+    )]
+    fn successor_preparation_preserves_paging_notification() -> DriverResult<()> {
+        let owner = SectionSynchronization::try_new()?;
+        let sealed = SectionSynchronization::begin(&owner)?.seal()?;
+        // Both callbacks observed rejection before the previous owner releases. They may reach
+        // the event wait only after a successor has reset its ordinary notification.
+        assert!(!SectionAdmission::Paging.accepts(owner.get().phase()));
+        assert!(!SectionAdmission::Ordinary.accepts(owner.get().phase()));
+        let paging = owner.try_acquire()?;
+        let ordinary = owner.try_acquire()?;
+        drop(sealed);
+        let successor = SectionSynchronization::begin(&owner)?;
+        std::thread::scope(|scope| {
+            let (paging_done, paging_result) = std::sync::mpsc::channel();
+            let (ordinary_done, ordinary_result) = std::sync::mpsc::channel();
+            let paging_worker = scope.spawn(move || {
+                paging.get().paging.wait();
+                paging_done.send(())
+            });
+            let ordinary_worker = scope.spawn(move || {
+                ordinary.get().ordinary.wait();
+                ordinary_done.send(())
+            });
+            let paging_resumed = paging_result.recv_timeout(core::time::Duration::from_secs(2));
+            let ordinary_blocked = ordinary_result.try_recv();
+            // Even on assertion failure, release and join before reporting it.
+            drop(successor);
+            for worker in [paging_worker, ordinary_worker] {
+                worker
+                    .join()
+                    .map_err(|_| DriverError::InternalInvariantViolation)?
+                    .map_err(|_| DriverError::InternalInvariantViolation)?;
+            }
+            assert_eq!(paging_resumed, Ok(()));
+            assert_eq!(ordinary_blocked, Err(std::sync::mpsc::TryRecvError::Empty));
+            assert_eq!(ordinary_result.recv(), Ok(()));
+            Ok(())
+        })
+    }
 
     /// # Errors
     /// Returns allocation, channel or waiter failure.

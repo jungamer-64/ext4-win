@@ -1666,9 +1666,13 @@ impl StreamContext {
                         cache_status(status)?;
                     }
                 }
+                let paging = self.paging_resource()?.exclusive();
+                let sealed = preparation.seal();
+                // Publish exclusion before releasing either resource. Every Cc flush and
+                // modified-page writer has drained through PagingIoResource at this point.
+                drop(paging);
                 drop(main);
-                let _paging = self.paging_resource()?.exclusive();
-                preparation.seal()
+                sealed
             }
             #[cfg(test)]
             {
