@@ -293,7 +293,7 @@ _Must_inspect_result_
 NTSTATUS
 NTAPI
 ext4win_capture_io_manager_security_descriptor(
-    _In_reads_bytes_(maximum_length) PSECURITY_DESCRIPTOR source,
+    _In_ PSECURITY_DESCRIPTOR source,
     _In_ SECURITY_INFORMATION required_information,
     _In_ ULONG maximum_length,
     _Outptr_result_bytebuffer_(*length_out) PVOID *snapshot_out,
@@ -306,7 +306,6 @@ ext4win_capture_io_manager_security_descriptor(
         DACL_SECURITY_INFORMATION;
     PVOID snapshot;
     ULONG candidate_length;
-    ULONG snapshot_length;
     NTSTATUS status;
 
     if (snapshot_out != NULL) {
@@ -381,22 +380,10 @@ ext4win_capture_io_manager_security_descriptor(
         return STATUS_INVALID_SECURITY_DESCR;
     }
 
-    snapshot_length = RtlLengthSecurityDescriptor(
-        (PSECURITY_DESCRIPTOR)snapshot);
-    if ((snapshot_length < header_length) ||
-        (snapshot_length > candidate_length)) {
-        RtlSecureZeroMemory(snapshot, candidate_length);
-        ExFreePoolWithTag(snapshot, EXT4WIN_DESCRIPTOR_POOL_TAG);
-        return STATUS_INVALID_SECURITY_DESCR;
-    }
-    if (snapshot_length < candidate_length) {
-        RtlSecureZeroMemory(
-            (PUCHAR)snapshot + snapshot_length,
-            candidate_length - snapshot_length);
-    }
-
+    /* Relative offsets retain gaps after unselected components are cleared. The validated
+     * endpoint bound must include those gaps; summing component sizes can truncate live data. */
     *snapshot_out = snapshot;
-    *length_out = snapshot_length;
+    *length_out = candidate_length;
     return STATUS_SUCCESS;
 }
 

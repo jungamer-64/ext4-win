@@ -594,7 +594,7 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         })
     }
 
-    /// Returns the requestor filename descriptor for queue-time directory capture.
+    /// Returns the I/O Manager-captured filename descriptor for a queue-time owned copy.
     /// # Errors
     ///
     /// Returns an error when the current stack location cannot be decoded.
@@ -709,7 +709,7 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         })
     }
 
-    /// Returns the requestor EA-name list for queue-time capture.
+    /// Returns the I/O Manager-captured EA-name list for a queue-time owned copy.
     /// # Errors
     ///
     /// Returns an error when the list length is invalid or a non-empty list has no address.

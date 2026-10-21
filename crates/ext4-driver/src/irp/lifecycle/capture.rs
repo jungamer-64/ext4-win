@@ -23,7 +23,7 @@ use super::{
     QueryEaStack, ReadStack, WriteStack,
 };
 
-/// Maximum self-relative security descriptor accepted from one untrusted requestor.
+/// Maximum owned snapshot of an I/O Manager-captured self-relative descriptor.
 #[cfg(not(test))]
 const SET_SECURITY_DESCRIPTOR_MAXIMUM: wdk_sys::ULONG = 128 * 1024;
 
@@ -398,9 +398,9 @@ impl PreparedQueryEa {
     }
 }
 
-/// Requestor auxiliary bytes copied into nonpaged native memory.
+/// I/O Manager auxiliary input copied into owned nonpaged native memory.
 #[derive(Debug)]
-struct CapturedRequestorInput {
+struct CapturedAuxiliaryInput {
     /// First byte of the native allocation.
     address: NonNull<u8>,
     /// Exact copied byte count.
@@ -413,9 +413,9 @@ struct CapturedRequestorInput {
 )]
 // SAFETY: The immutable nonpaged allocation is uniquely owned and crosses threads only inside the
 // typed device-mailbox payload whose publication requires `Send`.
-unsafe impl Send for CapturedRequestorInput {}
+unsafe impl Send for CapturedAuxiliaryInput {}
 
-impl CapturedRequestorInput {
+impl CapturedAuxiliaryInput {
     /// Captures a bounded EA name list before an IRP is queued.
     /// # Errors
     ///
@@ -428,7 +428,6 @@ impl CapturedRequestorInput {
         )
     )]
     fn capture_ea_name_list(
-        target: &ActiveIrp<'_>,
         source: NonNull<c_void>,
         length: super::IrpBufferLength,
     ) -> Result<Self, IrpCompletion> {
@@ -436,15 +435,14 @@ impl CapturedRequestorInput {
         {
             let length = wdk_sys::ULONG::try_from(length.as_usize())
                 .map_err(|_| IrpCompletion::from_error(DriverError::InvalidParameter))?;
-            let requestor_mode = target.requestor_mode();
             let mut snapshot = core::ptr::null_mut();
             let mut captured_length = 0;
             let status = unsafe {
-                // SAFETY: The native boundary probes/copies only the bounded requestor range.
-                ffi::ext4win_capture_ea_name_list(
+                // SAFETY: The active IRP retains this I/O Manager-captured list. The native
+                // boundary copies its bounded range into an independently owned allocation.
+                ffi::ext4win_capture_io_manager_ea_name_list(
                     source.as_ptr(),
                     length,
-                    requestor_mode,
                     core::ptr::addr_of_mut!(snapshot),
                     core::ptr::addr_of_mut!(captured_length),
                 )
@@ -454,7 +452,7 @@ impl CapturedRequestorInput {
                 if !snapshot.is_null() {
                     unsafe {
                         // SAFETY: Native capture transferred this allocation to the constructor.
-                        ffi::ext4win_release_captured_requestor_input(snapshot);
+                        ffi::ext4win_release_captured_auxiliary_input(snapshot);
                     }
                 }
                 return Err(IrpCompletion::from_error(
@@ -474,7 +472,7 @@ impl CapturedRequestorInput {
                 unsafe {
                     // SAFETY: Native capture returned a null-length violation with ownership
                     // transferred to this failed constructor.
-                    ffi::ext4win_release_captured_requestor_input(address.as_ptr().cast());
+                    ffi::ext4win_release_captured_auxiliary_input(address.as_ptr().cast());
                 }
                 return Err(IrpCompletion::from_error(
                     DriverError::InternalInvariantViolation,
@@ -484,7 +482,6 @@ impl CapturedRequestorInput {
         }
         #[cfg(test)]
         {
-            let _: &ActiveIrp<'_> = target;
             let _: NonNull<c_void> = source;
             let _: super::IrpBufferLength = length;
             Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
@@ -503,12 +500,10 @@ impl CapturedRequestorInput {
         )
     )]
     fn capture_directory_pattern(
-        target: &ActiveIrp<'_>,
         source: NonNull<wdk_sys::UNICODE_STRING>,
     ) -> Result<Option<Self>, IrpCompletion> {
         #[cfg(not(test))]
         {
-            let _: &ActiveIrp<'_> = target;
             let mut snapshot = core::ptr::null_mut();
             let mut captured_length = 0;
             let status = unsafe {
@@ -526,7 +521,7 @@ impl CapturedRequestorInput {
                     unsafe {
                         // SAFETY: Native capture transferred this unexpected allocation to the
                         // constructor, which releases it before reporting the invariant failure.
-                        ffi::ext4win_release_captured_requestor_input(snapshot);
+                        ffi::ext4win_release_captured_auxiliary_input(snapshot);
                     }
                     return Err(IrpCompletion::from_error(
                         DriverError::InternalInvariantViolation,
@@ -546,7 +541,7 @@ impl CapturedRequestorInput {
             else {
                 unsafe {
                     // SAFETY: Native capture transferred this allocation to the constructor.
-                    ffi::ext4win_release_captured_requestor_input(address.as_ptr().cast());
+                    ffi::ext4win_release_captured_auxiliary_input(address.as_ptr().cast());
                 }
                 return Err(IrpCompletion::from_error(
                     DriverError::InternalInvariantViolation,
@@ -556,7 +551,6 @@ impl CapturedRequestorInput {
         }
         #[cfg(test)]
         {
-            let _: &ActiveIrp<'_> = target;
             let _: NonNull<wdk_sys::UNICODE_STRING> = source;
             Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))
         }
@@ -575,7 +569,7 @@ impl CapturedRequestorInput {
     }
 }
 
-impl Drop for CapturedRequestorInput {
+impl Drop for CapturedAuxiliaryInput {
     #[cfg_attr(
         not(test),
         expect(
@@ -587,7 +581,7 @@ impl Drop for CapturedRequestorInput {
         #[cfg(not(test))]
         unsafe {
             // SAFETY: This value uniquely owns the native snapshot allocation.
-            ffi::ext4win_release_captured_requestor_input(self.address.as_ptr().cast());
+            ffi::ext4win_release_captured_auxiliary_input(self.address.as_ptr().cast());
         }
     }
 }
@@ -1173,7 +1167,7 @@ impl PreparedRequest {
                 match stack.directory_control_minor() {
                     DirectoryControlMinorFunction::QueryDirectory => {
                         let query = stack.query_directory().map_err(IrpCompletion::from_error)?;
-                        let pattern = capture_directory_pattern(target, stack)?;
+                        let pattern = capture_directory_pattern(stack)?;
                         Self::DirectoryControl(PreparedDirectoryControl::QueryDirectory(
                             PreparedQueryDirectory {
                                 stack: query,
@@ -1244,7 +1238,7 @@ impl PreparedRequest {
             DispatchMajor::FlushBuffers => Ok((Self::FlushBuffers, generic_key())),
             DispatchMajor::QueryEa => {
                 let query = stack.query_ea().map_err(IrpCompletion::from_error)?;
-                let selection = capture_ea_selection(target, stack)?;
+                let selection = capture_ea_selection(stack)?;
                 Ok((
                     Self::QueryEa(PreparedQueryEa {
                         stack: query,
@@ -1278,7 +1272,6 @@ impl PreparedRequest {
             DispatchMajor::SetSecurity => {
                 let set = stack.set_security().map_err(IrpCompletion::from_error)?;
                 let descriptor = CapturedSetSecurityDescriptor::capture(
-                    target,
                     set.security_descriptor_source(),
                     set.selection(),
                 )?;
@@ -1312,7 +1305,6 @@ impl PreparedRequest {
 ///
 /// Returns a completion when the descriptor cannot be captured or its payload is malformed.
 fn capture_directory_pattern(
-    target: &ActiveIrp<'_>,
     stack: super::CurrentIrpStackLocation<'_>,
 ) -> Result<PreparedDirectoryPattern, IrpCompletion> {
     let Some(source) = stack
@@ -1321,7 +1313,7 @@ fn capture_directory_pattern(
     else {
         return Ok(PreparedDirectoryPattern::All);
     };
-    let Some(captured) = CapturedRequestorInput::capture_directory_pattern(target, source)? else {
+    let Some(captured) = CapturedAuxiliaryInput::capture_directory_pattern(source)? else {
         return Ok(PreparedDirectoryPattern::All);
     };
     decode_directory_pattern(captured.as_slice())
@@ -1345,20 +1337,19 @@ fn decode_directory_pattern(bytes: &[u8]) -> Result<PreparedDirectoryPattern, Ir
     Ok(PreparedDirectoryPattern::Name(units))
 }
 
-/// Captures the requestor-owned QueryEa name list or seals its scalar selection.
+/// Copies the I/O Manager-captured QueryEa name list or seals its scalar selection.
 /// # Errors
 ///
 /// Returns a completion when the name list cannot be captured or an owned copy cannot be
 /// allocated.
 fn capture_ea_selection(
-    target: &ActiveIrp<'_>,
     stack: super::CurrentIrpStackLocation<'_>,
 ) -> Result<PreparedEaSelection, IrpCompletion> {
     if let Some((source, length)) = stack
         .query_ea_name_list()
         .map_err(IrpCompletion::from_error)?
     {
-        let captured = CapturedRequestorInput::capture_ea_name_list(target, source, length)?;
+        let captured = CapturedAuxiliaryInput::capture_ea_name_list(source, length)?;
         let mut bytes = DriverVec::try_with_capacity(captured.as_slice().len())
             .map_err(IrpCompletion::from_error)?;
         bytes
@@ -1622,7 +1613,7 @@ impl Drop for CapturedRequestorOutput {
 pub(crate) struct CapturedSetSecurityDescriptor {
     /// First byte of the native nonpaged allocation.
     address: NonNull<u8>,
-    /// Exact logical descriptor length validated by the native boundary.
+    /// Validated byte bound containing all selected relative components.
     length: NonZeroUsize,
 }
 
@@ -1635,7 +1626,7 @@ pub(crate) struct CapturedSetSecurityDescriptor {
 unsafe impl Send for CapturedSetSecurityDescriptor {}
 
 impl CapturedSetSecurityDescriptor {
-    /// Captures, validates, and owns one requestor descriptor in a single native operation.
+    /// Copies and validates one I/O Manager-captured descriptor into owned native memory.
     /// # Errors
     ///
     /// Returns a native boundary failure or an invariant error when successful output ownership is
@@ -1648,7 +1639,6 @@ impl CapturedSetSecurityDescriptor {
         )
     )]
     fn capture(
-        target: &ActiveIrp<'_>,
         source: NonNull<c_void>,
         selection: SecuritySelection,
     ) -> Result<Self, IrpCompletion> {
@@ -1657,11 +1647,10 @@ impl CapturedSetSecurityDescriptor {
             let mut snapshot = core::ptr::null_mut();
             let mut captured_length = 0;
             let status = unsafe {
-                // SAFETY: The native boundary performs only bounded requestor reads, copies into a
-                // naturally aligned owned allocation, then validates that immutable snapshot.
-                ffi::ext4win_capture_set_security_descriptor(
+                // SAFETY: The active IRP retains the I/O Manager-captured descriptor. The native
+                // boundary copies bounded input into aligned owned memory, then validates it.
+                ffi::ext4win_capture_io_manager_security_descriptor(
                     source.as_ptr().cast(),
-                    target.requestor_mode(),
                     selection.required_information(),
                     SET_SECURITY_DESCRIPTOR_MAXIMUM,
                     core::ptr::addr_of_mut!(snapshot),
@@ -1691,7 +1680,6 @@ impl CapturedSetSecurityDescriptor {
         }
         #[cfg(test)]
         {
-            let _: &ActiveIrp<'_> = target;
             let _: NonNull<c_void> = source;
             let _: SecuritySelection = selection;
             Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest))

@@ -169,7 +169,7 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Executes native APC and filesystem callback oracles without WDK imports.
+/// Executes native input, APC, and filesystem callback oracles without WDK imports.
 /// # Errors
 /// Returns compiler, execution or mandatory generated-directory cleanup failures.
 #[cfg(windows)]
@@ -184,6 +184,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "requestor-subject",
             "requestor_subject.tests.c",
             "native requestor token retention and cancellation contract",
+        ),
+        (
+            "io-manager-input",
+            "io_manager_input.tests.c",
+            "native captured-input bounds, descriptor validity, and SEH ownership contract",
         ),
         (
             "executive-resource",
