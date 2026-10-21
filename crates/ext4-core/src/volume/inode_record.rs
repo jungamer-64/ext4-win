@@ -1110,7 +1110,6 @@ mod tests {
     }
 
     use super::*;
-    use crate::NodeReparsePoint;
     use crate::disk_format::inode::{Ext4Gid, Ext4Uid};
 
     /// Builds an empty raw inode record for typestate tests.
@@ -1361,30 +1360,18 @@ mod tests {
         record.set_encoded_size(record.raw.encoding.encode_file_size(eof)?)?;
         record.set_encoded_allocation_size(record.raw.encoding.encode_allocation_size(charge)?)?;
         let inode = record.parse()?;
-        let snapshot = NodeMetadataSnapshot::from_inode(&inode, None, false);
+        let snapshot = NodeMetadataSnapshot::from_inode(&inode);
         assert_eq!(snapshot.node().file_index(), 16);
         assert_eq!(snapshot.size(), eof);
         assert_eq!(snapshot.allocation_size(), charge);
         assert_eq!(snapshot.security(), inode.security());
         assert_eq!(snapshot.times(), inode.times());
         assert_eq!(snapshot.links_count(), inode.links_count());
-        assert_eq!(
-            snapshot.windows_attributes(),
-            crate::platform::windows::Ext4WindowsAttributes::NONE
-        );
-        assert_eq!(snapshot.reparse_point(), NodeReparsePoint::None);
-        assert_eq!(snapshot.windows_file_attributes(), 0x0000_0080);
         assert_eq!(snapshot.data_policy(), crate::NodeDataPolicy::Writable);
 
         record.set_permissions(Ext4Permissions::new(0o444)?)?;
-        let hidden = crate::platform::windows::Ext4WindowsAttributes::new(
-            crate::platform::windows::Ext4WindowsAttributes::HIDDEN,
-        )?;
-        let overlay = crate::platform::windows::WindowsOverlay::new(hidden);
-        let reparse = NodeMetadataSnapshot::from_inode(&record.parse()?, Some(overlay), true);
-        assert_eq!(reparse.windows_file_attributes(), 0x0000_0403);
         record.mark_verity()?;
-        let verified = NodeMetadataSnapshot::from_inode(&record.parse()?, Some(overlay), false);
+        let verified = NodeMetadataSnapshot::from_inode(&record.parse()?);
         assert_eq!(verified.data_policy(), crate::NodeDataPolicy::ReadOnly);
         assert_eq!(snapshot.data_policy(), crate::NodeDataPolicy::Writable);
         Ok(())

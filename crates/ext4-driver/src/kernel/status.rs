@@ -30,6 +30,8 @@ pub(crate) enum DriverError {
     InvalidParameter,
     /// A Windows component cannot be represented by the namespace boundary.
     InvalidName,
+    /// Private Windows xattr encoding or attribute mask is invalid.
+    InvalidWindowsMetadata,
     /// More than one ext4 spelling matches the Windows comparison policy.
     AmbiguousName,
     /// Driver attempted to build a collection larger than `Vec` can represent.
@@ -156,7 +158,9 @@ impl DriverError {
     pub(crate) const fn ntstatus(self) -> NTSTATUS {
         match self {
             Self::InvalidDeviceRequest => STATUS_INVALID_DEVICE_REQUEST,
-            Self::InvalidParameter | Self::InvalidName => STATUS_INVALID_PARAMETER,
+            Self::InvalidParameter | Self::InvalidName | Self::InvalidWindowsMetadata => {
+                STATUS_INVALID_PARAMETER
+            }
             Self::AmbiguousName => STATUS_OBJECT_NAME_COLLISION,
             Self::InvalidBufferSize => STATUS_INVALID_BUFFER_SIZE,
             Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,

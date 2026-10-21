@@ -54,7 +54,7 @@ pub enum Error {
     DirectorySizeLimit,
     /// An HTree cannot receive another routing entry at the active maximum depth.
     DirectoryIndexFull,
-    /// An ext4 or Windows path component failed validation.
+    /// An ext4 path component failed validation.
     InvalidName,
     /// An extended attribute name, value, or set failed validation.
     InvalidXattr,

@@ -289,7 +289,7 @@ impl MetadataMutation<'_, '_> {
             };
             if live {
                 let record = self.raw_inode_for_policy(inode_id)?;
-                node_metadata_updates.try_push(self.node_metadata_snapshot(&record)?)?;
+                node_metadata_updates.try_push(self.node_metadata_update(&record)?)?;
             }
             let resource = MutationResource::inode(inode_id);
             observed.include(resource, coordinator.resource_version(resource))?;

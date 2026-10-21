@@ -9,13 +9,12 @@ use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
+use crate::metadata::WindowsNodeMetadata;
 #[cfg(test)]
 use core::cell::UnsafeCell;
 #[cfg(test)]
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use ext4_core::{
-    ClusterSize, EpochSequence, FileAllocationSize, FileSize, NodeId, NodeMetadataSnapshot,
-};
+use ext4_core::{ClusterSize, EpochSequence, FileAllocationSize, FileSize, NodeId};
 #[cfg(test)]
 use std::sync::Mutex;
 
@@ -151,7 +150,7 @@ pub(super) struct StreamMetadata {
 
 impl StreamMetadata {
     /// Builds one native projection from a coherent core snapshot and its committed epoch.
-    fn from_snapshot(snapshot: NodeMetadataSnapshot, epoch: EpochSequence) -> Self {
+    fn from_snapshot(snapshot: WindowsNodeMetadata, epoch: EpochSequence) -> Self {
         let times = snapshot.times();
         let directory = matches!(snapshot.node(), NodeId::Directory(_));
         Self {
@@ -639,7 +638,7 @@ impl StreamContext {
     /// Returns an allocation or invariant error when the native FCB boundary cannot be built.
     pub(crate) fn try_new_committed_node(
         sizes: StreamSizes,
-        snapshot: NodeMetadataSnapshot,
+        snapshot: WindowsNodeMetadata,
         epoch: EpochSequence,
         trace: OperationalTrace,
     ) -> DriverResult<Self> {
@@ -1158,7 +1157,7 @@ impl StreamContext {
     pub(crate) fn publish_node_metadata(
         &self,
         sizes: StreamSizes,
-        snapshot: NodeMetadataSnapshot,
+        snapshot: WindowsNodeMetadata,
         epoch: EpochSequence,
     ) -> DriverResult<StreamMetadataPublication> {
         if self.runtime.kind() != StreamOwnerKind::Node {

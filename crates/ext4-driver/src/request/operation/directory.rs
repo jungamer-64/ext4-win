@@ -185,14 +185,8 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                                 pass,
                                 record.node(),
                             )?;
-                            let xattrs = if self.query.needs_ea_size(metadata) {
-                                Some(ext4_core::CommittedReadPass::read_xattrs(
-                                    pass,
-                                    record.node(),
-                                )?)
-                            } else {
-                                None
-                            };
+                            let xattrs =
+                                ext4_core::CommittedReadPass::read_xattrs(pass, record.node())?;
                             Ok((metadata, xattrs))
                         }))
                     });
@@ -214,10 +208,17 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                             };
                         }
                         ReadTransition::Complete(Ok((metadata, xattrs))) => {
-                            let ea_size = xattrs
-                                .as_ref()
-                                .map(crate::request::ea::information_size_from_xattrs)
-                                .transpose();
+                            let metadata = match crate::metadata::WindowsNodeMetadata::from_ext4(
+                                metadata, &xattrs,
+                            ) {
+                                Ok(metadata) => metadata,
+                                Err(error) => return self.fail(error),
+                            };
+                            let ea_size = if self.query.needs_ea_size(metadata) {
+                                crate::request::ea::information_size_from_xattrs(&xattrs).map(Some)
+                            } else {
+                                Ok(None)
+                            };
                             match ea_size.and_then(|size| {
                                 self.query
                                     .append_metadata(record, metadata, size.unwrap_or(0))

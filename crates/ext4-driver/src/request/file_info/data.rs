@@ -1060,13 +1060,12 @@ fn write_regular_file_windowed(
     };
     let node = NodeId::File(file_id);
     if let Some(overlay) = super::set::archive_overlay(
-        mutation
-            .staged_node_metadata(node)?
+        crate::metadata::staged_node_metadata(mutation, node)?
             .windows_attributes()
             .bits(),
     )? {
         let node = mutation.node(node)?;
-        mutation.set_windows_overlay(node, overlay)?;
+        overlay.store(mutation, node)?;
     }
     let position = match authority {
         RegularFileDataAuthority::Handle => request.with_active(|active| {

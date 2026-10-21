@@ -181,9 +181,7 @@ impl EpochReadView<'_, '_> {
     /// Returns an error when the inode or its external xattr block is malformed.
     pub(super) fn read_inode_xattrs(&mut self, inode_id: InodeId) -> Result<XattrSet> {
         let inode = self.read_live_inode_record(inode_id)?;
-        self.read_inode_xattrs_from_live(&inode)?
-            .public()
-            .try_clone()
+        Ok(self.read_inode_xattrs_from_live(&inode)?.into_public())
     }
 
     /// Reads one extended attribute value by name.

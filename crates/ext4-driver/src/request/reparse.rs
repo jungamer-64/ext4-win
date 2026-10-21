@@ -5,11 +5,10 @@ use alloc::vec::Vec;
 use crate::irp::{IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
+use crate::metadata::WindowsSymlinkReparsePoint;
 use crate::state::{OpenedLocation, OpenedObject};
 use crate::wire::{LittleEndianInput, LittleEndianOutput, WireByteLen, WireOffset, WireRange};
-use ext4_core::{
-    CommittedReadPass, NodeId, SymlinkNodeId, SymlinkTarget, WindowsSymlinkReparsePoint,
-};
+use ext4_core::{CommittedReadPass, NodeId, SymlinkNodeId, SymlinkTarget};
 
 use super::DriverMutationPass;
 
@@ -46,9 +45,9 @@ impl NodeSymlinkReparsePoint {
     ) -> DriverResult<Option<Self>> {
         match node {
             NodeId::Symlink(symlink) => Ok(Some(Self::NativeSymlink(symlink))),
-            NodeId::File(_) | NodeId::Directory(_) => Ok(read
-                .read_windows_symlink_reparse_point(node)?
-                .map(Self::WindowsSymlink)),
+            NodeId::File(_) | NodeId::Directory(_) => {
+                Ok(crate::metadata::read_symlink(read, node)?.map(Self::WindowsSymlink))
+            }
         }
     }
 
@@ -257,8 +256,7 @@ fn set_node_reparse_point(
 ) -> DriverResult<()> {
     match node {
         NodeId::File(file) => {
-            if transaction
-                .load_node_metadata(NodeId::File(file))?
+            if crate::metadata::load_node_metadata(transaction, NodeId::File(file))?
                 .size()
                 .bytes()
                 != 0
@@ -278,7 +276,7 @@ fn set_node_reparse_point(
         NodeId::Symlink(_) => return Err(DriverError::NotSupported),
     }
     let node = transaction.node(node)?;
-    transaction.set_windows_symlink_reparse_point(node, reparse_point)?;
+    reparse_point.store(transaction, node)?;
     Ok(())
 }
 
@@ -292,10 +290,7 @@ fn delete_node_reparse_point(
     node: NodeId,
 ) -> DriverResult<()> {
     let node = transaction.node(node)?;
-    if transaction
-        .remove_windows_symlink_reparse_point(node)?
-        .is_none()
-    {
+    if WindowsSymlinkReparsePoint::remove(transaction, node)?.is_none() {
         return Err(DriverError::NotAReparsePoint);
     }
     Ok(())
@@ -665,8 +660,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use crate::kernel::status::DriverError;
+    use crate::metadata::WindowsSymlinkReparsePoint;
     use crate::wire::{LittleEndianInput, LittleEndianOutput};
-    use ext4_core::{SymlinkTarget, WindowsSymlinkReparsePoint};
+    use ext4_core::SymlinkTarget;
 
     use super::{
         MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MAXIMUM_SYMLINK_PATH_CODE_UNITS,

@@ -18,6 +18,7 @@ mod lifecycle_control {
     include!(concat!(env!("OUT_DIR"), "/lifecycle-control-v1.rs"));
 }
 mod memory;
+mod metadata;
 mod namespace;
 mod request;
 mod security_descriptor;

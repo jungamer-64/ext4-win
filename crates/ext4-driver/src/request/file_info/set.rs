@@ -505,9 +505,9 @@ pub(crate) fn set_creation_attributes(
     node: NodeId,
     attributes: u32,
 ) -> DriverResult<()> {
-    let metadata = FileMetadata::from(mutation.staged_node_metadata(node)?);
+    let metadata = FileMetadata::from(crate::metadata::staged_node_metadata(mutation, node)?);
     let attributes = if matches!(node, NodeId::File(_)) {
-        attributes | Ext4WindowsAttributes::ARCHIVE
+        attributes | WindowsAttributes::ARCHIVE
     } else {
         attributes
     };
@@ -517,7 +517,7 @@ pub(crate) fn set_creation_attributes(
         mutation.set_posix_security(node, security)?;
     }
     if let Some(overlay) = update.overlay() {
-        mutation.set_windows_overlay(node, overlay)?;
+        overlay.store(mutation, node)?;
     }
     Ok(())
 }
@@ -674,9 +674,9 @@ fn apply_basic_information(
         transaction.set_posix_security(node, security)?;
     }
     if let Some(overlay) = attributes.overlay() {
-        transaction.set_windows_overlay(node, overlay)?;
+        overlay.store(transaction, node)?;
     }
-    let staged_times = transaction.staged_node_metadata(node_id)?.times();
+    let staged_times = crate::metadata::staged_node_metadata(transaction, node_id)?.times();
     let times = update.times(metadata.times, staged_times, policy);
     if times != staged_times {
         transaction.set_times(node, times)?;
@@ -727,7 +727,7 @@ impl PreservedHandleTimes {
         };
         Ok(Some(Self {
             node,
-            before: mutation.load_node_metadata(node)?.times(),
+            before: crate::metadata::load_node_metadata(mutation, node)?.times(),
             policy,
         }))
     }
@@ -736,7 +736,7 @@ impl PreservedHandleTimes {
     /// # Errors
     /// Returns staged inode observation or timestamp staging failures.
     pub(crate) fn restore(self, mutation: &mut DriverMutationPass<'_, '_, '_>) -> DriverResult<()> {
-        let after = mutation.staged_node_metadata(self.node)?.times();
+        let after = crate::metadata::staged_node_metadata(mutation, self.node)?.times();
         let retained = self.policy.preserve(self.before, after);
         if retained != after {
             let node = mutation.node(self.node)?;
@@ -1208,7 +1208,7 @@ impl PreparedHardLinkMutation {
         let target_parent = mutation.directory(self.target_parent)?;
         if let Some(overlay) = self.archive_overlay {
             let node = mutation.node(self.source_node)?;
-            mutation.set_windows_overlay(node, overlay)?;
+            overlay.store(mutation, node)?;
         }
         match &self.destination {
             PreparedNamespaceDestination::Vacant => mutation.create_hard_link(
@@ -1330,11 +1330,11 @@ fn prepare_hard_link_destination(
 pub(super) fn archive_overlay(
     current_attributes: wdk_sys::ULONG,
 ) -> DriverResult<Option<WindowsOverlay>> {
-    if current_attributes & Ext4WindowsAttributes::ARCHIVE != 0 {
+    if current_attributes & WindowsAttributes::ARCHIVE != 0 {
         return Ok(None);
     }
-    Ok(Some(WindowsOverlay::new(Ext4WindowsAttributes::new(
-        current_attributes | Ext4WindowsAttributes::ARCHIVE,
+    Ok(Some(WindowsOverlay::new(WindowsAttributes::new(
+        current_attributes | WindowsAttributes::ARCHIVE,
     )?)))
 }
 
@@ -2359,10 +2359,7 @@ fn resolve_namespace_target(
                 let NodeId::Directory(directory_id) = *child.node() else {
                     return Err(DriverError::ObjectPathNotFound);
                 };
-                if read
-                    .read_windows_symlink_reparse_point(NodeId::Directory(directory_id))?
-                    .is_some()
-                {
+                if crate::metadata::read_symlink(read, NodeId::Directory(directory_id))?.is_some() {
                     return Err(DriverError::NotSupported);
                 }
                 parent_id = directory_id;
@@ -2433,7 +2430,7 @@ fn set_basic_attributes(
     }
     validate_kind_attribute(metadata, attributes)?;
 
-    let accepted = Ext4WindowsAttributes::SUPPORTED_MASK
+    let accepted = WindowsAttributes::SUPPORTED_MASK
         | wdk_sys::FILE_ATTRIBUTE_READONLY
         | wdk_sys::FILE_ATTRIBUTE_NORMAL
         | wdk_sys::FILE_ATTRIBUTE_DIRECTORY
@@ -2443,13 +2440,11 @@ fn set_basic_attributes(
     }
 
     let security = readonly_security_update(metadata.security, attributes)?;
-    let overlay_bits = attributes & Ext4WindowsAttributes::SUPPORTED_MASK;
+    let overlay_bits = attributes & WindowsAttributes::SUPPORTED_MASK;
     let overlay = if overlay_bits == metadata.overlay_attributes {
         None
     } else {
-        Some(WindowsOverlay::new(Ext4WindowsAttributes::new(
-            overlay_bits,
-        )?))
+        Some(WindowsOverlay::new(WindowsAttributes::new(overlay_bits)?))
     };
     Ok(BasicAttributeUpdate::new(security, overlay))
 }

@@ -187,11 +187,11 @@ fn hard_link_count_and_archive_boundaries_are_explicit() {
     if let Ok(Some(overlay)) = overlay {
         assert_eq!(
             overlay.attributes().bits(),
-            ext4_core::Ext4WindowsAttributes::ARCHIVE
+            crate::metadata::WindowsAttributes::ARCHIVE
         );
     }
     assert_eq!(
-        super::archive_overlay(ext4_core::Ext4WindowsAttributes::ARCHIVE),
+        super::archive_overlay(crate::metadata::WindowsAttributes::ARCHIVE),
         Ok(None)
     );
 }

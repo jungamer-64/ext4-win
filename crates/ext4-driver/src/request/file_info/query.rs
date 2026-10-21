@@ -313,7 +313,7 @@ impl WindowsHardLinks {
             let name = match WindowsName::from_ext4(link.name()) {
                 Ok(name) => name,
                 Err(DriverError::InvalidName) => continue,
-                Err(error) => return Err(DriverError::from(error)),
+                Err(error) => return Err(error),
             };
             let entry = WindowsHardLinkEntry {
                 parent_file_id: u64::from(NodeId::Directory(link.parent()).file_index()),
@@ -608,17 +608,17 @@ pub(super) enum FileMetadataReparsePoint {
     SymbolicLink,
 }
 
-impl From<NodeMetadataSnapshot> for FileMetadata {
+impl From<WindowsNodeMetadata> for FileMetadata {
     /// Projects the coherent core observation to the Windows packing boundary.
-    fn from(snapshot: NodeMetadataSnapshot) -> Self {
+    fn from(snapshot: WindowsNodeMetadata) -> Self {
         let kind = match snapshot.node() {
             NodeId::File(_) => FileMetadataKind::File,
             NodeId::Directory(_) => FileMetadataKind::Directory,
             NodeId::Symlink(_) => FileMetadataKind::Symlink,
         };
         let reparse_point = match snapshot.reparse_point() {
-            NodeReparsePoint::None => FileMetadataReparsePoint::None,
-            NodeReparsePoint::SymbolicLink => FileMetadataReparsePoint::SymbolicLink,
+            WindowsReparsePoint::None => FileMetadataReparsePoint::None,
+            WindowsReparsePoint::SymbolicLink => FileMetadataReparsePoint::SymbolicLink,
         };
         Self {
             file_index: snapshot.node().file_index(),
@@ -644,7 +644,7 @@ pub(super) fn metadata_from_node(
     read: &mut impl CommittedReadPass,
     node_id: NodeId,
 ) -> DriverResult<FileMetadata> {
-    Ok(read.load_node_metadata(node_id)?.into())
+    Ok(crate::metadata::load_node_metadata(read, node_id)?.into())
 }
 
 /// Packs FILE_BASIC_INFORMATION.
@@ -884,7 +884,7 @@ fn node_relative_name(
                 let projected = match WindowsName::from_ext4(link.name()) {
                     Ok(name) => name,
                     Err(DriverError::InvalidName) => continue,
-                    Err(error) => return Err(error.into()),
+                    Err(error) => return Err(error),
                 };
                 let mut components = DriverVec::new();
                 components

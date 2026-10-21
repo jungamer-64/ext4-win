@@ -76,7 +76,7 @@ pub(super) use super::mount::{
 pub(super) use super::node::{
     ChildLookup, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId,
     HardLinkEntry, HardLinkNodeId, HardLinks, LoadedNode, NodeId, NodeMetadataSnapshot,
-    SymlinkNode, SymlinkNodeId,
+    NodeMetadataUpdate, SymlinkNode, SymlinkNodeId,
 };
 
 /// Builds a volume-owned on-disk field offset.

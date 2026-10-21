@@ -317,7 +317,7 @@ impl<'a> CreateCompletionOwner<'a> {
         node: NodeId,
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
-        let metadata = read.load_node_metadata(node)?;
+        let metadata = crate::metadata::load_node_metadata(read, node)?;
         let descriptor = CreateSecurityDescriptor::for_node(read, node, self.identity)?;
         let required = self.parameters.existing_operation_required_access();
         let requested = self.parameters.desired_access();
@@ -548,7 +548,7 @@ fn open_or_create(
                 owner.authorize_target_directory(directory, target, requirement, mutation)?;
             let stream_metadata = CommittedNodeStreamMetadata::new(
                 NodeStreamMetadata::try_from_snapshot(
-                    mutation.load_node_metadata(NodeId::Directory(directory))?,
+                    crate::metadata::load_node_metadata(mutation, NodeId::Directory(directory))?,
                     operations.volume_geometry().cluster_size(),
                 )?,
                 operations.current_epoch_sequence(),
@@ -1660,7 +1660,7 @@ fn finish_existing_create(
         let NodeId::File(id) = open.node else {
             return Err(DriverError::InternalInvariantViolation);
         };
-        let current = mutation.load_node_metadata(open.node)?;
+        let current = crate::metadata::load_node_metadata(mutation, open.node)?;
         if current.windows_attributes().bits() & wdk_sys::FILE_ATTRIBUTE_READONLY != 0
             || current.security().permissions().as_u16() & 0o222 == 0
         {
@@ -1675,7 +1675,7 @@ fn finish_existing_create(
         metadata.apply(open.node, mutation)?;
         if *reset == ExistingFileReset::Supersede {
             let node = mutation.node(open.node)?;
-            let times = mutation.staged_node_metadata(open.node)?.times();
+            let times = crate::metadata::staged_node_metadata(mutation, open.node)?.times();
             mutation.set_times(
                 node,
                 ext4_core::Ext4Times::new(
@@ -1760,7 +1760,7 @@ fn open_existing_node(
     let deletion = prepare_create_deletion(policy, node, &target.location, mutation)?;
     let stream = CommittedNodeStreamMetadata::new(
         NodeStreamMetadata::try_from_snapshot(
-            mutation.load_node_metadata(node)?,
+            crate::metadata::load_node_metadata(mutation, node)?,
             operations.volume_geometry().cluster_size(),
         )?,
         operations.current_epoch_sequence(),
@@ -1953,7 +1953,7 @@ fn create_missing_node(
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
     request.owner.metadata.apply(node, mutation)?;
     let staged_stream = StagedNodeStreamMetadata::try_from_staged_snapshot(
-        mutation.staged_node_metadata(node)?,
+        crate::metadata::staged_node_metadata(mutation, node)?,
         operations.volume_geometry().cluster_size(),
     )?;
     let file_object =
@@ -2155,7 +2155,7 @@ fn resolve_path(
                 });
             }
             Ok(ChildLookup::NotFound) => return Err(DriverError::ObjectPathNotFound),
-            Err(error) => return Err(DriverError::from(error)),
+            Err(error) => return Err(error),
         };
         let child_node = *child.node();
         let child_location = OpenedLocation::try_directory_entry(child.parent(), child.name())?;
@@ -3009,7 +3009,7 @@ mod tests {
         ];
         assert_eq!(
             CreatePathName::decode(&units),
-            Err(DriverError::from(ext4_core::Error::InvalidName))
+            Err(DriverError::InvalidName)
         );
     }
 

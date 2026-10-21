@@ -299,7 +299,7 @@ impl FileControlBlock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct NodeStreamMetadata {
     /// Inode metadata that owns every projected Windows field.
-    snapshot: NodeMetadataSnapshot,
+    snapshot: WindowsNodeMetadata,
     /// Native section and allocation sizes derived from `snapshot`.
     sizes: StreamSizes,
 }
@@ -310,7 +310,7 @@ impl NodeStreamMetadata {
     ///
     /// Returns an error when the observed sizes exceed Windows' signed size domain.
     pub(crate) fn try_from_snapshot(
-        snapshot: NodeMetadataSnapshot,
+        snapshot: WindowsNodeMetadata,
         cluster_size: ClusterSize,
     ) -> DriverResult<Self> {
         Ok(Self {
@@ -329,7 +329,7 @@ impl NodeStreamMetadata {
     }
 
     /// Complete coherent core metadata represented by this projection.
-    pub(crate) const fn snapshot(self) -> NodeMetadataSnapshot {
+    pub(crate) const fn snapshot(self) -> WindowsNodeMetadata {
         self.snapshot
     }
 
@@ -360,7 +360,7 @@ impl CommittedNodeStreamMetadata {
     }
 
     /// Complete coherent core metadata represented by this observation.
-    pub(crate) const fn snapshot(self) -> NodeMetadataSnapshot {
+    pub(crate) const fn snapshot(self) -> WindowsNodeMetadata {
         self.metadata.snapshot()
     }
 
@@ -390,7 +390,7 @@ impl StagedNodeStreamMetadata {
     ///
     /// Returns an error when the observed sizes exceed Windows' signed size domain.
     pub(crate) fn try_from_staged_snapshot(
-        snapshot: NodeMetadataSnapshot,
+        snapshot: WindowsNodeMetadata,
         cluster_size: ClusterSize,
     ) -> DriverResult<Self> {
         Ok(Self {
@@ -430,13 +430,13 @@ impl PreparedStreamMetadataPublications {
     ///
     /// Returns an error on allocation failure or a size outside the Windows domain.
     pub(crate) fn try_new(
-        snapshots: &[NodeMetadataSnapshot],
+        snapshots: &[ext4_core::NodeMetadataUpdate],
         cluster_size: ClusterSize,
     ) -> DriverResult<Self> {
         let mut nodes = DriverVec::try_with_capacity(snapshots.len())?;
         for snapshot in snapshots {
             nodes.try_push(NodeStreamMetadata::try_from_snapshot(
-                *snapshot,
+                WindowsNodeMetadata::from_ext4(snapshot.metadata(), snapshot.xattrs())?,
                 cluster_size,
             )?)?;
         }

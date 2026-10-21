@@ -46,9 +46,15 @@ pub trait CommittedReadPass {
     /// Returns an inode-kind mismatch, storage failure or malformed inode.
     fn load_node_metadata(&mut self, node: NodeId) -> Result<super::NodeMetadataSnapshot> {
         let snapshot = match node {
-            NodeId::File(id) => super::NodeMetadataSnapshot::from_inode(self.load_file(id)?.inode()),
-            NodeId::Directory(id) => super::NodeMetadataSnapshot::from_inode(self.load_directory(id)?.inode()),
-            NodeId::Symlink(id) => super::NodeMetadataSnapshot::from_inode(self.load_symlink(id)?.inode()),
+            NodeId::File(id) => {
+                super::NodeMetadataSnapshot::from_inode(self.load_file(id)?.inode())
+            }
+            NodeId::Directory(id) => {
+                super::NodeMetadataSnapshot::from_inode(self.load_directory(id)?.inode())
+            }
+            NodeId::Symlink(id) => {
+                super::NodeMetadataSnapshot::from_inode(self.load_symlink(id)?.inode())
+            }
         };
         Ok(snapshot)
     }

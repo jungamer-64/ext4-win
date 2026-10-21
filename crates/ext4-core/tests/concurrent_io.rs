@@ -3488,3 +3488,54 @@ fn mount_rejects_unsupported_format_selectors_before_storage_effects() -> Result
     }
     Ok(())
 }
+
+/// # Errors
+/// Returns ext4 fixture, mutation, storage or allocation failures.
+/// # Panics
+/// Fails if opaque user values change inode-read or payload-write eligibility.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe opaque ext4 attributes and committed file contents"
+)]
+fn user_xattr_values_remain_opaque_through_metadata_and_content_mutation() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    for name in [
+        b"arbitrary".as_slice(),
+        b"ext4win.attributes",
+        b"ext4win.reparse.symlink",
+    ] {
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, name)?,
+                XattrValue::new(b"opaque")?,
+            )
+        })?;
+    }
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.write_file_range(file, FileOffset::ZERO, b"Z")
+    })?;
+    fixture.remount()?;
+    let snapshot = fixture.read(|pass| pass.load_node_metadata(NodeId::File(file)))?;
+    assert_eq!(snapshot.size(), FileSize::from_bytes(1));
+    for name in [b"ext4win.attributes".as_slice(), b"ext4win.reparse.symlink"] {
+        let value = fixture.read(|pass| {
+            pass.read_xattr(
+                NodeId::File(file),
+                &XattrName::new(XattrNamespace::User, name)?,
+            )
+        })?;
+        assert_eq!(
+            value.as_ref().map(XattrValue::bytes),
+            Some(b"opaque".as_slice())
+        );
+    }
+    let mut bytes = [0; 1];
+    fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
+    assert_eq!(&bytes, b"Z");
+    Ok(())
+}

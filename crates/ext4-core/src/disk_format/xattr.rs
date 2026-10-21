@@ -230,24 +230,6 @@ impl XattrSet {
         }
     }
 
-    /// Copies this xattr set without using infallible allocation.
-    /// # Errors
-    ///
-    /// Returns an error when copying an entry name/value or reserving the set storage fails.
-    pub(crate) fn try_clone(&self) -> Result<Self> {
-        let mut entries = Vec::new();
-        entries
-            .try_reserve_exact(self.entries.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for entry in &self.entries {
-            entries.try_push(XattrEntry {
-                name: entry.name.try_clone()?,
-                value: entry.value.try_clone()?,
-            })?;
-        }
-        Ok(Self { entries })
-    }
-
     /// Returns true when this set has no entries.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -353,6 +335,11 @@ impl InodeXattrSet {
     #[must_use]
     pub(crate) const fn public(&self) -> &XattrSet {
         &self.public
+    }
+
+    /// Moves public attributes out while retiring private encryption context storage.
+    pub(crate) fn into_public(self) -> XattrSet {
+        self.public
     }
 
     /// Mutable public xattrs attached to the inode.

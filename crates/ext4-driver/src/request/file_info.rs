@@ -3,12 +3,14 @@
 use alloc::boxed::Box;
 use core::{num::NonZeroUsize, ptr::NonNull};
 
+use crate::metadata::{
+    WindowsAttributes, WindowsNodeMetadata, WindowsOverlay, WindowsReparsePoint,
+};
 use crate::namespace::WindowsName;
 use ext4_core::{
     ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4LinkCount, Ext4Name, Ext4Permissions,
-    Ext4Security, Ext4Times, Ext4Timestamp, Ext4WindowsAttributes, FileAllocationSize, FileNodeId,
-    FileOffset, FileSize, HardLinkNodeId, HardLinks, NamespaceDestination, NodeId,
-    NodeMetadataSnapshot, NodeReparsePoint, StorageRequest, StorageTarget, WindowsOverlay,
+    Ext4Security, Ext4Times, Ext4Timestamp, FileAllocationSize, FileNodeId, FileOffset, FileSize,
+    HardLinkNodeId, HardLinks, NamespaceDestination, NodeId, StorageRequest, StorageTarget,
 };
 use wdk_sys::LARGE_INTEGER;
 

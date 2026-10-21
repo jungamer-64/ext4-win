@@ -69,7 +69,7 @@ pub(crate) enum DirectoryScanPosition {
         /// Secondary hash of the last consumed key.
         minor: u32,
     },
-    /// Reconstruct a cursor by scanning to a Windows-supplied ordinal.
+    /// Reconstruct a cursor by scanning to a caller-supplied ordinal.
     Ordinal(u64),
     /// The prior scan observed end of directory.
     End,

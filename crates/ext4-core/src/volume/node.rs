@@ -126,6 +126,29 @@ pub struct NodeMetadataSnapshot {
     data_policy: NodeDataPolicy,
 }
 
+/// Final inode metadata and opaque extended attributes from one resolved mutation.
+/// Publication is permitted only after the mutation's commit durability is established.
+#[derive(Debug)]
+pub struct NodeMetadataUpdate {
+    /// Inode observation from the staged record.
+    pub(super) metadata: NodeMetadataSnapshot,
+    /// Public xattrs read from that same staged record and its staged external block.
+    pub(super) xattrs: crate::XattrSet,
+}
+
+impl NodeMetadataUpdate {
+    /// Inode fields paired with this update's xattrs.
+    #[must_use]
+    pub const fn metadata(&self) -> NodeMetadataSnapshot {
+        self.metadata
+    }
+    /// Opaque values whose ext4 storage structure was validated by the mutation.
+    #[must_use]
+    pub const fn xattrs(&self) -> &crate::XattrSet {
+        &self.xattrs
+    }
+}
+
 /// Inode-owned data protection, independent from a handle's granted security rights.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NodeDataPolicy {
@@ -199,7 +222,6 @@ impl NodeMetadataSnapshot {
     pub const fn links_count(self) -> Ext4LinkCount {
         self.links_count
     }
-
 }
 
 /// Typed identity of an inode that can own hard-link names.

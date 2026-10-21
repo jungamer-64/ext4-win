@@ -45,7 +45,6 @@ impl MutationResolvePass<'_, '_, '_> {
             Ok(removed)
         })
     }
-
 }
 
 impl MetadataMutation<'_, '_> {
@@ -111,12 +110,25 @@ impl MetadataMutation<'_, '_> {
     /// Builds the exact post-mutation metadata projection for one staged live inode.
     /// # Errors
     ///
-    /// Returns an error when the inode, xattr storage, is invalid.
+    /// Returns an error when the staged inode is malformed.
     pub(super) fn node_metadata_snapshot(
         &mut self,
         raw_inode: &LiveInodeRecord,
     ) -> Result<NodeMetadataSnapshot> {
         Ok(NodeMetadataSnapshot::from_inode(&raw_inode.parse()?))
+    }
+
+    /// Pairs the staged inode observation with its opaque attributes before commit.
+    /// # Errors
+    /// Returns malformed inode/xattr storage, backing-read or allocation failures.
+    pub(super) fn node_metadata_update(
+        &mut self,
+        raw: &LiveInodeRecord,
+    ) -> Result<NodeMetadataUpdate> {
+        Ok(NodeMetadataUpdate {
+            metadata: self.node_metadata_snapshot(raw)?,
+            xattrs: self.xattr_set_for_raw_inode(raw)?.into_public(),
+        })
     }
 
     /// Stages the latest image for a mutated external xattr block.

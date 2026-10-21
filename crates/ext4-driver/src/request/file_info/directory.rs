@@ -712,7 +712,7 @@ impl DirectoryQuery {
     pub(crate) fn append_metadata(
         &mut self,
         record: DirectoryRecord,
-        metadata: NodeMetadataSnapshot,
+        metadata: WindowsNodeMetadata,
         ea_size: u32,
     ) -> DriverResult<bool> {
         self.append(
@@ -725,10 +725,10 @@ impl DirectoryQuery {
     }
 
     /// Selects EA observation only when this wire class uses the byte-charge field.
-    pub(crate) fn needs_ea_size(&self, metadata: NodeMetadataSnapshot) -> bool {
+    pub(crate) fn needs_ea_size(&self, metadata: WindowsNodeMetadata) -> bool {
         self.class.ea_size_offset().is_some()
             && (self.class.reparse_tag_offset().is_some()
-                || metadata.reparse_point() == NodeReparsePoint::None)
+                || metadata.reparse_point() == WindowsReparsePoint::None)
     }
 
     /// Commits one packed record locally. A partial first record preserves its original cursor.

@@ -306,7 +306,7 @@ pub(crate) fn stage_cleanup_deletion(
             ChildLookup::Found(child) if *child.node() == plan.node => {}
             ChildLookup::Found(_) | ChildLookup::NotFound => return Err(DriverError::CannotDelete),
         }
-        let metadata = mutation.staged_node_metadata(plan.node)?;
+        let metadata = crate::metadata::staged_node_metadata(mutation, plan.node)?;
         if (matches!(plan.node, NodeId::Directory(_))
             || metadata.links_count().on_disk_count() == 1)
             && operations.has_active_inode_handles(plan.fcb)

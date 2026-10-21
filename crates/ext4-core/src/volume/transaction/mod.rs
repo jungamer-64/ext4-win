@@ -256,7 +256,7 @@ impl TransactionHardLinkSource {
 /// Prevalidated namespace state at a requested destination.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NamespaceDestination<'name> {
-    /// No Windows-visible entry occupies the requested destination.
+    /// No directory entry occupies the requested destination.
     Vacant,
     /// One exact ext4 entry selected for replacement occupies the destination.
     Replace {
@@ -370,7 +370,7 @@ pub struct ResolvedMutation {
     /// The commit lane excludes key publication after preparation begins.
     key_version: Option<ResourceVersion>,
     /// Complete final metadata for every live inode serialized by this mutation.
-    node_metadata_updates: Vec<NodeMetadataSnapshot>,
+    node_metadata_updates: Vec<NodeMetadataUpdate>,
     /// Ordered data images that must be durable before journal metadata is written.
     data_writes: Vec<RangeWrite>,
     /// Complete metadata and journaled data images supplied to JBD2 serialization.
@@ -434,7 +434,7 @@ impl ReservedMutation {
     /// These values are preparation inputs only; publication is permitted only after commit
     /// durability. Deleted inodes are excluded because they have no live metadata snapshot.
     #[must_use]
-    pub fn node_metadata_updates(&self) -> &[NodeMetadataSnapshot] {
+    pub fn node_metadata_updates(&self) -> &[NodeMetadataUpdate] {
         &self.resolved.node_metadata_updates
     }
 }
@@ -809,6 +809,19 @@ impl MutationResolvePass<'_, '_, '_> {
         self.edit(|pass| {
             let record = pass.mutation.raw_inode_for_policy(node.inode())?;
             pass.mutation.node_metadata_snapshot(&record)
+        })
+    }
+
+    /// Reads opaque public xattrs from the latest staged inode and external xattr block.
+    /// # Errors
+    /// Returns a deleted/malformed inode, xattr-storage or allocation failure.
+    pub fn staged_xattrs(&mut self, node: NodeId) -> Result<XattrSet> {
+        self.edit(|pass| {
+            let record = pass.mutation.raw_inode_for_policy(node.inode())?;
+            Ok(pass
+                .mutation
+                .xattr_set_for_raw_inode(&record)?
+                .into_public())
         })
     }
 

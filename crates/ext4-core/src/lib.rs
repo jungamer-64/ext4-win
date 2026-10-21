@@ -59,7 +59,7 @@ pub use volume::{
     JournalPayloadDurability, MetadataCache, MetadataCacheAccess, MountOperation, MountTransition,
     MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveOperation,
     MutationResolvePass, MutationResolveReady, MutationResolveTransition, MutationResource,
-    NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot,
+    NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot, NodeMetadataUpdate,
     ObservedResourceVersionSet, OperationEvent, OperationId, OrderedDataDurability,
     PreparedKeyChange, PublishedMutation, ReadTransition, ReservedKeyChange, ReservedMutation,
     ResolvedKeyChange, ResolvedMutation, ResourceVersion, RetryPermit, ScannedDirectoryEntry,
