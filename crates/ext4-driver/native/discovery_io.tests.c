@@ -2,6 +2,13 @@
  * No kernel import or physical device is used by this oracle. */
 #define assert(condition) do { if (!(condition)) { __builtin_trap(); } } while (0)
 #define NTAPI
+#define _At_(target, annotation)
+#define _Frees_ptr_
+#define _Frees_ptr_opt_
+#define _In_
+#define _In_reads_bytes_opt_(length)
+#define _Outptr_result_nullonfailure_
+#define _Success_(condition)
 #define NULL ((void *)0)
 #define TRUE 1
 #define FALSE 0

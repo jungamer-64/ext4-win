@@ -34,10 +34,12 @@ struct _EXT4WIN_DISCOVERY_REQUEST {
     PVOID Buffer;
 };
 
-static VOID ext4win_discovery_release_request(EXT4WIN_DISCOVERY_REQUEST *request)
+/* Exclusive ownership belongs to preparation until publication, or to the last
+ * reference owner after retirement. Both paths consume the complete allocation. */
+_At_(request->Allocation, _Frees_ptr_opt_)
+static VOID ext4win_discovery_destroy_request(_In_ _Frees_ptr_ EXT4WIN_DISCOVERY_REQUEST *request)
 {
     PMDL mdl, next;
-    if (InterlockedDecrement(&request->References) != 0) { return; }
     if (request->Irp != NULL) {
         mdl = request->Irp->MdlAddress;
         request->Irp->MdlAddress = NULL;
@@ -54,6 +56,13 @@ static VOID ext4win_discovery_release_request(EXT4WIN_DISCOVERY_REQUEST *request
     }
     ObDereferenceObject(request->Target);
     ExFreePoolWithTag(request, EXT4WIN_DISCOVERY_POOL_TAG);
+}
+
+static VOID ext4win_discovery_release_request(_In_ EXT4WIN_DISCOVERY_REQUEST *request)
+{
+    if (InterlockedDecrement(&request->References) == 0) {
+        ext4win_discovery_destroy_request(request);
+    }
 }
 
 static VOID ext4win_discovery_cancel_request(EXT4WIN_DISCOVERY_REQUEST *request)
@@ -140,10 +149,12 @@ BOOLEAN NTAPI ext4win_discovery_channel_destroy(EXT4WIN_DISCOVERY_CHANNEL *chann
     return TRUE;
 }
 
+_Success_(return == STATUS_SUCCESS)
 static NTSTATUS ext4win_discovery_prepare(
-    PDEVICE_OBJECT device, UCHAR major, ULONG code,
-    const VOID *input, ULONG input_length, ULONG output_length, ULONG alignment_mask,
-    EXT4WIN_DISCOVERY_REQUEST **prepared)
+    _In_ PDEVICE_OBJECT device, UCHAR major, ULONG code,
+    _In_reads_bytes_opt_(input_length) const VOID *input,
+    ULONG input_length, ULONG output_length, ULONG alignment_mask,
+    _Outptr_result_nullonfailure_ EXT4WIN_DISCOVERY_REQUEST **prepared)
 {
     EXT4WIN_DISCOVERY_REQUEST *request;
     PIO_STACK_LOCATION stack;
@@ -169,14 +180,14 @@ static NTSTATUS ext4win_discovery_prepare(
     request->Allocation = ExAllocatePool2(POOL_FLAG_NON_PAGED,
         (SIZE_T)length + mask + 1, EXT4WIN_DISCOVERY_POOL_TAG);
     if (request->Allocation == NULL) {
-        ext4win_discovery_release_request(request);
+        ext4win_discovery_destroy_request(request);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     request->Buffer = (PVOID)(((ULONG_PTR)request->Allocation + mask) & ~(ULONG_PTR)mask);
     if (input_length != 0) { RtlCopyMemory(request->Buffer, input, input_length); }
     request->Irp = IoAllocateIrp(device->StackSize, FALSE);
     if (request->Irp == NULL) {
-        ext4win_discovery_release_request(request);
+        ext4win_discovery_destroy_request(request);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     request->Irp->RequestorMode = KernelMode;
@@ -194,7 +205,7 @@ static NTSTATUS ext4win_discovery_prepare(
         if ((device->Flags & DO_DIRECT_IO) != 0) {
             PMDL mdl = IoAllocateMdl(request->Buffer, output_length, FALSE, FALSE, request->Irp);
             if (mdl == NULL) {
-                ext4win_discovery_release_request(request);
+                ext4win_discovery_destroy_request(request);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
             MmBuildMdlForNonPagedPool(mdl);
