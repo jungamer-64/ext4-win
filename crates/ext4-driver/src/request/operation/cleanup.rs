@@ -116,9 +116,10 @@ impl CleanupOperation {
         mut owned: OwnedIrp,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        match crate::request::file_info::prepare_cleanup_cache_work(owned.request(), access) {
-            Ok(Some(work)) => {
-                self.state = CleanupState::Uninitializing(owned);
+        match crate::request::file_info::prepare_cleanup_cache_lease(owned.request(), access) {
+            Ok(Some(file_object)) => {
+                let work = crate::irp::PassiveWork::uninitialize(file_object, owned);
+                self.state = CleanupState::Uninitializing;
                 OperationTransition::SubmitPassiveWork {
                     work,
                     suspended: self,
@@ -231,10 +232,10 @@ impl MountedVolumeOperation for CleanupOperation {
                 self.uninitialize(owned, access)
             }
             (
-                CleanupState::Uninitializing(owned),
-                CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Uninitialize(
-                    result,
-                )),
+                CleanupState::Uninitializing,
+                CompletionEvent::PassiveCompleted(
+                    crate::irp::PassiveWorkCompletion::Uninitialize { owned, result },
+                ),
             ) => {
                 self.record_failure(result);
                 self.release(owned, access)

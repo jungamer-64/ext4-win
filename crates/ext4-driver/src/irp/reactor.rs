@@ -5069,8 +5069,11 @@ mod tests {
                     crate::irp::PassiveWorkCompletion::Flush(result)
                     | crate::irp::PassiveWorkCompletion::CloseWriteback(result)
                     | crate::irp::PassiveWorkCompletion::Purge(result)
-                    | crate::irp::PassiveWorkCompletion::CleanupOplock(result)
-                    | crate::irp::PassiveWorkCompletion::Uninitialize(result) => {
+                    | crate::irp::PassiveWorkCompletion::CleanupOplock(result) => {
+                        let _result = result;
+                    }
+                    crate::irp::PassiveWorkCompletion::Uninitialize { owned, result } => {
+                        let _owned = owned;
                         let _result = result;
                     }
                     crate::irp::PassiveWorkCompletion::DrainForVolumeLock(result) => {

@@ -2,14 +2,14 @@
 
 use super::*;
 
-/// Captures FILE_OBJECT cache-map teardown work before cleanup releases handle-owned state.
+/// Retains the stream before cleanup transfers its IRP to native cache-map teardown.
 /// # Errors
 ///
 /// Returns a FILE_OBJECT, stream-identity, or lease failure before worker submission.
-pub(crate) fn prepare_cleanup_cache_work(
+pub(crate) fn prepare_cleanup_cache_lease(
     mut request: PendingIrpLease<'_>,
     operations: &MountedVolumeAccess<'_>,
-) -> DriverResult<Option<crate::irp::PassiveWork>> {
+) -> DriverResult<Option<crate::state::FileObjectCacheLease>> {
     request.with_active(|active| {
         let file_object = active.current_stack()?.file_object()?;
         if file_object.has_no_file_system_contexts() {
@@ -18,7 +18,6 @@ pub(crate) fn prepare_cleanup_cache_work(
         match OpenedFileObject::decode(file_object)? {
             OpenedFileObject::Node(_) => operations
                 .acquire_file_object_cache_lease(file_object)
-                .map(crate::irp::PassiveWork::uninitialize)
                 .map(Some),
             OpenedFileObject::Volume(_) => Ok(None),
         }

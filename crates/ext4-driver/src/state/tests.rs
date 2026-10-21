@@ -1969,6 +1969,61 @@ fn paging_stream_admission_uses_shared_fcb_identity_without_a_ccb() -> Result<()
 }
 
 /// # Errors
+/// Returns fixture allocation or stream-lease acquisition failure.
+/// # Panics
+/// Fails if private cache-map teardown accepts another live FILE_OBJECT for the same stream.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fixture failures return Result while assertions check exact FILE_OBJECT authority"
+)]
+fn private_cache_teardown_requires_the_retained_file_object() -> Result<(), DriverError> {
+    let volume_stream = crate::kernel::stream::StreamContext::try_new_volume(
+        crate::kernel::stream::StreamSizes::EMPTY,
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+        crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+    )?;
+    let mut ledger = FileControlBlockLedger::try_new()?;
+    let volume = NonNull::<VolumeControlBlock>::dangling();
+    let fcb = ledger.staged_file_control_block(
+        volume,
+        &volume_stream,
+        super::StagedNodeStreamMetadata {
+            node: NodeId::Directory(DirectoryNodeId::ROOT),
+            sizes: crate::kernel::stream::StreamSizes::EMPTY,
+        },
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+    )?;
+    let fcb_pointer = NonNull::from(fcb.as_ref().get_ref());
+    let header = fcb.stream_header().as_ptr();
+    let sections = fcb.stream_section_objects()?.as_ptr();
+    ledger
+        .table
+        .get_mut()
+        .try_push_owned(fcb)
+        .map_err(|failure| failure.into_parts().0)?;
+    let mut retained = file_object_with_contexts(header, core::ptr::null_mut());
+    retained.SectionObjectPointer = sections;
+    let mut other = file_object_with_contexts(header, core::ptr::null_mut());
+    other.SectionObjectPointer = sections;
+    let lease = with_active_file_object(&mut retained, |active| {
+        ledger.acquire_file_object_cache_lease(active, volume)
+    })?;
+    assert_eq!(
+        with_active_file_object(&mut other, |active| lease.uninitialize(active)),
+        Err(DriverError::InternalInvariantViolation)
+    );
+    assert_eq!(
+        with_active_file_object(&mut retained, |active| lease.uninitialize(active)),
+        Ok(())
+    );
+    drop(lease);
+    ledger.close(fcb_pointer);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
 ///
 /// Returns a fixture allocation or native stream-header error.
 /// # Panics

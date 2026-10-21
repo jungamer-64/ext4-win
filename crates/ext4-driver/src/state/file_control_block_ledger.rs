@@ -990,12 +990,15 @@ impl FileObjectCacheLease {
     /// Releases this FILE_OBJECT's private cache map.
     /// # Errors
     ///
-    /// Returns the exact Cache Manager exception status.
-    pub(crate) fn uninitialize(&self) -> DriverResult<()> {
+    /// Rejects a different FILE_OBJECT before native access, or returns the exact Cache Manager status.
+    pub(crate) fn uninitialize(&self, file_object: ActiveFileObject<'_>) -> DriverResult<()> {
+        if file_object.address() != self.file_object {
+            return Err(DriverError::InternalInvariantViolation);
+        }
         self.stream
             .stream()
             .stream_context
-            .uninitialize_cache_map(self.file_object.as_non_null())
+            .uninitialize_cache_map(file_object)
     }
 }
 

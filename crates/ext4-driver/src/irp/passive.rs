@@ -268,7 +268,10 @@ impl PassiveWork {
     }
 
     /// Builds one FILE_OBJECT cache-map uninitialization.
-    pub(crate) const fn uninitialize(file_object: FileObjectCacheLease, owned: super::OwnedIrp) -> Self {
+    pub(crate) const fn uninitialize(
+        file_object: FileObjectCacheLease,
+        owned: super::OwnedIrp,
+    ) -> Self {
         Self::Uninitialize { file_object, owned }
     }
 
@@ -335,8 +338,14 @@ impl PassiveWork {
             Self::CleanupOplock { check, irp } => {
                 PassiveWorkCompletion::CleanupOplock(check.execute(irp))
             }
-            Self::Uninitialize { file_object } => {
-                PassiveWorkCompletion::Uninitialize(file_object.uninitialize())
+            Self::Uninitialize {
+                file_object,
+                mut owned,
+            } => {
+                let result = owned.request().with_active(|active| {
+                    file_object.uninitialize(active.current_stack()?.file_object()?)
+                });
+                PassiveWorkCompletion::Uninitialize { owned, result }
             }
         }
     }
@@ -369,20 +378,24 @@ impl PassiveWork {
             Self::PrepareWriteOpen { .. } => PassiveWorkCompletion::PrepareWriteOpen(Err(error)),
             Self::PrepareVerity { .. } => PassiveWorkCompletion::PrepareVerity(Err(error)),
             Self::CleanupOplock { .. } => PassiveWorkCompletion::CleanupOplock(Err(error)),
-            Self::Uninitialize { .. } => PassiveWorkCompletion::Uninitialize(Err(error)),
+            Self::Uninitialize { owned, .. } => PassiveWorkCompletion::Uninitialize {
+                owned,
+                result: Err(error),
+            },
         }
     }
 
-    /// Returns cache-transfer IRP ownership on cancellation before native submission.
+    /// Returns worker-owned IRP authority on cancellation before native submission.
     /// Other work leaves IRP ownership in its suspended operation and resumes that cancel path.
     #[cfg(not(test))]
     pub(super) fn cancel_before_execution(self) -> super::reactor::CompletionEvent {
         match self {
-            work @ (Self::Read { .. } | Self::Write { .. } | Self::Mdl { .. }) => {
-                super::reactor::CompletionEvent::PassiveCompleted(
-                    work.failed(DriverError::from(ext4_core::Error::OperationCancelled)),
-                )
-            }
+            work @ (Self::Read { .. }
+            | Self::Write { .. }
+            | Self::Mdl { .. }
+            | Self::Uninitialize { .. }) => super::reactor::CompletionEvent::PassiveCompleted(
+                work.failed(DriverError::from(ext4_core::Error::OperationCancelled)),
+            ),
             _ => super::reactor::CompletionEvent::Core(ext4_core::OperationEvent::CancelRequested),
         }
     }
@@ -392,8 +405,8 @@ impl PassiveWork {
     unsafe_code,
     reason = "suspended IRPs, stream leases and referenced devices retain every captured mapping and identity through native work"
 )]
-// SAFETY: Cached transfers own their captured IRP; other IRP work is retained by the suspended
-// operation in the same envelope. Stream leases retain Cc/MM identities, and sector queries own
+// SAFETY: Cached transfers and cache teardown own their IRP; other IRP work is retained by the
+// suspended operation in the same envelope. Stream leases retain Cc/MM identities, and sector queries own
 // a device reference. Native access ends before either completion owner can resume or release.
 unsafe impl Send for PassiveWork {}
 
