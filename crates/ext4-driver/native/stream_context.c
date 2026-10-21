@@ -14,6 +14,7 @@
 #include "section_deletion.h"
 #include "irp_forward.h"
 #include "directory_notification.h"
+#include "fsrtl_completion.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
@@ -554,7 +555,7 @@ ext4win_stream_oplock_fsctrl(
     ext4win_acquire_resource_exclusive(&stream->MainResource, TRUE);
     FsRtlIncrementLockRequestsInProgress(stream->ByteRangeLocks);
     __try {
-        status = FsRtlOplockFsctrlEx(
+        status = ext4win_oplock_fsctrl(
             &stream->Header.Oplock,
             irp,
             open_count,
@@ -591,7 +592,7 @@ ext4win_stream_check_oplock(
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
     ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
     __try {
-        status = FsRtlCheckOplockEx(
+        status = ext4win_check_oplock(
             &stream->Header.Oplock,
             irp,
             flags,
@@ -628,7 +629,7 @@ ext4win_stream_cleanup_oplock(_In_ PVOID stream_header, _Inout_ PIRP irp, _In_ U
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
     ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
     __try {
-        status = FsRtlCheckOplockEx(&stream->Header.Oplock, irp, flags, NULL, NULL, NULL);
+        status = ext4win_check_oplock(&stream->Header.Oplock, irp, flags, NULL, NULL, NULL);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { status = GetExceptionCode(); }
     ext4win_release_resource(&stream->MainResource);
@@ -657,7 +658,7 @@ ext4win_stream_backout_atomic_oplock(
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
     ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
     __try {
-        status = FsRtlCheckOplockEx(
+        status = ext4win_check_oplock(
             &stream->Header.Oplock,
             irp,
             OPLOCK_FLAG_BACK_OUT_ATOMIC_OPLOCK,
@@ -1578,7 +1579,7 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     stream->Signature = 0;
     stream->Owner = NULL;
     if (stream->OplockInitialized) {
-        FsRtlUninitializeOplock(&stream->Header.Oplock);
+        ext4win_uninitialize_oplock(&stream->Header.Oplock);
         stream->OplockInitialized = FALSE;
     }
     if (stream->HeaderInitialized) {

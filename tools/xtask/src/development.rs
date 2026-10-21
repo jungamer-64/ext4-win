@@ -215,6 +215,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "directory_notification.tests.c",
             "native directory notification allocation exception contract",
         ),
+        (
+            "fsrtl-completion",
+            "fsrtl_completion.tests.c",
+            "native FsRtl completion reentry and SEH restoration contract",
+        ),
     ] {
         let directory = crate::process::create_task_directory(root, name)?;
         let executable = directory.join("synchronization-tests.exe");

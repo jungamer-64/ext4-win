@@ -186,18 +186,17 @@ pub(crate) use wdk_sys::ntddk::{
     ExInitializeRundownProtection, ExReleaseResourceAndLeaveCriticalRegion,
     ExReleaseRundownProtection, ExWaitForRundownProtectionRelease, FsRtlDismountComplete,
     FsRtlFastCheckLockForRead, FsRtlFastCheckLockForWrite, FsRtlGetSectorSizeInformation,
-    FsRtlInitializeFileLock, FsRtlNotifyCleanup, FsRtlNotifyCleanupAll,
-    FsRtlNotifyFullChangeDirectory, FsRtlNotifyFullReportChange, FsRtlNotifyUninitializeSync,
-    FsRtlUninitializeFileLock, IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl,
-    IoAllocateWorkItem, IoCancelIrp, IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp,
-    IoFreeIrp, IoFreeMdl, IoFreeWorkItem, IoGetNextIrpStackLocation, IoGetRequestorProcess,
-    IoGetTopLevelIrp, IoQueueWorkItem, IoRegisterShutdownNotification, IoReleaseVpbSpinLock,
-    IoSetCompletionRoutineEx, IoSetTopLevelIrp, IoUnregisterShutdownNotification, IofCallDriver,
-    KeAcquireSpinLockRaiseToDpc, KeCancelTimer, KeFlushQueuedDpcs, KeInitializeDpc,
-    KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer, KeInsertQueueDpc,
-    KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool,
-    MmUnlockPages, ObfDereferenceObject, ObfReferenceObject, PsCreateSystemThread,
-    PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
+    FsRtlInitializeFileLock, FsRtlNotifyUninitializeSync, FsRtlUninitializeFileLock,
+    IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl, IoAllocateWorkItem, IoCancelIrp,
+    IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoFreeWorkItem,
+    IoGetNextIrpStackLocation, IoGetRequestorProcess, IoGetTopLevelIrp, IoQueueWorkItem,
+    IoRegisterShutdownNotification, IoReleaseVpbSpinLock, IoSetCompletionRoutineEx,
+    IoSetTopLevelIrp, IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc,
+    KeCancelTimer, KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock,
+    KeInitializeTimer, KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent, KeSetTimer,
+    KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages, ObfDereferenceObject,
+    ObfReferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
+    ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]
@@ -224,6 +223,42 @@ unsafe extern "system" {
     pub(crate) fn ext4win_notify_initialize_sync(
         sync: *mut wdk_sys::PNOTIFY_SYNC,
     ) -> wdk_sys::NTSTATUS;
+
+    /// Transfers a live watch IRP to FsRtl with recursive completion marked until return.
+    /// The pinned sync/list and CCB context must outlive the registered watch.
+    pub(crate) fn ext4win_notify_register(
+        sync: wdk_sys::PNOTIFY_SYNC,
+        list: *mut wdk_sys::LIST_ENTRY,
+        context: wdk_sys::PVOID,
+        directory: wdk_sys::PSTRING,
+        filter: u32,
+        irp: wdk_sys::PIRP,
+    );
+
+    /// Reports a borrowed name synchronously under a saved/restored completion marker.
+    /// The sync/list must be initialized and pinned for this call.
+    pub(crate) fn ext4win_notify_report(
+        sync: wdk_sys::PNOTIFY_SYNC,
+        list: *mut wdk_sys::LIST_ENTRY,
+        target: wdk_sys::PSTRING,
+        name_offset: u16,
+        filter: u32,
+        action: u32,
+    );
+
+    /// Completes watches for a live CCB context under a saved/restored completion marker.
+    /// The sync/list must remain initialized and pinned through completion.
+    pub(crate) fn ext4win_notify_cleanup(
+        sync: wdk_sys::PNOTIFY_SYNC,
+        list: *mut wdk_sys::LIST_ENTRY,
+        context: wdk_sys::PVOID,
+    );
+
+    /// Drains the initialized, pinned watch list under a saved/restored completion marker.
+    pub(crate) fn ext4win_notify_cleanup_all(
+        sync: wdk_sys::PNOTIFY_SYNC,
+        list: *mut wdk_sys::LIST_ENTRY,
+    );
 
     /// Copies effective user/primary-group SIDs while retaining and locking the captured subject.
     pub(crate) fn ext4win_creator_sids(

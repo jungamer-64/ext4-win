@@ -56,6 +56,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/file_lock_completion.h");
     println!("cargo:rerun-if-changed=native/irp_forward.h");
     println!("cargo:rerun-if-changed=native/directory_notification.h");
+    println!("cargo:rerun-if-changed=native/fsrtl_completion.h");
     println!("cargo:rerun-if-changed=native/stream_metadata.h");
     println!("cargo:rerun-if-changed=native/cache_mdl.h");
     println!("cargo:rerun-if-changed=native/cache_close.h");

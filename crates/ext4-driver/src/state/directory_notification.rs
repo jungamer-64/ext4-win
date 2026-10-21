@@ -255,17 +255,13 @@ impl DirectoryChangeNotifier {
                 // SAFETY: The IRP was removed from the driver queue and its
                 // unique completion owner is intentionally transferring it to
                 // FsRtl. The registration context is a live CCB pointer.
-                ffi::FsRtlNotifyFullChangeDirectory(
+                ffi::ext4win_notify_register(
                     sync,
                     list_head,
                     registration.context.as_ptr(),
                     registration.full_directory_name.as_ptr().cast(),
-                    0,
-                    0,
                     registration.completion_filter,
                     target.into_raw_irp(),
-                    None,
-                    core::ptr::null_mut(),
                 );
             }
             STATUS_PENDING
@@ -311,16 +307,13 @@ impl DirectoryChangeNotifier {
             unsafe {
                 // SAFETY: This runs after the namespace transaction commits
                 // at PASSIVE_LEVEL. FsRtl consumes the event synchronously.
-                ffi::FsRtlNotifyFullReportChange(
+                ffi::ext4win_notify_report(
                     sync,
                     list_head,
                     core::ptr::from_mut(&mut full_target_name).cast(),
                     change.target.name_offset_bytes,
-                    core::ptr::null_mut(),
-                    core::ptr::null_mut(),
                     change.completion_filter,
                     change.action.as_ulong(),
-                    core::ptr::null_mut(),
                 );
             }
         }
@@ -358,7 +351,7 @@ impl DirectoryChangeNotifier {
             unsafe {
                 // SAFETY: The CCB pointer uniquely identifies the FILE_OBJECT
                 // being cleaned up and stays alive until its later close IRP.
-                ffi::FsRtlNotifyCleanup(sync, list_head, context.as_ptr());
+                ffi::ext4win_notify_cleanup(sync, list_head, context.as_ptr());
             }
         }
         #[cfg(test)]
@@ -393,7 +386,7 @@ impl DirectoryChangeNotifier {
             };
             unsafe {
                 // SAFETY: No actor-owned registration can race this volume-wide withdrawal.
-                ffi::FsRtlNotifyCleanupAll(sync, list_head);
+                ffi::ext4win_notify_cleanup_all(sync, list_head);
             }
         }
     }
