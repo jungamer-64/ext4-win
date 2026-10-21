@@ -253,7 +253,7 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     transition,
                     close,
                 },
-                CompletionEvent::Core(OperationEvent::BarrierReleased(permit)),
+                CompletionEvent::BarrierReleased(permit),
             ) => {
                 if permit.into_identity() != 1 {
                     return Self::fail(
@@ -289,7 +289,7 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     transition,
                     close,
                 },
-                CompletionEvent::Core(OperationEvent::BarrierReleased(permit)),
+                CompletionEvent::BarrierReleased(permit),
             ) => {
                 if permit.into_identity() != 1 {
                     return Self::fail(

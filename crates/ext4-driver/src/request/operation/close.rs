@@ -63,10 +63,7 @@ impl MountedVolumeOperation for CloseOperation {
                     suspended: self,
                 }
             }
-            (
-                CloseState::Waiting(mut owned),
-                CompletionEvent::Core(OperationEvent::BarrierReleased(permit)),
-            ) => {
+            (CloseState::Waiting(mut owned), CompletionEvent::BarrierReleased(permit)) => {
                 if permit.into_identity() != CLOSE_HANDLE_BARRIER {
                     crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }

@@ -215,10 +215,7 @@ impl MountedVolumeOperation for CleanupOperation {
                     suspended: self,
                 }
             }
-            (
-                CleanupState::Waiting(mut owned),
-                CompletionEvent::Core(OperationEvent::BarrierReleased(permit)),
-            ) => {
+            (CleanupState::Waiting(mut owned), CompletionEvent::BarrierReleased(permit)) => {
                 if permit.into_identity() != CLEANUP_HANDLE_BARRIER {
                     crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }

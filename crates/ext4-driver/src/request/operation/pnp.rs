@@ -166,7 +166,7 @@ impl MountedVolumeOperation for QueryRemoveOperation {
                     preparation,
                     barrier,
                 },
-                CompletionEvent::Core(OperationEvent::BarrierReleased(permit)),
+                CompletionEvent::BarrierReleased(permit),
             ) => {
                 if permit.into_identity() != 1 {
                     crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();

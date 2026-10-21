@@ -20,10 +20,7 @@ mod scope;
 mod transaction;
 
 pub use directory::{DirectoryScanCursor, ScannedDirectoryEntry};
-pub use event::{
-    CheckpointLease, CommitLease, MutationLease, OperationEvent, OperationId,
-    VisibilityLease,
-};
+pub use event::{CheckpointLease, CommitLease, MutationLease, OperationEvent, VisibilityLease};
 pub use mount::{
     CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CommittedEpoch,
     CommittedReadContext, CompletedMount, EpochSequence, ExternalJournalProbeOperation,

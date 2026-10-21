@@ -579,12 +579,10 @@ impl ControlDeviceOperation for MountRequestOperation {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
                 OperationEvent::StorageCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_) => {
+                | OperationEvent::CheckpointGranted(_) => {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
@@ -1071,12 +1069,10 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     }
                     OperationEvent::StorageCompleted(_)
                     | OperationEvent::DeviceLengthCompleted(_)
-                    | OperationEvent::RetryElapsed(_)
                     | OperationEvent::IntentGranted(_)
                     | OperationEvent::CommitGranted(_)
                     | OperationEvent::VisibilityGranted(_)
-                    | OperationEvent::CheckpointGranted(_)
-                    | OperationEvent::BarrierReleased(_) => {
+                    | OperationEvent::CheckpointGranted(_) => {
                         Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                     }
                 };
@@ -1102,12 +1098,10 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     }
                     OperationEvent::StorageCompleted(_)
                     | OperationEvent::DeviceLengthCompleted(_)
-                    | OperationEvent::RetryElapsed(_)
                     | OperationEvent::IntentGranted(_)
                     | OperationEvent::CommitGranted(_)
                     | OperationEvent::VisibilityGranted(_)
-                    | OperationEvent::CheckpointGranted(_)
-                    | OperationEvent::BarrierReleased(_) => {
+                    | OperationEvent::CheckpointGranted(_) => {
                         Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                     }
                 };
@@ -1464,12 +1458,10 @@ impl MountedVolumeOperation for RawVolumeOperation {
                 }
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_) => {
+                | OperationEvent::CheckpointGranted(_) => {
                     self.complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
@@ -1717,12 +1709,10 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
             OperationEvent::CancelRequested => Err(DriverError::from(Error::OperationCancelled)),
             OperationEvent::StorageCompleted(_)
             | OperationEvent::DeviceLengthCompleted(_)
-            | OperationEvent::RetryElapsed(_)
             | OperationEvent::IntentGranted(_)
             | OperationEvent::CommitGranted(_)
             | OperationEvent::VisibilityGranted(_)
-            | OperationEvent::CheckpointGranted(_)
-            | OperationEvent::BarrierReleased(_) => Err(DriverError::InternalInvariantViolation),
+            | OperationEvent::CheckpointGranted(_) => Err(DriverError::InternalInvariantViolation),
         };
         OperationTransition::Complete(owned.prepare_result(result))
     }
@@ -1797,12 +1787,10 @@ impl MountedVolumeOperation for NotificationOperation {
             ),
             OperationEvent::StorageCompleted(_)
             | OperationEvent::DeviceLengthCompleted(_)
-            | OperationEvent::RetryElapsed(_)
             | OperationEvent::IntentGranted(_)
             | OperationEvent::CommitGranted(_)
             | OperationEvent::VisibilityGranted(_)
-            | OperationEvent::CheckpointGranted(_)
-            | OperationEvent::BarrierReleased(_) => OperationTransition::Complete(
+            | OperationEvent::CheckpointGranted(_) => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::InternalInvariantViolation)),
             ),
         }
@@ -1985,12 +1973,10 @@ impl MountedVolumeOperation for ByteRangeLockOperation {
                 | ByteRangeLockOperationState::OplockReady { owned, .. },
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_),
+                | OperationEvent::CheckpointGranted(_),
             ) => Self::complete(owned, Err(DriverError::InternalInvariantViolation)),
             (ByteRangeLockOperationState::OplockDelegated, _)
             | (ByteRangeLockOperationState::Terminal, _) => {
@@ -2142,12 +2128,10 @@ impl MountedVolumeOperation for OplockControlOperation {
                 OplockControlOperationState::Ready { owned, .. },
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_),
+                | OperationEvent::CheckpointGranted(_),
             ) => Self::complete(owned, DriverError::InternalInvariantViolation),
             (OplockControlOperationState::Terminal, _) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
@@ -2366,6 +2350,43 @@ impl MountedVolumeOperation for VolumeControlOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
+            CompletionEvent::BarrierReleased(permit) => {
+                let state =
+                    core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
+                let VolumeControlOperationState::Waiting {
+                    owned,
+                    target,
+                    transition,
+                    devices,
+                } = state
+                else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+
+                if permit.into_identity() != 1 {
+                    return Self::fail_transition(
+                        owned,
+                        transition,
+                        DriverError::InternalInvariantViolation,
+                        access,
+                    );
+                }
+                let request = StorageRequest::Flush {
+                    target: ext4_core::StorageTarget::Filesystem,
+                };
+                let expected = StorageRequestIdentity::from_request(&request);
+                self.state = VolumeControlOperationState::Flushing {
+                    owned,
+                    target,
+                    transition,
+                    expected,
+                };
+                return OperationTransition::SubmitLower {
+                    devices,
+                    request,
+                    suspended: self,
+                };
+            }
             CompletionEvent::PassiveCompleted(completion) => {
                 let state =
                     core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
@@ -2459,46 +2480,16 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 }
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_) => {
+                | OperationEvent::CheckpointGranted(_) => {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
             VolumeControlOperationState::Waiting {
-                owned,
-                target,
-                transition,
-                devices,
+                owned, transition, ..
             } => match event {
-                OperationEvent::BarrierReleased(permit) => {
-                    if permit.into_identity() != 1 {
-                        return Self::fail_transition(
-                            owned,
-                            transition,
-                            DriverError::InternalInvariantViolation,
-                            access,
-                        );
-                    }
-                    let request = StorageRequest::Flush {
-                        target: ext4_core::StorageTarget::Filesystem,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = VolumeControlOperationState::Flushing {
-                        owned,
-                        target,
-                        transition,
-                        expected,
-                    };
-                    OperationTransition::SubmitLower {
-                        devices,
-                        request,
-                        suspended: self,
-                    }
-                }
                 OperationEvent::CancelRequested => Self::fail_transition(
                     owned,
                     transition,
@@ -2508,7 +2499,6 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 OperationEvent::Admitted
                 | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
@@ -2560,12 +2550,10 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 OperationEvent::Admitted
                 | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_) => Self::fail_transition(
+                | OperationEvent::CheckpointGranted(_) => Self::fail_transition(
                     owned,
                     transition,
                     DriverError::InternalInvariantViolation,
@@ -2844,6 +2832,30 @@ impl MountedVolumeOperation for FlushRequestOperation {
     ) -> OperationTransition {
         let event = match event {
             CompletionEvent::Core(event) => event,
+            CompletionEvent::BarrierReleased(permit) => {
+                let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
+                let FlushOperationState::Waiting { owned } = state else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+
+                if permit.into_identity() != 0 {
+                    return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
+                }
+                let request = StorageRequest::Flush {
+                    target: ext4_core::StorageTarget::Filesystem,
+                };
+                let expected = StorageRequestIdentity::from_request(&request);
+                self.state = FlushOperationState::InFlight {
+                    owned,
+                    expected,
+                    scope: crate::state::VolumeFlushScope::Filesystem,
+                };
+                return OperationTransition::SubmitLower {
+                    devices: self.devices,
+                    request,
+                    suspended: self,
+                };
+            }
             CompletionEvent::PassiveCompleted(completion) => {
                 let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
                 let (
@@ -2896,12 +2908,10 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 }
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_) => {
+                | OperationEvent::CheckpointGranted(_) => {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
@@ -2921,12 +2931,10 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 }
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::CheckpointGranted(_)
-                | OperationEvent::BarrierReleased(_) => {
+                | OperationEvent::CheckpointGranted(_) => {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
@@ -2939,33 +2947,12 @@ impl MountedVolumeOperation for FlushRequestOperation {
                     .bugcheck()
             }
             FlushOperationState::Waiting { owned } => match event {
-                OperationEvent::BarrierReleased(permit) => {
-                    if permit.into_identity() != 0 {
-                        return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
-                    }
-                    let request = StorageRequest::Flush {
-                        target: ext4_core::StorageTarget::Filesystem,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = FlushOperationState::InFlight {
-                        owned,
-                        expected,
-                        scope: crate::state::VolumeFlushScope::Filesystem,
-                    };
-                    OperationTransition::SubmitLower {
-                        devices: self.devices,
-                        request,
-                        suspended: self,
-                    }
-                }
-
                 OperationEvent::CancelRequested => {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
                 OperationEvent::Admitted
                 | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
@@ -5273,6 +5260,10 @@ impl MutationRequestOperation {
         access: &mut MountedVolumeAccess<'_>,
     ) -> MutationStep {
         let event = match event {
+            CompletionEvent::BarrierReleased(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             CompletionEvent::Core(event) => event,
             CompletionEvent::PassiveCompleted(completion) => {
                 let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
@@ -5901,11 +5892,9 @@ impl MutationRequestOperation {
                 OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::CancelRequested
-                | OperationEvent::RetryElapsed(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
-                | OperationEvent::VisibilityGranted(_)
-                | OperationEvent::BarrierReleased(_) => {
+                | OperationEvent::VisibilityGranted(_) => {
                     let (_, publication, _) = pending.into_parts();
                     MutationStep::Transition(self.fail_checkpoint(
                         publication,

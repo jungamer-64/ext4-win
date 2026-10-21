@@ -325,6 +325,25 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget);
 }
 
+/// One terminal-barrier release bound to an operation waiting behind earlier requests.
+#[derive(Debug)]
+pub(crate) struct BarrierPermit {
+    /// Scheduler-local barrier identity.
+    barrier: u64,
+}
+
+impl BarrierPermit {
+    /// Issued only by this reactor after every operation preceding the barrier has terminated.
+    const fn released(barrier: u64) -> Self {
+        Self { barrier }
+    }
+
+    /// Consumes the permit into its scheduler-local identity.
+    pub(crate) const fn into_identity(self) -> u64 {
+        self.barrier
+    }
+}
+
 /// Events owned by the Windows executor, including failures with native status semantics.
 ///
 /// A volume failure only rejects an ungranted commit or a durability wait. It never revokes
@@ -333,6 +352,8 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
 pub(crate) enum CompletionEvent {
     /// A filesystem event with its original consuming grant or lower completion.
     Core(OperationEvent),
+    /// A handle or durability barrier has released this operation.
+    BarrierReleased(BarrierPermit),
     /// One PASSIVE_LEVEL native work item returned to the unique reactor owner.
     PassiveCompleted(crate::irp::PassiveWorkCompletion),
     /// The volume can no longer satisfy a pre-effect commit or durability wait.
@@ -349,12 +370,12 @@ impl CompletionEvent {
         }
     }
 
-    /// Extracts an event for an operation that never waits on volume durability.
+    /// Extracts an event for an operation that never waits on native work or scheduler barriers.
     /// A native wait failure routed to such an operation is reactor state corruption.
     pub(crate) fn into_core(self) -> OperationEvent {
         match self {
             Self::Core(event) => event,
-            Self::PassiveCompleted(_) | Self::VolumeFailed(_) => {
+            Self::BarrierReleased(_) | Self::PassiveCompleted(_) | Self::VolumeFailed(_) => {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             }
         }
@@ -365,9 +386,7 @@ impl CompletionEvent {
     fn durability_wait(identity: u64, readiness: DriverResult<bool>) -> Option<Self> {
         match readiness {
             Ok(false) => None,
-            Ok(true) => Some(Self::Core(OperationEvent::BarrierReleased(
-                ext4_core::BarrierPermit::released(identity),
-            ))),
+            Ok(true) => Some(Self::BarrierReleased(BarrierPermit::released(identity))),
             Err(error) => Some(Self::VolumeFailed(error)),
         }
     }
@@ -4395,8 +4414,8 @@ impl CompletionReactor {
                 }) {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
-                Some(CompletionEvent::Core(OperationEvent::BarrierReleased(
-                    ext4_core::BarrierPermit::released(identity),
+                Some(CompletionEvent::BarrierReleased(BarrierPermit::released(
+                    identity,
                 )))
             }
         };
@@ -5114,9 +5133,9 @@ mod tests {
         let released = CompletionEvent::durability_wait(1, Ok(true));
         assert!(matches!(
             &released,
-            Some(CompletionEvent::Core(OperationEvent::BarrierReleased(_)))
+            Some(CompletionEvent::BarrierReleased(_))
         ));
-        let Some(CompletionEvent::Core(OperationEvent::BarrierReleased(permit))) = released else {
+        let Some(CompletionEvent::BarrierReleased(permit)) = released else {
             return;
         };
         assert_eq!(permit.into_identity(), 1);
