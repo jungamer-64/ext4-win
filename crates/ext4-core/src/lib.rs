@@ -47,7 +47,7 @@ pub use protection::verity::{
     FsverityBlockSize, FsverityEnable, FsverityHashAlgorithm, FsveritySalt, FsveritySignature,
 };
 pub use volume::{
-    BarrierPermit, CheckpointLease, CheckpointOperation, CheckpointPublication, ChildLookup,
+    CheckpointLease, CheckpointOperation, CheckpointPublication, ChildLookup,
     CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CleanJournalDurability,
     CleanJournalRecordPhase, CommitDurability, CommitLease, CommitReadyMutation, CommitRecordPhase,
     CommittedEpoch, CommittedReadContext, CommittedReadPass, CompletedMount, DataAllocationRun,
@@ -60,9 +60,9 @@ pub use volume::{
     MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveOperation,
     MutationResolvePass, MutationResolveReady, MutationResolveTransition, MutationResource,
     NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot, NodeMetadataUpdate,
-    ObservedResourceVersionSet, OperationEvent, OperationId, OrderedDataDurability,
+    ObservedResourceVersionSet, OperationEvent, OrderedDataDurability,
     PreparedKeyChange, PublishedMutation, ReadTransition, ReservedKeyChange, ReservedMutation,
-    ResolvedKeyChange, ResolvedMutation, ResourceVersion, RetryPermit, ScannedDirectoryEntry,
+    ResolvedKeyChange, ResolvedMutation, ResourceVersion, ScannedDirectoryEntry,
     StorageRequestSequence, StorageRequestSequenceStep, SymlinkNode, SymlinkNodeId,
     TransactionDirectory, TransactionFile, TransactionHardLinkSource, TransactionNode,
     TransactionSymlink, ValidatedExternalJournal, VisibilityLease, VolumeGeometry, VolumeIdentity,

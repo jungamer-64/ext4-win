@@ -21,8 +21,8 @@ mod transaction;
 
 pub use directory::{DirectoryScanCursor, ScannedDirectoryEntry};
 pub use event::{
-    BarrierPermit, CheckpointLease, CommitLease, MutationLease, OperationEvent, OperationId,
-    RetryPermit, VisibilityLease,
+    CheckpointLease, CommitLease, MutationLease, OperationEvent, OperationId,
+    VisibilityLease,
 };
 pub use mount::{
     CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CommittedEpoch,

@@ -402,13 +402,11 @@ impl EpochReadOperation {
             super::OperationEvent::CancelRequested => {
                 return ReadTransition::Complete(Err(Error::OperationCancelled));
             }
-            super::OperationEvent::RetryElapsed(_)
-            | super::OperationEvent::DeviceLengthCompleted(_)
+            super::OperationEvent::DeviceLengthCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)
-            | super::OperationEvent::CheckpointGranted(_)
-            | super::OperationEvent::BarrierReleased(_) => {
+            | super::OperationEvent::CheckpointGranted(_) => {
                 return ReadTransition::Complete(Err(Error::DeviceIo));
             }
         }
@@ -503,13 +501,11 @@ impl MutationResolveOperation {
                 self.filesystem.complete(completion)?;
             }
             super::OperationEvent::CancelRequested => return Err(Error::OperationCancelled),
-            super::OperationEvent::RetryElapsed(_)
-            | super::OperationEvent::DeviceLengthCompleted(_)
+            super::OperationEvent::DeviceLengthCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)
-            | super::OperationEvent::CheckpointGranted(_)
-            | super::OperationEvent::BarrierReleased(_) => return Err(Error::DeviceIo),
+            | super::OperationEvent::CheckpointGranted(_) => return Err(Error::DeviceIo),
         }
         Ok(MutationResolveReady {
             mount: self.mount,
