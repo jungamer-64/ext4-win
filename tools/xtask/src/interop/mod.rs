@@ -1049,11 +1049,22 @@ fn run_prepared_mutation_until_boundary(
         return Ok(controller.stopped());
     };
     let published = durable
-        .publish(coordinator.grant_visibility(ticket), coordinator)
+        .publish(
+            coordinator
+                .acquire_visibility(ticket)
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)
+                .map_err(core_task_error)?,
+            coordinator,
+        )
         .map_err(|(error, _durable)| core_task_error(error))?;
     let (epoch, checkpoint) = published.into_parts();
     let sequence = checkpoint
-        .start(coordinator.grant_checkpoint(epoch.sequence()))
+        .start(
+            coordinator
+                .acquire_checkpoint(epoch.sequence())
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)
+                .map_err(core_task_error)?,
+        )
         .map_err(|(error, _checkpoint)| core_task_error(error))?;
     let home = match complete_boundary_sequence(storage, &mut controller, sequence)? {
         BoundarySequence::Stopped => return Ok(controller.stopped()),
@@ -1273,7 +1284,11 @@ where
         .map_err(core_task_error)?;
     let prepared = reserved
         .prepare_commit(
-            coordinator.grant_commit(ticket),
+            coordinator
+                .acquire_commit(ticket)
+                .map_err(core_task_error)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)
+                .map_err(core_task_error)?,
             coordinator,
             epoch,
             &mut cache,
@@ -1334,11 +1349,22 @@ fn complete_prepared_mutation<S: HostStorage>(
     let commit_durability = complete_file_transfer(storage, commit_record.submit())?;
     let durable = complete_file_transfer(storage, commit_durability.submit())?;
     let published = durable
-        .publish(coordinator.grant_visibility(ticket), coordinator)
+        .publish(
+            coordinator
+                .acquire_visibility(ticket)
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)
+                .map_err(core_task_error)?,
+            coordinator,
+        )
         .map_err(|(error, _durable)| core_task_error(error))?;
     let (epoch, checkpoint) = published.into_parts();
     let sequence = checkpoint
-        .start(coordinator.grant_checkpoint(epoch.sequence()))
+        .start(
+            coordinator
+                .acquire_checkpoint(epoch.sequence())
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)
+                .map_err(core_task_error)?,
+        )
         .map_err(|(error, _checkpoint)| core_task_error(error))?;
     let home = complete_storage_sequence(storage, sequence)?;
     let clean_record = complete_file_transfer(storage, home.submit())?;

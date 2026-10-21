@@ -658,18 +658,44 @@ impl StorageReadOverlay for CommittedEpoch {
     }
 }
 
+/// Operation authority over a clean journal, independent of its durable on-disk state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CommitAdmission {
+    /// No journal or mount-key operation owns the commit lane.
+    Available,
+    /// One unprepared lease can be consumed or explicitly revoked.
+    Granted(super::event::CommitClaim),
+    /// The preparation owns all subsequent commit/publication authority.
+    Prepared(super::event::CommitClaim),
+    /// One visibility lease has been issued for that preparation.
+    Publishing(super::event::CommitClaim),
+}
+
+/// Checkpoint admission cannot be reconstructed after its lease is issued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CheckpointAdmission {
+    /// The durable mutation has handed off its dirty journal to checkpoint work.
+    Available,
+    /// The checkpoint operation owns its only grant through clean publication.
+    Granted,
+}
+
 /// Journal coordinator phase. A new commit is granted only in `Ready`.
 #[derive(Debug)]
-pub(crate) enum JournalCoordinatorState {
+pub(super) enum JournalCoordinatorState {
     /// Clean journal with space available for one commit.
     Ready {
         /// Clean log whose space can admit the next commit.
         journal: Journal<CleanJournal>,
+        /// Sole acquisition and consumption state for this clean journal.
+        admission: CommitAdmission,
         /// Published identity paired with the version table while no checkpoint is pending.
         epoch: (FilesystemUuid, EpochSequence),
     },
     /// Commit is visible, while an independent checkpoint still owns the dirty journal state.
     CheckpointPending {
+        /// Sole checkpoint acquisition state.
+        admission: CheckpointAdmission,
         /// Durable overlay identity paired with versions until home-block durability completes.
         epoch: (FilesystemUuid, EpochSequence),
     },
@@ -679,7 +705,7 @@ impl JournalCoordinatorState {
     /// Identity published by the transition that owns this journal phase.
     const fn epoch(&self) -> (FilesystemUuid, EpochSequence) {
         match self {
-            Self::Ready { epoch, .. } | Self::CheckpointPending { epoch } => *epoch,
+            Self::Ready { epoch, .. } | Self::CheckpointPending { epoch, .. } => *epoch,
         }
     }
 }
@@ -790,16 +816,18 @@ struct ReadObservation<'pass, 'state> {
 
 /// Mutable journal cursor, resource versions, and allocation reservations.
 ///
-/// The owning scheduler arbitrates gates before issuing grants through this coordinator.
+/// The scheduler selects candidates; this coordinator acquires and consumes journal authority.
 /// Each grant belongs to this mount session and is consumed even when a transition rejects it.
 #[derive(Debug)]
 pub struct MutationCoordinatorState {
     /// Origin retained independently of on-disk UUID and local sequence numbers.
     pub(super) mount: MountIdentity,
     /// Current journal phase.
-    pub(crate) journal: JournalCoordinatorState,
+    pub(super) journal: JournalCoordinatorState,
     /// Monotonic FIFO ticket assigned to the next mutation admission.
     next_ticket: u64,
+    /// Next non-reusable commit acquisition identity.
+    next_claim: u64,
     /// Indexed committed resource versions, expanded before commit I/O.
     resource_versions: ResourceVersionTable,
 }
@@ -814,10 +842,12 @@ impl MutationCoordinatorState {
         Self {
             mount: current.mount,
             journal: JournalCoordinatorState::Ready {
+                admission: CommitAdmission::Available,
                 journal,
                 epoch: (current.identity().uuid(), current.sequence()),
             },
             next_ticket: 0,
+            next_claim: 0,
             resource_versions: ResourceVersionTable::empty(),
         }
     }
@@ -859,6 +889,157 @@ impl MutationCoordinatorState {
     #[must_use]
     pub fn grant_intent(&mut self, ticket: u64) -> super::MutationLease {
         super::MutationLease::new(self.mount, ticket)
+    }
+
+    /// Acquires the sole commit lane without bypassing a pending checkpoint.
+    /// `Ok(None)` denotes contention and leaves the existing owner unchanged.
+    /// # Errors
+    /// Returns acquisition-identity exhaustion before issuing any authority.
+    pub fn acquire_commit(&mut self, ticket: u64) -> Result<Option<super::CommitLease>> {
+        let JournalCoordinatorState::Ready {
+            admission: CommitAdmission::Available,
+            ..
+        } = self.journal
+        else {
+            return Ok(None);
+        };
+        let claim = super::event::CommitClaim {
+            ticket,
+            generation: self.next_claim,
+        };
+        let next = self
+            .next_claim
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if let JournalCoordinatorState::Ready { admission, .. } = &mut self.journal {
+            *admission = CommitAdmission::Granted(claim);
+        }
+        self.next_claim = next;
+        Ok(Some(super::CommitLease::new(self.mount, claim)))
+    }
+
+    /// Revokes an unprepared grant; a stale lease stays invalid after reacquisition.
+    /// Prepared, durable, and checkpoint authority can only be retired by their owning values.
+    pub fn revoke_unprepared_commit(&mut self, ticket: u64) {
+        if let JournalCoordinatorState::Ready { admission, .. } = &mut self.journal
+            && matches!(admission, CommitAdmission::Granted(claim) if claim.ticket == ticket)
+        {
+            *admission = CommitAdmission::Available;
+        }
+    }
+
+    /// Issues visibility authority only for the current completed preparation.
+    #[must_use]
+    pub fn acquire_visibility(&mut self, ticket: u64) -> Option<super::VisibilityLease> {
+        let JournalCoordinatorState::Ready { admission, .. } = &mut self.journal else {
+            return None;
+        };
+        let CommitAdmission::Prepared(claim) = *admission else {
+            return None;
+        };
+        if claim.ticket != ticket {
+            return None;
+        }
+        *admission = CommitAdmission::Publishing(claim);
+        Some(super::VisibilityLease::new(self.mount, claim))
+    }
+
+    /// Acquires checkpoint authority exactly once for the currently visible dirty epoch.
+    #[must_use]
+    pub fn acquire_checkpoint(
+        &mut self,
+        requested: EpochSequence,
+    ) -> Option<super::CheckpointLease> {
+        let JournalCoordinatorState::CheckpointPending { epoch, admission } = &mut self.journal
+        else {
+            return None;
+        };
+        if epoch.1 != requested || *admission != CheckpointAdmission::Available {
+            return None;
+        }
+        *admission = CheckpointAdmission::Granted;
+        Some(super::CheckpointLease::new(self.mount, requested))
+    }
+
+    /// Whether a clean journal has no granted or prepared operation.
+    #[must_use]
+    pub fn journal_is_clean(&self) -> bool {
+        matches!(
+            self.journal,
+            JournalCoordinatorState::Ready {
+                admission: CommitAdmission::Available,
+                ..
+            }
+        )
+    }
+
+    /// Consumes only the acquisition currently reserved for this preparation.
+    /// # Errors
+    /// Returns a revoked, foreign or mismatched lease; no unrelated authority is released.
+    pub(super) fn accept_commit(
+        &self,
+        lease: super::CommitLease,
+        ticket: u64,
+    ) -> Result<super::event::CommitClaim> {
+        let claim = lease.consume(&self.mount)?;
+        if claim.ticket != ticket
+            || !matches!(self.journal, JournalCoordinatorState::Ready { admission: CommitAdmission::Granted(current), .. } if current == claim)
+        {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        Ok(claim)
+    }
+
+    /// Owns grant consumption, fallible preparation and pre-effect failure recovery together.
+    /// # Errors
+    /// Returns a rejected grant or preparation failure; accepted failures release the acquisition.
+    pub(super) fn prepare_publication<T>(
+        &mut self,
+        lease: super::CommitLease,
+        ticket: u64,
+        prepare: impl FnOnce(&mut Self, super::event::CommitClaim) -> Result<T>,
+    ) -> Result<T> {
+        let claim = self.accept_commit(lease, ticket)?;
+        let result = prepare(self, claim);
+        if let JournalCoordinatorState::Ready { admission, .. } = &mut self.journal {
+            *admission = match &result {
+                Ok(_) => CommitAdmission::Prepared(claim),
+                Err(_) => CommitAdmission::Available,
+            };
+        }
+        result
+    }
+
+    /// Checks the one visibility lease against its preparation, acquisition and mount.
+    pub(super) fn accepts_visibility(
+        &self,
+        lease: super::VisibilityLease,
+        claim: super::event::CommitClaim,
+    ) -> bool {
+        lease.consume(&self.mount) == Ok(claim)
+            && matches!(self.journal, JournalCoordinatorState::Ready { admission: CommitAdmission::Publishing(current), .. } if current == claim)
+    }
+
+    /// Retires an unpublished preparation only when its owning value is being consumed.
+    /// # Errors
+    /// Returns a foreign or superseded preparation without changing current authority.
+    pub(super) fn abort_prepared(
+        &mut self,
+        mount: MountIdentity,
+        claim: super::event::CommitClaim,
+    ) -> Result<()> {
+        if self.mount != mount {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        let JournalCoordinatorState::Ready { admission, .. } = &mut self.journal else {
+            return Err(Error::ClusterReferenceConflict);
+        };
+        if !matches!(admission, CommitAdmission::Prepared(current) | CommitAdmission::Publishing(current) if *current == claim)
+        {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        *admission = CommitAdmission::Available;
+        Ok(())
     }
 
     /// Current committed version of one resource.
@@ -2229,6 +2410,7 @@ impl MountOperation {
                         mount.completed.epoch.clusters = completion.clusters;
                         mount.completed.profile.superblock = completion.superblock;
                         mount.completed.coordinator.journal = JournalCoordinatorState::Ready {
+                            admission: CommitAdmission::Available,
                             journal: completion.journal,
                             epoch: (
                                 mount.completed.epoch.identity().uuid(),

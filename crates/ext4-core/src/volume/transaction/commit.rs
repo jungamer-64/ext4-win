@@ -340,15 +340,35 @@ impl ReservedMutation {
         current_epoch: &CommittedEpoch,
         cache: &mut crate::MetadataCache,
     ) -> Result<CommitReadyMutation> {
-        if commit.consume(&coordinator.mount)? != self.resolved.observed.ticket()
-            || !self.resolved.is_current(coordinator)
-        {
+        coordinator.prepare_publication(
+            commit,
+            self.resolved.observed.ticket(),
+            |coordinator, claim| {
+                let result = self.prepare_under_claim(coordinator, current_epoch, cache, claim);
+                if result.is_err() {
+                    cache.abandon_mutation();
+                }
+                result
+            },
+        )
+    }
+
+    /// Serializes and fences a mutation under its already consumed commit acquisition.
+    /// # Errors
+    /// Returns stale resources, invalid journal state, serialization or allocation failure.
+    fn prepare_under_claim(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+        current_epoch: &CommittedEpoch,
+        cache: &mut crate::MetadataCache,
+        claim: CommitClaim,
+    ) -> Result<CommitReadyMutation> {
+        if !self.resolved.is_current(coordinator) {
             return Err(Error::ClusterReferenceConflict);
         }
-        let ticket = self.resolved.observed.ticket();
         let version_publication =
             coordinator.prepare_version_publication(&self.resolved.observed)?;
-        let JournalCoordinatorState::Ready { journal, epoch } = &coordinator.journal else {
+        let JournalCoordinatorState::Ready { journal, epoch, .. } = &coordinator.journal else {
             return Err(Error::JournalCorrupt);
         };
         if coordinator.mount != current_epoch.mount
@@ -443,7 +463,7 @@ impl ReservedMutation {
                 .chain(core::iter::once(&checkpoint.clean_write)),
         )?;
         Ok(CommitReadyMutation {
-            ticket,
+            claim,
             ordered_data_writes,
             journal_writes,
             commit_write,
@@ -457,11 +477,33 @@ impl ReservedMutation {
 }
 
 impl CommitReadyMutation {
+    /// Consumes an unstarted write plan and releases its journal acquisition and cache fence.
+    /// Dropping the plan alone retains the acquisition, so forgotten cleanup cannot admit a second commit.
+    /// # Errors
+    /// Returns the error and reusable plan for a foreign or mismatched coordinator.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejected abort retains the owned write plan without allocating"
+    )]
+    pub fn abort(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+        cache: &mut crate::MetadataCache,
+    ) -> core::result::Result<(), (Error, Self)> {
+        if let Err(error) = coordinator.abort_prepared(self.durable_epoch.mount, self.claim) {
+            return Err((error, self));
+        }
+        cache.abandon_mutation();
+        Ok(())
+    }
+
     /// Starts ordered data I/O while sealing all later commit and publication states.
+    /// Transfer failure or abandoned continuation retains the acquisition: the mount owner must
+    /// retire mutation admission and recover the journal before admitting another commit.
     #[must_use]
     pub fn start(self) -> StorageRequestSequence<OrderedDataDurability> {
         let durable = DurableMutation {
-            ticket: self.ticket,
+            claim: self.claim,
             durable_journal: self.durable_journal,
             durable_epoch: self.durable_epoch,
             checkpoint: self.checkpoint,
@@ -497,7 +539,7 @@ impl DurableMutation {
         visibility: super::super::VisibilityLease,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<PublishedMutation, (Error, Self)> {
-        let valid = visibility.consume(&coordinator.mount) == Ok(self.ticket)
+        let valid = coordinator.accepts_visibility(visibility, self.claim)
             && coordinator.mount == self.durable_epoch.mount
             && matches!(coordinator.journal, JournalCoordinatorState::Ready { .. })
             && coordinator.published_epoch().1.next() == Ok(self.durable_epoch.sequence());
@@ -506,6 +548,7 @@ impl DurableMutation {
         }
         let _durable_journal = self.durable_journal;
         coordinator.journal = JournalCoordinatorState::CheckpointPending {
+            admission: CheckpointAdmission::Available,
             epoch: (
                 self.durable_epoch.identity().uuid(),
                 self.durable_epoch.sequence(),
@@ -568,13 +611,17 @@ impl CheckpointPublication {
         if coordinator.mount != self.checkpointed_epoch.mount
             || !matches!(
                 coordinator.journal,
-                JournalCoordinatorState::CheckpointPending { .. }
+                JournalCoordinatorState::CheckpointPending {
+                    admission: CheckpointAdmission::Granted,
+                    ..
+                }
             )
             || coordinator.published_epoch().1.next() != Ok(self.checkpointed_epoch.sequence())
         {
             return Err((Error::ClusterReferenceConflict, self));
         }
         coordinator.journal = JournalCoordinatorState::Ready {
+            admission: CommitAdmission::Available,
             journal: self.clean_journal,
             epoch: (
                 self.checkpointed_epoch.identity().uuid(),

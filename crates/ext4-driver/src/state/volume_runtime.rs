@@ -340,9 +340,10 @@ impl VolumeRuntime {
     }
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
+    #[cfg(not(test))]
     pub(crate) fn journal_is_clean(&self) -> bool {
         self.active_mutations.get().load(Ordering::Acquire) == 0
-            && matches!(self.commit_gate, CommitGateState::Ready)
+            && self.coordinator.journal_is_clean()
     }
 
     /// Acquires one current immutable epoch for a read or resolve operation.
@@ -467,6 +468,13 @@ impl VolumeRuntime {
         Ok(change.prepare(commit, &mut self.coordinator, self.epochs.current())?)
     }
 
+    /// Retires an unpublished key value and its core-owned acquisition together.
+    pub(crate) fn abort_key_change(&mut self, change: ext4_core::PreparedKeyChange) {
+        if change.abort(&mut self.coordinator).is_err() {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+    }
+
     /// Reserves the single immutable epoch needed by a mount-local key publication.
     /// # Errors
     /// Returns mutation admission or stable allocation failure.
@@ -482,20 +490,12 @@ impl VolumeRuntime {
         visibility: VisibilityLease,
         slot: EpochPublicationSlot,
     ) {
-        let ticket = visibility.ticket();
-        if self.commit_gate != (CommitGateState::CommitGranted { ticket })
-            || self.visibility_gate != (VisibilityGateState::Granted { ticket })
-        {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
         let epoch = match change.publish(visibility, &mut self.coordinator) {
             Ok(epoch) => epoch,
             Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
         };
         self.metadata_cache.publish(&epoch);
         self.epochs.publish(slot, epoch);
-        self.commit_gate = CommitGateState::Ready;
-        self.visibility_gate = VisibilityGateState::Ready;
     }
 
     /// Converts successful scheduler intent arbitration into this mount's capability.
@@ -508,43 +508,34 @@ impl VolumeRuntime {
     /// # Errors
     ///
     /// Returns the volume's mutation failure without acquiring or replacing a grant.
+    #[cfg(not(test))]
     pub(crate) fn acquire_commit(
         &mut self,
         ticket: u64,
     ) -> DriverResult<Option<ext4_core::CommitLease>> {
-        Ok(self
-            .commit_gate
-            .acquire(ticket, self.failure)?
-            .map(|selected| self.coordinator.grant_commit(selected)))
+        self.failure.authorize_mutation()?;
+        Ok(self.coordinator.acquire_commit(ticket)?)
     }
 
-    /// Releases a commit grant before the first lower write was issued.
+    /// Revokes a grant that has not been consumed by core preparation.
+    #[cfg(not(test))]
     pub(crate) fn abandon_commit(&mut self, ticket: u64) {
-        self.commit_gate
-            .abandon(ticket, &mut self.metadata_cache, &mut self.visibility_gate);
+        self.coordinator.revoke_unprepared_commit(ticket);
     }
 
     /// Grants the short visibility swap independently of checkpoint I/O.
+    #[cfg(not(test))]
     pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> Option<VisibilityLease> {
-        if self.commit_gate != (CommitGateState::CommitGranted { ticket })
-            || self.visibility_gate != VisibilityGateState::Ready
-        {
-            return None;
-        }
-        self.visibility_gate = VisibilityGateState::Granted { ticket };
-        Some(self.coordinator.grant_visibility(ticket))
+        self.coordinator.acquire_visibility(ticket)
     }
 
     /// Grants the detached checkpoint operation after durable visibility publication.
+    #[cfg(not(test))]
     pub(crate) fn try_grant_checkpoint(
         &mut self,
         epoch: EpochSequence,
     ) -> Option<ext4_core::CheckpointLease> {
-        if self.commit_gate != (CommitGateState::CheckpointPending { epoch }) {
-            return None;
-        }
-        self.commit_gate = CommitGateState::CheckpointGranted { epoch };
-        Some(self.coordinator.grant_checkpoint(epoch))
+        self.coordinator.acquire_checkpoint(epoch)
     }
 
     /// Allocation-free durable epoch publication after a matching visibility grant.
@@ -555,13 +546,6 @@ impl VolumeRuntime {
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
     ) -> PendingCheckpoint {
-        let ticket = visibility.ticket();
-        if self.commit_gate != (CommitGateState::CommitGranted { ticket }) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
-        if self.visibility_gate != (VisibilityGateState::Granted { ticket }) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
         let published: PublishedMutation =
             match mutation.publish(visibility, self.coordinator_mut()) {
                 Ok(published) => published,
@@ -571,8 +555,6 @@ impl VolumeRuntime {
         let sequence = epoch.sequence();
         self.metadata_cache.publish(&epoch);
         self.epochs.publish(durable_slot, epoch);
-        self.commit_gate = CommitGateState::CheckpointPending { epoch: sequence };
-        self.visibility_gate = VisibilityGateState::Ready;
         PendingCheckpoint {
             epoch: sequence,
             operation: checkpoint,
@@ -585,18 +567,13 @@ impl VolumeRuntime {
         &mut self,
         durability: CheckpointPublication,
         publication: EpochPublicationSlot,
-        epoch: EpochSequence,
     ) {
-        if self.commit_gate != (CommitGateState::CheckpointGranted { epoch }) {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        }
         let checkpointed = match durability.publish(self.coordinator_mut()) {
             Ok(epoch) => epoch,
             Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
         };
         self.metadata_cache.publish(&checkpointed);
         self.epochs.publish(publication, checkpointed);
-        self.commit_gate = CommitGateState::Ready;
     }
 
     /// Requires a healthy runtime before a flush can claim journal durability.
@@ -713,7 +690,7 @@ impl PendingCheckpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::{CommitGateState, VisibilityGateState, VolumeFailureState, VolumeRuntime};
+    use super::VolumeFailureState;
 
     /// # Panics
     ///
@@ -795,73 +772,5 @@ mod tests {
                 unexamined_updates: 2,
             }
         );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when contention swallows terminal failure or failure acquires/replaces a grant.
-    #[test]
-    fn commit_grants_preserve_failure_separately_from_contention() {
-        let mut gate = CommitGateState::Ready;
-        assert_eq!(
-            gate.acquire(7, VolumeFailureState::Operational),
-            Ok(Some(7))
-        );
-        assert!(matches!(
-            gate.acquire(8, VolumeFailureState::Operational),
-            Ok(None)
-        ));
-        let failed = VolumeFailureState::CommittedButUnpublished {
-            status: wdk_sys::STATUS_IO_DEVICE_ERROR,
-            published_streams: 1,
-            unexamined_updates: 0,
-        };
-        let error = crate::kernel::status::DriverError::CacheManagerFailure(
-            wdk_sys::STATUS_IO_DEVICE_ERROR,
-        );
-        assert!(matches!(gate.acquire(8, failed), Err(failure) if failure == error));
-        assert_eq!(gate, CommitGateState::CommitGranted { ticket: 7 });
-        let mut vacant = CommitGateState::Ready;
-        assert!(matches!(vacant.acquire(9, failed), Err(failure) if failure == error));
-        assert_eq!(vacant, CommitGateState::Ready);
-        let mut cache = ext4_core::MetadataCache::default();
-        let mut visibility = VisibilityGateState::Granted { ticket: 7 };
-        gate.abandon(8, &mut cache, &mut visibility);
-        assert_eq!(visibility, VisibilityGateState::Granted { ticket: 7 });
-        assert!(matches!(
-            gate.acquire(9, VolumeFailureState::Operational),
-            Ok(None)
-        ));
-        gate.abandon(7, &mut cache, &mut visibility);
-        assert_eq!(visibility, VisibilityGateState::Ready);
-        assert_eq!(
-            gate.acquire(9, VolumeFailureState::Operational),
-            Ok(Some(9))
-        );
-    }
-
-    /// Keeps serialized commit, visibility, and checkpoint grants in the unit-test production
-    /// graph even though constructing a mounted runtime belongs to mount integration tests.
-    ///
-    /// # Panics
-    ///
-    /// This test has no runtime failure path. Compilation fails if these gates cease to be one
-    /// explicit state-machine boundary.
-    #[test]
-    fn durability_gate_boundaries_remain_linked() {
-        let _clean: fn(&VolumeRuntime) -> bool = VolumeRuntime::journal_is_clean;
-        let _commit: fn(
-            &mut VolumeRuntime,
-            u64,
-        )
-            -> crate::kernel::status::DriverResult<Option<ext4_core::CommitLease>> =
-            VolumeRuntime::acquire_commit;
-        let _abandon: fn(&mut VolumeRuntime, u64) = VolumeRuntime::abandon_commit;
-        let _visibility: fn(&mut VolumeRuntime, u64) -> Option<ext4_core::VisibilityLease> =
-            VolumeRuntime::try_grant_visibility;
-        let _checkpoint: fn(
-            &mut VolumeRuntime,
-            ext4_core::EpochSequence,
-        ) -> Option<ext4_core::CheckpointLease> = VolumeRuntime::try_grant_checkpoint;
     }
 }

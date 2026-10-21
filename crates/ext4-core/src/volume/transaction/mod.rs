@@ -443,7 +443,7 @@ impl ReservedMutation {
 #[derive(Debug)]
 pub struct CommitReadyMutation {
     /// Scheduler ticket whose commit and visibility grants protect this publication.
-    ticket: u64,
+    claim: CommitClaim,
     /// Ordered data writes before journal descriptor/data records.
     ordered_data_writes: Vec<crate::StorageRequest>,
     /// Dirty-superblock, descriptor, and journal payload writes.
@@ -466,7 +466,7 @@ pub struct CommitReadyMutation {
 #[derive(Debug)]
 pub struct DurableMutation {
     /// Scheduler ticket whose commit and visibility grants protect this publication.
-    ticket: u64,
+    claim: CommitClaim,
     /// Dirty journal coordinator value.
     durable_journal: Journal<DirtyJournal>,
     /// Overlay epoch ready for an allocation-free swap.

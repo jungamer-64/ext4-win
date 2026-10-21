@@ -229,12 +229,12 @@ impl MountedVolumeOperation for KeyRequestOperation {
                 KeyState::Commit { context, reserved },
                 CompletionEvent::Core(OperationEvent::CommitGranted(commit)),
             ) => {
-                let prepared = match access.prepare_key_change(reserved, commit) {
-                    Ok(prepared) => prepared,
-                    Err(error) => return Self::fail(context, error),
-                };
                 let slot = match access.reserve_key_publication() {
                     Ok(slot) => slot,
+                    Err(error) => return Self::fail(context, error),
+                };
+                let prepared = match access.prepare_key_change(reserved, commit) {
+                    Ok(prepared) => prepared,
                     Err(error) => return Self::fail(context, error),
                 };
                 self.state = KeyState::Visibility {
@@ -273,12 +273,21 @@ impl MountedVolumeOperation for KeyRequestOperation {
                 CompletionEvent::VolumeFailed(error),
             ) => OperationTransition::Complete(owned.prepare_result(Err(error))),
             (
-                KeyState::Intent { context, .. }
-                | KeyState::Commit { context, .. }
-                | KeyState::Visibility { context, .. }
-                | KeyState::Publishing { context, .. },
+                KeyState::Intent { context, .. } | KeyState::Commit { context, .. },
                 CompletionEvent::VolumeFailed(error),
             ) => Self::fail(context, error),
+            (
+                KeyState::Visibility {
+                    context, prepared, ..
+                }
+                | KeyState::Publishing {
+                    context, prepared, ..
+                },
+                CompletionEvent::VolumeFailed(error),
+            ) => {
+                access.abort_key_change(prepared);
+                Self::fail(context, error)
+            }
             (
                 KeyState::Ready {
                     owned,
@@ -289,12 +298,21 @@ impl MountedVolumeOperation for KeyRequestOperation {
                 owned.prepare_result(Err(DriverError::from(Error::OperationCancelled))),
             ),
             (
-                KeyState::Intent { context, .. }
-                | KeyState::Commit { context, .. }
-                | KeyState::Visibility { context, .. }
-                | KeyState::Publishing { context, .. },
+                KeyState::Intent { context, .. } | KeyState::Commit { context, .. },
                 CompletionEvent::Core(OperationEvent::CancelRequested),
             ) => Self::fail(context, DriverError::from(Error::OperationCancelled)),
+            (
+                KeyState::Visibility {
+                    context, prepared, ..
+                }
+                | KeyState::Publishing {
+                    context, prepared, ..
+                },
+                CompletionEvent::Core(OperationEvent::CancelRequested),
+            ) => {
+                access.abort_key_change(prepared);
+                Self::fail(context, DriverError::from(Error::OperationCancelled))
+            }
             (KeyState::Terminal, CompletionEvent::Core(OperationEvent::Admitted)) => {
                 OperationTransition::Retired
             }

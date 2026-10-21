@@ -5018,6 +5018,10 @@ impl MutationRequestOperation {
     ) -> OperationTransition {
         if self.write_effect_observed {
             access.record_durability_unknown();
+        } else {
+            // The started core plan has consumed its acquisition. A terminal transfer cannot
+            // recreate that authority, so queued mutation/durability waits must observe failure.
+            access.record_durable_abort();
         }
         let CommitContext {
             owned, publication, ..
@@ -5809,16 +5813,6 @@ impl MutationRequestOperation {
                             );
                         }
                     };
-                let ready: Result<CommitReadyMutation, Error> =
-                    access.prepare_mutation_commit(reserved, commit);
-                let ready = match ready {
-                    Ok(ready) => ready,
-                    Err(error) => {
-                        return MutationStep::Transition(
-                            self.complete_error(owned, DriverError::from(error)),
-                        );
-                    }
-                };
                 let mut publication = publication;
                 if let Some((fcb, open_count)) = publication.oplock_reservation_target() {
                     if !access.oplock_grant_available(fcb) {
@@ -5841,6 +5835,16 @@ impl MutationRequestOperation {
                         };
                     publication.accept_oplock_reservation(reservation);
                 }
+                let ready: Result<CommitReadyMutation, Error> =
+                    access.prepare_mutation_commit(reserved, commit);
+                let ready = match ready {
+                    Ok(ready) => ready,
+                    Err(error) => {
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::from(error)),
+                        );
+                    }
+                };
                 let (durable_slot, checkpoint_slot) = slots.into_parts();
                 let context = CommitContext {
                     owned,
@@ -6135,9 +6139,9 @@ impl InfalliblePublication for MutationRequestOperation {
             MutationOperationState::PublishingCheckpoint {
                 durability,
                 publication,
-                epoch,
+                ..
             } => {
-                access.publish_checkpoint(durability, publication, epoch);
+                access.publish_checkpoint(durability, publication);
                 self.state = MutationOperationState::Terminal;
                 None
             }

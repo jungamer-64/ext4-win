@@ -111,10 +111,23 @@ impl ReservedKeyChange {
         coordinator: &mut MutationCoordinatorState,
         current: &CommittedEpoch,
     ) -> Result<PreparedKeyChange> {
-        let ticket = self.resolved.observed.ticket();
-        if commit.consume(&coordinator.mount)? != ticket
-            || !coordinator.revalidate(&self.resolved.observed)
-        {
+        coordinator.prepare_publication(
+            commit,
+            self.resolved.observed.ticket(),
+            |coordinator, claim| self.prepare_under_claim(coordinator, current, claim),
+        )
+    }
+
+    /// Prepares an allocation-free key publication under the consumed acquisition.
+    /// # Errors
+    /// Returns stale keys/epochs or allocation failures before publication.
+    fn prepare_under_claim(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+        current: &CommittedEpoch,
+        claim: CommitClaim,
+    ) -> Result<PreparedKeyChange> {
+        if !coordinator.revalidate(&self.resolved.observed) {
             return Err(Error::ClusterReferenceConflict);
         }
         if coordinator.mount != current.mount {
@@ -135,7 +148,7 @@ impl ReservedKeyChange {
             Vec::new(),
         );
         Ok(PreparedKeyChange {
-            ticket,
+            claim,
             expected_epoch,
             epoch,
             versions,
@@ -143,11 +156,12 @@ impl ReservedKeyChange {
     }
 }
 
-/// Fully prepared mount-key publication; dropping it leaves the published keys unchanged.
+/// Fully prepared mount-key publication; dropping it leaves keys unchanged and retains the
+/// acquisition. Explicit abort consumes the successor before another operation can be admitted.
 #[derive(Debug)]
 pub struct PreparedKeyChange {
     /// Mutation whose exclusive grants protect this publication.
-    ticket: u64,
+    claim: CommitClaim,
     /// Published epoch that must still be current at the consuming transition.
     expected_epoch: (crate::FilesystemUuid, super::EpochSequence),
     /// Complete successor requiring no allocation during the swap.
@@ -157,26 +171,52 @@ pub struct PreparedKeyChange {
 }
 
 impl PreparedKeyChange {
-    /// Publishes the key snapshot and read-dependency version in one allocation-free transition.
+    /// Consumes an unpublished key successor and revokes its preparation and visibility authority.
     /// # Errors
-    /// Returns a mismatched visibility grant or intervening epoch change before any publication.
+    /// Returns the error and reusable successor for a foreign or superseded coordinator.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejected abort retains secret-owned preparation without allocating"
+    )]
+    pub fn abort(
+        self,
+        coordinator: &mut MutationCoordinatorState,
+    ) -> core::result::Result<(), (Error, Self)> {
+        if let Err(error) = coordinator.abort_prepared(self.epoch.mount, self.claim) {
+            return Err((error, self));
+        }
+        Ok(())
+    }
+
+    /// Publishes keys and their dependency version without allocation or storage I/O.
+    /// # Errors
+    /// Consumes the visibility grant on either outcome. Rejection returns the unpublished key
+    /// successor, which can be explicitly aborted against its owning coordinator.
+    #[expect(
+        clippy::result_large_err,
+        reason = "publication rejection returns the secret-owned successor without allocating"
+    )]
     pub fn publish(
         self,
         visibility: VisibilityLease,
         coordinator: &mut MutationCoordinatorState,
-    ) -> Result<CommittedEpoch> {
-        if visibility.consume(&coordinator.mount)? != self.ticket
+    ) -> core::result::Result<CommittedEpoch, (Error, Self)> {
+        if !coordinator.accepts_visibility(visibility, self.claim)
             || coordinator.mount != self.epoch.mount
         {
-            return Err(Error::ClusterReferenceConflict);
+            return Err((Error::ClusterReferenceConflict, self));
         }
-        let JournalCoordinatorState::Ready { epoch, .. } = &mut coordinator.journal else {
-            return Err(Error::StaleReadContext);
+        let JournalCoordinatorState::Ready {
+            epoch, admission, ..
+        } = &mut coordinator.journal
+        else {
+            return Err((Error::StaleReadContext, self));
         };
         if *epoch != self.expected_epoch {
-            return Err(Error::StaleReadContext);
+            return Err((Error::StaleReadContext, self));
         }
         *epoch = (self.epoch.identity().uuid(), self.epoch.sequence());
+        *admission = CommitAdmission::Available;
         coordinator.publish_versions(self.versions);
         Ok(self.epoch)
     }

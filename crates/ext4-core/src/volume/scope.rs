@@ -64,14 +64,15 @@ pub(super) use super::directory::{
     ScannedDirectoryEntry,
 };
 pub(super) use super::directory_read::DirectoryReader;
+pub(super) use super::event::CommitClaim;
 pub(super) use super::inode_record::{
     AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord,
     RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
 pub(super) use super::mount::{
-    CommittedEpoch, EpochReadView, JournalCoordinatorState, MountIdentity, MountedProfile,
-    MutationCoordinatorState, MutationResource, ObservedResourceVersionSet, ReadObservations,
-    ResourceVersion, ResourceVersionPublication,
+    CheckpointAdmission, CommitAdmission, CommittedEpoch, EpochReadView, JournalCoordinatorState,
+    MountIdentity, MountedProfile, MutationCoordinatorState, MutationResource,
+    ObservedResourceVersionSet, ReadObservations, ResourceVersion, ResourceVersionPublication,
 };
 pub(super) use super::node::{
     ChildLookup, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId,

@@ -59,7 +59,10 @@ fn mount_sessions_isolate_plans_grants_and_read_provenance() -> Result<()> {
         .reserve(origin.coordinator.grant_intent(ticket), &origin.coordinator)?;
     assert!(matches!(
         reserved.prepare_commit(
-            other.coordinator.grant_commit(ticket),
+            other
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut origin.coordinator,
             &origin.epoch,
             &mut origin.cache
@@ -136,7 +139,10 @@ fn durable_publications_retain_state_after_mismatched_authority() -> Result<()> 
     let prepared = resolved
         .reserve(origin.coordinator.grant_intent(ticket), &origin.coordinator)?
         .prepare_commit(
-            origin.coordinator.grant_commit(ticket),
+            origin
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut origin.coordinator,
             &origin.epoch,
             &mut origin.cache,
@@ -147,40 +153,77 @@ fn durable_publications_retain_state_after_mismatched_authority() -> Result<()> 
     let record = origin.disk.transfer(payload.submit())?;
     let barrier = origin.disk.transfer(record.submit())?;
     let durable = origin.disk.transfer(barrier.submit())?;
+    let other_ticket = other.coordinator.admit_mutation()?;
+    let (other_resolved, ()) = other.disk.resolve(
+        &other.profile,
+        &other.epoch,
+        &other.coordinator,
+        other_ticket,
+        &mut PlainCrypto,
+        |pass| pass.set_volume_label(Ext4VolumeLabel::new(b"other")?),
+    )?;
+    let other_prepared = other_resolved
+        .reserve(
+            other.coordinator.grant_intent(other_ticket),
+            &other.coordinator,
+        )?
+        .prepare_commit(
+            other
+                .coordinator
+                .acquire_commit(other_ticket)?
+                .ok_or(Error::ClusterReferenceConflict)?,
+            &mut other.coordinator,
+            &other.epoch,
+            &mut other.cache,
+        )?;
     let effects = origin.disk.storage_effects;
     let (error, durable) = durable
         .publish(
-            other.coordinator.grant_visibility(ticket),
+            other
+                .coordinator
+                .acquire_visibility(other_ticket)
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut other.coordinator,
         )
         .err()
         .ok_or(Error::DeviceIo)?;
     assert_eq!(error, Error::ClusterReferenceConflict);
+    other_prepared
+        .abort(&mut other.coordinator, &mut other.cache)
+        .map_err(|(error, _prepared)| error)?;
     let wrong_ticket = origin.coordinator.admit_mutation()?;
-    let (error, durable) = durable
-        .publish(
-            origin.coordinator.grant_visibility(wrong_ticket),
-            &mut origin.coordinator,
-        )
-        .err()
-        .ok_or(Error::DeviceIo)?;
-    assert_eq!(error, Error::ClusterReferenceConflict);
+    assert!(
+        origin
+            .coordinator
+            .acquire_visibility(wrong_ticket)
+            .is_none()
+    );
     let (epoch, checkpoint) = durable
         .publish(
-            origin.coordinator.grant_visibility(ticket),
+            origin
+                .coordinator
+                .acquire_visibility(ticket)
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut origin.coordinator,
         )
         .map_err(|(error, _durable)| error)?
         .into_parts();
     assert_eq!(origin.disk.storage_effects, effects);
     assert_eq!(epoch.identity().label(), Ext4VolumeLabel::new(b"scoped")?);
-    let (error, checkpoint) = checkpoint
-        .start(other.coordinator.grant_checkpoint(epoch.sequence()))
-        .err()
-        .ok_or(Error::DeviceIo)?;
-    assert_eq!(error, Error::ClusterReferenceConflict);
+    assert!(
+        other
+            .coordinator
+            .acquire_checkpoint(epoch.sequence())
+            .is_none()
+    );
+    assert!(origin.coordinator.acquire_commit(wrong_ticket)?.is_none());
     let sequence = checkpoint
-        .start(origin.coordinator.grant_checkpoint(epoch.sequence()))
+        .start(
+            origin
+                .coordinator
+                .acquire_checkpoint(epoch.sequence())
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
+        )
         .map_err(|(error, _checkpoint)| error)?;
     let home = origin.disk.sequence(sequence)?;
     let record = origin.disk.transfer(home.submit())?;
@@ -479,7 +522,10 @@ fn allocation_preserves_committed_owners_until_the_retirement_commit() -> Result
             &fixture.coordinator,
         )?
         .prepare_commit(
-            fixture.coordinator.grant_commit(ticket),
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
@@ -687,7 +733,10 @@ fn sparse_extension_zeroes_initialized_storage_after_interrupted_write() -> Resu
             &fixture.coordinator,
         )?
         .prepare_commit(
-            fixture.coordinator.grant_commit(ticket),
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
@@ -758,7 +807,10 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
             &fixture.coordinator,
         )?
         .prepare_commit(
-            fixture.coordinator.grant_commit(ticket),
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
@@ -774,7 +826,10 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
     assert_eq!(fixture.disk.filesystem.get(home), Some(&b'a'));
     let (epoch, checkpoint) = durable
         .publish(
-            fixture.coordinator.grant_visibility(ticket),
+            fixture
+                .coordinator
+                .acquire_visibility(ticket)
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut fixture.coordinator,
         )
         .map_err(|(error, _durable)| error)?
@@ -789,7 +844,8 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
             .start(
                 fixture
                     .coordinator
-                    .grant_checkpoint(fixture.epoch.sequence()),
+                    .acquire_checkpoint(fixture.epoch.sequence())
+                    .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             )
             .map_err(|(error, _checkpoint)| error)?,
     )?;
@@ -1168,13 +1224,22 @@ impl Disk {
         let durability = self.transfer(commit_record.submit())?;
         let durable = self.transfer(durability.submit())?;
         let (epoch, checkpoint) = durable
-            .publish(coordinator.grant_visibility(ticket), coordinator)
+            .publish(
+                coordinator
+                    .acquire_visibility(ticket)
+                    .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
+                coordinator,
+            )
             .map_err(|(error, _durable)| error)?
             .into_parts();
         cache.publish(&epoch);
         let home = self.sequence(
             checkpoint
-                .start(coordinator.grant_checkpoint(epoch.sequence()))
+                .start(
+                    coordinator
+                        .acquire_checkpoint(epoch.sequence())
+                        .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
+                )
                 .map_err(|(error, _checkpoint)| error)?,
         )?;
         let clean_record = self.transfer(home.submit())?;
@@ -1266,14 +1331,20 @@ impl Fixture {
         let prepared = change
             .reserve(self.coordinator.grant_intent(ticket), &self.coordinator)?
             .prepare(
-                self.coordinator.grant_commit(ticket),
+                self.coordinator
+                    .acquire_commit(ticket)?
+                    .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
                 &mut self.coordinator,
                 &self.epoch,
             )?;
-        self.epoch = prepared.publish(
-            self.coordinator.grant_visibility(ticket),
-            &mut self.coordinator,
-        )?;
+        self.epoch = prepared
+            .publish(
+                self.coordinator
+                    .acquire_visibility(ticket)
+                    .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
+                &mut self.coordinator,
+            )
+            .map_err(|(error, _prepared)| error)?;
         self.cache.publish(&self.epoch);
         Ok(())
     }
@@ -1341,7 +1412,9 @@ impl Fixture {
         let ready = resolved
             .reserve(coordinator.grant_intent(ticket), &coordinator)?
             .prepare_commit(
-                coordinator.grant_commit(ticket),
+                coordinator
+                    .acquire_commit(ticket)?
+                    .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
                 &mut coordinator,
                 &epoch,
                 &mut cache,
@@ -1379,7 +1452,9 @@ impl Fixture {
         let ready = resolved
             .reserve(self.coordinator.grant_intent(ticket), &self.coordinator)?
             .prepare_commit(
-                self.coordinator.grant_commit(ticket),
+                self.coordinator
+                    .acquire_commit(ticket)?
+                    .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
                 &mut self.coordinator,
                 &self.epoch,
                 &mut self.cache,
@@ -1476,7 +1551,10 @@ fn shared_metadata_images_revalidate_before_overwriting_neighbors() -> Result<()
             &fixture.coordinator,
         )?
         .prepare_commit(
-            fixture.coordinator.grant_commit(ticket_a),
+            fixture
+                .coordinator
+                .acquire_commit(ticket_a)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
@@ -1749,7 +1827,10 @@ fn current_versions_reject_an_earlier_epoch_at_admission() -> Result<()> {
             &fixture.coordinator,
         )?
         .prepare_commit(
-            fixture.coordinator.grant_commit(ticket),
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache,
@@ -2047,11 +2128,16 @@ fn mount_keys_publish_without_storage_and_disappear_on_remount() -> Result<()> {
                 &fixture.coordinator,
             )?
             .prepare(
-                fixture.coordinator.grant_commit(ticket),
+                fixture
+                    .coordinator
+                    .acquire_commit(ticket)?
+                    .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
                 &mut fixture.coordinator,
                 &fixture.epoch,
             )?;
-    drop(abandoned);
+    abandoned
+        .abort(&mut fixture.coordinator)
+        .map_err(|(error, _prepared)| error)?;
     assert_eq!(fixture.epoch.sequence(), published);
     assert_eq!(
         fixture.epoch.fscrypt_key_presence(identifier),
@@ -2277,7 +2363,10 @@ fn key_removal_revokes_encrypted_reads_and_resolved_mutations() -> Result<()> {
     ));
     assert!(matches!(
         reserved.prepare_commit(
-            fixture.coordinator.grant_commit(reserved_ticket),
+            fixture
+                .coordinator
+                .acquire_commit(reserved_ticket)?
+                .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
             &mut fixture.coordinator,
             &fixture.epoch,
             &mut fixture.cache
@@ -3537,5 +3626,86 @@ fn user_xattr_values_remain_opaque_through_metadata_and_content_mutation() -> Re
     let mut bytes = [0; 1];
     fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
     assert_eq!(&bytes, b"Z");
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, acquisition, mutation-resolution or preparation failures.
+/// # Panics
+/// Fails if revocation revalidates an older lease or an owned preparation admits another commit.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify journal ownership through real resolve and prepare boundaries"
+)]
+fn journal_acquisition_revocation_and_preparation_are_exclusive() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let resolve = |fixture: &mut Fixture| -> Result<ReservedMutation> {
+        let (resolved, ()) = fixture.disk.resolve(
+            &fixture.profile,
+            &fixture.epoch,
+            &fixture.coordinator,
+            ticket,
+            &mut PlainCrypto,
+            |pass| pass.set_volume_label(Ext4VolumeLabel::new(b"exclusive")?),
+        )?;
+        resolved.reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )
+    };
+    let old = fixture
+        .coordinator
+        .acquire_commit(ticket)?
+        .ok_or(Error::DeviceIo)?;
+    assert!(fixture.coordinator.acquire_commit(ticket)?.is_none());
+    fixture.coordinator.revoke_unprepared_commit(ticket);
+    let current = fixture
+        .coordinator
+        .acquire_commit(ticket)?
+        .ok_or(Error::DeviceIo)?;
+    assert!(matches!(
+        resolve(&mut fixture)?.prepare_commit(
+            old,
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache
+        ),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    let prepared = resolve(&mut fixture)?.prepare_commit(
+        current,
+        &mut fixture.coordinator,
+        &fixture.epoch,
+        &mut fixture.cache,
+    )?;
+    fixture.coordinator.revoke_unprepared_commit(ticket);
+    assert!(fixture.coordinator.acquire_commit(ticket)?.is_none());
+    prepared
+        .abort(&mut fixture.coordinator, &mut fixture.cache)
+        .map_err(|(error, _prepared)| error)?;
+    assert!(fixture.coordinator.journal_is_clean());
+    let foreign = Fixture::new()?;
+    let reserved = resolve(&mut fixture)?;
+    let grant = fixture
+        .coordinator
+        .acquire_commit(ticket)?
+        .ok_or(Error::DeviceIo)?;
+    assert!(matches!(
+        reserved.prepare_commit(
+            grant,
+            &mut fixture.coordinator,
+            &foreign.epoch,
+            &mut fixture.cache
+        ),
+        Err(Error::ClusterReferenceConflict)
+    ));
+    assert!(fixture.coordinator.journal_is_clean());
+    fixture.mutate(|pass| pass.set_volume_label(Ext4VolumeLabel::new(b"after-abort")?))?;
+    assert_eq!(
+        fixture.epoch.identity().label(),
+        Ext4VolumeLabel::new(b"after-abort")?
+    );
     Ok(())
 }

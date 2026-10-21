@@ -1580,6 +1580,11 @@ impl MountedVolumeAccess<'_> {
         self.runtime.prepare_key_change(change, commit)
     }
 
+    /// Consumes unpublished key preparation on cancellation or terminal driver failure.
+    pub(crate) fn abort_key_change(&mut self, change: ext4_core::PreparedKeyChange) {
+        self.runtime.abort_key_change(change);
+    }
+
     /// Revalidates the key snapshot after the scheduler acquired its exclusive intent.
     /// # Errors
     /// Returns a changed key version before commit admission.
@@ -1717,10 +1722,8 @@ impl MountedVolumeAccess<'_> {
         &mut self,
         durability: CheckpointPublication,
         publication: EpochPublicationSlot,
-        epoch: ext4_core::EpochSequence,
     ) {
-        self.runtime
-            .publish_checkpoint(durability, publication, epoch);
+        self.runtime.publish_checkpoint(durability, publication);
     }
 
     /// Records a confirmed durable abort as a read-only transition.
