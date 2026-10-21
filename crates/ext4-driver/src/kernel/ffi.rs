@@ -293,10 +293,9 @@ unsafe extern "system" {
     /// Releases an unconsumed locked requestor output.
     pub(crate) fn ext4win_release_requestor_output(output: wdk_sys::PVOID);
 
-    /// Bounded-copies and validates one caller descriptor into owned, aligned native memory.
-    pub(crate) fn ext4win_capture_set_security_descriptor(
+    /// Copies an I/O Manager-captured descriptor into owned, aligned memory and validates it.
+    pub(crate) fn ext4win_capture_io_manager_security_descriptor(
         source: wdk_sys::PSECURITY_DESCRIPTOR,
-        requestor_mode: wdk_sys::KPROCESSOR_MODE,
         required_information: wdk_sys::SECURITY_INFORMATION,
         maximum_length: wdk_sys::ULONG,
         snapshot_out: *mut wdk_sys::PVOID,
@@ -306,11 +305,10 @@ unsafe extern "system" {
     /// Releases one native set-security snapshot.
     pub(crate) fn ext4win_release_set_security_descriptor(snapshot: wdk_sys::PVOID);
 
-    /// Copies one bounded FILE_GET_EA_INFORMATION name list into nonpaged native memory.
-    pub(crate) fn ext4win_capture_ea_name_list(
+    /// Copies an I/O Manager-captured FILE_GET_EA_INFORMATION list into owned nonpaged memory.
+    pub(crate) fn ext4win_capture_io_manager_ea_name_list(
         source: *const core::ffi::c_void,
         length: wdk_sys::ULONG,
-        requestor_mode: wdk_sys::KPROCESSOR_MODE,
         snapshot_out: *mut wdk_sys::PVOID,
         length_out: *mut wdk_sys::ULONG,
     ) -> wdk_sys::NTSTATUS;
@@ -322,8 +320,8 @@ unsafe extern "system" {
         length_out: *mut wdk_sys::ULONG,
     ) -> wdk_sys::NTSTATUS;
 
-    /// Releases one purpose-specific requestor-input capture.
-    pub(crate) fn ext4win_release_captured_requestor_input(snapshot: wdk_sys::PVOID);
+    /// Releases one owned EA-list or directory-pattern snapshot.
+    pub(crate) fn ext4win_release_captured_auxiliary_input(snapshot: wdk_sys::PVOID);
     /// Opens the service-owned persistent identity root at PASSIVE_LEVEL.
     pub(crate) fn ext4win_identity_open_root(
         service: wdk_sys::PCUNICODE_STRING,
