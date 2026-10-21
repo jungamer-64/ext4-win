@@ -861,27 +861,6 @@ impl MutationCoordinatorState {
         super::MutationLease::new(self.mount, ticket)
     }
 
-    /// Issues a mount-scoped commit grant after the owning scheduler acquires its gate.
-    /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
-    #[must_use]
-    pub fn grant_commit(&mut self, ticket: u64) -> super::CommitLease {
-        super::CommitLease::new(self.mount, ticket)
-    }
-
-    /// Issues a mount-scoped visibility grant after the owning scheduler acquires its gate.
-    /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
-    #[must_use]
-    pub fn grant_visibility(&mut self, ticket: u64) -> super::VisibilityLease {
-        super::VisibilityLease::new(self.mount, ticket)
-    }
-
-    /// Issues a mount-scoped checkpoint grant after the owning scheduler acquires its gate.
-    /// The scheduler retains arbitration and release responsibility; observation alone grants no gate.
-    #[must_use]
-    pub fn grant_checkpoint(&mut self, epoch: EpochSequence) -> super::CheckpointLease {
-        super::CheckpointLease::new(self.mount, epoch)
-    }
-
     /// Current committed version of one resource.
     pub(crate) fn resource_version(&self, resource: MutationResource) -> ResourceVersion {
         self.resource_versions.version(resource)

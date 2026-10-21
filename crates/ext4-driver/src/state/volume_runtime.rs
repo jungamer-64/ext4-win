@@ -256,76 +256,6 @@ impl EpochPublicationSlots {
     }
 }
 
-/// Commit/checkpoint gate state for the currently supported one-transaction journal profile.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommitGateState {
-    /// Journal space is clean and one commit may be granted.
-    Ready,
-    /// One mutation owns commit authority through durable visibility publication.
-    CommitGranted {
-        /// Mutation ticket owning commit authority.
-        ticket: u64,
-    },
-    /// A visible overlay is awaiting independent checkpoint and journal-space release.
-    CheckpointPending {
-        /// Visible overlay epoch awaiting checkpoint admission.
-        epoch: EpochSequence,
-    },
-    /// The detached checkpoint operation owns journal-space release authority.
-    CheckpointGranted {
-        /// Visible overlay epoch whose detached checkpoint owns the journal lane.
-        epoch: EpochSequence,
-    },
-}
-
-impl CommitGateState {
-    /// Revokes the ticket's pre-effect commit and visibility grants and its cache fence.
-    /// Unrelated tickets and checkpoint authority cannot reopen metadata registration.
-    fn abandon(
-        &mut self,
-        ticket: u64,
-        cache: &mut ext4_core::MetadataCache,
-        visibility: &mut VisibilityGateState,
-    ) {
-        if *self == (Self::CommitGranted { ticket }) {
-            cache.abandon_mutation();
-            if *visibility == (VisibilityGateState::Granted { ticket }) {
-                *visibility = VisibilityGateState::Ready;
-            }
-            *self = Self::Ready;
-        }
-    }
-    /// Acquires clean journal space only while the volume still permits mutation.
-    /// # Errors
-    ///
-    /// Returns the authoritative volume failure without changing the current grant. `Ok(None)`
-    /// means only that a healthy volume must wait for existing commit/checkpoint work.
-    fn acquire(&mut self, ticket: u64, failure: VolumeFailureState) -> DriverResult<Option<u64>> {
-        failure.authorize_mutation()?;
-        match self {
-            Self::Ready => {
-                *self = Self::CommitGranted { ticket };
-                Ok(Some(ticket))
-            }
-            Self::CommitGranted { .. }
-            | Self::CheckpointPending { .. }
-            | Self::CheckpointGranted { .. } => Ok(None),
-        }
-    }
-}
-
-/// Short allocation-free visibility gate, separate from checkpoint ownership.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VisibilityGateState {
-    /// No epoch is being installed.
-    Ready,
-    /// One prepared mutation owns the sole epoch-swap transition.
-    Granted {
-        /// Mutation ticket owning the short publication gate.
-        ticket: u64,
-    },
-}
-
 /// Driver-local mounted runtime split into immutable profile, immutable epochs, and mutable
 /// mutation coordination.
 #[derive(Debug)]
@@ -348,10 +278,6 @@ pub(crate) struct VolumeRuntime {
     failure: VolumeFailureState,
     /// Sole publisher of the native observation of `failure`.
     native_reliability: IoReliabilityOwner,
-    /// Serialized commit/checkpoint ownership.
-    commit_gate: CommitGateState,
-    /// Short epoch-swap gate independent from checkpoint I/O.
-    visibility_gate: VisibilityGateState,
     /// Mutations admitted before closing and not yet fully checkpointed or abandoned.
     active_mutations: DriverShared<AtomicU32>,
 }
@@ -381,8 +307,6 @@ impl VolumeRuntime {
             crypto,
             failure: VolumeFailureState::Operational,
             native_reliability: IoReliabilityOwner::try_new()?,
-            commit_gate: CommitGateState::Ready,
-            visibility_gate: VisibilityGateState::Ready,
             active_mutations: DriverShared::try_new(AtomicU32::new(0))?,
         })
     }
