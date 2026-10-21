@@ -7,7 +7,7 @@ use core::{cell::UnsafeCell, ffi::c_void, marker::PhantomPinned, ptr::NonNull};
 use ext4_core::ExtVolumeSignature;
 use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
-use crate::irp::lower::AlignedTransferBuffer;
+use super::DiscoveryIo;
 use crate::kernel::device_interface::{VolumeInterfaceClass, VolumeInterfaces, unicode_string};
 use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace};
 use crate::kernel::{fatal::KernelWideInconsistency, ffi};
@@ -36,6 +36,14 @@ impl DiscoveryPhase {
     }
 }
 
+/// Whether an immutable interface snapshot was completely visited.
+enum ScanProgress {
+    /// Every candidate was visited or discovery admission closed.
+    Complete,
+    /// A completion-owned exchange prevents further submissions; resume with a fresh snapshot.
+    Deferred,
+}
+
 /// Owns subscription closure and thread completion before releasing callback storage.
 /// The control extension creates, activates and destroys this owner at PASSIVE_LEVEL.
 pub(crate) struct VolumeDiscovery {
@@ -49,6 +57,8 @@ struct DiscoveryContext {
     phase: AtomicU8,
     /// Coalescing auto-reset event; callbacks never wait for I/O or allocate.
     event: UnsafeCell<wdk_sys::KEVENT>,
+    /// Owns bounded exchanges and retains every timed-out lower request until completion.
+    io: DiscoveryIo,
     /// One PnP registration, atomically consumed on closure or initialization rollback.
     notification: AtomicPtr<c_void>,
     /// Sole joinable system-thread handle, absent until creation succeeds.
@@ -70,10 +80,12 @@ impl VolumeDiscovery {
         reason = "pinned context publication is paired with unregister and join"
     )]
     pub(crate) fn start(owner: KernelDevice, trace: OperationalTrace) -> Result<Self, NTSTATUS> {
+        let io = DiscoveryIo::try_new(owner)?;
         let context = memory::boxed_try_with(|| {
             Ok(DiscoveryContext {
                 phase: AtomicU8::new(DiscoveryPhase::Dormant.raw()),
                 event: UnsafeCell::new(wdk_sys::KEVENT::default()),
+                io,
                 notification: AtomicPtr::new(core::ptr::null_mut()),
                 thread: AtomicPtr::new(core::ptr::null_mut()),
                 owner,
@@ -158,8 +170,8 @@ impl VolumeDiscovery {
         Ok(discovery)
     }
 
-    /// Closes discovery admission and observes completion for at most one second.
-    /// A busy result retains the thread, callback storage and lower-I/O buffers for a later stop.
+    /// Closes discovery admission, cancels its exchange and joins the worker for at most one second.
+    /// A busy result retains callback storage and completion-owned lower I/O for a later stop.
     /// # Errors
     /// Returns STATUS_DEVICE_BUSY while lower I/O or thread completion remains pending.
     #[expect(
@@ -171,6 +183,7 @@ impl VolumeDiscovery {
         context
             .phase
             .store(DiscoveryPhase::Stopping.raw(), Ordering::Release);
+        context.io.close();
         let registration = context
             .notification
             .swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -200,6 +213,9 @@ impl VolumeDiscovery {
         }
         if status != STATUS_SUCCESS {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+        }
+        if !context.io.idle() {
+            return Err(wdk_sys::STATUS_DEVICE_BUSY);
         }
         if context.thread.swap(core::ptr::null_mut(), Ordering::AcqRel) != thread {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
@@ -246,6 +262,7 @@ impl Drop for VolumeDiscovery {
         if previous_phase == DiscoveryPhase::Running.raw() {
             KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
         }
+        context.io.close();
         let registration = context
             .notification
             .swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -302,19 +319,33 @@ impl DiscoveryContext {
         reason = "only the owned system thread waits on the pinned native event"
     )]
     fn run(&self) {
+        let mut rescan = false;
         loop {
-            let status = unsafe {
-                // SAFETY: This is the only waiter; Drop signals and joins before event destruction.
-                ffi::KeWaitForSingleObject(
-                    self.event.get().cast(),
-                    wdk_sys::_KWAIT_REASON::Executive,
-                    0,
-                    0,
-                    core::ptr::null_mut(),
-                )
+            // Callback publication may precede its final reference release. While a late request
+            // occupies the finite slot, recheck retirement without blocking stop or allocating.
+            let mut interval = wdk_sys::LARGE_INTEGER {
+                QuadPart: -1_000_000,
             };
-            if status < STATUS_SUCCESS {
-                KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+            let pending = !self.io.idle();
+            let timeout = if pending {
+                &raw mut interval
+            } else {
+                core::ptr::null_mut()
+            };
+            if pending || !rescan {
+                let status = unsafe {
+                    // SAFETY: This is the only waiter; Drop signals and joins before event destruction.
+                    ffi::KeWaitForSingleObject(
+                        self.event.get().cast(),
+                        wdk_sys::_KWAIT_REASON::Executive,
+                        0,
+                        0,
+                        timeout,
+                    )
+                };
+                if status < STATUS_SUCCESS {
+                    KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
+                }
             }
             let phase = self.phase.load(Ordering::Acquire);
             if phase == DiscoveryPhase::Stopping.raw() {
@@ -323,12 +354,17 @@ impl DiscoveryContext {
             if phase == DiscoveryPhase::Dormant.raw() {
                 continue;
             }
+            if !self.io.idle() {
+                rescan = true;
+                continue;
+            }
             self.trace.record(
                 OperationalPath::DiscoveryScan,
                 STATUS_SUCCESS,
                 OperationalOutcome::Selected,
             );
             let scanned = self.scan();
+            rescan = matches!(scanned, Ok(ScanProgress::Deferred));
             self.trace.record_status(
                 OperationalPath::DiscoveryScan,
                 scanned.as_ref().err().copied().unwrap_or(STATUS_SUCCESS),
@@ -342,7 +378,7 @@ impl DiscoveryContext {
     /// Streams one immutable PnP snapshot without retaining references between scans.
     /// # Errors
     /// Returns enumeration failure; individual candidate failures are reported independently.
-    fn scan(&self) -> Result<(), NTSTATUS> {
+    fn scan(&self) -> Result<ScanProgress, NTSTATUS> {
         let mut volumes = VolumeInterfaces::enumerate(VolumeInterfaceClass::Hidden)?;
         while let Some(path) = volumes.next_path()? {
             if self.phase.load(Ordering::Acquire) != DiscoveryPhase::Running.raw() {
@@ -351,8 +387,11 @@ impl DiscoveryContext {
             if let Err(status) = self.probe(path) {
                 self.report(status);
             }
+            if !self.io.idle() {
+                return Ok(ScanProgress::Deferred);
+            }
         }
-        Ok(())
+        Ok(ScanProgress::Complete)
     }
 
     /// Performs read-only recognition before the separate Mount Manager acceptance boundary.
@@ -386,6 +425,7 @@ impl DiscoveryContext {
         let status = unsafe {
             // SAFETY: The file reference keeps the lower device live; outputs are writable.
             ext4win_query_volume_partition(
+                self.io.as_ptr(),
                 volume.device.as_ptr(),
                 &raw mut kind,
                 &raw mut attributes,
@@ -408,7 +448,11 @@ impl DiscoveryContext {
         );
         let status = unsafe {
             // SAFETY: Live referenced storage device with a synchronous output slot.
-            ext4win_query_volume_sector_size(volume.device.as_ptr(), &raw mut sector)
+            ext4win_query_volume_sector_size(
+                self.io.as_ptr(),
+                volume.device.as_ptr(),
+                &raw mut sector,
+            )
         };
         self.trace
             .record_status(OperationalPath::DiscoveryGeometry, status);
@@ -416,15 +460,6 @@ impl DiscoveryContext {
         if sector < 512 || !sector.is_power_of_two() || sector > 65_536 {
             return Err(wdk_sys::STATUS_NOT_SUPPORTED);
         }
-        let alignment_requirement = unsafe {
-            // SAFETY: The probe's FILE_OBJECT retains this stable device transfer constraint;
-            // no reference is formed to independently mutable native device fields.
-            (*volume.device.as_ptr()).AlignmentRequirement
-        };
-        let alignment = alignment_requirement
-            .checked_add(1)
-            .ok_or(wdk_sys::STATUS_INVALID_BUFFER_SIZE)?
-            .max(sector);
         let superblock_size = u64::try_from(ExtVolumeSignature::BYTE_LEN)
             .map_err(|_| wdk_sys::STATUS_INVALID_BUFFER_SIZE)?;
         let prefix_size = ExtVolumeSignature::BYTE_OFFSET
@@ -432,9 +467,9 @@ impl DiscoveryContext {
             .and_then(|size| size.checked_next_multiple_of(u64::from(sector)))
             .ok_or(wdk_sys::STATUS_INVALID_BUFFER_SIZE)?;
         let length = u32::try_from(prefix_size).map_err(|_| wdk_sys::STATUS_INVALID_BUFFER_SIZE)?;
-        let mut buffer = AlignedTransferBuffer::try_zeroed(
+        let mut buffer = memory::DriverVec::try_repeated_copy(
+            0_u8,
             usize::try_from(length).map_err(|_| wdk_sys::STATUS_INVALID_BUFFER_SIZE)?,
-            usize::try_from(alignment).map_err(|_| wdk_sys::STATUS_INVALID_BUFFER_SIZE)?,
         )
         .map_err(|error| error.ntstatus())?;
         self.trace.record(
@@ -443,11 +478,13 @@ impl DiscoveryContext {
             OperationalOutcome::Selected,
         );
         let status = unsafe {
-            // SAFETY: Buffer is nonpaged and aligned, exclusively borrowed until I/O completes.
+            // SAFETY: The native exchange owns its aligned lower buffer and copies only completed output.
             ext4win_read_volume_prefix(
+                self.io.as_ptr(),
                 volume.device.as_ptr(),
                 buffer.as_mut_slice().as_mut_ptr().cast(),
                 length,
+                sector,
             )
         };
         self.trace
@@ -471,7 +508,7 @@ impl DiscoveryContext {
             STATUS_SUCCESS,
             OperationalOutcome::Selected,
         );
-        let status = crate::kernel::mount_manager::announce_volume_arrival(volume.device)
+        let status = crate::kernel::mount_manager::announce_volume_arrival(&self.io, volume.device)
             .map_or_else(|status| status, |()| STATUS_SUCCESS);
         self.trace
             .record_status(OperationalPath::DiscoveryAnnouncement, status);
@@ -546,7 +583,7 @@ impl Drop for ReferencedVolume {
     )]
     fn drop(&mut self) {
         unsafe {
-            // SAFETY: All synchronous requests completed before the lease is dropped.
+            // SAFETY: Each submitted request retains its own device reference and owned buffers.
             let _remaining = ffi::ObfDereferenceObject(self.file.as_ptr().cast());
         }
     }
@@ -603,25 +640,29 @@ unsafe extern "C" fn discovery_thread(context: *mut c_void) {
 
 #[expect(
     unsafe_code,
-    reason = "native routines own WDK IOCTL layouts and synchronous completion"
+    reason = "native routines own WDK wire layouts and completion-owned exchange storage"
 )]
 unsafe extern "system" {
     /// Queries the real partition identity without modifying its table or attributes.
     fn ext4win_query_volume_partition(
+        channel: *mut c_void,
         device: wdk_sys::PDEVICE_OBJECT,
         kind: *mut wdk_sys::GUID,
         attributes: *mut u64,
     ) -> NTSTATUS;
     /// Queries logical sector geometry for the aligned recognition read.
     fn ext4win_query_volume_sector_size(
+        channel: *mut c_void,
         device: wdk_sys::PDEVICE_OBJECT,
         sector: *mut u32,
     ) -> NTSTATUS;
-    /// Returns only after the exclusively borrowed nonpaged read buffer is no longer in use.
+    /// Copies completed output or returns timeout/cancellation without retaining the borrowed buffer.
     fn ext4win_read_volume_prefix(
+        channel: *mut c_void,
         device: wdk_sys::PDEVICE_OBJECT,
         buffer: *mut c_void,
         length: u32,
+        sector_size: u32,
     ) -> NTSTATUS;
     /// Sends asynchronous discovery failure to the system error log.
     fn ext4win_report_volume_discovery_failure(owner: wdk_sys::PDEVICE_OBJECT, status: NTSTATUS);

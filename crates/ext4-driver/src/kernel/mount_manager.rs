@@ -51,11 +51,11 @@ fn reconcile_arrival(
 mod native {
     use super::*;
     use crate::{
-        kernel::{device_interface::unicode_string, ffi},
+        kernel::{device_interface::unicode_string, ffi, volume_discovery::DiscoveryIo},
         memory::{self, DriverVec},
         state::KernelDevice,
     };
-    use core::{ffi::c_void, ptr::NonNull};
+    use core::ptr::NonNull;
 
     /// Mount-device name query, defined by the Windows mount-device protocol.
     const QUERY_DEVICE_NAME: u32 = 0x004d_0008;
@@ -134,45 +134,12 @@ mod native {
         }
     }
 
-    /// Exchanges owned byte images synchronously; no native pointer escapes completion.
-    #[expect(
-        unsafe_code,
-        reason = "input and output are exclusively borrowed through the native final-completion wait"
-    )]
-    fn ioctl(
-        device: KernelDevice,
-        code: u32,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> (NTSTATUS, usize) {
-        let Ok(input_length) = u32::try_from(input.len()) else {
-            return (wdk_sys::STATUS_INVALID_BUFFER_SIZE, 0);
-        };
-        let Ok(output_length) = u32::try_from(output.len()) else {
-            return (wdk_sys::STATUS_INVALID_BUFFER_SIZE, 0);
-        };
-        let mut transferred = 0;
-        let status = unsafe {
-            // SAFETY: Owned images and retained device remain live until final completion.
-            ext4win_discovery_ioctl(
-                device.as_ptr(),
-                code,
-                input.as_ptr().cast_mut().cast(),
-                input_length,
-                output.as_mut_ptr().cast(),
-                output_length,
-                &mut transferred,
-            )
-        };
-        (status, transferred)
-    }
-
     /// Captures the existing lower stack name and rejects a changing or malformed response.
     /// # Errors
     /// Returns native query, malformed name, or allocation failure before publication.
-    fn device_name(device: KernelDevice) -> Result<DriverVec<u8>, NTSTATUS> {
+    fn device_name(io: &DiscoveryIo, device: KernelDevice) -> Result<DriverVec<u8>, NTSTATUS> {
         let mut prefix = [0_u8; 4];
-        let (status, transferred) = ioctl(device, QUERY_DEVICE_NAME, &[], &mut prefix);
+        let (status, transferred) = io.ioctl(device, QUERY_DEVICE_NAME, &[], &mut prefix);
         if status != wdk_sys::STATUS_BUFFER_OVERFLOW && status < wdk_sys::STATUS_SUCCESS {
             return Err(status);
         }
@@ -184,7 +151,7 @@ mod native {
             .checked_add(2)
             .ok_or(wdk_sys::STATUS_INVALID_BUFFER_SIZE)?;
         let mut name = DriverVec::try_repeated_copy(0, size).map_err(|error| error.ntstatus())?;
-        let (status, transferred) = ioctl(device, QUERY_DEVICE_NAME, &[], name.as_mut_slice());
+        let (status, transferred) = io.ioctl(device, QUERY_DEVICE_NAME, &[], name.as_mut_slice());
         if status < wdk_sys::STATUS_SUCCESS {
             return Err(status);
         }
@@ -215,8 +182,11 @@ mod native {
     /// # Errors
     /// Returns preparation failure or an unconfirmed registration outcome; an error never authorizes rollback.
     #[inline(never)] // Retains the publication owner in the signed-artifact reachability boundary.
-    pub(in crate::kernel) fn announce_volume_arrival(device: KernelDevice) -> Result<(), NTSTATUS> {
-        let name = device_name(device)?;
+    pub(in crate::kernel) fn announce_volume_arrival(
+        io: &DiscoveryIo,
+        device: KernelDevice,
+    ) -> Result<(), NTSTATUS> {
+        let name = device_name(io, device)?;
         let bytes = name
             .as_slice()
             .get(2..)
@@ -252,26 +222,16 @@ mod native {
         reconcile_arrival(
             || {
                 let mut points = [0_u8; 32];
-                registration(ioctl(manager.device, QUERY_POINTS, query.as_slice(), &mut points).0)
+                registration(
+                    io.ioctl(manager.device, QUERY_POINTS, query.as_slice(), &mut points)
+                        .0,
+                )
             },
-            || ioctl(manager.device, VOLUME_ARRIVAL, target.as_slice(), &mut []).0,
+            || {
+                io.ioctl(manager.device, VOLUME_ARRIVAL, target.as_slice(), &mut [])
+                    .0
+            },
         )
-    }
-
-    #[expect(
-        unsafe_code,
-        reason = "the native transport owns only one synchronous IRP and its final-completion wait"
-    )]
-    unsafe extern "system" {
-        fn ext4win_discovery_ioctl(
-            device: wdk_sys::PDEVICE_OBJECT,
-            code: u32,
-            input: *mut c_void,
-            input_length: u32,
-            output: *mut c_void,
-            output_length: u32,
-            transferred: *mut usize,
-        ) -> NTSTATUS;
     }
 }
 

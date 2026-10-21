@@ -1,7 +1,11 @@
 //! Linux data partition admission, separate from ext superblock and mount validation.
 
 #[cfg(not(test))]
+mod io;
+#[cfg(not(test))]
 mod native;
+#[cfg(not(test))]
+pub(in crate::kernel) use io::DiscoveryIo;
 #[cfg(not(test))]
 pub(crate) use native::VolumeDiscovery;
 

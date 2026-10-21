@@ -238,9 +238,15 @@ service `ImagePath` SYS match the production manifest SHA-256, the registry
 records `Type=2` and `Start=3`, and demand-start initialization returned with
 the service in `Running` state. Before SCM stop, the administrator/System-only
 named control device consumes the `IoRegisterFileSystem` reference through its
-payload-free prepare-unload request. It first unregisters hidden-volume PnP
-notifications and joins discovery I/O while mount requests can still complete,
-then closes reactor admission, drains and destroys
+payload-free prepare-unload request. It first closes hidden-volume discovery,
+unregisters PnP notifications, requests exchange cancellation and joins its
+worker while mount requests can still complete. Discovery completion waits have
+a deadline; each exchange owns its private IRP, aligned buffer and target
+reference. A timed-out or cancelled exchange occupies the single request slot
+until caller, completion and cancellation access retire. Prepare-unload returns
+busy while lower I/O remains outstanding, retaining registration and storage
+for a later attempt; cancellation alone cannot authorize their release.
+After discovery quiesces, it closes reactor admission, drains and destroys
 the control reactor, withdraws its alias, and requests device deletion. Existing
 control handles can still complete Cleanup/Close against the closed extension
 header. Base filesystem drivers must retire every device before `DriverUnload`

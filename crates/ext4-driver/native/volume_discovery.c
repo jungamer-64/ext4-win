@@ -13,9 +13,12 @@ C_ASSERT(sizeof(MOUNTMGR_MOUNT_POINTS) == 32);
 C_ASSERT(FIELD_OFFSET(MOUNTDEV_NAME, Name) == 2);
 C_ASSERT(FIELD_OFFSET(MOUNTMGR_TARGET_NAME, DeviceName) == 2);
 
+#include "discovery_io.h"
+
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NTAPI
 ext4win_query_volume_partition(
+    _In_ EXT4WIN_DISCOVERY_CHANNEL *channel,
     _In_ PDEVICE_OBJECT device,
     _Out_ GUID *partition_type,
     _Out_ ULONGLONG *attributes)
@@ -23,7 +26,7 @@ ext4win_query_volume_partition(
     PARTITION_INFORMATION_EX partition = {0};
     ULONG_PTR transferred;
     NTSTATUS status = ext4win_discovery_ioctl(
-        device, IOCTL_DISK_GET_PARTITION_INFO_EX, NULL, 0,
+        channel, device, IOCTL_DISK_GET_PARTITION_INFO_EX, NULL, 0,
         &partition, sizeof(partition), &transferred);
     if (!NT_SUCCESS(status)) { return status; }
     if (transferred < sizeof(partition)) { return STATUS_INFO_LENGTH_MISMATCH; }
@@ -38,12 +41,13 @@ ext4win_query_volume_partition(
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NTAPI
 ext4win_query_volume_sector_size(
+    _In_ EXT4WIN_DISCOVERY_CHANNEL *channel,
     _In_ PDEVICE_OBJECT device, _Out_ ULONG *sector_size)
 {
     DISK_GEOMETRY geometry = {0};
     ULONG_PTR transferred;
     NTSTATUS status = ext4win_discovery_ioctl(
-        device, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0,
+        channel, device, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0,
         &geometry, sizeof(geometry), &transferred);
     if (!NT_SUCCESS(status)) { return status; }
     if (transferred < sizeof(geometry)) { return STATUS_INFO_LENGTH_MISMATCH; }
