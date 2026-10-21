@@ -159,6 +159,19 @@ enum MountRequestState {
         /// Suspended core candidate validator.
         probe: Box<ExternalJournalProbeOperation>,
     },
+    /// Mount authority retained while a native worker opens the unique journal.
+    OpeningExternalJournal {
+        /// Unique mount completion owner.
+        owned: OwnedIrp,
+        /// Stable mount admission identities.
+        admission: MountAdmission,
+        /// Primary storage owner.
+        devices: MountedStorage,
+        /// Core operation awaiting the external journal.
+        mount: Box<MountOperation>,
+        /// Required journal identity and format.
+        requirement: ExternalJournalRequirement,
+    },
     /// The unique matching interface has been reopened exclusively and awaits its length.
     QueryExclusiveJournalLength {
         /// Top-level mount IRP.
@@ -346,23 +359,11 @@ impl MountRequestOperation {
                 Ok(selected) => selected,
                 Err(error) => return Self::complete(owned, Err(error)),
             };
-            let external = match ExclusiveExternalJournal::open(selected) {
-                Ok(external) => external,
-                Err(error) => return Self::complete(owned, Err(error)),
+            self.state = MountRequestState::OpeningExternalJournal {
+                owned, admission, devices, mount, requirement,
             };
-            let completion_owner = admission.file_system_device();
-            let target = external.device();
-            self.state = MountRequestState::QueryExclusiveJournalLength {
-                owned,
-                admission,
-                devices,
-                mount,
-                requirement,
-                external,
-            };
-            OperationTransition::QueryDeviceLength {
-                completion_owner,
-                target,
+            OperationTransition::SubmitPassiveWork {
+                work: crate::irp::PassiveWork::OpenExternalJournal(selected),
                 suspended: self,
             }
         }
