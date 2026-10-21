@@ -6,12 +6,12 @@ use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
 use crate::disk_format::directory_hash::DirectoryHashScheme;
 use crate::disk_format::inode::InodeId;
+use crate::disk_format::name::Ext4Name;
 use crate::disk_format::superblock::{
     ChecksumSeed, DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
 };
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
-use crate::disk_format::name::Ext4Name;
 
 /// Bytes occupied by the fixed header of an ext4 directory record.
 const DIRENT_HEADER_SIZE: usize = 8;
@@ -205,12 +205,6 @@ impl DirectoryEntry {
     #[must_use]
     pub const fn kind(&self) -> DirectoryEntryKind {
         self.kind
-    }
-
-    /// Consumes this entry into its validated components without copying its owned name.
-    #[must_use]
-    pub(crate) fn into_parts(self) -> (InodeId, Ext4Name, DirectoryEntryKind) {
-        (self.inode, self.name, self.kind)
     }
 
     /// Returns the minimum aligned bytes needed to serialize this entry.

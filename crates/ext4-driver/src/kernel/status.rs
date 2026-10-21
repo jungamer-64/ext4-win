@@ -28,6 +28,10 @@ pub(crate) enum DriverError {
     InvalidDeviceRequest,
     /// Caller supplied parameters outside the accepted FSD boundary.
     InvalidParameter,
+    /// A Windows component cannot be represented by the namespace boundary.
+    InvalidName,
+    /// More than one ext4 spelling matches the Windows comparison policy.
+    AmbiguousName,
     /// Driver attempted to build a collection larger than `Vec` can represent.
     InvalidBufferSize,
     /// A local invariant inside driver-only helper code was violated.
@@ -152,7 +156,8 @@ impl DriverError {
     pub(crate) const fn ntstatus(self) -> NTSTATUS {
         match self {
             Self::InvalidDeviceRequest => STATUS_INVALID_DEVICE_REQUEST,
-            Self::InvalidParameter => STATUS_INVALID_PARAMETER,
+            Self::InvalidParameter | Self::InvalidName => STATUS_INVALID_PARAMETER,
+            Self::AmbiguousName => STATUS_OBJECT_NAME_COLLISION,
             Self::InvalidBufferSize => STATUS_INVALID_BUFFER_SIZE,
             Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
@@ -227,7 +232,7 @@ const fn ntstatus(value: u32) -> NTSTATUS {
 const fn core_error_status(error: Error) -> NTSTATUS {
     match error {
         Error::DirectoryEntryNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
-        Error::NameAlreadyExists | Error::AmbiguousWindowsName => STATUS_OBJECT_NAME_COLLISION,
+        Error::NameAlreadyExists => STATUS_OBJECT_NAME_COLLISION,
         Error::TooManyLinks => ntstatus(0xC000_0265),
         Error::WrongInodeKind => STATUS_OBJECT_TYPE_MISMATCH,
         Error::NoSpace

@@ -1,7 +1,8 @@
 //! Native Windows expression semantics with request-local failure ownership.
 
 use crate::kernel::status::{DriverError, DriverResult};
-use ext4_core::{WindowsName, WindowsNameLookup};
+
+use crate::namespace::{WindowsName, WindowsNameLookup};
 
 /// Case policy selected by the native open flags and retained by directory handles.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

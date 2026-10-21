@@ -33,13 +33,13 @@ pub use disk_format::inode::{
     Ext4Uid, FileAllocationSize, FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata,
     NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
+pub use disk_format::name::Ext4Name;
 pub use disk_format::superblock::{
     ClusterCount, ClusterSize, Ext4VolumeLabel, ExtVolumeSignature, FilesystemUuid,
     FreeClusterCount, JournalUuid,
 };
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};
-pub use disk_format::name::Ext4Name;
 pub use platform::windows::{Ext4WindowsAttributes, WindowsOverlay, WindowsSymlinkReparsePoint};
 pub use protection::crypto::CryptographicOperation;
 pub use protection::fscrypt::{

@@ -312,7 +312,7 @@ impl WindowsHardLinks {
         for link in links.entries() {
             let name = match WindowsName::from_ext4(link.name()) {
                 Ok(name) => name,
-                Err(ext4_core::Error::InvalidName) => continue,
+                Err(DriverError::InvalidName) => continue,
                 Err(error) => return Err(DriverError::from(error)),
             };
             let entry = WindowsHardLinkEntry {
@@ -846,9 +846,10 @@ fn volume_relative_name(
         OpenedLocation::DirectoryEntry { parent, name } => {
             let loaded = read.load_directory(*parent)?;
             let visible_name = WindowsName::from_ext4(name)?;
-            let child = match read.lookup_windows_child(
+            let child = match crate::namespace::lookup_child(
+                read,
                 loaded.id(),
-                ext4_core::WindowsNameLookup::Exact(&visible_name),
+                crate::namespace::WindowsNameLookup::Exact(&visible_name),
             )? {
                 ChildLookup::Found(child) if *child.node() == node => child,
                 ChildLookup::Found(_) | ChildLookup::NotFound => {
@@ -882,7 +883,7 @@ fn node_relative_name(
             for link in links.entries() {
                 let projected = match WindowsName::from_ext4(link.name()) {
                     Ok(name) => name,
-                    Err(ext4_core::Error::InvalidName) => continue,
+                    Err(DriverError::InvalidName) => continue,
                     Err(error) => return Err(error.into()),
                 };
                 let mut components = DriverVec::new();

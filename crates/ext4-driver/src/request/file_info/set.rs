@@ -1247,7 +1247,8 @@ fn prepare_hard_link_destination(
     HardLinkDirectoryChanges,
 )> {
     let parent = read.load_directory(target_parent)?;
-    let target = read.lookup_windows_child(
+    let target = crate::namespace::lookup_child(
+        read,
         parent.id(),
         NameCase::Insensitive.lookup(target_windows_name),
     )?;
@@ -1530,7 +1531,8 @@ impl PreparedRenameMutation {
             return Ok(Self::Unchanged);
         }
         let parent = read.load_directory(target_parent)?;
-        let target = read.lookup_windows_child(
+        let target = crate::namespace::lookup_child(
+            read,
             parent.id(),
             NameCase::Insensitive.lookup(&WindowsName::from_ext4(&target_name)?),
         )?;
@@ -2347,8 +2349,11 @@ fn resolve_namespace_target(
         let parent = read
             .load_directory(parent_id)
             .map_err(|_| DriverError::ObjectPathNotFound)?;
-        let child =
-            read.lookup_windows_child(parent.id(), NameCase::Insensitive.lookup(component))?;
+        let child = crate::namespace::lookup_child(
+            read,
+            parent.id(),
+            NameCase::Insensitive.lookup(component),
+        )?;
         match child {
             ChildLookup::Found(child) => {
                 let NodeId::Directory(directory_id) = *child.node() else {

@@ -6,9 +6,8 @@ use core::ffi::c_void;
 use core::num::NonZeroU32;
 use core::ptr::NonNull;
 
-use ext4_core::{
-    ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, Ext4Security, NodeId, WindowsName,
-};
+use crate::namespace::WindowsName;
+use ext4_core::{ChildLookup, CommittedReadPass, DirectoryNodeId, Ext4Name, Ext4Security, NodeId};
 #[cfg(test)]
 use wdk_sys::FILE_OBJECT;
 
@@ -2130,8 +2129,11 @@ fn resolve_path(
             Ok(directory) => directory,
             Err(error) => return Err(DriverError::from(error)),
         };
-        let child = match read.lookup_windows_child(parent.id(), name_case.lookup(component.name()))
-        {
+        let child = match crate::namespace::lookup_child(
+            read,
+            parent.id(),
+            name_case.lookup(component.name()),
+        ) {
             Ok(ChildLookup::Found(child)) => child,
             Ok(ChildLookup::NotFound)
                 if position == PathComponentPosition::Final

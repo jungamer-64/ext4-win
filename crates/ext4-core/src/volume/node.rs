@@ -7,8 +7,8 @@ use crate::disk_format::inode::{
     Ext4LinkCount, Ext4Security, Ext4Times, FileAllocationSize, FileSize, Inode, InodeId,
     InodeKind, InodeProtection,
 };
-use crate::error::{Error, Result};
 use crate::disk_format::name::Ext4Name;
+use crate::error::{Error, Result};
 use crate::platform::windows::{Ext4WindowsAttributes, WindowsOverlay};
 
 /// Typed regular-file inode identity.
@@ -516,11 +516,6 @@ pub struct DirectoryChild {
 }
 
 impl DirectoryChild {
-    /// Creates a typed directory child after validating the referenced inode.
-    pub(super) const fn new(parent: DirectoryNodeId, name: Ext4Name, node: NodeId) -> Self {
-        Self { parent, name, node }
-    }
-
     /// Parent directory containing the child.
     #[must_use]
     pub const fn parent(&self) -> DirectoryNodeId {

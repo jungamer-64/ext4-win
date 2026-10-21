@@ -4,8 +4,9 @@ use crate::irp::PreparedDirectoryPattern;
 use crate::kernel::name_expression::NameCase;
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
+use crate::namespace::WindowsName;
 use core::cell::{Cell, OnceCell};
-use ext4_core::{DirectoryScanCursor, WindowsName};
+use ext4_core::DirectoryScanCursor;
 
 /// The first expression is captured once, even across restart and failed output copies.
 #[derive(Debug)]

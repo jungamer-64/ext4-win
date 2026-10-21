@@ -1152,8 +1152,6 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
             .volume
             .lookup_child(&parent, name, self.crypto)
     }
-
-
 }
 
 impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {

@@ -343,7 +343,8 @@ impl DirectoryReader {
                 return Ok(ReaderStep::Progress);
             };
             let entry = view.validate_directory_entry(pending.raw.try_clone()?, visible)?;
-            let result = ScannedDirectoryEntry::new(entry, self.cursor.ordinal, next);
+            let result =
+                ScannedDirectoryEntry::new(self.directory, entry, self.cursor.ordinal, next);
             self.cursor = next;
             walk.pending = None;
             return Ok(ReaderStep::Entry(result));

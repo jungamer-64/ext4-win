@@ -740,33 +740,6 @@ fn verify_htree_mutation_profile(
         ) {
             return Err(ext4_core::Error::DirectoryEntryNotFound);
         }
-        let exact_name = ext4_core::WindowsName::from_ext4(&source)?;
-        let uppercase = ext4_core::Ext4Name::new(&source.bytes().to_ascii_uppercase())?;
-        let uppercase_name = ext4_core::WindowsName::from_ext4(&uppercase)?;
-        for (lookup, should_exist) in [
-            (ext4_core::WindowsNameLookup::Exact(&exact_name), true),
-            (ext4_core::WindowsNameLookup::Exact(&uppercase_name), false),
-            (
-                ext4_core::WindowsNameLookup::CaseInsensitive {
-                    name: &uppercase_name,
-                    // This independent fixture profile contains ASCII names only.
-                    upcase: |unit| match unit {
-                        0x0061..=0x007a => unit & !0x0020,
-                        _ => unit,
-                    },
-                },
-                true,
-            ),
-        ] {
-            let found =
-                ext4_core::CommittedReadPass::lookup_windows_child(pass, root.id(), lookup)?;
-            match found {
-                ext4_core::ChildLookup::Found(child) if should_exist && child.name() == &source => {
-                }
-                ext4_core::ChildLookup::NotFound if !should_exist => {}
-                _ => return Err(ext4_core::Error::InvalidDirectoryEntry),
-            }
-        }
         let transaction_root = pass.directory(root.id())?;
         pass.rename_child(
             transaction_root,
@@ -4297,10 +4270,8 @@ fn verify_locked_directory_enumeration(
         cursor = *entry.next_cursor();
         let entry = entry.into_entry();
         if !matches!(entry.name().bytes(), b"." | b"..") {
-            let visible =
-                ext4_core::WindowsName::from_ext4(entry.name()).map_err(core_task_error)?;
             let found = drive_internal_core_read(&image, |pass| {
-                pass.lookup_windows_child(directory, ext4_core::WindowsNameLookup::Exact(&visible))
+                pass.lookup_child(directory, entry.name())
             })?;
             if !matches!(found, ext4_core::ChildLookup::Found(child) if child.node() == entry.node())
             {

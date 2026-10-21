@@ -1,10 +1,10 @@
 //! Directory lookup and bounded enumeration domain types.
 
+use crate::disk_format::name::Ext4Name;
 use crate::error::{Error, Result};
 use crate::memory;
-use crate::disk_format::name::Ext4Name;
 
-use super::node::DirectoryEntry;
+use super::node::{DirectoryChild, DirectoryEntry, DirectoryNodeId};
 
 /// Inline HTree name retained by a cursor without allocating in driver handle state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,6 +167,8 @@ impl Default for DirectoryScanCursor {
 /// One validated entry from a bounded scan, with the cursor that consumes it.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ScannedDirectoryEntry {
+    /// Parent whose scan established this namespace relation.
+    parent: DirectoryNodeId,
     /// Validated caller-visible entry.
     entry: DirectoryEntry,
     /// Raw live-entry ordinal assigned to this result.
@@ -178,11 +180,13 @@ pub struct ScannedDirectoryEntry {
 impl ScannedDirectoryEntry {
     /// Joins one projected entry to its ordinal and consumption cursor.
     pub(crate) const fn new(
+        parent: DirectoryNodeId,
         entry: DirectoryEntry,
         ordinal: u64,
         next_cursor: DirectoryScanCursor,
     ) -> Self {
         Self {
+            parent,
             entry,
             ordinal,
             next_cursor,
@@ -205,6 +209,12 @@ impl ScannedDirectoryEntry {
     #[must_use]
     pub const fn next_cursor(&self) -> &DirectoryScanCursor {
         &self.next_cursor
+    }
+
+    /// Consumes this record into the child relation established by its directory scan.
+    #[must_use]
+    pub fn into_child(self) -> DirectoryChild {
+        self.entry.into_child(self.parent)
     }
 
     /// Consumes this scan record into its validated entry.

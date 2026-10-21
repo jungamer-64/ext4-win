@@ -1061,26 +1061,38 @@ impl EpochReadView<'_, '_> {
         name: &Ext4Name,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<ChildLookup> {
-        if let Some(entry) =
+        let exact_entry = if parent.protection().is_encrypted() {
+            match self.encrypt_directory_child_name(parent.inode(), name, crypto) {
+                Ok(ciphertext) => self.find_raw_directory_entry(
+                    parent.inode(),
+                    DirectoryLookup::Exact(&ciphertext),
+                    crypto,
+                )?,
+                Err(Error::MissingEncryptionKey) => {
+                    let Some(query) = FscryptNoKeyName::from_display(name.bytes())? else {
+                        return Err(Error::MissingEncryptionKey);
+                    };
+                    self.find_raw_directory_entry(
+                        parent.inode(),
+                        DirectoryLookup::NoKey(&query),
+                        crypto,
+                    )?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            if parent.protection().is_verity() {
+                return Err(Error::UnsupportedVerity);
+            }
             self.find_raw_directory_entry(parent.inode(), DirectoryLookup::Exact(name), crypto)?
-        {
-            return Ok(ChildLookup::Found(self.directory_child(parent, entry)?));
+        };
+        if let Some(raw) = exact_entry {
+            return Ok(ChildLookup::Found(
+                self.validate_directory_entry(raw, name)?
+                    .into_child(parent.id()),
+            ));
         }
         Ok(ChildLookup::NotFound)
-    }
-
-    /// Converts a directory entry into a child whose inode kind is validated.
-    /// # Errors
-    ///
-    /// Returns an error when the entry inode cannot be loaded and classified.
-    pub(super) fn directory_child(
-        &mut self,
-        parent: &DirectoryNode,
-        entry: RawDirectoryEntry,
-    ) -> Result<DirectoryChild> {
-        let (inode, name, _kind) = entry.into_parts();
-        let node = self.load_inode_node(inode)?.id();
-        Ok(DirectoryChild::new(parent.id(), name, node))
     }
 
     /// Converts one raw directory entry into a public entry using an explicit visible name.

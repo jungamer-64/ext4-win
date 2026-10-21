@@ -15,13 +15,14 @@ use core::sync::atomic::{AtomicU8, Ordering};
 #[cfg(test)]
 use std::sync::{Mutex, MutexGuard};
 
+use crate::namespace::WindowsName;
 use ext4_core::{
     ByteOffset, CheckpointPublication, ClusterSize, CommitLease, CommitReadyMutation,
     CompletedMount, DeviceLength, DirectoryNodeId, DirectoryScanCursor, DurableMutation, Ext4Name,
     FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile,
     MutationLease, MutationResolvePass, NewDirectoryMetadata, NewFileMetadata, NodeId,
     NodeMetadataSnapshot, ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry,
-    VolumeIdentity, WindowsName, XattrName, XattrValue,
+    VolumeIdentity, XattrName, XattrValue,
 };
 use wdk_sys::{
     DO_DEVICE_INITIALIZING, DO_DIRECT_IO, FILE_OBJECT, LARGE_INTEGER, PDEVICE_OBJECT,

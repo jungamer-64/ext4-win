@@ -2,10 +2,10 @@
 
 use core::array;
 
+use crate::disk_format::name::Ext4Name;
 use crate::disk_format::superblock::{
     DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
 };
-use crate::disk_format::name::Ext4Name;
 
 /// Seed prescribed by the ext4 format when every stored seed word is zero.
 const FORMAT_DEFAULT_SEED: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
@@ -360,10 +360,10 @@ mod tests {
     use alloc::vec;
 
     use super::{DirectoryHash, DirectoryHashScheme};
+    use crate::disk_format::name::Ext4Name;
     use crate::disk_format::superblock::{
         DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
     };
-    use crate::disk_format::name::Ext4Name;
 
     /// Seed supplied to the independent e2fsprogs `debugfs dx_hash` oracle.
     const ORACLE_SEED: DirectoryHashSeed =

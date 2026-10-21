@@ -32,6 +32,7 @@ pub(super) use crate::disk_format::inode::{
     NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 pub(super) use crate::disk_format::journal::{CleanJournal, DirtyJournal, Journal, JournalBlock};
+pub(super) use crate::disk_format::name::Ext4Name;
 pub(super) use crate::disk_format::superblock::{
     BlockGroupId, ClusterAddress, DirectoryIndexing, Ext4VolumeLabel, FreeClusterCount,
     FreeClusterDelta, InodeTimestampEncoding, MetadataChecksum, SparseSuperblockLayout, Superblock,
@@ -42,7 +43,6 @@ pub(super) use crate::disk_format::xattr::{
 };
 pub(super) use crate::error::{Error, Result};
 pub(super) use crate::memory::{self, FallibleVec};
-pub(super) use crate::disk_format::name::Ext4Name;
 pub(super) use crate::platform::windows::{WindowsOverlay, WindowsSymlinkReparsePoint};
 pub(super) use crate::protection::crypto::CryptographicOperation;
 pub(super) use crate::protection::fscrypt::{
@@ -75,8 +75,8 @@ pub(super) use super::mount::{
     ResourceVersion, ResourceVersionPublication,
 };
 pub(super) use super::node::{
-    ChildLookup, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode,
-    FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, LoadedNode, NodeId, NodeMetadataSnapshot,
+    ChildLookup, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId,
+    HardLinkEntry, HardLinkNodeId, HardLinks, LoadedNode, NodeId, NodeMetadataSnapshot,
     SymlinkNode, SymlinkNodeId,
 };
 
