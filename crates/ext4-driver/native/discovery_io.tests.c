@@ -346,6 +346,23 @@ static VOID preparation_failures_release_unsubmitted_ownership(VOID) {
         finish();
     }
 }
+static VOID optional_input_requires_storage_for_nonzero_length(VOID) {
+    unsigned char output[4] = {1, 2, 3, 4};
+    ULONG_PTR transferred = 99;
+    begin(Inline);
+    assert(ext4win_discovery_ioctl(channel, &target, 0, NULL, 1, output,
+        sizeof(output), &transferred) == STATUS_INVALID_PARAMETER);
+    assert(transferred == 0);
+    assert(output[0] == 1 && output[1] == 2 && output[2] == 3 && output[3] == 4);
+    assert(submissions == 0 && cancellations == 0 && live_allocations == 1);
+    assert(channel->Pending == NULL && target.references == 0);
+    assert(ext4win_discovery_ioctl(channel, &target, 0, NULL, 0, output,
+        sizeof(output), &transferred) == STATUS_SUCCESS);
+    assert(transferred == sizeof(output));
+    assert(output[0] == 0x7b && output[3] == 0x7b);
+    assert(submissions == 1 && cancellations == 0);
+    finish();
+}
 static VOID closed_and_invalid_requests_have_no_effect(VOID) {
     unsigned char output[512] = {0};
     ULONG_PTR transferred;
@@ -365,6 +382,7 @@ int main(VOID) {
     cancellation_and_completion_orders();
     late_direct_read_retains_mdl_and_rejects_short_success();
     preparation_failures_release_unsubmitted_ownership();
+    optional_input_requires_storage_for_nonzero_length();
     closed_and_invalid_requests_have_no_effect();
     return 0;
 }

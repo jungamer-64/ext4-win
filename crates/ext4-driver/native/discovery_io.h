@@ -161,7 +161,8 @@ static NTSTATUS ext4win_discovery_prepare(
     ULONG length = input_length > output_length ? input_length : output_length;
     ULONG mask = device->AlignmentRequirement;
     *prepared = NULL;
-    if ((length > EXT4WIN_DISCOVERY_MAX_TRANSFER) || (mask > 65535)
+    if (((input == NULL) && (input_length != 0))
+        || (length > EXT4WIN_DISCOVERY_MAX_TRANSFER) || (mask > 65535)
         || (((mask + 1) & mask) != 0) || (device->StackSize <= 0)
         || (alignment_mask > 65535) || (((alignment_mask + 1) & alignment_mask) != 0)
         || ((major == IRP_MJ_DEVICE_CONTROL) && ((code & 3) != METHOD_BUFFERED))
