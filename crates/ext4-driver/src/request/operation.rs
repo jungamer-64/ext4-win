@@ -1801,6 +1801,8 @@ enum ByteRangeLockOperationState {
 /// One handle-serialized lock-control request delegated to FsRtl exactly once.
 #[derive(Debug)]
 struct ByteRangeLockOperation {
+    /// Finite pre-effect main-resource admission policy.
+    admission: crate::irp::NativeAdmissionBudget,
     /// Current completion-ownership phase.
     state: ByteRangeLockOperationState,
 }
@@ -1827,6 +1829,7 @@ impl ByteRangeLockOperation {
         };
         match memory::boxed_try_map((owned, check), |(owned, check)| Self {
             state: ByteRangeLockOperationState::CheckingOplock { owned, check },
+            admission: crate::irp::NativeAdmissionBudget::new(),
         }) {
             Ok(operation) => Ok(operation),
             Err(error) => {
@@ -1842,7 +1845,7 @@ impl ByteRangeLockOperation {
     }
 
     /// Revalidates the live FILE_OBJECT identity and transfers terminal ownership to FsRtl.
-    fn delegate(mut owned: OwnedIrp) -> OperationTransition {
+    fn delegate(mut self: Box<Self>, mut owned: OwnedIrp) -> OperationTransition {
         let file_control_block = match owned
             .request()
             .with_active(crate::request::file_info::lock_control)
@@ -1850,8 +1853,20 @@ impl ByteRangeLockOperation {
             Ok(file_control_block) => file_control_block,
             Err(error) => return Self::complete(owned, Err(error)),
         };
-        let _status = owned.delegate_byte_range_lock(file_control_block);
-        OperationTransition::Retired
+        match owned.delegate_byte_range_lock(file_control_block) {
+            Ok(_) => OperationTransition::Retired,
+            Err(owned) if self.admission.defer() => {
+                self.state = ByteRangeLockOperationState::OplockReady {
+                    owned,
+                    status: STATUS_SUCCESS,
+                };
+                OperationTransition::DeferOperation { suspended: self }
+            }
+            Err(owned) => Self::complete(
+                owned,
+                Err(DriverError::OplockFailure(wdk_sys::STATUS_IO_TIMEOUT)),
+            ),
+        }
     }
 }
 
@@ -1894,7 +1909,7 @@ impl MountedVolumeOperation for ByteRangeLockOperation {
             (
                 ByteRangeLockOperationState::OplockReady { owned, status },
                 OperationEvent::Admitted,
-            ) if status >= STATUS_SUCCESS => Self::delegate(owned),
+            ) if status >= STATUS_SUCCESS => self.delegate(owned),
             (
                 ByteRangeLockOperationState::OplockReady { owned, status },
                 OperationEvent::Admitted,
@@ -1961,6 +1976,8 @@ enum OplockControlOperationState {
 /// One handle-serialized oplock FSCTL delegated to the stream-owned FsRtl package exactly once.
 #[derive(Debug)]
 struct OplockControlOperation {
+    /// Finite pre-effect main-resource admission policy.
+    admission: crate::irp::NativeAdmissionBudget,
     /// Current completion-ownership phase.
     state: OplockControlOperationState,
 }
@@ -1979,6 +1996,7 @@ impl OplockControlOperation {
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         match memory::boxed_try_map((owned, target), |(owned, target)| Self {
+            admission: crate::irp::NativeAdmissionBudget::new(),
             state: OplockControlOperationState::Ready {
                 owned,
                 file_control_block: target.file_control_block,
@@ -2000,6 +2018,7 @@ impl OplockControlOperation {
 
     /// Revalidates the live stream identity and consumes the IRP into FsRtl.
     fn delegate(
+        mut self: Box<Self>,
         mut owned: OwnedIrp,
         expected: core::ptr::NonNull<crate::state::FileControlBlock>,
         action: crate::irp::OplockControlAction,
@@ -2020,8 +2039,21 @@ impl OplockControlOperation {
         {
             return Self::complete(owned, DriverError::OplockNotGranted);
         }
-        let _status = owned.delegate_oplock_control(expected);
-        OperationTransition::Retired
+        match owned.delegate_oplock_control(expected) {
+            Ok(_) => OperationTransition::Retired,
+            Err(owned) if self.admission.defer() => {
+                self.state = OplockControlOperationState::Ready {
+                    owned,
+                    file_control_block: expected,
+                    action,
+                };
+                OperationTransition::DeferOperation { suspended: self }
+            }
+            Err(owned) => Self::complete(
+                owned,
+                DriverError::OplockFailure(wdk_sys::STATUS_IO_TIMEOUT),
+            ),
+        }
     }
 }
 
@@ -2041,7 +2073,7 @@ impl MountedVolumeOperation for OplockControlOperation {
                     action,
                 },
                 OperationEvent::Admitted,
-            ) => Self::delegate(owned, file_control_block, action, access),
+            ) => self.delegate(owned, file_control_block, action, access),
             (OplockControlOperationState::Ready { owned, .. }, OperationEvent::CancelRequested) => {
                 Self::complete(owned, DriverError::from(Error::OperationCancelled))
             }

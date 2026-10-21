@@ -17,6 +17,8 @@ pub(crate) enum ExecutionClass {
     Ordinary,
     /// Cache and Memory Manager I/O needed by already admitted user work.
     Paging,
+    /// Oplock acknowledgements and byte-range unlocks release existing waiters.
+    Release,
     /// Non-cancellable handle release, serialized over reusable terminal resources.
     Finalization,
 }
@@ -25,8 +27,9 @@ impl ExecutionClass {
     /// Each class owns disjoint execution and notification slots.
     pub(crate) const fn slots(self) -> core::ops::Range<usize> {
         match self {
-            Self::Ordinary => 0..47,
+            Self::Ordinary => 0..46,
             Self::Paging => 47..63,
+            Self::Release => 46..47,
             Self::Finalization => 63..64,
         }
     }
@@ -1081,6 +1084,7 @@ mod tests {
         let mut slots = [None; MAX_OPERATIONS];
         for class in [
             ExecutionClass::Ordinary,
+            ExecutionClass::Release,
             ExecutionClass::Paging,
             ExecutionClass::Finalization,
         ] {
@@ -1092,6 +1096,7 @@ mod tests {
             assert!(!scheduler.available(class));
             assert!(scheduler.reserve(class).is_none());
             if class == ExecutionClass::Ordinary {
+                assert!(scheduler.available(ExecutionClass::Release));
                 assert!(scheduler.available(ExecutionClass::Paging));
                 assert!(scheduler.available(ExecutionClass::Finalization));
             }

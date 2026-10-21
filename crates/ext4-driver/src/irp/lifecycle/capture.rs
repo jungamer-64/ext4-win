@@ -597,6 +597,8 @@ impl Drop for CapturedRequestorInput {
 pub(super) struct QueueContext {
     /// Complete typed request classification plus any requestor-context capture.
     prepared: PreparedRequest,
+    /// Progress responsibility captured before the IRP enters the queue.
+    execution: super::scheduler::ExecutionClass,
     /// Stable cleanup cancellation identity; no queued stack re-decode is required.
     cancellation_key: QueueCancellationKey,
 }
@@ -759,16 +761,7 @@ impl QueueContextOwnership {
 impl QueueContext {
     /// Paging must progress even while ordinary Cache Manager work owns its execution slots.
     pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
-        let paging = match &self.prepared {
-            PreparedRequest::Read(read) => read.kind() == DataIoKind::Paging,
-            PreparedRequest::Write(write) => write.kind() == DataIoKind::Paging,
-            _ => false,
-        };
-        if paging {
-            super::scheduler::ExecutionClass::Paging
-        } else {
-            super::scheduler::ExecutionClass::Ordinary
-        }
+        self.execution
     }
 
     /// Captures one queued request while dispatch still runs in the requestor's context.
@@ -793,9 +786,41 @@ impl QueueContext {
             _ => {}
         }
         let (prepared, cancellation_key) = PreparedRequest::capture(target, stack, major)?;
+        let paging = matches!(&prepared, PreparedRequest::Read(read) if read.kind() == DataIoKind::Paging)
+            || matches!(&prepared, PreparedRequest::Write(write) if write.kind() == DataIoKind::Paging);
+        let release = if major == DispatchMajor::LockControl {
+            stack.releases_byte_range_lock()
+        } else if major == DispatchMajor::FileSystemControl
+            && stack.file_system_control_minor() == FileSystemControlMinorFunction::UserFsRequest
+        {
+            let control = stack
+                .file_system_control()
+                .map_err(IrpCompletion::from_error)?;
+            let code = control.fs_control_code;
+            code.is_oplock()
+                && code != super::super::FsControlCode::OplockBreakNotify
+                && code
+                    .oplock_action(
+                        target
+                            .buffered_input(control.input_buffer_length)
+                            .map_err(IrpCompletion::from_error)?,
+                    )
+                    .map_err(IrpCompletion::from_error)?
+                    == super::super::OplockControlAction::BreakContinuation
+        } else {
+            false
+        };
+        let execution = if paging {
+            super::scheduler::ExecutionClass::Paging
+        } else if release {
+            super::scheduler::ExecutionClass::Release
+        } else {
+            super::scheduler::ExecutionClass::Ordinary
+        };
         memory::boxed_try_with(|| {
             Ok(Self {
                 prepared,
+                execution,
                 cancellation_key,
             })
         })
@@ -811,6 +836,7 @@ impl QueueContext {
     pub(super) fn for_test_create() -> DriverResult<Box<Self>> {
         memory::boxed_try_with(|| {
             Ok(Self {
+                execution: super::scheduler::ExecutionClass::Ordinary,
                 prepared: PreparedRequest::Create,
                 cancellation_key: QueueCancellationKey::Device,
             })
@@ -2690,18 +2716,106 @@ mod tests {
     }
 
     /// # Panics
+    /// Panics when a waiting request consumes release capacity or an ACK/unlock loses that lane.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "native stack and buffer fixtures outlive capture and owner drop"
+    )]
+    fn release_admission_excludes_waiting_requests() {
+        use super::super::scheduler::ExecutionClass;
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        for (major, minor, code, flags, expected) in [
+            (
+                DispatchMajor::LockControl,
+                1,
+                0,
+                0,
+                ExecutionClass::Ordinary,
+            ),
+            (DispatchMajor::LockControl, 2, 0, 0, ExecutionClass::Release),
+            (DispatchMajor::LockControl, 3, 0, 0, ExecutionClass::Release),
+            (DispatchMajor::LockControl, 4, 0, 0, ExecutionClass::Release),
+            (
+                DispatchMajor::FileSystemControl,
+                0,
+                0x9000c,
+                0,
+                ExecutionClass::Release,
+            ),
+            (
+                DispatchMajor::FileSystemControl,
+                0,
+                0x90014,
+                0,
+                ExecutionClass::Ordinary,
+            ),
+            (
+                DispatchMajor::FileSystemControl,
+                0,
+                0x90240,
+                2,
+                ExecutionClass::Release,
+            ),
+            (
+                DispatchMajor::FileSystemControl,
+                0,
+                0x90240,
+                1,
+                ExecutionClass::Ordinary,
+            ),
+        ] {
+            let mut input = [0_u8; 12];
+            input[8] = flags;
+            let mut irp = wdk_sys::IRP::default();
+            irp.AssociatedIrp.SystemBuffer = input.as_mut_ptr().cast();
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: if major == DispatchMajor::LockControl {
+                    0x11
+                } else {
+                    0x0d
+                },
+                MinorFunction: minor,
+                FileObject: &raw mut file,
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            stack.Parameters.FileSystemControl.FsControlCode = code;
+            stack.Parameters.FileSystemControl.InputBufferLength = 12;
+            let target = unsafe {
+                // SAFETY: These local allocations retain every native identity and input byte.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            };
+            assert!(target.is_some());
+            if let Some(target) = target {
+                let captured = PendingIrp::capture(target, major);
+                assert!(
+                    captured.is_ok(),
+                    "{major:?} minor={minor} code={code:x} error={:?}",
+                    captured.as_ref().err()
+                );
+                if let Ok(captured) = captured {
+                    assert_eq!(captured.execution_class(), expected);
+                }
+            }
+        }
+    }
+
+    /// # Panics
     ///
     /// Panics when cleanup cancels a queued flush that remains legal after the cleanup barrier, or
     /// when it stops cancelling an ordinary request from the same handle.
     #[test]
     fn cleanup_preserves_queued_flushes() {
         let flush = QueueContext {
+            execution: super::super::scheduler::ExecutionClass::Ordinary,
             prepared: PreparedRequest::FlushBuffers,
             cancellation_key: QueueCancellationKey::Device,
         };
         assert!(!flush.cleanup_cancel_eligible());
 
         let ordinary = QueueContext {
+            execution: super::super::scheduler::ExecutionClass::Ordinary,
             prepared: PreparedRequest::QueryInformation,
             cancellation_key: QueueCancellationKey::Device,
         };

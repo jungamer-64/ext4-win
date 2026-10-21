@@ -154,6 +154,16 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         }
     }
 
+    /// Unlock requests release existing file-lock waiters without acquiring a new lock.
+    pub(crate) fn releases_byte_range_lock(self) -> bool {
+        matches!(
+            u32::from(self.raw_minor_function()),
+            wdk_sys::IRP_MN_UNLOCK_SINGLE
+                | wdk_sys::IRP_MN_UNLOCK_ALL
+                | wdk_sys::IRP_MN_UNLOCK_ALL_BY_KEY
+        )
+    }
+
     /// Returns the raw minor-function byte for local enum decoding only.
     #[expect(
         unsafe_code,

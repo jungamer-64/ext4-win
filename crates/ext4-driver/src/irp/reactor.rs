@@ -504,6 +504,11 @@ pub(crate) enum OperationTransition {
         /// Operation resumed only by its commit grant.
         suspended: Box<dyn CompletionOperation>,
     },
+    /// Yield actor admission while retaining the exact operation and cancellation authority.
+    DeferOperation {
+        /// Pre-effect operation resumed after a ten-millisecond delay.
+        suspended: Box<dyn CompletionOperation>,
+    },
     /// Arm one fixed storage retry timer.
     #[cfg(not(test))]
     ArmRetry {
@@ -649,6 +654,9 @@ enum SlotPayload {
     /// FsRtl-owned top-level IRP and its stable oplock continuation identity.
     #[cfg(not(test))]
     Oplock(PublishedOplockRequest),
+    /// Pre-effect oplock admission retained until its bounded retry timer.
+    #[cfg(not(test))]
+    OplockRetry(Box<OplockEnvelope>),
 }
 
 impl fmt::Debug for SlotPayload {
@@ -665,6 +673,8 @@ impl fmt::Debug for SlotPayload {
             Self::Lower(_) => formatter.write_str("Lower"),
             #[cfg(not(test))]
             Self::Oplock(_) => formatter.write_str("Oplock"),
+            #[cfg(not(test))]
+            Self::OplockRetry(_) => formatter.write_str("OplockRetry"),
         }
     }
 }
@@ -1012,6 +1022,8 @@ pub(crate) struct CompletionReactor {
     oplock_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Ordinary pending queue budget; execution capacity is independently reserved.
     ordinary_pending: AtomicUsize,
+    /// Release requests have independent queue and notification admission.
+    release_pending: AtomicUsize,
     /// Paging pending budget cannot be consumed by ordinary callers.
     paging_pending: AtomicUsize,
     /// Non-cancellable terminal IRPs retain the native FILE_OBJECT resources they release.
@@ -1316,6 +1328,14 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).release_pending)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(AtomicUsize::new(0));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
             core::ptr::addr_of_mut!((*reactor).wake_event)
         };
         unsafe {
@@ -1509,6 +1529,7 @@ impl CompletionReactor {
             passive_completion_head: _,
             oplock_completion_head: _,
             ordinary_pending: _,
+            release_pending: _,
             paging_pending: _,
             terminal_pending: _,
             terminal_head: _,
@@ -1954,6 +1975,7 @@ impl CompletionReactor {
     fn pending_budget(&self, class: ExecutionClass) -> &AtomicUsize {
         match class {
             ExecutionClass::Ordinary => &self.ordinary_pending,
+            ExecutionClass::Release => &self.release_pending,
             ExecutionClass::Paging => &self.paging_pending,
             ExecutionClass::Finalization => &self.terminal_pending,
         }
@@ -2343,6 +2365,7 @@ impl CompletionReactor {
         };
         if reactor.state() != ReactorState::Stopped
             || reactor.ordinary_pending.load(Ordering::Acquire) != 0
+            || reactor.release_pending.load(Ordering::Acquire) != 0
             || reactor.paging_pending.load(Ordering::Acquire) != 0
             || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
@@ -2380,6 +2403,7 @@ impl CompletionReactor {
         if reactor.state() != ReactorState::Stopped
             || !reactor.thread_handle.load(Ordering::Acquire).is_null()
             || reactor.ordinary_pending.load(Ordering::Acquire) != 0
+            || reactor.release_pending.load(Ordering::Acquire) != 0
             || reactor.paging_pending.load(Ordering::Acquire) != 0
             || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
@@ -2488,6 +2512,7 @@ impl CompletionReactor {
             }
             if self.state() == ReactorState::Draining
                 && self.ordinary_pending.load(Ordering::Acquire) == 0
+                && self.release_pending.load(Ordering::Acquire) == 0
                 && self.paging_pending.load(Ordering::Acquire) == 0
                 && self.terminal_pending.load(Ordering::Acquire) == 0
                 && !self.has_active()
@@ -2652,6 +2677,7 @@ impl CompletionReactor {
         let mut admitted_any = false;
         for class in [
             ExecutionClass::Finalization,
+            ExecutionClass::Release,
             ExecutionClass::Paging,
             ExecutionClass::Ordinary,
         ] {
@@ -2865,6 +2891,29 @@ impl CompletionReactor {
                     },
                 );
                 self.grant_available_commit();
+            }
+            OperationTransition::DeferOperation { suspended } => {
+                let identity = self
+                    .with_scheduler(|scheduler| scheduler.identity(index))
+                    .unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    });
+                if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry)) {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                self.install_payload(
+                    index,
+                    SlotPayload::Operation {
+                        operation: suspended,
+                        event: None,
+                    },
+                );
+                self.retry_timers
+                    .get(index)
+                    .unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    })
+                    .arm(identity.generation(), StorageRetryDelay::TenMilliseconds);
             }
             OperationTransition::ArmRetry { retry } => {
                 self.arm_retry(index, retry);
@@ -3273,6 +3322,13 @@ impl CompletionReactor {
             );
             return;
         }
+        self.submit_prepared_oplock(index, prepared);
+    }
+
+    /// Delegates only after restoring exact slot and cancellation ownership.
+    #[cfg(not(test))]
+    fn submit_prepared_oplock(&self, index: usize, prepared: Box<OplockEnvelope>) {
+        let identity = prepared.identity();
         if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Oplock)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -3284,6 +3340,24 @@ impl CompletionReactor {
                 let (owned, suspended, status) =
                     OplockEnvelope::reclaim_immediate(envelope, status);
                 self.restore_oplock_operation(index, owned, suspended, status);
+            }
+            OplockSubmission::Deferred(mut envelope) => {
+                self.take_oplock_slot(identity, NonNull::from(envelope.as_ref()));
+                envelope.restore_cancellation(NonNull::from(
+                    self.cancel_envelopes.get(index).unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    }),
+                ));
+                if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry)) {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                self.install_payload(index, SlotPayload::OplockRetry(envelope));
+                self.retry_timers
+                    .get(index)
+                    .unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    })
+                    .arm(identity.generation(), StorageRetryDelay::TenMilliseconds);
             }
             OplockSubmission::Pending => {
                 if self.cancellation_is_pending(index) {
@@ -4137,6 +4211,27 @@ impl CompletionReactor {
                 core::mem::replace(&mut slot.payload, SlotPayload::Empty)
             });
             let retry = match payload {
+                SlotPayload::OplockRetry(envelope) => {
+                    if self.cancellation_is_pending(index) {
+                        let (_check, owned, suspended) =
+                            OplockEnvelope::cancel_before_submit(envelope);
+                        self.restore_oplock_operation(index, owned, suspended, STATUS_SUCCESS);
+                    } else {
+                        self.submit_prepared_oplock(index, envelope);
+                    }
+                    continue;
+                }
+                SlotPayload::Operation {
+                    operation,
+                    event: None,
+                } => {
+                    self.set_ready_operation_event(
+                        index,
+                        operation,
+                        CompletionEvent::Core(OperationEvent::Admitted),
+                    );
+                    continue;
+                }
                 SlotPayload::Retry(retry) => retry,
                 SlotPayload::PassiveRetry(envelope) => {
                     if self.cancellation_is_pending(index) {
@@ -5237,6 +5332,7 @@ mod tests {
             OperationTransition::Complete(completion) => {
                 let _status = completion.notify();
             }
+            OperationTransition::DeferOperation { suspended } => drop(suspended),
             OperationTransition::Retired => {}
         }
     }

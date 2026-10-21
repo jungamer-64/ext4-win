@@ -423,6 +423,17 @@ impl<'a> SectionResource<'a> {
         }
     }
 
+    /// Attempts actor admission without blocking paging or release processing.
+    pub(super) fn try_exclusive(self) -> Option<SectionResourceGuard<'a>> {
+        if !self.acquire(true, false) {
+            return None;
+        }
+        Some(SectionResourceGuard {
+            resource: self,
+            same_thread: PhantomData,
+        })
+    }
+
     /// Retains an exclusive resource through a synchronous native preparation call.
     pub(super) fn exclusive(self) -> SectionResourceGuard<'a> {
         if !self.acquire(true, true) {

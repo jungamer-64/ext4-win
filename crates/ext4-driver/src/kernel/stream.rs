@@ -914,6 +914,26 @@ impl StreamContext {
         .ok_or(DriverError::InternalInvariantViolation)
     }
 
+    /// Admits a short actor control call while preserving its input on resource contention.
+    /// Native callbacks may reacquire this same-thread exclusive resource recursively.
+    /// # Errors
+    /// Returns the unconsumed input when native resource admission is busy.
+    pub(crate) fn with_control_resource<T, R>(
+        &self,
+        input: T,
+        action: impl FnOnce(T) -> R,
+    ) -> Result<R, T> {
+        #[cfg(not(test))]
+        let _guard = {
+            let resource = self.main_resource().unwrap_or_else(|_| crate::kernel::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck());
+            let Some(guard) = resource.try_exclusive() else {
+                return Err(input);
+            };
+            guard
+        };
+        Ok(action(input))
+    }
+
     /// Transfers one live filesystem-control IRP to the stream-owned FsRtl oplock package.
     ///
     /// # Safety
@@ -970,8 +990,9 @@ impl StreamContext {
         irp: NonNull<wdk_sys::IRP>,
         flags: u32,
         continuation: NonNull<c_void>,
-    ) -> NTSTATUS {
-        unsafe {
+    ) -> (NTSTATUS, bool) {
+        let mut admitted = 0;
+        let status = unsafe {
             // SAFETY: The caller supplies the consuming IRP and stable continuation capabilities
             // documented above; native SEH contains FsRtl exceptions at the C boundary.
             ext4win_stream_check_oplock(
@@ -979,8 +1000,10 @@ impl StreamContext {
                 irp.as_ptr(),
                 flags,
                 continuation.as_ptr(),
+                &raw mut admitted,
             )
-        }
+        };
+        (status, admitted != 0)
     }
 
     /// Releases the exact cleanup handle's oplock without client acknowledgment or IRP delegation.
@@ -2076,6 +2099,7 @@ unsafe extern "system" {
         irp: *mut wdk_sys::IRP,
         flags: wdk_sys::ULONG,
         continuation: wdk_sys::PVOID,
+        admitted: *mut u8,
     ) -> NTSTATUS;
     fn ext4win_stream_backout_atomic_oplock(
         stream_header: wdk_sys::PVOID,

@@ -579,7 +579,8 @@ ext4win_stream_check_oplock(
     _In_ PVOID stream_header,
     _Inout_ PIRP irp,
     _In_ ULONG flags,
-    _In_ PVOID continuation)
+    _In_ PVOID continuation,
+    _Out_ PBOOLEAN admitted)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
     NTSTATUS status;
@@ -589,8 +590,13 @@ ext4win_stream_check_oplock(
         (continuation == NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
+    *admitted = TRUE;
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
-    ext4win_acquire_resource_shared(&stream->MainResource, TRUE);
+    if (!ext4win_acquire_resource_exclusive(&stream->MainResource, FALSE)) {
+        *admitted = FALSE;
+        return STATUS_CANT_WAIT;
+    }
+    *admitted = TRUE;
     __try {
         status = ext4win_check_oplock(
             &stream->Header.Oplock,
@@ -603,8 +609,7 @@ ext4win_stream_check_oplock(
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = GetExceptionCode();
     }
-    ext4win_release_resource(&stream->MainResource);
-    ext4win_acquire_resource_exclusive(&stream->MainResource, TRUE);
+
     ext4win_stream_refresh_fast_io_projection(stream);
     ext4win_release_resource(&stream->MainResource);
     ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK, status);

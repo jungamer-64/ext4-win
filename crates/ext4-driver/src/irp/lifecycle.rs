@@ -1535,6 +1535,8 @@ impl OwnedIrp {
     /// The caller has already serialized this request with the handle lane and completed its
     /// stream oplock check. FsRtl then owns completion, conflict waiting, and cancellation for the
     /// byte-range request.
+    /// # Errors
+    /// Returns the still-owned IRP when main-resource admission is busy.
     #[expect(
         unsafe_code,
         reason = "the decoded FCB remains live through the consumed queued IRP and handle lane"
@@ -1542,36 +1544,39 @@ impl OwnedIrp {
     pub(crate) fn delegate_byte_range_lock(
         self,
         file_control_block: NonNull<FileControlBlock>,
-    ) -> NTSTATUS {
-        let Self {
-            target,
-            context,
-            #[cfg(not(test))]
-            notification,
-            #[cfg(not(test))]
-            active_cancellation,
-        } = self;
-        #[cfg(not(test))]
-        drop(active_cancellation);
-        drop(context);
+    ) -> Result<NTSTATUS, Self> {
         let file_control_block = unsafe {
-            // SAFETY: Reactor admission decoded this FCB from the same live FILE_OBJECT. The
-            // consumed IRP and its ordinary handle lane retain that object through delegation.
+            // SAFETY: The live owned IRP and handle lane retain this decoded FCB through admission.
             file_control_block.as_ref()
         };
-        #[cfg(not(test))]
-        let completion = notification.for_file_lock();
-        file_control_block.process_byte_range_lock(
-            target,
+        file_control_block.with_control_resource(self, |owned| {
+            let Self {
+                target,
+                context,
+                #[cfg(not(test))]
+                notification,
+                #[cfg(not(test))]
+                active_cancellation,
+            } = owned;
             #[cfg(not(test))]
-            completion,
-        )
+            drop(active_cancellation);
+            drop(context);
+            #[cfg(not(test))]
+            let completion = notification.for_file_lock();
+            file_control_block.process_byte_range_lock(
+                target,
+                #[cfg(not(test))]
+                completion,
+            )
+        })
     }
 
     /// Transfers this queued namespace-stream oplock FSCTL's terminal completion to FsRtl.
     ///
     /// The caller has serialized the request through the live handle lane and revalidated the
     /// FILE_OBJECT-to-FCB binding immediately before this consuming transition.
+    /// # Errors
+    /// Returns the still-owned IRP when main-resource admission is busy.
     #[expect(
         unsafe_code,
         reason = "the decoded FCB remains live through the consumed queued IRP and handle lane"
@@ -1579,26 +1584,27 @@ impl OwnedIrp {
     pub(crate) fn delegate_oplock_control(
         self,
         file_control_block: NonNull<FileControlBlock>,
-    ) -> NTSTATUS {
-        let Self {
-            target,
-            context,
-            #[cfg(not(test))]
-            notification,
-            #[cfg(not(test))]
-            active_cancellation,
-        } = self;
-        #[cfg(not(test))]
-        drop(active_cancellation);
-        drop(context);
+    ) -> Result<NTSTATUS, Self> {
         let file_control_block = unsafe {
-            // SAFETY: Reactor admission decoded this FCB from the same live FILE_OBJECT. The
-            // consumed IRP and its ordinary handle lane retain that object through delegation.
+            // SAFETY: The live owned IRP and handle lane retain this decoded FCB through admission.
             file_control_block.as_ref()
         };
-        #[cfg(not(test))]
-        drop(notification);
-        file_control_block.process_oplock_fsctrl(target)
+        file_control_block.with_control_resource(self, |owned| {
+            let Self {
+                target,
+                context,
+                #[cfg(not(test))]
+                notification,
+                #[cfg(not(test))]
+                active_cancellation,
+            } = owned;
+            #[cfg(not(test))]
+            drop(active_cancellation);
+            drop(context);
+            #[cfg(not(test))]
+            drop(notification);
+            file_control_block.process_oplock_fsctrl(target)
+        })
     }
 
     /// Prepares cancellation after detaching driver-owned request resources.

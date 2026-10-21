@@ -187,6 +187,17 @@ impl FileControlBlock {
         self.node
     }
 
+    /// Retains control-call ownership when the main resource cannot be acquired immediately.
+    /// # Errors
+    /// Returns the unconsumed input on resource contention.
+    pub(crate) fn with_control_resource<T, R>(
+        &self,
+        input: T,
+        action: impl FnOnce(T) -> R,
+    ) -> Result<R, T> {
+        self.stream_context.with_control_resource(input, action)
+    }
+
     /// Transfers one validated lock-control IRP to the FsRtl lock package.
     #[cfg_attr(
         not(test),

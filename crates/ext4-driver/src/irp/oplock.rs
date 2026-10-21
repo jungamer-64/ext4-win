@@ -186,7 +186,11 @@ impl OplockCheck {
         unsafe_code,
         reason = "the stable envelope and delegated IRP are the audited native oplock-call boundary"
     )]
-    unsafe fn submit(&self, irp: NonNull<wdk_sys::IRP>, continuation: NonNull<c_void>) -> NTSTATUS {
+    unsafe fn submit(
+        &self,
+        irp: NonNull<wdk_sys::IRP>,
+        continuation: NonNull<c_void>,
+    ) -> (NTSTATUS, bool) {
         unsafe {
             // SAFETY: The envelope owns this stream lease and delegated IRP until native return or
             // callback publication, and its stable allocation is supplied as `continuation`.
@@ -513,6 +517,8 @@ pub(super) enum OplockSubmission {
     },
     /// FsRtl owns the raw envelope until its wait-completion callback publishes it.
     Pending,
+    /// Main-resource admission denied before FsRtl observed the IRP.
+    Deferred(Box<OplockEnvelope>),
 }
 
 /// Non-owning cancellation identity published only while FsRtl retains an oplock wait.
@@ -577,6 +583,8 @@ pub(super) struct OplockEnvelope {
     suspended: Option<Box<dyn OplockContinuation>>,
     /// Exact callback state and `IRP.IoStatus.Status` publication.
     callback: OplockCallbackProtocol,
+    /// Finite pre-effect resource retry policy.
+    retries: super::scheduler::NativeAdmissionBudget,
 }
 
 #[cfg(not(test))]
@@ -620,6 +628,7 @@ impl OplockEnvelope {
                 delegated: None,
                 suspended: Some(suspended),
                 callback: OplockCallbackProtocol::new(),
+                retries: super::scheduler::NativeAdmissionBudget::new(),
             },
         )
         .map_err(|failure| {
@@ -663,6 +672,16 @@ impl OplockEnvelope {
         }
     }
 
+    /// Restores driver cancellation while a pre-effect admission timer owns this envelope.
+    pub(super) fn restore_cancellation(&mut self, cancel: NonNull<super::ActiveCancelEnvelope>) {
+        self.owned
+            .as_mut()
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            })
+            .install_active_cancellation(cancel);
+    }
+
     /// Removes driver cancel authority, transfers the stable allocation, and calls FsRtl once.
     pub(super) fn submit(mut envelope: Box<Self>) -> OplockSubmission {
         let owned = envelope.owned.take().unwrap_or_else(|| {
@@ -682,11 +701,28 @@ impl OplockEnvelope {
         .unwrap_or_else(|| {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
         });
-        let status = unsafe {
+        let (status, admitted) = unsafe {
             // SAFETY: The stable box retains the check, delegated IRP, continuation, and rundown
             // through native return or callback publication.
             check.submit(irp, continuation)
         };
+        if !admitted {
+            let mut envelope = unsafe {
+                // SAFETY: No native delegation occurred; this actor still owns the allocation.
+                Box::from_raw(raw)
+            };
+            if envelope.retries.defer() {
+                let delegated = envelope.delegated.take().unwrap_or_else(|| {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                });
+                envelope.owned = Some(delegated.reclaim());
+                return OplockSubmission::Deferred(envelope);
+            }
+            return OplockSubmission::Immediate {
+                envelope,
+                status: wdk_sys::STATUS_IO_TIMEOUT,
+            };
+        }
         if status == STATUS_PENDING {
             let was_posted = unsafe {
                 // SAFETY: `raw` remains owned by FsRtl or the queued completion envelope here.

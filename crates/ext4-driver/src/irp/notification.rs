@@ -37,6 +37,7 @@ impl NotificationPool {
         let mut slots = KernelVec::try_with_capacity(super::scheduler::MAX_OPERATIONS)?;
         for class in [
             super::scheduler::ExecutionClass::Ordinary,
+            super::scheduler::ExecutionClass::Release,
             super::scheduler::ExecutionClass::Paging,
             super::scheduler::ExecutionClass::Finalization,
         ] {
