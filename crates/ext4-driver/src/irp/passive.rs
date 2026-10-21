@@ -129,6 +129,8 @@ pub(crate) enum PassiveWork {
     Uninitialize {
         /// Stream and FILE_OBJECT identity retained through uninitialization.
         file_object: FileObjectCacheLease,
+        /// Sole completion owner retains FILE_OBJECT through native teardown.
+        owned: super::OwnedIrp,
     },
 }
 
@@ -179,7 +181,12 @@ pub(crate) enum PassiveWorkCompletion {
     /// Synchronous handle-oplock release status; driver completion ownership remains retained.
     CleanupOplock(DriverResult<()>),
     /// Private cache-map uninitialization status.
-    Uninitialize(DriverResult<()>),
+    Uninitialize {
+        /// Completion authority returned after native FILE_OBJECT access ends.
+        owned: super::OwnedIrp,
+        /// Exact teardown outcome, including failure before worker submission.
+        result: DriverResult<()>,
+    },
 }
 
 impl PassiveWork {
@@ -261,8 +268,8 @@ impl PassiveWork {
     }
 
     /// Builds one FILE_OBJECT cache-map uninitialization.
-    pub(crate) const fn uninitialize(file_object: FileObjectCacheLease) -> Self {
-        Self::Uninitialize { file_object }
+    pub(crate) const fn uninitialize(file_object: FileObjectCacheLease, owned: super::OwnedIrp) -> Self {
+        Self::Uninitialize { file_object, owned }
     }
 
     /// Executes the sole native call selected before the actor suspended.

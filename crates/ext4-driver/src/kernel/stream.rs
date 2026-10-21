@@ -1762,12 +1762,13 @@ impl StreamContext {
     /// Returns the exact Cache Manager exception status.
     pub(crate) fn uninitialize_cache_map(
         &self,
-        _file_object: NonNull<wdk_sys::FILE_OBJECT>,
+        _file_object: crate::irp::ActiveFileObject<'_>,
     ) -> DriverResult<()> {
         #[cfg(not(test))]
         {
             let status = unsafe {
-                // SAFETY: Cleanup/close retains the FILE_OBJECT and stream for the complete call.
+                // SAFETY: The active IRP borrow retains FILE_OBJECT and self retains the stream
+                // throughout this synchronous native call.
                 ext4win_stream_cache_uninitialize(self.header.as_ptr(), _file_object.as_ptr())
             };
             cache_status(status)

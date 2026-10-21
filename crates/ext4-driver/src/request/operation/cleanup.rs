@@ -16,7 +16,7 @@ enum CleanupState {
     /// A reserved native worker notifies FsRtl; cleanup never transfers IRP completion ownership.
     Notifying(OwnedIrp),
     /// Native private cache-map release runs outside the actor.
-    Uninitializing(OwnedIrp),
+    Uninitializing,
     /// A terminal completion or deletion mutation owns the original IRP.
     Terminal,
 }
