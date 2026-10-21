@@ -72,16 +72,16 @@ pub(crate) enum CommandOutcome {
         stderr: Vec<u8>,
     },
 }
-/// Requester supervision retained through successful completion or termination observation.
+/// Requester supervision retained until exit observation or an explicit uncertain outcome.
 #[derive(Debug)]
 struct Requester(Option<Child>);
 impl Drop for Requester {
     /// Requests OS-owned termination without waiting for potentially stuck kernel I/O.
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            if let Err(error) = child.kill() {
-                eprintln!("requester fallback termination: {error}");
-            }
+        if let Some(mut child) = self.0.take()
+            && let Err(error) = child.kill()
+        {
+            eprintln!("requester fallback termination: {error}");
         }
     }
 }
@@ -153,7 +153,7 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
 
 /// Captures only bytes already available, with an explicit eight-MiB per-stream diagnostic limit.
 /// # Errors
-/// Returns pipe errors or a policy-limit failure; the requester owner then terminates and waits.
+/// Returns pipe errors or a policy-limit failure; the owner then requests termination.
 fn drain(pipe: &mut (impl AsRawHandle + Read), bytes: &mut Vec<u8>) -> io::Result<()> {
     let available =
         usize::try_from(windows_host::pipe_bytes_available(pipe)?).map_err(io::Error::other)?;
@@ -257,7 +257,9 @@ mod tests {
             "-Command",
             "[Console]::WriteLine('accepted'); Start-Sleep -Seconds 30",
         ]);
+        let started = Instant::now();
         let outcome = bounded(command, Duration::from_secs(2))?;
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(matches!(&outcome, CommandOutcome::Uncertain { .. }));
         let failure = checked_outcome(outcome, "timed requester")
             .err()
