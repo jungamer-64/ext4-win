@@ -15,8 +15,8 @@ compile the driver or require WDK.
 | Command | Host requirements | What it establishes |
 | --- | --- | --- |
 | `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, runs the portable tests and Clippy, and documents the host boundary. |
-| `cargo xtask verify-windows-host` | Elevated Windows host | Exercises native ETW enable-before-registration, scalar delivery, trace persistence and joined shutdown without installing a driver. |
-| `cargo xtask verify-driver` | Windows with MSVC, WDK, and Clang configured | Checks bounded I/O Manager input capture, native resource/APC ownership, Rust stream admission and mutation ownership, metadata publication progress, and Cc ownership including SEH failure cleanup, checks, tests, lints, and builds rustdoc for the `ext4win` kernel-driver crate. It does not build a signed release package. |
+| `cargo xtask verify-windows-host` | Elevated Windows host | Exercises native Windows ETW and token/privilege contracts without installing a driver. |
+| `cargo xtask verify-driver` | Windows with MSVC, WDK, and Clang configured | Checks, tests, lints, and documents the kernel-driver crate and its native boundaries. |
 | `cargo xtask verify-fuzz-replay` | Host with the repository-pinned cargo-fuzz installed | Discovers every declared fuzz target and replays its tracked corpus once under the bounded fuzz harness. |
 | `cargo xtask verify-journal-interop` | Native Linux or Windows with WSL; e2fsprogs | Exercises ext4 mutation and recovery against independently generated `debugfs` and `e2fsck` evidence. |
 | `cargo xtask verify-htree-interop` | Native Linux or Windows with WSL; e2fsprogs and root loop-mount authority | Exercises bounded HTree lookup, paging, and local mutation against independently generated ext4 images. |
@@ -30,9 +30,10 @@ compile the driver or require WDK.
 | `cargo xtask benchmark-multi-file` | A host that passes the live preflight | Measures native random reads and writes on independently populated disposable storage, retaining artifact-bound latency and flush evidence. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
 
-`verify-fuzz-replay` is the deterministic pull-request gate for previously retained inputs.
-The scheduled fuzz campaign remains a separate, time-bounded search rather than part of the
-signed production umbrella.
+The [development tasks](tools/xtask/src/development.rs) define the format, lint,
+test, and rustdoc gates. CI hosts and triggers are defined in the
+[verification workflow](.github/workflows/verify.yml) and
+[fuzz workflow](.github/workflows/fuzz.yml).
 
 ## Developer diagnostics
 
@@ -67,18 +68,6 @@ pending kernel operation. Neither command changes
 driver lifecycle or storage. Extent input files must be a complete superblock
 and external extent block; the checksum result does not validate the rest of
 the filesystem. Wait-log extraction reports its match count and any truncation.
-
-Diagnostic wire-format, immutable-snapshot and failure contracts run in
-`verify-portable`. On Windows this also checks real volume queries, service
-absence, requester termination and durable session recovery. The elevated
-`verify-windows-host` gate additionally exercises the actual ETW ABI.
-
-Linux-local fixture mutations run in a Rust executable built from current
-source before use. Windows builds its statically linked Linux target with the
-repository toolchain and runs it in WSL; e2fsprogs remains the independent
-filesystem oracle. Native Windows handles, directory queries and ETW belong
-to `windows-host`. Hyper-V and certificate-store management commands return
-external observations; Rust owns identity checks, sequencing and recovery.
 
 ## Volume identity administration
 
@@ -140,28 +129,17 @@ checks explicit ownership and security privileges.
 
 ## Ext4 durability and interoperability
 
-`verify-journal-interop` treats e2fsprogs as an independent oracle rather than
-generating expected results through the production core. Every scenario starts
-from a newly formatted or freshly copied image. The 4 KiB profile covers file
-and directory creation, multi-block writes, growth, truncation, rename, hard
-links, unlink, and xattr creation, replacement, and removal. The 4 KiB-block/
-16 KiB-cluster BIGALLOC profile additionally covers allocation, cluster reuse,
-and free-space accounting.
+Interoperability uses e2fsprogs as an independent oracle on newly formatted or
+freshly copied images. Linux-local fixture mutations run an executable built
+from current source, including when invoked through WSL. Tested profiles and
+operations are defined by the [interoperability scenarios](tools/xtask/src/interop/scenarios.rs)
+and [orphan recovery cases](tools/xtask/src/interop/scenarios/orphan.rs).
 
-Fresh 1 KiB and 4 KiB profiles also exercise authenticated orphan-file slots,
-the fallback orphan chain, zero-link reclamation, linked EOF truncation, and
-BIGALLOC accounting. A multi-batch orphan fixture is interrupted after every
-512-byte write prefix and flush. At every cut, remount publication must wait for
-tracker cleanup to checkpoint, and clean close must leave an `e2fsck`-clean
+External-journal crash recovery is accepted only when `e2fsck -f` is clean and
+the observable namespace, content, links, xattrs, and allocation state are
+wholly old or wholly new. Interrupted orphan recovery must checkpoint tracker
+cleanup before remount publication; clean close must leave an `e2fsck`-clean
 allocation and namespace endpoint.
-
-Journal recovery is one part of this ext4-wide gate. Linux-generated JBD2
-records exercise supported block sizes, checksum layouts, 64-bit block numbers,
-and revokes. The external-journal profile groups rename, sparse-extension write,
-and xattr update into one mutation and evaluates interrupted home-block writes
-and flush cuts. Recovery is accepted only when `e2fsck -f` is clean and the
-observable namespace, content, links, xattrs, and allocation state are wholly
-old or wholly new.
 
 The crash model assumes atomic 512-byte sectors. Writes may be absent, may
 persist at a sector-aligned prefix, or may persist completely. Successful
@@ -169,31 +147,18 @@ flushes preserve prior write ordering and make durable only the target device,
 so an external journal and its filesystem image have independent volatile and
 durable states.
 
-Supported-feature acceptance remains owned by core mount validation. These
-scenarios describe tested behavior; they do not create a second feature matrix.
+Volume feature, geometry, and journal acceptance are determined by
+[core mount validation](crates/ext4-core/src/volume/mount.rs).
 
 ## Production release evidence
 
-`verify-production-driver` is the signed-bundle and reachability gate. It first runs
-`verify-portable`, `verify-driver`, `verify-journal-interop`, and
-`verify-htree-interop`. It then creates one build identity, builds and signs the
-package, binds the LLVM IR, link map, and driver image to that identity, runs
-the production reachability gate, and rejects concurrent source changes. It
-fails explicitly on macOS and Linux instead of compiling a non-Windows driver
-shim.
-
-The allocation-free Rust audit starts at mounted-volume durable publication,
-including both epoch replacement and stream-size publication. The link-map
-contract also requires the native advanced-header allocation, owner/section
-decoding, size access, destruction, Cache Manager, oplock FSCTL, Fast I/O
-registration/read/write, raw-volume admission, and operational ETW
-register/write/unregister boundaries, including the underlying kernel ETW
-imports. The checked-in trace schema carries one fixed event identifier,
-`NTSTATUS`, and outcome per record; it has no field for file names, offsets,
-lengths, pointers, or file data. Retaining these linked entry points does not
-establish their live behavior; Cache Manager reentry, oplock breaks, mapped
-writeback, Fast I/O selection, ETW observation, and raw-sector effects require
-the dedicated live-volume gate.
+`verify-production-driver` builds and signs one bundle from a fixed source
+snapshot and verifies release reachability. It rejects concurrent source
+changes. The [production workflow](tools/xtask/src/production.rs) defines the
+composed gates and artifact checks; the
+[reachability gate](tools/production-reachability/src/main.rs) defines the
+allocation-free durable-publication audit and required native boundaries.
+Linked entry points do not establish live behavior.
 
 Successful bundles are atomically published below
 `target/verified-production/<artifact-id>/`. The versioned manifest binds the
@@ -210,114 +175,66 @@ root are the authoritative project texts. The core and driver crates are interna
 workspace components and are not published separately. Production bundles carry
 the project's original license texts from the repository root.
 
-`verify-hosted-driver-load` is the kernel-load-only umbrella. It performs the hosted
-preflight, invokes `verify-production-driver`'s bundle construction exactly
-once, shuts down the production gate's WSL oracle so its ext4 virtual disk is
-not an incidental mount target, and passes the resulting verified bundle value
-directly to the DriverStore/service lifecycle owner. The lower production
-command remains available when signed artifact and reachability evidence are
-the intended boundary without a live kernel-load claim.
+## Live-driver validation and recovery
 
-## CI and live-driver boundaries
+`verify-hosted-driver-load` installs the verified bundle and checks that the
+DriverStore and service images match its SHA-256, then requires demand-start
+initialization and complete service/package cleanup. This establishes package
+and configured-image identity and successful initialization, not a hash of
+kernel memory or filesystem I/O behavior.
 
-CI runs `verify-portable` on Windows, Ubuntu, and macOS, replays every tracked fuzz corpus on
-pull requests, runs time-bounded fuzz campaigns on schedule, and runs ext4 interoperability on
-Ubuntu. The blocking live read-write job runs on the `windows-2025-vs2026` GitHub-hosted
-image. It imports the single cargo-wdk certificate identity into LocalMachine
-Root and Trusted Publishers, confirms both thumbprints, and then runs
-`verify-live-vhdx`. Pull requests, pushes to `main`, and manual dispatches run
-the same gate. The live session enables the immediately applicable Driver Verifier DIF
-checks after the driver starts and before filesystem I/O; it does not rely on next-boot
-settings or reboot the runner. The workflow stops the selected rule classes after
-session cleanup.
+`verify-live-vhdx` additionally requires persisted Windows readback after flush,
+dismount, and VHDX reattachment with the same loaded driver. Runtime Driver
+Verifier evidence must identify active checks and the loaded driver before and
+after filesystem I/O. The report parser requires English Windows runtime
+output; unknown formats fail validation. Live results apply to the generated
+volume and exercised scenarios, not arbitrary physical volumes or untested
+feature combinations. The [live-session owner](tools/xtask/src/live/owner.rs)
+defines scenario execution and evidence collection.
 
-A green production bundle proves signed artifact identity and release
-reachability. The hosted load gate additionally proves that structured PnPUtil
-inventory selected the sole installed package, both its exported SYS and the
-service `ImagePath` SYS match the production manifest SHA-256, the registry
-records `Type=2` and `Start=3`, and demand-start initialization returned with
-the service in `Running` state. Before SCM stop, the administrator/System-only
-named control device consumes the `IoRegisterFileSystem` reference through its
-payload-free prepare-unload request. It first closes hidden-volume discovery,
-unregisters PnP notifications, requests exchange cancellation and joins its
-worker while mount requests can still complete. Discovery completion waits have
-a deadline; each exchange owns its private IRP, aligned buffer and target
-reference. A timed-out or cancelled exchange occupies the single request slot
-until caller, completion and cancellation access retire. Prepare-unload returns
-busy while lower I/O remains outstanding, retaining registration and storage
-for a later attempt; cancellation alone cannot authorize their release.
-After discovery quiesces, it closes reactor admission, drains and destroys
-the control reactor, withdraws its alias, and requests device deletion. Existing
-control handles can still complete Cleanup/Close against the closed extension
-header. Base filesystem drivers must retire every device before `DriverUnload`
-can run; mounted volumes retire through dismount and final close, not through
-that callback. The host closes its control handle and verifies alias withdrawal
-before SCM stop. Interrupted cleanup can find an already-withdrawn endpoint;
-that absence alone is not unload success. SCM stop must complete `DriverUnload`;
-OEM package removal and final service/package absence are mandatory. The
-lifecycle device path and IOCTL are generated into the driver and read by the
-cleanup owner from the same versioned contract.
-
-The hosted gate does not claim a byte hash of kernel memory, VHDX or filesystem
-I/O behavior, or Driver Verifier coverage. Those are distinct live-validation
-boundaries and a hosted smoke result does not substitute for them.
-
-The live CI result additionally requires byte-for-byte readback through Windows,
-rename and hard-link enumeration, flush/dismount, and persisted readback after
-VHDX reattachment with the same loaded driver. Runtime `verifier /query` reports
-must identify active flags and a currently loaded `ext4win.sys` before and after
-the filesystem scenario. The report parser accepts the English Windows runtime
-format and fails closed on unknown formats. Registry settings alone cannot pass.
-The job retains the transcript, live-session phase records, runtime Verifier
-report, driver-load identity evidence, and signed production bundle, including
-available evidence after failure. It attempts identity-checked session recovery
-even after a failed test step; cleanup success does not turn failed I/O into a
-passing result. A VM crash or job-level timeout can prevent cleanup and artifact
-upload; the hosted VM is discarded, and that run is not acceptance evidence.
-
-The Rust live-session owner starts an ETW consumer before the driver registers its provider.
-It streams fixed initialization and discovery stages, status and outcome to the
-job console and retains a bounded ETL alongside session evidence. This makes
-the last delivered kernel stage observable when the runner cannot upload files.
-Delivery remains buffered; a stopped host can lose its final events, and absence
-of an event does not prove that its operation never started. SCM start and stop
-requests have bounded helper waits. A start timeout does not cancel DriverEntry;
-cleanup retains the service and package while SCM still reports `StartPending`.
-
-`verify-live-vhdx` composes the common driver-load preflight with its additional
-Hyper-V, WSL/e2fsprogs, and Driver Verifier requirements. It does not accept a disk path or disk number. It creates one
-fixed-size VHDX below `target/live-vhdx-sessions/<session-id>/`, bounds WSL
-device discovery to the device introduced by that VHDX, and unmounts the device
-from WSL before Windows-driver access. It also shuts down WSL so the oracle's
-own ext4 disk cannot become an incidental discovery target. Driver installation, start, stop, package
-selection, hash verification, and cleanup are delegated to the same durable
-driver-load session used by the hosted gate.
+Live evaluation requires a dedicated, elevated Windows host and creates its own
+VHDX below `target/live-vhdx-sessions/<session-id>/`. It accepts no disk path or
+disk number. WSL access is confined to that VHDX and ends before Windows-driver
+access; WSL is shut down before driver startup so its own ext4 disk cannot
+become a discovery target.
 
 Load preflight rejects existing Linux data GUID volumes. Immediately before
 driver startup, any such partition must match the live session's generated VHDX,
 disk identity and exact partition identity/range. The dedicated host must remain
 free of unrelated storage arrivals throughout the run.
 
-The disposable partition retains the Linux filesystem data GUID. The live gate
-requires Mount Manager to enumerate a volume with that exact disk extent before
-creating a session-owned directory mount point. It checks both discovery at
-driver startup and reattachment while the driver is running, and rechecks GPT
-type, identity and range after filesystem I/O. Neither the harness nor the
-driver substitutes a Basic Data partition type to obtain a mount point.
+The disposable partition retains its Linux filesystem data type, identity, and
+range. Mount Manager must enumerate that exact disk extent before a
+session-owned directory mount point is created. Discovery is checked at driver
+startup and reattachment; [partition admission](crates/ext4-driver/src/kernel/volume_discovery.rs)
+and [volume publication](crates/ext4-driver/src/kernel/mount_manager.rs) own the
+recognition contracts.
 
-The live scenario requires file create, read, write, rename, hard link,
-patterned enumeration, durable flush, clean dismount, driver unload, package
-removal, and VHDX removal to succeed. The hard-link deletion and rename scenario
-uses backup-intent handles with SeRestorePrivilege enabled on a private thread;
-ordinary opens are separately required to refuse namespace DELETE authority.
-The elevated host gate checks the same privileged namespace operations before
-the live volume is attached. Lifecycle side effects are preceded by a
-durably flushed immutable JSON phase record. An intent records uncertain
-acceptance; only a subsequent observation records completion. Cleanup reloads
-the latest committed record and revalidates the verified bundle
-identity, signer thumbprint, SYS hash, OEM INF, service image path, VHDX path,
-and disk unique ID before acting. An interrupted session also queries the exact
-session volume's mounted state before detaching its VHDX. It performs a clean
-filesystem dismount when required and does not consume the driver's unload
-control endpoint until storage cleanup is complete. Physical disks remain
-permanently outside this workflow.
+Lifecycle effects are preceded by durably flushed session intent records. An
+intent does not establish completion. After interruption, use the matching
+cleanup command from the command table; recovery reloads the committed record
+and revalidates artifact, signer, package, service, and storage identities
+before acting. Volume state is reconciled and mounted storage is cleanly
+dismounted before detachment or driver retirement. The
+[driver-load owner](tools/xtask/src/driver_load/owner.rs) and
+[session records](tools/xtask/src/session.rs) define recovery and persistence.
+
+A start timeout does not cancel DriverEntry; recovery retains the service and
+package while SCM reports `StartPending`. Prepare-unload can return busy while
+lower I/O remains outstanding. Cancellation or an absent control endpoint is
+not proof of unload: SCM stop, package removal, and final service/package
+absence are required. The driver retains outstanding resources according to
+its [discovery exchange](crates/ext4-driver/src/kernel/volume_discovery/io.rs)
+and [device retirement](crates/ext4-driver/src/state/control_device.rs) contracts.
+
+Operational ETW carries fixed event IDs, status, and outcomes without file
+names, offsets, lengths, pointers, or file data; its
+[provider owner](crates/ext4-driver/src/kernel/operational_trace.rs) defines the
+payload and registration lifetime. Delivery is buffered, so missing final
+events do not establish that an operation never started.
+
+Live validation requires filesystem validation, driver unload, and service,
+package, and VHDX cleanup. Available evidence is retained after failure and recovery is
+attempted; cleanup cannot turn failed I/O into a passing result. A VM crash or
+job timeout can prevent cleanup and evidence upload, and that run is not
+acceptance evidence.
