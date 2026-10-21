@@ -294,20 +294,7 @@ impl FileControlBlock {
             .permits_write(requestor, file_object, start, length, key)
     }
 
-    /// Releases all byte-range locks held by this FILE_OBJECT's requestor during cleanup.
-    pub(crate) fn release_handle_byte_range_locks(
-        &self,
-        requestor: RequestorProcess,
-        file_object: KernelFileObject,
-    ) {
-        if self
-            .stream_context
-            .unlock_all(file_object.as_non_null(), requestor.as_non_null())
-            .is_err()
-        {
-            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
-        }
-    }
+
 }
 
 /// Complete identity-bound Windows stream projection derived from one coherent core snapshot.
