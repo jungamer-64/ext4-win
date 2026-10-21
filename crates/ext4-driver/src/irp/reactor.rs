@@ -340,6 +340,15 @@ pub(crate) enum CompletionEvent {
 }
 
 impl CompletionEvent {
+    /// Native completion must return its resources before cancellation can retire the request.
+    fn prefer_cancellation(self, cancelled: bool) -> Self {
+        match self {
+            Self::PassiveCompleted(_) => self,
+            _ if cancelled => Self::Core(OperationEvent::CancelRequested),
+            _ => self,
+        }
+    }
+
     /// Extracts an event for an operation that never waits on volume durability.
     /// A native wait failure routed to such an operation is reactor state corruption.
     pub(crate) fn into_core(self) -> OperationEvent {
@@ -2108,11 +2117,7 @@ impl CompletionReactor {
         operation: SuspendedOperation,
         event: CompletionEvent,
     ) {
-        let event = if self.cancellation_is_pending(index) {
-            CompletionEvent::Core(OperationEvent::CancelRequested)
-        } else {
-            event
-        };
+        let event = event.prefer_cancellation(self.cancellation_is_pending(index));
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
@@ -2190,7 +2195,12 @@ impl CompletionReactor {
                     let SlotPayload::Operation { event, .. } = &mut slot.payload else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    *event = Some(CompletionEvent::Core(OperationEvent::CancelRequested));
+                    *event = Some(
+                        event
+                            .take()
+                            .unwrap_or(CompletionEvent::Core(OperationEvent::CancelRequested))
+                            .prefer_cancellation(true),
+                    );
                 });
             }
             CancelDisposition::CancelLower => {
@@ -4807,6 +4817,25 @@ mod tests {
         PublicationAuthority, SlotPayload, SuspendedOperation, driver_error_to_core,
         initialize_list_head, insert_tail_list, list_is_empty, remove_head_list, slot_bit,
     };
+
+    /// # Panics
+    /// Native completion remains deliverable even when cancellation wins a concurrent race.
+    #[test]
+    fn cancellation_preserves_native_completion() {
+        let event = CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Flush(
+            Err(DriverError::DeviceBusy),
+        ));
+        assert!(matches!(
+            event.prefer_cancellation(true),
+            CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Flush(Err(
+                DriverError::DeviceBusy
+            )))
+        ));
+        assert!(matches!(
+            CompletionEvent::Core(OperationEvent::Admitted).prefer_cancellation(true),
+            CompletionEvent::Core(OperationEvent::CancelRequested)
+        ));
+    }
 
     /// # Panics
     /// Panics if normal queue exhaustion refuses terminal release or cancellation removes it.
