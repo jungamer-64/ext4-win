@@ -62,8 +62,10 @@ pub(crate) fn management(expression: &str) -> TaskResult<Value> {
 pub(crate) enum CommandOutcome {
     /// Requester completed and reported its exact exit status and diagnostics.
     Exited(Output),
-    /// Requester was stopped and joined; the external operation may already have been accepted.
+    /// Termination was requested; pending kernel I/O may still retain the requester.
     Uncertain {
+        /// Native process identity for subsequent observation; external effects require reconciliation.
+        requester: u32,
         /// Captured stdout/stderr before requester termination.
         stdout: Vec<u8>,
         /// Captured stderr.
@@ -74,14 +76,11 @@ pub(crate) enum CommandOutcome {
 #[derive(Debug)]
 struct Requester(Option<Child>);
 impl Drop for Requester {
-    /// Stops and observes an abandoned requester; accepted SCM/device effects still need reconciliation.
+    /// Requests OS-owned termination without waiting for potentially stuck kernel I/O.
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
             if let Err(error) = child.kill() {
                 eprintln!("requester fallback termination: {error}");
-            }
-            if let Err(error) = child.wait() {
-                eprintln!("requester fallback completion: {error}");
             }
         }
     }
@@ -111,18 +110,18 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let start = Instant::now();
-        let (status, uncertain) = loop {
+        let status = loop {
             drain(&mut stdout, &mut stdout_bytes)?;
             drain(&mut stderr, &mut stderr_bytes)?;
             if let Some(status) = child.try_wait()? {
-                break (status, false);
+                break Some(status);
             }
             if start.elapsed() >= timeout {
                 match child.kill() {
-                    Ok(()) => break (child.wait()?, true),
+                    Ok(()) => break None,
                     Err(error) => {
                         if let Some(status) = child.try_wait()? {
-                            break (status, false);
+                            break Some(status);
                         }
                         return Err(error.into());
                     }
@@ -132,14 +131,15 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
         };
         drain(&mut stdout, &mut stdout_bytes)?;
         drain(&mut stderr, &mut stderr_bytes)?;
-        if uncertain {
+        if status.is_none() {
             Ok(CommandOutcome::Uncertain {
+                requester: child.id(),
                 stdout: stdout_bytes,
                 stderr: stderr_bytes,
             })
         } else {
             Ok(CommandOutcome::Exited(Output {
-                status,
+                status: status.ok_or_else(|| io::Error::other("requester status missing"))?,
                 stdout: stdout_bytes,
                 stderr: stderr_bytes,
             }))
@@ -186,10 +186,10 @@ pub(crate) fn checked_outcome(outcome: CommandOutcome, description: &str) -> Tas
             String::from_utf8_lossy(&output.stderr)
         ))
         .into()),
-        CommandOutcome::Uncertain { stdout, stderr } => Err(io::Error::new(
+        CommandOutcome::Uncertain { requester, stdout, stderr } => Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "{description}: external acceptance/outcome uncertain; {}; {}",
+                "{description}: requester {requester} termination requested; external acceptance/outcome uncertain; {}; {}",
                 String::from_utf8_lossy(&stdout),
                 String::from_utf8_lossy(&stderr)
             ),
