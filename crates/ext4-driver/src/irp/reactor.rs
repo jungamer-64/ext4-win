@@ -487,17 +487,11 @@ pub(crate) enum OperationTransition {
         suspended: Box<dyn CompletionOperation>,
     },
     /// Execute one prepared native call outside the actor and requester threads.
+    /// Mutation intents and commit authority cannot cross this boundary.
     SubmitPassiveWork {
         /// Fully captured native operation whose resource lease owns every referenced identity.
         work: crate::irp::PassiveWork,
         /// Operation moved by value into the work-item completion envelope.
-        suspended: Box<dyn CompletionOperation>,
-    },
-    /// Release a provisional mutation intent before a reentrant native call.
-    SubmitPassiveWorkAfterIntentRelease {
-        /// Fully captured native operation whose resource lease owns every identity.
-        work: crate::irp::PassiveWork,
-        /// Operation resumed only after native work, then re-resolved before requesting intent.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Transfer one break-causing top-level IRP to the stream-owned FsRtl oplock package.
@@ -2840,16 +2834,6 @@ impl CompletionReactor {
                 );
             }
             OperationTransition::SubmitPassiveWork { work, suspended } => {
-                self.submit_passive_work(index, work, suspended);
-            }
-            OperationTransition::SubmitPassiveWorkAfterIntentRelease { work, suspended } => {
-                let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
-                else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                if !self.with_scheduler(|scheduler| scheduler.release_required_intent(identity)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                }
                 self.submit_passive_work(index, work, suspended);
                 self.grant_available_intents();
             }
@@ -5289,25 +5273,6 @@ mod tests {
                     crate::irp::PassiveWorkCompletion::PrepareVerity(result) => {
                         let _result = result;
                     }
-                }
-                drop(suspended);
-            }
-            OperationTransition::SubmitPassiveWorkAfterIntentRelease { work, suspended } => {
-                let completion = work.execute(false);
-                match completion {
-                    crate::irp::PassiveWorkCompletion::Retry(work) => {
-                        drop(work);
-                    }
-                    crate::irp::PassiveWorkCompletion::PrepareSizeChange(result) => {
-                        let _result = result;
-                    }
-                    crate::irp::PassiveWorkCompletion::PrepareDeletion(result) => {
-                        let _result = result;
-                    }
-                    crate::irp::PassiveWorkCompletion::PrepareWriteOpen(result) => {
-                        let _result = result;
-                    }
-                    _ => return,
                 }
                 drop(suspended);
             }

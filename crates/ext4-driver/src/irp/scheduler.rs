@@ -248,7 +248,7 @@ pub(crate) enum Phase {
     Registering,
     /// A completion envelope owns the lower lifetime.
     Lower,
-    /// A non-cancellable PASSIVE_LEVEL native work envelope owns the operation.
+    /// A non-cancellable native work envelope owns the operation without intent or commit grants.
     Passive,
     /// FsRtl owns the top-level IRP while an oplock break is pending.
     Oplock,
@@ -509,12 +509,22 @@ impl Scheduler {
     }
 
     /// Sets an actor-owned slot to a new phase.
+    ///
+    /// Native work may wait for paging mutations, so entering Passive releases provisional
+    /// intents. A held commit forbids that transition: its owner must finish or abandon commit
+    /// authority before native suspension. Resumption must reacquire any required intent.
     pub(crate) fn set_phase(&mut self, identity: SlotId, phase: Phase) -> bool {
         let Some(slot) = self.slot_mut(identity) else {
             return false;
         };
         if !matches!(slot.phase, Phase::Actor) {
             return false;
+        }
+        if matches!(phase, Phase::Passive) {
+            if slot.commit.is_some() {
+                return false;
+            }
+            slot.intent = None;
         }
         slot.phase = phase;
         true
@@ -734,14 +744,6 @@ impl Scheduler {
         };
         slot.intent = None;
         true
-    }
-
-    /// Consumes a required held intent before reentrant external preparation begins.
-    pub(crate) fn release_required_intent(&mut self, identity: SlotId) -> bool {
-        let Some(slot) = self.slot_mut(identity) else {
-            return false;
-        };
-        slot.intent.take().is_some()
     }
 
     /// Queues one commit request from actor ownership.
@@ -1157,13 +1159,13 @@ mod tests {
         assert_eq!(scheduler.grant_next_intent(), None);
     }
 
-    /// Verifies reentrant preparation explicitly consumes its provisional intent authority.
+    /// Verifies native suspension lets conflicting paging finish before intent reacquisition.
     /// # Panics
     ///
-    /// Panics if a conflicting paging mutation cannot progress after the size-preparation owner
-    /// releases its grant, or if that grant can be consumed twice.
+    /// Panics if native work retains its provisional intent or resumes mutation without
+    /// reacquiring its original ticket after the conflicting paging mutation completes.
     #[test]
-    fn reentrant_preparation_releases_exactly_one_held_intent() {
+    fn passive_work_releases_intent_until_conflicting_paging_completes() {
         let mut storage = core::mem::MaybeUninit::uninit();
         Scheduler::initialize(&mut storage);
         #[expect(
@@ -1176,7 +1178,7 @@ mod tests {
             storage.assume_init()
         };
         let preparation = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
-        let paging = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        let paging = require_some!(scheduler.reserve(ExecutionClass::Paging));
         let preparation_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         let paging_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
         assert_eq!(
@@ -1189,9 +1191,21 @@ mod tests {
         );
         assert_eq!(scheduler.grant_next_intent(), Some((preparation, 1)));
         assert_eq!(scheduler.grant_next_intent(), None);
-        assert!(scheduler.release_required_intent(preparation));
-        assert!(!scheduler.release_required_intent(preparation));
+        assert!(scheduler.set_phase(preparation, Phase::Passive));
         assert_eq!(scheduler.grant_next_intent(), Some((paging, 2)));
+        assert_eq!(
+            scheduler.enter_phase(preparation.index(), |phase| matches!(phase, Phase::Passive)),
+            Some(preparation)
+        );
+        let fresh_resources = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
+        assert_eq!(
+            scheduler.request_intent(preparation, IntentRequest::new(1, fresh_resources)),
+            Some(super::IntentDisposition::Queued)
+        );
+        assert_eq!(scheduler.grant_next_intent(), None);
+        assert!(scheduler.release_intent(paging));
+        assert!(scheduler.complete(paging));
+        assert_eq!(scheduler.grant_next_intent(), Some((preparation, 1)));
     }
 
     /// Verifies serialized commit selection by mutation ticket.
@@ -1755,6 +1769,7 @@ mod tests {
             Some((mutation, 7))
         );
         assert!(scheduler.grant_commit(mutation, 7));
+        assert!(!scheduler.set_phase(mutation, Phase::Passive));
         assert!(!scheduler.consume_cancel_before_effect(mutation.index(), false));
         assert_eq!(
             scheduler.request_cancel(mutation.index()),
