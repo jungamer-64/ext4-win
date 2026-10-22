@@ -57,7 +57,7 @@ impl DirectoryChangeAction {
 }
 
 /// Committed namespace mutation prepared before its ext4 transaction is published.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct DirectoryChange {
     /// Full synthetic target name used only by the FsRtl notifier package.
     pub(super) target: DirectoryNotificationTarget,
@@ -492,10 +492,10 @@ impl PartialEq for DirectoryNotificationDirectoryName {
 impl Eq for DirectoryNotificationDirectoryName {}
 
 /// Full synthetic target path reported to the FsRtl notification package.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(super) struct DirectoryNotificationTarget {
-    /// UTF-16 `\\<opaque parent id>\\<child name>` target path.
-    pub(super) units: [u16; DIRECTORY_NOTIFICATION_TARGET_UNITS],
+    /// Complete UTF-16 target, allocated before commit and retained through synchronous reporting.
+    pub(super) units: DriverVec<u16>,
     /// UTF-16 byte count of the populated target path.
     pub(super) byte_length: u16,
     /// Byte offset of the final child component inside `units`.
@@ -506,7 +506,7 @@ impl DirectoryNotificationTarget {
     /// Builds one complete target path from a directory entry identity.
     /// # Errors
     ///
-    /// Returns an error when the ext4 child name cannot be represented by Windows.
+    /// Returns an encoding, length, or allocation error before namespace commit can begin.
     fn new(parent: DirectoryNodeId, name: &Ext4Name) -> DriverResult<Self> {
         let directory_units = DirectoryNotificationDirectoryName::encode(parent);
         let name = WindowsName::from_ext4(name)?;
@@ -516,25 +516,6 @@ impl DirectoryNotificationTarget {
         let length = prefix_length
             .checked_add(name.utf16().len())
             .ok_or(DriverError::InvalidBufferSize)?;
-        if length > DIRECTORY_NOTIFICATION_TARGET_UNITS {
-            return Err(DriverError::InvalidBufferSize);
-        }
-        let mut units = [0_u16; DIRECTORY_NOTIFICATION_TARGET_UNITS];
-        let directory_destination = units
-            .get_mut(..DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
-            .ok_or(DriverError::InvalidBufferSize)?;
-        let directory_source = directory_units
-            .get(..DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
-            .ok_or(DriverError::InvalidBufferSize)?;
-        memory::copy_exact(directory_destination, directory_source)?;
-        let separator = units
-            .get_mut(DIRECTORY_NOTIFICATION_DIRECTORY_UNITS)
-            .ok_or(DriverError::InvalidBufferSize)?;
-        *separator = DIRECTORY_NOTIFICATION_SEPARATOR;
-        let child_destination = units
-            .get_mut(prefix_length..length)
-            .ok_or(DriverError::InvalidBufferSize)?;
-        memory::copy_exact(child_destination, name.utf16())?;
         let byte_length = u16::try_from(
             length
                 .checked_mul(core::mem::size_of::<u16>())
@@ -547,6 +528,10 @@ impl DirectoryNotificationTarget {
                 .ok_or(DriverError::InvalidBufferSize)?,
         )
         .map_err(|_| DriverError::InvalidBufferSize)?;
+        let mut units = DriverVec::try_with_capacity(length)?;
+        units.try_extend_from_copy_slice(&directory_units)?;
+        units.try_push(DIRECTORY_NOTIFICATION_SEPARATOR)?;
+        units.try_extend_from_copy_slice(name.utf16())?;
         Ok(Self {
             units,
             byte_length,
@@ -559,7 +544,7 @@ impl DirectoryNotificationTarget {
         UNICODE_STRING {
             Length: self.byte_length,
             MaximumLength: self.byte_length,
-            Buffer: self.units.as_ptr().cast_mut(),
+            Buffer: self.units.as_slice().as_ptr().cast_mut(),
         }
     }
 }
@@ -570,5 +555,3 @@ const DIRECTORY_NOTIFICATION_SEPARATOR: u16 = 0x005C;
 const DIRECTORY_NOTIFICATION_INODE_MARKER: u16 = 0x0100;
 /// `\\` plus four lossless inode-identity units.
 pub(super) const DIRECTORY_NOTIFICATION_DIRECTORY_UNITS: usize = 5;
-/// Synthetic parent path, one separator, and the largest ext4 name in UTF-16 units.
-const DIRECTORY_NOTIFICATION_TARGET_UNITS: usize = 261;
