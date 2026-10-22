@@ -1141,10 +1141,12 @@ fn hard_link_lifecycle(directory: &Path) -> io::Result<()> {
     let c = root.join("c");
     let d = root.join("d");
     let operation = (|| {
+        println!("hard-link lifecycle: create links for independent cleanup");
         std::fs::write(&a, b"surviving link")?;
         std::fs::hard_link(&a, &b)?;
         let first = FileHandle::open(&a, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
         let second = FileHandle::open(&b, 0x80, 0)?;
+        println!("hard-link lifecycle: delete one link with another handle retained");
         let result = completed(delete_file_link(&first), first.close());
         let result = result.and_then(|()| {
             if a.try_exists()? || std::fs::read(&b)? != b"surviving link" {
@@ -1155,7 +1157,9 @@ fn hard_link_lifecycle(directory: &Path) -> io::Result<()> {
             Ok(())
         });
         completed(result, second.close())?;
+        println!("hard-link lifecycle: delete the final surviving link");
         remove_namespace_link(&b)?;
+        println!("hard-link lifecycle: verify independent pending dispositions");
         std::fs::write(&a, b"retained hard link")?;
         std::fs::hard_link(&a, &b)?;
         let first = FileHandle::open(&a, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
@@ -1189,6 +1193,7 @@ fn hard_link_lifecycle(directory: &Path) -> io::Result<()> {
             ));
         }
         for replace in [false, true] {
+            println!("hard-link lifecycle: coalesce and rename shared handles, replace={replace}");
             std::fs::write(&a, b"retained hard link")?;
             std::fs::hard_link(&a, &b)?;
             let first = FileHandle::open(&a, 0x0001_0080, FILE_FLAG_BACKUP_SEMANTICS)?;
@@ -1221,6 +1226,7 @@ fn hard_link_lifecycle(directory: &Path) -> io::Result<()> {
         Ok(())
     })();
     let cleanup = (|| {
+        println!("hard-link lifecycle: remove scenario namespace");
         for path in [&a, &b, &c, &d] {
             match remove_namespace_link(path) {
                 Ok(()) => {}

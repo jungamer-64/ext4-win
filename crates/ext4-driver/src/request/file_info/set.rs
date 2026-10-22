@@ -110,14 +110,14 @@ pub(crate) enum SetFilePublication {
         /// Existing destination identity retained through a case-preserving replacement.
         location: Option<PreparedLinkRename>,
         /// Ordered namespace notifications allocated before commit.
-        notifications: Box<HardLinkDirectoryChanges>,
+        notifications: HardLinkDirectoryChanges,
     },
     /// Shared-link location and notification moves for a committed rename.
     Rename {
         /// Exact shared-link update prepared before the first write.
         location: PreparedLinkRename,
         /// Fully allocated notification sequence.
-        notifications: Box<RenameDirectoryNameChanges>,
+        notifications: RenameDirectoryNameChanges,
     },
 }
 
@@ -195,7 +195,7 @@ impl SetFilePublication {
                 if let Some(location) = location {
                     location.publish();
                 }
-                (*notifications).report(operations);
+                notifications.report(operations);
             }
             Self::Rename {
                 location,
@@ -415,7 +415,6 @@ pub(super) fn set_file_information(
                 return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
             }
             let (location, changes) = prepared.apply(mutation)?;
-            let changes = memory::boxed_try_with(move || Ok(changes))?;
             return Ok(SetFileResolution::Mutation(SetFilePublication::HardLink {
                 location,
                 notifications: changes,
@@ -1104,7 +1103,7 @@ pub(crate) struct HardLinkDirectoryChanges {
     /// First and always-present notification.
     first: DirectoryChange,
     /// Second notification required only for a case-preserving spelling change.
-    second: Option<Box<DirectoryChange>>,
+    second: Option<DirectoryChange>,
 }
 
 impl HardLinkDirectoryChanges {
@@ -1112,7 +1111,7 @@ impl HardLinkDirectoryChanges {
     fn report(self, operations: &MountedVolumeAccess<'_>) {
         operations.report_directory_change(self.first);
         if let Some(second) = self.second {
-            operations.report_directory_change(*second);
+            operations.report_directory_change(second);
         }
     }
 }
@@ -1300,15 +1299,12 @@ fn prepare_hard_link_destination(
                 target_node,
                 DirectoryChangeAction::Removed,
             )?,
-            second: Some(
-                Box::try_new(DirectoryChange::new(
-                    target_parent,
-                    target_name,
-                    source_node,
-                    DirectoryChangeAction::Added,
-                )?)
-                .map_err(|_| DriverError::InsufficientResources)?,
-            ),
+            second: Some(DirectoryChange::new(
+                target_parent,
+                target_name,
+                source_node,
+                DirectoryChangeAction::Added,
+            )?),
         }
     };
     let count_effect = if target_node == source_node {
@@ -1473,7 +1469,7 @@ enum PreparedRename {
         /// New CCB location.
         location: RenameLinkPublication,
         /// Namespace notifications derived before commit.
-        notifications: Box<RenameDirectoryNameChanges>,
+        notifications: RenameDirectoryNameChanges,
     },
 }
 
@@ -1500,7 +1496,7 @@ enum PreparedRenameMutation {
         /// New handle location published only after durable commit.
         location: OpenedLocation,
         /// Fully allocated post-commit notification sequence.
-        notifications: Box<RenameDirectoryNameChanges>,
+        notifications: RenameDirectoryNameChanges,
     },
 }
 
@@ -1642,8 +1638,6 @@ impl PreparedRenameMutation {
             NamespaceParentOplockEffect::Change
         };
         let oplocks = NamespaceOplockPlan::rename(source_parent, target_parent, target_effect);
-        let notifications =
-            Box::try_new(notifications).map_err(|_| DriverError::InsufficientResources)?;
         Ok(Self::Changed {
             source_parent,
             source_name,
@@ -1738,7 +1732,7 @@ impl PreparedRenameMutation {
 }
 
 /// Committed directory-name changes caused by one non-no-op rename operation.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct RenameDirectoryNameChanges {
     /// Existing target entry removed by a replace-capable rename.
     replaced_target: Option<DirectoryChange>,

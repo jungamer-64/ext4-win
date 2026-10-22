@@ -68,7 +68,7 @@ pub(crate) enum CleanupResolution {
 }
 
 /// One namespace removal whose storage and notification are prepared before irreversible I/O.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct CleanupLinkPublication {
     /// Exact allocation claimed by this cleanup batch.
     target: NonNull<FileDeleteTarget>,
@@ -88,7 +88,7 @@ pub(crate) struct PreparedCleanupPublication {
 impl PreparedCleanupPublication {
     /// Publishes the atomic namespace result and every prepared notification without allocation.
     pub(crate) fn publish(self, operations: &mut MountedVolumeAccess<'_>) -> IrpCompletion {
-        for link in self.links.iter() {
+        for link in self.links {
             operations.complete_file_delete(self.fcb, link.target);
             operations.report_directory_change(link.notification);
         }
@@ -328,10 +328,12 @@ pub(crate) fn stage_cleanup_deletion(
             NodeId::Directory(_) => mutation.remove_empty_directory(parent, target.name())?,
             NodeId::Symlink(_) => mutation.remove_symlink(parent, target.name())?,
         }
-        links.try_push(CleanupLinkPublication {
-            target: target_pointer,
-            notification,
-        })?;
+        links
+            .push_reserved_owned(CleanupLinkPublication {
+                target: target_pointer,
+                notification,
+            })
+            .map_err(|failure| failure.into_parts().0)?;
     }
     if links.is_empty() {
         for target in plan.targets() {

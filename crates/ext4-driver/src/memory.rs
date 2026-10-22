@@ -587,6 +587,15 @@ pub(crate) fn try_repeated_vec<T: Copy>(value: T, len: usize) -> DriverResult<Ve
     Ok(output)
 }
 
+impl<T, A: Allocator> IntoIterator for KernelVec<T, A> {
+    type Item = T;
+    type IntoIter = alloc::vec::IntoIter<T, A>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.into_iter()
+    }
+}
+
 impl<T> Default for KernelVec<T, Global> {
     fn default() -> Self {
         Self::new()

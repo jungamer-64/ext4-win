@@ -1367,8 +1367,47 @@ fn directory_change_encodes_the_child_boundary_and_action() {
     };
     assert_eq!(usize::from(change.target.name_offset_bytes), prefix_bytes);
     let target_name = change.target.unicode_string();
-    assert_eq!(target_name.Buffer, change.target.units.as_ptr().cast_mut());
+    assert_eq!(
+        target_name.Buffer,
+        change.target.units.as_slice().as_ptr().cast_mut()
+    );
     assert_eq!(target_name.Length, change.target.byte_length);
+    assert_eq!(
+        change.target.units.as_slice(),
+        &[
+            0x005c, 0x0100, 0x0100, 0x0100, 0x0102, 0x005c, 99, 104, 105, 108, 100
+        ]
+    );
+    assert_eq!(target_name.Length, 22);
+}
+
+/// # Errors
+/// Propagates name conversion or notification allocation failure.
+/// # Panics
+/// Fails if UTF-16 expansion or the maximum ext4 component loses bytes or its child boundary.
+#[test]
+fn directory_notification_preserves_unicode_and_maximum_component()
+-> crate::kernel::status::DriverResult<()> {
+    let largest = [b'a'; 255];
+    let largest_utf16 = [97_u16; 255];
+    let unicode = [0x00e9, 0xd83d, 0xde00];
+    for (bytes, child, expected_bytes) in [
+        ("é😀".as_bytes(), unicode.as_slice(), 18_u16),
+        (largest.as_slice(), largest_utf16.as_slice(), 522_u16),
+    ] {
+        let change = DirectoryChange::new(
+            DirectoryNodeId::ROOT,
+            &Ext4Name::new(bytes)?,
+            NodeId::Directory(DirectoryNodeId::ROOT),
+            DirectoryChangeAction::Added,
+        )?;
+        assert_eq!(change.target.units.as_slice().get(6..), Some(child));
+        assert_eq!(change.target.name_offset_bytes, 12);
+        let descriptor = change.target.unicode_string();
+        assert_eq!(descriptor.Length, expected_bytes);
+        assert_eq!(descriptor.MaximumLength, expected_bytes);
+    }
+    Ok(())
 }
 
 /// # Panics

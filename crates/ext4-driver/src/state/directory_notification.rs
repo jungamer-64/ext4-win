@@ -71,8 +71,7 @@ impl DirectoryChange {
     /// Builds a namespace change event for one parent/name/node tuple.
     /// # Errors
     ///
-    /// Returns an error when the ext4 child name cannot be represented in the Windows notification
-    /// namespace.
+    /// Returns an encoding, length, or allocation error while preparing the notification payload.
     pub(crate) fn new(
         parent: DirectoryNodeId,
         name: &Ext4Name,
@@ -94,8 +93,7 @@ impl DirectoryChange {
     /// Builds the metadata-change event required when one exact file link is replaced in place.
     /// # Errors
     ///
-    /// Returns an error when the ext4 child name cannot be represented in the Windows notification
-    /// namespace.
+    /// Returns an encoding, length, or allocation error while preparing the notification payload.
     pub(crate) fn hard_link_replaced(
         parent: DirectoryNodeId,
         name: &Ext4Name,
