@@ -2739,25 +2739,29 @@ impl CompletionReactor {
                         crate::request::dispatch::admit_owned(owned, target, self.trace, pool)
                     })
                 });
-                match admitted {
-                    Ok(operation) => self.install_admitted_at(index, operation),
+                let completion = match admitted {
+                    Ok(crate::request::dispatch::AdmittedRequest::Operation(operation)) => {
+                        self.install_admitted_at(index, operation);
+                        continue;
+                    }
+                    Ok(crate::request::dispatch::AdmittedRequest::Complete(completion)) => {
+                        completion
+                    }
                     Err(error) => {
                         let (error, owned) = error.into_parts();
-                        let completion = owned.prepare_result(Err(error));
-                        self.retire_cancel_slot(index);
-                        let identity = self
-                            .with_scheduler(|scheduler| scheduler.identity(index))
-                            .unwrap_or_else(|| {
-                                KernelWideInconsistency::completion_reactor_state_corruption()
-                                    .bugcheck()
-                            });
-                        if !self.with_scheduler(|scheduler| scheduler.complete(identity)) {
-                            KernelWideInconsistency::completion_reactor_state_corruption()
-                                .bugcheck();
-                        }
-                        let _status = completion.notify();
+                        owned.prepare_result(Err(error))
                     }
+                };
+                self.retire_cancel_slot(index);
+                let identity = self
+                    .with_scheduler(|scheduler| scheduler.identity(index))
+                    .unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    });
+                if !self.with_scheduler(|scheduler| scheduler.complete(identity)) {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
+                let _status = completion.notify();
             }
         }
         admitted_any

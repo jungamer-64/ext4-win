@@ -17,12 +17,52 @@ pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 pub(crate) use wdk_sys::ntddk::IoCompleteRequest;
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
-    IoCheckShareAccess, IoRemoveShareAccess, KeQuerySystemTimePrecise,
+    IoCheckShareAccess, IoCreateDevice, IoDeleteDevice, IoRemoveShareAccess,
+    KeQuerySystemTimePrecise,
 };
 pub(crate) use wdk_sys::ntddk::{
-    IoCreateDevice, IoCreateSymbolicLink, IoDeleteDevice, IoDeleteSymbolicLink,
-    IoRegisterFileSystem, IoUnregisterFileSystem,
+    IoCreateSymbolicLink, IoDeleteSymbolicLink, IoRegisterFileSystem, IoUnregisterFileSystem,
 };
+
+/// # Safety
+/// Retains the I/O Manager ABI; host fixtures cannot create kernel device objects.
+/// # Panics
+/// Fails if a host fixture attempts native device creation.
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::panic,
+    clippy::disallowed_macros,
+    reason = "host admission tests must not simulate kernel device allocation"
+)]
+pub(crate) unsafe fn IoCreateDevice(
+    _driver: wdk_sys::PDRIVER_OBJECT,
+    _extension_size: wdk_sys::ULONG,
+    _name: wdk_sys::PUNICODE_STRING,
+    _device_type: wdk_sys::ULONG,
+    _characteristics: wdk_sys::ULONG,
+    _exclusive: wdk_sys::BOOLEAN,
+    _device: *mut wdk_sys::PDEVICE_OBJECT,
+) -> wdk_sys::NTSTATUS {
+    panic!("native device creation requires the I/O Manager")
+}
+
+/// # Safety
+/// Retains the I/O Manager ABI; host fixtures never own deletable kernel device objects.
+/// # Panics
+/// Fails if a host fixture attempts native device deletion.
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::panic,
+    clippy::disallowed_macros,
+    reason = "host admission tests cannot delete a kernel device they never acquired"
+)]
+pub(crate) unsafe fn IoDeleteDevice(_device: wdk_sys::PDEVICE_OBJECT) {
+    panic!("native device deletion requires the I/O Manager")
+}
 
 /// # Safety
 /// Retains the native sharing boundary; host fixtures cannot establish kernel share claims.

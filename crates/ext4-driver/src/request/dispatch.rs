@@ -5,7 +5,7 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 use crate::{
     irp::{
         ActorRequest, DataIoKind, DispatchMajor, IrpCompletion, OwnedIrp, PreparedDirectoryControl,
-        PreparedRequest, ReceivedIrp,
+        PreparedIrpCompletion, PreparedRequest, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -656,7 +656,7 @@ pub(crate) fn admit_owned(
     target: &mut ReactorTarget,
     trace: crate::kernel::operational_trace::OperationalTrace,
     finalization: &mut crate::irp::FinalizationPool,
-) -> Result<AdmittedOperation, AdmitOperationError> {
+) -> Result<AdmittedRequest, AdmitOperationError> {
     if !matches!(
         owned.actor_request(),
         ActorRequest::Cleanup | ActorRequest::Close
@@ -919,7 +919,9 @@ pub(crate) fn admit_owned(
         };
         match prepared {
             None if handle_class == HandleRequestClass::Close => {
-                (OperationAdmission::Device, LifecyclePublication::None)
+                return Ok(AdmittedRequest::Complete(
+                    owned.prepare_result(Ok(IrpCompletion::EMPTY)),
+                ));
             }
             None => {
                 return Err(AdmitOperationError::new(
@@ -1053,7 +1055,26 @@ pub(crate) fn admit_owned(
         LifecyclePublication::Cleanup(prepared) => prepared.begin_cleanup(),
         LifecyclePublication::Close(prepared) => prepared.begin_close(),
     }
-    Ok(AdmittedOperation::new(operation, operation_admission))
+    Ok(AdmittedRequest::Operation(AdmittedOperation::new(
+        operation,
+        operation_admission,
+    )))
+}
+
+/// Admission either owns a scheduled operation or has already prepared terminal completion.
+#[derive(Debug)]
+pub(crate) enum AdmittedRequest {
+    /// An opened handle or device request retains its operation and scheduler lane.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "the native reactor consumes scheduled operations; host admission tests inspect terminal completions"
+        )
+    )]
+    Operation(AdmittedOperation),
+    /// A context-free Close has no handle resources or predecessor barrier to drain.
+    Complete(PreparedIrpCompletion),
 }
 
 #[cfg(test)]

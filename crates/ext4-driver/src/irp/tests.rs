@@ -97,6 +97,83 @@ fn irp_status(irp: &wdk_sys::IRP) -> wdk_sys::NTSTATUS {
 }
 
 /// # Panics
+/// Panics if a context-free Close acquires a handle barrier, consumes the finalization reserve,
+/// or a missing FILE_OBJECT is accepted as a context-free Close.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the fixture retains each device, FILE_OBJECT, stack and exclusively owned IRP through notification"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "fixture construction and exact admission outcomes are asserted test preconditions"
+)]
+fn context_free_close_completes_at_admission() {
+    use crate::request::dispatch::{AdmittedRequest, admit_owned};
+
+    let mut raw_device = wdk_sys::DEVICE_OBJECT::default();
+    let device = kernel_device_fixture(&mut raw_device).expect("fixture device is live");
+    let mut target =
+        super::reactor::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty());
+    let mut finalization =
+        crate::request::operation::prepare_finalization().expect("initial finalization reserve");
+    for flags in [0, wdk_sys::FO_CLEANUP_COMPLETE, wdk_sys::FO_VOLUME_OPEN] {
+        let mut file = wdk_sys::FILE_OBJECT {
+            Flags: flags,
+            ..wdk_sys::FILE_OBJECT::default()
+        };
+        for file_present in [true, false] {
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: u8::try_from(wdk_sys::IRP_MJ_CLOSE)
+                    .expect("Close major fits the ABI"),
+                FileObject: if file_present {
+                    core::ptr::from_mut(&mut file)
+                } else {
+                    core::ptr::null_mut()
+                },
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            let mut irp = wdk_sys::IRP::default();
+            irp.Tail
+                .Overlay
+                .__bindgen_anon_2
+                .__bindgen_anon_1
+                .CurrentStackLocation = core::ptr::from_mut(&mut stack);
+            let received = unsafe {
+                // SAFETY: Local device and IRP storage outlive this request's unique owner.
+                ReceivedIrp::decode(device.as_ptr(), core::ptr::from_mut(&mut irp))
+            }
+            .expect("fixture dispatch target");
+            let captured = super::PendingIrp::capture(received, super::DispatchMajor::Close);
+            if !file_present {
+                assert_eq!(captured.err(), Some(STATUS_INVALID_PARAMETER));
+                assert_eq!(irp_status(&irp), STATUS_INVALID_PARAMETER);
+                continue;
+            }
+            let pending = captured.expect("Close capture requires no allocation");
+            let raw = pending.publish();
+            let owned = unsafe {
+                // SAFETY: This fixture is the sole queue owner and reclaims its published IRP once.
+                OwnedIrp::from_queued_raw(device, raw)
+            };
+            let admitted = admit_owned(
+                owned,
+                &mut target,
+                crate::kernel::operational_trace::OperationalTrace::host_test(),
+                &mut finalization,
+            );
+            assert!(matches!(admitted, Ok(AdmittedRequest::Complete(_))));
+            let Ok(AdmittedRequest::Complete(completion)) = admitted else {
+                return;
+            };
+            assert_eq!(completion.notify(), wdk_sys::STATUS_SUCCESS);
+            assert_eq!(irp_status(&irp), wdk_sys::STATUS_SUCCESS);
+            assert!(file.FsContext.is_null() && file.FsContext2.is_null());
+        }
+    }
+}
+
+/// # Panics
 /// Fails if terminal status publication interferes with independent I/O Manager cancellation.
 #[test]
 #[expect(
