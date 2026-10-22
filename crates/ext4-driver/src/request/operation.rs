@@ -5683,12 +5683,10 @@ impl MutationRequestOperation {
                             owned,
                             size_changes,
                         };
-                        return MutationStep::Transition(
-                            OperationTransition::SubmitPassiveWorkAfterIntentRelease {
-                                work: crate::irp::PassiveWork::prepare_deletion(stream),
-                                suspended: self,
-                            },
-                        );
+                        return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                            work: crate::irp::PassiveWork::prepare_deletion(stream),
+                            suspended: self,
+                        });
                     }
                 }
                 let deletion_node = deletion.as_ref().map(|prepared| prepared.node());
@@ -5738,12 +5736,10 @@ impl MutationRequestOperation {
                             plan,
                             deletion,
                         };
-                        return MutationStep::Transition(
-                            OperationTransition::SubmitPassiveWorkAfterIntentRelease {
-                                work: crate::irp::PassiveWork::prepare_size_change(stream),
-                                suspended: self,
-                            },
-                        );
+                        return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                            work: crate::irp::PassiveWork::prepare_size_change(stream),
+                            suspended: self,
+                        });
                     }
                     let empty = match plan.into_prepared() {
                         Ok(empty) => empty,
