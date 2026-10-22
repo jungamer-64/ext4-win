@@ -86,6 +86,10 @@ pub(crate) enum Operation {
     Partition,
     /// Windows VHDX detachment.
     DetachWindows,
+    /// Withdraw the identity-matched disposable disk's volumes.
+    OfflineDisk,
+    /// Restore the identity-matched disposable disk's volumes.
+    OnlineDisk,
     /// WSL attachment.
     AttachWsl,
     /// ext4 oracle formatting and independent fixture construction.

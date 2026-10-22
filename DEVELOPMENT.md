@@ -207,8 +207,13 @@ The disposable partition retains its Linux filesystem data type, identity, and
 range. Mount Manager must enumerate that exact disk extent before a
 session-owned directory mount point is created. Discovery is checked at driver
 startup and reattachment; [partition admission](crates/ext4-driver/src/kernel/volume_discovery.rs)
-and [volume publication](crates/ext4-driver/src/kernel/mount_manager.rs) own the
+and [volume publication](crates/ext4-driver/src/kernel/device_interface.rs) own the
 recognition contracts.
+
+Recognized volumes expose the standard volume interface on their existing storage
+PDO. PnP removal withdraws active Mount Manager links while preserving persistent
+volume identity and mount-point assignments for reattachment. Live validation
+requires the same volume GUID and drive letters after disk offline/online cycles.
 
 Lifecycle effects are preceded by durably flushed session intent records. An
 intent does not establish completion. After interruption, use the matching

@@ -136,3 +136,42 @@ pub(crate) fn unicode_string(path: &[u16]) -> Result<wdk_sys::UNICODE_STRING, NT
         Buffer: path.as_ptr().cast_mut(),
     })
 }
+
+/// Enables the recognized storage volume's standard interface on its existing PDO.
+/// PnP owns removal notification and Mount Manager retains the lower driver's persistent identity.
+/// Repeated scans enable the same interface; no filesystem-owned device or mount-point name exists.
+/// Must run on the discovery system thread at PASSIVE_LEVEL with the lower stack referenced.
+/// # Errors
+/// Returns native registration or enable failure. Success establishes interface enablement;
+/// Mount Manager processes its notification asynchronously. A later scan may safely enable again.
+#[inline(never)] // Keeps the publication boundary visible in production reachability evidence.
+#[expect(
+    unsafe_code,
+    reason = "the referenced discovery target encloses native PDO acquisition and interface publication"
+)]
+pub(in crate::kernel) fn publish_volume_interface(
+    device: crate::state::KernelDevice,
+) -> Result<(), NTSTATUS> {
+    let status = unsafe {
+        // SAFETY: Discovery retains the lower stack and runs in a PASSIVE_LEVEL system thread.
+        // Native code balances its PDO reference and allocated name before returning.
+        ext4win_publish_volume_interface(device.as_ptr(), VolumeInterfaceClass::Visible.guid())
+    };
+    if status < STATUS_SUCCESS {
+        Err(status)
+    } else {
+        Ok(())
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "native code owns the WDK interface allocation and PDO reference protocol"
+)]
+unsafe extern "system" {
+    /// Enables the supplied interface class on the referenced storage stack's PDO.
+    fn ext4win_publish_volume_interface(
+        device: wdk_sys::PDEVICE_OBJECT,
+        class: *const GUID,
+    ) -> NTSTATUS;
+}

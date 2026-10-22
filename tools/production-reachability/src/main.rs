@@ -136,7 +136,9 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "hidden volume recognition read",
         "ext4win_read_volume_prefix",
     ),
-    ("Mount Manager publication owner", "announce_volume_arrival"),
+    ("PnP volume publication owner", "publish_volume_interface"),
+    ("volume interface registration", "IoRegisterDeviceInterface"),
+    ("volume interface enablement", "IoSetDeviceInterfaceState"),
     (
         "synchronous volume protocol transport",
         "ext4win_discovery_ioctl",
@@ -2408,7 +2410,9 @@ mod tests {
              EtwUnregister\n\
              ext4win_query_volume_partition\n\
              ext4win_read_volume_prefix\n\
-             announce_volume_arrival\n\
+             publish_volume_interface\n\
+             IoRegisterDeviceInterface\n\
+             IoSetDeviceInterfaceState\n\
              ext4win_discovery_ioctl\n\
              raw_volume\n\
              FsRtlGetSectorSizeInformation\n\

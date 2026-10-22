@@ -59,44 +59,6 @@ impl DiscoveryIo {
             ext4win_discovery_channel_idle(self.channel.as_ptr()) != 0
         }
     }
-
-    /// Copies request images into native-owned storage before submitting one buffered IOCTL.
-    /// A timeout/cancellation ends the borrow, preserves uncertain acceptance, and retains late
-    /// I/O in the channel. Occupied-slot exhaustion returns busy without another submission.
-    #[expect(
-        unsafe_code,
-        reason = "the transport copies all borrowed input before submission and publishes output only after completion"
-    )]
-    pub(in crate::kernel) fn ioctl(
-        &self,
-        device: KernelDevice,
-        code: u32,
-        input: &[u8],
-        output: &mut [u8],
-    ) -> (NTSTATUS, usize) {
-        let Ok(input_length) = u32::try_from(input.len()) else {
-            return (wdk_sys::STATUS_INVALID_BUFFER_SIZE, 0);
-        };
-        let Ok(output_length) = u32::try_from(output.len()) else {
-            return (wdk_sys::STATUS_INVALID_BUFFER_SIZE, 0);
-        };
-        let mut transferred = 0;
-        let status = unsafe {
-            // SAFETY: Both images remain borrowed for this call only. The native transport
-            // references the target and never exposes these addresses to a lower stack.
-            ext4win_discovery_ioctl(
-                self.channel.as_ptr(),
-                device.as_ptr(),
-                code,
-                input.as_ptr().cast(),
-                input_length,
-                output.as_mut_ptr().cast(),
-                output_length,
-                &mut transferred,
-            )
-        };
-        (status, transferred)
-    }
 }
 
 impl Drop for DiscoveryIo {
@@ -130,15 +92,4 @@ unsafe extern "system" {
     fn ext4win_discovery_channel_idle(channel: *mut c_void) -> u8;
     /// Consumes the channel only after explicit closure and observed quiescence.
     fn ext4win_discovery_channel_destroy(channel: *mut c_void) -> u8;
-    /// Bounded buffered exchange; borrowed byte images are never retained by lower I/O.
-    fn ext4win_discovery_ioctl(
-        channel: *mut c_void,
-        device: wdk_sys::PDEVICE_OBJECT,
-        code: u32,
-        input: *const c_void,
-        input_length: u32,
-        output: *mut c_void,
-        output_length: u32,
-        transferred: *mut usize,
-    ) -> NTSTATUS;
 }

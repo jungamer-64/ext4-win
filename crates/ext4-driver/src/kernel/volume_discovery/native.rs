@@ -394,11 +394,11 @@ impl DiscoveryContext {
         Ok(ScanProgress::Complete)
     }
 
-    /// Performs read-only recognition before the separate Mount Manager acceptance boundary.
+    /// Performs read-only recognition before enabling the standard PnP volume interface.
     /// # Errors
-    /// Preserves native I/O/arrival failure; signature mismatch and ineligible GPT are not errors.
-    /// Arrival failure does not imply unpublished names: subsequent discovery reconciles with
-    /// Mount Manager, and neither this worker nor its destructor rolls back shared mount points.
+    /// Preserves native I/O/publication failure; signature mismatch and ineligible GPT are not errors.
+    /// Publication is idempotent and tied to the existing PDO's PnP lifetime. Discovery never
+    /// removes shared mount points or disables the storage device's interface on driver unload.
     #[expect(
         unsafe_code,
         reason = "referenced volume and owned buffers outlive each synchronous call"
@@ -508,7 +508,7 @@ impl DiscoveryContext {
             STATUS_SUCCESS,
             OperationalOutcome::Selected,
         );
-        let status = crate::kernel::mount_manager::announce_volume_arrival(&self.io, volume.device)
+        let status = crate::kernel::device_interface::publish_volume_interface(volume.device)
             .map_or_else(|status| status, |()| STATUS_SUCCESS);
         self.trace
             .record_status(OperationalPath::DiscoveryAnnouncement, status);

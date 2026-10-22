@@ -15,6 +15,8 @@ pub(crate) struct Disk {
     pub(crate) number: u32,
     /// Stable disk identity against which reused numbers are checked.
     pub(crate) unique: String,
+    /// Observed availability, used to reconcile an interrupted disk transition before cleanup.
+    pub(crate) offline: bool,
 }
 /// Durable GPT facts, independent of the current Windows disk number.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,7 +69,7 @@ pub(crate) fn disk(vhdx: &Path) -> TaskResult<Option<Disk>> {
     }
     let path = windows::literal(vhdx.as_os_str())?;
     let observation = windows::management(&format!(
-        "$vhd=Get-VHD -Path {path}; if ($vhd.Attached) {{ @(Get-Disk -Number $vhd.DiskNumber | ForEach-Object {{ [pscustomobject]@{{ number=[uint32]$_.Number; unique=[string]$_.UniqueId }} }}) }} else {{ @() }}"
+        "$vhd=Get-VHD -Path {path}; if ($vhd.Attached) {{ @(Get-Disk -Number $vhd.DiskNumber | ForEach-Object {{ [pscustomobject]@{{ number=[uint32]$_.Number; unique=[string]$_.UniqueId; offline=[bool]$_.IsOffline }} }}) }} else {{ @() }}"
     ))?;
     let observations: Vec<Disk> = windows::observations(observation)?;
     if observations.len() > 1

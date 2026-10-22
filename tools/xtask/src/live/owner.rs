@@ -117,10 +117,19 @@ impl LiveState {
     }
     /// Records the Mount Manager observation only within an acquired partition's identity.
     /// # Errors
-    /// Returns a missing-partition protocol error.
+    /// Returns a missing-partition protocol error or a changed persistent volume identity.
     fn observe_volume(&mut self, observed: String) -> TaskResult<()> {
         match &mut self.storage {
             StorageIdentity::Partition { volume, .. } => {
+                if volume
+                    .as_ref()
+                    .is_some_and(|previous| !previous.eq_ignore_ascii_case(&observed))
+                {
+                    return Err(io::Error::other(
+                        "the same GPT partition acquired a different volume GUID",
+                    )
+                    .into());
+                }
                 *volume = Some(observed);
                 Ok(())
             }
@@ -867,11 +876,80 @@ fn wait_removed(session: &Session<LiveState>) -> TaskResult<()> {
         }
         if start.elapsed() >= Duration::from_secs(30) {
             return Err(
-                io::Error::other("detached session volume still resolves to a device").into(),
+                io::Error::other("withdrawn session volume still resolves to a device").into(),
             );
         }
         thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Requested storage availability, independent of VHDX attachment and driver lifetime.
+#[derive(Clone, Copy)]
+enum DiskAvailability {
+    /// Withdraw the disposable disk's volumes through the normal storage PnP path.
+    Offline,
+    /// Reenumerate the same disposable disk without changing its partition identity.
+    Online,
+}
+
+/// Changes only the identity-matched session VHDX disk and observes the resulting disk state.
+/// An interrupted request can leave either state; cleanup detaches that same owned VHDX.
+/// # Errors
+/// Returns changed identity, management failure or an unconfirmed state transition.
+fn disk_availability(
+    session: &mut Session<LiveState>,
+    availability: DiskAvailability,
+) -> TaskResult<()> {
+    let scope = scope(session)?;
+    let path = windows::literal(scope.vhdx.as_os_str())?;
+    let unique = windows::literal(OsStr::new(&scope.disk))?;
+    let (offline, operation) = match availability {
+        DiskAvailability::Offline => {
+            storage::validate(&scope)?;
+            ("$true", Operation::OfflineDisk)
+        }
+        DiskAvailability::Online => ("$false", Operation::OnlineDisk),
+    };
+    session.publish(Phase::Intent(operation))?;
+    let observed = windows::management(&format!(
+        "$vhd=Get-VHD -Path {path}; if (-not $vhd.Attached) {{ throw 'session VHDX is detached' }}; $disk=Get-Disk -Number $vhd.DiskNumber; if ($disk.UniqueId -ne {unique}) {{ throw 'session disk identity changed' }}; $disk | Set-Disk -IsOffline {offline}; (Get-Disk -Number $vhd.DiskNumber).IsOffline -eq {offline}"
+    ))?;
+    if observed != serde_json::Value::Bool(true) {
+        return Err(io::Error::other("disk availability transition was not observed").into());
+    }
+    session.publish(Phase::Observed(operation))
+}
+
+/// Requires repeated offline/online discovery to preserve all assigned paths and durable content.
+/// # Errors
+/// Returns lifecycle, changed volume GUID/path assignments or persisted-content failures.
+fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> TaskResult<()> {
+    let volume = session
+        .state()
+        .volume()
+        .ok_or_else(|| io::Error::other("offline scenario lacks a volume identity"))?
+        .to_owned();
+    let paths: BTreeSet<_> = windows_host::volume_mount_paths(&volume)?
+        .into_iter()
+        .collect();
+    for _ in 0..2 {
+        disk_availability(session, DiskAvailability::Offline)?;
+        wait_removed(session)?;
+        disk_availability(session, DiskAvailability::Online)?;
+        let mount = mount_namespace(session)?;
+        if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
+            return Err(io::Error::other("online volume lost durable content").into());
+        }
+        dismount_filesystem(session)?;
+        remove_namespace(session)?;
+        let observed: BTreeSet<_> = windows_host::volume_mount_paths(&volume)?
+            .into_iter()
+            .collect();
+        if observed != paths {
+            return Err(io::Error::other("disk offline/online changed volume mount paths").into());
+        }
+    }
+    Ok(())
 }
 
 /// Executes startup discovery, native I/O and reattachment while the same driver remains loaded.
@@ -937,6 +1015,7 @@ fn exercise_driver(
     combine_verification_and_cleanup(remount, released)?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
+    exercise_offline_online(session, &payload)?;
     attachment(session, false)?;
     wait_removed(session)?;
     session.publish(Phase::Intent(Operation::StopDriver))?;
@@ -992,6 +1071,9 @@ fn cleanup(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
             .is_some_and(|expected| !expected.eq_ignore_ascii_case(&disk.unique))
         {
             return Err(io::Error::other("cleanup disk identity differs from session").into());
+        }
+        if disk.offline && session.state().partition().is_some() {
+            disk_availability(session, DiskAvailability::Online)?;
         }
         dismount_filesystem(session)?;
         remove_namespace(session)?;
@@ -1211,6 +1293,29 @@ mod tests {
             offset: 1,
             length: 1,
         };
+        let mut state = LiveState {
+            storage: StorageIdentity::Partition {
+                unique: "fixture-disk".into(),
+                partition: partition.clone(),
+                volume: None,
+            },
+            wsl: WslAttachment::Detached,
+            driver: DriverStage::Running,
+            identity: None,
+        };
+        let volume = r"\\?\Volume{2ca3ad84-858a-49ba-be4a-430713ddf498}\";
+        state.observe_volume(volume.into())?;
+        state.observe_volume(volume.to_uppercase())?;
+        assert!(
+            state
+                .observe_volume(r"\\?\Volume{00000000-0000-0000-0000-000000000001}\".into())
+                .is_err()
+        );
+        assert!(
+            state
+                .volume()
+                .is_some_and(|current| current.eq_ignore_ascii_case(volume))
+        );
         let layout = "sde disk\nsde2 part 2ca3ad84-858a-49ba-be4a-430713ddf498 0fc63daf-8483-4772-8e79-3d69d8477de4\n";
         assert_eq!(linux_partition(layout, &partition)?, "sde2");
         assert!(linux_partition(&format!("{layout}{layout}"), &partition).is_err());

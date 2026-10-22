@@ -823,6 +823,45 @@ pub fn volume_device_present(volume: &str) -> io::Result<bool> {
         Err(error) => Err(error),
     }
 }
+/// Observes the drive letters and directory mount points assigned to a volume GUID path.
+/// # Errors
+/// Returns native lookup failure or malformed/ungrowing buffer-length responses.
+pub fn volume_mount_paths(volume: &str) -> io::Result<Vec<PathBuf>> {
+    let volume = wide(OsStr::new(volume))?;
+    let mut buffer = vec![0_u16; 256];
+    loop {
+        let capacity = u32::try_from(buffer.len()).map_err(io::Error::other)?;
+        let mut required = 0;
+        let success = unsafe {
+            // SAFETY: The terminated input and exclusive initialized output remain live for
+            // the synchronous call. The supplied capacity is the actual allocation length.
+            GetVolumePathNamesForVolumeNameW(
+                volume.as_ptr(),
+                buffer.as_mut_ptr(),
+                capacity,
+                &mut required,
+            )
+        };
+        if success == 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(234) || required <= capacity {
+                return Err(error);
+            }
+            buffer.resize(usize::try_from(required).map_err(io::Error::other)?, 0);
+            continue;
+        }
+        let paths = buffer
+            .get(..usize::try_from(required).map_err(io::Error::other)?)
+            .filter(|paths| paths.last() == Some(&0))
+            .ok_or_else(|| io::Error::other("invalid volume mount-path response"))?;
+        return Ok(paths
+            .split(|unit| *unit == 0)
+            .take_while(|path| !path.is_empty())
+            .map(|path| PathBuf::from(OsString::from_wide(path)))
+            .collect());
+    }
+}
+
 /// Finds a unique volume by its exact disk extent and GPT identity without mounting it.
 ///
 /// Volumes whose identity controls cannot be queried are not admitted. `None` means no fully
@@ -2000,6 +2039,14 @@ mod tests {
             .ok_or_else(|| io::Error::other("executable lacks a volume root"))?;
         let volume = volume_at_mount(root)?;
         assert!(volume_device_present(&volume)?);
+        let paths = volume_mount_paths(&volume)?;
+        assert!(paths.iter().any(|path| path == root));
+        for path in paths {
+            assert_eq!(volume_at_mount(&path)?, volume);
+        }
+        assert!(
+            volume_mount_paths("\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\").is_err()
+        );
         assert!(!volume_device_present(
             "\\\\?\\Volume{00000000-0000-0000-0000-000000000000}\\"
         )?);
