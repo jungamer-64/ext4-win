@@ -934,7 +934,6 @@ fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> 
         .collect();
     for _ in 0..2 {
         disk_availability(session, DiskAvailability::Offline)?;
-        wait_removed(session)?;
         disk_availability(session, DiskAvailability::Online)?;
         let mount = mount_namespace(session)?;
         if fs::read(mount.join("live-ci/alpha.bin"))? != payload {

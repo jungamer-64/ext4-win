@@ -289,7 +289,7 @@ static NTSTATUS ext4win_discovery_exchange(
     return status;
 }
 
-NTSTATUS NTAPI ext4win_discovery_ioctl(
+static NTSTATUS ext4win_discovery_ioctl(
     EXT4WIN_DISCOVERY_CHANNEL *channel, PDEVICE_OBJECT device, ULONG code,
     const VOID *input, ULONG input_length, PVOID output, ULONG output_length,
     PULONG_PTR transferred)

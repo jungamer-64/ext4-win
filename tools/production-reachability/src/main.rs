@@ -41,6 +41,8 @@ const UNVERIFIED_ARTIFACT_ID: &str = "00000000000000000000000000000000";
 const ARTIFACT_ID_SYMBOL: &str = "EXT4WIN_PRODUCTION_ARTIFACT_ID";
 
 /// Linked production roots and protocol boundaries required in the final image map.
+/// Discovery ownership is observed at its native channel lifecycle boundary; internal
+/// transport helpers may be inlined into the required recognition/query entry points.
 const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("active cancellation callback", "active_irp_cancelled"),
     ("storage retry timer callback", "storage_retry_timer_dpc"),
@@ -140,8 +142,20 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("volume interface registration", "IoRegisterDeviceInterface"),
     ("volume interface enablement", "IoSetDeviceInterfaceState"),
     (
-        "synchronous volume protocol transport",
-        "ext4win_discovery_ioctl",
+        "discovery channel acquisition",
+        "ext4win_discovery_channel_create",
+    ),
+    (
+        "discovery cancellation and admission closure",
+        "ext4win_discovery_channel_close",
+    ),
+    (
+        "discovery completion quiescence observation",
+        "ext4win_discovery_channel_idle",
+    ),
+    (
+        "discovery channel retirement",
+        "ext4win_discovery_channel_destroy",
     ),
     ("raw-volume operation admission", "raw_volume"),
     (
@@ -2413,7 +2427,10 @@ mod tests {
              publish_volume_interface\n\
              IoRegisterDeviceInterface\n\
              IoSetDeviceInterfaceState\n\
-             ext4win_discovery_ioctl\n\
+             ext4win_discovery_channel_create\n\
+             ext4win_discovery_channel_close\n\
+             ext4win_discovery_channel_idle\n\
+             ext4win_discovery_channel_destroy\n\
              raw_volume\n\
              FsRtlGetSectorSizeInformation\n\
              ObfReferenceObject\n\
@@ -2578,7 +2595,7 @@ mod tests {
     ///
     /// # Errors
     ///
-    /// Returns an error if removing a required linked callback is not detected.
+    /// Returns an error if removing cancellation or discovery-closure authority is not detected.
     #[test]
     fn link_map_requires_production_roots() -> Result<(), GateError> {
         let map = link_map_fixture(
@@ -2586,12 +2603,14 @@ mod tests {
             0x0000_0001_8000_0000,
             0x0000_0001_8000_1000,
             0x0000_0001_8000_2000,
-        )
-        .replace("active_irp_cancelled", "missing_cancel_callback");
-        require(
-            LinkMap::parse(&map).is_err(),
-            "link map without active cancellation callback was accepted",
-        )
+        );
+        for symbol in ["active_irp_cancelled", "ext4win_discovery_channel_close"] {
+            require(
+                LinkMap::parse(&map.replace(symbol, "missing_required_boundary")).is_err(),
+                "link map without a required cancellation boundary was accepted",
+            )?;
+        }
+        Ok(())
     }
 
     /// A native PE without an embedded Authenticode certificate table is not a production input.
