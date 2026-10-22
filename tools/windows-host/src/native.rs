@@ -1210,21 +1210,39 @@ fn hard_link_lifecycle(directory: &Path) -> io::Result<()> {
                 let result = (|| {
                     let standard = file_information_query(&other, 5, 24, 0)?;
                     let links = file_information_query(&other, 54, 12, 0)?;
-                    if u32::from_le_bytes(field(&standard, 16)?) != 1
-                        || standard.get(20) != Some(&0)
-                        || u32::from_le_bytes(field(&links, 0)?) != 1
-                        || u32::from_le_bytes(field(&links, 4)?) != 2
-                        || links.get(8) != Some(&0)
+                    let standard_links = u32::from_le_bytes(field(&standard, 16)?);
+                    let standard_pending = standard.get(20);
+                    let accessible_links = u32::from_le_bytes(field(&links, 0)?);
+                    let total_links = u32::from_le_bytes(field(&links, 4)?);
+                    let link_pending = links.get(8);
+                    if standard_links != 1
+                        || standard_pending != Some(&0)
+                        || accessible_links != 1
+                        || total_links != 2
+                        || link_pending != Some(&0)
                     {
-                        return Err(io::Error::other("deletion leaked to another hard link"));
+                        return Err(io::Error::other(format!(
+                            "deletion leaked to another hard link: standard links={standard_links}, \
+                             pending={standard_pending:?}; accessible={accessible_links}, \
+                             total={total_links}, pending={link_pending:?}"
+                        )));
                     }
                     Ok(())
-                })();
+                })()
+                .inspect_err(|error| {
+                    eprintln!("hard-link lifecycle: pending-link query failed: {error}");
+                });
                 completed(result, other.close())?;
                 delete_file_link(&second)
-            })();
+            })()
+            .inspect_err(|error| {
+                eprintln!("hard-link lifecycle: independent disposition failed: {error}");
+            });
             completed(result, second.close())
-        })();
+        })()
+        .inspect_err(|error| {
+            eprintln!("hard-link lifecycle: pending disposition finalization failed: {error}");
+        });
         completed(result, first.close())?;
         if a.try_exists()? || b.try_exists()? {
             return Err(io::Error::other(
@@ -1263,7 +1281,10 @@ fn hard_link_lifecycle(directory: &Path) -> io::Result<()> {
             remove_namespace_link(&d)?;
         }
         Ok(())
-    })();
+    })()
+    .inspect_err(|error| {
+        eprintln!("hard-link lifecycle: verification failed before namespace cleanup: {error}");
+    });
     let cleanup = (|| {
         println!("hard-link lifecycle: remove scenario namespace");
         for path in [&a, &b, &c, &d] {
