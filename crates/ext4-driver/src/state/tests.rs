@@ -1386,6 +1386,10 @@ fn directory_change_encodes_the_child_boundary_and_action() {
 /// # Panics
 /// Fails if UTF-16 expansion or the maximum ext4 component loses bytes or its child boundary.
 #[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "setup propagates conversion and allocation errors while assertions verify native notification lengths"
+)]
 fn directory_notification_preserves_unicode_and_maximum_component()
 -> crate::kernel::status::DriverResult<()> {
     let largest = [b'a'; 255];

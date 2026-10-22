@@ -1474,6 +1474,10 @@ enum PreparedRename {
 }
 
 /// Fully resolved rename staged only after its exact parent oplock plan is authorized.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the bounded rename plan retains its prepared publication inline without another fallible allocation"
+)]
 enum PreparedRenameMutation {
     /// Source and target identify the same effective namespace entry.
     Unchanged,
