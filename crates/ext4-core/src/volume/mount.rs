@@ -1917,28 +1917,6 @@ impl ResolvedPrimary {
 }
 
 impl MountOperation {
-    /// Creates a mount operation for a primary filesystem device only.
-    #[must_use]
-    pub const fn new(
-        filesystem_length: DeviceLength,
-        fscrypt_keys: FscryptKeySet,
-        access: super::MountAccess,
-    ) -> Self {
-        Self {
-            access,
-            recovery: match access {
-                super::MountAccess::ReadWrite => None,
-                super::MountAccess::ReadOnly { recovery_memory } => {
-                    Some(super::recovery::RecoveryOverlay::new(recovery_memory))
-                }
-            },
-            filesystem: StorageTranscript::new(StorageTarget::Filesystem, filesystem_length),
-            fscrypt_keys: Some(fscrypt_keys),
-            state: MountState::Resolving,
-            cancel_requested: false,
-        }
-    }
-
     /// Attaches a token minted by exclusive core validation and resumes external recovery.
     #[must_use]
     pub fn attach_external_journal(
