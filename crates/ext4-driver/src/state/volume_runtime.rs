@@ -295,6 +295,11 @@ impl VolumeRuntime {
     ) -> DriverResult<Self> {
         let (profile, epoch, coordinator) = mount.into_parts();
         let identity = catalog.binding(epoch.identity().uuid())?;
+        let mut native_reliability = IoReliabilityOwner::try_new()?;
+        native_reliability.publish(match profile.access() {
+            ext4_core::MediaAccess::ReadWrite => NativeIoPolicy::ReadWrite,
+            ext4_core::MediaAccess::ReadOnly => NativeIoPolicy::ReadOnly,
+        });
         let crypto = CngProvider::try_open()?;
         let metadata_cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
         Ok(Self {
@@ -306,7 +311,7 @@ impl VolumeRuntime {
             storage,
             crypto,
             failure: VolumeFailureState::Operational,
-            native_reliability: IoReliabilityOwner::try_new()?,
+            native_reliability,
             active_mutations: DriverShared::try_new(AtomicU32::new(0))?,
         })
     }
@@ -335,7 +340,13 @@ impl VolumeRuntime {
 
     /// Publishes with the authoritative transition in one non-suspending actor step.
     fn set_failure(&mut self, failure: VolumeFailureState) {
-        self.native_reliability.publish(failure.native_policy());
+        let policy = match (failure.native_policy(), self.profile.access()) {
+            (NativeIoPolicy::ReadWrite, ext4_core::MediaAccess::ReadOnly) => {
+                NativeIoPolicy::ReadOnly
+            }
+            (policy, _) => policy,
+        };
+        self.native_reliability.publish(policy);
         self.failure = failure;
     }
 
@@ -399,6 +410,26 @@ impl VolumeRuntime {
     ///
     /// Returns an error when mutations are no longer authorized or ticket allocation overflows.
     pub(crate) fn admit_mutation(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
+        self.require_media_write()?;
+        self.admit_key_change()
+    }
+
+    /// Requires the session's fixed media authority independently of runtime health.
+    /// # Errors
+    /// Returns write protection for a read-only mount.
+    pub(crate) fn require_media_write(&self) -> DriverResult<()> {
+        match self.profile.access() {
+            ext4_core::MediaAccess::ReadWrite => Ok(()),
+            ext4_core::MediaAccess::ReadOnly => {
+                Err(DriverError::from(ext4_core::Error::ReadOnlyFilesystem))
+            }
+        }
+    }
+
+    /// Admits mount-local key publication without granting any media write authority.
+    /// # Errors
+    /// Returns unhealthy volume state or finite operation-accounting exhaustion.
+    pub(crate) fn admit_key_change(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
         self.failure.authorize_mutation()?;
         let activity = MutationActivityLease::acquire(&self.active_mutations)?;
         let ticket = self

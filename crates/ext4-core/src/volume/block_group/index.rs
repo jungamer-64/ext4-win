@@ -853,6 +853,7 @@ mod tests {
             superblock,
             crate::FscryptKeySet::empty(),
             ClusterReferenceIndex::new(),
+            crate::MountAccess::ReadWrite,
         )?;
         let mut cache = crate::MetadataCache::try_new(&initial)?;
         let transcript = || {
@@ -1764,6 +1765,7 @@ mod tests {
                 superblock,
                 FscryptKeySet::empty(),
                 ClusterReferenceIndex::new(),
+                crate::MountAccess::ReadWrite,
             )?;
             let mut root = [0_u8; 60];
             for (offset, value) in [(0, 0xf30a), (2, 3), (4, 4), (6, 1)] {

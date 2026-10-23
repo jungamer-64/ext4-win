@@ -564,7 +564,11 @@ impl ControlDeviceOperation for MountRequestOperation {
                     let devices =
                         MountedStorage::primary(admission.file_system_device(), filesystem);
                     let mount = match memory::boxed_try_with(move || {
-                        Ok(MountOperation::new(length, FscryptKeySet::empty()))
+                        Ok(MountOperation::new(
+                            length,
+                            FscryptKeySet::empty(),
+                            ext4_core::MountAccess::ReadWrite,
+                        ))
                     }) {
                         Ok(mount) => mount,
                         Err(error) => return Self::complete(owned, Err(error)),
@@ -2371,6 +2375,9 @@ impl MountedVolumeOperation for VolumeControlOperation {
                         access,
                     );
                 }
+                if access.mounted_profile().access() == ext4_core::MediaAccess::ReadOnly {
+                    return Self::publish(self.kind, owned, target, transition, access);
+                }
                 let request = StorageRequest::Flush {
                     target: ext4_core::StorageTarget::Filesystem,
                 };
@@ -2758,6 +2765,9 @@ impl FlushRequestOperation {
         scope: crate::state::VolumeFlushScope,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        if access.mounted_profile().access() == ext4_core::MediaAccess::ReadOnly {
+            return Self::complete(owned, Ok(IrpCompletion::EMPTY));
+        }
         let work = match self.prepare_cache_flush(&mut owned, access) {
             Ok(work) => work,
             Err(error) => return Self::complete(owned, Err(error)),

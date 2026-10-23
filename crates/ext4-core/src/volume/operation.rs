@@ -529,6 +529,7 @@ impl MutationResolveReady {
         crypto: &'pass mut dyn CryptographicOperation,
     ) -> Result<MutationResolvePass<'pass, 'pass, 'pass>> {
         let epoch = cache.epoch();
+        epoch.require_writable()?;
         if self.mount != epoch.mount
             || self
                 .epoch

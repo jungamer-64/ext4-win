@@ -431,6 +431,8 @@ impl EpochSequence {
 /// Immutable feature, geometry, device, and journal identity established at mount.
 #[derive(Debug)]
 pub struct MountedProfile {
+    /// Media operations fixed when this session was constructed.
+    access: super::MediaAccess,
     /// Origin retained independently of on-disk UUID and local sequence numbers.
     pub(super) mount: MountIdentity,
     /// Validated feature and fixed geometry fields.
@@ -442,14 +444,22 @@ pub struct MountedProfile {
 }
 
 impl MountedProfile {
+    /// Media authority fixed before recovery; failure state cannot widen it.
+    #[must_use]
+    pub const fn access(&self) -> super::MediaAccess {
+        self.access
+    }
+
     /// Builds the immutable profile after replay has established a supported filesystem.
     pub(super) fn new(
         mount: &MountIdentity,
         superblock: Superblock,
         filesystem_length: DeviceLength,
         journal_target: StorageTarget,
+        access: super::MediaAccess,
     ) -> Self {
         Self {
+            access,
             mount: *mount,
             superblock,
             filesystem_length,
@@ -479,6 +489,8 @@ impl MountedProfile {
 /// Immutable state visible to readers after one commit publication.
 #[derive(Debug)]
 pub struct CommittedEpoch {
+    /// Immutable media authority inherited by each successor.
+    access: super::MediaAccess,
     /// Origin retained independently of on-disk UUID and local sequence numbers.
     pub(super) mount: MountIdentity,
     /// Monotonic registry identity.
@@ -491,9 +503,21 @@ pub struct CommittedEpoch {
     pub(super) clusters: ClusterReferenceIndex,
     /// Durable journal payloads not yet copied to home blocks.
     pub(super) overlay: Vec<JournalBlock>,
+    /// Immutable virtual recovery bytes; absent for writable mounts.
+    recovery: Option<alloc::sync::Arc<super::recovery::RecoveryOverlay>>,
 }
 
 impl CommittedEpoch {
+    /// Rejects media mutation independently of mount-local key publication.
+    /// # Errors
+    /// Returns write protection for sessions admitted without media authority.
+    pub(super) fn require_writable(&self) -> Result<()> {
+        match self.access {
+            super::MediaAccess::ReadWrite => Ok(()),
+            super::MediaAccess::ReadOnly => Err(Error::ReadOnlyFilesystem),
+        }
+    }
+
     /// Builds the initial committed epoch after successful replay and mount validation.
     /// # Errors
     /// Returns mount identity exhaustion before any mount publication write.
@@ -501,14 +525,17 @@ impl CommittedEpoch {
         superblock: Superblock,
         fscrypt_keys: FscryptKeySet,
         clusters: ClusterReferenceIndex,
+        access: super::MountAccess,
     ) -> Result<Self> {
         Ok(Self {
             mount: MountIdentity::new()?,
+            access: access.media_access(),
             sequence: EpochSequence::INITIAL,
             superblock,
             fscrypt_keys,
             clusters,
             overlay: Vec::new(),
+            recovery: None,
         })
     }
 
@@ -523,11 +550,13 @@ impl CommittedEpoch {
     ) -> Self {
         Self {
             mount: current.mount,
+            access: current.access,
             sequence,
             superblock,
             fscrypt_keys,
             clusters,
             overlay,
+            recovery: current.recovery.as_ref().map(alloc::sync::Arc::clone),
         }
     }
 
@@ -577,6 +606,11 @@ impl StorageReadOverlay for CommittedEpoch {
             .get()
             .checked_add(u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?)
             .ok_or(Error::ArithmeticOverflow)?;
+        if let Some(recovery) = &self.recovery
+            && recovery.read(target, offset, out)?
+        {
+            return Ok(true);
+        }
         for image in &self.overlay {
             let start = self.superblock.block_size().offset_of(image.block())?.get();
             let image_end = start
@@ -604,6 +638,9 @@ impl StorageReadOverlay for CommittedEpoch {
     fn apply(&self, target: StorageTarget, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
         if target != StorageTarget::Filesystem || out.is_empty() {
             return Ok(());
+        }
+        if let Some(recovery) = &self.recovery {
+            recovery.apply(target, offset, out)?;
         }
         let request_start = offset.get();
         let request_end = request_start
@@ -820,6 +857,8 @@ struct ReadObservation<'pass, 'state> {
 /// Each grant belongs to this mount session and is consumed even when a transition rejects it.
 #[derive(Debug)]
 pub struct MutationCoordinatorState {
+    /// Fixed media authority; key-publication grants do not widen it.
+    access: super::MediaAccess,
     /// Origin retained independently of on-disk UUID and local sequence numbers.
     pub(super) mount: MountIdentity,
     /// Current journal phase.
@@ -833,6 +872,11 @@ pub struct MutationCoordinatorState {
 }
 
 impl MutationCoordinatorState {
+    /// Fixed media authority of this coordinator session.
+    pub(super) const fn mount_access(&self) -> super::MediaAccess {
+        self.access
+    }
+
     /// Published identity paired with the committed resource-version authority.
     pub(super) const fn published_epoch(&self) -> (FilesystemUuid, EpochSequence) {
         self.journal.epoch()
@@ -841,6 +885,7 @@ impl MutationCoordinatorState {
     pub(crate) fn new(journal: Journal<CleanJournal>, current: &CommittedEpoch) -> Self {
         Self {
             mount: current.mount,
+            access: current.access,
             journal: JournalCoordinatorState::Ready {
                 admission: CommitAdmission::Available,
                 journal,
@@ -1320,7 +1365,8 @@ pub struct ExternalJournalProbeOperation {
     candidate: StorageTranscript,
 }
 
-/// Proof that both primary write-session markers were durably cleared after every mounted device drained.
+/// Proof that this session's media-change obligations completed after its operations drained.
+/// Read-only sessions leave the medium's existing recovery markers unchanged.
 #[derive(Debug)]
 pub struct CleanCloseDurability {
     /// Prevents construction outside this module.
@@ -1337,13 +1383,15 @@ pub enum CleanCloseTransition {
         /// Operation resumed only by the matching completion.
         suspended: Box<CleanCloseOperation>,
     },
-    /// The marker is durably clean, or the volume must remain recovery-required.
+    /// This session has no remaining media-change obligation, or closing failed.
     Complete(Result<CleanCloseDurability>),
 }
 
 /// Allocation-before-effects clean shutdown/dismount operation.
 #[derive(Debug)]
 pub struct CleanCloseOperation {
+    /// Authority selected when this close request was constructed.
+    access: super::MediaAccess,
     /// Primary filesystem transcript used only to obtain the latest superblock bytes.
     filesystem: StorageTranscript,
     /// Journal flush target selected by validated mount placement.
@@ -1386,13 +1434,14 @@ enum CleanClosePhase {
 impl CleanCloseOperation {
     /// Starts close preparation before the first effect-bearing request.
     #[must_use]
-    pub const fn new(
-        filesystem_length: crate::DeviceLength,
-        journal_target: StorageTarget,
-    ) -> Self {
+    pub const fn new(profile: &MountedProfile) -> Self {
         Self {
-            filesystem: StorageTranscript::new(StorageTarget::Filesystem, filesystem_length),
-            journal_target,
+            access: profile.access(),
+            filesystem: StorageTranscript::new(
+                StorageTarget::Filesystem,
+                profile.filesystem_length(),
+            ),
+            journal_target: profile.journal_target(),
             phase: CleanClosePhase::PrepareMarker,
             marker: None,
             cancellation_requested: false,
@@ -1465,6 +1514,9 @@ impl CleanCloseOperation {
 
     /// Drives allocation-free request publication after the marker image has been prepared.
     fn drive(mut self: Box<Self>) -> CleanCloseTransition {
+        if matches!(self.access, super::MediaAccess::ReadOnly) {
+            return CleanCloseTransition::Complete(Ok(CleanCloseDurability { _private: () }));
+        }
         loop {
             match self.phase {
                 CleanClosePhase::PrepareMarker => {
@@ -1651,6 +1703,8 @@ pub enum MountTransition {
 pub struct MountOperation {
     /// Media authority fixed before the first mount operation.
     access: super::MountAccess,
+    /// Private recovery destination; moved into immutable epoch ownership at publication.
+    recovery: Option<super::recovery::RecoveryOverlay>,
     /// Filesystem-device transcript used only for restartable metadata resolution.
     filesystem: StorageTranscript,
     /// Mount key snapshot moved once into the initial epoch before marker publication.
@@ -1865,9 +1919,19 @@ impl ResolvedPrimary {
 impl MountOperation {
     /// Creates a mount operation for a primary filesystem device only.
     #[must_use]
-    pub const fn new(filesystem_length: DeviceLength, fscrypt_keys: FscryptKeySet, access: super::MountAccess) -> Self {
+    pub const fn new(
+        filesystem_length: DeviceLength,
+        fscrypt_keys: FscryptKeySet,
+        access: super::MountAccess,
+    ) -> Self {
         Self {
             access,
+            recovery: match access {
+                super::MountAccess::ReadWrite => None,
+                super::MountAccess::ReadOnly { recovery_memory } => {
+                    Some(super::recovery::RecoveryOverlay::new(recovery_memory))
+                }
+            },
             filesystem: StorageTranscript::new(StorageTarget::Filesystem, filesystem_length),
             fscrypt_keys: Some(fscrypt_keys),
             state: MountState::Resolving,
@@ -1953,6 +2017,25 @@ impl MountOperation {
     ///
     /// Returns an error for a failed, mismatched, short, or phase-inconsistent completion.
     fn accept_completion(&mut self, completion: crate::StorageCompletion) -> Result<()> {
+        let completion = if let Some(recovery) = &self.recovery {
+            let (mut transfer, information, result) = completion.into_parts();
+            if result.is_ok()
+                && let crate::CompletedStorageTransfer::Read {
+                    target,
+                    offset,
+                    buffer,
+                } = &mut transfer
+                && information == buffer.len()
+            {
+                recovery.apply(*target, *offset, buffer)?;
+            }
+            match result {
+                Ok(()) => crate::StorageCompletion::success(transfer, information),
+                Err(error) => crate::StorageCompletion::failure(transfer, error),
+            }
+        } else {
+            completion
+        };
         match core::mem::replace(&mut self.state, MountState::Resolving) {
             MountState::Resolving => {
                 self.filesystem.complete(completion)?;
@@ -2039,8 +2122,54 @@ impl MountOperation {
         Ok(())
     }
 
-    /// Advances internal phases without polling unrelated operations.
+    /// Executes private recovery effects without ever publishing them to backing storage.
     fn drive(mut self: Box<Self>) -> MountTransition {
+        loop {
+            let transition = self.drive_step();
+            let MountTransition::SubmitLower {
+                mut request,
+                mut suspended,
+            } = transition
+            else {
+                return transition;
+            };
+            let Some(recovery) = &mut suspended.recovery else {
+                return MountTransition::SubmitLower { request, suspended };
+            };
+            let result = match &mut request {
+                crate::StorageRequest::Read {
+                    target,
+                    offset,
+                    buffer,
+                } => match recovery.read(*target, *offset, buffer) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => return MountTransition::SubmitLower { request, suspended },
+                    Err(error) => Err(error),
+                },
+                crate::StorageRequest::Write {
+                    target,
+                    offset,
+                    buffer,
+                } => recovery.write(*target, *offset, buffer),
+                crate::StorageRequest::Flush { .. } => Ok(()),
+            };
+            if let Err(error) = result {
+                return MountTransition::Complete(Err(error));
+            }
+            let information = request.byte_count();
+            let completion = crate::StorageCompletion::success(
+                crate::CompletedStorageTransfer::from_request(request),
+                information,
+            );
+            if let Err(error) = suspended.accept_completion(completion) {
+                return MountTransition::Complete(Err(error));
+            }
+            self = suspended;
+        }
+    }
+
+    /// Advances internal phases until an owned effect or terminal result is ready.
+    fn drive_step(mut self: Box<Self>) -> MountTransition {
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
                 MountState::Resolving => match self.resolve_journal() {
@@ -2260,10 +2389,18 @@ impl MountOperation {
                 MountState::PreparingMarker(indexed) => {
                     let raw = {
                         let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                        Superblock::prepare_write_session(
-                            &mut filesystem,
-                            WriteSessionState::Active,
-                        )
+                        match self.access {
+                            super::MountAccess::ReadWrite => Superblock::prepare_write_session(
+                                &mut filesystem,
+                                WriteSessionState::Active,
+                            ),
+                            super::MountAccess::ReadOnly { .. } => {
+                                let mut raw = [0_u8; 1024];
+                                filesystem
+                                    .read_exact_at(ByteOffset::new(1024), &mut raw)
+                                    .map(|()| raw)
+                            }
+                        }
                     };
                     match raw {
                         Ok(raw) => {
@@ -2275,17 +2412,22 @@ impl MountOperation {
                                 Some(keys) => keys,
                                 None => return MountTransition::Complete(Err(Error::DeviceIo)),
                             };
-                            let epoch =
-                                match CommittedEpoch::initial(marked, keys, indexed.clusters) {
-                                    Ok(epoch) => epoch,
-                                    Err(error) => return MountTransition::Complete(Err(error)),
-                                };
+                            let epoch = match CommittedEpoch::initial(
+                                marked,
+                                keys,
+                                indexed.clusters,
+                                self.access,
+                            ) {
+                                Ok(epoch) => epoch,
+                                Err(error) => return MountTransition::Complete(Err(error)),
+                            };
                             let completed = CompletedMount {
                                 profile: MountedProfile::new(
                                     &epoch.mount,
                                     marked,
                                     self.filesystem.len(),
                                     indexed.publication.journal_target,
+                                    self.access.media_access(),
                                 ),
                                 coordinator: MutationCoordinatorState::new(
                                     indexed.publication.journal,
@@ -2305,7 +2447,14 @@ impl MountOperation {
                                 completed,
                                 orphans: indexed.orphans.into_queue(),
                             };
-                            self.state = MountState::MarkerWriteReady { completed, marker };
+                            self.state = match self.access {
+                                super::MountAccess::ReadWrite => {
+                                    MountState::MarkerWriteReady { completed, marker }
+                                }
+                                super::MountAccess::ReadOnly { .. } => {
+                                    MountState::RecoveringOrphans(completed)
+                                }
+                            };
                         }
                         Err(Error::OperationSuspended) => {
                             self.state = MountState::PreparingMarker(indexed);
@@ -2433,7 +2582,13 @@ impl MountOperation {
                 MountState::OrphanWritePending { .. } => {
                     return MountTransition::Complete(Err(Error::DeviceIo));
                 }
-                MountState::Published(completed) => {
+                MountState::Published(mut completed) => {
+                    if let Some(recovery) = self.recovery.take() {
+                        completed.epoch.recovery = match recovery.seal() {
+                            Ok(recovery) => Some(recovery),
+                            Err(error) => return MountTransition::Complete(Err(error)),
+                        };
+                    }
                     return if self.cancel_requested {
                         MountTransition::Complete(Err(Error::OperationCancelled))
                     } else {
@@ -2616,10 +2771,17 @@ mod tests {
         } else {
             OperationEvent::Admitted
         };
-        let mut transition = crate::memory::try_box(CleanCloseOperation::new(
-            DeviceLength::from_bytes(16_384),
+        let mut transition = crate::memory::try_box(CleanCloseOperation {
+            access: crate::MediaAccess::ReadWrite,
+            filesystem: super::StorageTranscript::new(
+                StorageTarget::Filesystem,
+                DeviceLength::from_bytes(16_384),
+            ),
             journal_target,
-        ))?
+            phase: super::CleanClosePhase::PrepareMarker,
+            marker: None,
+            cancellation_requested: false,
+        })?
         .advance(initial_event);
         let mut observed = Vec::new();
         observed

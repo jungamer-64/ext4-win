@@ -1336,6 +1336,7 @@ impl MountedVolumeAccess<'_> {
         let (access, extent) = target.authority();
         access.require(kind)?;
         if kind == RawVolumeOperationKind::Write {
+            self.runtime.require_media_write()?;
             target.ensure_write_retryable()?;
         }
         let route = self.storage_route();
@@ -1531,6 +1532,15 @@ impl MountedVolumeAccess<'_> {
         self.authorize_storage()?;
         self.storage_access().authorize_paging()?;
         self.runtime.admit_mutation()
+    }
+
+    /// Admits mount-local key publication while retaining volume-close drain ownership.
+    /// # Errors
+    /// Returns storage lifecycle or operation-accounting failure without granting media writes.
+    pub(crate) fn admit_key_change(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
+        self.authorize_storage()?;
+        self.storage_access().authorize_paging()?;
+        self.runtime.admit_key_change()
     }
 
     /// Resolves one ephemeral core pass against the current mutation coordinator snapshot.

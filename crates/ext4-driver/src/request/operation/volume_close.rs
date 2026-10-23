@@ -102,12 +102,7 @@ pub(crate) fn volume_close(
         }
     };
     let profile = access.mounted_profile();
-    let close = match memory::boxed_try_with(|| {
-        Ok(CleanCloseOperation::new(
-            profile.filesystem_length(),
-            profile.journal_target(),
-        ))
-    }) {
+    let close = match memory::boxed_try_with(|| Ok(CleanCloseOperation::new(profile))) {
         Ok(close) => close,
         Err(error) => return Err(AdmitOperationError::new(error, owned)),
     };

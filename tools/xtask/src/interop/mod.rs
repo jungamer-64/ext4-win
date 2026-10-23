@@ -790,6 +790,7 @@ fn mount_internal_core<S: HostStorage>(
     let mut transition = Box::try_new(ext4_core::MountOperation::new(
         filesystem_length,
         ext4_core::FscryptKeySet::empty(),
+        ext4_core::MountAccess::ReadWrite,
     ))?
     .advance(ext4_core::OperationEvent::Admitted);
     loop {
@@ -828,6 +829,7 @@ fn mount_external_core<S: HostStorage>(
     let mut transition = Box::try_new(ext4_core::MountOperation::new(
         filesystem_length,
         ext4_core::FscryptKeySet::empty(),
+        ext4_core::MountAccess::ReadWrite,
     ))?
     .advance(ext4_core::OperationEvent::Admitted);
     loop {
@@ -865,6 +867,7 @@ fn run_internal_mount_until_boundary(
     let mut transition = Box::try_new(ext4_core::MountOperation::new(
         filesystem_length,
         ext4_core::FscryptKeySet::empty(),
+        ext4_core::MountAccess::ReadWrite,
     ))?
     .advance(ext4_core::OperationEvent::Admitted);
     loop {
@@ -898,14 +901,10 @@ fn run_internal_mount_until_boundary(
 /// Returns an error for lower storage I/O or a rejected clean-close transition.
 fn complete_core_clean_close<S: HostStorage>(
     storage: &mut S,
-    filesystem_length: ext4_core::DeviceLength,
-    journal_target: ext4_core::StorageTarget,
+    profile: &ext4_core::MountedProfile,
 ) -> TaskResult<()> {
-    let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(
-        filesystem_length,
-        journal_target,
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
+    let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(profile))?
+        .advance(ext4_core::OperationEvent::Admitted);
     loop {
         match close {
             ext4_core::CleanCloseTransition::SubmitLower { request, suspended } => {
@@ -940,6 +939,7 @@ fn run_external_mount_until_boundary(
     let mut transition = Box::try_new(ext4_core::MountOperation::new(
         filesystem_length,
         ext4_core::FscryptKeySet::empty(),
+        ext4_core::MountAccess::ReadWrite,
     ))?
     .advance(ext4_core::OperationEvent::Admitted);
     loop {
@@ -978,16 +978,11 @@ fn run_external_clean_close_until_boundary(
     cut: Option<EffectCut>,
 ) -> TaskResult<EffectBoundaryRun> {
     let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
-    let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_external_core(&mut storage)?;
     let (profile, _epoch, _coordinator) = completed.into_parts();
     let mut controller = EffectBoundaryController::new(cut)?;
-    let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(
-        filesystem_length,
-        profile.journal_target(),
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
+    let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(&profile))?
+        .advance(ext4_core::OperationEvent::Admitted);
     loop {
         match close {
             ext4_core::CleanCloseTransition::SubmitLower { request, suspended } => {
@@ -1147,11 +1142,9 @@ fn complete_boundary_transfer<Next>(
 /// Returns an error for host file I/O, unexpected external discovery, or any core terminal error.
 fn drive_core_mount_and_clean_close(image: &Path) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_internal_core(&mut storage)?;
     let (profile, _epoch, _coordinator) = completed.into_parts();
-    complete_core_clean_close(&mut storage, length, profile.journal_target())
+    complete_core_clean_close(&mut storage, &profile)
 }
 
 /// Executes production external discovery, validation, recovery, and clean close against two
@@ -1166,11 +1159,9 @@ fn drive_external_core_mount_and_clean_close(
     external_journal: &Path,
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_external(filesystem, external_journal)?;
-    let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_external_core(&mut storage)?;
     let (profile, _epoch, _coordinator) = completed.into_parts();
-    complete_core_clean_close(&mut storage, filesystem_length, profile.journal_target())
+    complete_core_clean_close(&mut storage, &profile)
 }
 
 /// Runs the public core validator for one exclusively selected external-journal file.
@@ -1391,15 +1382,13 @@ where
         &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
     ) -> ext4_core::Result<R>,
 {
-    let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let (profile, epoch, mut coordinator) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let (prepared, output) =
         prepare_core_mutation(storage, &profile, &epoch, &mut coordinator, ticket, mutate)?;
     let _checkpointed_epoch =
         complete_prepared_mutation(storage, &mut coordinator, ticket, prepared)?;
-    complete_core_clean_close(storage, filesystem_length, profile.journal_target())?;
+    complete_core_clean_close(storage, &profile)?;
     Ok(output)
 }
 
@@ -1448,8 +1437,6 @@ where
     ) -> ext4_core::Result<R>,
 {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let filesystem_length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let completed = mount_internal_core(&mut storage)?;
     let (profile, epoch, coordinator) = (*completed).into_parts();
     let mut cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
@@ -1487,7 +1474,7 @@ where
             }
         }
     };
-    complete_core_clean_close(&mut storage, filesystem_length, profile.journal_target())?;
+    complete_core_clean_close(&mut storage, &profile)?;
     Ok((output, lower_reads))
 }
 
@@ -1737,8 +1724,6 @@ fn drive_directory_enumeration(
     expected: &mut alloc::collections::BTreeSet<Vec<u8>>,
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut operation = ext4_core::DirectoryReadOperation::new(
         &profile,
@@ -1814,7 +1799,7 @@ fn drive_directory_enumeration(
         first,
         started.elapsed()
     );
-    complete_core_clean_close(&mut storage, length, profile.journal_target())?;
+    complete_core_clean_close(&mut storage, &profile)?;
     Ok(())
 }
 
@@ -1826,8 +1811,6 @@ fn verify_directory_read_faults(
     directory: ext4_core::DirectoryNodeId,
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut baseline = Vec::new();
     let mut read_count = 0_usize;
@@ -1971,7 +1954,7 @@ fn verify_directory_read_faults(
     println!(
         "directory cancellation/read failure boundaries: PASS ({read_count} lower reads each)"
     );
-    complete_core_clean_close(&mut storage, length, profile.journal_target())
+    complete_core_clean_close(&mut storage, &profile)
 }
 
 /// Captures one request's names and publishable cursor, then releases its mounted epoch.
@@ -1984,8 +1967,6 @@ fn read_directory_request(
     limit: usize,
 ) -> TaskResult<(Vec<Vec<u8>>, ext4_core::DirectoryScanCursor)> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let length =
-        ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut operation = ext4_core::DirectoryReadOperation::new(&profile, directory, cursor);
     let mut event = ext4_core::OperationEvent::Admitted;
@@ -2021,6 +2002,6 @@ fn read_directory_request(
             }
         }
     };
-    complete_core_clean_close(&mut storage, length, profile.journal_target())?;
+    complete_core_clean_close(&mut storage, &profile)?;
     Ok((names, cursor))
 }

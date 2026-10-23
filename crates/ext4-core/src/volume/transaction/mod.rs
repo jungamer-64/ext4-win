@@ -412,6 +412,9 @@ impl ResolvedMutation {
         intent: super::MutationLease,
         coordinator: &MutationCoordinatorState,
     ) -> Result<ReservedMutation> {
+        if matches!(coordinator.mount_access(), super::MediaAccess::ReadOnly) {
+            return Err(Error::ReadOnlyFilesystem);
+        }
         if intent.consume(&coordinator.mount)? != self.observed.ticket()
             || !self.is_current(coordinator)
         {

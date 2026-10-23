@@ -31,21 +31,28 @@ pub enum MountOutcome {
     StepBudgetExhausted,
 }
 
-/// Runs the mount/recovery protocol twice and asserts an identical terminal classification.
+/// Runs both media-access modes twice and checks deterministic, bounded recovery.
 pub fn assert_deterministic_mount(filesystem: &[u8], external_journal: Option<&[u8]>) {
     if filesystem.len() > MAX_INPUT_BYTES
         || external_journal.is_some_and(|journal| journal.len() > MAX_INPUT_BYTES)
     {
         return;
     }
-    let first = run_mount(filesystem, external_journal);
-    let second = run_mount(filesystem, external_journal);
-    assert_eq!(first, second, "mount/recovery result must be deterministic");
-    assert_ne!(
-        first,
-        MountOutcome::StepBudgetExhausted,
-        "mount/recovery must terminate within the explicit transition budget"
-    );
+    for access in [
+        ext4_core::MountAccess::ReadWrite,
+        ext4_core::MountAccess::ReadOnly {
+            recovery_memory: ext4_core::RecoveryMemoryLimit::DEFAULT,
+        },
+    ] {
+        let first = run_mount(filesystem, external_journal, access);
+        let second = run_mount(filesystem, external_journal, access);
+        assert_eq!(first, second, "mount/recovery result must be deterministic");
+        assert_ne!(
+            first,
+            MountOutcome::StepBudgetExhausted,
+            "mount/recovery must terminate within the explicit transition budget"
+        );
+    }
 }
 
 /// Bounded external-journal validation result before mount continuation attachment.
@@ -161,10 +168,15 @@ fn copy_exact(destination: &mut [u8], source: &[u8]) -> bool {
 }
 
 /// Advances the concrete production mount operation within the explicit step budget.
-fn run_mount(filesystem: &[u8], external_journal: Option<&[u8]>) -> MountOutcome {
+fn run_mount(
+    filesystem: &[u8],
+    external_journal: Option<&[u8]>,
+    access: ext4_core::MountAccess,
+) -> MountOutcome {
     let Ok(operation) = Box::try_new(MountOperation::new(
         DeviceLength::from_bytes(u64::try_from(filesystem.len()).unwrap_or(u64::MAX)),
         FscryptKeySet::empty(),
+        access,
     )) else {
         return MountOutcome::Rejected;
     };
@@ -176,6 +188,12 @@ fn run_mount(filesystem: &[u8], external_journal: Option<&[u8]>) -> MountOutcome
     for _step in 0..MAX_STEPS {
         match transition {
             MountTransition::SubmitLower { request, suspended } => {
+                if access.media_access() == ext4_core::MediaAccess::ReadOnly {
+                    assert!(
+                        matches!(&request, StorageRequest::Read { .. }),
+                        "read-only mounting must not submit media effects"
+                    );
+                }
                 transition =
                     suspended.advance(OperationEvent::StorageCompleted(devices.complete(request)));
             }

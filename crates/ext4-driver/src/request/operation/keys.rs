@@ -111,7 +111,7 @@ impl KeyRequestOperation {
                     KeyRequest::Remove(exclusion)
                 }
             };
-            let (ticket, activity) = access.admit_mutation()?;
+            let (ticket, activity) = access.admit_key_change()?;
             Ok((request, ticket, activity))
         })();
         let (request, ticket, activity) = match prepared {

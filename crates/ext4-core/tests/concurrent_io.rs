@@ -9,6 +9,95 @@ use ext4_core::*;
 use sha2::Digest as _;
 
 /// # Errors
+/// Returns fixture setup, journal commit, private replay or read failures.
+/// # Panics
+/// Fails if private replay changes media, loses committed bytes, or grants media mutation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions directly observe write-free replay through production I/O boundaries"
+)]
+fn read_only_recovery_preserves_media_and_mount_local_keys() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        &mut PlainCrypto,
+        |pass| {
+            let file = pass.file(fixture.a)?;
+            pass.write_file_range(file, FileOffset::from_bytes(0), b"private-replay")
+        },
+    )?;
+    let prepared = resolved
+        .reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?
+        .prepare_commit(
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(Error::ClusterReferenceConflict)?,
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+        )?;
+    let ordered = fixture.disk.sequence(prepared.start())?;
+    let payloads = fixture.disk.transfer(ordered.submit())?;
+    let payload = fixture.disk.sequence(payloads)?;
+    let commit = fixture.disk.transfer(payload.submit())?;
+    let durability = fixture.disk.transfer(commit.submit())?;
+    drop(fixture.disk.transfer(durability.submit())?);
+    let filesystem = fixture.disk.filesystem.clone();
+    let journal = fixture.disk.journal.clone();
+    fixture.disk.storage_effects = 0;
+    assert!(matches!(
+        fixture.disk.mount(MountAccess::ReadOnly {
+            recovery_memory: RecoveryMemoryLimit::new(1)?
+        }),
+        Err(Error::RecoveryMemoryLimitExceeded)
+    ));
+    assert_eq!(fixture.disk.storage_effects, 0);
+    assert_eq!(fixture.disk.filesystem, filesystem);
+    assert_eq!(fixture.disk.journal, journal);
+    let access = MountAccess::ReadOnly {
+        recovery_memory: RecoveryMemoryLimit::DEFAULT,
+    };
+    let (profile, epoch, coordinator) = fixture.disk.mount(access)?.into_parts();
+    fixture.profile = profile;
+    fixture.epoch = epoch;
+    fixture.coordinator = coordinator;
+    fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+    let file = fixture.a;
+    let read = |pass: &mut EpochReadPass<'_, '_, '_>| {
+        let mut bytes = [0; 14];
+        let _read = pass.read_file(file, FileOffset::from_bytes(0), &mut bytes)?;
+        Ok(bytes)
+    };
+    assert_eq!(fixture.read(read)?, *b"private-replay");
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
+    let change = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, key)?;
+    fixture.publish_keys(change)?;
+    assert_eq!(fixture.read(read)?, *b"private-replay");
+    assert!(matches!(
+        fixture.mutate(|pass| pass.set_volume_label(Ext4VolumeLabel::new(b"denied")?)),
+        Err(Error::ReadOnlyFilesystem)
+    ));
+    let close = Box::try_new(CleanCloseOperation::new(&fixture.profile))
+        .map_err(|_| Error::OutOfMemory)?
+        .advance(OperationEvent::Admitted);
+    assert!(matches!(close, CleanCloseTransition::Complete(Ok(_))));
+    assert_eq!(fixture.disk.storage_effects, 0);
+    assert_eq!(fixture.disk.filesystem, filesystem);
+    assert_eq!(fixture.disk.journal, journal);
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture construction or mutation resolution failures.
 /// # Panics
 /// Fails if equal disk UUIDs and local counters let one mount consume another mount's state.
@@ -746,7 +835,7 @@ fn sparse_extension_zeroes_initialized_storage_after_interrupted_write() -> Resu
         let _payload_sequence = fixture.disk.transfer(ordered.submit())?;
         // A crash loses preparation and publication state after data reaches its home block.
     }
-    let (profile, epoch, coordinator) = fixture.disk.mount()?.into_parts();
+    let (profile, epoch, coordinator) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
     fixture.profile = profile;
     fixture.cache = MetadataCache::try_new(&epoch)?;
     fixture.epoch = epoch;
@@ -1139,11 +1228,12 @@ impl Disk {
 
     /// # Errors
     /// Returns a mount, external-journal discovery, or storage failure.
-    fn mount(&mut self) -> Result<CompletedMount> {
+    fn mount(&mut self, access: MountAccess) -> Result<CompletedMount> {
         let length = u64::try_from(self.filesystem.len()).map_err(|_| Error::DeviceRange)?;
         let mut step = Box::try_new(MountOperation::new(
             DeviceLength::from_bytes(length),
             FscryptKeySet::empty(),
+            access,
         ))
         .map_err(|_| Error::OutOfMemory)?
         .advance(OperationEvent::Admitted);
@@ -1316,7 +1406,7 @@ impl Fixture {
     /// # Errors
     /// Returns mount recovery or cache allocation failure.
     fn remount(&mut self) -> Result<()> {
-        let (profile, epoch, coordinator) = self.disk.mount()?.into_parts();
+        let (profile, epoch, coordinator) = self.disk.mount(MountAccess::ReadWrite)?.into_parts();
         self.profile = profile;
         self.cache = MetadataCache::try_new(&epoch)?;
         self.epoch = epoch;
@@ -1387,7 +1477,7 @@ impl Fixture {
     /// # Errors
     /// Returns fixture mount, namespace, payload or commit failure.
     fn from_disk(mut disk: Disk) -> Result<Self> {
-        let (profile, epoch, mut coordinator) = disk.mount()?.into_parts();
+        let (profile, epoch, mut coordinator) = disk.mount(MountAccess::ReadWrite)?.into_parts();
         let ticket = coordinator.admit_mutation()?;
         let (resolved, (a, b)) = disk.resolve(
             &profile,
@@ -2168,7 +2258,7 @@ fn mount_keys_publish_without_storage_and_disappear_on_remount() -> Result<()> {
             fixture_crc32c(u32::MAX, &fixture.disk.journal),
         )
     );
-    let (_, remounted, _) = fixture.disk.mount()?.into_parts();
+    let (_, remounted, _) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
     assert_eq!(
         remounted.fscrypt_key_presence(identifier),
         FscryptKeyPresence::Absent
@@ -2275,7 +2365,7 @@ fn key_removal_revokes_encrypted_reads_and_resolved_mutations() -> Result<()> {
     fixture
         .disk
         .encode_inode(NodeId::File(b), 0x0008_0800, Some(&context))?;
-    let (profile, epoch, coordinator) = fixture.disk.mount()?.into_parts();
+    let (profile, epoch, coordinator) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
     fixture.profile = profile;
     fixture.epoch = epoch;
     fixture.coordinator = coordinator;
@@ -3467,7 +3557,7 @@ fn external_xattr_counts_match_exact_inode_ownership_before_mount() -> Result<()
     for count in [0, 1, 3] {
         let mut fixture = shared_xattr_fixture(count)?;
         assert_eq!(
-            fixture.disk.mount().err(),
+            fixture.disk.mount(MountAccess::ReadWrite).err(),
             Some(Error::InvalidXattr),
             "count={count}"
         );
@@ -3565,7 +3655,7 @@ fn persisted_metadata_checksums_precede_mount_authority() -> Result<()> {
         };
         *disk.filesystem.get_mut(offset).ok_or(Error::DeviceRange)? ^= mask;
         assert_eq!(
-            disk.mount().err(),
+            disk.mount(MountAccess::ReadWrite).err(),
             Some(Error::ChecksumMismatch),
             "offset={offset}"
         );
@@ -3628,7 +3718,10 @@ fn journal_checksum_zero_does_not_disable_authentication() -> Result<()> {
         .get_mut(4348..4352)
         .ok_or(Error::DeviceRange)?
         .fill(0);
-    assert_eq!(disk.mount().err(), Some(Error::ChecksumMismatch));
+    assert_eq!(
+        disk.mount(MountAccess::ReadWrite).err(),
+        Some(Error::ChecksumMismatch)
+    );
     assert_eq!(disk.storage_effects, 0);
     Ok(())
 }
@@ -3660,7 +3753,10 @@ fn mount_rejects_unsupported_format_selectors_before_storage_effects() -> Result
         {
             *target = byte;
         }
-        assert_eq!(disk.mount().err(), Some(Error::UnsupportedWriteFeature));
+        assert_eq!(
+            disk.mount(MountAccess::ReadWrite).err(),
+            Some(Error::UnsupportedWriteFeature)
+        );
         assert_eq!(disk.storage_effects, 0);
     }
     Ok(())

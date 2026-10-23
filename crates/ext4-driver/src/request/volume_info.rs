@@ -223,7 +223,9 @@ fn prepare_query(
                         .volume_device_information(),
                     output,
                 ),
-                QueryVolumeInformationClass::Attribute => pack_attribute_information(output),
+                QueryVolumeInformationClass::Attribute => {
+                    pack_attribute_information(output, operations.mounted_profile().access())
+                }
                 QueryVolumeInformationClass::FullSize => {
                     pack_full_size_information(geometry, sector, output)
                 }
@@ -528,7 +530,10 @@ fn pack_full_size_information(
 ///
 /// Returns an error when the filesystem name byte count overflows or the output buffer is too
 /// small.
-fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> {
+fn pack_attribute_information(
+    output: &mut [u8],
+    access: ext4_core::MediaAccess,
+) -> DriverResult<IrpCompletion> {
     let header = core::mem::offset_of!(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName);
     let name_len = FILE_SYSTEM_NAME
         .len()
@@ -556,7 +561,11 @@ fn pack_attribute_information(output: &mut [u8]) -> DriverResult<IrpCompletion> 
             | FILE_UNICODE_ON_DISK
             | FILE_SUPPORTS_REPARSE_POINTS
             | FILE_SUPPORTS_EXTENDED_ATTRIBUTES
-            | FILE_SUPPORTS_HARD_LINKS,
+            | FILE_SUPPORTS_HARD_LINKS
+            | match access {
+                ext4_core::MediaAccess::ReadWrite => 0,
+                ext4_core::MediaAccess::ReadOnly => wdk_sys::FILE_READ_ONLY_VOLUME,
+            },
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -883,12 +892,24 @@ mod tests {
     }
 
     /// # Panics
-    ///
+    /// Fails when mounted media authority is omitted from the native capability report.
+    #[test]
+    fn attribute_information_reports_read_only_media() {
+        let mut buffer = [0; 128];
+        assert!(pack_attribute_information(&mut buffer, ext4_core::MediaAccess::ReadOnly).is_ok());
+        let attributes = LittleEndianInput::new(&buffer).read_u32(WireOffset::new(
+            core::mem::offset_of!(wdk_sys::FILE_FS_ATTRIBUTE_INFORMATION, FileSystemAttributes),
+        ));
+        assert!(matches!(attributes, Ok(flags) if flags & wdk_sys::FILE_READ_ONLY_VOLUME != 0));
+    }
+
+    /// # Panics
     /// Panics when the filesystem name, buffer boundaries or hard-link capability differ.
     #[test]
     fn attribute_information_reports_ext4_and_hard_links() {
         let mut buffer = vec![0xA5; 128];
-        let written = pack_attribute_information(buffer.as_mut_slice());
+        let written =
+            pack_attribute_information(buffer.as_mut_slice(), ext4_core::MediaAccess::ReadWrite);
         assert_eq!(written, IrpCompletion::from_usize(20));
         let attributes = LittleEndianInput::new(buffer.as_slice()).read_u32(WireOffset::new(
             core::mem::offset_of!(wdk_sys::FILE_FS_ATTRIBUTE_INFORMATION, FileSystemAttributes),
@@ -912,26 +933,26 @@ mod tests {
 
         let mut exact = [0xA5; 20];
         assert_eq!(
-            pack_attribute_information(&mut exact),
+            pack_attribute_information(&mut exact, ext4_core::MediaAccess::ReadWrite),
             IrpCompletion::from_usize(20)
         );
         assert_eq!(buffer.get(..20), Some(exact.as_slice()));
 
         let mut short = [0xA5; 19];
         assert_eq!(
-            pack_attribute_information(&mut short),
+            pack_attribute_information(&mut short, ext4_core::MediaAccess::ReadWrite),
             IrpCompletion::buffer_overflow(19)
         );
         assert_eq!(buffer.get(..19), Some(short.as_slice()));
         let mut header_only = [0xA5; 12];
         assert_eq!(
-            pack_attribute_information(&mut header_only),
+            pack_attribute_information(&mut header_only, ext4_core::MediaAccess::ReadWrite),
             IrpCompletion::buffer_overflow(12)
         );
         assert_eq!(buffer.get(..12), Some(header_only.as_slice()));
         let mut missing_header = [0xA5; 11];
         assert_eq!(
-            pack_attribute_information(&mut missing_header),
+            pack_attribute_information(&mut missing_header, ext4_core::MediaAccess::ReadWrite),
             Err(DriverError::InfoLengthMismatch)
         );
         assert_eq!(missing_header, [0xA5; 11]);

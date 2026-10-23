@@ -34,8 +34,29 @@ pub enum MountAccess {
     /// Journaled changes may be persisted to exclusively held backing storage.
     ReadWrite,
     /// Recovery is private to memory; no media write or flush is authorized.
+    /// Backing storage must remain unchanged by other writers until unmount.
     ReadOnly {
         /// Finite admission for recovery images and their indexing storage.
         recovery_memory: RecoveryMemoryLimit,
     },
+}
+
+impl MountAccess {
+    /// Attenuates recovery admission to the media operations granted after mounting.
+    #[must_use]
+    pub const fn media_access(self) -> MediaAccess {
+        match self {
+            Self::ReadWrite => MediaAccess::ReadWrite,
+            Self::ReadOnly { .. } => MediaAccess::ReadOnly,
+        }
+    }
+}
+
+/// Immutable mounted-media authority, independent of recovery resource admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaAccess {
+    /// Journaled persistent updates may be admitted.
+    ReadWrite,
+    /// Only observations and mount-local key changes may be admitted.
+    ReadOnly,
 }
