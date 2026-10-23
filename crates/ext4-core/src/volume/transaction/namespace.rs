@@ -382,6 +382,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 let mut directory = DirectoryBlock::empty(
                     usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
                     directory_checksum,
+                    DirectoryEntryEncoding::Standard,
                 )?;
                 directory.initialize_dot_entries(inode_id, parent.inode())?;
                 pass.stage_directory_block(block, directory.into_bytes())?;
@@ -866,6 +867,7 @@ impl MutationResolvePass<'_, '_, '_> {
             .superblock
             .name_semantics(&parent_inode)?;
         names.key(name.bytes())?;
+        let entry = RawDirectoryEntry::new(child, &disk_name, kind)?;
         if parent_inode.flags().has_inline_data() {
             if let Some(()) = self.mutation.edit_inline_directory(
                 &mut raw_parent,
@@ -876,8 +878,8 @@ impl MutationResolvePass<'_, '_, '_> {
                             return Err(Error::NameAlreadyExists);
                         }
                     }
-                    if first.insert(child, &disk_name, kind)?
-                        || (!second.bytes().is_empty() && second.insert(child, &disk_name, kind)?)
+                    if first.insert(&entry)?
+                        || (!second.bytes().is_empty() && second.insert(&entry)?)
                     {
                         Ok(())
                     } else {
@@ -906,7 +908,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 inode_index,
                 raw_parent,
                 &parent_inode,
-                RawDirectoryEntry::new(child, &disk_name, kind)?,
+                entry,
             );
         }
 
@@ -923,7 +925,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 &tree,
                 LogicalBlock::try_from(logical)?,
             )?;
-            if block.insert(child, &disk_name, kind)? {
+            if block.insert(&entry)? {
                 self.stage_directory_block(physical, block.into_bytes())?;
                 raw_parent.touch_contents(self.now)?;
                 self.mutation.replace_live_inode(inode_index, raw_parent)?;
@@ -942,7 +944,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 raw_parent,
                 &parent_inode,
                 tree,
-                RawDirectoryEntry::new(child, &disk_name, kind)?,
+                entry,
             );
         }
 
@@ -953,9 +955,10 @@ impl MutationResolvePass<'_, '_, '_> {
         let mut block = DirectoryBlock::empty(
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
             self.mutation.volume.directory_checksum(&parent_inode),
+            DirectoryEntryEncoding::for_inode(&parent_inode),
         )?;
         block.initialize_free_space()?;
-        let inserted = block.insert(child, &disk_name, kind)?;
+        let inserted = block.insert(&entry)?;
         if !inserted {
             return Err(Error::InvalidDirectoryEntry);
         }
@@ -1083,6 +1086,7 @@ impl MutationResolvePass<'_, '_, '_> {
         if old_disk_name == new_disk_name {
             return self.find_child_entry(parent, old_name);
         }
+        let replacement = RawDirectoryEntry::new(child, &new_disk_name, kind)?;
         if parent_inode.flags().has_inline_data() {
             if let Some(result) = self.mutation.edit_inline_directory(
                 &mut raw_parent,
@@ -1097,9 +1101,8 @@ impl MutationResolvePass<'_, '_, '_> {
                     if removed.inode() != child {
                         return Err(Error::InvalidDirectoryEntry);
                     }
-                    if first.insert(child, &new_disk_name, kind)?
-                        || (!second.bytes().is_empty()
-                            && second.insert(child, &new_disk_name, kind)?)
+                    if first.insert(&replacement)?
+                        || (!second.bytes().is_empty() && second.insert(&replacement)?)
                     {
                         Ok(removed)
                     } else {
@@ -1131,21 +1134,12 @@ impl MutationResolvePass<'_, '_, '_> {
                 return Err(Error::InvalidDirectoryEntry);
             }
             self.stage_directory_block(source.physical, source.block.into_bytes())?;
-            self.insert_htree_directory_entry(
-                inode_index,
-                raw_parent,
-                &parent_inode,
-                RawDirectoryEntry::new(child, &new_disk_name, kind)?,
-            )?;
+            self.insert_htree_directory_entry(inode_index, raw_parent, &parent_inode, replacement)?;
             return Ok(renamed);
         }
-        match source.block.rename(&old_disk_name, &new_disk_name) {
+        match source.block.rename(&old_disk_name, &replacement) {
             Ok(Some(renamed)) => {
                 if renamed.inode() != child {
-                    return Err(Error::InvalidDirectoryEntry);
-                }
-                let replacement = source.block.replace(&new_disk_name, child, kind)?;
-                if replacement.is_none() {
                     return Err(Error::InvalidDirectoryEntry);
                 }
                 self.stage_directory_block(source.physical, source.block.into_bytes())?;
@@ -1309,7 +1303,11 @@ impl MutationResolvePass<'_, '_, '_> {
         };
         Ok((
             physical,
-            DirectoryBlock::new(bytes, self.mutation.volume.directory_checksum(inode)),
+            DirectoryBlock::new(
+                bytes,
+                self.mutation.volume.directory_checksum(inode),
+                DirectoryEntryEncoding::for_inode(inode),
+            ),
         ))
     }
 
@@ -1567,7 +1565,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .superblock
                 .name_semantics(parent_inode)?,
         )?;
-        if leaf.insert(entry.inode(), entry.name(), entry.kind())? {
+        if leaf.insert(&entry)? {
             self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
             raw_parent.touch_contents(self.now)?;
             return self.mutation.replace_live_inode(inode_index, raw_parent);
@@ -1622,8 +1620,18 @@ impl MutationResolvePass<'_, '_, '_> {
         let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
         let block_bytes = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
-        let left = DirectoryBlock::from_entries(block_bytes, checksum, left_entries)?;
-        let right = DirectoryBlock::from_entries(block_bytes, checksum, right_entries)?;
+        let left = DirectoryBlock::from_entries(
+            block_bytes,
+            checksum,
+            left_entries,
+            DirectoryEntryEncoding::for_inode(parent_inode),
+        )?;
+        let right = DirectoryBlock::from_entries(
+            block_bytes,
+            checksum,
+            right_entries,
+            DirectoryEntryEncoding::for_inode(parent_inode),
+        )?;
         let mut next_logical = round_up_div(
             parent_inode.size().bytes(),
             u64::from(self.mutation.volume.superblock.block_size().bytes()),
@@ -1850,7 +1858,12 @@ impl MutationResolvePass<'_, '_, '_> {
             .map_err(|_| Error::ArithmeticOverflow)?;
         let mut next_logical = 1_u64;
         let mut routes = Vec::new();
-        match DirectoryBlock::from_entries(block_bytes, checksum, &children) {
+        match DirectoryBlock::from_entries(
+            block_bytes,
+            checksum,
+            &children,
+            DirectoryEntryEncoding::for_inode(parent_inode),
+        ) {
             Ok(leaf) => {
                 let (leaf_logical, leaf_physical) =
                     self.allocate_directory_block(&mut tree, &mut next_logical)?;
@@ -1881,8 +1894,18 @@ impl MutationResolvePass<'_, '_, '_> {
                     )?
                     .major;
                 let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
-                let left = DirectoryBlock::from_entries(block_bytes, checksum, left_entries)?;
-                let right = DirectoryBlock::from_entries(block_bytes, checksum, right_entries)?;
+                let left = DirectoryBlock::from_entries(
+                    block_bytes,
+                    checksum,
+                    left_entries,
+                    DirectoryEntryEncoding::for_inode(parent_inode),
+                )?;
+                let right = DirectoryBlock::from_entries(
+                    block_bytes,
+                    checksum,
+                    right_entries,
+                    DirectoryEntryEncoding::for_inode(parent_inode),
+                )?;
                 let (left_logical, left_physical) =
                     self.allocate_directory_block(&mut tree, &mut next_logical)?;
                 let (right_logical, right_physical) =

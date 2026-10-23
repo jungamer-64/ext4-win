@@ -40,6 +40,16 @@ pub(crate) struct DirectoryHash {
 }
 
 impl DirectoryHash {
+    /// Validates a stored name hash before it can participate in routing.
+    /// # Errors
+    /// Rejects continuation-bit and end-marker values reserved by the index format.
+    pub(crate) fn from_stored(major: u32, minor: u32) -> crate::Result<Self> {
+        if major & 1 != 0 || major == END_MARKER_HASH {
+            return Err(crate::Error::InvalidDirectoryEntry);
+        }
+        Ok(Self { major, minor })
+    }
+
     /// Converts an algorithm result into the HTree name-key domain.
     const fn from_algorithm(major: u32, minor: u32) -> Self {
         let major = major & !1;

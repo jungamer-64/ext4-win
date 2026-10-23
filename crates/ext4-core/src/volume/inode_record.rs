@@ -270,7 +270,11 @@ impl AllocatedInodeRecord {
                 .inherited_by(InodeKind::Directory)
                 .into_inline_storage(),
         )?;
-        let mut region = DirectoryBlock::empty(56, DirectoryChecksum::None)?;
+        let mut region = DirectoryBlock::empty(
+            56,
+            DirectoryChecksum::None,
+            DirectoryEntryEncoding::Standard,
+        )?;
         region.initialize_free_space()?;
         let mut prefix = [0; 60];
         memory::copy_exact(

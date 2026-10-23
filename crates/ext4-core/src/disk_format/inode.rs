@@ -1596,7 +1596,9 @@ impl InodeInlineData {
             )?,
         )?;
         for region in [first.as_slice(), second.as_slice()] {
-            for entry in DirectoryEntry::parse_all(region)? {
+            for entry in
+                DirectoryEntry::parse_all(region, super::dir::DirectoryEntryEncoding::Standard)?
+            {
                 if matches!(entry.name().bytes(), b"." | b"..") {
                     return Err(Error::InvalidDirectoryEntry);
                 }

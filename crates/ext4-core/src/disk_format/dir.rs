@@ -101,6 +101,31 @@ pub(crate) enum DirectoryEntryEncoding {
     EncryptedCasefold,
 }
 
+impl DirectoryEntryEncoding {
+    /// Selects the external record layout from the owning directory flags.
+    pub(crate) const fn for_inode(inode: &crate::disk_format::inode::Inode) -> Self {
+        if inode.flags().has_casefold() && inode.protection().is_encrypted() {
+            Self::EncryptedCasefold
+        } else {
+            Self::Standard
+        }
+    }
+    /// Accounts for the aligned trailer while exempting the two format-defined dot records.
+    /// # Errors
+    /// Rejects short ciphertext and unrepresentable record geometry.
+    fn record_len(self, name: &[u8]) -> Result<usize> {
+        let prefix = required_name_rec_len(name.len())?;
+        if self == Self::EncryptedCasefold && !matches!(name, b"." | b"..") {
+            if name.len() < 16 {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            prefix.checked_add(8).ok_or(Error::ArithmeticOverflow)
+        } else {
+            Ok(prefix)
+        }
+    }
+}
+
 /// A stored name and the routing information that belongs to that exact ciphertext.
 #[derive(Debug, Eq, PartialEq)]
 enum DirectoryEntryName {
@@ -134,9 +159,53 @@ impl DirectoryEntry {
     pub(crate) fn new(inode: InodeId, name: &Ext4Name, kind: DirectoryEntryKind) -> Result<Self> {
         Ok(Self {
             inode,
-            name: Ext4Name::from_disk(name.bytes())?,
+            name: DirectoryEntryName::Unhashed(Ext4Name::from_disk(name.bytes())?),
             kind,
         })
+    }
+
+    /// Joins ciphertext to the hash of the normalized plaintext that produced it.
+    /// # Errors
+    /// Rejects invalid ciphertext geometry, reserved routing values or allocation failure.
+    pub(crate) fn encrypted_casefold(
+        inode: InodeId,
+        ciphertext: &Ext4Name,
+        kind: DirectoryEntryKind,
+        hash: DirectoryHash,
+    ) -> Result<Self> {
+        if matches!(ciphertext.bytes(), b"." | b"..") {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        DirectoryEntryEncoding::EncryptedCasefold.record_len(ciphertext.bytes())?;
+        let hash = DirectoryHash::from_stored(hash.major, hash.minor)?;
+        Ok(Self {
+            inode,
+            name: DirectoryEntryName::EncryptedCasefold {
+                ciphertext: ciphertext.try_to_owned_name()?,
+                hash,
+            },
+            kind,
+        })
+    }
+
+    /// Borrows a stored keyed hash without decrypting the name or reinterpreting ciphertext.
+    pub(crate) const fn stored_hash(&self) -> Option<DirectoryHash> {
+        match self.name {
+            DirectoryEntryName::Unhashed(_) => None,
+            DirectoryEntryName::EncryptedCasefold { hash, .. } => Some(hash),
+        }
+    }
+
+    /// Requires agreement between a complete record and the directory that will own it.
+    /// # Errors
+    /// Rejects a hashless encrypted folded name or a trailer in an ordinary directory.
+    fn require_encoding(&self, encoding: DirectoryEntryEncoding) -> Result<()> {
+        let expects_hash = encoding == DirectoryEntryEncoding::EncryptedCasefold
+            && !matches!(self.name().bytes(), b"." | b"..");
+        if expects_hash != self.stored_hash().is_some() {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        Ok(())
     }
 
     /// Copies this directory entry without infallible allocation.
@@ -144,7 +213,12 @@ impl DirectoryEntry {
     ///
     /// Returns an error when copying the raw directory name bytes cannot allocate.
     pub(crate) fn try_clone(&self) -> Result<Self> {
-        Self::new(self.inode, &self.name, self.kind)
+        match &self.name {
+            DirectoryEntryName::Unhashed(name) => Self::new(self.inode, name, self.kind),
+            DirectoryEntryName::EncryptedCasefold { ciphertext, hash } => {
+                Self::encrypted_casefold(self.inode, ciphertext, self.kind, *hash)
+            }
+        }
     }
 
     /// Parses a directory file payload into live directory entries.
@@ -155,60 +229,15 @@ impl DirectoryEntry {
     pub(crate) fn parse_all(bytes: &[u8], encoding: DirectoryEntryEncoding) -> Result<Vec<Self>> {
         let mut entries = Vec::new();
         let mut offset = 0_usize;
-
         while offset < bytes.len() {
-            let remaining = bytes
-                .len()
-                .checked_sub(offset)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if remaining < DIRENT_HEADER_SIZE {
-                return Err(Error::InvalidDirectoryEntry);
+            let record = decode_record_at(bytes, offset, encoding)?;
+            if let Some(entry) = record.entry {
+                entries.try_push(entry.to_owned()?)?;
             }
-
-            let inode = le_u32(bytes, disk_offset(offset))?;
-            let rec_len = read_record_length(bytes, offset)?;
-            let name_len = usize::from(
-                *bytes
-                    .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
-                    .ok_or(Error::InvalidDirectoryEntry)?,
-            );
-            let file_type = *bytes
-                .get(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
-                .ok_or(Error::InvalidDirectoryEntry)?;
-
-            if rec_len < DIRENT_HEADER_SIZE || rec_len > remaining || rec_len % 4 != 0 {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let payload_len = rec_len
-                .checked_sub(DIRENT_HEADER_SIZE)
-                .ok_or(Error::InvalidDirectoryEntry)?;
-            if name_len > payload_len {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-
-            if inode != 0 {
-                let name_start = offset
-                    .checked_add(DIRENT_HEADER_SIZE)
-                    .ok_or(Error::ArithmeticOverflow)?;
-                let name_end = name_start
-                    .checked_add(name_len)
-                    .ok_or(Error::ArithmeticOverflow)?;
-                entries.try_push(Self {
-                    inode: InodeId::try_from(inode)?,
-                    name: Ext4Name::from_disk(
-                        bytes
-                            .get(name_start..name_end)
-                            .ok_or(Error::InvalidDirectoryEntry)?,
-                    )?,
-                    kind: DirectoryEntryKind::from_raw(file_type),
-                })?;
-            }
-
             offset = offset
-                .checked_add(rec_len)
+                .checked_add(record.length)
                 .ok_or(Error::ArithmeticOverflow)?;
         }
-
         Ok(entries)
     }
 
@@ -221,7 +250,10 @@ impl DirectoryEntry {
     /// Raw ext4 entry name.
     #[must_use]
     pub const fn name(&self) -> &Ext4Name {
-        &self.name
+        match &self.name {
+            DirectoryEntryName::Unhashed(name) => name,
+            DirectoryEntryName::EncryptedCasefold { ciphertext, .. } => ciphertext,
+        }
     }
 
     /// Directory entry file type.
@@ -235,7 +267,13 @@ impl DirectoryEntry {
     ///
     /// Returns an error when record-length arithmetic cannot be represented.
     pub(crate) fn encoded_len(&self) -> Result<usize> {
-        required_name_rec_len(self.name.bytes().len())
+        match self.name {
+            DirectoryEntryName::Unhashed(_) => DirectoryEntryEncoding::Standard,
+            DirectoryEntryName::EncryptedCasefold { .. } => {
+                DirectoryEntryEncoding::EncryptedCasefold
+            }
+        }
+        .record_len(self.name().bytes())
     }
 }
 
@@ -562,7 +600,7 @@ impl HtreeRoot {
         if bytes.len() < DX_ROOT_COUNT_OFFSET + DX_ENTRY_BYTES {
             return Err(Error::InvalidDirectoryEntry);
         }
-        let dot = parse_live_entry_at(bytes, 0)?;
+        let dot = parse_live_entry_at(bytes, 0, DirectoryEntryEncoding::Standard)?;
         if dot.inode() != directory_inode
             || dot.name().bytes() != b"."
             || dot.kind() != DirectoryEntryKind::Directory
@@ -572,7 +610,11 @@ impl HtreeRoot {
         if read_record_length(bytes, 0)? != checked_rec_len(DIRENT_HEADER_SIZE + 1)? {
             return Err(Error::InvalidDirectoryEntry);
         }
-        let dotdot = parse_live_entry_at(bytes, checked_rec_len(DIRENT_HEADER_SIZE + 1)?)?;
+        let dotdot = parse_live_entry_at(
+            bytes,
+            checked_rec_len(DIRENT_HEADER_SIZE + 1)?,
+            DirectoryEntryEncoding::Standard,
+        )?;
         if dotdot.name().bytes() != b".." || dotdot.kind() != DirectoryEntryKind::Directory {
             return Err(Error::InvalidDirectoryEntry);
         }
@@ -1133,20 +1175,24 @@ pub(crate) fn create_htree_root(
     write_entry(
         &mut bytes,
         0,
-        self_inode,
         dot_len,
-        b".",
-        DirectoryEntryKind::Directory,
+        &DirectoryEntry::new(
+            self_inode,
+            &Ext4Name::new(b".")?,
+            DirectoryEntryKind::Directory,
+        )?,
     )?;
     write_entry(
         &mut bytes,
         dot_len,
-        parent_inode,
         block_size
             .checked_sub(dot_len)
             .ok_or(Error::ArithmeticOverflow)?,
-        b"..",
-        DirectoryEntryKind::Directory,
+        &DirectoryEntry::new(
+            parent_inode,
+            &Ext4Name::new(b"..")?,
+            DirectoryEntryKind::Directory,
+        )?,
     )?;
     put_le_u32(&mut bytes, disk_offset(DX_ROOT_INFO_OFFSET), 0)?;
     *bytes
@@ -1225,6 +1271,7 @@ impl DirectoryBlock {
         }
         let mut minimum = 0_usize;
         for entry in entries {
+            entry.require_encoding(encoding)?;
             minimum = minimum
                 .checked_add(entry.encoded_len()?)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -1242,14 +1289,7 @@ impl DirectoryBlock {
             } else {
                 entry.encoded_len()?
             };
-            write_entry(
-                &mut block.bytes,
-                offset,
-                entry.inode(),
-                rec_len,
-                entry.name().bytes(),
-                entry.kind(),
-            )?;
+            write_entry(&mut block.bytes, offset, rec_len, entry)?;
             offset = offset
                 .checked_add(rec_len)
                 .ok_or(Error::ArithmeticOverflow)?;
@@ -1289,21 +1329,25 @@ impl DirectoryBlock {
         write_entry(
             &mut self.bytes,
             0,
-            self_inode,
             checked_rec_len(DIRENT_HEADER_SIZE + 1)?,
-            b".",
-            DirectoryEntryKind::Directory,
+            &DirectoryEntry::new(
+                self_inode,
+                &Ext4Name::new(b".")?,
+                DirectoryEntryKind::Directory,
+            )?,
         )?;
         let dotdot_offset = checked_rec_len(DIRENT_HEADER_SIZE + 1)?;
         write_entry(
             &mut self.bytes,
             dotdot_offset,
-            parent_inode,
             live_limit
                 .checked_sub(dotdot_offset)
                 .ok_or(Error::ArithmeticOverflow)?,
-            b"..",
-            DirectoryEntryKind::Directory,
+            &DirectoryEntry::new(
+                parent_inode,
+                &Ext4Name::new(b"..")?,
+                DirectoryEntryKind::Directory,
+            )?,
         )?;
         self.refresh_leaf_checksum()
     }
@@ -1330,6 +1374,7 @@ impl DirectoryBlock {
             self.bytes
                 .get(..self.live_limit()?)
                 .ok_or(Error::InvalidDirectoryEntry)?,
+            self.encoding,
         )
     }
 
@@ -1340,49 +1385,22 @@ impl DirectoryBlock {
     /// inode is invalid.
     pub(crate) fn records(&self) -> Result<Vec<DirectoryRecord>> {
         self.verify_leaf_checksum()?;
-        let live_limit = self.live_limit()?;
+        let bytes = self
+            .bytes
+            .get(..self.live_limit()?)
+            .ok_or(Error::InvalidDirectoryEntry)?;
         let mut records = Vec::new();
         let mut offset = 0_usize;
-        while offset < live_limit {
-            let remaining = live_limit
-                .checked_sub(offset)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if remaining < DIRENT_HEADER_SIZE {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let rec_len = read_record_length(&self.bytes, offset)?;
-            if rec_len < DIRENT_HEADER_SIZE
-                || !rec_len.is_multiple_of(DIRENT_ALIGNMENT)
-                || rec_len > remaining
-            {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let name_len = usize::from(
-                *self
-                    .bytes
-                    .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
-                    .ok_or(Error::InvalidDirectoryEntry)?,
-            );
-            if name_len
-                > rec_len
-                    .checked_sub(DIRENT_HEADER_SIZE)
-                    .ok_or(Error::InvalidDirectoryEntry)?
-            {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            if le_u32(&self.bytes, disk_offset(offset))? != 0 {
+        while offset < bytes.len() {
+            let record = decode_record_at(bytes, offset, self.encoding)?;
+            if let Some(entry) = record.entry {
                 records.try_push(DirectoryRecord {
                     offset: u32::try_from(offset).map_err(|_| Error::ArithmeticOverflow)?,
-                    entry: parse_live_entry_at(
-                        self.bytes
-                            .get(..live_limit)
-                            .ok_or(Error::InvalidDirectoryEntry)?,
-                        offset,
-                    )?,
+                    entry: entry.to_owned()?,
                 })?;
             }
             offset = offset
-                .checked_add(rec_len)
+                .checked_add(record.length)
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         Ok(records)
@@ -1393,12 +1411,23 @@ impl DirectoryBlock {
     ///
     /// Returns an error when the current block cannot be parsed before the lookup.
     pub(crate) fn contains_name(&self, name: &Ext4Name) -> Result<bool> {
-        for entry in self.entries()? {
-            if entry.name() == name {
-                return Ok(true);
-            }
+        self.verify_leaf_checksum()?;
+        let bytes = self
+            .bytes
+            .get(..self.live_limit()?)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let mut offset = 0_usize;
+        let mut found = false;
+        while offset < bytes.len() {
+            let record = decode_record_at(bytes, offset, self.encoding)?;
+            found |= record
+                .entry
+                .is_some_and(|entry| entry.name() == name.bytes());
+            offset = offset
+                .checked_add(record.length)
+                .ok_or(Error::ArithmeticOverflow)?;
         }
-        Ok(false)
+        Ok(found)
     }
 
     /// Inserts a live entry by reusing free space or splitting an oversized record.
@@ -1406,73 +1435,53 @@ impl DirectoryBlock {
     ///
     /// Returns an error when the name already exists, record accounting overflows, an existing
     /// dirent is malformed, or the new entry cannot be encoded.
-    pub(crate) fn insert(
-        &mut self,
-        inode: InodeId,
-        name: &Ext4Name,
-        kind: DirectoryEntryKind,
-    ) -> Result<bool> {
+    pub(crate) fn insert(&mut self, entry: &DirectoryEntry) -> Result<bool> {
+        entry.require_encoding(self.encoding)?;
+        let name = entry.name();
         if self.contains_name(name)? {
             return Err(Error::NameAlreadyExists);
         }
         let live_limit = self.live_limit()?;
-        let needed = checked_rec_len(
-            DIRENT_HEADER_SIZE
-                .checked_add(name.bytes().len())
-                .ok_or(Error::ArithmeticOverflow)?,
-        )?;
+        let needed = entry.encoded_len()?;
         let mut offset = 0_usize;
         while offset < live_limit {
-            let rec_len = read_record_length(&self.bytes, offset)?;
-            if rec_len < DIRENT_HEADER_SIZE
-                || offset
-                    .checked_add(rec_len)
-                    .ok_or(Error::ArithmeticOverflow)?
-                    > live_limit
-            {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let live_inode = le_u32(&self.bytes, disk_offset(offset))?;
-            let name_len = usize::from(
-                *self
-                    .bytes
-                    .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
+            let record = decode_record_at(
+                self.bytes
+                    .get(..live_limit)
                     .ok_or(Error::InvalidDirectoryEntry)?,
-            );
-            if live_inode == 0 && rec_len >= needed {
-                write_entry(&mut self.bytes, offset, inode, rec_len, name.bytes(), kind)?;
-                self.refresh_leaf_checksum()?;
-                return Ok(true);
-            }
-            let used = checked_rec_len(
-                DIRENT_HEADER_SIZE
-                    .checked_add(name_len)
-                    .ok_or(Error::ArithmeticOverflow)?,
+                offset,
+                self.encoding,
             )?;
-            if live_inode != 0
-                && rec_len >= used.checked_add(needed).ok_or(Error::ArithmeticOverflow)?
+            let length = record.length;
+            let used = match record.entry {
+                None => 0,
+                Some(live) => self.encoding.record_len(live.name())?,
+            };
+            if length
+                .checked_sub(used)
+                .ok_or(Error::InvalidDirectoryEntry)?
+                >= needed
             {
-                let encoded = encode_record_length(used, self.bytes.len())?;
-                put_le_u16(
-                    &mut self.bytes,
-                    disk_offset(offset).checked_add_bytes(4)?,
-                    encoded,
-                )?;
                 let insert_offset = offset.checked_add(used).ok_or(Error::ArithmeticOverflow)?;
-                let insert_len = rec_len.checked_sub(used).ok_or(Error::ArithmeticOverflow)?;
+                if used != 0 {
+                    let encoded = encode_record_length(used, self.bytes.len())?;
+                    put_le_u16(
+                        &mut self.bytes,
+                        disk_offset(offset).checked_add_bytes(4)?,
+                        encoded,
+                    )?;
+                }
                 write_entry(
                     &mut self.bytes,
                     insert_offset,
-                    inode,
-                    insert_len,
-                    name.bytes(),
-                    kind,
+                    length.checked_sub(used).ok_or(Error::ArithmeticOverflow)?,
+                    entry,
                 )?;
                 self.refresh_leaf_checksum()?;
                 return Ok(true);
             }
             offset = offset
-                .checked_add(rec_len)
+                .checked_add(length)
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         Ok(false)
@@ -1488,52 +1497,21 @@ impl DirectoryBlock {
         let live_limit = self.live_limit()?;
         let mut offset = 0_usize;
         while offset < live_limit {
-            let rec_len = read_record_length(&self.bytes, offset)?;
-            if rec_len < DIRENT_HEADER_SIZE
-                || offset
-                    .checked_add(rec_len)
-                    .ok_or(Error::ArithmeticOverflow)?
-                    > live_limit
-            {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let inode = le_u32(&self.bytes, disk_offset(offset))?;
-            let name_len = usize::from(
-                *self
-                    .bytes
-                    .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
+            let record = decode_record_at(
+                self.bytes
+                    .get(..live_limit)
                     .ok_or(Error::InvalidDirectoryEntry)?,
-            );
-            let name_start = offset
-                .checked_add(DIRENT_HEADER_SIZE)
-                .ok_or(Error::ArithmeticOverflow)?;
-            let name_end = name_start
-                .checked_add(name_len)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if inode != 0
-                && self
-                    .bytes
-                    .get(name_start..name_end)
-                    .ok_or(Error::InvalidDirectoryEntry)?
-                    == name.bytes()
-            {
-                let kind = DirectoryEntryKind::from_raw(
-                    *self
-                        .bytes
-                        .get(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
-                        .ok_or(Error::InvalidDirectoryEntry)?,
-                );
-                let removed = DirectoryEntry {
-                    inode: InodeId::try_from(inode)?,
-                    name: Ext4Name::from_disk(name.bytes())?,
-                    kind,
-                };
+                offset,
+                self.encoding,
+            )?;
+            if let Some(entry) = record.entry.filter(|entry| entry.name() == name.bytes()) {
+                let removed = entry.to_owned()?;
                 put_le_u32(&mut self.bytes, disk_offset(offset), 0)?;
                 self.refresh_leaf_checksum()?;
                 return Ok(Some(removed));
             }
             offset = offset
-                .checked_add(rec_len)
+                .checked_add(record.length)
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         Ok(None)
@@ -1547,9 +1525,10 @@ impl DirectoryBlock {
     pub(crate) fn rename(
         &mut self,
         old_name: &Ext4Name,
-        new_name: &Ext4Name,
+        replacement: &DirectoryEntry,
     ) -> Result<Option<DirectoryEntry>> {
-        if self.contains_name(new_name)? {
+        replacement.require_encoding(self.encoding)?;
+        if self.contains_name(replacement.name())? {
             return Err(Error::NameAlreadyExists);
         }
 
@@ -1557,7 +1536,7 @@ impl DirectoryBlock {
         let Some(entry) = self.remove(old_name)? else {
             return Ok(None);
         };
-        let renamed = self.insert(entry.inode(), new_name, entry.kind())?;
+        let renamed = self.insert(replacement)?;
         if renamed {
             Ok(Some(entry))
         } else {
@@ -1581,51 +1560,25 @@ impl DirectoryBlock {
         let live_limit = self.live_limit()?;
         let mut offset = 0_usize;
         while offset < live_limit {
-            let rec_len = read_record_length(&self.bytes, offset)?;
-            if rec_len < DIRENT_HEADER_SIZE
-                || offset
-                    .checked_add(rec_len)
-                    .ok_or(Error::ArithmeticOverflow)?
-                    > live_limit
-            {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let live_inode = le_u32(&self.bytes, disk_offset(offset))?;
-            let name_len = usize::from(
+            let record = decode_record_at(
+                self.bytes
+                    .get(..live_limit)
+                    .ok_or(Error::InvalidDirectoryEntry)?,
+                offset,
+                self.encoding,
+            )?;
+            if let Some(entry) = record.entry.filter(|entry| entry.name() == name.bytes()) {
+                let previous = entry.to_owned()?;
+                put_le_u32(&mut self.bytes, disk_offset(offset), inode.as_u32())?;
                 *self
                     .bytes
-                    .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
-                    .ok_or(Error::InvalidDirectoryEntry)?,
-            );
-            let name_start = offset
-                .checked_add(DIRENT_HEADER_SIZE)
-                .ok_or(Error::ArithmeticOverflow)?;
-            let name_end = name_start
-                .checked_add(name_len)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if live_inode != 0
-                && self
-                    .bytes
-                    .get(name_start..name_end)
-                    .ok_or(Error::InvalidDirectoryEntry)?
-                    == name.bytes()
-            {
-                let previous = DirectoryEntry {
-                    inode: InodeId::try_from(live_inode)?,
-                    name: Ext4Name::from_disk(name.bytes())?,
-                    kind: DirectoryEntryKind::from_raw(
-                        *self
-                            .bytes
-                            .get(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
-                            .ok_or(Error::InvalidDirectoryEntry)?,
-                    ),
-                };
-                write_entry(&mut self.bytes, offset, inode, rec_len, name.bytes(), kind)?;
+                    .get_mut(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
+                    .ok_or(Error::InvalidDirectoryEntry)? = kind.to_raw();
                 self.refresh_leaf_checksum()?;
                 return Ok(Some(previous));
             }
             offset = offset
-                .checked_add(rec_len)
+                .checked_add(record.length)
                 .ok_or(Error::ArithmeticOverflow)?;
         }
         Ok(None)
@@ -1694,55 +1647,141 @@ fn encode_record_length(length: usize, block_bytes: usize) -> Result<u16> {
     }
 }
 
-/// Parses one live directory entry at a fixed offset.
+/// Borrowed name representation tied to the immutable record bytes that established it.
+#[derive(Clone, Copy, Debug)]
+enum DirectoryEntryNameView<'bytes> {
+    /// Ordinary record name, including dot entries.
+    Unhashed(&'bytes [u8]),
+    /// Ciphertext and the keyed comparison hash stored in the same validated record.
+    EncryptedCasefold {
+        /// Borrowed filename ciphertext.
+        ciphertext: &'bytes [u8],
+        /// Validated primary and secondary hash words.
+        hash: DirectoryHash,
+    },
+}
+
+/// Allocation-free live entry whose name and optional trailer have been bounded by its record.
+#[derive(Clone, Copy, Debug)]
+struct DirectoryEntryView<'bytes> {
+    /// Referenced live inode.
+    inode: InodeId,
+    /// Validated borrowed name representation.
+    name: DirectoryEntryNameView<'bytes>,
+    /// On-disk file kind.
+    kind: DirectoryEntryKind,
+}
+impl<'bytes> DirectoryEntryView<'bytes> {
+    /// Borrows the complete stored name bytes.
+    const fn name(self) -> &'bytes [u8] {
+        match self.name {
+            DirectoryEntryNameView::Unhashed(name) => name,
+            DirectoryEntryNameView::EncryptedCasefold { ciphertext, .. } => ciphertext,
+        }
+    }
+    /// Acquires ownership without changing the record's name/hash relation.
+    /// # Errors
+    /// Returns physical allocation failure while copying its name.
+    fn to_owned(self) -> Result<DirectoryEntry> {
+        let name = match self.name {
+            DirectoryEntryNameView::Unhashed(name) => {
+                DirectoryEntryName::Unhashed(Ext4Name::from_disk(name)?)
+            }
+            DirectoryEntryNameView::EncryptedCasefold { ciphertext, hash } => {
+                DirectoryEntryName::EncryptedCasefold {
+                    ciphertext: Ext4Name::from_disk(ciphertext)?,
+                    hash,
+                }
+            }
+        };
+        Ok(DirectoryEntry {
+            inode: self.inode,
+            name,
+            kind: self.kind,
+        })
+    }
+}
+
+/// One validated free or live record and the byte extent used to advance to its successor.
+#[derive(Clone, Copy, Debug)]
+struct DirectoryRecordView<'bytes> {
+    /// Complete aligned record extent, including free space owned by a live entry.
+    length: usize,
+    /// Absence denotes an unallocated record with no live name or hash authority.
+    entry: Option<DirectoryEntryView<'bytes>>,
+}
+
+/// Establishes record-local bounds before reading a live name or its keyed hash trailer.
 /// # Errors
-///
-/// Returns an error when the record length, inode, name length, name bytes, or file-type byte is not
-/// a valid live ext4 dirent at `offset`.
-fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
-    let rec_len = read_record_length(bytes, offset)?;
-    if rec_len < DIRENT_HEADER_SIZE
-        || offset
-            .checked_add(rec_len)
-            .ok_or(Error::ArithmeticOverflow)?
-            > bytes.len()
-    {
+/// Rejects truncation, misalignment, malformed names, short ciphertext and reserved hash values.
+fn decode_record_at(
+    bytes: &[u8],
+    offset: usize,
+    encoding: DirectoryEntryEncoding,
+) -> Result<DirectoryRecordView<'_>> {
+    let length = read_record_length(bytes, offset)?;
+    if length < DIRENT_HEADER_SIZE || !length.is_multiple_of(DIRENT_ALIGNMENT) {
         return Err(Error::InvalidDirectoryEntry);
     }
-    let inode = le_u32(bytes, disk_offset(offset))?;
-    if inode == 0 {
-        return Err(Error::InvalidDirectoryEntry);
-    }
-    let name_len = usize::from(
-        *bytes
-            .get(offset.checked_add(6).ok_or(Error::ArithmeticOverflow)?)
-            .ok_or(Error::InvalidDirectoryEntry)?,
-    );
-    let payload_len = rec_len
-        .checked_sub(DIRENT_HEADER_SIZE)
-        .ok_or(Error::InvalidDirectoryEntry)?;
-    if name_len > payload_len {
-        return Err(Error::InvalidDirectoryEntry);
-    }
-    let name_start = offset
-        .checked_add(DIRENT_HEADER_SIZE)
+    let end = offset
+        .checked_add(length)
         .ok_or(Error::ArithmeticOverflow)?;
-    let name_end = name_start
+    let record = bytes.get(offset..end).ok_or(Error::InvalidDirectoryEntry)?;
+    let inode = le_u32(record, disk_offset(0))?;
+    let name_len = usize::from(*record.get(6).ok_or(Error::InvalidDirectoryEntry)?);
+    let name_end = DIRENT_HEADER_SIZE
         .checked_add(name_len)
         .ok_or(Error::ArithmeticOverflow)?;
-    Ok(DirectoryEntry {
-        inode: InodeId::try_from(inode)?,
-        name: Ext4Name::from_disk(
-            bytes
-                .get(name_start..name_end)
-                .ok_or(Error::InvalidDirectoryEntry)?,
-        )?,
-        kind: DirectoryEntryKind::from_raw(
-            *bytes
-                .get(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
-                .ok_or(Error::InvalidDirectoryEntry)?,
-        ),
+    let name = record
+        .get(DIRENT_HEADER_SIZE..name_end)
+        .ok_or(Error::InvalidDirectoryEntry)?;
+    if inode == 0 {
+        return Ok(DirectoryRecordView {
+            length,
+            entry: None,
+        });
+    }
+    if name.is_empty() {
+        return Err(Error::InvalidName);
+    }
+    if encoding.record_len(name)? > length {
+        return Err(Error::InvalidDirectoryEntry);
+    }
+    let name =
+        if encoding == DirectoryEntryEncoding::EncryptedCasefold && !matches!(name, b"." | b"..") {
+            let trailer = required_name_rec_len(name_len)?;
+            DirectoryEntryNameView::EncryptedCasefold {
+                ciphertext: name,
+                hash: DirectoryHash::from_stored(
+                    le_u32(record, disk_offset(trailer))?,
+                    le_u32(record, disk_offset(trailer).checked_add_bytes(4)?)?,
+                )?,
+            }
+        } else {
+            DirectoryEntryNameView::Unhashed(name)
+        };
+    Ok(DirectoryRecordView {
+        length,
+        entry: Some(DirectoryEntryView {
+            inode: InodeId::try_from(inode)?,
+            name,
+            kind: DirectoryEntryKind::from_raw(*record.get(7).ok_or(Error::InvalidDirectoryEntry)?),
+        }),
     })
+}
+
+/// Owns one required live record using the same validation as leaf traversal and mutation.
+/// # Errors
+/// Rejects malformed or free records and propagates name allocation failure.
+fn parse_live_entry_at(
+    bytes: &[u8],
+    offset: usize,
+    encoding: DirectoryEntryEncoding,
+) -> Result<DirectoryEntry> {
+    decode_record_at(bytes, offset, encoding)?
+        .entry
+        .ok_or(Error::InvalidDirectoryEntry)?
+        .to_owned()
 }
 
 /// Writes one ext4 directory record into a checked block slice.
@@ -1753,15 +1792,14 @@ fn parse_live_entry_at(bytes: &[u8], offset: usize) -> Result<DirectoryEntry> {
 fn write_entry(
     bytes: &mut [u8],
     offset: usize,
-    inode: InodeId,
     rec_len: usize,
-    name: &[u8],
-    kind: DirectoryEntryKind,
+    entry: &DirectoryEntry,
 ) -> Result<()> {
+    let name = entry.name().bytes();
     // The record length is owned by the caller so existing free-space shape can
     // be preserved when inserting into a hole or splitting a live entry.
     let encoded_length = encode_record_length(rec_len, bytes.len())?;
-    if rec_len < required_name_rec_len(name.len())?
+    if rec_len < entry.encoded_len()?
         || offset
             .checked_add(rec_len)
             .ok_or(Error::ArithmeticOverflow)?
@@ -1769,7 +1807,7 @@ fn write_entry(
     {
         return Err(Error::InvalidDirectoryEntry);
     }
-    put_le_u32(bytes, disk_offset(offset), inode.as_u32())?;
+    put_le_u32(bytes, disk_offset(offset), entry.inode().as_u32())?;
     put_le_u16(
         bytes,
         disk_offset(offset).checked_add_bytes(4)?,
@@ -1781,7 +1819,7 @@ fn write_entry(
         u8::try_from(name.len()).map_err(|_| Error::InvalidName)?;
     *bytes
         .get_mut(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
-        .ok_or(Error::InvalidDirectoryEntry)? = kind.to_raw();
+        .ok_or(Error::InvalidDirectoryEntry)? = entry.kind().to_raw();
     let name_start = offset
         .checked_add(DIRENT_HEADER_SIZE)
         .ok_or(Error::ArithmeticOverflow)?;
@@ -1808,6 +1846,17 @@ fn write_entry(
             )
             .ok_or(Error::InvalidDirectoryEntry)?
             .fill(0);
+    }
+    if let Some(hash) = entry.stored_hash() {
+        let trailer = offset
+            .checked_add(required_name_rec_len(name.len())?)
+            .ok_or(Error::ArithmeticOverflow)?;
+        put_le_u32(bytes, disk_offset(trailer), hash.major)?;
+        put_le_u32(
+            bytes,
+            disk_offset(trailer).checked_add_bytes(4)?,
+            hash.minor,
+        )?;
     }
     Ok(())
 }
@@ -1863,7 +1912,155 @@ mod tests {
     use super::*;
 
     /// # Errors
-    /// Propagates fixture encoding and directory surgery failures.
+    /// Returns fixture allocation or record operation failure.
+    /// # Panics
+    /// Fails if aligned trailer words or complete stored name/hash relations are changed.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "literal on-disk vectors independently observe trailer offsets and mutation preservation"
+    )]
+    fn encrypted_casefold_records_preserve_keyed_hashes() -> Result<()> {
+        let encoding = DirectoryEntryEncoding::EncryptedCasefold;
+        let mut bytes = memory::repeated_vec(0, 128)?;
+        memory::copy_exact(
+            bytes.get_mut(..8).ok_or(Error::InvalidDirectoryEntry)?,
+            &[12, 0, 0, 0, 128, 0, 17, 1],
+        )?;
+        memory::copy_exact(
+            bytes.get_mut(8..25).ok_or(Error::InvalidDirectoryEntry)?,
+            b"0123456789ABCDEF!",
+        )?;
+        let trailer = [0x78, 0x56, 0x34, 0x12, 0x01, 0xef, 0xcd, 0xab];
+        memory::copy_exact(
+            bytes.get_mut(28..36).ok_or(Error::InvalidDirectoryEntry)?,
+            &trailer,
+        )?;
+        let mut block = DirectoryBlock::new(bytes, DirectoryChecksum::None, encoding);
+        let entry = block.entries()?.pop().ok_or(Error::InvalidDirectoryEntry)?;
+        assert_eq!(
+            entry.stored_hash(),
+            Some(DirectoryHash {
+                major: 0x1234_5678,
+                minor: 0xabcd_ef01
+            })
+        );
+        assert_eq!(entry.encoded_len()?, 36);
+        let second = DirectoryEntry::encrypted_casefold(
+            inode(13)?,
+            &Ext4Name::from_disk(b"SECONDciphertext!")?,
+            DirectoryEntryKind::File,
+            DirectoryHash {
+                major: 0x1020_3040,
+                minor: 7,
+            },
+        )?;
+        assert!(block.insert(&second)?);
+        assert_eq!(read_record_length(block.bytes(), 0)?, 36);
+        assert_eq!(block.bytes().get(28..36), Some(trailer.as_slice()));
+        let previous = block
+            .replace(entry.name(), inode(14)?, DirectoryEntryKind::Symlink)?
+            .ok_or(Error::DirectoryEntryNotFound)?;
+        assert_eq!(previous, entry);
+        assert_eq!(block.bytes().get(28..36), Some(trailer.as_slice()));
+        let renamed = DirectoryEntry::encrypted_casefold(
+            inode(14)?,
+            &Ext4Name::from_disk(b"renamedciphertextbytes")?,
+            DirectoryEntryKind::Symlink,
+            DirectoryHash {
+                major: 0xa0b0_c0d0,
+                minor: 0x0bad_f00d,
+            },
+        )?;
+        let removed = block
+            .rename(entry.name(), &renamed)?
+            .ok_or(Error::DirectoryEntryNotFound)?;
+        assert_eq!(removed.stored_hash(), entry.stored_hash());
+        assert_eq!(removed.inode(), inode(14)?);
+        let entries = block.entries()?;
+        assert!(entries.contains(&second));
+        assert!(entries.contains(&renamed));
+        let mut rebuilt =
+            DirectoryBlock::from_entries(128, DirectoryChecksum::None, &entries, encoding)?;
+        assert_eq!(rebuilt.remove(renamed.name())?, Some(renamed));
+        assert_eq!(rebuilt.remove(second.name())?, Some(second));
+        assert!(rebuilt.entries()?.is_empty());
+        let mut dots = DirectoryBlock::empty(128, DirectoryChecksum::None, encoding)?;
+        dots.initialize_dot_entries(inode(2)?, inode(2)?)?;
+        assert!(
+            dots.entries()?
+                .iter()
+                .all(|entry| entry.stored_hash().is_none())
+        );
+        assert!(dots.insert(&entry)?);
+        assert_eq!(dots.entries()?.len(), 3);
+        assert!(
+            DirectoryBlock::from_entries(
+                128,
+                DirectoryChecksum::None,
+                &[entry],
+                DirectoryEntryEncoding::Standard
+            )
+            .is_err()
+        );
+        assert!(
+            dots.insert(&DirectoryEntry::new(
+                inode(20)?,
+                &Ext4Name::new(b"hashlessciphertext")?,
+                DirectoryEntryKind::File
+            )?)
+            .is_err()
+        );
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture encoding or allocation failure.
+    /// # Panics
+    /// Fails if a name-only bound admits a trailer outside the same record or checksums omit it.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "malformed independent vectors exercise record-local trailer bounds and checksum coverage"
+    )]
+    fn encrypted_casefold_trailers_require_complete_record_bounds() -> Result<()> {
+        let encoding = DirectoryEntryEncoding::EncryptedCasefold;
+        for (name_len, rec_len, major) in [
+            (17, 28, 0x1234_5678),
+            (15, 32, 0x1234_5678),
+            (17, 40, 3),
+            (17, 40, 0xffff_fffe),
+        ] {
+            let mut bytes = memory::repeated_vec(0x61, 40)?;
+            put_le_u32(&mut bytes, disk_offset(0), 12)?;
+            put_le_u16(&mut bytes, disk_offset(4), rec_len)?;
+            *bytes.get_mut(6).ok_or(Error::InvalidDirectoryEntry)? = name_len;
+            *bytes.get_mut(7).ok_or(Error::InvalidDirectoryEntry)? = 1;
+            put_le_u32(&mut bytes, disk_offset(28), major)?;
+            assert!(decode_record_at(&bytes, 0, encoding).is_err());
+        }
+        let checksum = DirectoryChecksum::metadata_csum(ChecksumSeed::from_u32(7), inode(2)?, 0);
+        let entry = DirectoryEntry::encrypted_casefold(
+            inode(12)?,
+            &Ext4Name::from_disk(b"0123456789ABCDEF!")?,
+            DirectoryEntryKind::File,
+            DirectoryHash {
+                major: 0x1234_5678,
+                minor: 1,
+            },
+        )?;
+        let mut bytes =
+            DirectoryBlock::from_entries(128, checksum, &[entry], encoding)?.into_bytes();
+        *bytes.get_mut(28).ok_or(Error::InvalidDirectoryEntry)? ^= 2;
+        assert_eq!(
+            DirectoryBlock::new(bytes, checksum, encoding).entries(),
+            Err(Error::ChecksumMismatch)
+        );
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns fixture allocation, parsing or mutation failure.
     /// # Panics
     /// Fails if independent full-block wire markers lose their byte-length meaning.
     #[test]
@@ -1875,11 +2072,19 @@ mod tests {
         for marker in [0_u16, u16::MAX] {
             let mut bytes = memory::repeated_vec(0, 65_536)?;
             put_le_u16(&mut bytes, disk_offset(4), marker)?;
-            let mut block = DirectoryBlock::new(bytes, DirectoryChecksum::None);
+            let mut block = DirectoryBlock::new(
+                bytes,
+                DirectoryChecksum::None,
+                DirectoryEntryEncoding::Standard,
+            );
             assert!(block.entries()?.is_empty());
             assert!(block.records()?.is_empty());
             let name = Ext4Name::new(b"file")?;
-            assert!(block.insert(inode(12)?, &name, DirectoryEntryKind::File)?);
+            assert!(block.insert(&DirectoryEntry::new(
+                inode(12)?,
+                &name,
+                DirectoryEntryKind::File
+            )?)?);
             assert_eq!(
                 block
                     .entries()?
@@ -1888,15 +2093,19 @@ mod tests {
                     .map(|entry| entry.inode()),
                 Some(inode(12)?)
             );
-            assert!(block.insert(
+            assert!(block.insert(&DirectoryEntry::new(
                 inode(13)?,
                 &Ext4Name::new(b"second")?,
                 DirectoryEntryKind::File
-            )?);
+            )?)?);
             assert_eq!(block.records()?.len(), 2);
             assert!(block.remove(&name)?.is_some());
         }
-        let mut block = DirectoryBlock::empty(65_536, DirectoryChecksum::None)?;
+        let mut block = DirectoryBlock::empty(
+            65_536,
+            DirectoryChecksum::None,
+            DirectoryEntryEncoding::Standard,
+        )?;
         block.initialize_free_space()?;
         assert_eq!(le_u16(block.bytes(), disk_offset(4))?, u16::MAX);
         let mut routes = Vec::new();
@@ -1912,7 +2121,7 @@ mod tests {
             1
         );
         let small = memory::repeated_vec(0, 4096)?;
-        assert!(DirectoryEntry::parse_all(&small).is_err());
+        assert!(DirectoryEntry::parse_all(&small, DirectoryEntryEncoding::Standard).is_err());
         Ok(())
     }
 

@@ -10,9 +10,9 @@ pub(super) use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put
 pub(super) use crate::disk::storage::OperationDevice;
 pub(super) use crate::disk_format::acl::{AclKind, Ext4Access};
 pub(super) use crate::disk_format::dir::{
-    DirectoryBlock, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry, DirectoryEntryKind,
-    DxEntry, DxIndex, HtreeHashRange, HtreeRoot, create_htree_root, write_htree_node,
-    write_htree_root_index,
+    DirectoryBlock, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry, DirectoryEntryEncoding,
+    DirectoryEntryKind, DxEntry, DxIndex, HtreeHashRange, HtreeRoot, create_htree_root,
+    write_htree_node, write_htree_root_index,
 };
 pub(super) use crate::disk_format::directory_hash::{DirectoryHash, DirectoryHashScheme};
 pub(super) use crate::disk_format::extent::{

@@ -59,14 +59,23 @@ impl MetadataMutation<'_, '_> {
             return Ok(None);
         }
         let mut parent = *parent;
-        let mut first = DirectoryBlock::new(memory::copied_slice(first)?, DirectoryChecksum::None);
+        let mut first = DirectoryBlock::new(
+            memory::copied_slice(first)?,
+            DirectoryChecksum::None,
+            DirectoryEntryEncoding::Standard,
+        );
         let mut second = if capacity == 0 {
-            DirectoryBlock::new(Vec::new(), DirectoryChecksum::None)
+            DirectoryBlock::new(
+                Vec::new(),
+                DirectoryChecksum::None,
+                DirectoryEntryEncoding::Standard,
+            )
         } else {
             DirectoryBlock::from_entries(
                 capacity,
                 DirectoryChecksum::None,
-                &RawDirectoryEntry::parse_all(second)?,
+                &RawDirectoryEntry::parse_all(second, DirectoryEntryEncoding::Standard)?,
+                DirectoryEntryEncoding::Standard,
             )?
         };
         let result = match edit(&mut parent, &mut first, &mut second) {
@@ -150,15 +159,20 @@ impl MetadataMutation<'_, '_> {
                 let entries = data.directory_entries(inode.id())?;
                 let checksum = self.volume.directory_checksum(&inode);
                 let mut next = 0_u64;
-                let mut block = DirectoryBlock::empty(width, checksum)?;
+                let mut block =
+                    DirectoryBlock::empty(width, checksum, DirectoryEntryEncoding::Standard)?;
                 block.initialize_free_space()?;
                 for entry in entries {
-                    if !block.insert(entry.inode(), entry.name(), entry.kind())? {
+                    if !block.insert(&entry)? {
                         self.append_inline_directory_block(&mut tree, next, block)?;
                         next = next.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-                        block = DirectoryBlock::empty(width, checksum)?;
+                        block = DirectoryBlock::empty(
+                            width,
+                            checksum,
+                            DirectoryEntryEncoding::Standard,
+                        )?;
                         block.initialize_free_space()?;
-                        if !block.insert(entry.inode(), entry.name(), entry.kind())? {
+                        if !block.insert(&entry)? {
                             return Err(Error::InvalidDirectoryEntry);
                         }
                     }

@@ -464,7 +464,11 @@ impl EpochReadView<'_, '_> {
         )?;
         self.device
             .read_metadata_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
-        Ok(DirectoryBlock::new(bytes, self.directory_checksum(inode)))
+        Ok(DirectoryBlock::new(
+            bytes,
+            self.directory_checksum(inode),
+            DirectoryEntryEncoding::for_inode(inode),
+        ))
     }
 
     /// Builds a root-to-leaf path for a primary hash without reading unrelated leaves.
