@@ -11,9 +11,14 @@ mod inode_record;
 mod keys;
 pub use keys::{PreparedKeyChange, ReservedKeyChange, ResolvedKeyChange};
 mod metadata_cache;
+mod mmp;
 mod mount;
 pub(crate) use metadata_cache::CacheReadStamp;
 pub use metadata_cache::{MetadataCache, MetadataCacheAccess};
+pub use mmp::{
+    MmpChange, MmpEffect, MmpEvent, MmpFailure, MmpLease, MmpOperation, MmpOwner, MmpTime,
+    MmpTransition,
+};
 mod node;
 mod operation;
 mod orphan;

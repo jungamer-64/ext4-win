@@ -131,6 +131,13 @@ pub fn le_u32(bytes: &[u8], offset: DiskOffset) -> Result<u32> {
     Ok(u32::from_le_bytes(raw))
 }
 
+/// Reads a complete little-endian 64-bit disk field.
+/// # Errors
+/// Returns truncation when the complete field is outside the input.
+pub(crate) fn le_u64(bytes: &[u8], offset: DiskOffset) -> Result<u64> {
+    Ok(u64::from_le_bytes(fixed::<8>(bytes, offset)?))
+}
+
 /// Reads a big-endian `u32` at `offset`.
 /// # Errors
 ///
@@ -206,7 +213,7 @@ fn fixed<const N: usize>(bytes: &[u8], offset: DiskOffset) -> Result<[u8; N]> {
 /// # Errors
 ///
 /// Returns an error when the source-width range overflows or is outside the output bytes.
-fn put_fixed(bytes: &mut [u8], offset: DiskOffset, source: &[u8]) -> Result<()> {
+pub(crate) fn put_fixed(bytes: &mut [u8], offset: DiskOffset, source: &[u8]) -> Result<()> {
     let target = DiskRange::new(offset, DiskByteLen::new(source.len()))?.write_to(bytes)?;
     memory::copy_exact(target, source)
 }

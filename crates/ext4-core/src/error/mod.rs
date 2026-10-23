@@ -8,6 +8,12 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Failures that keep invalid or unsupported ext4 state out of the domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// The multiple-mount record has invalid geometry, encoding or authentication.
+    MmpCorrupt,
+    /// Independent observations show an active mount or offline checker.
+    MmpOwnerActive,
+    /// Media no longer contains this mount's ownership identity.
+    MmpOwnershipLost,
     /// A recovery memory budget cannot admit any resident storage.
     InvalidRecoveryMemoryLimit,
     /// Write-free recovery exceeded its logical resident-storage admission.
@@ -132,6 +138,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::MmpCorrupt => "invalid multiple-mount protection record",
+            Self::MmpOwnerActive => "filesystem has another active owner",
+            Self::MmpOwnershipLost => "multiple-mount ownership was lost",
             Self::InvalidRecoveryMemoryLimit => "recovery memory limit must be nonzero",
             Self::RecoveryMemoryLimitExceeded => "recovery memory limit exceeded",
             Self::ReadOnlyFilesystem => "filesystem is mounted read only",

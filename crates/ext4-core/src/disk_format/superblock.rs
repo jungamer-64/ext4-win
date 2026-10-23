@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::ext4_crc32c;
-use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u32};
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, le_u64, put_le_u32};
 use crate::disk::storage::OperationDevice;
 use crate::disk_format::inode::{
     DirectorySizeEncoding, FileSizeEncoding, InodeBlockCountEncoding, InodeDataEncoding, InodeId,
@@ -1636,6 +1636,8 @@ pub struct Superblock {
     default_directory_hash_version: DirectoryHashVersion,
     /// Encoding capability present only when the filesystem advertises casefold.
     casefold: Option<super::name::NameSemantics>,
+    /// Independent media ownership record; journal replay never establishes its lease.
+    mmp: Option<super::mmp::MmpParameters>,
     /// Feature bits validated for this mount policy.
     features: FeatureSet,
 }
@@ -1914,6 +1916,21 @@ impl Superblock {
             None
         };
 
+        let mmp = if le_u32(raw, disk_offset(96))? & INCOMPAT_MMP != 0 {
+            let block = BlockAddress::new(le_u64(raw, disk_offset(0x168))?);
+            if block.get() <= first_data_block.get() || block.get() >= block_count.as_u64() {
+                return Err(Error::MmpCorrupt);
+            }
+            Some(super::mmp::MmpParameters {
+                block,
+                bytes: block_size,
+                seed: (features.metadata_checksum() == MetadataChecksum::Crc32c)
+                    .then_some(checksum_seed.as_u32()),
+                update_seconds: le_u16(raw, disk_offset(0x166))?,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             block_size,
             inode_count,
@@ -1941,8 +1958,14 @@ impl Superblock {
             directory_hash_signedness,
             default_directory_hash_version,
             casefold,
+            mmp,
             features,
         })
+    }
+
+    /// Independent ownership placement selected by the primary superblock.
+    pub(crate) const fn mmp(self) -> Option<super::mmp::MmpParameters> {
+        self.mmp
     }
 
     /// Requires the feature and encoding needed to change a directory's comparison state.

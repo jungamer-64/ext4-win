@@ -7,6 +7,7 @@ pub(crate) mod extent;
 pub(crate) mod group;
 pub(crate) mod inode;
 pub(crate) mod journal;
+pub(crate) mod mmp;
 pub(crate) mod name;
 pub(crate) mod orphan;
 pub(crate) mod superblock;

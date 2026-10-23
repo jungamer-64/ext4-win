@@ -246,6 +246,8 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::DirectoryNotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
         Error::CannotRemoveRoot => STATUS_CANNOT_DELETE,
         Error::MissingEncryptionKey => STATUS_ACCESS_DENIED,
+        Error::MmpOwnerActive => ntstatus(0xC000_009E),
+        Error::MmpOwnershipLost => STATUS_VOLUME_DIRTY,
         Error::DirtyVolume => STATUS_VOLUME_DIRTY,
         Error::ReadOnlyFilesystem => wdk_sys::STATUS_MEDIA_WRITE_PROTECTED,
         Error::InvalidRecoveryMemoryLimit => STATUS_INVALID_PARAMETER,
@@ -280,7 +282,8 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         | Error::InvalidTimestamp
         | Error::DirectoryCycle
         | Error::TransactionTooLarge => STATUS_INVALID_PARAMETER,
-        Error::TruncatedStructure
+        Error::MmpCorrupt
+        | Error::TruncatedStructure
         | Error::InvalidMagic
         | Error::InvalidSuperblock
         | Error::InvalidClusterGeometry
