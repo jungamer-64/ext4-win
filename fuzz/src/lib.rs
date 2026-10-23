@@ -199,21 +199,34 @@ fn run_mount(
     let Some(prepared) = prepared else {
         return MountOutcome::Rejected;
     };
-    let Ok(operation) = Box::try_new(prepared.start(FscryptKeySet::empty(), access)) else {
+    let mut millis = 0_u64;
+    let now = ext4_core::MmpTime::new(millis, 0);
+    let Ok(operation) = prepared.start(
+        FscryptKeySet::empty(),
+        access,
+        ext4_core::MmpOwner::new([0x35; 16]),
+        now,
+    ) else {
         return MountOutcome::Rejected;
     };
-    let mut transition = operation.advance(OperationEvent::Admitted);
+    let Ok(operation) = Box::try_new(operation) else {
+        return MountOutcome::Rejected;
+    };
+    let mut transition = operation.advance(OperationEvent::Admitted, now);
     for _step in 0..MAX_STEPS {
         match transition {
-            MountTransition::SubmitLower { request, suspended } => {
+            MountTransition::SubmitLower { request, suspended }
+            | MountTransition::SubmitOwnership { request, suspended } => {
                 if access.media_access() == ext4_core::MediaAccess::ReadOnly {
                     assert!(
                         matches!(&request, StorageRequest::Read { .. }),
                         "read-only mounting must not submit media effects"
                     );
                 }
-                transition =
-                    suspended.advance(OperationEvent::StorageCompleted(devices.complete(request)));
+                transition = suspended.advance(
+                    OperationEvent::StorageCompleted(devices.complete(request)),
+                    ext4_core::MmpTime::new(millis, 0),
+                );
             }
             MountTransition::DiscoverExternalJournal {
                 requirement,
@@ -232,7 +245,15 @@ fn run_mount(
                             return MountOutcome::StepBudgetExhausted;
                         }
                     };
-                transition = suspended.attach_external_journal(validated);
+                transition = suspended
+                    .attach_external_journal(validated, ext4_core::MmpTime::new(millis, 0));
+            }
+            MountTransition::WaitForTimer { seconds, suspended } => {
+                millis = millis.saturating_add(u64::from(seconds).saturating_mul(1000));
+                transition = suspended.advance(
+                    OperationEvent::TimerElapsed,
+                    ext4_core::MmpTime::new(millis, 0),
+                );
             }
             MountTransition::Complete(result) => {
                 return if result.is_ok() {
