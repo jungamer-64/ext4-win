@@ -17,6 +17,7 @@ cc.workspace = true
 wdk-build.workspace = true
 
 [dependencies]
+ext4-control = { path = "../ext4-control" }
 ext4-core = { path = "../ext4-core" }
 ext4-security = { path = "../ext4-security" }
 wdk-alloc.workspace = true

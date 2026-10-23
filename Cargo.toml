@@ -3,6 +3,7 @@ members = [
     "crates/ext4-core",
     "crates/ext4-driver",
     "crates/ext4-security",
+    "crates/ext4-control",
     "tools/production-reachability",
     "tools/xtask",
     "tools/diagnostics",
@@ -14,6 +15,7 @@ exclude = ["fuzz"]
 default-members = [
     "crates/ext4-core",
     "crates/ext4-security",
+    "crates/ext4-control",
     "tools/production-reachability",
     "tools/xtask",
     "tools/diagnostics",

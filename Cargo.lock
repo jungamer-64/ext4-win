@@ -287,6 +287,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4-control"
+version = "0.1.0"
+dependencies = [
+ "ext4-core",
+]
+
+[[package]]
 name = "ext4-core"
 version = "0.1.0"
 dependencies = [
@@ -319,6 +326,7 @@ dependencies = [
 name = "ext4ctl"
 version = "0.1.0"
 dependencies = [
+ "ext4-control",
  "ext4-core",
  "ext4-security",
  "windows-host",
@@ -329,6 +337,7 @@ name = "ext4win"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "ext4-control",
  "ext4-core",
  "ext4-security",
  "wdk-alloc",
@@ -932,6 +941,7 @@ dependencies = [
 name = "windows-host"
 version = "0.1.0"
 dependencies = [
+ "ext4-control",
  "ext4-core",
  "ext4-security",
  "windows-sys 0.61.2",
