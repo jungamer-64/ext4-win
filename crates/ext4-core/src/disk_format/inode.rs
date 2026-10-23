@@ -1659,10 +1659,6 @@ pub(crate) struct InodeData {
     size: FileSize,
     /// Decoded inode allocation charge.
     allocation_size: FileAllocationSize,
-    /// POSIX owner parsed from uid/gid fields.
-    owner: Ext4Owner,
-    /// Timestamps parsed from ext4 inode time fields.
-    times: Ext4Times,
     /// Inode flags hidden behind typed predicates and capability constructors.
     flags: InodeFlags,
     /// Inode generation used by metadata checksums.
@@ -1682,16 +1678,11 @@ impl InodeData {
             return Err(Error::TruncatedStructure);
         }
         let mode = InodeMode::from_disk(le_u16(raw, disk_offset(0))?)?;
-        let owner = Ext4Owner::new(
-            Ext4Uid::from_u32(parse_uid(raw)?),
-            Ext4Gid::from_u32(parse_gid(raw)?),
-        );
         let size = encoding.decode_size(
             mode.kind(),
             le_u32(raw, disk_offset(4))?,
             le_u32(raw, disk_offset(108))?,
         )?;
-        let times = parse_times(raw)?;
         let flags = InodeFlags::from_u32(le_u32(raw, disk_offset(32))?);
         let allocation_size = encoding.decode_allocation_size(
             le_u32(raw, disk_offset(28))?,
@@ -1726,8 +1717,6 @@ impl InodeData {
             mode,
             size,
             allocation_size,
-            owner,
-            times,
             flags,
             generation,
             storage,
