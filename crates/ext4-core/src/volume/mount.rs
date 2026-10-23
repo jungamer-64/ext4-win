@@ -720,6 +720,11 @@ pub(super) enum CheckpointAdmission {
 /// Journal coordinator phase. A new commit is granted only in `Ready`.
 #[derive(Debug)]
 pub(super) enum JournalCoordinatorState {
+    /// Media ownership has been revoked; neither issued grants nor cached reads can restore it.
+    Fenced {
+        /// Last published identity retained for recovery diagnostics and stale-grant checks.
+        epoch: (FilesystemUuid, EpochSequence),
+    },
     /// Clean journal with space available for one commit.
     Ready {
         /// Clean log whose space can admit the next commit.
@@ -742,7 +747,9 @@ impl JournalCoordinatorState {
     /// Identity published by the transition that owns this journal phase.
     const fn epoch(&self) -> (FilesystemUuid, EpochSequence) {
         match self {
-            Self::Ready { epoch, .. } | Self::CheckpointPending { epoch, .. } => *epoch,
+            Self::Ready { epoch, .. }
+            | Self::CheckpointPending { epoch, .. }
+            | Self::Fenced { epoch } => *epoch,
         }
     }
 }
@@ -872,6 +879,24 @@ pub struct MutationCoordinatorState {
 }
 
 impl MutationCoordinatorState {
+    /// Irreversibly revokes this session after loss of media ownership. A fresh mount must observe
+    /// ownership and recover storage; issued intent, commit, visibility and checkpoint grants do not
+    /// reconstruct the retired journal cursor or authorize another publication.
+    pub fn revoke_media_ownership(&mut self) {
+        let epoch = self.journal.epoch();
+        self.journal = JournalCoordinatorState::Fenced { epoch };
+    }
+
+    /// Requires the mounted session's independently revocable media ownership.
+    /// # Errors
+    /// Returns ownership loss after the one-way fence transition.
+    pub(super) const fn require_session_authority(&self) -> Result<()> {
+        if matches!(self.journal, JournalCoordinatorState::Fenced { .. }) {
+            return Err(Error::MmpOwnershipLost);
+        }
+        Ok(())
+    }
+
     /// Fixed media authority of this coordinator session.
     pub(super) const fn mount_access(&self) -> super::MediaAccess {
         self.access
@@ -904,6 +929,7 @@ impl MutationCoordinatorState {
         &'state self,
         cache: crate::MetadataCacheAccess<'state>,
     ) -> Result<CommittedReadContext<'state>> {
+        self.require_session_authority()?;
         let epoch = cache.epoch();
         if self.mount != epoch.mount
             || self.journal.epoch() != (epoch.identity().uuid(), epoch.sequence())
@@ -921,6 +947,7 @@ impl MutationCoordinatorState {
     ///
     /// Returns [`Error::ArithmeticOverflow`] when the FIFO ticket space is exhausted.
     pub fn admit_mutation(&mut self) -> Result<u64> {
+        self.require_session_authority()?;
         let ticket = self.next_ticket;
         self.next_ticket = self
             .next_ticket
@@ -941,6 +968,7 @@ impl MutationCoordinatorState {
     /// # Errors
     /// Returns acquisition-identity exhaustion before issuing any authority.
     pub fn acquire_commit(&mut self, ticket: u64) -> Result<Option<super::CommitLease>> {
+        self.require_session_authority()?;
         let JournalCoordinatorState::Ready {
             admission: CommitAdmission::Available,
             ..
@@ -1029,6 +1057,7 @@ impl MutationCoordinatorState {
         lease: super::CommitLease,
         ticket: u64,
     ) -> Result<super::event::CommitClaim> {
+        self.require_session_authority()?;
         let claim = lease.consume(&self.mount)?;
         if claim.ticket != ticket
             || !matches!(self.journal, JournalCoordinatorState::Ready { admission: CommitAdmission::Granted(current), .. } if current == claim)
@@ -1058,14 +1087,21 @@ impl MutationCoordinatorState {
         result
     }
 
-    /// Checks the one visibility lease against its preparation, acquisition and mount.
-    pub(super) fn accepts_visibility(
+    /// Consumes one visibility lease against its session, preparation and acquisition.
+    /// # Errors
+    /// Distinguishes revoked media ownership from foreign or superseded grants.
+    pub(super) fn validate_visibility(
         &self,
         lease: super::VisibilityLease,
         claim: super::event::CommitClaim,
-    ) -> bool {
-        lease.consume(&self.mount) == Ok(claim)
-            && matches!(self.journal, JournalCoordinatorState::Ready { admission: CommitAdmission::Publishing(current), .. } if current == claim)
+    ) -> Result<()> {
+        self.require_session_authority()?;
+        if lease.consume(&self.mount)? != claim
+            || !matches!(self.journal, JournalCoordinatorState::Ready { admission: CommitAdmission::Publishing(current), .. } if current == claim)
+        {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        Ok(())
     }
 
     /// Retires an unpublished preparation only when its owning value is being consumed.
@@ -1076,6 +1112,7 @@ impl MutationCoordinatorState {
         mount: MountIdentity,
         claim: super::event::CommitClaim,
     ) -> Result<()> {
+        self.require_session_authority()?;
         if self.mount != mount {
             return Err(Error::ClusterReferenceConflict);
         }
@@ -1097,7 +1134,8 @@ impl MutationCoordinatorState {
 
     /// Revalidates every resource observed by a resolved mutation.
     pub(crate) fn revalidate(&self, observed: &ObservedResourceVersionSet) -> bool {
-        self.mount == observed.mount
+        self.require_session_authority().is_ok()
+            && self.mount == observed.mount
             && observed
                 .entries
                 .iter()
