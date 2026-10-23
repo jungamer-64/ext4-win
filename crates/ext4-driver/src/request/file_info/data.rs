@@ -869,7 +869,7 @@ fn read_regular_file_direct(
                 if kind != DataIoKind::Paging {
                     return Err(DriverError::InternalInvariantViolation);
                 }
-                paging.validate_file_object(file_object)?;
+                let file = paging.file(file_object)?;
                 let SelectedReadStart::Absolute(start) =
                     select_read_start(kind, stack.starting_point())?
                 else {
@@ -880,7 +880,7 @@ fn read_regular_file_direct(
                     return Ok(None);
                 }
                 let _output = output_address.ok_or(DriverError::InternalInvariantViolation)?;
-                Ok(Some((paging.file(), range)))
+                Ok(Some((file, range)))
             }
         }
     })?
@@ -966,7 +966,7 @@ fn write_regular_file_windowed(
                 if kind != DataIoKind::Paging {
                     return Err(DriverError::InternalInvariantViolation);
                 }
-                paging.validate_file_object(file_object)?;
+                let file = paging.file(file_object)?;
                 let selected_start = select_write_start(
                     RegularFileWriteAccess::Denied,
                     kind,
@@ -974,7 +974,7 @@ fn write_regular_file_windowed(
                 )?;
                 let anchor = selected_start
                     .bind_current_position(|| Err(DriverError::InternalInvariantViolation))?;
-                Ok((paging.file(), anchor, None))
+                Ok((file, anchor, None))
             }
         }
     })?;
@@ -1020,7 +1020,9 @@ fn write_regular_file_windowed(
                 if active.data_io_kind() != DataIoKind::Paging || data_transfer_mode.is_some() {
                     return Err(DriverError::InternalInvariantViolation);
                 }
-                paging.validate_file_object(file_object)?;
+                if paging.file(file_object)? != file_id {
+                    return Err(DriverError::InternalInvariantViolation);
+                }
                 if !stack.length().is_empty() {
                     let _input = input_address.ok_or(DriverError::InternalInvariantViolation)?;
                 }

@@ -7,7 +7,7 @@ use super::*;
 pub(super) struct FcbRegistry {
     /// The sole ownership authority; moving boxes cannot move an FCB.
     owned: DriverVec<Pin<Box<FileControlBlock>>>,
-    /// Node identities projected to owning positions.
+    /// Current inode allocations projected to owning positions; retired streams have no binding.
     nodes: FcbIndex,
     /// Observed pointer addresses projected to owning positions; never pointer constructors.
     pointers: FcbIndex,
@@ -149,20 +149,40 @@ impl FcbRegistry {
     }
     /// Projects a node identity to owning storage.
     fn node_index(&self, node: NodeId) -> Option<usize> {
-        self.nodes.owner(Self::node_key(node))
+        self.nodes
+            .owner(Self::inode_key(node.inode()))
+            .filter(|index| self.get(*index).is_some_and(|owner| owner.node() == node))
     }
     /// Validates pointer membership through its address index.
     fn pointer_index(&self, pointer: NonNull<FileControlBlock>) -> Option<usize> {
         self.pointers.owner(Self::pointer_key(pointer))
     }
-    /// Encodes kind and inode without merging different node identity domains.
-    fn node_key(node: NodeId) -> u64 {
-        let kind = match node {
-            NodeId::File(_) => 0_u64,
-            NodeId::Directory(_) => 1,
-            NodeId::Symlink(_) => 2,
-        };
-        (kind << 32) | u64::from(node.file_index())
+    /// Resolves a retained stream only while it still owns the current inode allocation.
+    /// # Errors
+    /// Returns file-closed after retirement or an invariant failure for an unretained pointer.
+    fn current_node(&self, pointer: NonNull<FileControlBlock>) -> DriverResult<NodeId> {
+        let index = self
+            .pointer_index(pointer)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let node = self
+            .get(index)
+            .ok_or(DriverError::InternalInvariantViolation)?
+            .node();
+        if self.node_index(node) != Some(index) {
+            return Err(DriverError::FileClosed);
+        }
+        Ok(node)
+    }
+    /// Encodes the single allocation domain shared by every ext4 inode kind.
+    fn inode_key(inode: InodeId) -> u64 {
+        u64::from(inode.as_u32())
+    }
+    /// Ends the current allocation binding without consuming native lifetime ownership.
+    fn retire_inode(&mut self, inode: InodeId) {
+        let key = Self::inode_key(inode);
+        if self.nodes.owner(key).is_some() {
+            self.nodes.remove(key);
+        }
     }
     /// Observes an address exclusively for membership; storage retains pointer provenance.
     fn pointer_key(pointer: NonNull<FileControlBlock>) -> u64 {
@@ -172,11 +192,18 @@ impl FcbRegistry {
     }
     /// Reserves ownership and both projections before publishing one FCB.
     /// # Errors
-    /// Returns the unchanged candidate when any allocation fails.
+    /// Returns the unchanged candidate on allocation failure or a duplicate current allocation.
     pub(super) fn try_push_owned(
         &mut self,
         value: Pin<Box<FileControlBlock>>,
     ) -> Result<(), memory::PushError<Pin<Box<FileControlBlock>>>> {
+        let node = Self::inode_key(value.node().inode());
+        if self.nodes.owner(node).is_some() {
+            return Err(memory::PushError::Reserve {
+                error: DriverError::InternalInvariantViolation,
+                value,
+            });
+        }
         let count = self
             .len()
             .checked_add(1)
@@ -197,7 +224,6 @@ impl FcbRegistry {
         if let Err(error) = reserve {
             return Err(memory::PushError::Reserve { error, value });
         }
-        let node = Self::node_key(value.node());
         let pointer = Self::pointer_key(NonNull::from(value.as_ref().get_ref()));
         let position = self.len();
         self.owned.push_reserved_owned(value)?;
@@ -208,15 +234,19 @@ impl FcbRegistry {
     /// Erases projections and repairs the owner moved into the vacated position.
     fn swap_remove(&mut self, index: usize) -> Option<Pin<Box<FileControlBlock>>> {
         let owner = self.get(index)?;
-        let node = Self::node_key(owner.node());
+        let node = Self::inode_key(owner.node().inode());
         let pointer = Self::pointer_key(NonNull::from(owner.as_ref().get_ref()));
-        self.nodes.remove(node);
+        if self.nodes.owner(node) == Some(index) {
+            self.nodes.remove(node);
+        }
         self.pointers.remove(pointer);
         let removed = self.owned.swap_remove(index);
         if let Some(moved) = self.get(index) {
-            let node = Self::node_key(moved.node());
+            let node = Self::inode_key(moved.node().inode());
             let pointer = Self::pointer_key(NonNull::from(moved.as_ref().get_ref()));
-            self.nodes.set(node, index);
+            if self.nodes.owner(node) == Some(self.len()) {
+                self.nodes.set(node, index);
+            }
             self.pointers.set(pointer, index);
         }
         removed
@@ -226,6 +256,95 @@ impl FcbRegistry {
 #[cfg(test)]
 mod index_tests {
     use super::*;
+
+    /// # Errors
+    /// Returns fixture allocation or native stream initialization failures.
+    /// # Panics
+    /// Fails if retired owners hide a reused inode or regain its current binding during release.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions observe current allocation identity independently from native lifetime"
+    )]
+    fn inode_reuse_preserves_retired_streams_until_their_own_release() -> DriverResult<()> {
+        let volume_stream = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
+        let ledger = FileControlBlockLedger::try_new()?;
+        let node = NodeId::Directory(DirectoryNodeId::ROOT);
+        let allocate = || {
+            ledger.staged_file_control_block(
+                NonNull::dangling(),
+                &volume_stream,
+                StagedNodeStreamMetadata {
+                    node,
+                    sizes: StreamSizes::EMPTY,
+                },
+                OperationalTrace::host_test(),
+            )
+        };
+        let mut table = FcbRegistry::new();
+        let first = allocate()?;
+        let first_pointer = NonNull::from(first.as_ref().get_ref());
+        table
+            .try_push_owned(first)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert_eq!(table.current_node(first_pointer), Ok(node));
+        table.retire_inode(node.inode());
+        assert_eq!(table.node_index(node), None);
+        assert_eq!(table.pointer_index(first_pointer), Some(0));
+        assert_eq!(
+            table.current_node(first_pointer),
+            Err(DriverError::FileClosed)
+        );
+
+        let second = allocate()?;
+        let second_pointer = NonNull::from(second.as_ref().get_ref());
+        table
+            .try_push_owned(second)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert_eq!(
+            find_file_control_block_in_table(&table, node),
+            Some(second_pointer)
+        );
+        assert_eq!(
+            table.current_node(first_pointer),
+            Err(DriverError::FileClosed)
+        );
+        assert_eq!(table.current_node(second_pointer), Ok(node));
+        table.retire_inode(node.inode());
+
+        let third = allocate()?;
+        let third_pointer = NonNull::from(third.as_ref().get_ref());
+        table
+            .try_push_owned(third)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert_eq!(
+            find_file_control_block_in_table(&table, node),
+            Some(third_pointer)
+        );
+        drop(table.swap_remove(0));
+        assert_eq!(table.pointer_index(first_pointer), None);
+        assert_eq!(table.pointer_index(third_pointer), Some(0));
+        assert_eq!(
+            find_file_control_block_in_table(&table, node),
+            Some(third_pointer)
+        );
+
+        drop(table.swap_remove(0));
+        assert_eq!(table.pointer_index(third_pointer), None);
+        assert_eq!(table.pointer_index(second_pointer), Some(0));
+        assert_eq!(table.node_index(node), None);
+        assert_eq!(
+            table.current_node(second_pointer),
+            Err(DriverError::FileClosed)
+        );
+        drop(table.swap_remove(0));
+        assert!(table.is_empty());
+        Ok(())
+    }
 
     /// # Panics
     /// Panics if growth, cluster deletion or address reuse loses another resident owner.
@@ -328,11 +447,9 @@ struct StreamPublicationLease {
 #[derive(Debug)]
 pub(crate) struct PagingStreamLease {
     /// Sole retention authority for this paging operation.
-    _retained: DeferredStreamLease,
+    retained: DeferredStreamLease,
     /// FILE_OBJECT whose FsContext and shared section identity granted this lease.
     file_object: KernelFileObject,
-    /// Typed inode identity fixed while the ledger resource was held.
-    file: FileNodeId,
 }
 
 /// One node stream retained across an FsRtl oplock operation.
@@ -853,23 +970,32 @@ impl Drop for DeferredStreamLease {
 }
 
 impl PagingStreamLease {
-    /// Returns the regular-file inode retained for this paging request.
-    pub(crate) const fn file(&self) -> FileNodeId {
-        self.file
-    }
-
-    /// Requires the live paging IRP to retain the same FILE_OBJECT that granted this lease.
+    /// Revalidates the retained allocation before addressing ext4 from a resumed paging request.
     /// # Errors
     ///
-    /// Returns an invariant error if operation ownership and the current IRP diverge.
-    pub(crate) fn validate_file_object(
-        &self,
-        file_object: ActiveFileObject<'_>,
-    ) -> DriverResult<()> {
-        if file_object.address() == self.file_object {
-            Ok(())
-        } else {
-            Err(DriverError::InternalInvariantViolation)
+    /// Returns file-closed after allocation retirement, or an invariant error for another IRP.
+    #[expect(
+        unsafe_code,
+        reason = "the deferred lease retains the exact FCB and its owning ledger through validation"
+    )]
+    pub(crate) fn file(&self, file_object: ActiveFileObject<'_>) -> DriverResult<FileNodeId> {
+        if file_object.address() != self.file_object {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let owner = unsafe {
+            // SAFETY: The deferred stream lease retains its owning ledger and exact FCB.
+            self.retained.owner.as_ref()
+        };
+        let _guard = owner.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource serializes current allocation lookup.
+            &*owner.table.get()
+        };
+        match table.current_node(self.retained.fcb)? {
+            NodeId::File(file) => Ok(file),
+            NodeId::Directory(_) | NodeId::Symlink(_) => {
+                Err(DriverError::from(ext4_core::Error::WrongInodeKind))
+            }
         }
     }
 }
@@ -2325,16 +2451,31 @@ impl FileControlBlockLedger {
         })
     }
 
-    /// Looks up current streams at durable publication and retains each through a short explicit
-    /// lease while the ledger resource is released for the native Cc/MM call.
+    /// Retires freed allocations before any fallible native projection, preserving their exact
+    /// pointer lifetimes. Live streams are retained through short leases while the ledger
+    /// resource is released for each native Cc/MM call.
     /// # Errors
     ///
     /// Returns the exact stream-lease or Cc/MM publication failure.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource exclusively owns the post-commit allocation binding transition"
+    )]
     pub(super) fn publish_stream_metadata(
         &self,
         updates: PreparedStreamMetadataPublications,
         epoch: ext4_core::EpochSequence,
     ) -> StreamProjectionOutcome {
+        {
+            let _guard = self.lock.acquire();
+            let table = unsafe {
+                // SAFETY: The ledger resource exclusively owns allocation binding transitions.
+                &mut *self.table.get()
+            };
+            for inode in updates.retired.iter() {
+                table.retire_inode(*inode);
+            }
+        }
         let mut published_streams = 0usize;
         let mut first_failure = None;
         let mut remaining_updates = updates.nodes.iter();
@@ -2432,18 +2573,14 @@ impl FileControlBlockLedger {
         file_object: ActiveFileObject<'_>,
         volume: NonNull<VolumeControlBlock>,
     ) -> DriverResult<PagingStreamLease> {
-        let (retained, node) = self.acquire_deferred_stream_lease(
+        let (retained, _) = self.acquire_deferred_stream_lease(
             file_object,
             volume,
             DeferredStreamTarget::RegularFile,
         )?;
-        let NodeId::File(file) = node else {
-            return Err(DriverError::from(ext4_core::Error::WrongInodeKind));
-        };
         Ok(PagingStreamLease {
-            _retained: retained,
+            retained,
             file_object: file_object.address(),
-            file,
         })
     }
 

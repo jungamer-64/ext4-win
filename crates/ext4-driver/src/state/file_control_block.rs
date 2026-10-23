@@ -422,6 +422,8 @@ impl StagedNodeStreamMetadata {
 pub(crate) struct PreparedStreamMetadataPublications {
     /// One final metadata projection per live inode changed by the reserved mutation.
     pub(super) nodes: DriverVec<NodeStreamMetadata>,
+    /// Freed inode allocations whose current stream bindings must end at epoch visibility.
+    pub(super) retired: DriverVec<InodeId>,
 }
 
 impl PreparedStreamMetadataPublications {
@@ -433,14 +435,28 @@ impl PreparedStreamMetadataPublications {
         snapshots: &[ext4_core::NodeMetadataUpdate],
         cluster_size: ClusterSize,
     ) -> DriverResult<Self> {
-        let mut nodes = DriverVec::try_with_capacity(snapshots.len())?;
+        let retired_count = snapshots
+            .iter()
+            .filter(|snapshot| matches!(snapshot, ext4_core::NodeMetadataUpdate::Retired { .. }))
+            .count();
+        let live_count = snapshots
+            .iter()
+            .filter(|snapshot| matches!(snapshot, ext4_core::NodeMetadataUpdate::Live { .. }))
+            .count();
+        let mut nodes = DriverVec::try_with_capacity(live_count)?;
+        let mut retired = DriverVec::try_with_capacity(retired_count)?;
         for snapshot in snapshots {
-            nodes.try_push(NodeStreamMetadata::try_from_snapshot(
-                WindowsNodeMetadata::from_ext4(snapshot.metadata(), snapshot.xattrs())?,
-                cluster_size,
-            )?)?;
+            match snapshot {
+                ext4_core::NodeMetadataUpdate::Live { metadata, xattrs } => {
+                    nodes.try_push(NodeStreamMetadata::try_from_snapshot(
+                        WindowsNodeMetadata::from_ext4(*metadata, xattrs)?,
+                        cluster_size,
+                    )?)?;
+                }
+                ext4_core::NodeMetadataUpdate::Retired { inode } => retired.try_push(*inode)?,
+            }
         }
-        Ok(Self { nodes })
+        Ok(Self { nodes, retired })
     }
 }
 

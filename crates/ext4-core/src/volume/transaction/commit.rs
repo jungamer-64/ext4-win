@@ -283,13 +283,18 @@ impl MetadataMutation<'_, '_> {
             .try_reserve_exact(self.inode_updates.len())
             .map_err(|_| Error::OutOfMemory)?;
         for index in 0..self.inode_updates.len() {
-            let (inode_id, live) = {
-                let inode = self.inode_updates.get(index).ok_or(Error::InvalidInode)?;
-                (inode.id(), matches!(inode, StagedInodeRecord::Live(_)))
-            };
-            if live {
-                let record = self.raw_inode_for_policy(inode_id)?;
-                node_metadata_updates.try_push(self.node_metadata_update(&record)?)?;
+            let inode = self.inode_updates.get(index).ok_or(Error::InvalidInode)?;
+            let inode_id = inode.id();
+            match inode {
+                StagedInodeRecord::Live(_) => {
+                    let record = self.raw_inode_for_policy(inode_id)?;
+                    node_metadata_updates.try_push(self.node_metadata_update(&record)?)?;
+                }
+                StagedInodeRecord::Deleted(_) => {
+                    node_metadata_updates
+                        .try_push(NodeMetadataUpdate::Retired { inode: inode_id })?;
+                }
+                StagedInodeRecord::Recovering(_) => {}
             }
             let resource = MutationResource::inode(inode_id);
             observed.include(resource, coordinator.resource_version(resource))?;
