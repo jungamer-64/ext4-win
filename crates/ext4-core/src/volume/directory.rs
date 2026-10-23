@@ -260,17 +260,20 @@ impl DirectoryLookup<'_> {
         }
     }
     /// Routes a query using the directory's authoritative hash profile.
+    /// # Errors
+    /// Returns invalid encoding or allocation failure before index selection.
     pub(super) fn major(
         &self,
         scheme: crate::disk_format::directory_hash::DirectoryHashScheme,
-    ) -> u32 {
+        names: crate::disk_format::name::NameSemantics,
+    ) -> Result<u32> {
         match *self {
             Self::Exact(name)
             | Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Ciphertext(name)) => {
-                scheme.hash(name).major
+                Ok(names.hash(name, scheme)?.major)
             }
             Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Digest { major, .. }) => {
-                *major
+                Ok(*major)
             }
         }
     }
@@ -281,14 +284,23 @@ impl DirectoryLookup<'_> {
         &self,
         entries: alloc::vec::Vec<crate::disk_format::dir::DirectoryEntry>,
         crypto: &mut dyn crate::CryptographicOperation,
+        names: crate::disk_format::name::NameSemantics,
     ) -> Result<Option<crate::disk_format::dir::DirectoryEntry>> {
-        for entry in entries {
-            let matches = match self {
-                Self::Exact(name) => entry.name() == *name,
-                Self::NoKey(name) => name.matches(entry.name().bytes(), crypto)?,
-            };
-            if matches {
-                return Ok(Some(entry));
+        match self {
+            Self::Exact(name) => {
+                let key = names.key(name.bytes())?;
+                for entry in entries {
+                    if names.key(entry.name().bytes())?.bytes() == key.bytes() {
+                        return Ok(Some(entry));
+                    }
+                }
+            }
+            Self::NoKey(name) => {
+                for entry in entries {
+                    if name.matches(entry.name().bytes(), crypto)? {
+                        return Ok(Some(entry));
+                    }
+                }
             }
         }
         Ok(None)

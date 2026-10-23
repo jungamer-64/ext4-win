@@ -585,8 +585,9 @@ impl EpochReadView<'_, '_> {
         query: DirectoryLookup<'_>,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<Option<RawDirectoryEntry>> {
+        let names = self.superblock.name_semantics(inode)?;
         if let InodeStorage::InlineData(data) = inode.storage() {
-            return query.find(data.directory_entries(inode.id())?, crypto);
+            return query.find(data.directory_entries(inode.id())?, crypto, names);
         }
         let mut tree = ExtentMappingCursor::new(
             inode.extent_root()?,
@@ -604,7 +605,7 @@ impl EpochReadView<'_, '_> {
                         &mut tree,
                         LogicalBlock::try_from(logical)?,
                     )?;
-                    if let Some(entry) = query.find(block.entries()?, crypto)? {
+                    if let Some(entry) = query.find(block.entries()?, crypto, names)? {
                         return Ok(Some(entry));
                     }
                 }
@@ -632,7 +633,7 @@ impl EpochReadView<'_, '_> {
                 {
                     return Ok(Some(entry.try_clone()?));
                 }
-                let major = query.major(root.hash_scheme());
+                let major = query.major(root.hash_scheme(), names)?;
                 let mut path = self.htree_path_for_hash(
                     inode,
                     &mut tree,
@@ -649,8 +650,8 @@ impl EpochReadView<'_, '_> {
                     )?;
                     let entries = leaf.entries()?;
                     path.hash_range()?
-                        .validate_leaf(&entries, root.hash_scheme())?;
-                    if let Some(entry) = query.find(entries, crypto)? {
+                        .validate_leaf(&entries, root.hash_scheme(), names)?;
+                    if let Some(entry) = query.find(entries, crypto, names)? {
                         return Ok(Some(entry));
                     }
                     if !self.advance_htree_path(
@@ -1011,7 +1012,7 @@ impl EpochReadView<'_, '_> {
                 self.directory_checksum(inode),
             )?
             .hash_scheme()
-            .hash(name)
+            .hash(name.bytes())
             .major
         } else {
             0
@@ -1057,8 +1058,13 @@ impl EpochReadView<'_, '_> {
             self.find_raw_directory_entry(parent.inode(), DirectoryLookup::Exact(name), crypto)?
         };
         if let Some(raw) = exact_entry {
+            let stored = if parent.inode().flags().has_casefold() {
+                Some(self.project_directory_name(parent, raw.try_clone()?, crypto)?)
+            } else {
+                None
+            };
             return Ok(ChildLookup::Found(
-                self.validate_directory_entry(raw, name)?
+                self.validate_directory_entry(raw, stored.as_ref().unwrap_or(name))?
                     .into_child(parent.id()),
             ));
         }

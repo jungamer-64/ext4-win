@@ -81,14 +81,12 @@ impl DirectoryHashScheme {
         }
     }
 
-    /// Produces the normalized HTree key for one validated ext4 name.
+    /// Produces the format-bounded HTree hash for one complete directory comparison key.
     #[must_use]
     pub(crate) fn hash(self, name: &[u8]) -> DirectoryHash {
         let (major, minor) = match self.version {
             DirectoryHashVersion::Legacy => rolling_hash(name, NameByteEncoding::Signed),
-            DirectoryHashVersion::LegacyUnsigned => {
-                rolling_hash(name, NameByteEncoding::Unsigned)
-            }
+            DirectoryHashVersion::LegacyUnsigned => rolling_hash(name, NameByteEncoding::Unsigned),
             DirectoryHashVersion::HalfMd4 => {
                 self.hash_with_half_md4(name, NameByteEncoding::Signed)
             }
@@ -359,7 +357,8 @@ mod tests {
     use alloc::vec;
 
     use super::{DirectoryHash, DirectoryHashScheme};
-        use crate::disk_format::superblock::{
+    use crate::Ext4Name;
+    use crate::disk_format::superblock::{
         DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
     };
 
@@ -389,7 +388,7 @@ mod tests {
                     version,
                     DirectoryHashSignedness::Unsigned,
                 )
-                .hash(&name),
+                .hash(name.bytes()),
                 DirectoryHash { major, minor }
             );
         }
@@ -456,7 +455,7 @@ mod tests {
                     version,
                     DirectoryHashSignedness::Signed
                 )
-                .hash(&name),
+                .hash(name.bytes()),
                 expected,
                 "version {version:?}"
             );
@@ -488,7 +487,7 @@ mod tests {
                     version,
                     DirectoryHashSignedness::Signed
                 )
-                .hash(&name),
+                .hash(name.bytes()),
                 DirectoryHash { major, minor },
                 "version {version:?}, length {length}"
             );
@@ -534,7 +533,7 @@ mod tests {
                     version,
                     DirectoryHashSignedness::Signed
                 )
-                .hash(&name),
+                .hash(name.bytes()),
                 expected
             );
         }

@@ -1634,6 +1634,8 @@ pub struct Superblock {
     directory_hash_signedness: DirectoryHashSignedness,
     /// Default hash version used when an HTree root does not override it.
     default_directory_hash_version: DirectoryHashVersion,
+    /// Encoding capability present only when the filesystem advertises casefold.
+    casefold: Option<super::name::NameSemantics>,
     /// Feature bits validated for this mount policy.
     features: FeatureSet,
 }
@@ -1903,6 +1905,14 @@ impl Superblock {
         let directory_hash_signedness =
             DirectoryHashSignedness::from_flags(le_u32(raw, disk_offset(FILESYSTEM_FLAGS_OFFSET))?);
         let uuid = FilesystemUuid::from_bytes(uuid);
+        let casefold = if le_u32(raw, disk_offset(96))? & INCOMPAT_CASEFOLD != 0 {
+            Some(super::name::NameSemantics::from_encoding(
+                le_u16(raw, disk_offset(0x27c))?,
+                le_u16(raw, disk_offset(0x27e))?,
+            )?)
+        } else {
+            None
+        };
 
         Ok(Self {
             block_size,
@@ -1930,8 +1940,28 @@ impl Superblock {
             directory_hash_seed,
             directory_hash_signedness,
             default_directory_hash_version,
+            casefold,
             features,
         })
+    }
+
+    /// Selects one directory's comparison contract from immutable mounted encoding authority.
+    /// # Errors
+    /// Rejects undeclared casefold state, wrong inode kind and unsupported encrypted index layout.
+    pub(crate) fn name_semantics(
+        self,
+        inode: &super::inode::Inode,
+    ) -> Result<super::name::NameSemantics> {
+        if !inode.flags().has_casefold() {
+            return Ok(super::name::NameSemantics::Bytewise);
+        }
+        if inode.kind() != super::inode::InodeKind::Directory {
+            return Err(Error::InvalidInode);
+        }
+        if inode.protection().is_encrypted() {
+            return Err(Error::UnsupportedWriteFeature);
+        }
+        self.casefold.ok_or(Error::InvalidInode)
     }
 
     /// Filesystem block containing the primary superblock for this block size.

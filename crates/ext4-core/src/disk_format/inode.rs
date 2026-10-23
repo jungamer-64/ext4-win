@@ -1296,6 +1296,10 @@ impl InodeFlags {
     pub(crate) const fn into_attribute_value(self) -> Self {
         Self((self.0 & !EXT4_INLINE_DATA_FL) | 0x0020_0000 | EXT4_EXTENTS_FL)
     }
+    /// Directory entries use the mounted Unicode comparison contract.
+    pub(crate) const fn has_casefold(self) -> bool {
+        self.0 & EXT4_CASEFOLD_FL != 0
+    }
     /// Whether i_block and the inode-body private attribute contain the payload.
     pub(crate) const fn has_inline_data(self) -> bool {
         self.0 & EXT4_INLINE_DATA_FL != 0

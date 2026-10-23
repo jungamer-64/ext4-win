@@ -753,16 +753,17 @@ impl MutationResolvePass<'_, '_, '_> {
         let lookup_name = self.directory_lookup_name(&inode, name)?;
         if let InodeStorage::InlineData(data) = inode.storage() {
             return DirectoryLookup::Exact(&lookup_name)
-                .find(data.directory_entries(inode.id())?, self.crypto)?
+                .find(
+                    data.directory_entries(inode.id())?,
+                    self.crypto,
+                    self.mutation.volume.superblock.name_semantics(&inode)?,
+                )?
                 .ok_or(Error::DirectoryEntryNotFound);
         }
         if let Some(location) =
             self.directory_entry_location(&inode, DirectoryLookup::Exact(&lookup_name))?
         {
-            return location
-                .block
-                .find(&lookup_name)?
-                .ok_or(Error::InvalidDirectoryEntry);
+            return Ok(location.entry);
         }
         Err(Error::DirectoryEntryNotFound)
     }
@@ -815,13 +816,21 @@ impl MutationResolvePass<'_, '_, '_> {
         let disk_name =
             self.mutation
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
+        let names = self
+            .mutation
+            .volume
+            .superblock
+            .name_semantics(&parent_inode)?;
+        names.key(name.bytes())?;
         if parent_inode.flags().has_inline_data() {
             if let Some(()) = self.mutation.edit_inline_directory(
                 &mut raw_parent,
                 |inline_parent, first, second| {
                     let _inline_parent = inline_parent;
-                    if first.find(&disk_name)?.is_some() || second.find(&disk_name)?.is_some() {
-                        return Err(Error::NameAlreadyExists);
+                    for candidate in first.entries()?.into_iter().chain(second.entries()?) {
+                        if names.equivalent(candidate.name(), &disk_name)? {
+                            return Err(Error::NameAlreadyExists);
+                        }
                     }
                     if first.insert(child, &disk_name, kind)?
                         || (!second.bytes().is_empty() && second.insert(child, &disk_name, kind)?)
@@ -1295,7 +1304,10 @@ impl MutationResolvePass<'_, '_, '_> {
             checksum,
         )?;
         let major = match target {
-            HtreePathTarget::Query(query) => query.major(root.hash_scheme()),
+            HtreePathTarget::Query(query) => query.major(
+                root.hash_scheme(),
+                self.mutation.volume.superblock.name_semantics(inode)?,
+            )?,
             HtreePathTarget::First => 0,
         };
         let mut levels = Vec::new();
@@ -1419,7 +1431,11 @@ impl MutationResolvePass<'_, '_, '_> {
                         &tree,
                         LogicalBlock::try_from(logical)?,
                     )?;
-                    if let Some(entry) = query.find(block.entries()?, self.crypto)? {
+                    if let Some(entry) = query.find(
+                        block.entries()?,
+                        self.crypto,
+                        self.mutation.volume.superblock.name_semantics(inode)?,
+                    )? {
                         return Ok(Some(DirectoryEntryLocation {
                             physical,
                             block,
@@ -1438,7 +1454,10 @@ impl MutationResolvePass<'_, '_, '_> {
                 }
                 let mut context =
                     self.mutation_htree_context(inode, &tree, HtreePathTarget::Query(query))?;
-                let major = query.major(context.root.hash_scheme());
+                let major = query.major(
+                    context.root.hash_scheme(),
+                    self.mutation.volume.superblock.name_semantics(inode)?,
+                )?;
                 loop {
                     let (physical, block) = self.read_mutation_directory_block(
                         inode,
@@ -1446,11 +1465,16 @@ impl MutationResolvePass<'_, '_, '_> {
                         LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
                     )?;
                     let entries = block.entries()?;
-                    context
-                        .path
-                        .hash_range()?
-                        .validate_leaf(&entries, context.root.hash_scheme())?;
-                    if let Some(entry) = query.find(entries, self.crypto)? {
+                    context.path.hash_range()?.validate_leaf(
+                        &entries,
+                        context.root.hash_scheme(),
+                        self.mutation.volume.superblock.name_semantics(inode)?,
+                    )?;
+                    if let Some(entry) = query.find(
+                        entries,
+                        self.crypto,
+                        self.mutation.volume.superblock.name_semantics(inode)?,
+                    )? {
                         return Ok(Some(DirectoryEntryLocation {
                             physical,
                             block,
@@ -1499,10 +1523,14 @@ impl MutationResolvePass<'_, '_, '_> {
             &tree,
             LogicalBlock::try_from(u64::from(leaf_logical))?,
         )?;
-        context
-            .path
-            .hash_range()?
-            .validate_leaf(&leaf.entries()?, context.root.hash_scheme())?;
+        context.path.hash_range()?.validate_leaf(
+            &leaf.entries()?,
+            context.root.hash_scheme(),
+            self.mutation
+                .volume
+                .superblock
+                .name_semantics(parent_inode)?,
+        )?;
         if leaf.insert(entry.inode(), entry.name(), entry.kind())? {
             self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
             raw_parent.touch_contents(self.now)?;
@@ -1527,25 +1555,34 @@ impl MutationResolvePass<'_, '_, '_> {
         let hash = context.root.hash_scheme();
         let mut entries = leaf.entries()?;
         entries.try_push(entry)?;
-        memory::heap_sort_by(&mut entries, |left, right| {
-            let left_hash = hash.hash(left.name());
-            let right_hash = hash.hash(right.name());
-            left_hash
-                .cmp(&right_hash)
-                .then(left.name().bytes().cmp(right.name().bytes()))
-        })?;
+        let names = self
+            .mutation
+            .volume
+            .superblock
+            .name_semantics(parent_inode)?;
+        let entries = ordered_directory_entries(entries, hash, names)?;
         let split_at = self.directory_leaf_split(&entries, checksum)?;
         let (left_entries, right_entries) = entries
             .split_at_checked(split_at)
             .ok_or(Error::InvalidDirectoryEntry)?;
-        let left_last_hash = left_entries
-            .last()
-            .map(|entry| hash.hash(entry.name()).major)
-            .ok_or(Error::InvalidDirectoryEntry)?;
-        let right_first_hash = right_entries
-            .first()
-            .map(|entry| hash.hash(entry.name()).major)
-            .ok_or(Error::InvalidDirectoryEntry)?;
+        let left_last_hash = names
+            .hash(
+                left_entries
+                    .last()
+                    .ok_or(Error::InvalidDirectoryEntry)?
+                    .name(),
+                hash,
+            )?
+            .major;
+        let right_first_hash = names
+            .hash(
+                right_entries
+                    .first()
+                    .ok_or(Error::InvalidDirectoryEntry)?
+                    .name(),
+                hash,
+            )?
+            .major;
         let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
         let block_bytes = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
@@ -1767,11 +1804,12 @@ impl MutationResolvePass<'_, '_, '_> {
             }
         }
         children.try_push(entry)?;
-        memory::heap_sort_by(&mut children, |left, right| {
-            hash.hash(left.name())
-                .cmp(&hash.hash(right.name()))
-                .then(left.name().bytes().cmp(right.name().bytes()))
-        })?;
+        let names = self
+            .mutation
+            .volume
+            .superblock
+            .name_semantics(parent_inode)?;
+        let children = ordered_directory_entries(children, hash, names)?;
         let block_bytes = usize::try_from(self.mutation.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
         let mut next_logical = 1_u64;
@@ -1788,14 +1826,24 @@ impl MutationResolvePass<'_, '_, '_> {
                 let (left_entries, right_entries) = children
                     .split_at_checked(split_at)
                     .ok_or(Error::InvalidDirectoryEntry)?;
-                let left_last_hash = left_entries
-                    .last()
-                    .map(|child| hash.hash(child.name()).major)
-                    .ok_or(Error::InvalidDirectoryEntry)?;
-                let right_first_hash = right_entries
-                    .first()
-                    .map(|child| hash.hash(child.name()).major)
-                    .ok_or(Error::InvalidDirectoryEntry)?;
+                let left_last_hash = names
+                    .hash(
+                        left_entries
+                            .last()
+                            .ok_or(Error::InvalidDirectoryEntry)?
+                            .name(),
+                        hash,
+                    )?
+                    .major;
+                let right_first_hash = names
+                    .hash(
+                        right_entries
+                            .first()
+                            .ok_or(Error::InvalidDirectoryEntry)?
+                            .name(),
+                        hash,
+                    )?
+                    .major;
                 let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
                 let left = DirectoryBlock::from_entries(block_bytes, checksum, left_entries)?;
                 let right = DirectoryBlock::from_entries(block_bytes, checksum, right_entries)?;
@@ -1922,10 +1970,11 @@ impl MutationResolvePass<'_, '_, '_> {
                         LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
                     )?;
                     let entries = block.entries()?;
-                    context
-                        .path
-                        .hash_range()?
-                        .validate_leaf(&entries, context.root.hash_scheme())?;
+                    context.path.hash_range()?.validate_leaf(
+                        &entries,
+                        context.root.hash_scheme(),
+                        self.mutation.volume.superblock.name_semantics(inode)?,
+                    )?;
                     if !entries.is_empty() {
                         return Ok(false);
                     }
@@ -1942,4 +1991,43 @@ impl MutationResolvePass<'_, '_, '_> {
         }
         Ok(true)
     }
+}
+
+/// Sorts immutable entry/hash pairs so normalization and its fallible allocations precede sorting.
+/// Bytewise directories retain their allocation-free comparator.
+/// # Errors
+/// Returns invalid encoding, normalization allocation or fallible sorting failures.
+fn ordered_directory_entries(
+    mut entries: Vec<RawDirectoryEntry>,
+    hash: DirectoryHashScheme,
+    names: crate::disk_format::name::NameSemantics,
+) -> Result<Vec<RawDirectoryEntry>> {
+    if names == crate::disk_format::name::NameSemantics::Bytewise {
+        memory::heap_sort_by(&mut entries, |left, right| {
+            hash.hash(left.name().bytes())
+                .cmp(&hash.hash(right.name().bytes()))
+                .then(left.name().bytes().cmp(right.name().bytes()))
+        })?;
+        return Ok(entries);
+    }
+    let mut keyed = Vec::new();
+    keyed
+        .try_reserve_exact(entries.len())
+        .map_err(|_| Error::OutOfMemory)?;
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the unbounded range is exactly the complete owned vector; its capacity is retained for reordered entries"
+    )]
+    for entry in entries.drain(..) {
+        keyed.try_push((names.hash(entry.name(), hash)?, entry))?;
+    }
+    memory::heap_sort_by(&mut keyed, |left, right| {
+        left.0
+            .cmp(&right.0)
+            .then(left.1.name().bytes().cmp(right.1.name().bytes()))
+    })?;
+    for (_, entry) in keyed {
+        entries.try_push(entry)?;
+    }
+    Ok(entries)
 }

@@ -978,12 +978,13 @@ impl HtreeHashRange {
         self,
         entries: &[DirectoryEntry],
         hash: DirectoryHashScheme,
+        names: super::name::NameSemantics,
     ) -> Result<()> {
         for entry in entries {
             if matches!(entry.name().bytes(), b"." | b"..") {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            let major = hash.hash(entry.name()).major;
+            let major = names.hash(entry.name(), hash)?.major;
             self.validate_hash(major)?;
         }
         Ok(())
@@ -2298,12 +2299,12 @@ mod tests {
             return;
         };
         let (lower_entry, upper_entry) =
-            if hash.hash(first.name()).major < hash.hash(second.name()).major {
+            if hash.hash(first.name().bytes()).major < hash.hash(second.name().bytes()).major {
                 (first, second)
             } else {
                 (second, first)
             };
-        let upper = hash.hash(upper_entry.name()).major;
+        let upper = hash.hash(upper_entry.name().bytes()).major;
 
         let Some(exclusive_first) = test_value(DxEntry::new(0, 1)) else {
             return;
@@ -2323,12 +2324,24 @@ mod tests {
         let Some(lower_clone) = test_value(lower_entry.try_clone()) else {
             return;
         };
-        assert!(range.validate_leaf(&[lower_clone], hash).is_ok());
+        assert!(
+            range
+                .validate_leaf(
+                    &[lower_clone],
+                    hash,
+                    super::super::name::NameSemantics::Bytewise
+                )
+                .is_ok()
+        );
         let Some(upper_clone) = test_value(upper_entry.try_clone()) else {
             return;
         };
         assert_eq!(
-            range.validate_leaf(&[upper_clone], hash),
+            range.validate_leaf(
+                &[upper_clone],
+                hash,
+                super::super::name::NameSemantics::Bytewise
+            ),
             Err(Error::InvalidDirectoryEntry)
         );
 
@@ -2347,7 +2360,11 @@ mod tests {
         assert!(
             HtreeHashRange::root()
                 .descend(&continued, 0)
-                .and_then(|range| range.validate_leaf(&[upper_entry], hash))
+                .and_then(|range| range.validate_leaf(
+                    &[upper_entry],
+                    hash,
+                    super::super::name::NameSemantics::Bytewise
+                ))
                 .is_ok()
         );
     }

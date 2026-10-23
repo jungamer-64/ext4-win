@@ -612,7 +612,10 @@ impl HashWalk {
                 if matches!(raw.name().bytes(), b"." | b"..") {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                let hash = self.hash.hash(raw.name());
+                let hash = view
+                    .superblock
+                    .name_semantics(directory.inode())?
+                    .hash(raw.name(), self.hash)?;
                 range.validate_hash(hash.major)?;
                 let candidate = Candidate { raw, hash };
                 if candidate.follows(self.after) {
