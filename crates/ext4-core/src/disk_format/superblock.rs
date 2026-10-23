@@ -1956,7 +1956,7 @@ impl Superblock {
 
     /// Selects one directory's comparison contract from immutable mounted encoding authority.
     /// # Errors
-    /// Rejects undeclared casefold state, wrong inode kind and unsupported encrypted index layout.
+    /// Rejects undeclared casefold state or a non-directory inode.
     pub(crate) fn name_semantics(
         self,
         inode: &super::inode::Inode,
@@ -1966,9 +1966,6 @@ impl Superblock {
         }
         if inode.kind() != super::inode::InodeKind::Directory {
             return Err(Error::InvalidInode);
-        }
-        if inode.protection().is_encrypted() {
-            return Err(Error::UnsupportedWriteFeature);
         }
         self.casefold.ok_or(Error::InvalidInode)
     }

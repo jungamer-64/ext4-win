@@ -97,7 +97,7 @@ impl FscryptKeyIdentifier {
         fscrypt_hkdf_expand(
             crypto,
             bytes,
-            FscryptHkdfContext::KeyIdentifierForRawKey,
+            FscryptHkdfContext::RawKeyIdentifier,
             &[],
             &mut identifier,
         )?;
@@ -592,7 +592,7 @@ impl FscryptMasterKey {
         fscrypt_hkdf_expand(
             crypto,
             &self.bytes,
-            FscryptHkdfContext::PerFileEncryptionKey,
+            FscryptHkdfContext::FileEncryption,
             &nonce.bytes(),
             &mut key.bytes,
         )?;
@@ -611,7 +611,7 @@ impl FscryptMasterKey {
         fscrypt_hkdf_expand(
             crypto,
             &self.bytes,
-            FscryptHkdfContext::DirectoryHashKey,
+            FscryptHkdfContext::DirectoryHash,
             &nonce.bytes(),
             &mut key.bytes,
         )?;
@@ -633,7 +633,7 @@ impl FscryptMasterKey {
         fscrypt_hkdf_expand(
             crypto,
             &self.bytes,
-            FscryptHkdfContext::PerFileEncryptionKey,
+            FscryptHkdfContext::FileEncryption,
             &nonce.bytes(),
             &mut key.bytes,
         )?;
@@ -1007,20 +1007,20 @@ impl fmt::Debug for FscryptDirectoryHashKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FscryptHkdfContext {
     /// `HKDF_CONTEXT_KEY_IDENTIFIER_FOR_RAW_KEY`.
-    KeyIdentifierForRawKey,
+    RawKeyIdentifier,
     /// `HKDF_CONTEXT_PER_FILE_ENC_KEY`.
-    PerFileEncryptionKey,
+    FileEncryption,
     /// Keyed directory-name hashing uses an independent HKDF output namespace.
-    DirectoryHashKey,
+    DirectoryHash,
 }
 
 impl FscryptHkdfContext {
     /// Returns the Linux fscrypt HKDF context byte.
     const fn value(self) -> u8 {
         match self {
-            Self::KeyIdentifierForRawKey => 1,
-            Self::PerFileEncryptionKey => 2,
-            Self::DirectoryHashKey => 5,
+            Self::RawKeyIdentifier => 1,
+            Self::FileEncryption => 2,
+            Self::DirectoryHash => 5,
         }
     }
 }
@@ -1041,9 +1041,9 @@ fn validate_raw_master_key(bytes: &[u8]) -> Result<()> {
 /// Validates the on-disk ciphertext filename length.
 /// # Errors
 ///
-/// Returns an error when the ciphertext name is empty or longer than one ext4 component.
+/// Returns an error when ciphertext cannot contain one AES block or exceeds one ext4 component.
 fn validate_ciphertext_filename_len(len: usize) -> Result<()> {
-    if len == 0 || len > 255 {
+    if !(16..=255).contains(&len) {
         return Err(Error::InvalidName);
     }
     Ok(())
@@ -1454,6 +1454,84 @@ mod tests {
         };
     }
 
+    /// # Errors
+    /// Returns raw-key admission or independent provider execution failure.
+    /// # Panics
+    /// Fails if the key namespace, SipHash variant, byte order or format hash bounds diverge.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixed HKDF and SipHash known answers observe independent primitive and format boundaries"
+    )]
+    fn directory_hash_key_and_siphash_known_answers() -> Result<()> {
+        let master = FscryptMasterKey::from_raw(&[0x42; 32], &mut TestCryptographicOperation)?;
+        let nonce = FscryptFileNonce::new([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let derived = master.derive_directory_hash_key(nonce, &mut TestCryptographicOperation)?;
+        // HKDF-SHA512 with no salt, info = fscrypt-NUL / namespace 5 / nonce.
+        assert_eq!(
+            derived.bytes,
+            [
+                0xd1, 0x3b, 0x0f, 0x23, 0xc0, 0x2e, 0x63, 0xa4, 0x26, 0xfc, 0xc6, 0x83, 0x27, 0x39,
+                0x4e, 0x2b
+            ]
+        );
+        let key = FscryptDirectoryHashKey {
+            bytes: nonce.bytes(),
+        };
+        assert_eq!(
+            key.hash(&[]),
+            crate::disk_format::directory_hash::DirectoryHash {
+                major: 0x726f_db46,
+                minor: 0xdd0e_0e31
+            }
+        );
+        assert_eq!(
+            key.hash(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]),
+            crate::disk_format::directory_hash::DirectoryHash {
+                major: 0xa129_ca60,
+                minor: 0x49be_45e5
+            }
+        );
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns known-answer parsing, identity preparation or provider failure.
+    /// # Panics
+    /// Fails if route word order, complete/digest framing or display length differs from the vectors.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "base64url and SHA-256 wire vectors were prepared independently of the production codec"
+    )]
+    fn keyless_route_display_known_answers() -> Result<()> {
+        let hash = crate::disk_format::directory_hash::DirectoryHash {
+            major: 0x1234_5678,
+            minor: 0xabcd_ef01,
+        };
+        for (ciphertext, expected) in [
+            (
+                b"0123456789ABCDEF!".as_slice(),
+                b"_fscrypt_eFY0EgHvzaswMTIzNDU2Nzg5QUJDREVGIQ".as_slice(),
+            ),
+            (
+                [0xa5; 192].as_slice(),
+                b"_fscrypt_.eFY0EgHvzavZnDNobxdhADSjOLedi1R3vOlJoowFzyQJ9BM4q5rIAg".as_slice(),
+            ),
+        ] {
+            let name = FscryptNoKeyName::from_ciphertext(
+                ciphertext,
+                hash,
+                &mut TestCryptographicOperation,
+            )?;
+            assert_eq!(name.display_bytes()?, expected);
+            let query = FscryptNoKeyName::from_display(expected)?.ok_or(Error::InvalidName)?;
+            assert_eq!(query.hash(), hash);
+            assert!(query.matches(ciphertext, &mut TestCryptographicOperation)?);
+        }
+        Ok(())
+    }
+
     /// # Panics
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
@@ -1723,7 +1801,7 @@ mod tests {
         reason = "assertions compare query identity across independently selected ciphertext boundary lengths"
     )]
     fn keyless_names_cover_the_complete_ciphertext_length_domain() -> Result<()> {
-        for length in 1..=255 {
+        for length in 16..=255 {
             let ciphertext = memory::repeated_vec(0xa5, length)?;
             let name = FscryptNoKeyName::from_ciphertext(
                 &ciphertext,

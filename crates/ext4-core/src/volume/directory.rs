@@ -246,8 +246,10 @@ mod tests {
 /// Owned query preparation keeps derived keys local while traversal borrows only their narrow capability.
 #[derive(Debug)]
 pub(super) enum PreparedDirectoryLookup<'name> {
-    /// Complete ordinary on-disk query name.
-    Exact(Ext4Name),
+    /// Unencrypted caller component, borrowed without allocating on the ordinary lookup path.
+    Plain(&'name Ext4Name),
+    /// Encrypted spelling for a bytewise directory.
+    Encrypted(Ext4Name),
     /// Complete keyless identity and route.
     NoKey(crate::protection::fscrypt::FscryptNoKeyName),
     /// A normalized plaintext key paired with candidate decryption and keyed routing.
@@ -271,7 +273,7 @@ impl<'name> PreparedDirectoryLookup<'name> {
         crypto: &mut dyn crate::CryptographicOperation,
     ) -> Result<Self> {
         if names == crate::disk_format::name::NameSemantics::Bytewise {
-            return Ok(Self::Exact(key.encrypt_name(name, crypto)?));
+            return Ok(Self::Encrypted(key.encrypt_name(name, crypto)?));
         }
         let comparison = names.key(name.bytes())?;
         let hash = key.directory_hash_key(crypto)?.hash(comparison.bytes());
@@ -285,7 +287,8 @@ impl<'name> PreparedDirectoryLookup<'name> {
     /// Borrows one immutable prepared query for bounded traversal.
     pub(super) fn query(&self) -> DirectoryLookup<'_> {
         match self {
-            Self::Exact(name) => DirectoryLookup::Exact(name),
+            Self::Plain(name) => DirectoryLookup::Name(name),
+            Self::Encrypted(name) => DirectoryLookup::Name(name),
             Self::NoKey(name) => DirectoryLookup::NoKey(name),
             Self::EncryptedCasefold {
                 comparison,
@@ -303,8 +306,8 @@ impl<'name> PreparedDirectoryLookup<'name> {
 /// Lookup semantics independent of traversal through committed or staged directory blocks.
 #[derive(Clone, Copy)]
 pub(super) enum DirectoryLookup<'name> {
-    /// Exact on-disk component.
-    Exact(&'name Ext4Name),
+    /// Component interpreted using the directory's comparison semantics.
+    Name(&'name Ext4Name),
     /// Exact stored identity retains any keyed route paired with its ciphertext.
     Stored(&'name crate::disk_format::dir::DirectoryEntry),
     /// Normalized plaintext equality after filtering and decrypting the keyed-hash candidates.
@@ -323,7 +326,7 @@ impl DirectoryLookup<'_> {
     /// Returns exact bytes when present in the query.
     pub(super) fn exact(&self) -> Option<&Ext4Name> {
         match self {
-            Self::Exact(name) => Some(name),
+            Self::Name(name) => Some(name),
             Self::Stored(entry) => Some(entry.name()),
             Self::NoKey(name) => name.direct(),
             Self::EncryptedCasefold { .. } => None,
@@ -339,7 +342,7 @@ impl DirectoryLookup<'_> {
     ) -> Result<u32> {
         match *self {
             Self::Stored(entry) => Ok(scheme.entry_hash(entry, names)?.major),
-            Self::Exact(name) => Ok(names.hash(name, scheme.computed()?)?.major),
+            Self::Name(name) => Ok(names.hash(name, scheme.computed()?)?.major),
             Self::NoKey(name) => Ok(name.hash().major),
             Self::EncryptedCasefold { hash, .. } => {
                 if scheme != crate::disk_format::dir::DirectoryIndexHash::StoredKeyed {
@@ -364,7 +367,7 @@ impl DirectoryLookup<'_> {
                     entry.name() == stored.name() && entry.stored_hash() == stored.stored_hash()
                 }));
             }
-            Self::Exact(name) => {
+            Self::Name(name) => {
                 let key = names.key(name.bytes())?;
                 for entry in entries {
                     if names.key(entry.name().bytes())?.bytes() == key.bytes() {

@@ -34,7 +34,7 @@ impl MetadataMutation<'_, '_> {
     ) -> Result<PreparedDirectoryLookup<'name>> {
         let names = self.volume.superblock.name_semantics(parent)?;
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
-            return Ok(PreparedDirectoryLookup::Exact(name.try_to_owned_name()?));
+            return Ok(PreparedDirectoryLookup::Plain(name));
         }
         match self.fscrypt_key_for_inode(parent) {
             Ok(key) => PreparedDirectoryLookup::encrypted(name, names, key, crypto),

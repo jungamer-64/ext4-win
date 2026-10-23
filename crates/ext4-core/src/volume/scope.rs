@@ -12,7 +12,7 @@ pub(super) use crate::disk_format::acl::{AclKind, Ext4Access};
 pub(super) use crate::disk_format::dir::{
     DirectoryBlock, DirectoryChecksum, DirectoryEntry as RawDirectoryEntry, DirectoryEntryEncoding,
     DirectoryEntryKind, DirectoryIndexHash, DxEntry, DxIndex, HtreeHashRange, HtreeRoot,
-    create_htree_root, write_htree_node, write_htree_root_index,
+    create_htree_root, replace_htree_parent, write_htree_node, write_htree_root_index,
 };
 pub(super) use crate::disk_format::directory_hash::{DirectoryHash, DirectoryHashScheme};
 pub(super) use crate::disk_format::extent::{
@@ -61,7 +61,7 @@ pub(super) use super::block_group::{
 };
 pub(super) use super::directory::{
     DirectoryCursorName, DirectoryLookup, DirectoryScanCursor, DirectoryScanPosition,
-    ScannedDirectoryEntry,
+    PreparedDirectoryLookup, ScannedDirectoryEntry,
 };
 pub(super) use super::directory_read::DirectoryReader;
 pub(super) use super::event::CommitClaim;
@@ -165,5 +165,3 @@ pub(super) const EXT4_INODE_MIN_EXTRA_ISIZE: u16 = 32;
 pub(super) const SUPERBLOCK_FREE_INODES_OFFSET: usize = 16;
 /// Byte offset of the primary ext4 superblock.
 pub(super) const SUPERBLOCK_OFFSET: u64 = 1024;
-
-pub(super) use super::directory::PreparedDirectoryLookup;

@@ -232,18 +232,18 @@ fn casefold_htree_routes_aliases_and_preserves_invalid_encoding_policy() -> Resu
         pass.set_directory_casefold(directory, DirectoryCasefold::Enabled)?;
         Ok(directory.id())
     })?;
-    for index in 0..40 {
-        let name = format!("É-{index:02}-{}", "x".repeat(180));
-        fixture.mutate(|pass| {
-            let directory = pass.directory(directory)?;
+    fixture.mutate(|pass| {
+        let directory = pass.directory(directory)?;
+        for index in 0..40 {
+            let name = format!("É-{index:02}-{}", "x".repeat(180));
             pass.create_file(
                 directory,
                 &Ext4Name::new(name.as_bytes())?,
                 NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
-            )
-            .map(|_file| ())
-        })?;
-    }
+            )?;
+        }
+        Ok(())
+    })?;
     fixture.remount()?;
     let offset = fixture_inode_offset(&fixture.disk, NodeId::Directory(directory))?;
     assert_eq!(
@@ -2891,12 +2891,18 @@ fn namespace_context(identifier: u8) -> [u8; 40] {
 /// Selects the routing provider and installs a matching key for an independently encoded parent.
 /// # Errors
 /// Returns fixture, mount, context encoding, or key publication failure.
+fn encrypted_namespace_fixture() -> Result<(Fixture, DirectoryNodeId)> {
+    encrypted_namespace_fixture_from(Fixture::new()?)
+}
+
+/// Installs an independently encoded directory policy on a caller-selected filesystem profile.
+/// # Errors
+/// Returns namespace construction, independent context encoding, mount or key publication failure.
 #[expect(
     clippy::disallowed_methods,
-    reason = "the checked identifier field has the exact 16-byte source width"
+    reason = "the checked key identifier field has the exact 16-byte source width"
 )]
-fn encrypted_namespace_fixture() -> Result<(Fixture, DirectoryNodeId)> {
-    let mut fixture = Fixture::new()?;
+fn encrypted_namespace_fixture_from(mut fixture: Fixture) -> Result<(Fixture, DirectoryNodeId)> {
     let parent = fixture.mutate(|pass| {
         let root = pass.directory(DirectoryNodeId::ROOT)?;
         pass.create_directory(
@@ -2906,6 +2912,28 @@ fn encrypted_namespace_fixture() -> Result<(Fixture, DirectoryNodeId)> {
         )
         .map(|directory| directory.id())
     })?;
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::Directory(parent))?;
+    if fixture_u32(
+        &fixture.disk.filesystem,
+        offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?,
+    )? & 0x1000_0000
+        != 0
+    {
+        let name = Ext4Name::new(&[b'x'; 255])?;
+        fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            pass.create_file(
+                parent,
+                &name,
+                NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+            )
+            .map(|_file| ())
+        })?;
+        fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            pass.unlink_file(parent, &name)
+        })?;
+    }
     let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
     let mut context = namespace_context(0x31);
     context
@@ -2922,6 +2950,293 @@ fn encrypted_namespace_fixture() -> Result<(Fixture, DirectoryNodeId)> {
     fixture.publish_keys(change)?;
     fixture.crypto = Box::try_new(ContextCrypto { nonce: 0x50 }).map_err(|_| Error::OutOfMemory)?;
     Ok((fixture, parent))
+}
+
+/// # Errors
+/// Propagates filesystem, encrypted namespace, journal, key transition or remount failure.
+/// # Panics
+/// Fails if folded ciphertext routes, source spelling, keyless identity or empty index transitions diverge.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe keyed and keyless namespace behavior through production transactions and reads"
+)]
+fn encrypted_casefold_namespace_survives_key_removal_and_index_transitions() -> Result<()> {
+    for features in [0, 0x8000] {
+        let (mut fixture, parent) =
+            encrypted_namespace_fixture_from(casefold_fixture(features, 1)?)?;
+        let stored = Ext4Name::new("Straße".as_bytes())?;
+        let alias = Ext4Name::new(b"strasse")?;
+        let upper = Ext4Name::new(b"STRASSE")?;
+        let (file, child) = fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            pass.set_directory_casefold(parent, DirectoryCasefold::Enabled)?;
+            let file = pass.create_file(
+                parent,
+                &stored,
+                NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+            )?;
+            let child = pass.create_directory(
+                parent,
+                &Ext4Name::new(b"Child")?,
+                NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+            )?;
+            pass.create_file(
+                child,
+                &Ext4Name::new("Résumé".as_bytes())?,
+                NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+            )?;
+            pass.rename_child(
+                child,
+                &Ext4Name::new("RÉSUMÉ".as_bytes())?,
+                parent,
+                &Ext4Name::new(b"moved")?,
+                NamespaceDestination::Vacant,
+            )?;
+            pass.unlink_file(parent, &Ext4Name::new(b"MOVED")?)?;
+            Ok((file.id(), child.id()))
+        })?;
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(parent, &alias))?, ChildLookup::Found(child) if child.name() == &stored && *child.node() == NodeId::File(file))
+        );
+        assert_eq!(
+            fixture.mutate(|pass| {
+                let parent = pass.directory(parent)?;
+                pass.create_file(
+                    parent,
+                    &upper,
+                    NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+                )
+                .map(|_file| ())
+            }),
+            Err(Error::NameAlreadyExists)
+        );
+        let child_offset = fixture_inode_offset(&fixture.disk, NodeId::Directory(child))?;
+        assert_eq!(
+            fixture_u32(
+                &fixture.disk.filesystem,
+                child_offset
+                    .checked_add(32)
+                    .ok_or(Error::ArithmeticOverflow)?
+            )? & 0x4000_0800,
+            0x4000_0800
+        );
+        fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            pass.rename_child(parent, &alias, parent, &upper, NamespaceDestination::Vacant)?;
+            for index in 0..24 {
+                let name = format!("É-{index:02}-{}", "x".repeat(180));
+                pass.create_file(
+                    parent,
+                    &Ext4Name::new(name.as_bytes())?,
+                    NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+                )?;
+            }
+            Ok(())
+        })?;
+        let container = fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            let container = pass.create_directory(
+                root,
+                &Ext4Name::new(b"container")?,
+                NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+            )?;
+            pass.rename_child(
+                root,
+                &Ext4Name::new(b"encrypted")?,
+                container,
+                &Ext4Name::new(b"moved-parent")?,
+                NamespaceDestination::Vacant,
+            )?;
+            Ok(container.id())
+        })?;
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(parent, &Ext4Name::new(b"..")?))?, ChildLookup::Found(found) if *found.node() == NodeId::Directory(container))
+        );
+        fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            let container = pass.directory(container)?;
+            pass.rename_child(
+                container,
+                &Ext4Name::new(b"moved-parent")?,
+                root,
+                &Ext4Name::new(b"encrypted")?,
+                NamespaceDestination::Vacant,
+            )?;
+            let parent = pass.directory(parent)?;
+            let sibling = pass.create_directory(
+                parent,
+                &Ext4Name::new(b"Sibling")?,
+                NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+            )?;
+            pass.rename_child(
+                parent,
+                &Ext4Name::new(b"CHILD")?,
+                sibling,
+                &Ext4Name::new(b"nested")?,
+                NamespaceDestination::Vacant,
+            )?;
+            pass.rename_child(
+                sibling,
+                &Ext4Name::new(b"NESTED")?,
+                parent,
+                &Ext4Name::new(b"Child")?,
+                NamespaceDestination::Vacant,
+            )?;
+            pass.remove_empty_directory(parent, &Ext4Name::new(b"SIBLING")?)?;
+            pass.remove_empty_directory(root, &Ext4Name::new(b"container")?)
+        })?;
+        let parent_offset = fixture_inode_offset(&fixture.disk, NodeId::Directory(parent))?;
+        let root_block = usize::try_from(fixture_u32(
+            &fixture.disk.filesystem,
+            parent_offset
+                .checked_add(60)
+                .ok_or(Error::ArithmeticOverflow)?,
+        )?)
+        .map_err(|_| Error::ArithmeticOverflow)?;
+        let version_offset = root_block
+            .checked_mul(4096)
+            .and_then(|offset| offset.checked_add(28))
+            .ok_or(Error::ArithmeticOverflow)?;
+        assert_eq!(fixture.disk.filesystem.get(version_offset), Some(&6));
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(parent, &stored))?, ChildLookup::Found(child) if child.name() == &upper && *child.node() == NodeId::File(file))
+        );
+        let key = FscryptMasterKey::from_raw(&[7; 32], &mut PlainCrypto)?;
+        let identifier = key.identifier();
+        let ticket = fixture.coordinator.admit_mutation()?;
+        let change =
+            ResolvedKeyChange::remove(&fixture.epoch, &fixture.coordinator, ticket, identifier)?;
+        let effects = fixture.disk.storage_effects;
+        fixture.publish_keys(change)?;
+        assert_eq!(fixture.disk.storage_effects, effects);
+        assert!(matches!(
+            fixture.read(|pass| pass.lookup_child(parent, &alias)),
+            Err(Error::MissingEncryptionKey)
+        ));
+        let mut reader = DirectoryReader::new(parent, DirectoryScanCursor::start());
+        let mut files = Vec::new();
+        let mut child_name = None;
+        while let Some(entry) = fixture.read(|pass| pass.next_directory_entry(&mut reader))? {
+            let entry = entry.into_entry();
+            if matches!(entry.name().bytes(), b"." | b"..") {
+                continue;
+            }
+            assert!(entry.name().bytes().len() <= 255);
+            assert!(
+                matches!(fixture.read(|pass| pass.lookup_child(parent, entry.name()))?, ChildLookup::Found(found) if found.node() == entry.node())
+            );
+            match entry.node() {
+                NodeId::File(_) => files.push(entry.name().try_to_owned_name()?),
+                NodeId::Directory(_) => child_name = Some(entry.name().try_to_owned_name()?),
+                NodeId::Symlink(_) => return Err(Error::WrongInodeKind),
+            }
+        }
+        assert_eq!(files.len(), 25);
+        assert!(
+            files
+                .iter()
+                .any(|name| name.bytes().starts_with(b"_fscrypt_."))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|name| !name.bytes().starts_with(b"_fscrypt_."))
+        );
+        fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            for name in &files {
+                pass.unlink_file(parent, name)?;
+            }
+            pass.remove_empty_directory(
+                parent,
+                child_name.as_ref().ok_or(Error::DirectoryEntryNotFound)?,
+            )
+        })?;
+        let ticket = fixture.coordinator.admit_mutation()?;
+        let change = ResolvedKeyChange::add(&fixture.epoch, &fixture.coordinator, ticket, key)?;
+        fixture.publish_keys(change)?;
+        fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            pass.set_directory_casefold(parent, DirectoryCasefold::Disabled)?;
+            for name in [b"A", b"a"] {
+                pass.create_file(
+                    parent,
+                    &Ext4Name::new(name)?,
+                    NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+                )?;
+            }
+            Ok(())
+        })?;
+        assert_ne!(fixture.disk.filesystem.get(version_offset), Some(&6));
+        fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            for name in [b"A", b"a"] {
+                pass.unlink_file(parent, &Ext4Name::new(name)?)?;
+            }
+            pass.set_directory_casefold(parent, DirectoryCasefold::Enabled)
+        })?;
+        fixture.remount()?;
+        assert_eq!(fixture.disk.filesystem.get(version_offset), Some(&6));
+        let mut reader = DirectoryReader::new(parent, DirectoryScanCursor::start());
+        let mut entries = 0;
+        while fixture
+            .read(|pass| pass.next_directory_entry(&mut reader))?
+            .is_some()
+        {
+            entries += 1;
+        }
+        assert_eq!(entries, 2);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns encoded fixture, encrypted namespace, key or committed read failure.
+/// # Panics
+/// Fails if strict rejection or whole-name opaque fallback depends on encryption.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "invalid UTF-8 has independently specified strict and opaque observable outcomes"
+)]
+fn encrypted_casefold_preserves_filesystem_invalid_encoding_policy() -> Result<()> {
+    for flags in [0, 1] {
+        let (mut fixture, parent) = encrypted_namespace_fixture_from(casefold_fixture(0, flags)?)?;
+        fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            pass.set_directory_casefold(parent, DirectoryCasefold::Enabled)
+        })?;
+        let invalid = Ext4Name::new(b"Mixed\xff")?;
+        let effects = fixture.disk.storage_effects;
+        let result = fixture.mutate(|pass| {
+            let parent = pass.directory(parent)?;
+            pass.create_file(
+                parent,
+                &invalid,
+                NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+            )
+            .map(|file| file.id())
+        });
+        if flags == 1 {
+            assert_eq!(result, Err(Error::InvalidName));
+            assert_eq!(fixture.disk.storage_effects, effects);
+        } else {
+            let file = result?;
+            assert!(
+                matches!(fixture.read(|pass| pass.lookup_child(parent, &invalid))?, ChildLookup::Found(child) if *child.node() == NodeId::File(file))
+            );
+            assert!(matches!(
+                fixture.read(|pass| pass.lookup_child(parent, &Ext4Name::new(b"mixed\xff")?))?,
+                ChildLookup::NotFound
+            ));
+            fixture.mutate(|pass| {
+                let parent = pass.directory(parent)?;
+                pass.unlink_file(parent, &invalid)
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// # Errors

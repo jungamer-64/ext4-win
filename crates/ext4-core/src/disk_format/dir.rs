@@ -664,33 +664,7 @@ impl HtreeRoot {
         if bytes.len() < DX_ROOT_COUNT_OFFSET + DX_ENTRY_BYTES {
             return Err(Error::InvalidDirectoryEntry);
         }
-        let dot = parse_live_entry_at(bytes, 0, DirectoryEntryEncoding::Standard)?;
-        if dot.inode() != directory_inode
-            || dot.name().bytes() != b"."
-            || dot.kind() != DirectoryEntryKind::Directory
-        {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        if read_record_length(bytes, 0)? != checked_rec_len(DIRENT_HEADER_SIZE + 1)? {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        let dotdot = parse_live_entry_at(
-            bytes,
-            checked_rec_len(DIRENT_HEADER_SIZE + 1)?,
-            DirectoryEntryEncoding::Standard,
-        )?;
-        if dotdot.name().bytes() != b".." || dotdot.kind() != DirectoryEntryKind::Directory {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        let dotdot_offset = checked_rec_len(DIRENT_HEADER_SIZE + 1)?;
-        if read_record_length(bytes, dotdot_offset)?
-            != bytes
-                .len()
-                .checked_sub(dotdot_offset)
-                .ok_or(Error::ArithmeticOverflow)?
-        {
-            return Err(Error::InvalidDirectoryEntry);
-        }
+        let (dot, dotdot) = parse_root_dot_entries(bytes, directory_inode)?;
         if le_u32(bytes, disk_offset(DX_ROOT_INFO_OFFSET))? != 0 {
             return Err(Error::InvalidDirectoryEntry);
         }
@@ -749,6 +723,64 @@ impl HtreeRoot {
     pub(crate) const fn index(&self) -> &DxIndex {
         &self.index
     }
+}
+
+/// Validates the two ordinary records shared by every root hash profile.
+/// # Errors
+/// Rejects malformed special records or a self inode that disagrees with the owning directory.
+fn parse_root_dot_entries(
+    bytes: &[u8],
+    directory_inode: InodeId,
+) -> Result<(DirectoryEntry, DirectoryEntry)> {
+    let dot = parse_live_entry_at(bytes, 0, DirectoryEntryEncoding::Standard)?;
+    if dot.inode() != directory_inode
+        || dot.name().bytes() != b"."
+        || dot.kind() != DirectoryEntryKind::Directory
+    {
+        return Err(Error::InvalidDirectoryEntry);
+    }
+    if read_record_length(bytes, 0)? != checked_rec_len(DIRENT_HEADER_SIZE + 1)? {
+        return Err(Error::InvalidDirectoryEntry);
+    }
+    let dotdot = parse_live_entry_at(
+        bytes,
+        checked_rec_len(DIRENT_HEADER_SIZE + 1)?,
+        DirectoryEntryEncoding::Standard,
+    )?;
+    if dotdot.name().bytes() != b".." || dotdot.kind() != DirectoryEntryKind::Directory {
+        return Err(Error::InvalidDirectoryEntry);
+    }
+    let dotdot_offset = checked_rec_len(DIRENT_HEADER_SIZE + 1)?;
+    if read_record_length(bytes, dotdot_offset)?
+        != bytes
+            .len()
+            .checked_sub(dotdot_offset)
+            .ok_or(Error::ArithmeticOverflow)?
+    {
+        return Err(Error::InvalidDirectoryEntry);
+    }
+    Ok((dot, dotdot))
+}
+
+/// Updates the parent reference while preserving index metadata and its checksum coverage.
+/// The operation interprets only the fixed root records and routing-table geometry.
+/// # Errors
+/// Rejects malformed special entries, routing geometry or checksums before changing bytes.
+pub(crate) fn replace_htree_parent(
+    bytes: &mut [u8],
+    directory_inode: InodeId,
+    parent: InodeId,
+    checksum: DirectoryChecksum,
+) -> Result<InodeId> {
+    let (_dot, previous) = parse_root_dot_entries(bytes, directory_inode)?;
+    let index = DxIndex::parse_at(bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
+    put_le_u32(
+        bytes,
+        disk_offset(checked_rec_len(DIRENT_HEADER_SIZE + 1)?),
+        parent.as_u32(),
+    )?;
+    checksum.write_dx_tail(bytes, DX_ROOT_COUNT_OFFSET, index.len(), index.limit)?;
+    Ok(previous.inode())
 }
 
 /// HTree index table.
@@ -1205,17 +1237,21 @@ pub(crate) fn write_htree_node(
     index.write_at(bytes, DX_NODE_COUNT_OFFSET, checksum)
 }
 
-/// Rewrites only the routing authority and depth in an existing HTree root block.
+/// Rewrites the hash profile, routing authority and depth in an existing HTree root block.
 /// # Errors
 ///
 /// Returns an error when the existing root metadata is truncated or the new routing table cannot be
 /// represented with the root's canonical capacity/checksum layout.
 pub(crate) fn write_htree_root_index(
     bytes: &mut [u8],
+    hash: DirectoryIndexHash,
     indirect_levels: u8,
     index: &DxIndex,
     checksum: DirectoryChecksum,
 ) -> Result<()> {
+    *bytes
+        .get_mut(DX_ROOT_INFO_OFFSET + 4)
+        .ok_or(Error::InvalidDirectoryEntry)? = hash.to_raw();
     *bytes
         .get_mut(DX_ROOT_INFO_OFFSET + 6)
         .ok_or(Error::InvalidDirectoryEntry)? = indirect_levels;
@@ -1610,43 +1646,35 @@ impl DirectoryBlock {
         }
     }
 
-    /// Replaces the inode and kind of an existing entry without changing its name.
+    /// Reparents a linear directory by changing only its fixed second special record.
     /// # Errors
-    ///
-    /// Returns an error when a scanned dirent is malformed, the previous entry cannot be decoded, or
-    /// the replacement entry cannot be written in place.
-    pub(crate) fn replace(
-        &mut self,
-        name: &Ext4Name,
-        inode: InodeId,
-        kind: DirectoryEntryKind,
-    ) -> Result<Option<DirectoryEntry>> {
+    /// Rejects checksum damage, misplaced special entries or a mismatched self inode.
+    pub(crate) fn reparent(&mut self, directory: InodeId, parent: InodeId) -> Result<InodeId> {
         self.verify_leaf_checksum()?;
-        let live_limit = self.live_limit()?;
-        let mut offset = 0_usize;
-        while offset < live_limit {
-            let record = decode_record_at(
-                self.bytes
-                    .get(..live_limit)
-                    .ok_or(Error::InvalidDirectoryEntry)?,
-                offset,
-                self.encoding,
-            )?;
-            if let Some(entry) = record.entry.filter(|entry| entry.name() == name.bytes()) {
-                let previous = entry.to_owned()?;
-                put_le_u32(&mut self.bytes, disk_offset(offset), inode.as_u32())?;
-                *self
-                    .bytes
-                    .get_mut(offset.checked_add(7).ok_or(Error::ArithmeticOverflow)?)
-                    .ok_or(Error::InvalidDirectoryEntry)? = kind.to_raw();
-                self.refresh_leaf_checksum()?;
-                return Ok(Some(previous));
-            }
-            offset = offset
-                .checked_add(record.length)
-                .ok_or(Error::ArithmeticOverflow)?;
+        let bytes = self
+            .bytes
+            .get(..self.live_limit()?)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        let dot = decode_record_at(bytes, 0, self.encoding)?;
+        let entry = dot.entry.ok_or(Error::InvalidDirectoryEntry)?;
+        if dot.length != checked_rec_len(DIRENT_HEADER_SIZE + 1)?
+            || entry.inode != directory
+            || entry.name() != b"."
+            || entry.kind != DirectoryEntryKind::Directory
+        {
+            return Err(Error::InvalidDirectoryEntry);
         }
-        Ok(None)
+        let dotdot = decode_record_at(bytes, dot.length, self.encoding)?
+            .entry
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        if dotdot.name() != b".." || dotdot.kind != DirectoryEntryKind::Directory {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let previous = dotdot.inode;
+        let parent_offset = dot.length;
+        put_le_u32(&mut self.bytes, disk_offset(parent_offset), parent.as_u32())?;
+        self.refresh_leaf_checksum()?;
+        Ok(previous)
     }
 
     /// Returns the byte boundary owned by live directory entries.
@@ -2109,15 +2137,10 @@ mod tests {
         assert!(block.insert(&second)?);
         assert_eq!(read_record_length(block.bytes(), 0)?, 36);
         assert_eq!(block.bytes().get(28..36), Some(trailer.as_slice()));
-        let previous = block
-            .replace(entry.name(), inode(14)?, DirectoryEntryKind::Symlink)?
-            .ok_or(Error::DirectoryEntryNotFound)?;
-        assert_eq!(previous, entry);
-        assert_eq!(block.bytes().get(28..36), Some(trailer.as_slice()));
         let renamed = DirectoryEntry::encrypted_casefold(
-            inode(14)?,
+            inode(12)?,
             &Ext4Name::from_disk(b"renamedciphertextbytes")?,
-            DirectoryEntryKind::Symlink,
+            DirectoryEntryKind::File,
             DirectoryHash {
                 major: 0xa0b0_c0d0,
                 minor: 0x0bad_f00d,
@@ -2127,7 +2150,7 @@ mod tests {
             .rename(entry.name(), &renamed)?
             .ok_or(Error::DirectoryEntryNotFound)?;
         assert_eq!(removed.stored_hash(), entry.stored_hash());
-        assert_eq!(removed.inode(), inode(14)?);
+        assert_eq!(removed.inode(), inode(12)?);
         let entries = block.entries()?;
         assert!(entries.contains(&second));
         assert!(entries.contains(&renamed));
@@ -2138,6 +2161,13 @@ mod tests {
         assert!(rebuilt.entries()?.is_empty());
         let mut dots = DirectoryBlock::empty(128, DirectoryChecksum::None, encoding)?;
         dots.initialize_dot_entries(inode(2)?, inode(2)?)?;
+        let parent = inode(3)?;
+        assert_eq!(dots.reparent(inode(2)?, parent)?, inode(2)?);
+        assert!(
+            dots.entries()?
+                .iter()
+                .any(|entry| entry.name().bytes() == b".." && entry.inode() == parent)
+        );
         assert!(
             dots.entries()?
                 .iter()
