@@ -1230,13 +1230,22 @@ impl Disk {
     /// Returns a mount, external-journal discovery, or storage failure.
     fn mount(&mut self, access: MountAccess) -> Result<CompletedMount> {
         let length = u64::try_from(self.filesystem.len()).map_err(|_| Error::DeviceRange)?;
-        let mut step = Box::try_new(MountOperation::new(
+        let mut probe = Box::try_new(ext4_core::MountProbeOperation::new(
             DeviceLength::from_bytes(length),
-            FscryptKeySet::empty(),
-            access,
         ))
         .map_err(|_| Error::OutOfMemory)?
         .advance(OperationEvent::Admitted);
+        let prepared = loop {
+            probe = match probe {
+                ext4_core::MountProbeTransition::SubmitLower { request, suspended } => {
+                    suspended.advance(OperationEvent::StorageCompleted(self.complete(request)?))
+                }
+                ext4_core::MountProbeTransition::Complete(result) => break result?,
+            };
+        };
+        let mut step = Box::try_new(prepared.start(FscryptKeySet::empty(), access))
+            .map_err(|_| Error::OutOfMemory)?
+            .advance(OperationEvent::Admitted);
         loop {
             step = match step {
                 MountTransition::SubmitLower { request, suspended } => {

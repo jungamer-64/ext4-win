@@ -7,10 +7,10 @@ use ext4_core::{
     CompletedStorageTransfer, DurableMutation, EpochReadOperation, Error,
     ExternalJournalProbeOperation, ExternalJournalProbeOutcome, ExternalJournalProbeTransition,
     ExternalJournalRequirement, FscryptKeySet, HomeBlockDurability, JournalPayloadDurability,
-    MountOperation, MountTransition, MutationResolveOperation, MutationResolveTransition,
-    OperationEvent, OrderedDataDurability, PendingStorageTransfer, ReadTransition,
-    ReservedMutation, ResolvedMutation, StorageRequest, StorageRequestIdentity,
-    StorageRequestSequence, StorageRequestSequenceStep,
+    MountOperation, MountProbeOperation, MountProbeTransition, MountTransition,
+    MutationResolveOperation, MutationResolveTransition, OperationEvent, OrderedDataDurability,
+    PendingStorageTransfer, ReadTransition, ReservedMutation, ResolvedMutation, StorageRequest,
+    StorageRequestIdentity, StorageRequestSequence, StorageRequestSequenceStep,
 };
 use wdk_sys::STATUS_SUCCESS;
 
@@ -133,6 +133,17 @@ enum MountRequestState {
         owned: OwnedIrp,
         /// Stable kernel identities captured from the mount stack.
         admission: MountAdmission,
+    },
+    /// Primary reads precede UUID-scoped policy selection and any recovery effect.
+    Probing {
+        /// Unique mount completion owner.
+        owned: OwnedIrp,
+        /// Stable kernel identities.
+        admission: MountAdmission,
+        /// Lower primary geometry.
+        devices: MountedStorage,
+        /// Read-only admission continuation.
+        probe: Box<MountProbeOperation>,
     },
     /// Core mount resolution or recovery I/O owns the next concrete event.
     Mounting {
@@ -270,6 +281,44 @@ impl MountRequestOperation {
     /// Completes and consumes the top-level mount IRP.
     fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
         OperationTransition::Complete(owned.prepare_result(result))
+    }
+
+    /// Resolves primary identity before selecting immutable mount authority.
+    fn drive_probe(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        admission: MountAdmission,
+        devices: MountedStorage,
+        transition: MountProbeTransition,
+        catalog: &mut crate::identity::IdentityDirectory,
+    ) -> OperationTransition {
+        match transition {
+            MountProbeTransition::SubmitLower { request, suspended } => {
+                let route = devices.route();
+                self.state = MountRequestState::Probing {
+                    owned,
+                    admission,
+                    devices,
+                    probe: suspended,
+                };
+                OperationTransition::SubmitLower {
+                    devices: route,
+                    request,
+                    suspended: self,
+                }
+            }
+            MountProbeTransition::Complete(Err(error)) => Self::complete(owned, Err(error.into())),
+            MountProbeTransition::Complete(Ok(prepared)) => {
+                let mount = match memory::boxed_try_with(|| {
+                    Ok(prepared.start(FscryptKeySet::empty(), ext4_core::MountAccess::ReadWrite))
+                }) {
+                    Ok(mount) => mount,
+                    Err(error) => return Self::complete(owned, Err(error)),
+                };
+                let transition = mount.advance(OperationEvent::Admitted);
+                self.drive_mount(owned, admission, devices, transition, catalog)
+            }
+        }
     }
 
     /// Converts a core mount transition into its matching reactor action.
@@ -563,18 +612,14 @@ impl ControlDeviceOperation for MountRequestOperation {
                         };
                     let devices =
                         MountedStorage::primary(admission.file_system_device(), filesystem);
-                    let mount = match memory::boxed_try_with(move || {
-                        Ok(MountOperation::new(
-                            length,
-                            FscryptKeySet::empty(),
-                            ext4_core::MountAccess::ReadWrite,
-                        ))
+                    let probe = match memory::boxed_try_with(move || {
+                        Ok(MountProbeOperation::new(length))
                     }) {
-                        Ok(mount) => mount,
+                        Ok(probe) => probe,
                         Err(error) => return Self::complete(owned, Err(error)),
                     };
-                    let transition = mount.advance(OperationEvent::Admitted);
-                    self.drive_mount(owned, admission, devices, transition, catalog)
+                    let transition = probe.advance(OperationEvent::Admitted);
+                    self.drive_probe(owned, admission, devices, transition, catalog)
                 }
                 OperationEvent::DeviceLengthCompleted(Err(error)) => {
                     Self::complete(owned, Err(DriverError::from(error)))
@@ -590,6 +635,15 @@ impl ControlDeviceOperation for MountRequestOperation {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
+            MountRequestState::Probing {
+                owned,
+                admission,
+                devices,
+                probe,
+            } => {
+                let transition = probe.advance(event);
+                self.drive_probe(owned, admission, devices, transition, catalog)
+            }
             MountRequestState::Mounting {
                 owned,
                 admission,

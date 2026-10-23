@@ -1677,6 +1677,107 @@ impl ExternalJournalProbeOperation {
     }
 }
 
+/// Read-only primary-device probe. It grants no recovery or media-write authority.
+#[derive(Debug)]
+pub struct MountProbeOperation {
+    /// The primary bytes retained for the selected mount, avoiding an identity reread race.
+    filesystem: StorageTranscript,
+}
+/// Probe suspension or a consumed preparation that can accept exactly one mount policy.
+#[derive(Debug)]
+pub enum MountProbeTransition {
+    /// Only reads can be produced before policy selection.
+    SubmitLower {
+        /// Owned primary-device read.
+        request: crate::StorageRequest,
+        /// Sole continuation for its completion.
+        suspended: Box<MountProbeOperation>,
+    },
+    /// Primary geometry is admitted; recovery still has to establish mounted validity.
+    Complete(Result<ProbedMount>),
+}
+/// Primary admission retained across UUID-scoped policy selection.
+///
+/// Its UUID identifies policy, not a healthy filesystem: a damaged primary may require journal
+/// repair, and ordinary mount validation must finish before any mounted state is published.
+#[derive(Debug)]
+pub struct ProbedMount {
+    /// Captured primary reads become the mount's sole bootstrap transcript.
+    filesystem: StorageTranscript,
+    /// Filesystem identity extracted from admitted recovery geometry.
+    uuid: FilesystemUuid,
+}
+impl MountProbeOperation {
+    /// Starts a primary probe without any permission to mutate storage.
+    pub const fn new(length: DeviceLength) -> Self {
+        Self {
+            filesystem: StorageTranscript::new(StorageTarget::Filesystem, length),
+        }
+    }
+    /// Consumes a probe event until another read or the policy-selection boundary.
+    #[must_use]
+    pub fn advance(mut self: Box<Self>, event: super::OperationEvent) -> MountProbeTransition {
+        let accepted = match event {
+            super::OperationEvent::Admitted => Ok(()),
+            super::OperationEvent::StorageCompleted(completion) => {
+                self.filesystem.complete(completion)
+            }
+            super::OperationEvent::CancelRequested => Err(Error::OperationCancelled),
+            _ => Err(Error::DeviceIo),
+        };
+        if let Err(error) = accepted {
+            return MountProbeTransition::Complete(Err(error));
+        }
+        let result = (|| {
+            let mut device = OperationDevice::new(&mut self.filesystem);
+            let primary = match Superblock::read_write_from(&mut device)? {
+                PrimarySuperblockRead::Valid(value) => value,
+                PrimarySuperblockRead::ChecksumInvalid(value) => value.recovery_bootstrap(),
+                PrimarySuperblockRead::TornWriteSession { repair } => {
+                    Superblock::parse_read_write(&repair)?
+                }
+            };
+            Ok(primary.uuid())
+        })();
+        match result {
+            Ok(uuid) => MountProbeTransition::Complete(Ok(ProbedMount {
+                filesystem: self.filesystem,
+                uuid,
+            })),
+            Err(Error::OperationSuspended) => match self.filesystem.take_pending_request() {
+                Ok(request) => MountProbeTransition::SubmitLower {
+                    request,
+                    suspended: self,
+                },
+                Err(error) => MountProbeTransition::Complete(Err(error)),
+            },
+            Err(error) => MountProbeTransition::Complete(Err(error)),
+        }
+    }
+}
+impl ProbedMount {
+    /// UUID used to pin the next-mount policy before recovery can accept any effect.
+    pub const fn uuid(&self) -> FilesystemUuid {
+        self.uuid
+    }
+    /// Consumes primary admission and fixes media authority for the entire mounted session.
+    pub fn start(self, fscrypt_keys: FscryptKeySet, access: super::MountAccess) -> MountOperation {
+        MountOperation {
+            access,
+            recovery: match access {
+                super::MountAccess::ReadWrite => None,
+                super::MountAccess::ReadOnly { recovery_memory } => {
+                    Some(super::recovery::RecoveryOverlay::new(recovery_memory))
+                }
+            },
+            filesystem: self.filesystem,
+            fscrypt_keys: Some(fscrypt_keys),
+            state: MountState::Resolving,
+            cancel_requested: false,
+        }
+    }
+}
+
 /// One consuming transition of the mount operation.
 #[derive(Debug)]
 pub enum MountTransition {

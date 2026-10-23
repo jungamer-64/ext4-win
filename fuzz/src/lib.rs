@@ -4,8 +4,8 @@
 
 use ext4_core::{
     CompletedStorageTransfer, DeviceLength, Error, ExternalJournalProbeOperation,
-    ExternalJournalProbeOutcome, ExternalJournalProbeTransition, FscryptKeySet, MountOperation,
-    MountTransition, OperationEvent, StorageCompletion, StorageRequest, StorageTarget,
+    ExternalJournalProbeOutcome, ExternalJournalProbeTransition, FscryptKeySet, MountTransition,
+    OperationEvent, StorageCompletion, StorageRequest, StorageTarget,
 };
 use std::boxed::Box;
 
@@ -173,16 +173,34 @@ fn run_mount(
     external_journal: Option<&[u8]>,
     access: ext4_core::MountAccess,
 ) -> MountOutcome {
-    let Ok(operation) = Box::try_new(MountOperation::new(
-        DeviceLength::from_bytes(u64::try_from(filesystem.len()).unwrap_or(u64::MAX)),
-        FscryptKeySet::empty(),
-        access,
-    )) else {
-        return MountOutcome::Rejected;
-    };
     let mut devices = Devices {
         filesystem: filesystem.to_vec(),
         external_journal: external_journal.map(<[u8]>::to_vec),
+    };
+    let Ok(probe) = Box::try_new(ext4_core::MountProbeOperation::new(
+        DeviceLength::from_bytes(u64::try_from(filesystem.len()).unwrap_or(u64::MAX)),
+    )) else {
+        return MountOutcome::Rejected;
+    };
+    let mut probe = probe.advance(OperationEvent::Admitted);
+    let mut prepared = None;
+    for _ in 0..MAX_STEPS {
+        probe = match probe {
+            ext4_core::MountProbeTransition::SubmitLower { request, suspended } => {
+                let completion = devices.complete(request);
+                suspended.advance(OperationEvent::StorageCompleted(completion))
+            }
+            ext4_core::MountProbeTransition::Complete(result) => {
+                prepared = result.ok();
+                break;
+            }
+        };
+    }
+    let Some(prepared) = prepared else {
+        return MountOutcome::Rejected;
+    };
+    let Ok(operation) = Box::try_new(prepared.start(FscryptKeySet::empty(), access)) else {
+        return MountOutcome::Rejected;
     };
     let mut transition = operation.advance(OperationEvent::Admitted);
     for _step in 0..MAX_STEPS {

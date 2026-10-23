@@ -28,9 +28,9 @@ pub use mount::{
     CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CommittedEpoch,
     CommittedReadContext, CompletedMount, EpochSequence, ExternalJournalProbeOperation,
     ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
-    MountOperation, MountTransition, MountedProfile, MutationCoordinatorState, MutationResource,
-    ObservedResourceVersionSet, ResourceVersion, ValidatedExternalJournal, VolumeGeometry,
-    VolumeIdentity,
+    MountOperation, MountProbeOperation, MountProbeTransition, MountTransition, MountedProfile,
+    MutationCoordinatorState, MutationResource, ObservedResourceVersionSet, ProbedMount,
+    ResourceVersion, ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
     ChildLookup, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,

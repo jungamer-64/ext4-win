@@ -776,6 +776,28 @@ fn write_host_range(file: &mut File, offset: u64, bytes: &[u8]) -> TaskResult<()
     Ok(())
 }
 
+/// Resolves UUID admission before selecting media authority.
+/// # Errors
+/// Propagates storage, allocation, or primary validation failure.
+fn probe_core_mount<S: HostStorage>(
+    storage: &mut S,
+    length: ext4_core::DeviceLength,
+) -> TaskResult<ext4_core::ProbedMount> {
+    let mut probe = Box::try_new(ext4_core::MountProbeOperation::new(length))?
+        .advance(ext4_core::OperationEvent::Admitted);
+    loop {
+        probe = match probe {
+            ext4_core::MountProbeTransition::SubmitLower { request, suspended } => suspended
+                .advance(ext4_core::OperationEvent::StorageCompleted(
+                    complete_file_request(storage, request)?,
+                )),
+            ext4_core::MountProbeTransition::Complete(result) => {
+                return result.map_err(|error| core_task_error(error).into());
+            }
+        };
+    }
+}
+
 /// Opens and fully mounts one internal-journal image through the public production protocol.
 ///
 /// # Errors
@@ -787,8 +809,7 @@ fn mount_internal_core<S: HostStorage>(
 ) -> TaskResult<Box<ext4_core::CompletedMount>> {
     let filesystem_length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
-    let mut transition = Box::try_new(ext4_core::MountOperation::new(
-        filesystem_length,
+    let mut transition = Box::try_new(probe_core_mount(storage, filesystem_length)?.start(
         ext4_core::FscryptKeySet::empty(),
         ext4_core::MountAccess::ReadWrite,
     ))?
@@ -826,8 +847,7 @@ fn mount_external_core<S: HostStorage>(
     let external_length = ext4_core::DeviceLength::from_bytes(
         storage.length(ext4_core::StorageTarget::ExternalJournal)?,
     );
-    let mut transition = Box::try_new(ext4_core::MountOperation::new(
-        filesystem_length,
+    let mut transition = Box::try_new(probe_core_mount(storage, filesystem_length)?.start(
         ext4_core::FscryptKeySet::empty(),
         ext4_core::MountAccess::ReadWrite,
     ))?
@@ -864,8 +884,7 @@ fn run_internal_mount_until_boundary(
     let filesystem_length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let mut controller = EffectBoundaryController::new(cut)?;
-    let mut transition = Box::try_new(ext4_core::MountOperation::new(
-        filesystem_length,
+    let mut transition = Box::try_new(probe_core_mount(&mut storage, filesystem_length)?.start(
         ext4_core::FscryptKeySet::empty(),
         ext4_core::MountAccess::ReadWrite,
     ))?
@@ -936,8 +955,7 @@ fn run_external_mount_until_boundary(
         storage.length(ext4_core::StorageTarget::ExternalJournal)?,
     );
     let mut controller = EffectBoundaryController::new(cut)?;
-    let mut transition = Box::try_new(ext4_core::MountOperation::new(
-        filesystem_length,
+    let mut transition = Box::try_new(probe_core_mount(&mut storage, filesystem_length)?.start(
         ext4_core::FscryptKeySet::empty(),
         ext4_core::MountAccess::ReadWrite,
     ))?
