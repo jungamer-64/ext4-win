@@ -29,7 +29,7 @@ pub use disk::storage::{
 pub use disk_format::acl::{AclGroup, AclPermissions, AclUser, Ext4Access, PosixAcl};
 pub use disk_format::inode::{
     Ext4Gid, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
-    Ext4Uid, FileAllocationSize, FileOffset, FileSize, NewDirectoryMetadata, NewFileMetadata,
+    Ext4Uid, FileAllocationSize, FileOffset, FileSize, InodeId, NewDirectoryMetadata, NewFileMetadata,
     NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
 pub use disk_format::name::Ext4Name;
