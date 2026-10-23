@@ -10,20 +10,12 @@ use alloc::vec::Vec;
 /// Runtime artifact generated in Cargo's target-specific output directory.
 const DATA: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/casefold.bin"));
 /// One closed scalar mapping record, including its canonical combining class.
-const RECORD_BYTES: usize = 24;
+const RECORD_BYTES: usize = 16;
 
-/// Canonical and full-fold mappings have separate ordering boundaries.
-#[derive(Clone, Copy, Debug)]
-enum Stage {
-    /// Reorders non-starters while their original combining classes still apply.
-    Canonical,
-    /// Case mappings may turn non-starters into starters after the first ordering boundary.
-    Folded,
-}
 /// Borrowed immutable table sections; offsets never escape their originating byte domain.
 #[derive(Clone, Copy, Debug)]
 struct Table {
-    /// Sorted scalar records with both closed mappings.
+    /// Sorted scalar records with closed casefold and canonical-decomposition mappings.
     records: &'static [u8],
     /// Sorted inclusive ranges of assigned scalars.
     assigned: &'static [u8],
@@ -35,7 +27,7 @@ impl Table {
     /// # Errors
     /// Rejects stale layout markers, truncated sections or overflow.
     fn load() -> Result<Self> {
-        if DATA.get(..8) != Some(b"U121CF02") {
+        if DATA.get(..8) != Some(b"U121CF03") {
             return Err(Error::InvalidName);
         }
         let records_len = usize::try_from(word(DATA, 8)?)
@@ -115,23 +107,21 @@ impl Table {
     /// Rejects malformed artifact records.
     fn class(self, cp: char) -> Result<u8> {
         self.record(u32::from(cp))?
-            .map(|record| record.get(20).copied().ok_or(Error::InvalidName))
+            .map(|record| record.get(12).copied().ok_or(Error::InvalidName))
             .unwrap_or(Ok(0))
     }
-    /// Expands one mapping phase, then stably orders its non-starters.
+    /// Expands each closed scalar mapping, then stably orders the resulting non-starters.
     /// # Errors
     /// Preserves allocation, malformed artifact and invalid Unicode errors.
-    fn apply(self, input: &str, stage: Stage) -> Result<Vec<(char, u8)>> {
+    fn apply(self, input: &str) -> Result<Vec<(char, u8)>> {
         let mut output = Vec::new();
+        let mut segment_start = 0_usize;
         for cp in input.chars() {
             let mut identity = [0; 4];
             let mapping = match self.record(u32::from(cp))? {
                 None => cp.encode_utf8(&mut identity),
                 Some(record) => {
-                    let field = match stage {
-                        Stage::Canonical => 4,
-                        Stage::Folded => 12,
-                    };
+                    let field = 4_usize;
                     let start = usize::try_from(word(record, field)?)
                         .map_err(|_| Error::ArithmeticOverflow)?;
                     let size = usize::try_from(word(
@@ -144,13 +134,19 @@ impl Table {
                         .map_err(|_| Error::InvalidName)?
                 }
             };
+            // An omitted scalar still separates canonical ordering segments in the filesystem
+            // encoding. Removing that boundary would move marks across an invisible starter.
+            if mapping.is_empty() {
+                segment_start = output.len();
+            }
             for mapped in mapping.chars() {
                 let class = self.class(mapped)?;
                 let mut at = output.len();
                 if class != 0 {
-                    while let Some((_, prior)) =
-                        at.checked_sub(1).and_then(|index| output.get(index))
-                    {
+                    while at > segment_start {
+                        let (_, prior) = output
+                            .get(at.checked_sub(1).ok_or(Error::ArithmeticOverflow)?)
+                            .ok_or(Error::InvalidName)?;
                         if *prior == 0 || *prior <= class {
                             break;
                         }
@@ -158,12 +154,17 @@ impl Table {
                     }
                 }
                 output.try_insert(at, (mapped, class))?;
+                if class == 0 {
+                    segment_start = output.len();
+                }
             }
         }
         Ok(output)
     }
 }
-/// Validates the original input before any deletion or expansion, then closes both phases.
+/// Validates the original input, expands closed scalar mappings, then orders their results.
+/// ext4 hashes this observable ordering. A mapping that changes a combining class participates
+/// using its result class; reordering the original scalar sequence first produces different keys.
 /// # Errors
 /// Returns invalid UTF-8, unsupported-age scalars, allocation or malformed generated data errors.
 pub(super) fn fold(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -174,9 +175,7 @@ pub(super) fn fold(bytes: &[u8]) -> Result<Vec<u8>> {
             return Err(Error::InvalidName);
         }
     }
-    let canonical = encode(table.apply(input, Stage::Canonical)?)?;
-    let canonical = core::str::from_utf8(&canonical).map_err(|_| Error::InvalidName)?;
-    encode(table.apply(canonical, Stage::Folded)?)
+    encode(table.apply(input)?)
 }
 /// Encodes owned ordered scalars through fallible byte growth.
 /// # Errors

@@ -148,32 +148,22 @@ fn build(cache: &Path) -> GenerationResult<Vec<u8>> {
         let Some(scalar) = char::from_u32(cp) else {
             continue;
         };
-        let canonical = properties.normalize_stage(&[cp], NormalizationStage::Canonical)?;
-        let folded = properties.normalize_stage(&[cp], NormalizationStage::Folded)?;
-        let encode = |sequence: Vec<u32>| -> GenerationResult<String> {
-            sequence
-                .into_iter()
-                .map(|cp| {
-                    char::from_u32(cp)
-                        .ok_or_else(|| io::Error::other("invalid mapped scalar").into())
-                })
-                .collect()
-        };
-        let canonical = encode(canonical)?;
-        let folded = encode(folded)?;
+        let normalized = properties.normalize_stage(&[cp], NormalizationStage::Folded)?;
+        let mut mapping = String::new();
+        for cp in normalized {
+            mapping
+                .push(char::from_u32(cp).ok_or_else(|| io::Error::other("invalid mapped scalar"))?);
+        }
         let combining = properties.combining.get(&cp).copied().unwrap_or(0);
         let mut identity = [0; 4];
-        let identity = scalar.encode_utf8(&mut identity).as_bytes();
-        if canonical.as_bytes() == identity && folded.as_bytes() == identity && combining == 0 {
+        if mapping.as_bytes() == scalar.encode_utf8(&mut identity).as_bytes() && combining == 0 {
             continue;
         }
         records.extend_from_slice(&cp.to_le_bytes());
-        for mapping in [canonical, folded] {
-            records.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
-            records.extend_from_slice(&u32::try_from(mapping.len())?.to_le_bytes());
-            payload.extend_from_slice(mapping.as_bytes());
-        }
+        records.extend_from_slice(&u32::try_from(payload.len())?.to_le_bytes());
+        records.extend_from_slice(&u32::try_from(mapping.len())?.to_le_bytes());
         records.extend_from_slice(&[combining, 0, 0, 0]);
+        payload.extend_from_slice(mapping.as_bytes());
         count = count
             .checked_add(1)
             .ok_or_else(|| io::Error::other("Unicode record count overflow"))?;
@@ -183,22 +173,39 @@ fn build(cache: &Path) -> GenerationResult<Vec<u8>> {
         if fields.is_empty() || field(&fields, 0)?.starts_with('@') {
             continue;
         }
-        let expected = properties.normalize(&sequence(field(&fields, 2)?)?)?;
+        let expected = sequence(field(&fields, 2)?)?;
+        if properties.normalize_stage(&expected, NormalizationStage::Canonical)? != expected {
+            return Err(
+                io::Error::other("canonical normalization column is not idempotent").into(),
+            );
+        }
         for index in [0, 1] {
-            if properties.normalize(&sequence(field(&fields, index)?)?)? != expected {
+            if properties.normalize_stage(
+                &sequence(field(&fields, index)?)?,
+                NormalizationStage::Canonical,
+            )? != expected
+            {
                 return Err(io::Error::other(format!(
                     "Unicode canonical equivalence failed: {line}"
                 ))
                 .into());
             }
         }
-        if properties.normalize(&sequence(field(&fields, 3)?)?)?
-            != properties.normalize(&sequence(field(&fields, 4)?)?)?
-        {
-            return Err(io::Error::other("Unicode compatibility-column equivalence failed").into());
+        let compatibility_decomposed = sequence(field(&fields, 4)?)?;
+        for index in [3, 4] {
+            if properties.normalize_stage(
+                &sequence(field(&fields, index)?)?,
+                NormalizationStage::Canonical,
+            )? != compatibility_decomposed
+            {
+                return Err(io::Error::other(
+                    "Unicode compatibility-column canonical decomposition failed",
+                )
+                .into());
+            }
         }
     }
-    let mut output = Vec::from(*b"U121CF02");
+    let mut output = Vec::from(*b"U121CF03");
     output.extend_from_slice(&count.to_le_bytes());
     output.extend_from_slice(&u32::try_from(properties.assigned.len())?.to_le_bytes());
     output.extend_from_slice(&records);
@@ -212,19 +219,12 @@ fn build(cache: &Path) -> GenerationResult<Vec<u8>> {
 /// Ordered normalization phases with distinct mapping authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NormalizationStage {
-    /// Establish canonical order before a case mapping can change a combining class.
+    /// Validates canonical decomposition against the independent Unicode normalization corpus.
     Canonical,
-    /// Apply full locale-independent folding after canonical ordering.
+    /// Closes scalar casefold/decomposition mappings before ordering the complete name.
     Folded,
 }
 impl Properties {
-    /// Expands independent mappings and applies stable canonical combining-class ordering.
-    /// # Errors
-    /// Returns malformed recursive mappings or an invalid Unicode scalar.
-    fn normalize(&self, input: &[u32]) -> GenerationResult<Vec<u32>> {
-        let canonical = self.normalize_stage(input, NormalizationStage::Canonical)?;
-        self.normalize_stage(&canonical, NormalizationStage::Folded)
-    }
     /// Applies one phase and canonical ordering without crossing its mapping boundary.
     /// # Errors
     /// Returns malformed source mappings or invalid Unicode scalars.
@@ -273,10 +273,11 @@ impl Properties {
         if depth >= 32 {
             return Err(io::Error::other("recursive Unicode mapping").into());
         }
-        if self
-            .ignored
-            .iter()
-            .any(|(start, end)| *start <= cp && cp <= *end)
+        if stage == NormalizationStage::Folded
+            && self
+                .ignored
+                .iter()
+                .any(|(start, end)| *start <= cp && cp <= *end)
         {
             return Ok(());
         }

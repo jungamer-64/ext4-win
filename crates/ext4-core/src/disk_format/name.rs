@@ -167,7 +167,7 @@ mod tests {
             ("Σςσ", "σσσ"),
             ("Å", "a\u{30a}"),
             ("각", "\u{1100}\u{1161}\u{11a8}"),
-            ("A\u{345}\u{35d}\u{345}B", "a\u{35d}\u{3b9}\u{3b9}b"),
+            ("A\u{345}\u{35d}\u{345}B", "a\u{3b9}\u{35d}\u{3b9}b"),
             ("ab\u{200d}cd", "ABCD"),
         ] {
             assert!(names.equivalent(
@@ -190,38 +190,36 @@ mod tests {
         Ok(())
     }
     /// # Errors
-    /// Returns malformed official fields, normalization rejection or physical allocation failure.
+    /// Propagates normalization or malformed hex-vector failures.
     /// # Panics
-    /// Fails if canonically equivalent official vectors acquire different comparison keys.
+    /// Fails if results differ from independently executed e2fsprogs 1.47.2 casefold outputs.
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
-        reason = "official Unicode normalization columns are an independent semantic oracle"
+        reason = "reference outputs preserve the format's exact scalar-expansion and combining order"
     )]
-    fn official_canonical_equivalence_vectors() -> Result<()> {
-        let text = include_str!("../../data/unicode-12.1.0/NormalizationTest.txt");
-        for line in text.lines() {
-            let data = line.split('#').next().unwrap_or("").trim();
-            if data.is_empty() || data.starts_with('@') {
-                continue;
-            }
-            let mut values = Vec::new();
-            for column in data.split(';').take(5) {
+    fn filesystem_casefold_known_answers() -> Result<()> {
+        for (input, expected) in [
+            ("61cd85cd9dcd8562", "61ceb9cd9dceb962"),
+            ("61cd9dcd85cd8562", "61cd9dceb9ceb962"),
+            ("efacb4e281a1e0ab8d", "d794d6bce0ab8d"),
+            ("efacb4e0ab8d", "d794e0ab8dd6bc"),
+        ] {
+            let decode = |text: &str| -> Result<Vec<u8>> {
                 let mut bytes = Vec::new();
-                for value in column.split_whitespace() {
-                    let scalar = u32::from_str_radix(value, 16).map_err(|_| Error::InvalidName)?;
-                    let cp = char::from_u32(scalar).ok_or(Error::InvalidName)?;
-                    let mut encoded = [0; 4];
-                    use crate::memory::FallibleVec as _;
-                    bytes.try_extend_from_slice(cp.encode_utf8(&mut encoded).as_bytes())?;
+                let (pairs, remainder) = text.as_bytes().as_chunks::<2>();
+                if !remainder.is_empty() {
+                    return Err(Error::InvalidName);
                 }
-                use crate::memory::FallibleVec as _;
-                values.try_push(normalization::fold(&bytes)?)?;
-            }
-            for index in [0, 1] {
-                assert_eq!(values.get(index), values.get(2), "{line}");
-            }
-            assert_eq!(values.get(3), values.get(4), "{line}");
+                for pair in pairs {
+                    let text = core::str::from_utf8(pair).map_err(|_| Error::InvalidName)?;
+                    use crate::memory::FallibleVec as _;
+                    bytes
+                        .try_push(u8::from_str_radix(text, 16).map_err(|_| Error::InvalidName)?)?;
+                }
+                Ok(bytes)
+            };
+            assert_eq!(normalization::fold(&decode(input)?)?, decode(expected)?);
         }
         Ok(())
     }
