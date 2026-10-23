@@ -1271,13 +1271,23 @@ pub struct CompletedMount {
     epoch: CommittedEpoch,
     /// Mutable journal and mutation coordinator.
     coordinator: MutationCoordinatorState,
+    /// Sole media ownership lease, requiring independent host heartbeat and final release.
+    mmp: Option<super::MmpLease>,
 }
 
 impl CompletedMount {
-    /// Separates the three mount-owned state domains for VCB publication.
+    /// Transfers core state and the independent physical lease to the host.
+    /// The host owns heartbeat, mutation fencing and clean release after filesystem finalization.
     #[must_use]
-    pub fn into_parts(self) -> (MountedProfile, CommittedEpoch, MutationCoordinatorState) {
-        (self.profile, self.epoch, self.coordinator)
+    pub fn into_parts(
+        self,
+    ) -> (
+        MountedProfile,
+        CommittedEpoch,
+        MutationCoordinatorState,
+        Option<super::MmpLease>,
+    ) {
+        (self.profile, self.epoch, self.coordinator, self.mmp)
     }
 }
 
@@ -1704,8 +1714,10 @@ pub enum MountProbeTransition {
 pub struct ProbedMount {
     /// Captured primary reads become the mount's sole bootstrap transcript.
     filesystem: StorageTranscript,
-    /// Immutable primary admission used for identity and physical ownership selection.
-    primary: Superblock,
+    /// UUID pinned before policy selection; journal recovery may not replace this identity.
+    uuid: FilesystemUuid,
+    /// Immutable physical ownership domain selected by primary validation.
+    mmp: Option<crate::disk_format::mmp::MmpParameters>,
 }
 impl MountProbeOperation {
     /// Starts a primary probe without any permission to mutate storage.
@@ -1732,7 +1744,13 @@ impl MountProbeOperation {
             let mut device = OperationDevice::new(&mut self.filesystem);
             let primary = match Superblock::read_write_from(&mut device)? {
                 PrimarySuperblockRead::Valid(value) => value,
-                PrimarySuperblockRead::ChecksumInvalid(value) => value.recovery_bootstrap(),
+                PrimarySuperblockRead::ChecksumInvalid(value) => {
+                    let primary = value.recovery_bootstrap();
+                    if primary.mmp().is_some() {
+                        return Err(Error::MmpCorrupt);
+                    }
+                    primary
+                }
                 PrimarySuperblockRead::TornWriteSession { repair } => {
                     Superblock::parse_read_write(&repair)?
                 }
@@ -1742,7 +1760,8 @@ impl MountProbeOperation {
         match result {
             Ok(primary) => MountProbeTransition::Complete(Ok(ProbedMount {
                 filesystem: self.filesystem,
-                primary,
+                uuid: primary.uuid(),
+                mmp: primary.mmp(),
             })),
             Err(Error::OperationSuspended) => match self.filesystem.take_pending_request() {
                 Ok(request) => MountProbeTransition::SubmitLower {
@@ -1758,7 +1777,7 @@ impl MountProbeOperation {
 impl ProbedMount {
     /// UUID used to pin the next-mount policy before recovery can accept any effect.
     pub const fn uuid(&self) -> FilesystemUuid {
-        self.primary.uuid()
+        self.uuid
     }
     /// Consumes primary admission and fixes media authority for the entire mounted session.
     /// # Errors
@@ -1770,13 +1789,16 @@ impl ProbedMount {
         owner: super::MmpOwner,
         now: super::MmpTime,
     ) -> Result<MountOperation> {
-        let ownership =
-            match super::MmpOperation::acquire(self.primary, owner, access.media_access())? {
-                Some(operation) => MountOwnership::Starting(memory::try_box(operation)?),
-                None => MountOwnership::Unprotected,
-            };
+        let ownership = match self.mmp {
+            Some(parameters) => MountOwnership::Starting(memory::try_box(
+                super::MmpOperation::acquire(parameters, owner, access.media_access())?,
+            )?),
+            None => MountOwnership::Unprotected,
+        };
         Ok(MountOperation {
             ownership,
+            mmp_parameters: self.mmp,
+            primary_uuid: self.uuid,
             now,
             access,
             recovery: match access {
@@ -1796,6 +1818,13 @@ impl ProbedMount {
 /// One consuming transition of the mount operation.
 #[derive(Debug)]
 pub enum MountTransition {
+    /// Direct ownership protocol transfer; no failed write may be blindly retried.
+    SubmitOwnership {
+        /// Complete uncached filesystem-device transfer.
+        request: crate::StorageRequest,
+        /// Sole mount continuation, including all provisional recovery state.
+        suspended: Box<MountOperation>,
+    },
     /// Independent media ownership observation requires a complete monotonic delay.
     WaitForTimer {
         /// Delay required before another ownership read can establish admission.
@@ -1826,6 +1855,10 @@ pub enum MountTransition {
 pub struct MountOperation {
     /// Independent ownership is established before journal replay and retained through publication.
     ownership: MountOwnership,
+    /// Immutable placement selected before recovery; replay cannot substitute another ownership domain.
+    mmp_parameters: Option<crate::disk_format::mmp::MmpParameters>,
+    /// UUID that selected the mount policy before recovery; replay cannot substitute another policy domain.
+    primary_uuid: FilesystemUuid,
     /// Host clock sampled at the current consuming event boundary.
     now: super::MmpTime,
     /// Media authority fixed before the first mount operation.
@@ -2062,7 +2095,9 @@ impl MountOperation {
     pub fn attach_external_journal(
         mut self: Box<Self>,
         validated: Box<ValidatedExternalJournal>,
+        now: super::MmpTime,
     ) -> MountTransition {
+        self.now = now;
         let validated = *validated;
         let state = core::mem::replace(&mut self.state, MountState::Resolving);
         let MountState::AwaitingExternal {
@@ -2096,6 +2131,29 @@ impl MountOperation {
         now: super::MmpTime,
     ) -> MountTransition {
         self.now = now;
+        let ownership = core::mem::replace(&mut self.ownership, MountOwnership::Unprotected);
+        match ownership {
+            MountOwnership::Starting(operation) => {
+                let event = match event {
+                    super::OperationEvent::Admitted => super::MmpEvent::Start,
+                    super::OperationEvent::CancelRequested => super::MmpEvent::Cancel,
+                    _ => return MountTransition::Complete(Err(Error::DeviceIo)),
+                };
+                return self.accept_ownership(operation.advance(event, now));
+            }
+            MountOwnership::Pending(operation) => {
+                let event = match event {
+                    super::OperationEvent::StorageCompleted(completion) => {
+                        super::MmpEvent::StorageCompleted(completion)
+                    }
+                    super::OperationEvent::TimerElapsed => super::MmpEvent::Elapsed,
+                    super::OperationEvent::CancelRequested => super::MmpEvent::Cancel,
+                    _ => return MountTransition::Complete(Err(Error::DeviceIo)),
+                };
+                return self.accept_ownership(operation.advance(event, now));
+            }
+            ownership => self.ownership = ownership,
+        }
         let accepted = match event {
             super::OperationEvent::Admitted => match &self.state {
                 MountState::Resolving => Ok(()),
@@ -2133,6 +2191,36 @@ impl MountOperation {
             return MountTransition::Complete(Err(error));
         }
         self.drive()
+    }
+
+    /// Ownership effects bypass the recovery overlay and every metadata transcript.
+    fn accept_ownership(mut self: Box<Self>, transition: super::MmpTransition) -> MountTransition {
+        match transition {
+            super::MmpTransition::SubmitLower { request, suspended } => {
+                self.ownership = MountOwnership::Pending(suspended);
+                MountTransition::SubmitOwnership {
+                    request,
+                    suspended: self,
+                }
+            }
+            super::MmpTransition::Wait { seconds, suspended } => {
+                self.ownership = MountOwnership::Pending(suspended);
+                MountTransition::WaitForTimer {
+                    seconds,
+                    suspended: self,
+                }
+            }
+            super::MmpTransition::Complete(Ok(lease)) => {
+                self.ownership = match lease {
+                    Some(lease) => MountOwnership::Held(lease),
+                    None => MountOwnership::Unprotected,
+                };
+                self.drive()
+            }
+            super::MmpTransition::Complete(Err(failure)) => {
+                MountTransition::Complete(Err(failure.reason))
+            }
+        }
     }
 
     /// Routes one completion exclusively to the phase that submitted it.
@@ -2247,6 +2335,25 @@ impl MountOperation {
 
     /// Executes private recovery effects without ever publishing them to backing storage.
     fn drive(mut self: Box<Self>) -> MountTransition {
+        let ownership = core::mem::replace(&mut self.ownership, MountOwnership::Unprotected);
+        match ownership {
+            MountOwnership::Held(lease) => {
+                if let Err(error) = lease.authorize(self.now) {
+                    return MountTransition::Complete(Err(error));
+                }
+                if lease.renewal_due(self.now) {
+                    let operation = match memory::try_box(lease.renew()) {
+                        Ok(operation) => operation,
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    };
+                    let now = self.now;
+                    return self.accept_ownership(operation.advance(super::MmpEvent::Start, now));
+                }
+                self.ownership = MountOwnership::Held(lease);
+            }
+            MountOwnership::Unprotected => {}
+            _ => return MountTransition::Complete(Err(Error::DeviceIo)),
+        }
         loop {
             let transition = self.drive_step();
             let MountTransition::SubmitLower {
@@ -2528,7 +2635,13 @@ impl MountOperation {
                     match raw {
                         Ok(raw) => {
                             let marked = match Superblock::parse_read_write(&raw) {
-                                Ok(marked) => marked,
+                                Ok(marked)
+                                    if marked.mmp() == self.mmp_parameters
+                                        && marked.uuid() == self.primary_uuid =>
+                                {
+                                    marked
+                                }
+                                Ok(_) => return MountTransition::Complete(Err(Error::MmpCorrupt)),
                                 Err(error) => return MountTransition::Complete(Err(error)),
                             };
                             let keys = match self.fscrypt_keys.take() {
@@ -2545,6 +2658,7 @@ impl MountOperation {
                                 Err(error) => return MountTransition::Complete(Err(error)),
                             };
                             let completed = CompletedMount {
+                                mmp: None,
                                 profile: MountedProfile::new(
                                     &epoch.mount,
                                     marked,
@@ -2706,6 +2820,11 @@ impl MountOperation {
                     return MountTransition::Complete(Err(Error::DeviceIo));
                 }
                 MountState::Published(mut completed) => {
+                    completed.mmp = match self.ownership {
+                        MountOwnership::Held(lease) => Some(lease),
+                        MountOwnership::Unprotected => None,
+                        _ => return MountTransition::Complete(Err(Error::DeviceIo)),
+                    };
                     if let Some(recovery) = self.recovery.take() {
                         completed.epoch.recovery = match recovery.seal() {
                             Ok(recovery) => Some(recovery),
@@ -2741,6 +2860,9 @@ impl MountOperation {
             }
         };
         let superblock = primary.recovery_bootstrap();
+        if superblock.mmp() != self.mmp_parameters || superblock.uuid() != self.primary_uuid {
+            return Err(Error::MmpCorrupt);
+        }
         match superblock.journal_mode() {
             JournalMode::Internal(journal_inode_id) => {
                 let journal_inode = {

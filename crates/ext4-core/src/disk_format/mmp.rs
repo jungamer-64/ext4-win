@@ -13,7 +13,7 @@ pub(crate) struct MmpParameters {
     pub(crate) bytes: crate::BlockSize,
     /// Metadata checksum feature selects authentication, including explicit seed support.
     pub(crate) seed: Option<u32>,
-    /// Requested heartbeat period; zero on disk selects the format's minimum interval.
+    /// Requested heartbeat period; zero selects the host's default period.
     pub(crate) update_seconds: u16,
 }
 

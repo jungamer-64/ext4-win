@@ -313,13 +313,24 @@ impl MountRequestOperation {
                     Ok(policy) => policy,
                     Err(error) => return Self::complete(owned, Err(error)),
                 };
+                let now = match crate::kernel::time::mmp_time() {
+                    Ok(now) => now,
+                    Err(error) => return Self::complete(owned, Err(error)),
+                };
                 let mount = match memory::boxed_try_with(|| {
-                    Ok(prepared.start(FscryptKeySet::empty(), policy.policy.mount_access()))
+                    let mut entropy = [0; 16];
+                    crate::kernel::cng::random_bytes(&mut entropy)?;
+                    Ok(prepared.start(
+                        FscryptKeySet::empty(),
+                        policy.policy.mount_access(),
+                        ext4_core::MmpOwner::new(entropy),
+                        now,
+                    )?)
                 }) {
                     Ok(mount) => mount,
                     Err(error) => return Self::complete(owned, Err(error)),
                 };
-                let transition = mount.advance(OperationEvent::Admitted);
+                let transition = mount.advance(OperationEvent::Admitted, now);
                 self.drive_mount(owned, admission, devices, transition, catalog)
             }
         }
@@ -335,6 +346,32 @@ impl MountRequestOperation {
         catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> OperationTransition {
         match transition {
+            MountTransition::WaitForTimer { seconds, suspended } => {
+                self.state = MountRequestState::Mounting {
+                    owned,
+                    admission,
+                    devices,
+                    mount: suspended,
+                };
+                OperationTransition::WaitForTimer {
+                    seconds,
+                    suspended: self,
+                }
+            }
+            MountTransition::SubmitOwnership { request, suspended } => {
+                let route = devices.route();
+                self.state = MountRequestState::Mounting {
+                    owned,
+                    admission,
+                    devices,
+                    mount: suspended,
+                };
+                OperationTransition::SubmitOwnershipLower {
+                    devices: route,
+                    request,
+                    suspended: self,
+                }
+            }
             MountTransition::SubmitLower { request, suspended } => {
                 let route = devices.route();
                 self.state = MountRequestState::Mounting {
@@ -500,7 +537,11 @@ impl MountRequestOperation {
                 let devices = context
                     .devices
                     .with_external(context.external, context.lease);
-                let transition = context.mount.attach_external_journal(validated);
+                let now = match crate::kernel::time::mmp_time() {
+                    Ok(now) => now,
+                    Err(error) => return Self::complete(context.owned, Err(error)),
+                };
+                let transition = context.mount.attach_external_journal(validated, now);
                 self.drive_mount(
                     context.owned,
                     context.admission,
@@ -634,7 +675,8 @@ impl ControlDeviceOperation for MountRequestOperation {
                 OperationEvent::CancelRequested => {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
                 | OperationEvent::VisibilityGranted(_)
@@ -657,7 +699,11 @@ impl ControlDeviceOperation for MountRequestOperation {
                 devices,
                 mount,
             } => {
-                let transition = mount.advance(event);
+                let now = match crate::kernel::time::mmp_time() {
+                    Ok(now) => now,
+                    Err(error) => return Self::complete(owned, Err(error)),
+                };
+                let transition = mount.advance(event, now);
                 self.drive_mount(owned, admission, devices, transition, catalog)
             }
             MountRequestState::DiscoveringCandidateLength { context } => match event {
@@ -1142,7 +1188,8 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     OperationEvent::CancelRequested => {
                         Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                     }
-                    OperationEvent::StorageCompleted(_)
+                    OperationEvent::TimerElapsed
+                    | OperationEvent::StorageCompleted(_)
                     | OperationEvent::DeviceLengthCompleted(_)
                     | OperationEvent::IntentGranted(_)
                     | OperationEvent::CommitGranted(_)
@@ -1171,7 +1218,8 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     OperationEvent::CancelRequested => {
                         Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                     }
-                    OperationEvent::StorageCompleted(_)
+                    OperationEvent::TimerElapsed
+                    | OperationEvent::StorageCompleted(_)
                     | OperationEvent::DeviceLengthCompleted(_)
                     | OperationEvent::IntentGranted(_)
                     | OperationEvent::CommitGranted(_)
@@ -1531,7 +1579,8 @@ impl MountedVolumeOperation for RawVolumeOperation {
                 OperationEvent::CancelRequested => {
                     self.complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -1782,7 +1831,8 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
                 })(),
             },
             OperationEvent::CancelRequested => Err(DriverError::from(Error::OperationCancelled)),
-            OperationEvent::StorageCompleted(_)
+            OperationEvent::TimerElapsed
+            | OperationEvent::StorageCompleted(_)
             | OperationEvent::DeviceLengthCompleted(_)
             | OperationEvent::IntentGranted(_)
             | OperationEvent::CommitGranted(_)
@@ -1860,7 +1910,8 @@ impl MountedVolumeOperation for NotificationOperation {
             OperationEvent::CancelRequested => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::from(Error::OperationCancelled))),
             ),
-            OperationEvent::StorageCompleted(_)
+            OperationEvent::TimerElapsed
+            | OperationEvent::StorageCompleted(_)
             | OperationEvent::DeviceLengthCompleted(_)
             | OperationEvent::IntentGranted(_)
             | OperationEvent::CommitGranted(_)
@@ -2046,7 +2097,8 @@ impl MountedVolumeOperation for ByteRangeLockOperation {
             (
                 ByteRangeLockOperationState::CheckingOplock { owned, .. }
                 | ByteRangeLockOperationState::OplockReady { owned, .. },
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -2201,7 +2253,8 @@ impl MountedVolumeOperation for OplockControlOperation {
             }
             (
                 OplockControlOperationState::Ready { owned, .. },
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -2556,7 +2609,8 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 OperationEvent::CancelRequested => {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -2575,6 +2629,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     access,
                 ),
                 OperationEvent::Admitted
+                | OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
@@ -2626,6 +2681,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     access,
                 ),
                 OperationEvent::Admitted
+                | OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
@@ -2987,7 +3043,8 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 OperationEvent::CancelRequested => {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -3010,7 +3067,8 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 OperationEvent::CancelRequested => {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -3032,6 +3090,7 @@ impl MountedVolumeOperation for FlushRequestOperation {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
                 OperationEvent::Admitted
+                | OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
@@ -5998,7 +6057,8 @@ impl MutationRequestOperation {
                         epoch,
                     ))
                 }
-                OperationEvent::StorageCompleted(_)
+                OperationEvent::TimerElapsed
+                | OperationEvent::StorageCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::CancelRequested
                 | OperationEvent::IntentGranted(_)

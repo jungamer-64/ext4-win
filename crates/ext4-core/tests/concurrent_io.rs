@@ -592,7 +592,7 @@ fn inline_growth_and_read_only_mount_preserve_storage_contracts() -> Result<()> 
     let filesystem = fixture.disk.filesystem.clone();
     let journal = fixture.disk.journal.clone();
     fixture.disk.storage_effects = 0;
-    let (profile, epoch, coordinator) = fixture
+    let (profile, epoch, coordinator, _mmp) = fixture
         .disk
         .mount(MountAccess::ReadOnly {
             recovery_memory: RecoveryMemoryLimit::DEFAULT,
@@ -949,7 +949,7 @@ fn read_only_recovery_preserves_media_and_mount_local_keys() -> Result<()> {
     let access = MountAccess::ReadOnly {
         recovery_memory: RecoveryMemoryLimit::DEFAULT,
     };
-    let (profile, epoch, coordinator) = fixture.disk.mount(access)?.into_parts();
+    let (profile, epoch, coordinator, _mmp) = fixture.disk.mount(access)?.into_parts();
     fixture.profile = profile;
     fixture.epoch = epoch;
     fixture.coordinator = coordinator;
@@ -1718,7 +1718,8 @@ fn sparse_extension_zeroes_initialized_storage_after_interrupted_write() -> Resu
         let _payload_sequence = fixture.disk.transfer(ordered.submit())?;
         // A crash loses preparation and publication state after data reaches its home block.
     }
-    let (profile, epoch, coordinator) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
+    let (profile, epoch, coordinator, _mmp) =
+        fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
     fixture.profile = profile;
     fixture.cache = MetadataCache::try_new(&epoch)?;
     fixture.epoch = epoch;
@@ -2137,13 +2138,29 @@ impl Disk {
                 ext4_core::MountProbeTransition::Complete(result) => break result?,
             };
         };
-        let mut step = Box::try_new(prepared.start(FscryptKeySet::empty(), access))
-            .map_err(|_| Error::OutOfMemory)?
-            .advance(OperationEvent::Admitted);
+        let mut millis = 0_u64;
+        let now = ext4_core::MmpTime::new(millis, 0);
+        let mut step = Box::try_new(prepared.start(
+            FscryptKeySet::empty(),
+            access,
+            ext4_core::MmpOwner::new([0x65; 16]),
+            now,
+        )?)
+        .map_err(|_| Error::OutOfMemory)?
+        .advance(OperationEvent::Admitted, now);
         loop {
             step = match step {
-                MountTransition::SubmitLower { request, suspended } => {
-                    suspended.advance(OperationEvent::StorageCompleted(self.complete(request)?))
+                MountTransition::SubmitLower { request, suspended }
+                | MountTransition::SubmitOwnership { request, suspended } => suspended.advance(
+                    OperationEvent::StorageCompleted(self.complete(request)?),
+                    ext4_core::MmpTime::new(millis, 0),
+                ),
+                MountTransition::WaitForTimer { seconds, suspended } => {
+                    millis = millis.saturating_add(u64::from(seconds).saturating_mul(1000));
+                    suspended.advance(
+                        OperationEvent::TimerElapsed,
+                        ext4_core::MmpTime::new(millis, 0),
+                    )
                 }
                 MountTransition::Complete(result) => return result.map(|mounted| *mounted),
                 MountTransition::DiscoverExternalJournal {
@@ -2173,7 +2190,7 @@ impl Disk {
                             },
                         };
                     };
-                    suspended.attach_external_journal(journal)
+                    suspended.attach_external_journal(journal, ext4_core::MmpTime::new(millis, 0))
                 }
             };
         }
@@ -2309,7 +2326,8 @@ impl Fixture {
     /// # Errors
     /// Returns mount recovery or cache allocation failure.
     fn remount(&mut self) -> Result<()> {
-        let (profile, epoch, coordinator) = self.disk.mount(MountAccess::ReadWrite)?.into_parts();
+        let (profile, epoch, coordinator, _mmp) =
+            self.disk.mount(MountAccess::ReadWrite)?.into_parts();
         self.profile = profile;
         self.cache = MetadataCache::try_new(&epoch)?;
         self.epoch = epoch;
@@ -2380,7 +2398,8 @@ impl Fixture {
     /// # Errors
     /// Returns fixture mount, namespace, payload or commit failure.
     fn from_disk(mut disk: Disk) -> Result<Self> {
-        let (profile, epoch, mut coordinator) = disk.mount(MountAccess::ReadWrite)?.into_parts();
+        let (profile, epoch, mut coordinator, _mmp) =
+            disk.mount(MountAccess::ReadWrite)?.into_parts();
         let ticket = coordinator.admit_mutation()?;
         let (resolved, (a, b)) = disk.resolve(
             &profile,
@@ -3476,7 +3495,7 @@ fn mount_keys_publish_without_storage_and_disappear_on_remount() -> Result<()> {
             fixture_crc32c(u32::MAX, &fixture.disk.journal),
         )
     );
-    let (_, remounted, _) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
+    let (_, remounted, _, _mmp) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
     assert_eq!(
         remounted.fscrypt_key_presence(identifier),
         FscryptKeyPresence::Absent
@@ -3583,7 +3602,8 @@ fn key_removal_revokes_encrypted_reads_and_resolved_mutations() -> Result<()> {
     fixture
         .disk
         .encode_inode(NodeId::File(b), 0x0008_0800, Some(&context))?;
-    let (profile, epoch, coordinator) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
+    let (profile, epoch, coordinator, _mmp) =
+        fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
     fixture.profile = profile;
     fixture.epoch = epoch;
     fixture.coordinator = coordinator;

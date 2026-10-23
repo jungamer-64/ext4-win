@@ -798,6 +798,31 @@ fn probe_core_mount<S: HostStorage>(
     }
 }
 
+/// One immutable process clock origin; it owns no configuration, resource or shutdown work.
+static MMP_CLOCK_ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Samples both domains from host clocks, retaining one monotonic origin across mount operations.
+/// # Errors
+/// Returns an unrepresentable clock or pre-epoch wall time.
+fn mmp_time() -> TaskResult<ext4_core::MmpTime> {
+    let origin = MMP_CLOCK_ORIGIN.get_or_init(std::time::Instant::now);
+    Ok(ext4_core::MmpTime::new(
+        u64::try_from(origin.elapsed().as_millis())?,
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    ))
+}
+/// Requests a new owner identity from the host RNG; fixture names and wall clocks are not entropy.
+/// # Errors
+/// Returns a host random-source failure before any media request.
+fn mmp_owner() -> TaskResult<ext4_core::MmpOwner> {
+    let mut entropy = [0; 16];
+    #[cfg(windows)]
+    windows_host::secure_random(&mut entropy)?;
+    #[cfg(not(windows))]
+    File::open("/dev/urandom")?.read_exact(&mut entropy)?;
+    Ok(ext4_core::MmpOwner::new(entropy))
+}
+
 /// Opens and fully mounts one internal-journal image through the public production protocol.
 ///
 /// # Errors
@@ -809,23 +834,37 @@ fn mount_internal_core<S: HostStorage>(
 ) -> TaskResult<Box<ext4_core::CompletedMount>> {
     let filesystem_length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
-    let mut transition = Box::try_new(probe_core_mount(storage, filesystem_length)?.start(
-        ext4_core::FscryptKeySet::empty(),
-        ext4_core::MountAccess::ReadWrite,
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
+    let mut transition = Box::try_new(
+        probe_core_mount(storage, filesystem_length)?
+            .start(
+                ext4_core::FscryptKeySet::empty(),
+                ext4_core::MountAccess::ReadWrite,
+                mmp_owner()?,
+                mmp_time()?,
+            )
+            .map_err(core_task_error)?,
+    )?
+    .advance(ext4_core::OperationEvent::Admitted, mmp_time()?);
     loop {
         match transition {
-            ext4_core::MountTransition::SubmitLower { request, suspended } => {
+            ext4_core::MountTransition::SubmitLower { request, suspended }
+            | ext4_core::MountTransition::SubmitOwnership { request, suspended } => {
                 let completion = complete_file_request(storage, request)?;
-                transition =
-                    suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
+                transition = suspended.advance(
+                    ext4_core::OperationEvent::StorageCompleted(completion),
+                    mmp_time()?,
+                );
             }
             ext4_core::MountTransition::DiscoverExternalJournal { .. } => {
                 return Err(io::Error::other(
                     "internal-journal interoperability image requested external discovery",
                 )
                 .into());
+            }
+            ext4_core::MountTransition::WaitForTimer { seconds, suspended } => {
+                std::thread::sleep(core::time::Duration::from_secs(u64::from(seconds)));
+                transition =
+                    suspended.advance(ext4_core::OperationEvent::TimerElapsed, mmp_time()?);
             }
             ext4_core::MountTransition::Complete(result) => {
                 return result.map_err(|error| core_task_error(error).into());
@@ -847,24 +886,38 @@ fn mount_external_core<S: HostStorage>(
     let external_length = ext4_core::DeviceLength::from_bytes(
         storage.length(ext4_core::StorageTarget::ExternalJournal)?,
     );
-    let mut transition = Box::try_new(probe_core_mount(storage, filesystem_length)?.start(
-        ext4_core::FscryptKeySet::empty(),
-        ext4_core::MountAccess::ReadWrite,
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
+    let mut transition = Box::try_new(
+        probe_core_mount(storage, filesystem_length)?
+            .start(
+                ext4_core::FscryptKeySet::empty(),
+                ext4_core::MountAccess::ReadWrite,
+                mmp_owner()?,
+                mmp_time()?,
+            )
+            .map_err(core_task_error)?,
+    )?
+    .advance(ext4_core::OperationEvent::Admitted, mmp_time()?);
     loop {
         match transition {
-            ext4_core::MountTransition::SubmitLower { request, suspended } => {
+            ext4_core::MountTransition::SubmitLower { request, suspended }
+            | ext4_core::MountTransition::SubmitOwnership { request, suspended } => {
                 let completion = complete_file_request(storage, request)?;
-                transition =
-                    suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
+                transition = suspended.advance(
+                    ext4_core::OperationEvent::StorageCompleted(completion),
+                    mmp_time()?,
+                );
             }
             ext4_core::MountTransition::DiscoverExternalJournal {
                 requirement,
                 suspended,
             } => {
                 let validated = drive_external_probe(storage, requirement, external_length)?;
-                transition = suspended.attach_external_journal(validated);
+                transition = suspended.attach_external_journal(validated, mmp_time()?);
+            }
+            ext4_core::MountTransition::WaitForTimer { seconds, suspended } => {
+                std::thread::sleep(core::time::Duration::from_secs(u64::from(seconds)));
+                transition =
+                    suspended.advance(ext4_core::OperationEvent::TimerElapsed, mmp_time()?);
             }
             ext4_core::MountTransition::Complete(result) => {
                 return result.map_err(|error| core_task_error(error).into());
@@ -884,25 +937,39 @@ fn run_internal_mount_until_boundary(
     let filesystem_length =
         ext4_core::DeviceLength::from_bytes(storage.length(ext4_core::StorageTarget::Filesystem)?);
     let mut controller = EffectBoundaryController::new(cut)?;
-    let mut transition = Box::try_new(probe_core_mount(&mut storage, filesystem_length)?.start(
-        ext4_core::FscryptKeySet::empty(),
-        ext4_core::MountAccess::ReadWrite,
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
+    let mut transition = Box::try_new(
+        probe_core_mount(&mut storage, filesystem_length)?
+            .start(
+                ext4_core::FscryptKeySet::empty(),
+                ext4_core::MountAccess::ReadWrite,
+                mmp_owner()?,
+                mmp_time()?,
+            )
+            .map_err(core_task_error)?,
+    )?
+    .advance(ext4_core::OperationEvent::Admitted, mmp_time()?);
     loop {
         match transition {
-            ext4_core::MountTransition::SubmitLower { request, suspended } => {
+            ext4_core::MountTransition::SubmitLower { request, suspended }
+            | ext4_core::MountTransition::SubmitOwnership { request, suspended } => {
                 let Some(completion) = controller.complete(&mut storage, request)? else {
                     return Ok(controller.stopped());
                 };
-                transition =
-                    suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
+                transition = suspended.advance(
+                    ext4_core::OperationEvent::StorageCompleted(completion),
+                    mmp_time()?,
+                );
             }
             ext4_core::MountTransition::DiscoverExternalJournal { .. } => {
                 return Err(io::Error::other(
                     "internal-journal fault image requested external discovery",
                 )
                 .into());
+            }
+            ext4_core::MountTransition::WaitForTimer { seconds, suspended } => {
+                std::thread::sleep(core::time::Duration::from_secs(u64::from(seconds)));
+                transition =
+                    suspended.advance(ext4_core::OperationEvent::TimerElapsed, mmp_time()?);
             }
             ext4_core::MountTransition::Complete(result) => {
                 result.map_err(core_task_error)?;
@@ -955,26 +1022,40 @@ fn run_external_mount_until_boundary(
         storage.length(ext4_core::StorageTarget::ExternalJournal)?,
     );
     let mut controller = EffectBoundaryController::new(cut)?;
-    let mut transition = Box::try_new(probe_core_mount(&mut storage, filesystem_length)?.start(
-        ext4_core::FscryptKeySet::empty(),
-        ext4_core::MountAccess::ReadWrite,
-    ))?
-    .advance(ext4_core::OperationEvent::Admitted);
+    let mut transition = Box::try_new(
+        probe_core_mount(&mut storage, filesystem_length)?
+            .start(
+                ext4_core::FscryptKeySet::empty(),
+                ext4_core::MountAccess::ReadWrite,
+                mmp_owner()?,
+                mmp_time()?,
+            )
+            .map_err(core_task_error)?,
+    )?
+    .advance(ext4_core::OperationEvent::Admitted, mmp_time()?);
     loop {
         match transition {
-            ext4_core::MountTransition::SubmitLower { request, suspended } => {
+            ext4_core::MountTransition::SubmitLower { request, suspended }
+            | ext4_core::MountTransition::SubmitOwnership { request, suspended } => {
                 let Some(completion) = controller.complete(&mut storage, request)? else {
                     return Ok(controller.stopped());
                 };
-                transition =
-                    suspended.advance(ext4_core::OperationEvent::StorageCompleted(completion));
+                transition = suspended.advance(
+                    ext4_core::OperationEvent::StorageCompleted(completion),
+                    mmp_time()?,
+                );
             }
             ext4_core::MountTransition::DiscoverExternalJournal {
                 requirement,
                 suspended,
             } => {
                 let validated = drive_external_probe(&mut storage, requirement, external_length)?;
-                transition = suspended.attach_external_journal(validated);
+                transition = suspended.attach_external_journal(validated, mmp_time()?);
+            }
+            ext4_core::MountTransition::WaitForTimer { seconds, suspended } => {
+                std::thread::sleep(core::time::Duration::from_secs(u64::from(seconds)));
+                transition =
+                    suspended.advance(ext4_core::OperationEvent::TimerElapsed, mmp_time()?);
             }
             ext4_core::MountTransition::Complete(result) => {
                 result.map_err(core_task_error)?;
@@ -997,7 +1078,7 @@ fn run_external_clean_close_until_boundary(
 ) -> TaskResult<EffectBoundaryRun> {
     let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
     let completed = mount_external_core(&mut storage)?;
-    let (profile, _epoch, _coordinator) = completed.into_parts();
+    let (profile, _epoch, _coordinator, _mmp) = completed.into_parts();
     let mut controller = EffectBoundaryController::new(cut)?;
     let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(&profile))?
         .advance(ext4_core::OperationEvent::Admitted);
@@ -1161,7 +1242,7 @@ fn complete_boundary_transfer<Next>(
 fn drive_core_mount_and_clean_close(image: &Path) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
     let completed = mount_internal_core(&mut storage)?;
-    let (profile, _epoch, _coordinator) = completed.into_parts();
+    let (profile, _epoch, _coordinator, _mmp) = completed.into_parts();
     complete_core_clean_close(&mut storage, &profile)
 }
 
@@ -1178,7 +1259,7 @@ fn drive_external_core_mount_and_clean_close(
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_external(filesystem, external_journal)?;
     let completed = mount_external_core(&mut storage)?;
-    let (profile, _epoch, _coordinator) = completed.into_parts();
+    let (profile, _epoch, _coordinator, _mmp) = completed.into_parts();
     complete_core_clean_close(&mut storage, &profile)
 }
 
@@ -1324,7 +1405,7 @@ fn prepare_volume_label_commit<S: HostStorage>(
     ext4_core::MutationCoordinatorState,
     u64,
 )> {
-    let (profile, epoch, mut coordinator) = (*completed).into_parts();
+    let (profile, epoch, mut coordinator, _mmp) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let (prepared, ()) = prepare_core_mutation(
         storage,
@@ -1400,7 +1481,7 @@ where
         &mut ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>,
     ) -> ext4_core::Result<R>,
 {
-    let (profile, epoch, mut coordinator) = (*completed).into_parts();
+    let (profile, epoch, mut coordinator, _mmp) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let (prepared, output) =
         prepare_core_mutation(storage, &profile, &epoch, &mut coordinator, ticket, mutate)?;
@@ -1456,7 +1537,7 @@ where
 {
     let mut storage = FileStorageAdapter::open_internal(image)?;
     let completed = mount_internal_core(&mut storage)?;
-    let (profile, epoch, coordinator) = (*completed).into_parts();
+    let (profile, epoch, coordinator, _mmp) = (*completed).into_parts();
     let mut cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
     let mut operation = ext4_core::EpochReadOperation::new(&profile);
     let mut event = ext4_core::OperationEvent::Admitted;
@@ -1742,7 +1823,7 @@ fn drive_directory_enumeration(
     expected: &mut alloc::collections::BTreeSet<Vec<u8>>,
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let (profile, epoch, coordinator, _mmp) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut operation = ext4_core::DirectoryReadOperation::new(
         &profile,
         directory,
@@ -1829,7 +1910,7 @@ fn verify_directory_read_faults(
     directory: ext4_core::DirectoryNodeId,
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let (profile, epoch, coordinator, _mmp) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut baseline = Vec::new();
     let mut read_count = 0_usize;
     let mut operation = ext4_core::DirectoryReadOperation::new(
@@ -1985,7 +2066,7 @@ fn read_directory_request(
     limit: usize,
 ) -> TaskResult<(Vec<Vec<u8>>, ext4_core::DirectoryScanCursor)> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
-    let (profile, epoch, coordinator) = (*mount_internal_core(&mut storage)?).into_parts();
+    let (profile, epoch, coordinator, _mmp) = (*mount_internal_core(&mut storage)?).into_parts();
     let mut operation = ext4_core::DirectoryReadOperation::new(&profile, directory, cursor);
     let mut event = ext4_core::OperationEvent::Admitted;
     let mut names = Vec::new();

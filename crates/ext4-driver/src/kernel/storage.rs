@@ -878,6 +878,15 @@ impl StorageFailureClass {
     }
 }
 
+/// Caller-owned effect semantics select whether a classified retry is permitted at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StorageRetryPolicy {
+    /// Apply bounded native status and completed-byte classification.
+    Classified,
+    /// The caller must reconcile the first outcome before any new device command.
+    Never,
+}
+
 /// Failed completed command retaining ownership for retry or abort handling.
 #[derive(Debug)]
 pub struct FailedStorageCommand<O> {
@@ -892,6 +901,12 @@ pub struct FailedStorageCommand<O> {
 }
 
 impl<O> FailedStorageCommand<O> {
+    /// Observes the caller's effect policy before retry selection consumes the failed request.
+    #[cfg(not(test))]
+    pub(crate) const fn suspended(&self) -> &O {
+        self.command.suspended()
+    }
+
     /// Converts a non-retryable failure into its operation, request, and durability class.
     pub fn into_failure(self) -> (O, StorageRequest, StorageFailureClass) {
         let effect_free_write_failure = matches!(
@@ -920,7 +935,10 @@ impl<O> FailedStorageCommand<O> {
     }
 
     /// Selects and owns the next fixed retry timer, or preserves terminal failure ownership.
-    pub fn into_retry(mut self) -> StorageRetryDecision<O> {
+    pub fn into_retry(mut self, policy: StorageRetryPolicy) -> StorageRetryDecision<O> {
+        if policy == StorageRetryPolicy::Never {
+            return StorageRetryDecision::Terminal(self);
+        }
         let status_retryable = if self.command.read_retry_policy() {
             matches!(
                 self.status,
@@ -1240,7 +1258,8 @@ mod tests {
         DeviceLengthProbe, FailedStorageCommand, LowerStorageDevice, MountedStorageRoute,
         PreparedStorageCommand, STATUS_CRC_ERROR, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY,
         STATUS_IO_TIMEOUT, STATUS_RETRY, StorageCommandStep, StorageFailureClass,
-        StorageRetryDecision, StorageRetryDelay, WriteTransferPhase, failed_unsubmitted_request,
+        StorageRetryDecision, StorageRetryDelay, StorageRetryPolicy, WriteTransferPhase,
+        failed_unsubmitted_request,
     };
     use crate::irp::lower::CompletedLowerIrp;
     use crate::kernel::status::DriverError;
@@ -1432,7 +1451,7 @@ mod tests {
         let Some(failed) = failed_command(prepared, STATUS_IO_TIMEOUT, 0) else {
             return;
         };
-        let first = failed.into_retry();
+        let first = failed.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(&first, StorageRetryDecision::Retry(_)));
         let StorageRetryDecision::Retry(first) = first else {
             return;
@@ -1447,7 +1466,7 @@ mod tests {
         let Some(failed) = failed_command(second_attempt, STATUS_IO_TIMEOUT, 0) else {
             return;
         };
-        let second = failed.into_retry();
+        let second = failed.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(&second, StorageRetryDecision::Retry(_)));
         let StorageRetryDecision::Retry(second) = second else {
             return;
@@ -1462,7 +1481,7 @@ mod tests {
         let Some(failed) = failed_command(third_attempt, STATUS_IO_TIMEOUT, 0) else {
             return;
         };
-        let terminal = failed.into_retry();
+        let terminal = failed.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(&terminal, StorageRetryDecision::Terminal(_)));
         let StorageRetryDecision::Terminal(terminal) = terminal else {
             return;
@@ -1516,7 +1535,7 @@ mod tests {
         let Some(timeout) = failed_command(write, STATUS_IO_TIMEOUT, 0) else {
             return;
         };
-        let timeout = timeout.into_retry();
+        let timeout = timeout.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(&timeout, StorageRetryDecision::Terminal(_)));
         let StorageRetryDecision::Terminal(timeout) = timeout else {
             return;
@@ -1554,7 +1573,7 @@ mod tests {
         let Some(timeout) = failed_command(flush, STATUS_IO_TIMEOUT, 0) else {
             return;
         };
-        let timeout = timeout.into_retry();
+        let timeout = timeout.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(&timeout, StorageRetryDecision::Terminal(_)));
         let StorageRetryDecision::Terminal(timeout) = timeout else {
             return;
@@ -1564,6 +1583,41 @@ mod tests {
             class,
             StorageFailureClass::DurabilityUnknown { completed: 0 }
         );
+    }
+
+    /// # Panics
+    /// Fails if an ownership write can be blindly retried, even for an otherwise retryable status.
+    #[test]
+    fn reconciliation_policy_retains_the_first_failed_effect() {
+        let fixture = storage_fixture();
+        assert!(fixture.is_some());
+        let Some(fixture) = fixture else {
+            return;
+        };
+        let request = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0xc3; 512],
+        };
+        let prepared = PreparedStorageCommand::try_new(fixture.devices, request, 23_u64);
+        assert!(prepared.is_ok());
+        let Ok(prepared) = prepared else {
+            return;
+        };
+        let failed = failed_command(prepared, STATUS_DEVICE_BUSY, 0);
+        assert!(failed.is_some());
+        let Some(failed) = failed else {
+            return;
+        };
+        let outcome = failed.into_retry(StorageRetryPolicy::Never);
+        assert!(matches!(&outcome, StorageRetryDecision::Terminal(_)));
+        let StorageRetryDecision::Terminal(failed) = outcome else {
+            return;
+        };
+        let (owner, request, class) = failed.into_failure();
+        assert_eq!(owner, 23);
+        assert!(matches!(request, StorageRequest::Write { .. }));
+        assert_eq!(class, StorageFailureClass::Terminal);
     }
 
     /// # Panics
@@ -1586,7 +1640,7 @@ mod tests {
         let Some(failed) = failed_command(prepared, STATUS_DEVICE_BUSY, 0) else {
             return;
         };
-        let retry = failed.into_retry();
+        let retry = failed.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(&retry, StorageRetryDecision::Retry(_)));
         let StorageRetryDecision::Retry(retry) = retry else {
             return;

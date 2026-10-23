@@ -494,6 +494,18 @@ impl Scheduler {
         Some(start)
     }
 
+    /// Arms an observation delay only when no mutation intent or commit is retained.
+    pub(crate) fn begin_observation_timer(&mut self, identity: SlotId) -> bool {
+        let Some(slot) = self.slot_mut(identity) else {
+            return false;
+        };
+        if !matches!(slot.phase, Phase::Actor) || slot.intent.is_some() || slot.commit.is_some() {
+            return false;
+        }
+        slot.phase = Phase::Retry;
+        true
+    }
+
     /// Moves one ready slot to sole-actor ownership.
     pub(crate) fn take_ready(&mut self) -> Option<SlotId> {
         let (index, slot) = self
@@ -1157,6 +1169,47 @@ mod tests {
         assert_eq!(scheduler.grant_next_intent(), Some((first, 1)));
         assert_eq!(scheduler.grant_next_intent(), Some((disjoint, 3)));
         assert_eq!(scheduler.grant_next_intent(), None);
+    }
+
+    /// # Panics
+    /// Fails if a monotonic observation can hold mutation authority or survive slot retirement.
+    #[test]
+    fn observation_timer_requires_released_mutation_authority() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "the fixture owns the fully initialized pointer-free scheduler"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization filled every field; this fixture now owns all scheduler state.
+            storage.assume_init()
+        };
+        let slot = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        assert!(scheduler.begin_observation_timer(slot));
+        assert!(scheduler.enter_retry(slot));
+        let scope = require_some!(resources(&[MutationResource::VOLUME_METADATA]));
+        assert_eq!(
+            scheduler.request_intent(slot, IntentRequest::new(1, scope)),
+            Some(super::IntentDisposition::Queued)
+        );
+        assert_eq!(scheduler.grant_next_intent(), Some((slot, 1)));
+        assert!(!scheduler.begin_observation_timer(slot));
+        assert!(scheduler.release_intent(slot));
+        assert!(scheduler.begin_observation_timer(slot));
+        assert!(scheduler.enter_retry(slot));
+        assert!(scheduler.request_commit(slot, 1));
+        assert!(scheduler.grant_commit(slot, 1));
+        assert!(!scheduler.begin_observation_timer(slot));
+        assert_eq!(scheduler.abandon_commit(slot), Some(1));
+        assert!(scheduler.begin_observation_timer(slot));
+        assert_eq!(
+            scheduler.request_cancel(slot.index()),
+            super::CancelDisposition::AwaitRetry
+        );
+        assert!(scheduler.enter_retry(slot));
+        assert!(scheduler.complete(slot));
+        assert!(!scheduler.enter_retry(slot));
     }
 
     /// Verifies native suspension lets conflicting paging finish before intent reacquisition.

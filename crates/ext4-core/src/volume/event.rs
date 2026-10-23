@@ -138,6 +138,8 @@ impl CheckpointLease {
 /// suspended operation, which then consumes itself into its next transition.
 #[derive(Debug)]
 pub enum OperationEvent {
+    /// A complete operation-owned monotonic delay elapsed.
+    TimerElapsed,
     /// First admission into a scheduler lane.
     Admitted,
     /// One lower-storage transfer whose IRP and buffer are no longer used by the lower stack.

@@ -1963,6 +1963,30 @@ pub fn verify_directory(directory: &Path) -> io::Result<()> {
     completed(result, file.close())
 }
 
+/// Fills an exact owned host buffer from the operating system's cryptographic random source.
+/// # Errors
+/// Returns a native RNG failure or an unrepresentable native buffer length.
+pub fn secure_random(output: &mut [u8]) -> io::Result<()> {
+    let length = u32::try_from(output.len())
+        .map_err(|_error| io::Error::other("random buffer too large"))?;
+    let status = unsafe {
+        // SAFETY: The system-preferred provider needs no handle; the exclusive slice remains live
+        // for this synchronous call, whose native byte count was checked above.
+        windows_sys::Win32::Security::Cryptography::BCryptGenRandom(
+            core::ptr::null_mut(),
+            output.as_mut_ptr(),
+            length,
+            windows_sys::Win32::Security::Cryptography::BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "system random source failed: {status:#x}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -402,7 +402,8 @@ impl EpochReadOperation {
             super::OperationEvent::CancelRequested => {
                 return ReadTransition::Complete(Err(Error::OperationCancelled));
             }
-            super::OperationEvent::DeviceLengthCompleted(_)
+            super::OperationEvent::TimerElapsed
+            | super::OperationEvent::DeviceLengthCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)
@@ -501,7 +502,8 @@ impl MutationResolveOperation {
                 self.filesystem.complete(completion)?;
             }
             super::OperationEvent::CancelRequested => return Err(Error::OperationCancelled),
-            super::OperationEvent::DeviceLengthCompleted(_)
+            super::OperationEvent::TimerElapsed
+            | super::OperationEvent::DeviceLengthCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)

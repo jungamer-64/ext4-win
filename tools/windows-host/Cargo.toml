@@ -11,7 +11,7 @@ ext4-core = { path = "../../crates/ext4-core" }
 ext4-security = { path = "../../crates/ext4-security" }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Wdk_System_SystemServices"] }
+windows-sys = { workspace = true, features = ["Wdk_System_SystemServices", "Win32_Security_Cryptography"] }
 
 [lints]
 workspace = true

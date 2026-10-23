@@ -579,23 +579,8 @@ pub(crate) struct CngOperation {
 }
 
 impl CryptographicOperation for CngOperation {
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
     fn fill_random(&mut self, output: &mut [u8]) -> Ext4Result<()> {
-        let output_bytes = u32::try_from(output.len()).map_err(|_| Error::ArithmeticOverflow)?;
-        let status = unsafe {
-            // SAFETY: A null algorithm handle selects the system-preferred RNG under this flag;
-            // `output` is exclusively writable for exactly `output_bytes`.
-            BCryptGenRandom(
-                core::ptr::null_mut(),
-                output.as_mut_ptr(),
-                output_bytes,
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-            )
-        };
-        cng_status_to_core(status)
+        random_bytes(output)
     }
 
     #[expect(
@@ -1206,6 +1191,28 @@ fn cng_status_to_core(status: NTSTATUS) -> Ext4Result<()> {
     } else {
         Err(Error::CryptographicFailure)
     }
+}
+
+/// Reads the system-preferred RNG without opening unrelated algorithm providers.
+/// # Errors
+/// Returns native random-source failure or a buffer length outside the native byte-count domain.
+#[expect(
+    unsafe_code,
+    reason = "the synchronous CNG RNG boundary owns the exclusive output slice"
+)]
+pub(crate) fn random_bytes(output: &mut [u8]) -> Ext4Result<()> {
+    let output_bytes = u32::try_from(output.len()).map_err(|_| Error::ArithmeticOverflow)?;
+    let status = unsafe {
+        // SAFETY: A null algorithm handle selects the system-preferred RNG under this flag;
+        // `output` is exclusively writable for exactly `output_bytes`.
+        BCryptGenRandom(
+            core::ptr::null_mut(),
+            output.as_mut_ptr(),
+            output_bytes,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    cng_status_to_core(status)
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ pub(crate) use wdk_sys::ntddk::IoCompleteRequest;
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
     IoCheckShareAccess, IoCreateDevice, IoDeleteDevice, IoRemoveShareAccess,
-    KeQuerySystemTimePrecise,
+    KeQueryInterruptTimePrecise, KeQuerySystemTimePrecise,
 };
 pub(crate) use wdk_sys::ntddk::{
     IoCreateSymbolicLink, IoDeleteSymbolicLink, IoRegisterFileSystem, IoUnregisterFileSystem,
@@ -119,6 +119,22 @@ pub(crate) unsafe fn IoRemoveShareAccess(
 )]
 pub(crate) unsafe fn KeQuerySystemTimePrecise(_time: wdk_sys::PLARGE_INTEGER) {
     panic!("kernel clock observation requires a loaded driver")
+}
+
+/// # Safety
+/// Retains the kernel clock ABI; host fixtures must supply clock observations explicitly.
+/// # Panics
+/// Fails if a host fixture reaches this kernel-only boundary.
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    non_snake_case,
+    clippy::panic,
+    clippy::disallowed_macros,
+    reason = "host fixtures cannot synthesize kernel monotonic clock observations"
+)]
+pub(crate) unsafe fn KeQueryInterruptTimePrecise(_counter: *mut u64) -> u64 {
+    panic!("kernel monotonic clock observation requires a loaded driver")
 }
 
 #[cfg(not(test))]

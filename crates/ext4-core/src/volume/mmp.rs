@@ -1,16 +1,18 @@
 //! Device-visible ownership operations, independent of journal durability and cached metadata.
 
 use super::MediaAccess;
-use crate::disk_format::{
-    mmp::{self, MmpParameters, MmpRecord},
-    superblock::Superblock,
-};
+use crate::disk_format::mmp::{self, MmpParameters, MmpRecord};
 use crate::memory;
 use crate::{
     ByteOffset, CompletedStorageTransfer, Error, Result, StorageCompletion, StorageRequest,
     StorageRequestIdentity, StorageTarget,
 };
 use alloc::{boxed::Box, vec::Vec};
+
+/// A bounded advertised window leaves at least one heartbeat period for completion latency.
+const MAX_ADVERTISED_SECONDS: u16 = 300;
+/// A zero superblock preference selects this host's ordinary five-second heartbeat.
+const DEFAULT_UPDATE_SECONDS: u16 = 5;
 
 impl MmpParameters {
     /// The only conversion from physical block coordinates to lower byte coordinates.
@@ -23,7 +25,7 @@ impl MmpParameters {
     }
     /// Bound observed waiting by the greater local and peer interval.
     fn observation_seconds(self, peer: u16) -> u32 {
-        let interval = u32::from(self.update_seconds.max(peer).max(mmp::MIN_INTERVAL));
+        let interval = u32::from(self.heartbeat_seconds().max(peer).max(mmp::MIN_INTERVAL));
         interval
             .saturating_mul(2)
             .saturating_add(1)
@@ -31,7 +33,18 @@ impl MmpParameters {
     }
     /// Advertise enough time for two ordinary heartbeat periods.
     fn check_seconds(self) -> u16 {
-        self.update_seconds.saturating_mul(2).max(mmp::MIN_INTERVAL)
+        self.heartbeat_seconds()
+            .saturating_mul(2)
+            .max(mmp::MIN_INTERVAL)
+    }
+    /// Select a period that always fits twice inside the bounded advertised window.
+    fn heartbeat_seconds(self) -> u16 {
+        let desired = if self.update_seconds == 0 {
+            DEFAULT_UPDATE_SECONDS
+        } else {
+            self.update_seconds
+        };
+        desired.min(MAX_ADVERTISED_SECONDS / 2)
     }
 }
 
@@ -88,12 +101,8 @@ pub struct MmpLease {
 }
 impl MmpLease {
     /// Maximum interval before the host must drive another ownership check.
-    pub const fn update_seconds(&self) -> u16 {
-        if self.parameters.update_seconds == 0 {
-            1
-        } else {
-            self.parameters.update_seconds
-        }
+    pub fn update_seconds(&self) -> u16 {
+        self.parameters.heartbeat_seconds()
     }
     /// Checks freshness before admitting a media mutation or publishing its result.
     /// # Errors
@@ -103,6 +112,13 @@ impl MmpLease {
             return Err(Error::MmpOwnershipLost);
         }
         Ok(())
+    }
+    /// Schedules renewal early enough to include write, flush and independent read latency.
+    pub(crate) fn renewal_due(&self, now: MmpTime) -> bool {
+        let window = u64::from(self.parameters.check_seconds()).saturating_mul(1000);
+        let since = self.valid_until_millis.saturating_sub(window);
+        now.monotonic_millis
+            >= since.saturating_add(u64::from(self.update_seconds()).saturating_mul(1000))
     }
     /// Consumes the lease until fresh media observation, update, flush and readback all complete.
     /// The host must revoke mutation/publication admission while no acknowledged lease is held.
@@ -297,25 +313,22 @@ enum State {
     },
 }
 impl MmpOperation {
-    /// Starts protection only when primary metadata declares MMP. No media effect occurs here.
+    /// Starts protection for the physical record selected by primary mount admission.
     /// # Errors
-    /// Rejects invalid physical placement or operation allocation at the host boundary.
-    pub fn acquire(
-        superblock: Superblock,
+    /// Rejects overflowing placement before constructing any lower transfer.
+    pub(super) fn acquire(
+        parameters: MmpParameters,
         owner: MmpOwner,
         access: MediaAccess,
-    ) -> Result<Option<Self>> {
-        let Some(parameters) = superblock.mmp() else {
-            return Ok(None);
-        };
+    ) -> Result<Self> {
         parameters.offset()?;
-        Ok(Some(Self {
+        Ok(Self {
             effect: MmpEffect::None,
             parameters,
             owner,
             action: Action::Acquire(access),
             state: State::Start,
-        }))
+        })
     }
     /// Consumes one owned event. Any failed renewal consumes its lease; the host must fence
     /// mutation and reconcile in-flight writes before further publication or clean release.

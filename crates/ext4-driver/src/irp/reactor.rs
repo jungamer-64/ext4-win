@@ -49,7 +49,8 @@ use super::{
 #[cfg(not(test))]
 use crate::kernel::storage::{
     DeviceLengthProbe, PreparedStorageCommand, RetryingStorageCommand, StorageCommand,
-    StorageCommandStep, StorageRetryDecision, StorageRetryDelay, failed_unsubmitted_request,
+    StorageCommandStep, StorageRetryDecision, StorageRetryDelay, StorageRetryPolicy,
+    failed_unsubmitted_request,
 };
 use crate::kernel::storage::{MountedStorageRoute, StorageFailureClass};
 
@@ -191,6 +192,8 @@ enum PublishedReactorLower {
 #[cfg(not(test))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EffectCancellation {
+    /// Ownership operations retain cancellation and reconcile failed effects without blind retries.
+    Ownership,
     /// Cancellation wins until the first write or flush is submitted.
     AbortBeforeEffect,
     /// One-way closing already began, so durability must continue to a known outcome.
@@ -222,7 +225,7 @@ impl PublishedReactorLower {
         match self {
             Self::Storage {
                 lower,
-                cancellation: EffectCancellation::AbortBeforeEffect,
+                cancellation: EffectCancellation::AbortBeforeEffect | EffectCancellation::Ownership,
             } => unsafe {
                 // SAFETY: The active slot retains the storage envelope identity through this call.
                 lower.cancel();
@@ -459,6 +462,22 @@ pub(crate) trait InfalliblePublication: CompletionOperation {
 /// One consuming action emitted by an event-driven operation.
 #[derive(Debug)]
 pub(crate) enum OperationTransition {
+    /// A complete monotonic observation delay, retaining no intent or commit authority.
+    WaitForTimer {
+        /// Required elapsed seconds, independent of wall-clock changes.
+        seconds: u32,
+        /// Sole continuation; teardown observes timer cancellation or its queued DPC.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// Ownership records have an explicit reconciliation protocol and forbid blind I/O retry.
+    SubmitOwnershipLower {
+        /// Referenced physical device route.
+        devices: MountedStorageRoute,
+        /// Direct uncached ownership transfer.
+        request: StorageRequest,
+        /// Completion owner retaining mount or mounted-volume lifetime.
+        suspended: Box<dyn CompletionOperation>,
+    },
     /// Build and submit one mount-time lower device-length query.
     QueryDeviceLength {
         /// Driver-owned device whose image pins the completion callback.
@@ -646,6 +665,9 @@ fn release_operation_reservation(admitted: &AtomicUsize) {
 
 /// WDK-shell payload ownership paired with the pointer-free scheduler slot at the same index.
 enum SlotPayload {
+    /// One operation waiting for a complete monotonic observation interval.
+    #[cfg(not(test))]
+    Observation(Box<dyn CompletionOperation>),
     /// Scheduler or the sole actor owns no shell payload in this slot.
     Empty,
     /// Suspended operation, with an event only while scheduler phase is `Ready`.
@@ -675,6 +697,8 @@ enum SlotPayload {
 impl fmt::Debug for SlotPayload {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(not(test))]
+            Self::Observation(_) => formatter.write_str("Observation"),
             Self::Empty => formatter.write_str("Empty"),
             Self::Operation { event: Some(_), .. } => formatter.write_str("ReadyOperation"),
             Self::Operation { event: None, .. } => formatter.write_str("SuspendedOperation"),
@@ -699,9 +723,17 @@ struct ShellSlot {
     payload: SlotPayload,
 }
 
+/// Native relative timer units selected before arming an address-stable envelope.
+#[cfg(not(test))]
+enum TimerDelay {
+    /// Bounded storage/native admission retry.
+    Retry(StorageRetryDelay),
+    /// Ownership or other complete observation interval.
+    ObservationSeconds(u32),
+}
 /// Address-stable timer/DPC envelope for one bounded retry slot.
 #[repr(C)]
-struct RetryTimerEnvelope {
+struct OperationTimerEnvelope {
     /// Native one-shot timer.
     timer: UnsafeCell<wdk_sys::KTIMER>,
     /// Native DPC publishing only a slot-generation event.
@@ -714,7 +746,7 @@ struct RetryTimerEnvelope {
     generation: AtomicU64,
 }
 
-impl RetryTimerEnvelope {
+impl OperationTimerEnvelope {
     /// Creates inert storage completed by final-address initialization.
     fn inert(index: usize) -> Self {
         Self {
@@ -745,7 +777,7 @@ impl RetryTimerEnvelope {
             // SAFETY: The DPC context points to this final-address envelope until teardown drains.
             ffi::KeInitializeDpc(
                 self.dpc.get(),
-                Some(storage_retry_timer_dpc),
+                Some(operation_timer_dpc),
                 core::ptr::from_ref(self).cast_mut().cast::<c_void>(),
             );
         }
@@ -758,11 +790,14 @@ impl RetryTimerEnvelope {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn arm(&self, generation: u64, delay: StorageRetryDelay) {
+    fn arm(&self, generation: u64, delay: TimerDelay) {
         self.generation.store(generation, Ordering::Release);
         let hundred_nanoseconds = match delay {
-            StorageRetryDelay::TenMilliseconds => -100_000_i64,
-            StorageRetryDelay::HundredMilliseconds => -1_000_000_i64,
+            TimerDelay::Retry(StorageRetryDelay::TenMilliseconds) => -100_000_i64,
+            TimerDelay::Retry(StorageRetryDelay::HundredMilliseconds) => -1_000_000_i64,
+            TimerDelay::ObservationSeconds(seconds) => i64::from(seconds)
+                .saturating_mul(10_000_000)
+                .saturating_neg(),
         };
         let already_armed = unsafe {
             // SAFETY: This one-shot timer is armed only while its slot is in `Retry`.
@@ -778,6 +813,18 @@ impl RetryTimerEnvelope {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
     }
+    /// Removes an unexpired observation timer; a false result leaves the queued DPC as sole owner.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the actor cancels the exact address-stable one-shot timer"
+    )]
+    fn cancel(&self) -> bool {
+        unsafe {
+            // SAFETY: The slot and reactor remain owned until cancellation succeeds or the DPC drains.
+            ffi::KeCancelTimer(self.timer.get()) != 0
+        }
+    }
 }
 
 #[expect(
@@ -786,7 +833,7 @@ impl RetryTimerEnvelope {
 )]
 // SAFETY: Native timer/DPC state is initialized once at a stable address; callbacks publish only
 // atomics and the reactor thread exclusively owns operation payloads.
-unsafe impl Sync for RetryTimerEnvelope {}
+unsafe impl Sync for OperationTimerEnvelope {}
 
 /// Actor-owned arming state for the one shared delayed-close timer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1053,7 +1100,7 @@ pub(crate) struct CompletionReactor {
     /// Auto-reset event signaled only when a concrete event is published.
     wake_event: UnsafeCell<wdk_sys::KEVENT>,
     /// Bitset of retry timer events published by DPC callbacks.
-    retry_ready: AtomicU64,
+    timer_ready: AtomicU64,
     /// Shared delayed-close timer event published by its DPC callback.
     delayed_close_ready: AtomicU8,
     /// Bitset of active top-level cancel events published by cancel routines.
@@ -1072,7 +1119,7 @@ pub(crate) struct CompletionReactor {
     /// Fixed WDK-shell payload registry; callbacks never dereference these values.
     payloads: UnsafeCell<[ShellSlot; MAX_OPERATIONS]>,
     /// One address-stable native timer envelope per bounded active slot.
-    retry_timers: [RetryTimerEnvelope; MAX_OPERATIONS],
+    operation_timers: [OperationTimerEnvelope; MAX_OPERATIONS],
     /// One native timer shared by the complete mounted-volume delayed-close set.
     delayed_close_timer: DelayedCloseTimerEnvelope,
     /// Arming state mutated only by the sole reactor actor.
@@ -1357,7 +1404,7 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
-            core::ptr::addr_of_mut!((*reactor).retry_ready)
+            core::ptr::addr_of_mut!((*reactor).timer_ready)
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
@@ -1456,14 +1503,15 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Project the uninitialized array without borrowing the complete reactor.
-            core::ptr::addr_of_mut!((*reactor).retry_timers)
+            core::ptr::addr_of_mut!((*reactor).operation_timers)
         };
         let slots = unsafe {
             // SAFETY: MaybeUninit preserve layout; every slot is exclusively owned.
-            &mut *destination.cast::<[core::mem::MaybeUninit<RetryTimerEnvelope>; MAX_OPERATIONS]>()
+            &mut *destination
+                .cast::<[core::mem::MaybeUninit<OperationTimerEnvelope>; MAX_OPERATIONS]>()
         };
         for (index, slot) in slots.iter_mut().enumerate() {
-            slot.write(RetryTimerEnvelope::inert(index));
+            slot.write(OperationTimerEnvelope::inert(index));
         }
         let destination = unsafe {
             // SAFETY: Project the uninitialized array without borrowing the complete reactor.
@@ -1551,7 +1599,7 @@ impl CompletionReactor {
             #[cfg(not(test))]
                 finalization_work: _,
             wake_event: _,
-            retry_ready: _,
+            timer_ready: _,
             delayed_close_ready: _,
             cancel_ready: _,
             lifecycle: _,
@@ -1566,7 +1614,7 @@ impl CompletionReactor {
             target: _,
             scheduler: _,
             payloads: _,
-            retry_timers: _,
+            operation_timers: _,
             cancel_envelopes: _,
         } = reactor;
         unsafe {
@@ -1598,7 +1646,7 @@ impl CompletionReactor {
             initialize_list_head(reactor.oplock_completion_head.get());
         }
         #[cfg(not(test))]
-        for timer in &reactor.retry_timers {
+        for timer in &reactor.operation_timers {
             unsafe {
                 // SAFETY: Every timer and the reactor itself are now at their final addresses.
                 timer.initialize(reactor_storage);
@@ -2224,9 +2272,48 @@ impl CompletionReactor {
     )]
     fn request_active_cancel(&self, index: usize) {
         match self.with_scheduler(|scheduler| scheduler.request_cancel(index)) {
-            CancelDisposition::Ignored
-            | CancelDisposition::AwaitRetry
-            | CancelDisposition::AwaitRegistration => {}
+            CancelDisposition::Ignored | CancelDisposition::AwaitRegistration => {}
+            CancelDisposition::AwaitRetry => {
+                let observation = self.with_payloads(|payloads| {
+                    payloads
+                        .get(index)
+                        .is_some_and(|slot| matches!(slot.payload, SlotPayload::Observation(_)))
+                });
+                if observation
+                    && self
+                        .operation_timers
+                        .get(index)
+                        .is_some_and(OperationTimerEnvelope::cancel)
+                {
+                    let identity = self
+                        .with_scheduler(|scheduler| scheduler.identity(index))
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        });
+                    if !self.with_scheduler(|scheduler| scheduler.enter_retry(identity)) {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    let operation = self.with_payloads(|payloads| {
+                        let slot = payloads.get_mut(index).unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        });
+                        let SlotPayload::Observation(operation) =
+                            core::mem::replace(&mut slot.payload, SlotPayload::Empty)
+                        else {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        };
+                        operation
+                    });
+                    self.set_ready_operation_event(
+                        index,
+                        operation,
+                        CompletionEvent::Core(OperationEvent::CancelRequested),
+                    );
+                }
+            }
             CancelDisposition::ResumeOperation => {
                 self.with_payloads(|payloads| {
                     let Some(slot) = payloads.get_mut(index) else {
@@ -2793,6 +2880,42 @@ impl CompletionReactor {
     #[cfg(not(test))]
     fn apply_transition(&self, index: usize, transition: OperationTransition) {
         match transition {
+            OperationTransition::SubmitOwnershipLower {
+                devices,
+                request,
+                suspended,
+            } => {
+                self.submit_storage(
+                    index,
+                    devices,
+                    request,
+                    suspended,
+                    EffectCancellation::Ownership,
+                );
+            }
+            OperationTransition::WaitForTimer { seconds, suspended } => {
+                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                    return;
+                };
+                let identity = self
+                    .with_scheduler(|scheduler| scheduler.identity(index))
+                    .unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    });
+                if !self.with_scheduler(|scheduler| scheduler.begin_observation_timer(identity)) {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                self.install_payload(index, SlotPayload::Observation(suspended));
+                self.operation_timers
+                    .get(index)
+                    .unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    })
+                    .arm(
+                        identity.generation(),
+                        TimerDelay::ObservationSeconds(seconds),
+                    );
+            }
             OperationTransition::QueryDeviceLength {
                 completion_owner,
                 target,
@@ -2915,12 +3038,15 @@ impl CompletionReactor {
                         event: None,
                     },
                 );
-                self.retry_timers
+                self.operation_timers
                     .get(index)
                     .unwrap_or_else(|| {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
                     })
-                    .arm(identity.generation(), StorageRetryDelay::TenMilliseconds);
+                    .arm(
+                        identity.generation(),
+                        TimerDelay::Retry(StorageRetryDelay::TenMilliseconds),
+                    );
             }
             OperationTransition::ArmRetry { retry } => {
                 self.arm_retry(index, retry);
@@ -3359,12 +3485,15 @@ impl CompletionReactor {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
                 self.install_payload(index, SlotPayload::OplockRetry(envelope));
-                self.retry_timers
+                self.operation_timers
                     .get(index)
                     .unwrap_or_else(|| {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
                     })
-                    .arm(identity.generation(), StorageRetryDelay::TenMilliseconds);
+                    .arm(
+                        identity.generation(),
+                        TimerDelay::Retry(StorageRetryDelay::TenMilliseconds),
+                    );
             }
             OplockSubmission::Pending => {
                 if self.cancellation_is_pending(index) {
@@ -3693,23 +3822,33 @@ impl CompletionReactor {
                         CompletionEvent::Core(OperationEvent::StorageCompleted(completion)),
                     );
                 }
-                Ok(StorageCommandStep::Failed(failed)) => match failed.into_retry() {
-                    StorageRetryDecision::Retry(retry) => {
-                        self.apply_transition(index, OperationTransition::ArmRetry { retry })
+                Ok(StorageCommandStep::Failed(failed)) => {
+                    let policy = if failed.suspended().cancellation == EffectCancellation::Ownership
+                    {
+                        StorageRetryPolicy::Never
+                    } else {
+                        StorageRetryPolicy::Classified
+                    };
+                    match failed.into_retry(policy) {
+                        StorageRetryDecision::Retry(retry) => {
+                            self.apply_transition(index, OperationTransition::ArmRetry { retry })
+                        }
+                        StorageRetryDecision::Terminal(failed) => {
+                            let (scheduled, request, class) = failed.into_failure();
+                            let mut suspended = scheduled.into_operation();
+                            self.with_target(|target| {
+                                suspended.record_storage_failure(class, target)
+                            });
+                            self.set_ready_operation_event(
+                                index,
+                                suspended,
+                                CompletionEvent::Core(OperationEvent::StorageCompleted(
+                                    failed_unsubmitted_request(request, ext4_core::Error::DeviceIo),
+                                )),
+                            );
+                        }
                     }
-                    StorageRetryDecision::Terminal(failed) => {
-                        let (scheduled, request, class) = failed.into_failure();
-                        let mut suspended = scheduled.into_operation();
-                        self.with_target(|target| suspended.record_storage_failure(class, target));
-                        self.set_ready_operation_event(
-                            index,
-                            suspended,
-                            CompletionEvent::Core(OperationEvent::StorageCompleted(
-                                failed_unsubmitted_request(request, ext4_core::Error::DeviceIo),
-                            )),
-                        );
-                    }
-                },
+                }
                 Err(_error) => {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                 }
@@ -3941,13 +4080,16 @@ impl CompletionReactor {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     }
                     self.install_payload(index, SlotPayload::PassiveRetry(envelope));
-                    self.retry_timers
+                    self.operation_timers
                         .get(index)
                         .unwrap_or_else(|| {
                             KernelWideInconsistency::completion_reactor_state_corruption()
                                 .bugcheck()
                         })
-                        .arm(identity.generation(), StorageRetryDelay::TenMilliseconds);
+                        .arm(
+                            identity.generation(),
+                            TimerDelay::Retry(StorageRetryDelay::TenMilliseconds),
+                        );
                     continue;
                 }
             };
@@ -4177,16 +4319,16 @@ impl CompletionReactor {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
         self.install_payload(index, SlotPayload::Retry(retry));
-        let Some(timer) = self.retry_timers.get(index) else {
+        let Some(timer) = self.operation_timers.get(index) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        timer.arm(identity.generation(), delay);
+        timer.arm(identity.generation(), TimerDelay::Retry(delay));
     }
 
     /// Consumes timer events published by DPC callbacks and builds a fresh private IRP attempt.
     #[cfg(not(test))]
     fn drain_retry_events(&self) -> bool {
-        let mut ready = self.retry_ready.swap(0, Ordering::AcqRel);
+        let mut ready = self.timer_ready.swap(0, Ordering::AcqRel);
         if ready == 0 {
             return false;
         }
@@ -4203,7 +4345,7 @@ impl CompletionReactor {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             };
             ready &= !mask;
-            let generation = match self.retry_timers.get(index) {
+            let generation = match self.operation_timers.get(index) {
                 Some(timer) => timer.generation.load(Ordering::Acquire),
                 None => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
             };
@@ -4236,6 +4378,14 @@ impl CompletionReactor {
                         index,
                         operation,
                         CompletionEvent::Core(OperationEvent::Admitted),
+                    );
+                    continue;
+                }
+                SlotPayload::Observation(operation) => {
+                    self.set_ready_operation_event(
+                        index,
+                        operation,
+                        CompletionEvent::Core(OperationEvent::TimerElapsed),
                     );
                     continue;
                 }
@@ -4514,19 +4664,19 @@ unsafe extern "C" fn delayed_close_timer_dpc(
 /// DPC callback publishing one concrete retry-timer event without touching operation state.
 /// # Safety
 ///
-/// `context` must point to the address-stable [`RetryTimerEnvelope`] installed in the reactor.
+/// `context` must point to the address-stable [`OperationTimerEnvelope`] installed in the reactor.
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-unsafe extern "C" fn storage_retry_timer_dpc(
+unsafe extern "C" fn operation_timer_dpc(
     _dpc: *mut wdk_sys::KDPC,
     context: PVOID,
     _argument_one: PVOID,
     _argument_two: PVOID,
 ) {
-    let Some(timer) = NonNull::new(context.cast::<RetryTimerEnvelope>()) else {
+    let Some(timer) = NonNull::new(context.cast::<OperationTimerEnvelope>()) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
     let timer = unsafe {
@@ -4547,7 +4697,7 @@ unsafe extern "C" fn storage_retry_timer_dpc(
         // SAFETY: Device teardown joins the reactor after every active timer has fired.
         reactor.as_ref()
     };
-    if reactor.retry_ready.fetch_or(mask, Ordering::AcqRel) & mask != 0 {
+    if reactor.timer_ready.fetch_or(mask, Ordering::AcqRel) & mask != 0 {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     }
     reactor.wake();
@@ -5188,6 +5338,10 @@ mod tests {
 
     fn consume_transition(transition: OperationTransition) {
         match transition {
+            OperationTransition::WaitForTimer {
+                seconds: _seconds,
+                suspended,
+            } => drop(suspended),
             OperationTransition::ForwardQueryRemove(forwarding) => forwarding.queue(),
             OperationTransition::QueryDeviceLength {
                 completion_owner: _completion_owner,
@@ -5206,6 +5360,11 @@ mod tests {
                 drop(suspended);
             }
             OperationTransition::SubmitLower {
+                devices: _devices,
+                request,
+                suspended,
+            }
+            | OperationTransition::SubmitOwnershipLower {
                 devices: _devices,
                 request,
                 suspended,

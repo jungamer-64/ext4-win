@@ -332,3 +332,122 @@ fn write_and_flush_failures_have_uncertain_effects() {
     })();
     assert_eq!(result, Ok(()));
 }
+
+/// # Panics
+/// Fails if an early timer event admits peer observation or cancellation hides a durable claim.
+#[test]
+fn early_observation_and_cancel_preserve_effect_classification() {
+    let result = (|| -> Result<()> {
+        let mut device = Device::new(1)?;
+        let transition = device.acquire(MediaAccess::ReadOnly)?;
+        let MmpTransition::SubmitLower { request, suspended } = transition else {
+            return Err(Error::DeviceIo);
+        };
+        let completion = device.complete(request)?;
+        let transition = suspended.advance(MmpEvent::StorageCompleted(completion), device.now());
+        let MmpTransition::Wait { suspended, .. } = transition else {
+            return Err(Error::DeviceIo);
+        };
+        assert!(matches!(
+            suspended.advance(MmpEvent::Elapsed, device.now()),
+            MmpTransition::Complete(Err(MmpFailure {
+                reason: Error::InvalidTimestamp,
+                effect: MmpEffect::None
+            }))
+        ));
+        let mut device = Device::new(mmp::CLEAN)?;
+        let mut transition = device.acquire(MediaAccess::ReadWrite)?;
+        loop {
+            transition = match transition {
+                MmpTransition::SubmitLower { request, suspended } => {
+                    let completion = device.complete(request)?;
+                    suspended.advance(MmpEvent::StorageCompleted(completion), device.now())
+                }
+                MmpTransition::Wait { suspended, .. } => {
+                    assert!(matches!(
+                        suspended.advance(MmpEvent::Cancel, device.now()),
+                        MmpTransition::Complete(Err(MmpFailure {
+                            reason: Error::OperationCancelled,
+                            effect: MmpEffect::Durable(MmpChange::Claim)
+                        }))
+                    ));
+                    break;
+                }
+                MmpTransition::Complete(_) => return Err(Error::MmpOwnershipLost),
+            }
+        }
+        assert_ne!(
+            MmpRecord::parse(&device.durable, None)?.sequence,
+            mmp::CLEAN
+        );
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if an extreme preference eliminates renewal slack or ignores the peer's advertised wait.
+#[test]
+fn interval_boundaries_retain_completion_slack() {
+    let result = (|| -> Result<()> {
+        for seconds in [0, 1, 2, 149, 150, 151, 299, 300, u16::MAX] {
+            let parameters = MmpParameters {
+                update_seconds: seconds,
+                ..Device::parameters()?
+            };
+            let heartbeat = parameters.heartbeat_seconds();
+            assert!(heartbeat > 0);
+            assert!(parameters.check_seconds() >= heartbeat.saturating_mul(2));
+            assert!(parameters.check_seconds() <= 300);
+            assert_eq!(parameters.observation_seconds(u16::MAX), 65_595);
+        }
+        assert_eq!(
+            MmpParameters {
+                update_seconds: 0,
+                ..Device::parameters()?
+            }
+            .heartbeat_seconds(),
+            5
+        );
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if a different owner with the same sequence can receive this mount's lease.
+#[test]
+fn delayed_claim_verification_compares_the_instance_identity() {
+    let result = (|| -> Result<()> {
+        let mut device = Device::new(mmp::CLEAN)?;
+        let mut transition = device.acquire(MediaAccess::ReadWrite)?;
+        loop {
+            transition = match transition {
+                MmpTransition::SubmitLower { request, suspended } => {
+                    let completion = device.complete(request)?;
+                    suspended.advance(MmpEvent::StorageCompleted(completion), device.now())
+                }
+                MmpTransition::Wait { seconds, suspended } => {
+                    put_fixed(&mut device.bytes, DiskOffset::new(16), b"foreign-owner")?;
+                    device.millis = device
+                        .millis
+                        .saturating_add(u64::from(seconds).saturating_mul(1000));
+                    suspended.advance(MmpEvent::Elapsed, device.now())
+                }
+                MmpTransition::Complete(outcome) => {
+                    assert!(matches!(
+                        outcome,
+                        Err(MmpFailure {
+                            reason: Error::MmpOwnershipLost,
+                            effect: MmpEffect::Durable(MmpChange::Claim)
+                        })
+                    ));
+                    break;
+                }
+            }
+        }
+        assert_eq!(device.effects, ["write", "flush"]);
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}

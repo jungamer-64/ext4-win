@@ -4081,7 +4081,7 @@ fn run_external_file_mutation_until_boundary(
 ) -> TaskResult<EffectBoundaryRun> {
     let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
     let completed = mount_external_core(&mut storage)?;
-    let (profile, epoch, mut coordinator) = (*completed).into_parts();
+    let (profile, epoch, mut coordinator, _mmp) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let (prepared, ()) = prepare_core_mutation(
         &mut storage,
@@ -4124,7 +4124,7 @@ fn run_internal_htree_mutation_until_boundary(
     let names = htree_fault_names()?;
     let mut storage = CrashStorageAdapter::open_internal(filesystem)?;
     let completed = mount_internal_core(&mut storage)?;
-    let (profile, epoch, mut coordinator) = (*completed).into_parts();
+    let (profile, epoch, mut coordinator, _mmp) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let (prepared, ()) = prepare_core_mutation(
         &mut storage,

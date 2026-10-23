@@ -270,6 +270,8 @@ pub(crate) struct VolumeRuntime {
     epochs: EpochRegistry,
     /// Journal cursor, allocation state, and resource versions.
     coordinator: MutationCoordinatorState,
+    /// Physical media ownership retained independently of journal state.
+    mmp: Option<ext4_core::MmpLease>,
     /// Validated lower-device geometry and completion owner.
     storage: MountedStorage,
     /// Mount admission owner for independently retained CNG algorithm providers.
@@ -293,7 +295,7 @@ impl VolumeRuntime {
         storage: MountedStorage,
         catalog: &mut crate::identity::IdentityDirectory,
     ) -> DriverResult<Self> {
-        let (profile, epoch, coordinator) = mount.into_parts();
+        let (profile, epoch, coordinator, mmp) = mount.into_parts();
         let identity = catalog.binding(epoch.identity().uuid())?;
         let mut native_reliability = IoReliabilityOwner::try_new()?;
         native_reliability.publish(match profile.access() {
@@ -308,6 +310,7 @@ impl VolumeRuntime {
             profile,
             epochs: EpochRegistry::try_new(epoch)?,
             coordinator,
+            mmp,
             storage,
             crypto,
             failure: VolumeFailureState::Operational,
@@ -418,6 +421,9 @@ impl VolumeRuntime {
     /// # Errors
     /// Returns write protection for a read-only mount.
     pub(crate) fn require_media_write(&self) -> DriverResult<()> {
+        if let Some(lease) = &self.mmp {
+            lease.authorize(crate::kernel::time::mmp_time()?)?;
+        }
         match self.profile.access() {
             ext4_core::MediaAccess::ReadWrite => Ok(()),
             ext4_core::MediaAccess::ReadOnly => {

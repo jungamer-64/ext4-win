@@ -50,6 +50,24 @@ pub(crate) fn current_ext4_timestamp() -> Result<Ext4Timestamp, DriverError> {
     ext4_timestamp(ticks)
 }
 
+/// Samples the kernel's boot-relative monotonic clock separately from diagnostic UTC seconds.
+/// # Errors
+/// Returns an invalid or unrepresentable wall-clock timestamp.
+#[expect(
+    unsafe_code,
+    reason = "the synchronous kernel clock call writes only its exact stack output"
+)]
+pub(crate) fn mmp_time() -> Result<ext4_core::MmpTime, DriverError> {
+    let mut counter = 0_u64;
+    let ticks = unsafe {
+        // SAFETY: `counter` is writable for the complete native output and outlives this call.
+        crate::kernel::ffi::KeQueryInterruptTimePrecise(core::ptr::addr_of_mut!(counter))
+    };
+    let seconds = u64::try_from(current_ext4_timestamp()?.seconds())
+        .map_err(|_error| DriverError::InvalidParameter)?;
+    Ok(ext4_core::MmpTime::new(ticks / 10_000, seconds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
