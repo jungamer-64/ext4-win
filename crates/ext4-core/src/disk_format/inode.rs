@@ -309,10 +309,16 @@ pub(crate) struct InodeDataEncoding {
     inline_data: bool,
     /// External attribute values are admitted by the mounted feature profile.
     attribute_values: bool,
+    /// Directory comparison flags require a declared and admitted filesystem encoding.
+    casefold: bool,
 }
 
 impl InodeDataEncoding {
     /// Builds the single inode data encoding selected by mounted features and geometry.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the mounted inode codec binds independent size, allocation, link and feature capabilities once"
+    )]
     pub(crate) const fn new(
         file_size: FileSizeEncoding,
         directory_size: DirectorySizeEncoding,
@@ -321,6 +327,7 @@ impl InodeDataEncoding {
         directory_links: DirectoryLinkEncoding,
         inline_data: bool,
         attribute_values: bool,
+        casefold: bool,
     ) -> Self {
         Self {
             file_size,
@@ -330,6 +337,7 @@ impl InodeDataEncoding {
             directory_links,
             inline_data,
             attribute_values,
+            casefold,
         }
     }
 
@@ -1757,13 +1765,19 @@ impl InodeData {
         if raw.len() < 128 {
             return Err(Error::TruncatedStructure);
         }
-        let mode = InodeMode::from_disk(le_u16(raw, disk_offset(0))?)?;
+        let raw_mode = le_u16(raw, disk_offset(0))?;
+        let flags = InodeFlags::from_u32(le_u32(raw, disk_offset(32))?);
+        if flags.has_casefold()
+            && (raw_mode & MODE_KIND_MASK != MODE_DIRECTORY || !encoding.casefold)
+        {
+            return Err(Error::InvalidInode);
+        }
+        let mode = InodeMode::from_disk(raw_mode)?;
         let size = encoding.decode_size(
             mode.kind(),
             le_u32(raw, disk_offset(4))?,
             le_u32(raw, disk_offset(108))?,
         )?;
-        let flags = InodeFlags::from_u32(le_u32(raw, disk_offset(32))?);
         let allocation_size = encoding.decode_allocation_size(
             le_u32(raw, disk_offset(28))?,
             le_u16(raw, disk_offset(116))?,
@@ -2223,6 +2237,7 @@ mod tests {
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
             false,
             false,
+            false,
         ))
     }
 
@@ -2341,6 +2356,7 @@ mod tests {
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
             false,
             false,
+            false,
         );
 
         assert_eq!(
@@ -2443,6 +2459,7 @@ mod tests {
             InodeBlockCountEncoding::LegacySectors,
             block_size,
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+            false,
             false,
             false,
         );

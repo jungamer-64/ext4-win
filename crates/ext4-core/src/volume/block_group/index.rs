@@ -488,13 +488,15 @@ fn begin_inode_scan(
         && !orphans.contains(raw.id)
         && let Err(error) = raw.parse()
     {
-        if raw.flags()?.has_inline_data() {
-            return Err(error);
+        // Unsupported namespace kinds carry no supported payload traversal. Validation failures
+        // for a recognized inode remain fatal rather than being interpreted as an absent inode.
+        if error == Error::WrongInodeKind
+            && !raw.flags()?.has_inline_data()
+            && !raw.has_extent_tree()?
+        {
+            return Ok(InodeAllocationScan::Next);
         }
-        if raw.has_extent_tree()? {
-            return Err(Error::UnsupportedBlockMap);
-        }
-        return Ok(InodeAllocationScan::Next);
+        return Err(error);
     }
     let data = InodeData::parse(raw.id, raw.bytes, raw.encoding)?;
     match data.storage() {

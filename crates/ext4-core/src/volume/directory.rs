@@ -228,6 +228,42 @@ impl ScannedDirectoryEntry {
 mod tests {
     use super::*;
 
+    /// # Errors
+    /// Returns malformed independent display framing or query routing failure.
+    /// # Panics
+    /// Fails if an unkeyed route trusts a stale hint when the complete ciphertext is available.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "literal ciphertext and independently calculated format hash observe routing authority"
+    )]
+    fn complete_keyless_identity_uses_the_current_unkeyed_profile() -> Result<()> {
+        use crate::disk_format::{
+            dir::DirectoryIndexHash,
+            directory_hash::DirectoryHashScheme,
+            name::NameSemantics,
+            superblock::{DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion},
+        };
+        let name = crate::protection::fscrypt::FscryptNoKeyName::from_display(
+            b"_fscrypt_AAAAAAAAAAAwMTIzNDU2Nzg5QUJDREVG",
+        )?
+        .ok_or(Error::InvalidName)?;
+        assert_eq!(name.hash().major, 0);
+        let scheme = DirectoryHashScheme::from_metadata(
+            DirectoryHashSeed::from_words([0; 4]),
+            DirectoryHashVersion::Legacy,
+            DirectoryHashSignedness::Signed,
+        );
+        assert_eq!(
+            DirectoryLookup::NoKey(&name).major(
+                DirectoryIndexHash::Computed(scheme),
+                NameSemantics::Bytewise
+            )?,
+            0xf4ca76fc
+        );
+        Ok(())
+    }
+
     /// # Panics
     ///
     /// Panics when explicit ordinal seeks truncate the live 64-bit cursor domain.
@@ -343,7 +379,13 @@ impl DirectoryLookup<'_> {
         match *self {
             Self::Stored(entry) => Ok(scheme.entry_hash(entry, names)?.major),
             Self::Name(name) => Ok(names.hash(name, scheme.computed()?)?.major),
-            Self::NoKey(name) => Ok(name.hash().major),
+            Self::NoKey(name) => match (scheme, name.direct()) {
+                (
+                    crate::disk_format::dir::DirectoryIndexHash::Computed(algorithm),
+                    Some(ciphertext),
+                ) => Ok(algorithm.hash(ciphertext.bytes()).major),
+                _ => Ok(name.hash().major),
+            },
             Self::EncryptedCasefold { hash, .. } => {
                 if scheme != crate::disk_format::dir::DirectoryIndexHash::StoredKeyed {
                     return Err(Error::UnsupportedDirectoryHash);

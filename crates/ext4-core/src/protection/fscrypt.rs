@@ -419,7 +419,8 @@ enum CiphertextIdentity {
 
 impl FscryptNoKeyName {
     /// Projects a complete route and ciphertext identity within the visible component bound.
-    /// Linear directories supply an unused zero route unless records contain keyed hashes.
+    /// The hint preserves stored keyed routing or a computed unkeyed route for abbreviated names.
+    /// Complete ciphertext can be rehashed under the current unkeyed index profile.
     /// # Errors
     /// Returns invalid ciphertext, allocation or hash-provider failure.
     pub(crate) fn from_ciphertext(

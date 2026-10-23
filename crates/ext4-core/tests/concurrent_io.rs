@@ -74,6 +74,45 @@ fn casefold_fixture(features: u32, encoding_flags: u16) -> Result<Fixture> {
 }
 
 /// # Errors
+/// Returns fixture preparation or independent inode-field encoding failure.
+/// # Panics
+/// Fails if a comparison flag is admitted without a directory and declared filesystem encoding.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "authenticated on-disk flag vectors must be rejected before mounted authority is published"
+)]
+fn comparison_flags_require_a_declared_directory_encoding() -> Result<()> {
+    let mut missing_encoding = Fixture::new()?;
+    let node = NodeId::Directory(DirectoryNodeId::ROOT);
+    let offset = fixture_inode_offset(&missing_encoding.disk, node)?;
+    let flags = fixture_u32(
+        &missing_encoding.disk.filesystem,
+        offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?,
+    )?;
+    missing_encoding
+        .disk
+        .encode_inode(node, flags | 0x4000_0000, None)?;
+    let effects = missing_encoding.disk.storage_effects;
+    assert_eq!(missing_encoding.remount(), Err(Error::InvalidInode));
+    assert_eq!(missing_encoding.disk.storage_effects, effects);
+    let mut wrong_kind = casefold_fixture(0, 1)?;
+    let node = NodeId::File(wrong_kind.a);
+    let offset = fixture_inode_offset(&wrong_kind.disk, node)?;
+    let flags = fixture_u32(
+        &wrong_kind.disk.filesystem,
+        offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?,
+    )?;
+    wrong_kind
+        .disk
+        .encode_inode(node, flags | 0x4000_0000, None)?;
+    let effects = wrong_kind.disk.storage_effects;
+    assert_eq!(wrong_kind.remount(), Err(Error::InvalidInode));
+    assert_eq!(wrong_kind.disk.storage_effects, effects);
+    Ok(())
+}
+
+/// # Errors
 /// Propagates mount, namespace transition, journal, remount or directory read failure.
 /// # Panics
 /// Fails if aliases change identity, duplicate names are admitted, or stored spelling is lost.

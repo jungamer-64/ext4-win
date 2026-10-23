@@ -2197,6 +2197,7 @@ impl Superblock {
             self.features.directory_links,
             self.features.inline_data,
             self.features.attribute_values,
+            self.casefold.is_some(),
         )
     }
 

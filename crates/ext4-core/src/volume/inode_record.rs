@@ -1392,6 +1392,7 @@ mod tests {
                 crate::disk_format::inode::DirectoryLinkEncoding::Counted,
                 false,
                 false,
+                false,
             ),
         })
     }

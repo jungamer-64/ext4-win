@@ -1001,7 +1001,9 @@ impl EpochReadView<'_, '_> {
         }
         let hash = if let Some(hash) = entry.stored_hash() {
             hash
-        } else if inode.directory_storage_kind()? == DirectoryStorageKind::HTree {
+        } else if name.bytes().len() > 176
+            && inode.directory_storage_kind()? == DirectoryStorageKind::HTree
+        {
             let block_size = self.superblock.block_size();
             let mut tree = ExtentMappingCursor::new(
                 inode.extent_root()?,
@@ -1024,6 +1026,13 @@ impl EpochReadView<'_, '_> {
             )?
             .hash_profile()
             .entry_hash(entry, self.superblock.name_semantics(inode)?)?
+        } else if name.bytes().len() > 176 {
+            DirectoryHashScheme::from_metadata(
+                self.superblock.directory_hash_seed(),
+                self.superblock.default_directory_hash_version(),
+                self.superblock.directory_hash_signedness(),
+            )
+            .hash(name.bytes())
         } else {
             DirectoryHash { major: 0, minor: 0 }
         };
