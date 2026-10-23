@@ -396,18 +396,22 @@ impl FscryptContextV2 {
     }
 }
 
-/// A bounded no-key name: reversible ciphertext or a routed strong digest.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FscryptNoKeyName {
-    /// Ciphertext that fits the reversible display encoding.
-    Ciphertext(crate::Ext4Name),
-    /// HTree routing hint and ciphertext identity; the hint never replaces digest verification.
-    Digest {
-        /// Root-profile routing hint, ignored by linear directory traversal.
-        major: u32,
-        /// Identity checked against the complete candidate ciphertext.
-        sha256: [u8; 32],
-    },
+/// A bounded ciphertext identity with the complete route needed for keyless lookup.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct FscryptNoKeyName {
+    /// Primary and secondary route, supplied by the owning directory's index profile.
+    hash: crate::disk_format::directory_hash::DirectoryHash,
+    /// Complete ciphertext or its strong identity when reversible display would exceed 255 bytes.
+    identity: CiphertextIdentity,
+}
+
+/// Ciphertext identity selected solely by the bounded display-name capacity.
+#[derive(Debug, Eq, PartialEq)]
+enum CiphertextIdentity {
+    /// Entire ciphertext retained for reversible display.
+    Complete(crate::Ext4Name),
+    /// SHA-256 of the complete ciphertext for names outside reversible display capacity.
+    Digest([u8; 32]),
 }
 
 impl FscryptNoKeyName {
@@ -417,7 +421,7 @@ impl FscryptNoKeyName {
     /// Returns invalid ciphertext, allocation, or hash-provider failures.
     pub(crate) fn from_ciphertext(
         ciphertext: &[u8],
-        major: u32,
+        hash: crate::disk_format::directory_hash::DirectoryHash,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<Self> {
         validate_ciphertext_filename_len(ciphertext.len())?;
