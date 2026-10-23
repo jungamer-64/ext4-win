@@ -8,6 +8,12 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// Failures that keep invalid or unsupported ext4 state out of the domain.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
+    /// A recovery memory budget cannot admit any resident storage.
+    InvalidRecoveryMemoryLimit,
+    /// Write-free recovery exceeded its logical resident-storage admission.
+    RecoveryMemoryLimitExceeded,
+    /// This mount grants no authority to modify backing media.
+    ReadOnlyFilesystem,
     /// A block read fell outside the backing device.
     DeviceRange,
     /// The backing device failed an in-range I/O request.
@@ -126,6 +132,9 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::InvalidRecoveryMemoryLimit => "recovery memory limit must be nonzero",
+            Self::RecoveryMemoryLimitExceeded => "recovery memory limit exceeded",
+            Self::ReadOnlyFilesystem => "filesystem is mounted read only",
             Self::StaleReadContext => "read context is no longer current",
             Self::ReadConflict => "read dependency changed during storage I/O",
             Self::DeviceRange => "block read is outside the backing device",

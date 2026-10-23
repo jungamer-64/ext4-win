@@ -1649,6 +1649,8 @@ pub enum MountTransition {
 /// Completion-driven journaled mount operation.
 #[derive(Debug)]
 pub struct MountOperation {
+    /// Media authority fixed before the first mount operation.
+    access: super::MountAccess,
     /// Filesystem-device transcript used only for restartable metadata resolution.
     filesystem: StorageTranscript,
     /// Mount key snapshot moved once into the initial epoch before marker publication.
@@ -1863,8 +1865,9 @@ impl ResolvedPrimary {
 impl MountOperation {
     /// Creates a mount operation for a primary filesystem device only.
     #[must_use]
-    pub const fn new(filesystem_length: DeviceLength, fscrypt_keys: FscryptKeySet) -> Self {
+    pub const fn new(filesystem_length: DeviceLength, fscrypt_keys: FscryptKeySet, access: super::MountAccess) -> Self {
         Self {
+            access,
             filesystem: StorageTranscript::new(StorageTarget::Filesystem, filesystem_length),
             fscrypt_keys: Some(fscrypt_keys),
             state: MountState::Resolving,

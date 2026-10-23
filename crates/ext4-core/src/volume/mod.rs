@@ -1,5 +1,7 @@
 //! Mounted ext4 volume state and journaled write transactions.
 
+mod access;
+pub use access::{MountAccess, RecoveryMemoryLimit};
 mod block_group;
 mod directory;
 mod directory_read;
