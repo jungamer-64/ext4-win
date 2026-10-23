@@ -297,6 +297,7 @@ dependencies = [
 name = "ext4-core"
 version = "0.1.0"
 dependencies = [
+ "ext4-unicode-gen",
  "hkdf",
  "sha2",
  "zeroize",
@@ -320,6 +321,13 @@ name = "ext4-security"
 version = "0.1.0"
 dependencies = [
  "ext4-core",
+]
+
+[[package]]
+name = "ext4-unicode-gen"
+version = "0.1.0"
+dependencies = [
+ "sha2",
 ]
 
 [[package]]
@@ -1082,6 +1090,7 @@ version = "0.1.0"
 dependencies = [
  "ext4-core",
  "ext4-security",
+ "ext4-unicode-gen",
  "serde",
  "serde_json",
  "sha2",

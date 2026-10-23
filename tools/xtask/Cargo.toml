@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 ext4-security = { path = "../../crates/ext4-security" }
 ext4-core = { path = "../../crates/ext4-core" }
+ext4-unicode-gen = { path = "../unicode-gen" }
 sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true

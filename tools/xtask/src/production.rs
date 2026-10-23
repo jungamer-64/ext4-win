@@ -659,10 +659,10 @@ fn seal_production_artifacts(
     })
 }
 
-/// Copies source notices for the target-resolved driver dependencies and Rust library.
+/// Seals notices for target-resolved source packages, generated data and Rust libraries.
 ///
-/// The package index records each source's own license expression; collecting a dependency's
-/// documents does not change the project's license. Normal edges also retain proc-macro source
+/// The package index records source-package and generated-data licenses separately; collecting
+/// a dependency's documents does not change the project's license. Normal edges retain proc-macro source
 /// notices, even when those packages contribute only generated code to the driver.
 ///
 /// # Errors
@@ -691,7 +691,9 @@ fn seal_license_documents(
     let metadata: LicenseMetadata = serde_json::from_slice(&metadata.stdout)?;
     let packages = driver_license_packages(&metadata)?;
     let mut documents = Vec::new();
-    let mut index = String::from("License expressions apply to their named source packages.\n\n");
+    let mut index = String::from(
+        "License expressions apply to their named source packages or generated data.\n\n",
+    );
     for package in packages {
         writeln!(&mut index, "{} {}", package.name, package.version)?;
         writeln!(
@@ -727,6 +729,24 @@ fn seal_license_documents(
             });
         }
         writeln!(&mut index)?;
+        if package.name == "ext4-core" && package.source.is_none() {
+            let notice = ext4_unicode_gen::license(&ext4_unicode_gen::cache_directory()?)?;
+            let name = format!(
+                "licenses/unicode-{}/LICENSE-UNICODE",
+                ext4_unicode_gen::UNICODE_VERSION
+            );
+            let document = seal_license_bytes(directory, name, notice.as_bytes())?;
+            writeln!(
+                &mut index,
+                "Unicode Character Database {}",
+                ext4_unicode_gen::UNICODE_VERSION
+            )?;
+            writeln!(&mut index, "material=generated filesystem casefold table")?;
+            writeln!(&mut index, "license={}", ext4_unicode_gen::DATA_LICENSE)?;
+            writeln!(&mut index, "document={}", document.name)?;
+            writeln!(&mut index)?;
+            documents.push(document);
+        }
     }
     let sysroot = run_checked_output(
         command_with_arguments("rustc", &["--print", "sysroot"]),
@@ -760,17 +780,34 @@ fn seal_license_documents(
             hash,
         });
     }
-    let name = "licenses/packages.txt".to_owned();
+    documents.push(seal_license_bytes(
+        directory,
+        "licenses/packages.txt".to_owned(),
+        index.as_bytes(),
+    )?);
+    Ok(documents)
+}
+
+/// Seals authenticated notice bytes or their package index into an unpublished bundle.
+/// # Errors
+/// Returns path creation, exclusive file creation, write, flush or hashing failure.
+fn seal_license_bytes(
+    directory: &Path,
+    name: String,
+    bytes: &[u8],
+) -> TaskResult<SealedLicenseDocument> {
     let path = directory.join(&name);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
     let mut output = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)?;
-    output.write_all(index.as_bytes())?;
+    output.write_all(bytes)?;
     output.sync_all()?;
-    let hash = sha256_bytes(index.as_bytes())?;
-    documents.push(SealedLicenseDocument { name, path, hash });
-    Ok(documents)
+    let hash = sha256_bytes(bytes)?;
+    Ok(SealedLicenseDocument { name, path, hash })
 }
 
 /// Selects the driver's normal dependency closure from Cargo's resolved graph.
@@ -845,7 +882,9 @@ fn package_license_documents(package: &LicensePackage) -> TaskResult<BTreeSet<Pa
         }
         if !found.is_empty() {
             documents.extend(found);
-            break;
+            if package.source.is_some() {
+                break;
+            }
         }
         // A registry package's root is its source boundary. Git packages may inherit notices
         // from the enclosing checkout, bounded by that checkout's own Git metadata.
@@ -1331,6 +1370,44 @@ mod tests {
                 return Err(
                     io::Error::other("Microsoft allocator copyright was not preserved").into(),
                 );
+            }
+            let unicode = documents
+                .iter()
+                .find(|document| document.name == "licenses/unicode-12.1.0/LICENSE-UNICODE")
+                .ok_or_else(|| io::Error::other("Unicode data notice was not sealed"))?;
+            if fs::read(&unicode.path)?
+                != ext4_unicode_gen::license(&ext4_unicode_gen::cache_directory()?)?.as_bytes()
+            {
+                return Err(io::Error::other("Unicode data notice changed during sealing").into());
+            }
+            let index = documents
+                .iter()
+                .find(|document| document.name == "licenses/packages.txt")
+                .ok_or_else(|| io::Error::other("license index was not sealed"))?;
+            let index = fs::read_to_string(&index.path)?;
+            let records: Vec<_> = index.split("\n\n").collect();
+            let source = records
+                .iter()
+                .find(|record| record.starts_with("ext4-core "))
+                .ok_or_else(|| io::Error::other("core source license record was not sealed"))?;
+            if !source
+                .lines()
+                .any(|line| line == "license=MIT OR Apache-2.0")
+            {
+                return Err(
+                    io::Error::other("core source license differs from project terms").into(),
+                );
+            }
+            let data = records
+                .iter()
+                .find(|record| record.starts_with("Unicode Character Database 12.1.0\n"))
+                .ok_or_else(|| io::Error::other("Unicode data license record was not sealed"))?;
+            if !data.lines().any(|line| line == "license=Unicode-3.0")
+                || !data
+                    .lines()
+                    .any(|line| line == "document=licenses/unicode-12.1.0/LICENSE-UNICODE")
+            {
+                return Err(io::Error::other("Unicode data license has no matching notice").into());
             }
             for document in &documents {
                 verify_sha256(&document.path, &document.hash, "license document")?;

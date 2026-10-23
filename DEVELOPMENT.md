@@ -35,6 +35,24 @@ test, and rustdoc gates. CI hosts and triggers are defined in the
 [verification workflow](.github/workflows/verify.yml) and
 [fuzz workflow](.github/workflows/fuzz.yml).
 
+The core's [build script](crates/ext4-core/build.rs) generates its Unicode runtime
+table in Cargo's `OUT_DIR` using the host-only [generator](tools/unicode-gen/src/lib.rs).
+The generator owns the fixed encoding version and authenticated upstream inputs;
+neither UCD inputs nor generated tables belong in the source tree. A cache miss
+requires an HTTPS-capable `curl` executable on `PATH`. Inputs are cached in
+`ext4-win-ucd-<version>` under the host temporary directory; `EXT4_UCD_CACHE` can
+select an absolute external cache path for offline builds. Cargo's `--offline`
+controls dependency resolution, so an offline build also needs every UCD input
+in that cache. Every generation authenticates its inputs and checks the independent
+normalization corpus. A hash mismatch fails the build; remove the named cache file
+to permit a fresh download. Cargo tracks the generator, cache files and cache-selection
+environment for regeneration. The generator runs on the host even when cross-compiling;
+the runtime core retains its `no_std` boundary.
+The same acquisition path authenticates the complete Unicode data notice. Generation
+writes `LICENSE-UNICODE` beside the table in `OUT_DIR`; production packaging seals
+that verbatim notice alongside the project's source notices. Offline generation and
+packaging require the notice in the external cache as well as the UCD inputs.
+
 ## Developer diagnostics
 
 `cargo diagnose` runs the Rust diagnostic executable. Inputs are explicit;
