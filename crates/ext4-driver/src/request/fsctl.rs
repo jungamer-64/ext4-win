@@ -1,4 +1,4 @@
-//! ext4win-private FSCTL payload decoding for fscrypt and fs-verity.
+//! Directory-comparison, fscrypt and fs-verity FSCTL boundaries.
 //!
 //! Key changes require a writable direct-volume handle and enabled `SeManageVolumePrivilege`
 //! on the effective requestor token before queue insertion. Key removal additionally requires
@@ -50,6 +50,60 @@ pub(crate) fn authorize_key_control(
             operations.authorize_key_removal(opened.file_object())?;
         }
         Ok(())
+    })
+}
+
+/// Captures the exact directory and its retained attribute-write grant before journal admission.
+/// # Errors
+/// Rejects foreign/lifecycle authority, a non-directory handle or malformed transition input.
+pub(crate) fn prepare_directory_casefold(
+    mut request: PendingIrpLease<'_>,
+    operations: &MountedVolumeAccess<'_>,
+) -> DriverResult<(ext4_core::DirectoryNodeId, ext4_core::DirectoryCasefold)> {
+    super::file_system_control::authorize_path_handle(&mut request, operations)?;
+    request.with_active(|active| {
+        let stack = active.current_stack()?;
+        let file = stack.file_object()?;
+        if OpenedObject::decode(file)?.file_attributes_write_access()
+            != crate::irp::FileAttributesWriteAccess::Granted
+        {
+            return Err(DriverError::AccessDenied);
+        }
+        let directory = crate::state::OpenedDirectory::decode(file)?.id();
+        let control = stack.file_system_control()?;
+        if !control.output_buffer_length().is_empty() {
+            return Err(DriverError::InvalidBufferSize);
+        }
+        let input = active.buffered_input(control.input_buffer_length())?;
+        let state = ext4_control::decode_casefold(input)?;
+        Ok((directory, state))
+    })
+}
+
+/// Observes comparison state from the current committed inode through a retained directory handle.
+/// # Errors
+/// Rejects malformed buffers, a non-directory handle, storage or output admission failure.
+pub(crate) fn query_directory_casefold(
+    mut request: PendingIrpLease<'_>,
+    read: &mut ext4_core::EpochReadPass<'_, '_, '_>,
+) -> DriverResult<IrpCompletion> {
+    request.with_active(|active| {
+        let stack = active.current_stack()?;
+        let control = stack.file_system_control()?;
+        if !control.input_buffer_length().is_empty() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let directory = crate::state::OpenedDirectory::decode(stack.file_object()?)?.id();
+        let state = read.load_directory(directory)?.casefold();
+        let output = active.buffered_output(
+            control
+                .output_buffer_length()
+                .prefix(ext4_control::CASEFOLD_STATE_BYTES)?,
+        )?;
+        crate::memory::copy_exact(output, &ext4_control::encode_casefold(state))?;
+        Ok(IrpCompletion::with_information(
+            crate::irp::InformationLength::from_usize(ext4_control::CASEFOLD_STATE_BYTES)?,
+        ))
     })
 }
 

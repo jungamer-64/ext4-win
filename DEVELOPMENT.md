@@ -170,6 +170,21 @@ effect may have persisted: query reconciles authoritative storage before another
 mount selection can proceed. A failed response is not evidence that a save was rejected; the CLI
 does not retry it automatically.
 
+## Directory comparison controls
+
+```console
+cargo run -p ext4ctl -- casefold show <directory>
+cargo run -p ext4ctl -- casefold set <directory> on
+cargo run -p ext4ctl -- casefold set <directory> off
+```
+
+The directory handle selects the target; changing comparison requires attribute-write access,
+a filesystem with a declared casefold encoding, and an empty directory. Child directories inherit
+its comparison state. Encoding and strictness remain filesystem properties. The transition and any
+required encrypted-index change share one journal commit. A failed transport acknowledgement can
+follow a committed transition: observe the directory before considering a retry. The CLI never
+retries an unacknowledged transition automatically.
+
 ## Ext4 durability and interoperability
 
 Interoperability uses e2fsprogs as an independent oracle on newly formatted or

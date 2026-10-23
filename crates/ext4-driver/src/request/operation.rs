@@ -842,6 +842,8 @@ pub(crate) enum ReadRequestKind {
     GetRetrievalPointers,
     /// Reparse-point FSCTL query.
     GetReparsePoint,
+    /// Committed directory comparison-state query.
+    QueryDirectoryCasefold,
 }
 
 /// Read request after data-stream authority has been fixed at actor admission.
@@ -1059,6 +1061,11 @@ impl ReadRequestOperation {
                 let mut request = owned.request();
                 crate::request::file_system_control::authorize_path_handle(&mut request, access)?;
                 crate::request::retrieval::query(request, read, access.volume_geometry())
+            }
+            PreparedReadRequest::Other(ReadRequestKind::QueryDirectoryCasefold) => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(&mut request, access)?;
+                crate::request::fsctl::query_directory_casefold(request, read)
             }
             PreparedReadRequest::Other(ReadRequestKind::GetReparsePoint) => {
                 let mut request = owned.request();
@@ -3113,6 +3120,8 @@ pub(crate) enum MutationRequestKind {
     RemoveEncryptionKey,
     /// Cleanup-time namespace deletion after the terminal handle barrier.
     CleanupDeletion,
+    /// Empty-directory Unicode comparison transition.
+    SetDirectoryCasefold,
 }
 
 /// Mutation request after any paging stream lifetime authority has been captured.
@@ -3143,6 +3152,13 @@ enum PreparedMutationRequest {
     SetVolumeInformation,
     /// Final cleanup owns its exact namespace deletion.
     CleanupDeletion,
+    /// Retained directory identity and decoded transition; emptiness is checked inside the core pass.
+    DirectoryCasefold {
+        /// Directory selected by the opened handle.
+        directory: ext4_core::DirectoryNodeId,
+        /// Complete validated transition input.
+        state: ext4_core::DirectoryCasefold,
+    },
 }
 
 /// Exclusive stream admission progresses before the core may read data for hashing.
@@ -3208,6 +3224,11 @@ impl PreparedMutationRequest {
                 })?;
                 Ok(Self::Create { mapping, creator })
             }
+            MutationRequestKind::SetDirectoryCasefold => {
+                let (directory, state) =
+                    crate::request::fsctl::prepare_directory_casefold(owned.request(), access)?;
+                Ok(Self::DirectoryCasefold { directory, state })
+            }
             MutationRequestKind::SetEa => Ok(Self::SetEa),
             MutationRequestKind::SetReparsePoint => Ok(Self::SetReparsePoint),
             MutationRequestKind::DeleteReparsePoint => Ok(Self::DeleteReparsePoint),
@@ -3225,6 +3246,7 @@ impl PreparedMutationRequest {
             Self::Security(_) => MutationRequestKind::SetSecurity,
             Self::SetInformation(_) => MutationRequestKind::SetInformation,
             Self::SetEa => MutationRequestKind::SetEa,
+            Self::DirectoryCasefold { .. } => MutationRequestKind::SetDirectoryCasefold,
             Self::SetReparsePoint => MutationRequestKind::SetReparsePoint,
             Self::DeleteReparsePoint => MutationRequestKind::DeleteReparsePoint,
             Self::SetVolumeInformation => MutationRequestKind::SetVolumeInformation,
@@ -3952,6 +3974,7 @@ impl MutationRequestOperation {
                 })?
             }
             PreparedMutationRequest::SetEa
+            | PreparedMutationRequest::DirectoryCasefold { .. }
             | PreparedMutationRequest::SetReparsePoint
             | PreparedMutationRequest::DeleteReparsePoint => true,
             PreparedMutationRequest::SetVolumeInformation
@@ -4301,6 +4324,18 @@ impl MutationRequestOperation {
                     crate::request::security::set(owned.request(), mutation, &mapping.get().map)?;
                 Ok(DriverResolveDisposition::Mutation(
                     PendingDriverPublication::Normal(completion),
+                ))
+            }
+            PreparedMutationRequest::DirectoryCasefold { directory, state } => {
+                let mut request = owned.request();
+                crate::request::file_system_control::authorize_path_handle(
+                    &mut request,
+                    operations,
+                )?;
+                let directory = mutation.directory(*directory)?;
+                mutation.set_directory_casefold(directory, *state)?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(IrpCompletion::EMPTY),
                 ))
             }
             PreparedMutationRequest::SetVolumeInformation => {

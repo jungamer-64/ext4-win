@@ -2284,3 +2284,6 @@ mod policy;
 pub use policy::{query_policy, replace_policy};
 mod identity;
 pub use identity::*;
+
+mod directory;
+pub use directory::{DirectoryCasefoldError, query_directory_casefold, set_directory_casefold};

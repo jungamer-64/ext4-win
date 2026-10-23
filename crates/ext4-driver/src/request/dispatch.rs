@@ -799,6 +799,12 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::QueryVolumeIdentity => {
                         Admission::Immediate(ImmediateRequestKind::QueryVolumeIdentity)
                     }
+                    crate::irp::FsControlCode::QueryDirectoryCasefold => {
+                        Admission::Read(ReadRequestKind::QueryDirectoryCasefold)
+                    }
+                    crate::irp::FsControlCode::SetDirectoryCasefold => {
+                        Admission::Mutation(MutationRequestKind::SetDirectoryCasefold)
+                    }
                     crate::irp::FsControlCode::RequestOplockLevel1
                     | crate::irp::FsControlCode::RequestOplockLevel2
                     | crate::irp::FsControlCode::RequestBatchOplock

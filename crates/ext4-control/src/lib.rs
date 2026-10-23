@@ -1,10 +1,40 @@
-//! UUID-scoped administration contracts for the driver and administrator tools.
+//! Mount-policy and directory-comparison controls shared by the driver and administrator tools.
 //!
 //! A saved policy selects future mounts. Existing sessions retain the authority fixed before
 //! recovery; a successful save never changes the media authority of an existing session.
 #![no_std]
 #![forbid(unsafe_code)]
 use ext4_core::{FilesystemUuid, MountAccess, RecoveryMemoryLimit};
+
+/// Directory comparison query on a retained directory handle, using buffered I/O.
+pub const QUERY_DIRECTORY_CASEFOLD_FSCTL: u32 = 0x0009_2414;
+/// Empty-directory comparison transition; the driver requires retained attribute-write access.
+pub const SET_DIRECTORY_CASEFOLD_FSCTL: u32 = 0x0009_2418;
+/// Complete directory comparison query reply or transition input.
+pub const CASEFOLD_STATE_BYTES: usize = 4;
+
+/// Encodes a directory comparison selection independently of native structure layout.
+pub const fn encode_casefold(state: ext4_core::DirectoryCasefold) -> [u8; CASEFOLD_STATE_BYTES] {
+    match state {
+        ext4_core::DirectoryCasefold::Disabled => 0_u32.to_le_bytes(),
+        ext4_core::DirectoryCasefold::Enabled => 1_u32.to_le_bytes(),
+    }
+}
+/// Decodes exactly one supported comparison selection before mutation admission.
+/// # Errors
+/// Rejects truncated, extended or unknown state tags.
+pub fn decode_casefold(bytes: &[u8]) -> Result<ext4_core::DirectoryCasefold, Error> {
+    let tag = u32::from_le_bytes(
+        bytes
+            .try_into()
+            .map_err(|_error| Error::MalformedEncoding)?,
+    );
+    match tag {
+        0 => Ok(ext4_core::DirectoryCasefold::Disabled),
+        1 => Ok(ext4_core::DirectoryCasefold::Enabled),
+        _ => Err(Error::MalformedEncoding),
+    }
+}
 
 /// Buffered query requiring readable administrator control access.
 pub const QUERY_POLICY_IOCTL: u32 = 0x0008_6014;
@@ -270,6 +300,23 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Panics
+    /// Fails if a directory control admits unknown tags or changes its independent wire vector.
+    #[test]
+    fn directory_casefold_wire_contract() {
+        assert_eq!(
+            encode_casefold(ext4_core::DirectoryCasefold::Enabled),
+            [1, 0, 0, 0]
+        );
+        assert_eq!(
+            decode_casefold(&[0; 4]),
+            Ok(ext4_core::DirectoryCasefold::Disabled)
+        );
+        for bytes in [&[2, 0, 0, 0][..], &[1, 0, 0][..], &[1, 0, 0, 0, 0][..]] {
+            assert_eq!(decode_casefold(bytes), Err(Error::MalformedEncoding));
+        }
+    }
+
     /// # Panics
     /// Panics if wire facts change or an invalid boundary is admitted.
     #[test]

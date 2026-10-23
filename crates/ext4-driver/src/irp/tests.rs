@@ -1333,6 +1333,14 @@ fn ext4win_private_fsctl_codes_decode_to_domain_variants() {
         FsControlCode::from_raw(0x0009_640c),
         Ok(FsControlCode::EnableVerity)
     );
+    assert_eq!(
+        FsControlCode::from_raw(0x0009_2414),
+        Ok(FsControlCode::QueryDirectoryCasefold)
+    );
+    assert_eq!(
+        FsControlCode::from_raw(0x0009_2418),
+        Ok(FsControlCode::SetDirectoryCasefold)
+    );
 }
 
 /// # Panics

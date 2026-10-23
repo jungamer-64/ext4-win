@@ -202,6 +202,10 @@ pub(super) const MOUNT_VOLUME_MINOR_FUNCTION: u32 = 1;
 pub(crate) enum FsControlCode {
     /// Returns the mounted ext4 filesystem UUID.
     QueryVolumeIdentity,
+    /// Query the opened directory's comparison state.
+    QueryDirectoryCasefold,
+    /// Change comparison state on an empty opened directory.
+    SetDirectoryCasefold,
     /// Windows `FSCTL_REQUEST_OPLOCK_LEVEL_1`.
     RequestOplockLevel1,
     /// Windows `FSCTL_REQUEST_OPLOCK_LEVEL_2`.
@@ -265,6 +269,8 @@ impl FsControlCode {
     pub(super) fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
         match value {
             ext4_security::QUERY_VOLUME_IDENTITY_FSCTL => Ok(Self::QueryVolumeIdentity),
+            ext4_control::QUERY_DIRECTORY_CASEFOLD_FSCTL => Ok(Self::QueryDirectoryCasefold),
+            ext4_control::SET_DIRECTORY_CASEFOLD_FSCTL => Ok(Self::SetDirectoryCasefold),
             FSCTL_REQUEST_OPLOCK_LEVEL_1 => Ok(Self::RequestOplockLevel1),
             FSCTL_REQUEST_OPLOCK_LEVEL_2 => Ok(Self::RequestOplockLevel2),
             FSCTL_REQUEST_BATCH_OPLOCK => Ok(Self::RequestBatchOplock),
@@ -330,6 +336,8 @@ impl FsControlCode {
             | Self::OplockBreakAckNoLevel2 => Ok(OplockControlAction::BreakContinuation),
             Self::RequestOplock => Ok(structured_oplock_action(structured_input)),
             Self::QueryVolumeIdentity
+            | Self::QueryDirectoryCasefold
+            | Self::SetDirectoryCasefold
             | Self::LockVolume
             | Self::UnlockVolume
             | Self::DismountVolume

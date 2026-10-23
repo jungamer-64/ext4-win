@@ -372,6 +372,16 @@ impl DirectoryNode {
         DirectoryNodeId::new(self.inode.id())
     }
 
+    /// Comparison selection interpreted with this filesystem's mounted encoding.
+    #[must_use]
+    pub const fn casefold(&self) -> crate::DirectoryCasefold {
+        if self.inode.flags().has_casefold() {
+            crate::DirectoryCasefold::Enabled
+        } else {
+            crate::DirectoryCasefold::Disabled
+        }
+    }
+
     /// POSIX security state parsed from the directory inode.
     #[must_use]
     pub const fn security(&self) -> Ext4Security {

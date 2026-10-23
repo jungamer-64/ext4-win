@@ -2,12 +2,21 @@
 use std::process::ExitCode;
 
 /// User-visible grammar; replacements contain the entire desired table.
-const USAGE: &str = "ext4ctl volumes\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>] [--auto-trim on|off]";
+const USAGE: &str = "ext4ctl volumes\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>] [--auto-trim on|off]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
 /// Fully parsed action before any replacement can be submitted.
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     /// Mounted ext4 volumes and UUIDs.
     Volumes,
+    /// Observe one opened directory's committed comparison state.
+    CasefoldShow(String),
+    /// Journal an empty directory's comparison transition.
+    CasefoldSet {
+        /// Directory path selected by the native handle.
+        path: String,
+        /// Complete requested comparison state.
+        state: ext4_core::DirectoryCasefold,
+    },
     /// Effective token user and primary group.
     Whoami,
     /// Saved/applied generations and complete active table.
@@ -43,6 +52,22 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
     let command = match action.as_str() {
         "volumes" => Command::Volumes,
         "whoami" => Command::Whoami,
+        "casefold" => {
+            let action = args.next().ok_or_else(|| USAGE.to_owned())?;
+            let path = args.next().ok_or_else(|| USAGE.to_owned())?;
+            match action.as_str() {
+                "show" => Command::CasefoldShow(path),
+                "set" => {
+                    let state = match args.next().as_deref() {
+                        Some("on") => ext4_core::DirectoryCasefold::Enabled,
+                        Some("off") => ext4_core::DirectoryCasefold::Disabled,
+                        _ => return Err(USAGE.to_owned()),
+                    };
+                    Command::CasefoldSet { path, state }
+                }
+                _ => return Err(USAGE.to_owned()),
+            }
+        }
         "policy" => {
             let action = args.next().ok_or_else(|| USAGE.to_owned())?;
             let target = args.next().ok_or_else(|| USAGE.to_owned())?;
@@ -155,6 +180,31 @@ fn uuid_text(uuid: ext4_core::FilesystemUuid) -> String {
         .map(char::from)
         .collect()
 }
+/// Retains authoritative comparison state even if native release fails after acknowledgement.
+/// # Errors
+/// Reports the native outcome without retrying a possibly committed transition.
+#[cfg(windows)]
+fn casefold_reply(
+    result: Result<ext4_core::DirectoryCasefold, windows_host::DirectoryCasefoldError>,
+) -> Result<ext4_core::DirectoryCasefold, String> {
+    match result {
+        Ok(state) => Ok(state),
+        Err(error @ windows_host::DirectoryCasefoldError::Release { state, .. }) => {
+            println!("casefold {}", casefold_text(state));
+            Err(error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+/// User-facing spelling shared by observed and acknowledged comparison states.
+#[cfg(windows)]
+const fn casefold_text(state: ext4_core::DirectoryCasefold) -> &'static str {
+    match state {
+        ext4_core::DirectoryCasefold::Disabled => "off",
+        ext4_core::DirectoryCasefold::Enabled => "on",
+    }
+}
+
 /// Resolves explicit UUIDs or mounted volumes, without guessing numeric identities.
 /// # Errors
 /// Returns native-volume resolution diagnostics.
@@ -231,6 +281,19 @@ fn execute(command: Command) -> Result<(), String> {
             {
                 println!("{} {name}", uuid_text(uuid));
             }
+        }
+        Command::CasefoldShow(path) => {
+            let state = casefold_reply(windows_host::query_directory_casefold(
+                std::path::Path::new(&path),
+            ))?;
+            println!("casefold {}", casefold_text(state));
+        }
+        Command::CasefoldSet { path, state } => {
+            let state = casefold_reply(windows_host::set_directory_casefold(
+                std::path::Path::new(&path),
+                state,
+            ))?;
+            println!("casefold {}", casefold_text(state));
         }
         Command::Whoami => {
             let identity = windows_host::effective_identity().map_err(|error| error.to_string())?;
@@ -411,6 +474,38 @@ mod tests {
             assert!(parse(args.into_iter().map(str::to_owned)).is_err());
         }
     }
+    /// # Panics
+    /// Fails if comparison controls accept incomplete or ambiguous transition operands.
+    #[test]
+    fn directory_comparison_grammar() {
+        assert_eq!(
+            parse(
+                ["casefold", "set", "X:/empty", "on"]
+                    .into_iter()
+                    .map(str::to_owned)
+            ),
+            Ok(Command::CasefoldSet {
+                path: "X:/empty".to_owned(),
+                state: ext4_core::DirectoryCasefold::Enabled
+            })
+        );
+        assert_eq!(
+            parse(
+                ["casefold", "show", "X:/empty"]
+                    .into_iter()
+                    .map(str::to_owned)
+            ),
+            Ok(Command::CasefoldShow("X:/empty".to_owned()))
+        );
+        for args in [
+            vec!["casefold", "set", "X:/empty"],
+            vec!["casefold", "set", "X:/empty", "yes"],
+            vec!["casefold", "show", "X:/empty", "on"],
+        ] {
+            assert!(parse(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
+
     /// Full replacements retain each explicit pair and reject missing/overflowing operands.
     /// # Panics
     /// Panics if parsing loses mappings or accepts incomplete replacements.
