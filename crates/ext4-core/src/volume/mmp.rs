@@ -120,16 +120,25 @@ impl MmpLease {
         now.monotonic_millis
             >= since.saturating_add(u64::from(self.update_seconds()).saturating_mul(1000))
     }
-    /// Consumes the lease until fresh media observation, update, flush and readback all complete.
-    /// The host must revoke mutation/publication admission while no acknowledged lease is held.
-    pub fn renew(self) -> MmpOperation {
-        MmpOperation {
+    /// Transfers record-update authority while retaining only the previous acknowledged I/O window.
+    /// # Errors
+    /// Expired admission consumes the old lease and cannot produce another update operation.
+    pub fn renew(self, now: MmpTime) -> Result<(MmpRenewingLease, MmpOperation)> {
+        self.authorize(now)?;
+        let pending = MmpRenewingLease {
+            parameters: self.parameters,
+            node: self.owner.node,
+            sequence: next_sequence(self.owner.sequence),
+            valid_until_millis: self.valid_until_millis,
+        };
+        let operation = MmpOperation {
             effect: MmpEffect::None,
             parameters: self.parameters,
             owner: self.owner,
             action: Action::Renew(self.valid_until_millis),
             state: State::Start,
-        }
+        };
+        Ok((pending, operation))
     }
     /// Consumes ownership for release after the host has finished all filesystem writes.
     /// Failure leaves ownership unreleased; it never authorizes a second unverified clean write.
@@ -141,6 +150,91 @@ impl MmpLease {
             action: Action::Release(self.valid_until_millis),
             state: State::Start,
         }
+    }
+}
+
+/// A renewal's retained I/O authority cannot update the MMP record or extend its own deadline.
+/// The host consumes this value with the matching result before processing later media effects.
+#[derive(Debug)]
+pub struct MmpRenewingLease {
+    /// Immutable physical and authentication scope of the transferred record update.
+    parameters: MmpParameters,
+    /// Expected mount-instance identity; observation does not grant another record-update operation.
+    node: [u8; 64],
+    /// Exactly one successor sequence may extend this window.
+    sequence: u32,
+    /// The previous acknowledged window remains bounded while update I/O is pending.
+    valid_until_millis: u64,
+}
+impl MmpRenewingLease {
+    /// Admits I/O only within the previous acknowledgement, including time spent awaiting completion.
+    /// # Errors
+    /// Returns ownership loss when no previously acknowledged time remains.
+    pub fn authorize(&self, now: MmpTime) -> Result<()> {
+        if now.monotonic_millis >= self.valid_until_millis {
+            return Err(Error::MmpOwnershipLost);
+        }
+        Ok(())
+    }
+    /// Consumes the retained window and its unique durable successor before extending I/O authority.
+    /// # Errors
+    /// Returns the durable proof on a foreign/mismatched completion or an expired new window.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejection preserves durable update progress without allocation"
+    )]
+    pub fn complete(
+        self,
+        renewal: MmpRenewal,
+        now: MmpTime,
+    ) -> core::result::Result<MmpLease, (Error, MmpRenewal)> {
+        if self.parameters != renewal.parameters
+            || self.node != renewal.owner.node
+            || self.sequence != renewal.owner.sequence
+        {
+            return Err((Error::ClusterReferenceConflict, renewal));
+        }
+        if now.monotonic_millis >= renewal.valid_until_millis {
+            return Err((Error::MmpOwnershipLost, renewal));
+        }
+        Ok(MmpLease {
+            parameters: renewal.parameters,
+            owner: renewal.owner,
+            valid_until_millis: renewal.valid_until_millis,
+        })
+    }
+}
+
+/// Durable update evidence; it grants no I/O authority until its matching retained lease accepts it.
+#[derive(Debug)]
+pub struct MmpRenewal {
+    /// Physical scope authenticated by the completed record update.
+    parameters: MmpParameters,
+    /// Exact record identity confirmed by independent readback.
+    owner: MmpOwner,
+    /// Deadline established at update submission, including lower completion latency.
+    valid_until_millis: u64,
+}
+
+/// Distinct postconditions of acquisition, observation, update and final release.
+#[derive(Debug)]
+pub enum MmpCompletion {
+    /// A fresh mount acquired ownership after delayed claim verification and a durable update.
+    Acquired(MmpLease),
+    /// Independent observation admitted a write-free mount; no ownership lease was created.
+    ReadOnly,
+    /// A matching retained lease must consume this evidence to extend I/O admission.
+    Renewed(MmpRenewal),
+    /// The final clean marker and its filesystem-device flush completed.
+    Released,
+}
+
+/// Ordinary owner sequences advance without entering either reserved ownership marker.
+const fn next_sequence(sequence: u32) -> u32 {
+    if sequence == mmp::LAST_SEQUENCE {
+        1
+    } else {
+        sequence.saturating_add(1)
     }
 }
 
@@ -192,7 +286,7 @@ pub enum MmpTransition {
         suspended: Box<MmpOperation>,
     },
     /// An acknowledged lease, or no write authority after read-only observation or clean release.
-    Complete(core::result::Result<Option<MmpLease>, MmpFailure>),
+    Complete(core::result::Result<MmpCompletion, MmpFailure>),
 }
 /// Ownership change submitted to the physical device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -393,7 +487,7 @@ impl MmpOperation {
                 }
                 self.effect = MmpEffect::Durable(after.change());
                 return match after {
-                    AfterWrite::Release => MmpTransition::Complete(Ok(None)),
+                    AfterWrite::Release => MmpTransition::Complete(Ok(MmpCompletion::Released)),
                     AfterWrite::Claim(seconds) => self.wait(ReadPurpose::VerifyClaim, seconds, now),
                     AfterWrite::Renewal(deadline) => self.read(ReadPurpose::VerifyLease(deadline)),
                 };
@@ -470,11 +564,23 @@ impl MmpOperation {
                 if !self.owns(record) || now.monotonic_millis >= deadline {
                     return self.failed(Error::MmpOwnershipLost);
                 }
-                return MmpTransition::Complete(Ok(Some(MmpLease {
-                    parameters: self.parameters,
-                    owner: self.owner,
-                    valid_until_millis: deadline,
-                })));
+                return match self.action {
+                    Action::Acquire(MediaAccess::ReadWrite) => {
+                        MmpTransition::Complete(Ok(MmpCompletion::Acquired(MmpLease {
+                            parameters: self.parameters,
+                            owner: self.owner,
+                            valid_until_millis: deadline,
+                        })))
+                    }
+                    Action::Renew(_) => {
+                        MmpTransition::Complete(Ok(MmpCompletion::Renewed(MmpRenewal {
+                            parameters: self.parameters,
+                            owner: self.owner,
+                            valid_until_millis: deadline,
+                        })))
+                    }
+                    _ => self.failed(Error::DeviceIo),
+                };
             }
             ReadPurpose::VerifyClaim => {
                 if !self.owns(record) {
@@ -504,7 +610,9 @@ impl MmpOperation {
             ReadPurpose::Observe(_) => {}
         }
         let (sequence, after) = match self.action {
-            Action::Acquire(MediaAccess::ReadOnly) => return MmpTransition::Complete(Ok(None)),
+            Action::Acquire(MediaAccess::ReadOnly) => {
+                return MmpTransition::Complete(Ok(MmpCompletion::ReadOnly));
+            }
             Action::Acquire(MediaAccess::ReadWrite) => (
                 self.owner.sequence,
                 AfterWrite::Claim(self.parameters.observation_seconds(record.interval)),
@@ -516,11 +624,7 @@ impl MmpOperation {
     }
     /// Establishes a new deadline from submission time, including lower write/flush/read latency.
     fn refresh(mut self: Box<Self>, buffer: Vec<u8>, now: MmpTime) -> MmpTransition {
-        self.owner.sequence = if self.owner.sequence == mmp::LAST_SEQUENCE {
-            1
-        } else {
-            self.owner.sequence.saturating_add(1)
-        };
+        self.owner.sequence = next_sequence(self.owner.sequence);
         let deadline = now
             .monotonic_millis
             .saturating_add(u64::from(self.parameters.check_seconds()).saturating_mul(1000));
