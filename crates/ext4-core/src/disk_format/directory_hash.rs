@@ -2,7 +2,6 @@
 
 use core::array;
 
-use crate::disk_format::name::Ext4Name;
 use crate::disk_format::superblock::{
     DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
 };
@@ -84,21 +83,21 @@ impl DirectoryHashScheme {
 
     /// Produces the normalized HTree key for one validated ext4 name.
     #[must_use]
-    pub(crate) fn hash(self, name: &Ext4Name) -> DirectoryHash {
+    pub(crate) fn hash(self, name: &[u8]) -> DirectoryHash {
         let (major, minor) = match self.version {
-            DirectoryHashVersion::Legacy => rolling_hash(name.bytes(), NameByteEncoding::Signed),
+            DirectoryHashVersion::Legacy => rolling_hash(name, NameByteEncoding::Signed),
             DirectoryHashVersion::LegacyUnsigned => {
-                rolling_hash(name.bytes(), NameByteEncoding::Unsigned)
+                rolling_hash(name, NameByteEncoding::Unsigned)
             }
             DirectoryHashVersion::HalfMd4 => {
-                self.hash_with_half_md4(name.bytes(), NameByteEncoding::Signed)
+                self.hash_with_half_md4(name, NameByteEncoding::Signed)
             }
             DirectoryHashVersion::HalfMd4Unsigned => {
-                self.hash_with_half_md4(name.bytes(), NameByteEncoding::Unsigned)
+                self.hash_with_half_md4(name, NameByteEncoding::Unsigned)
             }
-            DirectoryHashVersion::Tea => self.hash_with_tea(name.bytes(), NameByteEncoding::Signed),
+            DirectoryHashVersion::Tea => self.hash_with_tea(name, NameByteEncoding::Signed),
             DirectoryHashVersion::TeaUnsigned => {
-                self.hash_with_tea(name.bytes(), NameByteEncoding::Unsigned)
+                self.hash_with_tea(name, NameByteEncoding::Unsigned)
             }
         };
         DirectoryHash::from_algorithm(major, minor)
@@ -360,8 +359,7 @@ mod tests {
     use alloc::vec;
 
     use super::{DirectoryHash, DirectoryHashScheme};
-    use crate::disk_format::name::Ext4Name;
-    use crate::disk_format::superblock::{
+        use crate::disk_format::superblock::{
         DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion,
     };
 
