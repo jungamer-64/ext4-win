@@ -201,9 +201,10 @@ impl PreparedKeyChange {
         visibility: VisibilityLease,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<CommittedEpoch, (Error, Self)> {
-        if !coordinator.accepts_visibility(visibility, self.claim)
-            || coordinator.mount != self.epoch.mount
-        {
+        if let Err(error) = coordinator.validate_visibility(visibility, self.claim) {
+            return Err((error, self));
+        }
+        if coordinator.mount != self.epoch.mount {
             return Err((Error::ClusterReferenceConflict, self));
         }
         let JournalCoordinatorState::Ready {

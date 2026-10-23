@@ -6048,11 +6048,16 @@ impl MutationRequestOperation {
                 }),
                 OperationEvent::CheckpointGranted(checkpoint) => {
                     let (operation, publication, epoch) = pending.into_parts();
+                    let sequence = match access.start_checkpoint(operation, checkpoint) {
+                        Ok(sequence) => sequence,
+                        Err((Error::MmpOwnershipLost, _checkpoint)) => {
+                            return MutationStep::Transition(self.fail_checkpoint(publication,
+                                StorageFailureClass::DurabilityUnknown { completed: 0 }, access));
+                        }
+                        Err(_) => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+                    };
                     MutationStep::Transition(self.drive_checkpoint_home(
-                        match operation.start(checkpoint) {
-                            Ok(sequence) => sequence,
-                            Err(_) => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
-                        },
+                        sequence,
                         publication,
                         epoch,
                     ))

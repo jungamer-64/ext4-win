@@ -546,8 +546,10 @@ impl DurableMutation {
         visibility: super::super::VisibilityLease,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<PublishedMutation, (Error, Self)> {
-        let valid = coordinator.accepts_visibility(visibility, self.claim)
-            && coordinator.mount == self.durable_epoch.mount
+        if let Err(error) = coordinator.validate_visibility(visibility, self.claim) {
+            return Err((error, self));
+        }
+        let valid = coordinator.mount == self.durable_epoch.mount
             && matches!(coordinator.journal, JournalCoordinatorState::Ready { .. })
             && coordinator.published_epoch().1.next() == Ok(self.durable_epoch.sequence());
         if !valid {
@@ -582,11 +584,25 @@ impl CheckpointOperation {
     pub fn start(
         self,
         checkpoint: super::super::CheckpointLease,
+        coordinator: &MutationCoordinatorState,
     ) -> core::result::Result<StorageRequestSequence<HomeBlockDurability>, (Error, Self)> {
-        if checkpoint
-            .consume(&self.checkpointed_epoch.mount)
-            .and_then(|epoch| epoch.next())
-            != Ok(self.checkpointed_epoch.sequence())
+        if let Err(error) = coordinator.require_session_authority() {
+            return Err((error, self));
+        }
+        if coordinator.mount != self.checkpointed_epoch.mount
+            || coordinator.published_epoch().0 != self.checkpointed_epoch.identity().uuid()
+            || coordinator.published_epoch().1.next() != Ok(self.checkpointed_epoch.sequence())
+            || !matches!(
+                coordinator.journal,
+                JournalCoordinatorState::CheckpointPending {
+                    admission: CheckpointAdmission::Granted,
+                    ..
+                }
+            )
+            || checkpoint
+                .consume(&self.checkpointed_epoch.mount)
+                .and_then(|epoch| epoch.next())
+                != Ok(self.checkpointed_epoch.sequence())
         {
             return Err((Error::ClusterReferenceConflict, self));
         }
@@ -617,6 +633,9 @@ impl CheckpointPublication {
         self,
         coordinator: &mut MutationCoordinatorState,
     ) -> core::result::Result<CommittedEpoch, (Error, Self)> {
+        if let Err(error) = coordinator.require_session_authority() {
+            return Err((error, self));
+        }
         if coordinator.mount != self.checkpointed_epoch.mount
             || !matches!(
                 coordinator.journal,

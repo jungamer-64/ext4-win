@@ -1088,6 +1088,221 @@ fn mount_sessions_isolate_plans_grants_and_read_provenance() -> Result<()> {
 }
 
 /// # Errors
+/// Returns actual fixture, preparation, storage or commit failures.
+fn durable_label_change(fixture: &mut Fixture) -> Result<(u64, ext4_core::DurableMutation)> {
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        &mut PlainCrypto,
+        |pass| pass.set_volume_label(Ext4VolumeLabel::new(b"committed")?),
+    )?;
+    let prepared = resolved
+        .reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?
+        .prepare_commit(
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(Error::ClusterReferenceConflict)?,
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+        )?;
+    let ordered = fixture.disk.sequence(prepared.start())?;
+    let payloads = fixture.disk.transfer(ordered.submit())?;
+    let payloads = fixture.disk.sequence(payloads)?;
+    let commit = fixture.disk.transfer(payloads.submit())?;
+    let barrier = fixture.disk.transfer(commit.submit())?;
+    Ok((ticket, fixture.disk.transfer(barrier.submit())?))
+}
+
+/// # Errors
+/// Returns fixture or pre-revocation preparation failure.
+/// # Panics
+/// Fails if an issued commit acquisition or cached reader bypasses session revocation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe externally revoked session authority"
+)]
+fn revoked_session_rejects_issued_commit_and_cached_reads() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        &mut PlainCrypto,
+        |pass| pass.set_volume_label(Ext4VolumeLabel::new(b"uncommitted")?),
+    )?;
+    let reserved = resolved.reserve(
+        fixture.coordinator.grant_intent(ticket),
+        &fixture.coordinator,
+    )?;
+    let commit = fixture
+        .coordinator
+        .acquire_commit(ticket)?
+        .ok_or(Error::ClusterReferenceConflict)?;
+    let effects = fixture.disk.storage_effects;
+    fixture.coordinator.revoke_media_ownership();
+    assert!(matches!(
+        reserved.prepare_commit(
+            commit,
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache
+        ),
+        Err(Error::MmpOwnershipLost)
+    ));
+    assert_eq!(
+        fixture.coordinator.admit_mutation(),
+        Err(Error::MmpOwnershipLost)
+    );
+    assert!(matches!(
+        fixture.coordinator.acquire_commit(ticket),
+        Err(Error::MmpOwnershipLost)
+    ));
+    assert!(matches!(
+        fixture
+            .coordinator
+            .read_context(fixture.cache.access(&fixture.epoch)),
+        Err(Error::MmpOwnershipLost)
+    ));
+    assert_eq!(fixture.disk.storage_effects, effects);
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, storage or recovery failure.
+/// # Panics
+/// Fails if a durable commit can consume a visibility grant after ownership revocation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions distinguish a durable effect from rejected publication"
+)]
+fn revoked_session_retains_durable_commit_for_fresh_mount_recovery() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let (ticket, durable) = durable_label_change(&mut fixture)?;
+    let visibility = fixture
+        .coordinator
+        .acquire_visibility(ticket)
+        .ok_or(Error::ClusterReferenceConflict)?;
+    let effects = fixture.disk.storage_effects;
+    fixture.coordinator.revoke_media_ownership();
+    let (error, durable) = durable
+        .publish(visibility, &mut fixture.coordinator)
+        .err()
+        .ok_or(Error::DeviceIo)?;
+    assert_eq!(error, Error::MmpOwnershipLost);
+    assert!(fixture.coordinator.acquire_visibility(ticket).is_none());
+    assert_eq!(fixture.disk.storage_effects, effects);
+    drop(durable);
+    let (_, epoch, _, _mmp) = fixture.disk.mount(MountAccess::ReadWrite)?.into_parts();
+    assert_eq!(
+        epoch.identity().label(),
+        Ext4VolumeLabel::new(b"committed")?
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture, storage or pre-revocation publication failure.
+/// # Panics
+/// Fails if a previously granted checkpoint starts writes or reconstructs admission after revocation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe checkpoint authority and actual lower effects"
+)]
+fn revoked_session_rejects_an_issued_checkpoint_grant() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let (ticket, durable) = durable_label_change(&mut fixture)?;
+    let visibility = fixture
+        .coordinator
+        .acquire_visibility(ticket)
+        .ok_or(Error::ClusterReferenceConflict)?;
+    let (epoch, checkpoint) = durable
+        .publish(visibility, &mut fixture.coordinator)
+        .map_err(|(error, _durable)| error)?
+        .into_parts();
+    let lease = fixture
+        .coordinator
+        .acquire_checkpoint(epoch.sequence())
+        .ok_or(Error::ClusterReferenceConflict)?;
+    let effects = fixture.disk.storage_effects;
+    fixture.coordinator.revoke_media_ownership();
+    let (error, checkpoint) = checkpoint
+        .start(lease, &fixture.coordinator)
+        .err()
+        .ok_or(Error::DeviceIo)?;
+    assert_eq!(error, Error::MmpOwnershipLost);
+    assert!(
+        fixture
+            .coordinator
+            .acquire_checkpoint(epoch.sequence())
+            .is_none()
+    );
+    assert_eq!(fixture.disk.storage_effects, effects);
+    drop(checkpoint);
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture or actual checkpoint storage failure.
+/// # Panics
+/// Fails if completed home/journal writes restore a revoked mount session.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe revocation after real durability effects"
+)]
+fn revoked_session_rejects_completed_checkpoint_publication() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let (ticket, durable) = durable_label_change(&mut fixture)?;
+    let visibility = fixture
+        .coordinator
+        .acquire_visibility(ticket)
+        .ok_or(Error::ClusterReferenceConflict)?;
+    let (epoch, checkpoint) = durable
+        .publish(visibility, &mut fixture.coordinator)
+        .map_err(|(error, _durable)| error)?
+        .into_parts();
+    let lease = fixture
+        .coordinator
+        .acquire_checkpoint(epoch.sequence())
+        .ok_or(Error::ClusterReferenceConflict)?;
+    let sequence = checkpoint
+        .start(lease, &fixture.coordinator)
+        .map_err(|(error, _checkpoint)| error)?;
+    let home = fixture.disk.sequence(sequence)?;
+    let record = fixture.disk.transfer(home.submit())?;
+    let barrier = fixture.disk.transfer(record.submit())?;
+    let publication = fixture.disk.transfer(barrier.submit())?;
+    let effects = fixture.disk.storage_effects;
+    fixture.coordinator.revoke_media_ownership();
+    let (error, publication) = publication
+        .publish(&mut fixture.coordinator)
+        .err()
+        .ok_or(Error::DeviceIo)?;
+    assert_eq!(error, Error::MmpOwnershipLost);
+    assert!(!fixture.coordinator.journal_is_clean());
+    assert!(matches!(
+        fixture.coordinator.acquire_commit(ticket),
+        Err(Error::MmpOwnershipLost)
+    ));
+    assert_eq!(fixture.disk.storage_effects, effects);
+    drop(publication);
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, storage, or journal transition failures.
 /// # Panics
 /// Fails if rejected publication loses the durable mutation or accepts another mount or ticket.
@@ -1195,6 +1410,7 @@ fn durable_publications_retain_state_after_mismatched_authority() -> Result<()> 
                 .coordinator
                 .acquire_checkpoint(epoch.sequence())
                 .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
+            &origin.coordinator,
         )
         .map_err(|(error, _checkpoint)| error)?;
     let home = origin.disk.sequence(sequence)?;
@@ -1819,6 +2035,7 @@ fn journaled_file_data_publishes_before_home_checkpoint() -> Result<()> {
                     .coordinator
                     .acquire_checkpoint(fixture.epoch.sequence())
                     .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
+                &fixture.coordinator,
             )
             .map_err(|(error, _checkpoint)| error)?,
     )?;
@@ -2249,6 +2466,7 @@ impl Disk {
                     coordinator
                         .acquire_checkpoint(epoch.sequence())
                         .ok_or(ext4_core::Error::ClusterReferenceConflict)?,
+                    coordinator,
                 )
                 .map_err(|(error, _checkpoint)| error)?,
         )?;

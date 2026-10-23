@@ -1158,6 +1158,7 @@ fn run_prepared_mutation_until_boundary(
                 .acquire_checkpoint(epoch.sequence())
                 .ok_or(ext4_core::Error::ClusterReferenceConflict)
                 .map_err(core_task_error)?,
+            coordinator,
         )
         .map_err(|(error, _checkpoint)| core_task_error(error))?;
     let home = match complete_boundary_sequence(storage, &mut controller, sequence)? {
@@ -1454,6 +1455,7 @@ fn complete_prepared_mutation<S: HostStorage>(
                 .acquire_checkpoint(epoch.sequence())
                 .ok_or(ext4_core::Error::ClusterReferenceConflict)
                 .map_err(core_task_error)?,
+            coordinator,
         )
         .map_err(|(error, _checkpoint)| core_task_error(error))?;
     let home = complete_storage_sequence(storage, sequence)?;

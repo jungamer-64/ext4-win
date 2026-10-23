@@ -1694,6 +1694,24 @@ impl MountedVolumeAccess<'_> {
         self.runtime.try_grant_checkpoint(epoch)
     }
 
+    /// Revalidates the session before a previously granted checkpoint can start lower writes.
+    /// # Errors
+    /// Consumes the grant and retains checkpoint state on ownership revocation or stale admission.
+    #[expect(
+        clippy::result_large_err,
+        reason = "rejection retains checkpoint ownership without allocating after commit"
+    )]
+    pub(crate) fn start_checkpoint(
+        &self,
+        operation: ext4_core::CheckpointOperation,
+        checkpoint: ext4_core::CheckpointLease,
+    ) -> Result<
+        ext4_core::StorageRequestSequence<ext4_core::HomeBlockDurability>,
+        (ext4_core::Error, ext4_core::CheckpointOperation),
+    > {
+        operation.start(checkpoint, self.runtime.coordinator())
+    }
+
     /// Reports whether no mutation or checkpoint owns journal space.
     #[cfg(not(test))]
     pub(crate) fn journal_is_clean(&self) -> bool {
