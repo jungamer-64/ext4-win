@@ -124,15 +124,27 @@ enum DirectoryLayout {
     Hash(alloc::boxed::Box<HashWalk>),
 }
 
+/// Directory storage owns only the continuation meaningful for that representation.
+#[derive(Debug)]
+enum DirectoryStorageWalk {
+    /// Inline regions are inode-checksummed and contain no extent coordinates.
+    Inline(alloc::vec::IntoIter<RawDirectoryEntry>),
+    /// An extent mapping and the directory's cursor interpretation.
+    Mapped {
+        /// Only extent nodes needed for the current logical block.
+        mapping: ExtentMappingCursor,
+        /// Linear or indexed interpretation of mapped blocks.
+        layout: DirectoryLayout,
+    },
+}
+
 /// An opened directory and the bounded storage state interpreting it.
 #[derive(Debug)]
 struct DirectoryWalk {
     /// Validated directory inode guarded by its observed resource version.
     directory: DirectoryNode,
-    /// Only the extent nodes mapping the currently requested block.
-    mapping: ExtentMappingCursor,
-    /// Directory-specific iteration state.
-    layout: DirectoryLayout,
+    /// Representation-specific traversal authority.
+    storage: DirectoryStorageWalk,
     /// Raw entry retained across projection I/O.
     pending: Option<PendingEntry>,
 }
@@ -277,38 +289,45 @@ impl DirectoryReader {
                 return Err(Error::UnsupportedVerity);
             }
             let inode = directory.inode();
-            let mapping = ExtentMappingCursor::new(
-                inode.extent_root()?,
-                view.superblock.block_size(),
-                view.extent_tree_context(inode),
-            )?;
-            let layout = match inode.directory_storage_kind()? {
-                DirectoryStorageKind::HTree => DirectoryLayout::Root,
-                DirectoryStorageKind::Linear => {
-                    let (logical, offset) = match self.cursor.position {
-                        DirectoryScanPosition::Linear { logical, offset } => {
-                            (u64::from(logical), offset)
-                        }
-                        DirectoryScanPosition::Start | DirectoryScanPosition::Ordinal(_) => (0, 0),
-                        _ => {
-                            self.skip = self.cursor.ordinal;
-                            (0, 0)
-                        }
-                    };
-                    DirectoryLayout::Linear(LinearWalk {
-                        logical,
-                        offset,
-                        records: None,
-                    })
-                }
+            let storage = if let InodeStorage::InlineData(data) = inode.storage() {
+                self.skip = self.cursor.ordinal;
+                DirectoryStorageWalk::Inline(data.directory_entries(inode.id())?.into_iter())
+            } else {
+                let mapping = ExtentMappingCursor::new(
+                    inode.extent_root()?,
+                    view.superblock.block_size(),
+                    view.extent_tree_context(inode),
+                )?;
+                let layout = match inode.directory_storage_kind()? {
+                    DirectoryStorageKind::HTree => DirectoryLayout::Root,
+                    DirectoryStorageKind::Linear => {
+                        let (logical, offset) = match self.cursor.position {
+                            DirectoryScanPosition::Linear { logical, offset } => {
+                                (u64::from(logical), offset)
+                            }
+                            DirectoryScanPosition::Start | DirectoryScanPosition::Ordinal(_) => {
+                                (0, 0)
+                            }
+                            _ => {
+                                self.skip = self.cursor.ordinal;
+                                (0, 0)
+                            }
+                        };
+                        DirectoryLayout::Linear(LinearWalk {
+                            logical,
+                            offset,
+                            records: None,
+                        })
+                    }
+                };
+                DirectoryStorageWalk::Mapped { mapping, layout }
             };
             if self.skip != 0 {
                 self.cursor.ordinal = 0;
             }
             self.state = ReaderState::Walking(memory::try_box(DirectoryWalk {
                 directory,
-                mapping,
-                layout,
+                storage,
                 pending: None,
             })?);
             return Ok(ReaderStep::Progress);
@@ -349,67 +368,79 @@ impl DirectoryReader {
             walk.pending = None;
             return Ok(ReaderStep::Entry(result));
         }
-        let step = match &mut walk.layout {
-            DirectoryLayout::Root => {
-                let inode = walk.directory.inode();
-                let block = view.read_directory_logical_block(
-                    inode,
-                    &mut walk.mapping,
-                    LogicalBlock::try_from(0_u64)?,
-                )?;
-                let root = HtreeRoot::parse(
-                    block.bytes(),
-                    inode.id(),
-                    view.superblock.directory_hash_seed(),
-                    view.superblock.directory_hash_signedness(),
-                    view.superblock.directory_indexing().require_supported()?,
-                    view.directory_checksum(inode),
-                )?;
-                let dot_start = match self.cursor.position {
-                    DirectoryScanPosition::Start | DirectoryScanPosition::Ordinal(_) => 0,
-                    DirectoryScanPosition::AfterDot => 1,
-                    DirectoryScanPosition::Linear { .. } => {
-                        self.skip = self.cursor.ordinal;
-                        self.cursor.ordinal = 0;
-                        0
+        let step = match &mut walk.storage {
+            DirectoryStorageWalk::Inline(entries) => match entries.next() {
+                Some(entry) => WalkStep::Entry(
+                    entry,
+                    DirectoryScanPosition::Ordinal(
+                        self.cursor
+                            .ordinal
+                            .checked_add(1)
+                            .ok_or(Error::ArithmeticOverflow)?,
+                    ),
+                ),
+                None => WalkStep::End,
+            },
+            DirectoryStorageWalk::Mapped { mapping, layout } => match layout {
+                DirectoryLayout::Root => {
+                    let inode = walk.directory.inode();
+                    let block = view.read_directory_logical_block(
+                        inode,
+                        mapping,
+                        LogicalBlock::try_from(0_u64)?,
+                    )?;
+                    let root = HtreeRoot::parse(
+                        block.bytes(),
+                        inode.id(),
+                        view.superblock.directory_hash_seed(),
+                        view.superblock.directory_hash_signedness(),
+                        view.superblock.directory_indexing().require_supported()?,
+                        view.directory_checksum(inode),
+                    )?;
+                    let dot_start = match self.cursor.position {
+                        DirectoryScanPosition::Start | DirectoryScanPosition::Ordinal(_) => 0,
+                        DirectoryScanPosition::AfterDot => 1,
+                        DirectoryScanPosition::Linear { .. } => {
+                            self.skip = self.cursor.ordinal;
+                            self.cursor.ordinal = 0;
+                            0
+                        }
+                        _ => 2,
+                    };
+                    let after = match self.cursor.position {
+                        DirectoryScanPosition::HTree { major, minor } => {
+                            Some((DirectoryHash { major, minor }, self.cursor.htree_name))
+                        }
+                        _ => None,
+                    };
+                    let major = after.map_or(0, |key| key.0.major);
+                    let mut dots = Vec::new();
+                    for raw in root.dot_entries().iter().skip(dot_start) {
+                        dots.try_push(raw.try_clone()?)?;
                     }
-                    _ => 2,
-                };
-                let after = match self.cursor.position {
-                    DirectoryScanPosition::HTree { major, minor } => {
-                        Some((DirectoryHash { major, minor }, self.cursor.htree_name))
-                    }
-                    _ => None,
-                };
-                let major = after.map_or(0, |key| key.0.major);
-                let mut dots = Vec::new();
-                for raw in root.dot_entries().iter().skip(dot_start) {
-                    dots.try_push(raw.try_clone()?)?;
+                    let index = root.index().try_clone()?;
+                    let selected = index.select(major);
+                    let mut levels = Vec::new();
+                    levels.try_push(HtreePathLevel {
+                        logical: 0,
+                        index,
+                        selected,
+                    })?;
+                    *layout = DirectoryLayout::Hash(memory::try_box(HashWalk {
+                        hash: root.hash_scheme(),
+                        depth: root.indirect_levels(),
+                        path: HtreePath { levels },
+                        descend_major: major,
+                        dots: dots.into_iter(),
+                        leaf: None,
+                        after,
+                        phase: HashPhase::Ordinary,
+                    })?);
+                    WalkStep::Progress
                 }
-                let index = root.index().try_clone()?;
-                let selected = index.select(major);
-                let mut levels = Vec::new();
-                levels.try_push(HtreePathLevel {
-                    logical: 0,
-                    index,
-                    selected,
-                })?;
-                walk.layout = DirectoryLayout::Hash(memory::try_box(HashWalk {
-                    hash: root.hash_scheme(),
-                    depth: root.indirect_levels(),
-                    path: HtreePath { levels },
-                    descend_major: major,
-                    dots: dots.into_iter(),
-                    leaf: None,
-                    after,
-                    phase: HashPhase::Ordinary,
-                })?);
-                WalkStep::Progress
-            }
-            DirectoryLayout::Linear(linear) => {
-                linear.step(view, &walk.directory, &mut walk.mapping)?
-            }
-            DirectoryLayout::Hash(hash) => hash.step(view, &walk.directory, &mut walk.mapping)?,
+                DirectoryLayout::Linear(linear) => linear.step(view, &walk.directory, mapping)?,
+                DirectoryLayout::Hash(hash) => hash.step(view, &walk.directory, mapping)?,
+            },
         };
         match step {
             WalkStep::Progress => Ok(ReaderStep::Progress),

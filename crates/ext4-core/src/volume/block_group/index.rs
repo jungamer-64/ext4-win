@@ -391,7 +391,12 @@ fn begin_inode_scan(
     if let Some(block) = raw.xattr_block()? {
         ranges.try_push(AllocationRange::new(block, 1, BlockOwnership::SharedXattr)?)?;
     }
-    if !orphans.contains(raw.id) && raw.parse().is_err() {
+    if !orphans.contains(raw.id)
+        && let Err(error) = raw.parse()
+    {
+        if raw.flags()?.has_inline_data() {
+            return Err(error);
+        }
         if raw.has_extent_tree()? {
             return Err(Error::UnsupportedBlockMap);
         }
@@ -399,7 +404,7 @@ fn begin_inode_scan(
     }
     let data = InodeData::parse(raw.id, raw.bytes, raw.encoding)?;
     match data.storage() {
-        InodeStorage::InlineBytes(_) => Ok(InodeAllocationScan::Next),
+        InodeStorage::FastSymlink(_) | InodeStorage::InlineData(_) => Ok(InodeAllocationScan::Next),
         InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
         InodeStorage::Extents(root) => {
             Ok(InodeAllocationScan::Extents(ExtentAllocationCursor::new(

@@ -154,6 +154,60 @@ impl AllocatedInodeRecord {
         self.raw.into_live()
     }
 
+    /// Initializes a directory entirely inside its inode body without allocating a data block.
+    /// # Errors
+    /// Propagates unsupported encoding, body capacity or inode-field failures.
+    pub(super) fn initialize_inline_directory(
+        mut self,
+        metadata: NewDirectoryMetadata,
+        parent: InodeId,
+        parent_flags: InodeFlags,
+        now: Ext4Timestamp,
+        block_size: BlockSize,
+        timestamp_encoding: InodeTimestampEncoding,
+    ) -> Result<LiveInodeRecord> {
+        self.raw.initialize_file(
+            NewFileMetadata::new(metadata.owner(), metadata.permissions()),
+            parent_flags,
+            now,
+            block_size,
+            timestamp_encoding,
+        )?;
+        self.raw
+            .set_mode(InodeMode::directory(metadata.permissions()))?;
+        self.raw.set_links_count(Ext4LinkCount::new(2)?)?;
+        self.raw.set_encoded_size(
+            self.raw
+                .encoding
+                .encode_directory_size(DirectorySize::from_bytes(60))?,
+        )?;
+        self.raw.set_flags(
+            parent_flags
+                .inherited_by(InodeKind::Directory)
+                .into_inline_storage(),
+        )?;
+        let mut region = DirectoryBlock::empty(56, DirectoryChecksum::None)?;
+        region.initialize_free_space()?;
+        let mut prefix = [0; 60];
+        memory::copy_exact(
+            prefix.get_mut(..4).ok_or(Error::InvalidInode)?,
+            &parent.as_u32().to_le_bytes(),
+        )?;
+        memory::copy_exact(
+            prefix.get_mut(4..).ok_or(Error::InvalidInode)?,
+            region.bytes(),
+        )?;
+        self.raw.set_extent_root_bytes(&prefix)?;
+        let mut set = InodeXattrSet::empty();
+        set.set_inline_data(XattrValue::new(&[])?);
+        let body = xattr_storage::serialize_inline_xattrs(
+            &set,
+            self.raw.writable_inline_xattr_region()?.len(),
+        )?;
+        memory::copy_exact(self.raw.writable_inline_xattr_region()?, &body)?;
+        self.raw.into_live()
+    }
+
     /// Initializes this allocation as a directory owning its first block.
     /// # Errors
     ///
@@ -253,6 +307,40 @@ impl LiveInodeRecord {
         self.raw.parse()
     }
 
+    /// Selects inline storage for an empty extent-backed allocation before publication.
+    /// # Errors
+    /// Rejects nonempty, protected or unsupported records and truncated fields.
+    pub(super) fn initialize_inline_storage(&mut self) -> Result<()> {
+        let inode = self.parse()?;
+        if inode.size().bytes() != 0
+            || inode.protection().is_encrypted()
+            || inode.protection().is_verity()
+        {
+            return Err(Error::InvalidInode);
+        }
+        self.raw.set_extent_root_bytes(&[0; 60])?;
+        self.raw.set_flags(inode.flags().into_inline_storage())
+    }
+    /// Atomically retires inline interpretation and establishes an empty extent root.
+    /// # Errors
+    /// Rejects an absent inline flag or truncated inode fields.
+    pub(super) fn replace_inline_storage(&mut self, root: &[u8; 60]) -> Result<()> {
+        let flags = self.raw.flags()?;
+        if !flags.has_inline_data() {
+            return Err(Error::InvalidInode);
+        }
+        self.raw.set_extent_root_bytes(root)?;
+        self.raw.set_flags(flags.into_extent_storage())
+    }
+    /// Replaces i_block bytes while retaining the inode's inline-data interpretation.
+    /// # Errors
+    /// Rejects non-inline storage or truncated fields.
+    pub(super) fn set_inline_payload(&mut self, bytes: &[u8; 60]) -> Result<()> {
+        if !self.raw.flags()?.has_inline_data() {
+            return Err(Error::InvalidInode);
+        }
+        self.raw.set_extent_root_bytes(bytes)
+    }
     /// Marks this directory inode as HTree indexed.
     /// # Errors
     ///
@@ -1127,6 +1215,7 @@ mod tests {
                 crate::disk_format::inode::InodeBlockCountEncoding::HugeFile,
                 block_size()?,
                 crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+                false,
             ),
         })
     }

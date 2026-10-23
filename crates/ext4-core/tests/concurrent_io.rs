@@ -8,6 +8,345 @@ use alloc::{boxed::Box, vec::Vec};
 use ext4_core::*;
 use sha2::Digest as _;
 
+/// Selects the on-disk inline-data feature using format constants and an independent CRC.
+/// # Errors
+/// Returns an invalid fixture field or failed production mount.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "checked fixture fields receive exactly sized format vectors"
+)]
+fn inline_fixture() -> Result<Fixture> {
+    let mut disk = Disk::fixture();
+    let flags = fixture_u32(&disk.filesystem, 1120)? | 0x8000;
+    disk.filesystem
+        .get_mut(1120..1124)
+        .ok_or(Error::DeviceRange)?
+        .copy_from_slice(&flags.to_le_bytes());
+    let checksum = fixture_crc32c(
+        u32::MAX,
+        disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+    );
+    disk.filesystem
+        .get_mut(2044..2048)
+        .ok_or(Error::DeviceRange)?
+        .copy_from_slice(&checksum.to_le_bytes());
+    Fixture::from_disk(disk)
+}
+
+/// # Errors
+/// Propagates fixture, private mount, content growth and reclamation failures.
+/// # Panics
+/// Fails if inline read-only access changes storage or growth loses its old prefix.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe lower effects, growth contents and final allocation accounting"
+)]
+fn inline_growth_and_read_only_mount_preserve_storage_contracts() -> Result<()> {
+    let mut fixture = inline_fixture()?;
+    let file = fixture.a;
+    let filesystem = fixture.disk.filesystem.clone();
+    let journal = fixture.disk.journal.clone();
+    fixture.disk.storage_effects = 0;
+    let (profile, epoch, coordinator) = fixture
+        .disk
+        .mount(MountAccess::ReadOnly {
+            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+        })?
+        .into_parts();
+    fixture.profile = profile;
+    fixture.epoch = epoch;
+    fixture.coordinator = coordinator;
+    fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+    let mut byte = [0];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut byte))?,
+        ReadBytes::from_usize(1)
+    );
+    assert_eq!(byte, *b"a");
+    assert_eq!(fixture.disk.storage_effects, 0);
+    assert_eq!(fixture.disk.filesystem, filesystem);
+    assert_eq!(fixture.disk.journal, journal);
+    fixture.remount()?;
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.write_file_range(file, FileOffset::from_bytes(200), b"tail")
+    })?;
+    fixture.remount()?;
+    let mut bytes = [0; 204];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?,
+        ReadBytes::from_usize(204)
+    );
+    assert_eq!(bytes.first(), Some(&b'a'));
+    assert!(
+        bytes
+            .get(1..200)
+            .ok_or(Error::DeviceRange)?
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    assert_eq!(bytes.get(200..), Some(b"tail".as_slice()));
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.unlink_file(root, &Ext4Name::new(b"concurrent-a")?)
+    })?;
+    fixture.remount()?;
+    Ok(())
+}
+
+/// # Errors
+/// Propagates independent field/checksum encoding failures.
+/// # Panics
+/// Fails if an authenticated but missing or undersized body can grant mount authority.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions check corruption rejection before lower storage effects"
+)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "checked format-vector fields have exact encoded widths"
+)]
+fn inline_inode_admission_requires_its_complete_private_body() -> Result<()> {
+    for missing_body in [true, false] {
+        let mut fixture = inline_fixture()?;
+        let node = NodeId::File(fixture.a);
+        let offset = fixture_inode_offset(&fixture.disk, node)?;
+        if missing_body {
+            let start = offset.checked_add(160).ok_or(Error::ArithmeticOverflow)?;
+            let end = offset.checked_add(256).ok_or(Error::ArithmeticOverflow)?;
+            fixture
+                .disk
+                .filesystem
+                .get_mut(start..end)
+                .ok_or(Error::DeviceRange)?
+                .fill(0);
+        } else {
+            let start = offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?;
+            let end = start.checked_add(4).ok_or(Error::ArithmeticOverflow)?;
+            fixture
+                .disk
+                .filesystem
+                .get_mut(start..end)
+                .ok_or(Error::DeviceRange)?
+                .copy_from_slice(&200_u32.to_le_bytes());
+        }
+        fixture.disk.encode_inode(node, 0x1000_0000, None)?;
+        fixture.disk.storage_effects = 0;
+        assert_eq!(
+            fixture.disk.mount(MountAccess::ReadWrite).err(),
+            Some(Error::InvalidInode)
+        );
+        assert_eq!(fixture.disk.storage_effects, 0);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates mount, content, xattr, conversion and remount failures.
+/// # Panics
+/// Fails if inode-body data leaks, gaps retain bytes, or conversion loses content or ownership.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions directly observe content, allocation and opaque-attribute contracts"
+)]
+fn inline_file_updates_and_xattr_conversion_preserve_content() -> Result<()> {
+    let mut fixture = inline_fixture()?;
+    let file = fixture.a;
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::File(file))?;
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?
+        )? & 0x1008_0000,
+        0x1000_0000
+    );
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(28).ok_or(Error::ArithmeticOverflow)?
+        )?,
+        0
+    );
+    assert!(
+        fixture
+            .read(|pass| pass.read_xattrs(NodeId::File(file)))?
+            .is_empty()
+    );
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.write_file_range(file, FileOffset::from_bytes(40), &[b'z'; 61])?;
+        pass.truncate_file(file, FileSize::from_bytes(65))?;
+        pass.extend_file(file, FileSize::from_bytes(100))
+    })?;
+    fixture.remount()?;
+    let mut expected = [0; 100];
+    if let Some(first) = expected.first_mut() {
+        *first = b'a';
+    }
+    expected
+        .get_mut(40..65)
+        .ok_or(Error::DeviceRange)?
+        .fill(b'z');
+    let mut actual = [0; 100];
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut actual))?,
+        ReadBytes::from_usize(100)
+    );
+    assert_eq!(actual, expected);
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?
+        )? & 0x1008_0000,
+        0x1000_0000
+    );
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(file))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"opaque")?,
+            XattrValue::new(&[0x73; 512])?,
+        )
+    })?;
+    fixture.remount()?;
+    assert_eq!(
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut actual))?,
+        ReadBytes::from_usize(100)
+    );
+    assert_eq!(actual, expected);
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?
+        )? & 0x1008_0000,
+        0x0008_0000
+    );
+    fixture.mutate(|pass| {
+        let selected = pass.file(file)?;
+        pass.truncate_file(selected, FileSize::from_bytes(1))
+    })?;
+    fixture.remount()?;
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?
+        )? & 0x1008_0000,
+        0x0008_0000
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Propagates directory, namespace, conversion and remount failures.
+/// # Panics
+/// Fails if two-region traversal, parent updates, growth or deletion loses namespace semantics.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe namespace and storage transitions across remount"
+)]
+fn inline_directories_enumerate_move_grow_and_delete() -> Result<()> {
+    let mut fixture = inline_fixture()?;
+    let owner = Ext4Owner::new(Ext4Uid::from_u32(1000), Ext4Gid::from_u32(1000));
+    let (directory, other) = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let directory = pass.create_directory(
+            root,
+            &Ext4Name::new(b"inline-dir")?,
+            NewDirectoryMetadata::new(owner, Ext4Permissions::new(0o755)?),
+        )?;
+        pass.create_file(
+            directory,
+            &Ext4Name::new(b"first")?,
+            NewFileMetadata::new(owner, Ext4Permissions::new(0o644)?),
+        )?;
+        let other = pass.create_directory(
+            root,
+            &Ext4Name::new(b"other-inline-dir")?,
+            NewDirectoryMetadata::new(owner, Ext4Permissions::new(0o755)?),
+        )?;
+        Ok((directory.id(), other.id()))
+    })?;
+    fixture.remount()?;
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::Directory(directory))?;
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?
+        )? & 0x1008_0000,
+        0x1000_0000
+    );
+    let mut reader = DirectoryReader::new(directory, DirectoryScanCursor::start());
+    let mut names = Vec::new();
+    while let Some(entry) = fixture.read(|pass| pass.next_directory_entry(&mut reader))? {
+        names.push(entry.entry().name().bytes().to_vec());
+    }
+    assert_eq!(names, [b".".to_vec(), b"..".to_vec(), b"first".to_vec()]);
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let other = pass.directory(other)?;
+        pass.rename_child(
+            root,
+            &Ext4Name::new(b"inline-dir")?,
+            other,
+            &Ext4Name::new(b"moved-inline-dir")?,
+            NamespaceDestination::Vacant,
+        )
+    })?;
+    fixture.remount()?;
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(40).ok_or(Error::ArithmeticOverflow)?
+        )?,
+        NodeId::Directory(other).file_index()
+    );
+    fixture.mutate(|pass| {
+        let directory = pass.directory(directory)?;
+        pass.unlink_file(directory, &Ext4Name::new(b"first")?)?;
+        for index in 0..12 {
+            let name = format!("entry-{index:02}-large-component");
+            pass.create_file(
+                directory,
+                &Ext4Name::new(name.as_bytes())?,
+                NewFileMetadata::new(owner, Ext4Permissions::new(0o644)?),
+            )?;
+        }
+        Ok(())
+    })?;
+    fixture.remount()?;
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(32).ok_or(Error::ArithmeticOverflow)?
+        )? & 0x1008_0000,
+        0x0008_0000
+    );
+    for index in 0..12 {
+        let name = format!("entry-{index:02}-large-component");
+        assert!(matches!(
+            fixture.read(|pass| pass.lookup_child(directory, &Ext4Name::new(name.as_bytes())?))?,
+            ChildLookup::Found(_)
+        ));
+    }
+    fixture.mutate(|pass| {
+        let selected = pass.directory(directory)?;
+        for index in 0..12 {
+            let name = format!("entry-{index:02}-large-component");
+            pass.unlink_file(selected, &Ext4Name::new(name.as_bytes())?)?;
+        }
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let other = pass.directory(other)?;
+        pass.remove_empty_directory(other, &Ext4Name::new(b"moved-inline-dir")?)?;
+        pass.remove_empty_directory(root, &Ext4Name::new(b"other-inline-dir")?)
+    })?;
+    fixture.remount()?;
+    Ok(())
+}
+
 /// # Errors
 /// Returns fixture setup, journal commit, private replay or read failures.
 /// # Panics

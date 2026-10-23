@@ -6,6 +6,7 @@ mod allocation;
 mod commit;
 mod file_data;
 mod fscrypt;
+mod inline_data;
 mod namespace;
 mod orphan;
 mod staging;
@@ -933,7 +934,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 xattrs
                     .public_mut()
                     .insert(AclKind::Access.name()?, acl.value()?)?;
-                pass.mutation.store_xattr_set(&mut raw_inode, &xattrs)?;
+                pass.mutation.store_xattr_set(&mut raw_inode, xattrs)?;
             }
             raw_inode.set_owner(security.owner())?;
             raw_inode.set_permissions(security.permissions())?;
@@ -1078,7 +1079,7 @@ impl MutationResolvePass<'_, '_, '_> {
         raw_inode.mark_encrypted()?;
         let mut set = self.mutation.xattr_set_for_raw_inode(raw_inode)?;
         set.set_encryption_context(XattrValue::new(&context.to_bytes()?)?);
-        self.mutation.store_xattr_set(raw_inode, &set)
+        self.mutation.store_xattr_set(raw_inode, set)
     }
 }
 

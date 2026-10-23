@@ -188,7 +188,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .encode_file_size(new_size)?;
             let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
             let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
-            let inode = raw_inode.parse()?;
+            let mut inode = raw_inode.parse()?;
             if inode.kind() != InodeKind::File {
                 return Err(Error::WrongInodeKind);
             }
@@ -201,6 +201,41 @@ impl MutationResolvePass<'_, '_, '_> {
                 None
             };
 
+            if let InodeStorage::InlineData(data) = inode.storage() {
+                let previous = data.file()?;
+                let total = core::cmp::max(
+                    previous.len(),
+                    usize::try_from(end_offset.bytes()).map_err(|_| Error::DeviceRange)?,
+                );
+                let capacity = 60_usize
+                    .checked_add(raw_inode.writable_inline_xattr_region()?.len())
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if total <= capacity {
+                    let mut payload = memory::repeated_vec(0, total)?;
+                    memory::copy_exact(
+                        payload
+                            .get_mut(..previous.len())
+                            .ok_or(Error::DeviceRange)?,
+                        previous,
+                    )?;
+                    let start = usize::try_from(offset.bytes()).map_err(|_| Error::DeviceRange)?;
+                    let end = start
+                        .checked_add(bytes.len())
+                        .ok_or(Error::ArithmeticOverflow)?;
+                    memory::copy_exact(
+                        payload.get_mut(start..end).ok_or(Error::DeviceRange)?,
+                        bytes,
+                    )?;
+                    if pass.mutation.store_inline_file(&mut raw_inode, &payload)? {
+                        pass.mutation.retire_file_privileges(&mut raw_inode)?;
+                        raw_inode.touch_contents(pass.now)?;
+                        pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                        return Ok(());
+                    }
+                }
+                pass.mutation.require_extent_storage(&mut raw_inode)?;
+                inode = raw_inode.parse()?;
+            }
             let plan = pass.prepare_file_write(&inode, offset, bytes.len())?;
             match plan {
                 FileWritePlan::Overwrite(plan) => {
@@ -260,6 +295,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 .encode_file_size(FileSize::from_bytes(bound.bytes()))?;
             let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
             let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            pass.mutation.require_extent_storage(&mut raw_inode)?;
             let inode = raw_inode.parse()?;
             pass.require_file_data_mutation(&inode)?;
             let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
@@ -296,6 +332,7 @@ impl MutationResolvePass<'_, '_, '_> {
         self.edit(|pass| {
             let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
             let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            pass.mutation.require_extent_storage(&mut raw_inode)?;
             let inode = raw_inode.parse()?;
             pass.require_file_data_mutation(&inode)?;
             if bound.bytes() < inode.size().bytes() {
@@ -775,10 +812,36 @@ impl MutationResolvePass<'_, '_, '_> {
                 .encode_file_size(new_size)?;
             let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
             let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
-            let inode = raw_inode.parse()?;
+            let mut inode = raw_inode.parse()?;
             pass.require_file_size_mutation(&inode)?;
             if new_size < inode.size() {
                 return Err(Error::InvalidWriteRange);
+            }
+            if let InodeStorage::InlineData(data) = inode.storage() {
+                let previous = data.file()?;
+                let requested = new_size.to_usize()?;
+                if requested < previous.len() {
+                    return Err(Error::InvalidWriteRange);
+                }
+                let capacity = 60_usize
+                    .checked_add(raw_inode.writable_inline_xattr_region()?.len())
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if requested <= capacity {
+                    let mut payload = memory::repeated_vec(0, requested)?;
+                    let count = core::cmp::min(previous.len(), requested);
+                    memory::copy_exact(
+                        payload.get_mut(..count).ok_or(Error::DeviceRange)?,
+                        previous.get(..count).ok_or(Error::DeviceRange)?,
+                    )?;
+                    if pass.mutation.store_inline_file(&mut raw_inode, &payload)? {
+                        pass.mutation.retire_file_privileges(&mut raw_inode)?;
+                        raw_inode.touch_contents(pass.now)?;
+                        pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                        return Ok(());
+                    }
+                }
+                pass.mutation.require_extent_storage(&mut raw_inode)?;
+                inode = raw_inode.parse()?;
             }
             if new_size > inode.size() {
                 let tree = pass.mutation.mutable_extent_tree(&inode)?;
@@ -812,10 +875,36 @@ impl MutationResolvePass<'_, '_, '_> {
                 .encode_file_size(new_size)?;
             let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
             let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
-            let inode = raw_inode.parse()?;
+            let mut inode = raw_inode.parse()?;
             pass.require_file_size_mutation(&inode)?;
             if new_size > inode.size() {
                 return Err(Error::InvalidWriteRange);
+            }
+            if let InodeStorage::InlineData(data) = inode.storage() {
+                let previous = data.file()?;
+                let requested = new_size.to_usize()?;
+                if requested > previous.len() {
+                    return Err(Error::InvalidWriteRange);
+                }
+                let capacity = 60_usize
+                    .checked_add(raw_inode.writable_inline_xattr_region()?.len())
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if requested <= capacity {
+                    let mut payload = memory::repeated_vec(0, requested)?;
+                    let count = core::cmp::min(previous.len(), requested);
+                    memory::copy_exact(
+                        payload.get_mut(..count).ok_or(Error::DeviceRange)?,
+                        previous.get(..count).ok_or(Error::DeviceRange)?,
+                    )?;
+                    if pass.mutation.store_inline_file(&mut raw_inode, &payload)? {
+                        pass.mutation.retire_file_privileges(&mut raw_inode)?;
+                        raw_inode.touch_contents(pass.now)?;
+                        pass.mutation.replace_live_inode(inode_index, raw_inode)?;
+                        return Ok(());
+                    }
+                }
+                pass.mutation.require_extent_storage(&mut raw_inode)?;
+                inode = raw_inode.parse()?;
             }
             let block_size_u64 = u64::from(pass.mutation.volume.superblock.block_size().bytes());
             let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
@@ -867,6 +956,7 @@ impl MutationResolvePass<'_, '_, '_> {
             pass.mutation.volume.superblock.require_verity()?;
             let inode_index = pass.mutation.ensure_inode_update(file.inode())?;
             let mut raw_inode = pass.mutation.staged_live_inode(inode_index)?;
+            pass.mutation.require_extent_storage(&mut raw_inode)?;
             let inode = raw_inode.parse()?;
             if inode.kind() != InodeKind::File {
                 return Err(Error::WrongInodeKind);

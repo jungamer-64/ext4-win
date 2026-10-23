@@ -78,7 +78,7 @@ impl MetadataMutation<'_, '_> {
             set.public_mut()
                 .insert(AclKind::Default.name()?, default.value()?)?;
         }
-        self.store_xattr_set(raw_inode, &set)
+        self.store_xattr_set(raw_inode, set)
     }
 
     /// Retires execution privileges within the transaction changing contents or ownership.
@@ -102,7 +102,7 @@ impl MetadataMutation<'_, '_> {
             .transpose()?;
         if let Some(capability) = capability {
             xattrs.public_mut().remove(&capability)?;
-            self.store_xattr_set(raw_inode, &xattrs)?;
+            self.store_xattr_set(raw_inode, xattrs)?;
         }
         Ok(())
     }
@@ -224,7 +224,7 @@ impl MetadataMutation<'_, '_> {
         if AclKind::Default.read(set.public())?.is_some() && inode.kind() != InodeKind::Directory {
             return Err(Error::InvalidAcl);
         }
-        self.store_xattr_set(&mut raw_inode, &set)?;
+        self.store_xattr_set(&mut raw_inode, set)?;
         raw_inode.touch_metadata(now)?;
         self.replace_live_inode(inode_index, raw_inode)?;
         Ok(())
@@ -239,7 +239,7 @@ impl MetadataMutation<'_, '_> {
     pub(super) fn store_xattr_set(
         &mut self,
         raw_inode: &mut LiveInodeRecord,
-        set: &InodeXattrSet,
+        mut set: InodeXattrSet,
     ) -> Result<()> {
         let old_block = raw_inode.xattr_block()?;
         if set.is_empty() {
@@ -250,7 +250,7 @@ impl MetadataMutation<'_, '_> {
             raw_inode.set_xattr_block(None)?;
         } else {
             let inline_capacity = raw_inode.writable_inline_xattr_region()?.len();
-            match xattr_storage::serialize_inline_xattrs(set, inline_capacity) {
+            match xattr_storage::serialize_inline_xattrs(&set, inline_capacity) {
                 Ok(bytes) => {
                     memory::copy_exact(raw_inode.writable_inline_xattr_region()?, &bytes)?;
                     if let Some(block) = old_block {
@@ -259,7 +259,10 @@ impl MetadataMutation<'_, '_> {
                     raw_inode.set_xattr_block(None)?;
                 }
                 Err(Error::NoSpace) => {
-                    self.store_external_xattr_set(raw_inode, set, old_block)?;
+                    if raw_inode.parse()?.flags().has_inline_data() {
+                        self.convert_inline_data(raw_inode, &mut set)?;
+                    }
+                    self.store_external_xattr_set(raw_inode, &set, old_block)?;
                 }
                 Err(error) => return Err(error),
             }
@@ -271,7 +274,9 @@ impl MetadataMutation<'_, '_> {
                 let tree = self.mutable_extent_tree(&inode)?;
                 self.set_inode_allocation_size(raw_inode, Some(&tree))
             }
-            InodeStorage::InlineBytes(_) => self.set_inode_allocation_size(raw_inode, None),
+            InodeStorage::FastSymlink(_) | InodeStorage::InlineData(_) => {
+                self.set_inode_allocation_size(raw_inode, None)
+            }
             InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
         }
     }

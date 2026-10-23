@@ -51,7 +51,7 @@ const EXT4_IMMUTABLE_FL: u32 = 0x0000_0010;
 const EXT4_APPEND_FL: u32 = 0x0000_0020;
 /// Inode flag rejected because encrypted payload interpretation is unsupported.
 const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
-/// Inode flag rejected for write-domain mutation of inline-data files.
+/// Inode-body payload storage flag.
 const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
 /// Inode flag rejected because casefolded lookup semantics are unsupported.
 const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
@@ -305,6 +305,8 @@ pub(crate) struct InodeDataEncoding {
     block_size: BlockSize,
     /// Mounted directory reference-count format.
     directory_links: DirectoryLinkEncoding,
+    /// Whether inode-body payload interpretation is admitted by the superblock.
+    inline_data: bool,
 }
 
 impl InodeDataEncoding {
@@ -315,6 +317,7 @@ impl InodeDataEncoding {
         block_count: InodeBlockCountEncoding,
         block_size: BlockSize,
         directory_links: DirectoryLinkEncoding,
+        inline_data: bool,
     ) -> Self {
         Self {
             file_size,
@@ -322,6 +325,7 @@ impl InodeDataEncoding {
             block_count,
             block_size,
             directory_links,
+            inline_data,
         }
     }
 
@@ -1280,6 +1284,18 @@ impl InodeFlags {
         }
     }
 
+    /// Whether i_block and the inode-body private attribute contain the payload.
+    pub(crate) const fn has_inline_data(self) -> bool {
+        self.0 & EXT4_INLINE_DATA_FL != 0
+    }
+    /// Selects inode-body storage for a newly initialized unencrypted object.
+    pub(crate) const fn into_inline_storage(self) -> Self {
+        Self((self.0 & !EXT4_EXTENTS_FL) | EXT4_INLINE_DATA_FL)
+    }
+    /// Selects extent storage while retiring inline payload interpretation.
+    pub(crate) const fn into_extent_storage(self) -> Self {
+        Self((self.0 & !EXT4_INLINE_DATA_FL) | EXT4_EXTENTS_FL)
+    }
     /// Returns whether the inode uses an extent tree.
     #[must_use]
     pub const fn has_extent_tree(self) -> bool {
@@ -1312,7 +1328,7 @@ impl InodeFlags {
     /// Creates a metadata mutation capability for these flags.
     ///
     /// # Errors
-    /// Returns an error when immutable, append-only or inline-data semantics reject writes.
+    /// Returns an error when immutable or append-only semantics reject writes.
     pub fn metadata_mutation(self) -> Result<MetadataMutationCapability> {
         self.require_common_mutation()?;
         if self.0 & EXT4_APPEND_FL != 0 {
@@ -1354,7 +1370,7 @@ impl InodeFlags {
     /// Authorizes changing a name or link count belonging to this inode.
     ///
     /// # Errors
-    /// Returns an error when immutable, append-only, or inline-data semantics reject the change.
+    /// Returns an error when immutable or append-only semantics reject the change.
     pub fn namespace_mutation(self) -> Result<NamespaceMutationCapability> {
         self.require_common_mutation()?;
         if self.0 & EXT4_APPEND_FL != 0 {
@@ -1366,10 +1382,9 @@ impl InodeFlags {
     /// Rejects inode flags that make every mutation unsupported.
     /// # Errors
     ///
-    /// Returns an error when immutable or inline-data flags make the inode outside the mutable
-    /// write domain.
+    /// Returns an error when immutable flags exclude the inode from mutation.
     fn require_common_mutation(self) -> Result<()> {
-        if self.0 & (EXT4_IMMUTABLE_FL | EXT4_INLINE_DATA_FL) != 0 {
+        if self.0 & EXT4_IMMUTABLE_FL != 0 {
             Err(Error::UnsupportedInodeMutation)
         } else {
             Ok(())
@@ -1454,14 +1469,128 @@ impl InodeProtection {
 }
 
 /// Typed representation of an inode's data pointer area.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum InodeStorage {
     /// Extent root stored in `i_block`.
     Extents(InodeExtentRoot),
     /// Inline bytes stored directly in `i_block`.
     FastSymlink(InodeFastSymlink),
+    /// File bytes or separate directory regions authenticated by the inode checksum.
+    InlineData(InodeInlineData),
     /// A legacy block map unsupported by this implementation.
     UnsupportedBlockMap,
+}
+
+/// Complete inline storage with file and directory interpretations kept distinct.
+#[derive(Debug, Eq, PartialEq)]
+pub enum InodeInlineData {
+    /// Visible file payload, bounded by its inode size.
+    File(alloc::vec::Vec<u8>),
+    /// Directory parent identity and two independently bounded dirent regions.
+    Directory {
+        /// Parent represented instead of an on-disk dot-dot dirent.
+        parent: InodeId,
+        /// Dirents after the four-byte parent prefix in i_block.
+        first: [u8; 56],
+        /// Separate dirent region stored in system.data.
+        second: alloc::vec::Vec<u8>,
+    },
+}
+impl InodeInlineData {
+    /// Interprets an inode-checksummed body without treating directory regions as one block.
+    /// # Errors
+    /// Rejects invalid size, missing system.data, symlink storage, or unsupported protection.
+    fn parse(kind: InodeKind, size: FileSize, block: [u8; 60], raw: &[u8]) -> Result<Self> {
+        let offset = InodeRecordLayout::parse(raw)?.xattr_offset();
+        let set = crate::disk_format::xattr::parse_inline_xattrs(
+            raw.get(offset..).ok_or(Error::InvalidInode)?,
+        )?;
+        let tail = set.inline_data().ok_or(Error::InvalidInode)?.bytes();
+        let capacity = block
+            .len()
+            .checked_add(tail.len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        match kind {
+            InodeKind::File => {
+                if size.to_usize()? > capacity {
+                    return Err(Error::InvalidInode);
+                }
+                let mut bytes = memory::copied_slice(&block)?;
+                bytes
+                    .try_reserve_exact(tail.len())
+                    .map_err(|_| Error::OutOfMemory)?;
+                crate::memory::FallibleVec::try_extend_from_slice(&mut bytes, tail)?;
+                bytes.truncate(size.to_usize()?);
+                Ok(Self::File(bytes))
+            }
+            InodeKind::Directory => {
+                if size.to_usize()? != capacity {
+                    return Err(Error::InvalidInode);
+                }
+                let parent = InodeId::try_from(le_u32(&block, disk_offset(0))?)?;
+                let mut first = [0; 56];
+                memory::copy_exact(&mut first, block.get(4..).ok_or(Error::InvalidInode)?)?;
+                Ok(Self::Directory {
+                    parent,
+                    first,
+                    second: memory::copied_slice(tail)?,
+                })
+            }
+            InodeKind::Symlink => Err(Error::InvalidInode),
+        }
+    }
+    /// Parses the two independently bounded directory regions and supplies implicit dot entries.
+    /// # Errors
+    /// Rejects file storage, malformed records and explicit dot entries in inline regions.
+    pub(crate) fn directory_entries(
+        &self,
+        id: InodeId,
+    ) -> Result<alloc::vec::Vec<crate::disk_format::dir::DirectoryEntry>> {
+        use crate::disk_format::dir::{DirectoryEntry, DirectoryEntryKind};
+        let Self::Directory {
+            parent,
+            first,
+            second,
+        } = self
+        else {
+            return Err(Error::WrongInodeKind);
+        };
+        let mut entries = alloc::vec::Vec::new();
+        crate::memory::FallibleVec::try_push(
+            &mut entries,
+            DirectoryEntry::new(
+                id,
+                &crate::Ext4Name::new(b".")?,
+                DirectoryEntryKind::Directory,
+            )?,
+        )?;
+        crate::memory::FallibleVec::try_push(
+            &mut entries,
+            DirectoryEntry::new(
+                *parent,
+                &crate::Ext4Name::new(b"..")?,
+                DirectoryEntryKind::Directory,
+            )?,
+        )?;
+        for region in [first.as_slice(), second.as_slice()] {
+            for entry in DirectoryEntry::parse_all(region)? {
+                if matches!(entry.name().bytes(), b"." | b"..") {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                crate::memory::FallibleVec::try_push(&mut entries, entry)?;
+            }
+        }
+        Ok(entries)
+    }
+    /// Borrows file bytes while rejecting the separate directory representation.
+    /// # Errors
+    /// Returns wrong-inode-kind for directories.
+    pub(crate) fn file(&self) -> Result<&[u8]> {
+        match self {
+            Self::File(bytes) => Ok(bytes),
+            Self::Directory { .. } => Err(Error::WrongInodeKind),
+        }
+    }
 }
 
 /// Raw extent root bytes isolated behind an inode-storage type.
@@ -1511,7 +1640,7 @@ impl InodeFastSymlink {
 }
 
 /// Parsed ext4 inode.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Inode {
     /// Parsed allocation and storage facts, independent of namespace reachability.
     data: InodeData,
@@ -1520,7 +1649,7 @@ pub struct Inode {
 }
 
 /// Inode storage facts shared by live access and unlinked-inode recovery.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct InodeData {
     /// Stable inode number used by directory entries and checksum seeds.
     id: InodeId,
@@ -1573,7 +1702,19 @@ impl InodeData {
         let block_slice = raw.get(40..100).ok_or(Error::TruncatedStructure)?;
         let mut block = [0_u8; 60];
         memory::copy_exact(&mut block, block_slice)?;
-        let storage = if flags.has_extent_tree() {
+        let storage = if flags.has_inline_data() {
+            if !encoding.inline_data {
+                return Err(Error::InvalidInode);
+            }
+            if flags.has_extent_tree()
+                || flags.has_indexed_directory()
+                || flags.protection().is_encrypted()
+                || flags.protection().is_verity()
+            {
+                return Err(Error::InvalidInode);
+            }
+            InodeStorage::InlineData(InodeInlineData::parse(mode.kind(), size, block, raw)?)
+        } else if flags.has_extent_tree() {
             InodeStorage::Extents(InodeExtentRoot::from_bytes(block))
         } else if mode.kind() == InodeKind::Symlink && size.to_usize()? < block.len() {
             InodeStorage::FastSymlink(InodeFastSymlink::from_bytes(block))
@@ -1779,22 +1920,22 @@ impl Inode {
     pub fn extent_root(&self) -> Result<&InodeExtentRoot> {
         match &self.data.storage {
             InodeStorage::Extents(root) => Ok(root),
-            InodeStorage::FastSymlink(_) | InodeStorage::UnsupportedBlockMap => {
-                Err(Error::UnsupportedBlockMap)
-            }
+            InodeStorage::FastSymlink(_)
+            | InodeStorage::InlineData(_)
+            | InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
         }
     }
 
-    /// Returns inline bytes when this inode stores data directly in `i_block`.
+    /// Borrows a fast symbolic-link target stored directly in `i_block`.
     ///
     /// # Errors
-    /// Returns an error when this inode uses extents or an unsupported block map.
+    /// Rejects files, directories and symbolic links with external payload storage.
     pub fn fast_symlink(&self) -> Result<&InodeFastSymlink> {
         match &self.data.storage {
             InodeStorage::FastSymlink(bytes) => Ok(bytes),
-            InodeStorage::Extents(_) | InodeStorage::UnsupportedBlockMap => {
-                Err(Error::UnsupportedBlockMap)
-            }
+            InodeStorage::Extents(_)
+            | InodeStorage::InlineData(_)
+            | InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
         }
     }
 }
@@ -1998,6 +2139,7 @@ mod tests {
             InodeBlockCountEncoding::HugeFile,
             BlockSize::from_superblock_log(0)?,
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+            false,
         ))
     }
 
@@ -2114,6 +2256,7 @@ mod tests {
             InodeBlockCountEncoding::LegacySectors,
             block_size,
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+            false,
         );
 
         assert_eq!(
@@ -2216,6 +2359,7 @@ mod tests {
             InodeBlockCountEncoding::LegacySectors,
             block_size,
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+            false,
         );
         let largest_block_aligned_legacy_sectors = u64::from(u32::MAX) - 1;
         assert!(

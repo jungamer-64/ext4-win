@@ -322,7 +322,8 @@ impl EpochReadView<'_, '_> {
             LoadedNode::Symlink(symlink) => symlink.inode(),
         };
         let root = match inode.storage() {
-            crate::disk_format::inode::InodeStorage::InlineBytes(_) => return Ok(None),
+            crate::disk_format::inode::InodeStorage::FastSymlink(_)
+            | crate::disk_format::inode::InodeStorage::InlineData(_) => return Ok(None),
             crate::disk_format::inode::InodeStorage::Extents(root) => root,
             crate::disk_format::inode::InodeStorage::UnsupportedBlockMap => {
                 return Err(Error::UnsupportedBlockMap);
@@ -401,7 +402,7 @@ impl EpochReadView<'_, '_> {
     pub(super) fn read_symlink(&mut self, symlink: &SymlinkNode) -> Result<Vec<u8>> {
         self.reject_unsupported_protected_payload_access(symlink.inode())?;
         let len = symlink.size().to_usize()?;
-        if let Ok(inline) = symlink.inode().inline_bytes() {
+        if let Ok(inline) = symlink.inode().fast_symlink() {
             return memory::copied_slice(inline.prefix(symlink.size())?);
         }
         let mut target = memory::repeated_vec(0_u8, len)?;
@@ -584,6 +585,9 @@ impl EpochReadView<'_, '_> {
         query: DirectoryLookup<'_>,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<Option<RawDirectoryEntry>> {
+        if let InodeStorage::InlineData(data) = inode.storage() {
+            return query.find(data.directory_entries(inode.id())?, crypto);
+        }
         let mut tree = ExtentMappingCursor::new(
             inode.extent_root()?,
             self.superblock.block_size(),
@@ -1134,6 +1138,16 @@ impl EpochReadView<'_, '_> {
             u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?,
             inode.size().remaining_from(offset)?,
         );
+        if let InodeStorage::InlineData(data) = inode.storage() {
+            let start = usize::try_from(offset.bytes()).map_err(|_| Error::DeviceRange)?;
+            let bytes = data.file()?.get(start..).ok_or(Error::DeviceRange)?;
+            let count = core::cmp::min(out.len(), bytes.len());
+            memory::copy_exact(
+                out.get_mut(..count).ok_or(Error::DeviceRange)?,
+                bytes.get(..count).ok_or(Error::DeviceRange)?,
+            )?;
+            return Ok(ReadBytes::from_usize(count));
+        }
         let context = self.extent_tree_context(inode);
         let mut extent_tree =
             ExtentMappingCursor::new(inode.extent_root()?, self.superblock.block_size(), context)?;

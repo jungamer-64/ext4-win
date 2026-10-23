@@ -271,7 +271,7 @@ impl From<HardLinkNodeId> for NodeId {
 }
 
 /// Typed node loaded from an inode.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) enum LoadedNode {
     /// Regular file node.
     File(FileNode),
@@ -303,7 +303,7 @@ impl LoadedNode {
 }
 
 /// Typed regular file node.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FileNode {
     /// Parsed inode backing this typed file node.
     inode: Inode,
@@ -359,7 +359,7 @@ impl FileNode {
 }
 
 /// Typed directory node.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct DirectoryNode {
     /// Parsed inode backing this typed directory node.
     inode: Inode,
@@ -415,7 +415,7 @@ impl DirectoryNode {
 }
 
 /// Typed symbolic link node.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct SymlinkNode {
     /// Parsed inode backing this typed symlink node.
     inode: Inode,
@@ -465,7 +465,7 @@ impl SymlinkNode {
 }
 
 /// Directory child selected by a lookup through a typed parent directory.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct DirectoryChild {
     /// Parent directory containing the child.
     parent: DirectoryNodeId,
@@ -496,7 +496,7 @@ impl DirectoryChild {
 }
 
 /// Directory entry whose referenced inode kind has been validated.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct DirectoryEntry {
     /// Child name visible at the listing boundary.
     name: Ext4Name,
@@ -600,7 +600,7 @@ impl HardLinks {
 }
 
 /// Result of a directory lookup.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum ChildLookup {
     /// The child name was found and its inode kind was validated.
     Found(DirectoryChild),

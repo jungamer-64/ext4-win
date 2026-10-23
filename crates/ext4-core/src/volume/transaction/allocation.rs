@@ -62,6 +62,25 @@ impl MetadataMutation<'_, '_> {
         ))
     }
 
+    /// Releases payload and extent metadata ownership without inventing blocks for inline storage.
+    /// # Errors
+    /// Rejects unsupported storage and inconsistent allocation references.
+    pub(super) fn release_inode_data(&mut self, inode: &Inode) -> Result<()> {
+        match inode.storage() {
+            InodeStorage::FastSymlink(_) | InodeStorage::InlineData(_) => Ok(()),
+            InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
+            InodeStorage::Extents(_) => {
+                let tree = self.mutable_extent_tree(inode)?;
+                for extent in tree.extents().iter().copied() {
+                    self.free_extent(extent, 0)?;
+                }
+                for block in tree.metadata_blocks().iter().copied() {
+                    self.release_cluster_reference(block)?;
+                }
+                Ok(())
+            }
+        }
+    }
     /// Releases terminal inode ownership after all data and extent-node references are staged away.
     /// # Errors
     /// Returns an error for invalid xattr ownership, allocation bitmaps, or directory accounting.

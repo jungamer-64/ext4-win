@@ -94,7 +94,11 @@ impl XattrName {
             .checked_add(1)
             .and_then(|len| len.checked_add(local.len()))
             .ok_or(Error::ArithmeticOverflow)?;
-        if local.is_empty() || local.contains(&0) || full_len > 255 {
+        if local.is_empty()
+            || local.contains(&0)
+            || full_len > 255
+            || (namespace == XattrNamespace::System && local == b"data")
+        {
             return Err(Error::InvalidXattr);
         }
         Ok(Self {
@@ -307,6 +311,8 @@ pub(crate) struct InodeXattrSet {
     public: XattrSet,
     /// ext4 private fscrypt context stored at index 9, name "c".
     encryption_context: Option<XattrValue>,
+    /// Inode-body payload tail; never exposed as a public system attribute.
+    inline_data: Option<XattrValue>,
 }
 
 impl InodeXattrSet {
@@ -316,6 +322,7 @@ impl InodeXattrSet {
         Self {
             public: XattrSet::empty(),
             encryption_context: None,
+            inline_data: None,
         }
     }
 
@@ -328,6 +335,7 @@ impl InodeXattrSet {
         Self {
             public,
             encryption_context,
+            inline_data: None,
         }
     }
 
@@ -358,10 +366,22 @@ impl InodeXattrSet {
         self.encryption_context = Some(context);
     }
 
+    /// Borrows the inode-body inline payload tail, including its required empty value.
+    pub(crate) fn inline_data(&self) -> Option<&XattrValue> {
+        self.inline_data.as_ref()
+    }
+    /// Installs the private inode-body tail after validating inline storage.
+    pub(crate) fn set_inline_data(&mut self, value: XattrValue) {
+        self.inline_data = Some(value);
+    }
+    /// Removes inode-body payload ownership during conversion to extent storage.
+    pub(crate) fn remove_inline_data(&mut self) {
+        self.inline_data = None;
+    }
     /// Returns true when no public or private xattrs are present.
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.public.is_empty() && self.encryption_context.is_none()
+        self.public.is_empty() && self.encryption_context.is_none() && self.inline_data.is_none()
     }
 }
 
@@ -555,7 +575,14 @@ pub(crate) fn merge_xattr_sets(left: InodeXattrSet, right: InodeXattrSet) -> Res
         (Some(value), None) | (None, Some(value)) => Some(value),
         (Some(_), Some(_)) => return Err(Error::InvalidXattr),
     };
-    Ok(InodeXattrSet::from_parts(public, encryption_context))
+    let inline_data = match (left.inline_data, right.inline_data) {
+        (None, None) => None,
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (Some(_), Some(_)) => return Err(Error::InvalidXattr),
+    };
+    let mut set = InodeXattrSet::from_parts(public, encryption_context);
+    set.inline_data = inline_data;
+    Ok(set)
 }
 
 /// Placement rules for serialized xattr values.
@@ -585,6 +612,8 @@ enum ParsedDiskXattrSlot {
     Public(XattrName),
     /// ext4 private fscrypt context.
     EncryptionContext,
+    /// Payload tail required by the inline-data flag.
+    InlineData,
 }
 
 /// Serialized entry paired with its disk-order key.
@@ -697,6 +726,7 @@ fn parse_xattr_entries(
 
     let mut public_entries = Vec::new();
     let mut encryption_context = None;
+    let mut inline_data = None;
     for entry in parsed {
         let value = if entry.value_size == 0 {
             XattrValue::new(&[])?
@@ -718,6 +748,12 @@ fn parse_xattr_entries(
         };
         match entry.slot {
             ParsedDiskXattrSlot::Public(name) => public_entries.try_push((name, value))?,
+            ParsedDiskXattrSlot::InlineData => {
+                if placement != XattrValuePlacement::InInode || inline_data.replace(value).is_some()
+                {
+                    return Err(Error::InvalidXattr);
+                }
+            }
             ParsedDiskXattrSlot::EncryptionContext => {
                 if encryption_context.replace(value).is_some() {
                     return Err(Error::InvalidXattr);
@@ -725,24 +761,19 @@ fn parse_xattr_entries(
             }
         }
     }
-    Ok(InodeXattrSet::from_parts(
-        XattrSet::from_entries(public_entries)?,
-        encryption_context,
-    ))
+    let mut set =
+        InodeXattrSet::from_parts(XattrSet::from_entries(public_entries)?, encryption_context);
+    set.inline_data = inline_data;
+    Ok(set)
 }
 
-/// Serializes xattr entries into a pre-zeroed storage image.
+/// Prepares the single disk-order entry representation used by layout and serialization.
 /// # Errors
-///
-/// Returns an error when entry metadata or value payloads cannot fit in `storage`, or an encoded
-/// name, value size, or value offset exceeds the ext4 field width.
-fn serialize_xattr_entries(
+/// Propagates allocation failure or forbidden placement of private payload.
+fn disk_entries(
     set: &InodeXattrSet,
-    storage: &mut [u8],
-    entry_offset: usize,
-    value_base: usize,
     placement: XattrValuePlacement,
-) -> Result<()> {
+) -> Result<Vec<SerializedDiskXattr>> {
     let mut entries = Vec::new();
     for entry in &set.public.entries {
         entries.try_push(SerializedDiskXattr {
@@ -759,7 +790,54 @@ fn serialize_xattr_entries(
             value: value.try_clone()?,
         })?;
     }
+    if let Some(value) = &set.inline_data {
+        if placement != XattrValuePlacement::InInode {
+            return Err(Error::NoSpace);
+        }
+        entries.try_push(SerializedDiskXattr {
+            key: DiskXattrKey {
+                index: EXT4_XATTR_INDEX_SYSTEM,
+                local: memory::copied_slice(b"data")?,
+            },
+            value: value.try_clone()?,
+        })?;
+    }
     memory::heap_sort_by(&mut entries, |left, right| left.key.cmp_disk(&right.key))?;
+    Ok(entries)
+}
+
+/// Maximum inode-body payload tail while keeping every other attribute in the same body.
+/// # Errors
+/// Returns no-space when the entry table or other values already exhaust the body.
+pub(crate) fn inline_data_capacity(set: &InodeXattrSet, capacity: usize) -> Result<usize> {
+    let entries = disk_entries(set, XattrValuePlacement::InInode)?;
+    let mut occupied = serialized_entries_end(EXT4_XATTR_INODE_HEADER_BYTES, &entries)?;
+    for entry in &entries {
+        if entry.key.index == EXT4_XATTR_INDEX_SYSTEM && entry.key.local == b"data" {
+            continue;
+        }
+        occupied = occupied
+            .checked_add(align_up(entry.value.bytes().len())?)
+            .ok_or(Error::ArithmeticOverflow)?;
+    }
+    align_down(capacity)
+        .checked_sub(occupied)
+        .ok_or(Error::NoSpace)
+}
+
+/// Serializes xattr entries into a pre-zeroed storage image.
+/// # Errors
+///
+/// Returns an error when entry metadata or value payloads cannot fit in `storage`, or an encoded
+/// name, value size, or value offset exceeds the ext4 field width.
+fn serialize_xattr_entries(
+    set: &InodeXattrSet,
+    storage: &mut [u8],
+    entry_offset: usize,
+    value_base: usize,
+    placement: XattrValuePlacement,
+) -> Result<()> {
+    let entries = disk_entries(set, placement)?;
 
     let entries_end = serialized_entries_end(entry_offset, &entries)?;
     if entries_end > storage.len() {
@@ -924,6 +1002,7 @@ fn disk_key(name: &XattrName) -> Result<DiskXattrKey> {
 /// private xattr slots.
 fn logical_slot(index: u8, local: &[u8]) -> Result<ParsedDiskXattrSlot> {
     match index {
+        EXT4_XATTR_INDEX_SYSTEM if local == b"data" => Ok(ParsedDiskXattrSlot::InlineData),
         EXT4_XATTR_INDEX_USER => Ok(ParsedDiskXattrSlot::Public(XattrName::new(
             XattrNamespace::User,
             local,
