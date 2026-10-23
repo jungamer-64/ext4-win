@@ -397,6 +397,9 @@ impl FscryptContextV2 {
 }
 
 /// A bounded ciphertext identity with the complete route needed for keyless lookup.
+/// Display bytes contain little-endian primary/secondary words followed by the ciphertext
+/// under `_fscrypt_`, or its complete SHA-256 under `_fscrypt_.`, all base64url without padding.
+/// The reversible limit reserves eight route bytes while keeping every display within 255 bytes.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct FscryptNoKeyName {
     /// Primary and secondary route, supplied by the owning directory's index profile.
@@ -415,110 +418,118 @@ enum CiphertextIdentity {
 }
 
 impl FscryptNoKeyName {
-    /// Projects ciphertext without exceeding the visible component bound.
-    /// Linear directories supply zero as the unused routing hint.
+    /// Projects a complete route and ciphertext identity within the visible component bound.
+    /// Linear directories supply an unused zero route unless records contain keyed hashes.
     /// # Errors
-    /// Returns invalid ciphertext, allocation, or hash-provider failures.
+    /// Returns invalid ciphertext, allocation or hash-provider failure.
     pub(crate) fn from_ciphertext(
         ciphertext: &[u8],
         hash: crate::disk_format::directory_hash::DirectoryHash,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<Self> {
         validate_ciphertext_filename_len(ciphertext.len())?;
-        if ciphertext.len() <= 184 {
-            Ok(Self::Ciphertext(crate::Ext4Name::from_disk(ciphertext)?))
+        let hash =
+            crate::disk_format::directory_hash::DirectoryHash::from_stored(hash.major, hash.minor)?;
+        let identity = if ciphertext.len() <= 176 {
+            CiphertextIdentity::Complete(crate::Ext4Name::from_disk(ciphertext)?)
         } else {
-            Ok(Self::Digest {
-                major,
-                sha256: crypto.sha256(ciphertext)?,
-            })
-        }
+            CiphertextIdentity::Digest(crypto.sha256(ciphertext)?)
+        };
+        Ok(Self { hash, identity })
     }
 
-    /// Parses canonical reversible or digest display names.
+    /// Parses canonical routed names with disjoint complete and digest framing.
     /// # Errors
-    /// Returns invalid framing, encoding, or routing hints.
+    /// Returns invalid framing, canonical base64 or reserved routing values.
     pub(crate) fn from_display(display: &[u8]) -> Result<Option<Self>> {
-        if let Some(encoded) = display.strip_prefix(b"_fscrypt_.") {
-            let wire = base64url_decode_nopad(encoded)?;
-            require_exact_len(&wire, 36).map_err(|_| Error::InvalidName)?;
-            let major = u32::from_le_bytes(fixed(&wire, 0)?);
-            if major & 1 != 0 || major >= 0xffff_fffe {
-                return Err(Error::InvalidName);
-            }
-            return Ok(Some(Self::Digest {
-                major,
-                sha256: fixed(&wire, 4)?,
-            }));
-        }
-        let Some(encoded) = display.strip_prefix(FSCRYPT_NOKEY_NAME_PREFIX) else {
+        let (encoded, digest) = if let Some(encoded) = display.strip_prefix(b"_fscrypt_.") {
+            (encoded, true)
+        } else if let Some(encoded) = display.strip_prefix(FSCRYPT_NOKEY_NAME_PREFIX) {
+            (encoded, false)
+        } else {
             return Ok(None);
         };
-        let ciphertext = base64url_decode_nopad(encoded)?;
-        validate_ciphertext_filename_len(ciphertext.len())?;
-        if ciphertext.len() > 184 {
-            return Err(Error::InvalidName);
-        }
-        Ok(Some(Self::Ciphertext(crate::Ext4Name::from_disk(
-            &ciphertext,
-        )?)))
+        let wire = base64url_decode_nopad(encoded)?;
+        let hash = crate::disk_format::directory_hash::DirectoryHash::from_stored(
+            u32::from_le_bytes(fixed(&wire, 0).map_err(|_| Error::InvalidName)?),
+            u32::from_le_bytes(fixed(&wire, 4).map_err(|_| Error::InvalidName)?),
+        )
+        .map_err(|_| Error::InvalidName)?;
+        let identity = if digest {
+            require_exact_len(&wire, 40).map_err(|_| Error::InvalidName)?;
+            CiphertextIdentity::Digest(fixed(&wire, 8).map_err(|_| Error::InvalidName)?)
+        } else {
+            let ciphertext = wire.get(8..).ok_or(Error::InvalidName)?;
+            validate_ciphertext_filename_len(ciphertext.len())?;
+            if ciphertext.len() > 176 {
+                return Err(Error::InvalidName);
+            }
+            CiphertextIdentity::Complete(crate::Ext4Name::from_disk(ciphertext)?)
+        };
+        Ok(Some(Self { hash, identity }))
     }
 
-    /// Encodes a name using disjoint reversible and digest prefixes.
+    /// Encodes the full route and identity with a fixed upper bound of 255 visible bytes.
     /// # Errors
-    /// Returns display-buffer allocation or encoding failure.
+    /// Returns allocation, field encoding or base64 failure.
     pub(crate) fn display_bytes(&self) -> Result<Vec<u8>> {
+        let mut wire = [0; 184];
+        put_bytes(&mut wire, 0, &self.hash.major.to_le_bytes())?;
+        put_bytes(&mut wire, 4, &self.hash.minor.to_le_bytes())?;
+        let (prefix, length) = match &self.identity {
+            CiphertextIdentity::Complete(name) => {
+                put_bytes(&mut wire, 8, name.bytes())?;
+                (
+                    FSCRYPT_NOKEY_NAME_PREFIX,
+                    8_usize
+                        .checked_add(name.bytes().len())
+                        .ok_or(Error::ArithmeticOverflow)?,
+                )
+            }
+            CiphertextIdentity::Digest(digest) => {
+                put_bytes(&mut wire, 8, digest)?;
+                (b"_fscrypt_.".as_slice(), 40)
+            }
+        };
         let mut display = Vec::new();
-        match self {
-            Self::Ciphertext(name) => {
-                display
-                    .try_reserve_exact(
-                        FSCRYPT_NOKEY_NAME_PREFIX
-                            .len()
-                            .checked_add(base64url_nopad_len(name.bytes().len())?)
-                            .ok_or(Error::ArithmeticOverflow)?,
-                    )
-                    .map_err(|_| Error::OutOfMemory)?;
-                display.try_extend_from_slice(FSCRYPT_NOKEY_NAME_PREFIX)?;
-                base64url_encode_nopad(name.bytes(), &mut display)?;
-            }
-            Self::Digest { major, sha256 } => {
-                display
-                    .try_reserve_exact(58)
-                    .map_err(|_| Error::OutOfMemory)?;
-                display.try_extend_from_slice(b"_fscrypt_.")?;
-                let mut wire = [0; 36];
-                memory::copy_exact(
-                    wire.get_mut(..4).ok_or(Error::InvalidName)?,
-                    &major.to_le_bytes(),
-                )?;
-                memory::copy_exact(wire.get_mut(4..).ok_or(Error::InvalidName)?, sha256)?;
-                base64url_encode_nopad(&wire, &mut display)?;
-            }
-        }
+        display
+            .try_reserve_exact(
+                prefix
+                    .len()
+                    .checked_add(base64url_nopad_len(length)?)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::OutOfMemory)?;
+        display.try_extend_from_slice(prefix)?;
+        base64url_encode_nopad(wire.get(..length).ok_or(Error::InvalidName)?, &mut display)?;
         Ok(display)
     }
 
-    /// Returns reversible ciphertext, when the display encoding retains it.
+    /// Complete routing hint, independent of whether the ciphertext identity is abbreviated.
+    pub(crate) const fn hash(&self) -> crate::disk_format::directory_hash::DirectoryHash {
+        self.hash
+    }
+
+    /// Returns the complete ciphertext when bounded display can retain it.
     pub(crate) const fn direct(&self) -> Option<&crate::Ext4Name> {
-        match self {
-            Self::Ciphertext(name) => Some(name),
-            Self::Digest { .. } => None,
+        match &self.identity {
+            CiphertextIdentity::Complete(name) => Some(name),
+            CiphertextIdentity::Digest(_) => None,
         }
     }
 
-    /// Verifies candidate identity independently of the routing hint.
+    /// Verifies the complete ciphertext identity independently of the routing hint.
     /// # Errors
-    /// Returns hash-provider failures.
+    /// Returns hash-provider failure.
     pub(crate) fn matches(
         &self,
         ciphertext: &[u8],
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<bool> {
-        match self {
-            Self::Ciphertext(name) => Ok(name.bytes() == ciphertext),
-            Self::Digest { sha256, .. } => {
-                Ok(ciphertext.len() > 184 && crypto.sha256(ciphertext)? == *sha256)
+        match &self.identity {
+            CiphertextIdentity::Complete(name) => Ok(name.bytes() == ciphertext),
+            CiphertextIdentity::Digest(digest) => {
+                Ok(ciphertext.len() > 176 && crypto.sha256(ciphertext)? == *digest)
             }
         }
     }
@@ -582,6 +593,25 @@ impl FscryptMasterKey {
             crypto,
             &self.bytes,
             FscryptHkdfContext::PerFileEncryptionKey,
+            &nonce.bytes(),
+            &mut key.bytes,
+        )?;
+        Ok(key)
+    }
+
+    /// Derives the directory's SipHash key in the format-defined v2 HKDF namespace.
+    /// # Errors
+    /// Returns operation-owned HKDF-SHA512 failure.
+    fn derive_directory_hash_key(
+        &self,
+        nonce: FscryptFileNonce,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<FscryptDirectoryHashKey> {
+        let mut key = FscryptDirectoryHashKey { bytes: [0; 16] };
+        fscrypt_hkdf_expand(
+            crypto,
+            &self.bytes,
+            FscryptHkdfContext::DirectoryHashKey,
             &nonce.bytes(),
             &mut key.bytes,
         )?;
@@ -763,6 +793,28 @@ impl FscryptInodeKey<'_> {
             .derive_contents_key(self.context.nonce(), crypto)
     }
 
+    /// Owns the filename key so a prepared lookup can decrypt candidates without borrowing a mount.
+    /// # Errors
+    /// Returns operation-owned key derivation failure.
+    pub(crate) fn filenames_key(
+        &self,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<FscryptFilenamesKey> {
+        self.master
+            .derive_filenames_key(self.context.nonce(), crypto)
+    }
+
+    /// Owns the independent keyed-hash capability for this directory's plaintext comparisons.
+    /// # Errors
+    /// Returns operation-owned key derivation failure.
+    pub(crate) fn directory_hash_key(
+        &self,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<FscryptDirectoryHashKey> {
+        self.master
+            .derive_directory_hash_key(self.context.nonce(), crypto)
+    }
+
     /// Encodes a plaintext component using this directory's nonce and padding policy.
     /// # Errors
     /// Returns invalid component, allocation, key-derivation or cryptographic-provider failure.
@@ -771,9 +823,7 @@ impl FscryptInodeKey<'_> {
         name: &crate::Ext4Name,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<crate::Ext4Name> {
-        let key = self
-            .master
-            .derive_filenames_key(self.context.nonce(), crypto)?;
+        let key = self.filenames_key(crypto)?;
         crate::Ext4Name::from_disk(&key.encrypt_filename(
             name.bytes(),
             self.policy().filename_padding(),
@@ -789,9 +839,7 @@ impl FscryptInodeKey<'_> {
         name: &crate::Ext4Name,
         crypto: &mut dyn CryptographicOperation,
     ) -> Result<crate::Ext4Name> {
-        let key = self
-            .master
-            .derive_filenames_key(self.context.nonce(), crypto)?;
+        let key = self.filenames_key(crypto)?;
         crate::Ext4Name::new(&key.decrypt_filename(name.bytes(), crypto)?)
     }
 }
@@ -922,6 +970,39 @@ impl fmt::Debug for FscryptFilenamesKey {
     }
 }
 
+/// Operation-owned keyed hashing of normalized plaintext; it grants no filename encryption authority.
+/// SipHash-2-4 evaluates bytes directly, independently of Rust's `Hash` framing or host endianness.
+#[derive(Eq, PartialEq)]
+pub(crate) struct FscryptDirectoryHashKey {
+    /// Derived secret hash key, erased when this operation-local capability is dropped.
+    bytes: [u8; 16],
+}
+impl FscryptDirectoryHashKey {
+    /// Computes the format's high-word primary and low-word secondary hash from comparison bytes.
+    pub(crate) fn hash(
+        &self,
+        comparison: &[u8],
+    ) -> crate::disk_format::directory_hash::DirectoryHash {
+        let value = siphasher::sip::SipHasher24::new_with_key(&self.bytes).hash(comparison);
+        let [a, b, c, d, e, f, g, h] = value.to_le_bytes();
+        crate::disk_format::directory_hash::DirectoryHash::from_algorithm(
+            u32::from_le_bytes([e, f, g, h]),
+            u32::from_le_bytes([a, b, c, d]),
+        )
+    }
+}
+impl Drop for FscryptDirectoryHashKey {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
+impl fmt::Debug for FscryptDirectoryHashKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FscryptDirectoryHashKey")
+            .finish_non_exhaustive()
+    }
+}
+
 /// HKDF output namespaces used by fscrypt v2.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FscryptHkdfContext {
@@ -929,6 +1010,8 @@ enum FscryptHkdfContext {
     KeyIdentifierForRawKey,
     /// `HKDF_CONTEXT_PER_FILE_ENC_KEY`.
     PerFileEncryptionKey,
+    /// Keyed directory-name hashing uses an independent HKDF output namespace.
+    DirectoryHashKey,
 }
 
 impl FscryptHkdfContext {
@@ -937,6 +1020,7 @@ impl FscryptHkdfContext {
         match self {
             Self::KeyIdentifierForRawKey => 1,
             Self::PerFileEncryptionKey => 2,
+            Self::DirectoryHashKey => 5,
         }
     }
 }
@@ -1609,7 +1693,7 @@ mod tests {
         let ciphertext = b"\x00\xff/opaque encrypted name";
         let name = must!(FscryptNoKeyName::from_ciphertext(
             ciphertext,
-            0,
+            crate::disk_format::directory_hash::DirectoryHash { major: 0, minor: 0 },
             &mut TestCryptographicOperation
         ));
         let display = must!(name.display_bytes());
@@ -1639,11 +1723,14 @@ mod tests {
         reason = "assertions compare query identity across independently selected ciphertext boundary lengths"
     )]
     fn keyless_names_cover_the_complete_ciphertext_length_domain() -> Result<()> {
-        for length in [184, 185, 192, 255] {
+        for length in 1..=255 {
             let ciphertext = memory::repeated_vec(0xa5, length)?;
             let name = FscryptNoKeyName::from_ciphertext(
                 &ciphertext,
-                0x1234,
+                crate::disk_format::directory_hash::DirectoryHash {
+                    major: 0x1234,
+                    minor: 0x5678,
+                },
                 &mut TestCryptographicOperation,
             )?;
             let display = name.display_bytes()?;

@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 zeroize.workspace = true
+siphasher.workspace = true
 
 [build-dependencies]
 ext4-unicode-gen = { path = "../../tools/unicode-gen" }

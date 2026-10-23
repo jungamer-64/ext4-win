@@ -51,7 +51,7 @@ impl DirectoryHash {
     }
 
     /// Converts an algorithm result into the HTree name-key domain.
-    const fn from_algorithm(major: u32, minor: u32) -> Self {
+    pub(crate) const fn from_algorithm(major: u32, minor: u32) -> Self {
         let major = major & !1;
         let major = if major == END_MARKER_HASH {
             LAST_NAME_HASH

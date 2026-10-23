@@ -23,19 +23,51 @@ impl MetadataMutation<'_, '_> {
         self.volume.fscrypt_key(context)
     }
 
-    /// Encodes a new name using the selected directory's staged protection state.
+    /// Prepares a query from this transaction's staged directory context and observed key snapshot.
     /// # Errors
-    /// Returns invalid name, context-selection, missing-key, or cryptographic-provider failure.
-    pub(super) fn encrypt_directory_child_name(
+    /// Returns context, encoding, allocation, crypto or missing-key display failure.
+    pub(super) fn prepare_directory_lookup<'name>(
+        &mut self,
+        parent: &Inode,
+        name: &'name Ext4Name,
+        crypto: &mut dyn CryptographicOperation,
+    ) -> Result<PreparedDirectoryLookup<'name>> {
+        let names = self.volume.superblock.name_semantics(parent)?;
+        if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
+            return Ok(PreparedDirectoryLookup::Exact(name.try_to_owned_name()?));
+        }
+        match self.fscrypt_key_for_inode(parent) {
+            Ok(key) => PreparedDirectoryLookup::encrypted(name, names, key, crypto),
+            Err(Error::MissingEncryptionKey) => Ok(PreparedDirectoryLookup::NoKey(
+                FscryptNoKeyName::from_display(name.bytes())?.ok_or(Error::MissingEncryptionKey)?,
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Encodes a complete record while the plaintext and its directory key are both available.
+    /// # Errors
+    /// Returns encoding, context, key, allocation or cryptographic failure before staging.
+    pub(super) fn encode_directory_entry(
         &mut self,
         parent: &Inode,
         name: &Ext4Name,
+        child: InodeId,
+        kind: DirectoryEntryKind,
         crypto: &mut dyn CryptographicOperation,
-    ) -> Result<Ext4Name> {
+    ) -> Result<RawDirectoryEntry> {
+        let names = self.volume.superblock.name_semantics(parent)?;
+        let comparison = names.key(name.bytes())?;
         if !parent.protection().is_encrypted() || matches!(name.bytes(), b"." | b"..") {
-            return Ext4Name::new(name.bytes());
+            return RawDirectoryEntry::new(child, name, kind);
         }
-        self.fscrypt_key_for_inode(parent)?
-            .encrypt_name(name, crypto)
+        let key = self.fscrypt_key_for_inode(parent)?;
+        let ciphertext = key.encrypt_name(name, crypto)?;
+        if parent.flags().has_casefold() {
+            let hash = key.directory_hash_key(crypto)?.hash(comparison.bytes());
+            RawDirectoryEntry::encrypted_casefold(child, &ciphertext, kind, hash)
+        } else {
+            RawDirectoryEntry::new(child, &ciphertext, kind)
+        }
     }
 }

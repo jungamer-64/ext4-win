@@ -243,6 +243,63 @@ mod tests {
     }
 }
 
+/// Owned query preparation keeps derived keys local while traversal borrows only their narrow capability.
+#[derive(Debug)]
+pub(super) enum PreparedDirectoryLookup<'name> {
+    /// Complete ordinary on-disk query name.
+    Exact(Ext4Name),
+    /// Complete keyless identity and route.
+    NoKey(crate::protection::fscrypt::FscryptNoKeyName),
+    /// A normalized plaintext key paired with candidate decryption and keyed routing.
+    EncryptedCasefold {
+        /// Authoritative comparison key derived from the caller's complete original name.
+        comparison: crate::disk_format::name::NameKey<'name>,
+        /// Operation-owned candidate decryption capability.
+        key: crate::protection::fscrypt::FscryptFilenamesKey,
+        /// Keyed plaintext route, never a hash of ciphertext bytes.
+        hash: crate::disk_format::directory_hash::DirectoryHash,
+    },
+}
+impl<'name> PreparedDirectoryLookup<'name> {
+    /// Prepares plaintext equality and its route from one selected directory key.
+    /// # Errors
+    /// Returns encoding, allocation, key derivation or encryption failure.
+    pub(super) fn encrypted(
+        name: &'name Ext4Name,
+        names: crate::disk_format::name::NameSemantics,
+        key: crate::protection::fscrypt::FscryptInodeKey<'_>,
+        crypto: &mut dyn crate::CryptographicOperation,
+    ) -> Result<Self> {
+        if names == crate::disk_format::name::NameSemantics::Bytewise {
+            return Ok(Self::Exact(key.encrypt_name(name, crypto)?));
+        }
+        let comparison = names.key(name.bytes())?;
+        let hash = key.directory_hash_key(crypto)?.hash(comparison.bytes());
+        Ok(Self::EncryptedCasefold {
+            comparison,
+            key: key.filenames_key(crypto)?,
+            hash,
+        })
+    }
+
+    /// Borrows one immutable prepared query for bounded traversal.
+    pub(super) fn query(&self) -> DirectoryLookup<'_> {
+        match self {
+            Self::Exact(name) => DirectoryLookup::Exact(name),
+            Self::NoKey(name) => DirectoryLookup::NoKey(name),
+            Self::EncryptedCasefold {
+                comparison,
+                key,
+                hash,
+            } => DirectoryLookup::EncryptedCasefold {
+                comparison: comparison.bytes(),
+                key,
+                hash: *hash,
+            },
+        }
+    }
+}
+
 /// Lookup semantics independent of traversal through committed or staged directory blocks.
 #[derive(Clone, Copy)]
 pub(super) enum DirectoryLookup<'name> {
@@ -250,6 +307,15 @@ pub(super) enum DirectoryLookup<'name> {
     Exact(&'name Ext4Name),
     /// Exact stored identity retains any keyed route paired with its ciphertext.
     Stored(&'name crate::disk_format::dir::DirectoryEntry),
+    /// Normalized plaintext equality after filtering and decrypting the keyed-hash candidates.
+    EncryptedCasefold {
+        /// Complete plaintext comparison bytes.
+        comparison: &'name [u8],
+        /// Operation-local filename decryption capability.
+        key: &'name crate::protection::fscrypt::FscryptFilenamesKey,
+        /// Keyed route derived from the same plaintext comparison bytes.
+        hash: crate::disk_format::directory_hash::DirectoryHash,
+    },
     /// Keyless ciphertext identity, including long-name digest queries.
     NoKey(&'name crate::protection::fscrypt::FscryptNoKeyName),
 }
@@ -260,6 +326,7 @@ impl DirectoryLookup<'_> {
             Self::Exact(name) => Some(name),
             Self::Stored(entry) => Some(entry.name()),
             Self::NoKey(name) => name.direct(),
+            Self::EncryptedCasefold { .. } => None,
         }
     }
     /// Routes a query using the directory's authoritative hash profile.
@@ -272,12 +339,13 @@ impl DirectoryLookup<'_> {
     ) -> Result<u32> {
         match *self {
             Self::Stored(entry) => Ok(scheme.entry_hash(entry, names)?.major),
-            Self::Exact(name)
-            | Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Ciphertext(name)) => {
-                Ok(names.hash(name, scheme.computed()?)?.major)
-            }
-            Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Digest { major, .. }) => {
-                Ok(*major)
+            Self::Exact(name) => Ok(names.hash(name, scheme.computed()?)?.major),
+            Self::NoKey(name) => Ok(name.hash().major),
+            Self::EncryptedCasefold { hash, .. } => {
+                if scheme != crate::disk_format::dir::DirectoryIndexHash::StoredKeyed {
+                    return Err(Error::UnsupportedDirectoryHash);
+                }
+                Ok(hash.major)
             }
         }
     }
@@ -292,9 +360,9 @@ impl DirectoryLookup<'_> {
     ) -> Result<Option<crate::disk_format::dir::DirectoryEntry>> {
         match self {
             Self::Stored(stored) => {
-                return Ok(entries
-                    .into_iter()
-                    .find(|entry| entry.name() == stored.name()));
+                return Ok(entries.into_iter().find(|entry| {
+                    entry.name() == stored.name() && entry.stored_hash() == stored.stored_hash()
+                }));
             }
             Self::Exact(name) => {
                 let key = names.key(name.bytes())?;
@@ -304,9 +372,31 @@ impl DirectoryLookup<'_> {
                     }
                 }
             }
+            Self::EncryptedCasefold {
+                comparison,
+                key,
+                hash,
+            } => {
+                for entry in entries {
+                    if matches!(entry.name().bytes(), b"." | b"..") {
+                        continue;
+                    }
+                    let stored = entry.stored_hash().ok_or(Error::InvalidDirectoryEntry)?;
+                    if stored != *hash {
+                        continue;
+                    }
+                    let plaintext =
+                        Ext4Name::new(&key.decrypt_filename(entry.name().bytes(), crypto)?)?;
+                    if names.key(plaintext.bytes())?.bytes() == *comparison {
+                        return Ok(Some(entry));
+                    }
+                }
+            }
             Self::NoKey(name) => {
                 for entry in entries {
-                    if name.matches(entry.name().bytes(), crypto)? {
+                    if entry.stored_hash().is_none_or(|hash| hash == name.hash())
+                        && name.matches(entry.name().bytes(), crypto)?
+                    {
                         return Ok(Some(entry));
                     }
                 }

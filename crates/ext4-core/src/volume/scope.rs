@@ -165,3 +165,5 @@ pub(super) const EXT4_INODE_MIN_EXTRA_ISIZE: u16 = 32;
 pub(super) const SUPERBLOCK_FREE_INODES_OFFSET: usize = 16;
 /// Byte offset of the primary ext4 superblock.
 pub(super) const SUPERBLOCK_OFFSET: u64 = 1024;
+
+pub(super) use super::directory::PreparedDirectoryLookup;
