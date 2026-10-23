@@ -91,6 +91,11 @@ impl DirectoryHashScheme {
         }
     }
 
+    /// Version that reproduces this effective algorithm and byte interpretation on disk.
+    pub(crate) const fn root_version(self) -> u8 {
+        self.version.to_raw()
+    }
+
     /// Produces the format-bounded HTree hash for one complete directory comparison key.
     #[must_use]
     pub(crate) fn hash(self, name: &[u8]) -> DirectoryHash {

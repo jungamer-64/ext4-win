@@ -570,11 +570,74 @@ fn dx_capacity(
         .ok_or(Error::InvalidDirectoryEntry)
 }
 
+/// Source of the name hashes selected by an HTree root and its owning directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryIndexHash {
+    /// Hash comparison bytes using the root-selected unkeyed algorithm.
+    Computed(DirectoryHashScheme),
+    /// Keyed plaintext hashes reside in encrypted casefold leaf records.
+    StoredKeyed,
+}
+impl DirectoryIndexHash {
+    /// Admits exactly the root version prescribed by the directory record layout.
+    /// # Errors
+    /// Rejects an unknown version or disagreement between keyed hashes and directory flags.
+    fn from_root(
+        seed: DirectoryHashSeed,
+        version: u8,
+        signedness: DirectoryHashSignedness,
+        encoding: DirectoryEntryEncoding,
+    ) -> Result<Self> {
+        match (encoding, version) {
+            (DirectoryEntryEncoding::EncryptedCasefold, 6) => Ok(Self::StoredKeyed),
+            (DirectoryEntryEncoding::EncryptedCasefold, _)
+            | (DirectoryEntryEncoding::Standard, 6) => Err(Error::UnsupportedDirectoryHash),
+            (DirectoryEntryEncoding::Standard, version) => {
+                Ok(Self::Computed(DirectoryHashScheme::from_metadata(
+                    seed,
+                    DirectoryHashVersion::from_raw(version)?,
+                    signedness,
+                )))
+            }
+        }
+    }
+    /// Requests an algorithm only when ciphertext-independent stored hashes are not required.
+    /// # Errors
+    /// Rejects attempts to hash ciphertext under a keyed plaintext profile.
+    pub(crate) fn computed(self) -> Result<DirectoryHashScheme> {
+        match self {
+            Self::Computed(scheme) => Ok(scheme),
+            Self::StoredKeyed => Err(Error::UnsupportedDirectoryHash),
+        }
+    }
+    /// Reads the entry's authoritative stored hash or derives its comparison-key hash.
+    /// # Errors
+    /// Rejects layout disagreement, invalid encoding or normalization allocation failure.
+    pub(crate) fn entry_hash(
+        self,
+        entry: &DirectoryEntry,
+        names: super::name::NameSemantics,
+    ) -> Result<DirectoryHash> {
+        match (self, entry.stored_hash()) {
+            (Self::Computed(scheme), None) => names.hash(entry.name(), scheme),
+            (Self::StoredKeyed, Some(hash)) => Ok(hash),
+            _ => Err(Error::InvalidDirectoryEntry),
+        }
+    }
+    /// Encodes the actual root hash version, including the keyed profile's format identifier.
+    const fn to_raw(self) -> u8 {
+        match self {
+            Self::Computed(scheme) => scheme.root_version(),
+            Self::StoredKeyed => 6,
+        }
+    }
+}
+
 /// Parsed HTree root block.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct HtreeRoot {
     /// Directory hash scheme selected by root info.
-    hash: DirectoryHashScheme,
+    hash: DirectoryIndexHash,
     /// `.` and `..` entries stored before the root info.
     dot_entries: Vec<DirectoryEntry>,
     /// Number of index levels between root entries and leaf blocks.
@@ -596,6 +659,7 @@ impl HtreeRoot {
         hash_signedness: DirectoryHashSignedness,
         maximum_indirect_levels: u8,
         checksum: DirectoryChecksum,
+        encoding: DirectoryEntryEncoding,
     ) -> Result<Self> {
         if bytes.len() < DX_ROOT_COUNT_OFFSET + DX_ENTRY_BYTES {
             return Err(Error::InvalidDirectoryEntry);
@@ -633,7 +697,8 @@ impl HtreeRoot {
         let root_hash_version = *bytes
             .get(DX_ROOT_INFO_OFFSET + 4)
             .ok_or(Error::InvalidDirectoryEntry)?;
-        let hash_version = DirectoryHashVersion::from_raw(root_hash_version)?;
+        let hash =
+            DirectoryIndexHash::from_root(hash_seed, root_hash_version, hash_signedness, encoding)?;
         let info_len = *bytes
             .get(DX_ROOT_INFO_OFFSET + 5)
             .ok_or(Error::InvalidDirectoryEntry)?;
@@ -653,7 +718,7 @@ impl HtreeRoot {
         }
         let index = DxIndex::parse_at(bytes, DX_ROOT_COUNT_OFFSET, checksum)?;
         Ok(Self {
-            hash: DirectoryHashScheme::from_metadata(hash_seed, hash_version, hash_signedness),
+            hash,
             dot_entries: {
                 let mut dot_entries = Vec::new();
                 dot_entries.try_push(dot)?;
@@ -666,7 +731,7 @@ impl HtreeRoot {
     }
 
     /// Returns the hash scheme selected by this root.
-    pub(crate) const fn hash_scheme(&self) -> DirectoryHashScheme {
+    pub(crate) const fn hash_profile(&self) -> DirectoryIndexHash {
         self.hash
     }
 
@@ -1166,7 +1231,7 @@ pub(crate) fn create_htree_root(
     block_size: usize,
     self_inode: InodeId,
     parent_inode: InodeId,
-    hash_version: DirectoryHashVersion,
+    hash: DirectoryIndexHash,
     index: &DxIndex,
     checksum: DirectoryChecksum,
 ) -> Result<Vec<u8>> {
@@ -1197,7 +1262,7 @@ pub(crate) fn create_htree_root(
     put_le_u32(&mut bytes, disk_offset(DX_ROOT_INFO_OFFSET), 0)?;
     *bytes
         .get_mut(DX_ROOT_INFO_OFFSET + 4)
-        .ok_or(Error::InvalidDirectoryEntry)? = hash_version.to_raw();
+        .ok_or(Error::InvalidDirectoryEntry)? = hash.to_raw();
     *bytes
         .get_mut(DX_ROOT_INFO_OFFSET + 5)
         .ok_or(Error::InvalidDirectoryEntry)? = DX_ROOT_INFO_LEN;
