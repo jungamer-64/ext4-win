@@ -20,7 +20,7 @@ use crate::namespace::WindowsName;
 use ext4_core::{
     ByteOffset, CheckpointPublication, ClusterSize, CommitLease, CommitReadyMutation,
     CompletedMount, DeviceLength, DirectoryNodeId, DirectoryScanCursor, DurableMutation, Ext4Name,
-    FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence, MountedProfile,
+    FileNodeId, FileOffset, FscryptKeyIdentifier, FscryptKeyPresence, InodeId, MountedProfile,
     MutationLease, MutationResolvePass, NewDirectoryMetadata, NewFileMetadata, NodeId,
     ReservedMutation, ResolvedMutation, VisibilityLease, VolumeGeometry, VolumeIdentity, XattrName,
     XattrValue,

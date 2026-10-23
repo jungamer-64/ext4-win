@@ -3274,6 +3274,94 @@ fn transaction_inode_retirement_preserves_replacement_and_next_transaction_alloc
     Ok(())
 }
 
+/// # Errors
+/// Returns fixture, hard-link, resolution, commit or inode-reuse failures.
+/// # Panics
+/// Fails if a surviving link retires its allocation or final unlink omits its retirement.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe resolved lifecycle publications and committed namespace behavior"
+)]
+fn final_unlink_publishes_retirement_before_inode_reuse() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let source = pass.hard_link_source(HardLinkNodeId::File(file))?;
+        pass.create_hard_link(
+            source,
+            root,
+            &Ext4Name::new(b"retained-alias")?,
+            NamespaceDestination::Vacant,
+        )
+    })?;
+    for (name, final_link) in [
+        (b"retained-alias".as_slice(), false),
+        (b"concurrent-a".as_slice(), true),
+    ] {
+        let ticket = fixture.coordinator.admit_mutation()?;
+        let (resolved, ()) = fixture.disk.resolve(
+            &fixture.profile,
+            &fixture.epoch,
+            &fixture.coordinator,
+            ticket,
+            &mut PlainCrypto,
+            |pass| {
+                let root = pass.directory(DirectoryNodeId::ROOT)?;
+                pass.unlink_file(root, &Ext4Name::new(name)?)
+            },
+        )?;
+        let reserved = resolved.reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?;
+        let updates = reserved.node_metadata_updates();
+        assert_eq!(
+            updates.iter().any(|update| matches!(update,
+                NodeMetadataUpdate::Retired { inode } if *inode == NodeId::File(file).inode()
+            )),
+            final_link
+        );
+        assert_eq!(
+            updates.iter().any(|update| matches!(update,
+                NodeMetadataUpdate::Live { metadata, .. } if metadata.node() == NodeId::File(file)
+            )),
+            !final_link
+        );
+        let ready = reserved.prepare_commit(
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(Error::ClusterReferenceConflict)?,
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+        )?;
+        fixture.epoch =
+            fixture
+                .disk
+                .commit(&mut fixture.coordinator, &mut fixture.cache, ticket, ready)?;
+    }
+    let replacement = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let replacement = pass.create_file(
+            root,
+            &Ext4Name::new(b"concurrent-a")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        pass.write_file_range(replacement, FileOffset::ZERO, b"replacement")?;
+        Ok(replacement.id())
+    })?;
+    // This fixture's first-free allocator must exercise the retired number, not a fresh slot.
+    assert_eq!(replacement, file);
+    fixture.remount()?;
+    let mut bytes = [0; 11];
+    fixture.read(|pass| pass.read_file(replacement, FileOffset::ZERO, &mut bytes))?;
+    assert_eq!(&bytes, b"replacement");
+    Ok(())
+}
+
 /// Shares one independently encoded external attribute block between two fixture inodes.
 /// Header and inode checksums authenticate the requested count, even when it disagrees with owners.
 /// # Errors

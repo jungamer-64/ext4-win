@@ -429,10 +429,11 @@ pub struct ReservedMutation {
 }
 
 impl ReservedMutation {
-    /// Final metadata for each live inode changed by this version-revalidated mutation.
+    /// Final metadata or retirement for each inode changed by this version-revalidated mutation.
     ///
     /// These values are preparation inputs only; publication is permitted only after commit
-    /// durability. Deleted inodes are excluded because they have no live metadata snapshot.
+    /// durability. Retirement ends the previous allocation's identity before its inode number
+    /// can be reused by another mutation.
     #[must_use]
     pub fn node_metadata_updates(&self) -> &[NodeMetadataUpdate] {
         &self.resolved.node_metadata_updates

@@ -125,7 +125,7 @@ impl MetadataMutation<'_, '_> {
         &mut self,
         raw: &LiveInodeRecord,
     ) -> Result<NodeMetadataUpdate> {
-        Ok(NodeMetadataUpdate {
+        Ok(NodeMetadataUpdate::Live {
             metadata: self.node_metadata_snapshot(raw)?,
             xattrs: self.xattr_set_for_raw_inode(raw)?.into_public(),
         })
