@@ -1,7 +1,7 @@
 //! Inode record typestates staged by mounted volume transactions.
 
 use super::scope::*;
-use crate::disk_format::inode::{InodeData, InodeRecordLayout};
+use crate::disk_format::inode::{AttributeInode, InodeData, InodeRecordLayout};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Raw inode image paired with its identity and device offset. Read-only consumers may borrow
@@ -45,6 +45,32 @@ pub(super) struct LiveInodeRecord {
     raw: RawInodeRecord<Vec<u8>>,
 }
 
+/// Allocated external attribute storage with no namespace owner or timestamp interpretation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct AttributeInodeRecord {
+    /// Sole writable record image; header validation establishes its attribute role.
+    raw: RawInodeRecord<Vec<u8>>,
+}
+/// Narrow data-layout authority shared by namespace and attribute-value inode serializers.
+pub(super) trait ExtentInodeRecord {
+    /// Reads allocation and extent geometry without namespace metadata.
+    /// # Errors
+    /// Rejects malformed storage encoding.
+    fn data(&self) -> Result<InodeData>;
+    /// External attribute block contributes to the inode's allocation charge.
+    /// # Errors
+    /// Rejects truncated pointer fields.
+    fn xattr_block(&self) -> Result<Option<BlockAddress>>;
+    /// Publishes a complete serialized root into this private inode image.
+    /// # Errors
+    /// Rejects truncated storage.
+    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()>;
+    /// Writes the allocation count already checked against mounted units.
+    /// # Errors
+    /// Rejects truncated allocation fields.
+    fn set_encoded_allocation_size(&mut self, size: EncodedInodeBlockCount) -> Result<()>;
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Inode record staged after final unlink and deletion serialization.
 pub(super) struct DeletedInodeRecord {
@@ -57,6 +83,8 @@ pub(super) struct DeletedInodeRecord {
 pub(super) enum StagedInodeRecord {
     /// Live inode metadata rewrite.
     Live(LiveInodeRecord),
+    /// Attribute value data/refcount update with no namespace publication.
+    Attribute(AttributeInodeRecord),
     /// Deleted inode cleanup rewrite.
     Deleted(DeletedInodeRecord),
     /// Allocated orphan whose remaining storage still requires recovery.
@@ -85,6 +113,9 @@ impl From<LiveInodeRecord> for StagedInodeRecord {
     }
 }
 
+impl From<AttributeInodeRecord> for StagedInodeRecord {
+    fn from(record: AttributeInodeRecord) -> Self { Self::Attribute(record) }
+}
 impl From<DeletedInodeRecord> for StagedInodeRecord {
     fn from(record: DeletedInodeRecord) -> Self {
         Self::Deleted(record)
@@ -125,6 +156,13 @@ impl RawInodeRecord<Vec<u8>> {
         AllocatedInodeRecord { raw: self }
     }
 
+    /// Establishes attribute-value ownership without constructing a namespace record.
+    /// # Errors
+    /// Rejects malformed or namespace inode headers.
+    pub(super) fn into_attribute(self) -> Result<AttributeInodeRecord> {
+        let _header = AttributeInode::parse(self.id, &self.bytes, self.encoding)?;
+        Ok(AttributeInodeRecord { raw: self })
+    }
     /// Moves this record into the live-inode state after parsing invariants.
     /// # Errors
     ///
@@ -136,6 +174,19 @@ impl RawInodeRecord<Vec<u8>> {
 }
 
 impl AllocatedInodeRecord {
+    /// Initializes a positive-reference attribute value before allocating its extent payload.
+    /// # Errors
+    /// Propagates metadata, size or field encoding failures.
+    pub(super) fn initialize_attribute_value(mut self, size: FileSize, checksum: u32, block_size: BlockSize) -> Result<AttributeInodeRecord> {
+        self.raw.initialize_file(NewFileMetadata::new(Ext4Owner::new(crate::Ext4Uid::from_u32(0), crate::Ext4Gid::from_u32(0)), Ext4Permissions::new(0o600)?),
+            InodeFlags::from_u32(0), Ext4Timestamp::from_seconds(0), block_size, InodeTimestampEncoding::ExtraFields)?;
+        self.raw.set_flags(InodeFlags::from_u32(0).into_attribute_value())?;
+        self.raw.set_encoded_size(self.raw.encoding.encode_file_size(size)?)?;
+        put_le_u32(&mut self.raw.bytes, disk_offset(8), checksum)?;
+        put_le_u32(&mut self.raw.bytes, disk_offset(12), 0)?;
+        put_le_u32(&mut self.raw.bytes, disk_offset(36), 1)?;
+        self.raw.into_attribute()
+    }
     /// Initializes this allocation as an empty extent-backed file.
     /// # Errors
     ///
@@ -567,6 +618,54 @@ impl LiveInodeRecord {
     }
 }
 
+impl AttributeInodeRecord {
+    /// Validated value header; hash and reference fields are never decoded as time.
+    /// # Errors
+    /// Rejects malformed attribute-inode storage.
+    pub(super) fn parse(&self) -> Result<AttributeInode> { AttributeInode::parse(self.raw.id, &self.raw.bytes, self.raw.encoding) }
+    /// Record identity for transaction resource admission.
+    pub(super) const fn id(&self) -> InodeId { self.raw.id }
+    /// Fallible independent copy for transaction staging.
+    /// # Errors
+    /// Propagates allocation failure.
+    pub(super) fn try_clone(&self) -> Result<Self> { Ok(Self { raw: self.raw.try_clone_record()? }) }
+    /// Writes a still-positive reference count; terminal release consumes this record separately.
+    /// # Errors
+    /// Rejects zero and truncated fields.
+    pub(super) fn set_references(&mut self, references: core::num::NonZeroU64) -> Result<()> {
+        put_le_u32(&mut self.raw.bytes, disk_offset(12), u32::try_from(references.get() >> 32).map_err(|_| Error::ArithmeticOverflow)?)?;
+        put_le_u32(&mut self.raw.bytes, disk_offset(36), u32::try_from(references.get() & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?)
+    }
+    /// Consumes the final reference after all value blocks have been released in this transaction.
+    /// # Errors
+    /// Rejects nonterminal reference count or failed inode-field encoding.
+    pub(super) fn retire(mut self, now: Ext4Timestamp, block_size: BlockSize) -> Result<DeletedInodeRecord> {
+        if self.parse()?.references() != 1 { return Err(Error::InvalidXattr); }
+        self.raw.set_deletion_time(now.base_seconds_bits()?)?;
+        self.raw.set_deleted_links_count()?;
+        self.raw.set_encoded_size(self.raw.encoding.encode_file_size(FileSize::from_bytes(0))?)?;
+        self.raw.set_encoded_allocation_size(self.raw.encoding.encode_allocation_size(FileAllocationSize::from_bytes(0))?)?;
+        self.raw.set_flags(InodeFlags::from_u32(0).with_extent_tree())?;
+        self.raw.set_xattr_block(None)?;
+        self.raw.clear_inline_xattr_region()?;
+        let empty = MutableExtentTree::from_extents(Vec::new())?.serialize(block_size, ExtentTreeContext::none())?;
+        self.raw.set_extent_root_bytes(empty.inode_root())?;
+        Ok(DeletedInodeRecord { raw: self.raw })
+    }
+}
+impl ExtentInodeRecord for LiveInodeRecord {
+    fn data(&self) -> Result<InodeData> { InodeData::parse(self.raw.id, &self.raw.bytes, self.raw.encoding) }
+    fn xattr_block(&self) -> Result<Option<BlockAddress>> { self.raw.xattr_block() }
+    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> { self.raw.set_extent_root_bytes(root) }
+    fn set_encoded_allocation_size(&mut self, size: EncodedInodeBlockCount) -> Result<()> { self.raw.set_encoded_allocation_size(size) }
+}
+impl ExtentInodeRecord for AttributeInodeRecord {
+    fn data(&self) -> Result<InodeData> { InodeData::parse(self.raw.id, &self.raw.bytes, self.raw.encoding) }
+    fn xattr_block(&self) -> Result<Option<BlockAddress>> { self.raw.xattr_block() }
+    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> { self.raw.set_extent_root_bytes(root) }
+    fn set_encoded_allocation_size(&mut self, size: EncodedInodeBlockCount) -> Result<()> { self.raw.set_encoded_allocation_size(size) }
+}
+
 impl StagedInodeRecord {
     /// Copies this staged inode image without infallible allocation.
     /// # Errors
@@ -577,6 +676,7 @@ impl StagedInodeRecord {
             Self::Live(record) => Self::Live(LiveInodeRecord {
                 raw: record.raw.try_clone_record()?,
             }),
+            Self::Attribute(record) => Self::Attribute(record.try_clone()?),
             Self::Deleted(record) => Self::Deleted(DeletedInodeRecord {
                 raw: record.raw.try_clone_record()?,
             }),
@@ -588,6 +688,7 @@ impl StagedInodeRecord {
     pub(super) const fn id(&self) -> InodeId {
         match self {
             Self::Live(record) => record.raw.id(),
+            Self::Attribute(record) => record.raw.id(),
             Self::Deleted(record) => record.raw.id(),
             Self::Recovering(record) => record.raw().id(),
         }
@@ -602,7 +703,7 @@ impl StagedInodeRecord {
             Self::Live(record) => Ok(LiveInodeRecord {
                 raw: record.raw.try_clone_record()?,
             }),
-            Self::Deleted(_) | Self::Recovering(_) => Err(Error::InvalidInode),
+            Self::Deleted(_) | Self::Recovering(_) | Self::Attribute(_) => Err(Error::InvalidInode),
         }
     }
 
@@ -613,6 +714,7 @@ impl StagedInodeRecord {
     pub(super) fn refresh_checksum(&mut self, superblock: &Superblock) -> Result<()> {
         match self {
             Self::Live(record) => record.raw.refresh_checksum(superblock),
+            Self::Attribute(record) => record.raw.refresh_checksum(superblock),
             Self::Deleted(record) => record.raw.refresh_checksum(superblock),
             Self::Recovering(record) => record.raw_mut().refresh_checksum(superblock),
         }
@@ -622,6 +724,7 @@ impl StagedInodeRecord {
     pub(super) const fn offset(&self) -> ByteOffset {
         match self {
             Self::Live(record) => record.raw.offset(),
+            Self::Attribute(record) => record.raw.offset(),
             Self::Deleted(record) => record.raw.offset(),
             Self::Recovering(record) => record.raw().offset(),
         }
@@ -631,6 +734,7 @@ impl StagedInodeRecord {
     pub(super) fn bytes(&self) -> &[u8] {
         match self {
             Self::Live(record) => record.raw.bytes(),
+            Self::Attribute(record) => record.raw.bytes(),
             Self::Deleted(record) => record.raw.bytes(),
             Self::Recovering(record) => record.raw().bytes(),
         }

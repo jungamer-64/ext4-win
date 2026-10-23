@@ -1284,6 +1284,10 @@ impl InodeFlags {
         }
     }
 
+    /// Whether this inode owns an external attribute value rather than namespace metadata.
+    pub(crate) const fn is_attribute_value(self) -> bool { self.0 & 0x0020_0000 != 0 }
+    /// Selects an external attribute value with ordinary extent storage.
+    pub(crate) const fn into_attribute_value(self) -> Self { Self((self.0 & !EXT4_INLINE_DATA_FL) | 0x0020_0000 | EXT4_EXTENTS_FL) }
     /// Whether i_block and the inode-body private attribute contain the payload.
     pub(crate) const fn has_inline_data(self) -> bool {
         self.0 & EXT4_INLINE_DATA_FL != 0
@@ -1505,7 +1509,7 @@ impl InodeInlineData {
         let set = crate::disk_format::xattr::parse_inline_xattrs(
             raw.get(offset..).ok_or(Error::InvalidInode)?,
         )?;
-        let tail = set.inline_data().ok_or(Error::InvalidInode)?.bytes();
+        let tail = set.inline_data().ok_or(Error::InvalidInode)?;
         let capacity = block
             .len()
             .checked_add(tail.len())
@@ -1646,6 +1650,42 @@ pub struct Inode {
     data: InodeData,
     /// Nonzero link count for this live inode.
     links_count: Ext4LinkCount,
+    /// Namespace ownership; attribute-value inodes have no such authority.
+    owner: Ext4Owner,
+    /// Namespace timestamps, distinct from overloaded attribute-inode fields.
+    times: Ext4Times,
+}
+
+/// Allocation and reference metadata for an external attribute value; never a namespace inode.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct AttributeInode {
+    /// Shared allocation geometry, without any namespace owner or timestamp interpretation.
+    data: InodeData,
+    /// Positive count of physical attribute entries referring to this value inode.
+    references: core::num::NonZeroU64,
+    /// CRC32C of the complete value using the mounted checksum seed.
+    value_checksum: u32,
+}
+impl AttributeInode {
+    /// Validates the value-inode header without interpreting its hash/refcount as timestamps.
+    /// # Errors
+    /// Rejects namespace inodes, unsupported storage/protection, zero references and wrong link count.
+    pub(crate) fn parse(id: InodeId, raw: &[u8], encoding: InodeDataEncoding) -> Result<Self> {
+        let data = InodeData::parse(id, raw, encoding)?;
+        if !data.flags.is_attribute_value() || data.kind() != InodeKind::File || !data.flags.has_extent_tree()
+            || data.flags.has_inline_data() || data.flags.protection().is_encrypted() || data.flags.protection().is_verity()
+            || le_u16(raw, disk_offset(26))? != 1 { return Err(Error::InvalidXattr); }
+        // The high half occupies i_ctime; the low half occupies Linux i_osd1/i_version.
+        let count = (u64::from(le_u32(raw, disk_offset(12))?) << 32) | u64::from(le_u32(raw, disk_offset(36))?);
+        let references = core::num::NonZeroU64::new(count).ok_or(Error::InvalidXattr)?;
+        Ok(Self { data, references, value_checksum: le_u32(raw, disk_offset(8))? })
+    }
+    /// Allocation geometry carries no namespace mutation authority.
+    pub(crate) const fn data(&self) -> &InodeData { &self.data }
+    /// Positive physical-entry reference count.
+    pub(crate) const fn references(&self) -> u64 { self.references.get() }
+    /// Expected checksum of the complete opaque value.
+    pub(crate) const fn value_checksum(&self) -> u32 { self.value_checksum }
 }
 
 /// Inode storage facts shared by live access and unlinked-inode recovery.
@@ -1759,6 +1799,9 @@ impl Inode {
     /// Returns an error for malformed storage facts or a zero link count.
     pub(crate) fn parse(id: InodeId, raw: &[u8], encoding: InodeDataEncoding) -> Result<Self> {
         let data = InodeData::parse(id, raw, encoding)?;
+        if data.flags.is_attribute_value() { return Err(Error::InvalidInode); }
+        let owner = Ext4Owner::new(Ext4Uid::from_u32(parse_uid(raw)?), Ext4Gid::from_u32(parse_gid(raw)?));
+        let times = parse_times(raw)?;
         let count = le_u16(raw, disk_offset(26))?;
         let links_count = if data.kind() == InodeKind::Directory && count == 1 {
             if encoding.directory_links != DirectoryLinkEncoding::Uncounted
@@ -1770,7 +1813,7 @@ impl Inode {
         } else {
             Ext4LinkCount::new(count)?
         };
-        Ok(Self { data, links_count })
+        Ok(Self { data, links_count, owner, times })
     }
 
     /// Inode identifier.
@@ -1805,13 +1848,13 @@ impl Inode {
     /// POSIX security state parsed from owner and mode fields.
     #[must_use]
     pub const fn security(&self) -> Ext4Security {
-        Ext4Security::new(self.data.owner, self.data.mode.permissions())
+        Ext4Security::new(self.owner, self.data.mode.permissions())
     }
 
     /// ext4 inode timestamps.
     #[must_use]
     pub const fn times(&self) -> Ext4Times {
-        self.data.times
+        self.times
     }
 
     /// Live link count.

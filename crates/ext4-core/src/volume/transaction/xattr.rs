@@ -173,6 +173,45 @@ impl MetadataMutation<'_, '_> {
         Ok(bytes)
     }
 
+    /// Acquires only attribute-value record ownership; namespace staging cannot alias it.
+    /// # Errors
+    /// Rejects another staged role or malformed/unallocated backing data.
+    fn attribute_record(&mut self, id: InodeId) -> Result<AttributeInodeRecord> {
+        match self.inode_updates.iter().find(|record| record.id() == id) {
+            Some(StagedInodeRecord::Attribute(record)) => record.try_clone(),
+            Some(_) => Err(Error::InvalidXattr),
+            None => self.volume.read_raw_inode_record(id)?.into_attribute(),
+        }
+    }
+    /// Reads a complete value through the transaction's inode, extent and payload overlays.
+    /// # Errors
+    /// Preserves metadata, physical allocation, checksum and suspended-I/O failures.
+    fn read_attribute_value(&mut self, reference: xattr_storage::AttributeValueReference) -> Result<XattrValue> {
+        let raw = self.attribute_record(reference.inode)?;
+        let header = raw.parse()?;
+        let data = header.data();
+        if data.size().to_usize()? != reference.size { return Err(Error::InvalidXattr); }
+        let InodeStorage::Extents(root) = data.storage() else { return Err(Error::InvalidXattr); };
+        let block_size = self.volume.superblock.block_size();
+        let context = crate::volume::orphan::extent_context(self.volume.superblock, data);
+        let mut source = TransactionExtentSource { device: &mut self.volume.device, staged: &self.extent_updates, block_size };
+        let tree = MutableExtentTree::load_inode_tree(root, block_size, &mut source, context)?;
+        let width = usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let mut bytes = memory::repeated_vec(0, reference.size)?;
+        let mut start = 0_usize;
+        let mut logical = 0_u64;
+        while start < bytes.len() {
+            let end = core::cmp::min(bytes.len(), start.checked_add(width).ok_or(Error::ArithmeticOverflow)?);
+            if let BlockMapping::Physical(block) = tree.map_logical(LogicalBlock::try_from(logical)?) {
+                let payload = self.file_block_bytes(block)?;
+                let count = end.checked_sub(start).ok_or(Error::ArithmeticOverflow)?;
+                memory::copy_exact(bytes.get_mut(start..end).ok_or(Error::DeviceRange)?, payload.get(..count).ok_or(Error::DeviceRange)?)?;
+            }
+            start = end;
+            logical = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+        }
+        reference.admit_value(&header, &bytes, self.volume.superblock.checksum_seed().as_u32())
+    }
     /// Reads all xattrs referenced by a staged live inode.
     /// # Errors
     ///
@@ -186,13 +225,13 @@ impl MetadataMutation<'_, '_> {
             XattrMutationSupport::Disabled => return Ok(InodeXattrSet::empty()),
             XattrMutationSupport::Enabled => {}
         }
-        let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
+        let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?.resolve(|reference| self.read_attribute_value(reference))?;
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
         };
         let bytes = self.xattr_block_bytes(block)?;
         let external =
-            xattr_storage::parse_external_xattr_block(&bytes, block, &self.volume.superblock)?;
+            xattr_storage::parse_external_xattr_block(&bytes, block, &self.volume.superblock)?.resolve(|reference| self.read_attribute_value(reference))?;
         xattr_storage::merge_xattr_sets(inline, external)
     }
 

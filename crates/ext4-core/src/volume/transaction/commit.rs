@@ -294,7 +294,7 @@ impl MetadataMutation<'_, '_> {
                     node_metadata_updates
                         .try_push(NodeMetadataUpdate::Retired { inode: inode_id })?;
                 }
-                StagedInodeRecord::Recovering(_) => {}
+                StagedInodeRecord::Recovering(_) | StagedInodeRecord::Attribute(_) => {}
             }
             let resource = MutationResource::inode(inode_id);
             observed.include(resource, coordinator.resource_version(resource))?;

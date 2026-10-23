@@ -66,7 +66,7 @@ pub(super) use super::directory::{
 pub(super) use super::directory_read::DirectoryReader;
 pub(super) use super::event::CommitClaim;
 pub(super) use super::inode_record::{
-    AllocatedInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord,
+    AllocatedInodeRecord, AttributeInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord,
     RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
 pub(super) use super::mount::{

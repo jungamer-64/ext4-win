@@ -1398,6 +1398,20 @@ impl EpochReadView<'_, '_> {
         self.read_raw_inode_record(inode_id)?.into_live()
     }
 
+    /// Reads an opaque attribute through its separate inode/storage validation boundary.
+    /// # Errors
+    /// Propagates malformed value metadata, extent I/O, allocation and checksum failures.
+    pub(super) fn read_attribute_value(&mut self, reference: xattr_storage::AttributeValueReference) -> Result<XattrValue> {
+        let raw = self.read_raw_inode_record(reference.inode)?.into_attribute()?;
+        let header = raw.parse()?;
+        let data = header.data();
+        if data.size().to_usize()? != reference.size { return Err(Error::InvalidXattr); }
+        let InodeStorage::Extents(root) = data.storage() else { return Err(Error::InvalidXattr); };
+        let mut mapping = ExtentMappingCursor::new(root, self.superblock.block_size(), crate::volume::orphan::extent_context(self.superblock, data))?;
+        let mut bytes = memory::repeated_vec(0, reference.size)?;
+        self.read_inode_stream_range(&mut mapping, 0, &mut bytes)?;
+        reference.admit_value(&header, &bytes, self.superblock.checksum_seed().as_u32())
+    }
     /// Reads all xattr storage locations referenced by a live inode.
     /// # Errors
     ///
@@ -1411,7 +1425,7 @@ impl EpochReadView<'_, '_> {
             XattrMutationSupport::Disabled => return Ok(InodeXattrSet::empty()),
             XattrMutationSupport::Enabled => {}
         }
-        let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?;
+        let inline = xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?.resolve(|reference| self.read_attribute_value(reference))?;
         let Some(block) = raw_inode.xattr_block()? else {
             return Ok(inline);
         };
@@ -1422,7 +1436,7 @@ impl EpochReadView<'_, '_> {
         )?;
         self.device
             .read_metadata_exact_at(self.superblock.block_size().offset_of(block)?, &mut bytes)?;
-        let external = xattr_storage::parse_external_xattr_block(&bytes, block, &self.superblock)?;
+        let external = xattr_storage::parse_external_xattr_block(&bytes, block, &self.superblock)?.resolve(|reference| self.read_attribute_value(reference))?;
         xattr_storage::merge_xattr_sets(inline, external)
     }
 

@@ -1,6 +1,7 @@
 //! Journaled write transaction domain for mounted ext4 volumes.
 
 use super::scope::*;
+use crate::volume::inode_record::ExtentInodeRecord;
 
 mod allocation;
 mod commit;
@@ -1261,7 +1262,7 @@ impl MetadataMutation<'_, '_> {
     /// or the updated inode block charge cannot be represented.
     fn stage_extent_tree(
         &mut self,
-        raw_inode: &mut LiveInodeRecord,
+        raw_inode: &mut impl ExtentInodeRecord,
         mut tree: MutableExtentTree,
     ) -> Result<()> {
         let block_size = self.volume.superblock.block_size();
@@ -1276,8 +1277,8 @@ impl MetadataMutation<'_, '_> {
         }
         tree.set_metadata_blocks(metadata_blocks);
 
-        let inode = raw_inode.parse()?;
-        let serialized = tree.serialize(block_size, self.volume.extent_tree_context(&inode))?;
+        let data = raw_inode.data()?;
+        let serialized = tree.serialize(block_size, crate::volume::orphan::extent_context(self.volume.superblock, &data))?;
         self.stage_serialized_extent_tree(raw_inode, &serialized)?;
         self.set_inode_allocation_size(raw_inode, Some(&tree))
     }
@@ -1289,7 +1290,7 @@ impl MetadataMutation<'_, '_> {
     /// resulting charge cannot be represented by the mounted inode encoding.
     fn set_inode_allocation_size(
         &self,
-        raw_inode: &mut LiveInodeRecord,
+        raw_inode: &mut impl ExtentInodeRecord,
         tree: Option<&MutableExtentTree>,
     ) -> Result<()> {
         let allocation_size = self.inode_allocation_size(raw_inode, tree)?;
@@ -1308,7 +1309,7 @@ impl MetadataMutation<'_, '_> {
     /// mapped to mounted cluster geometry.
     fn inode_allocation_size(
         &self,
-        raw_inode: &LiveInodeRecord,
+        raw_inode: &impl ExtentInodeRecord,
         tree: Option<&MutableExtentTree>,
     ) -> Result<FileAllocationSize> {
         let superblock = self.volume.superblock;
@@ -1355,7 +1356,7 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when the serialized inode-root extent payload cannot be written.
     fn stage_serialized_extent_tree(
         &mut self,
-        raw_inode: &mut LiveInodeRecord,
+        raw_inode: &mut impl ExtentInodeRecord,
         serialized: &SerializedExtentTree,
     ) -> Result<()> {
         raw_inode.set_extent_root_bytes(serialized.inode_root())?;
