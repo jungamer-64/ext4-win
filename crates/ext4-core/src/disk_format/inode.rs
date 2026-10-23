@@ -1459,7 +1459,7 @@ pub enum InodeStorage {
     /// Extent root stored in `i_block`.
     Extents(InodeExtentRoot),
     /// Inline bytes stored directly in `i_block`.
-    InlineBytes(InodeInlineBytes),
+    FastSymlink(InodeFastSymlink),
     /// A legacy block map unsupported by this implementation.
     UnsupportedBlockMap,
 }
@@ -1487,12 +1487,12 @@ impl InodeExtentRoot {
 
 /// Inline bytes isolated behind an inode-storage type.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InodeInlineBytes {
+pub struct InodeFastSymlink {
     /// Exact `i_block` bytes when a symlink payload is stored inline.
     bytes: [u8; 60],
 }
 
-impl InodeInlineBytes {
+impl InodeFastSymlink {
     /// Creates inline bytes from the 60-byte inode storage field.
     #[must_use]
     pub(crate) const fn from_bytes(bytes: [u8; 60]) -> Self {
@@ -1576,7 +1576,7 @@ impl InodeData {
         let storage = if flags.has_extent_tree() {
             InodeStorage::Extents(InodeExtentRoot::from_bytes(block))
         } else if mode.kind() == InodeKind::Symlink && size.to_usize()? < block.len() {
-            InodeStorage::InlineBytes(InodeInlineBytes::from_bytes(block))
+            InodeStorage::FastSymlink(InodeFastSymlink::from_bytes(block))
         } else {
             InodeStorage::UnsupportedBlockMap
         };
@@ -1779,7 +1779,7 @@ impl Inode {
     pub fn extent_root(&self) -> Result<&InodeExtentRoot> {
         match &self.data.storage {
             InodeStorage::Extents(root) => Ok(root),
-            InodeStorage::InlineBytes(_) | InodeStorage::UnsupportedBlockMap => {
+            InodeStorage::FastSymlink(_) | InodeStorage::UnsupportedBlockMap => {
                 Err(Error::UnsupportedBlockMap)
             }
         }
@@ -1789,9 +1789,9 @@ impl Inode {
     ///
     /// # Errors
     /// Returns an error when this inode uses extents or an unsupported block map.
-    pub fn inline_bytes(&self) -> Result<&InodeInlineBytes> {
+    pub fn fast_symlink(&self) -> Result<&InodeFastSymlink> {
         match &self.data.storage {
-            InodeStorage::InlineBytes(bytes) => Ok(bytes),
+            InodeStorage::FastSymlink(bytes) => Ok(bytes),
             InodeStorage::Extents(_) | InodeStorage::UnsupportedBlockMap => {
                 Err(Error::UnsupportedBlockMap)
             }
