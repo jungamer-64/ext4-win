@@ -629,6 +629,7 @@ impl EpochReadView<'_, '_> {
                     self.superblock.directory_hash_signedness(),
                     self.superblock.directory_indexing().require_supported()?,
                     checksum,
+                    DirectoryEntryEncoding::for_inode(inode),
                 )?;
                 if let Some(entry) = root
                     .dot_entries()
@@ -637,7 +638,7 @@ impl EpochReadView<'_, '_> {
                 {
                     return Ok(Some(entry.try_clone()?));
                 }
-                let major = query.major(root.hash_scheme(), names)?;
+                let major = query.major(root.hash_profile(), names)?;
                 let mut path = self.htree_path_for_hash(
                     inode,
                     &mut tree,
@@ -654,7 +655,7 @@ impl EpochReadView<'_, '_> {
                     )?;
                     let entries = leaf.entries()?;
                     path.hash_range()?
-                        .validate_leaf(&entries, root.hash_scheme(), names)?;
+                        .validate_leaf(&entries, root.hash_profile(), names)?;
                     if let Some(entry) = query.find(entries, crypto, names)? {
                         return Ok(Some(entry));
                     }
@@ -1014,8 +1015,10 @@ impl EpochReadView<'_, '_> {
                 self.superblock.directory_hash_signedness(),
                 self.superblock.directory_indexing().require_supported()?,
                 self.directory_checksum(inode),
+                DirectoryEntryEncoding::for_inode(inode),
             )?
-            .hash_scheme()
+            .hash_profile()
+            .computed()?
             .hash(name.bytes())
             .major
         } else {

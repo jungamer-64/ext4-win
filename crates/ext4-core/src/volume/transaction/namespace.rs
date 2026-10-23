@@ -1336,10 +1336,11 @@ impl MutationResolvePass<'_, '_, '_> {
                 .directory_indexing()
                 .require_supported()?,
             checksum,
+            DirectoryEntryEncoding::for_inode(inode),
         )?;
         let major = match target {
             HtreePathTarget::Query(query) => query.major(
-                root.hash_scheme(),
+                root.hash_profile(),
                 self.mutation.volume.superblock.name_semantics(inode)?,
             )?,
             HtreePathTarget::First => 0,
@@ -1489,7 +1490,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 let mut context =
                     self.mutation_htree_context(inode, &tree, HtreePathTarget::Query(query))?;
                 let major = query.major(
-                    context.root.hash_scheme(),
+                    context.root.hash_profile(),
                     self.mutation.volume.superblock.name_semantics(inode)?,
                 )?;
                 loop {
@@ -1501,7 +1502,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     let entries = block.entries()?;
                     context.path.hash_range()?.validate_leaf(
                         &entries,
-                        context.root.hash_scheme(),
+                        context.root.hash_profile(),
                         self.mutation.volume.superblock.name_semantics(inode)?,
                     )?;
                     if let Some(entry) = query.find(
@@ -1549,7 +1550,7 @@ impl MutationResolvePass<'_, '_, '_> {
         let mut context = self.mutation_htree_context(
             parent_inode,
             &tree,
-            HtreePathTarget::Query(DirectoryLookup::Exact(entry.name())),
+            HtreePathTarget::Query(DirectoryLookup::Stored(&entry)),
         )?;
         let leaf_logical = context.path.leaf()?;
         let (leaf_physical, mut leaf) = self.read_mutation_directory_block(
@@ -1559,7 +1560,7 @@ impl MutationResolvePass<'_, '_, '_> {
         )?;
         context.path.hash_range()?.validate_leaf(
             &leaf.entries()?,
-            context.root.hash_scheme(),
+            context.root.hash_profile(),
             self.mutation
                 .volume
                 .superblock
@@ -1586,7 +1587,7 @@ impl MutationResolvePass<'_, '_, '_> {
         {
             return Err(Error::DirectoryIndexFull);
         }
-        let hash = context.root.hash_scheme();
+        let hash = context.root.hash_profile();
         let mut entries = leaf.entries()?;
         entries.try_push(entry)?;
         let names = self
@@ -1599,22 +1600,16 @@ impl MutationResolvePass<'_, '_, '_> {
         let (left_entries, right_entries) = entries
             .split_at_checked(split_at)
             .ok_or(Error::InvalidDirectoryEntry)?;
-        let left_last_hash = names
-            .hash(
-                left_entries
-                    .last()
-                    .ok_or(Error::InvalidDirectoryEntry)?
-                    .name(),
-                hash,
+        let left_last_hash = hash
+            .entry_hash(
+                left_entries.last().ok_or(Error::InvalidDirectoryEntry)?,
+                names,
             )?
             .major;
-        let right_first_hash = names
-            .hash(
-                right_entries
-                    .first()
-                    .ok_or(Error::InvalidDirectoryEntry)?
-                    .name(),
-                hash,
+        let right_first_hash = hash
+            .entry_hash(
+                right_entries.first().ok_or(Error::InvalidDirectoryEntry)?,
+                names,
             )?
             .major;
         let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
@@ -1833,14 +1828,20 @@ impl MutationResolvePass<'_, '_, '_> {
         if dot_inode != parent_inode.id() {
             return Err(Error::InvalidDirectoryEntry);
         }
-        let hash = DirectoryHashScheme::from_metadata(
-            self.mutation.volume.superblock.directory_hash_seed(),
-            self.mutation
-                .volume
-                .superblock
-                .default_directory_hash_version(),
-            self.mutation.volume.superblock.directory_hash_signedness(),
-        );
+        let hash = if DirectoryEntryEncoding::for_inode(parent_inode)
+            == DirectoryEntryEncoding::EncryptedCasefold
+        {
+            DirectoryIndexHash::StoredKeyed
+        } else {
+            DirectoryIndexHash::Computed(DirectoryHashScheme::from_metadata(
+                self.mutation.volume.superblock.directory_hash_seed(),
+                self.mutation
+                    .volume
+                    .superblock
+                    .default_directory_hash_version(),
+                self.mutation.volume.superblock.directory_hash_signedness(),
+            ))
+        };
         let mut children = Vec::new();
         for child in entries {
             if !matches!(child.name().bytes(), b"." | b"..") {
@@ -1875,22 +1876,16 @@ impl MutationResolvePass<'_, '_, '_> {
                 let (left_entries, right_entries) = children
                     .split_at_checked(split_at)
                     .ok_or(Error::InvalidDirectoryEntry)?;
-                let left_last_hash = names
-                    .hash(
-                        left_entries
-                            .last()
-                            .ok_or(Error::InvalidDirectoryEntry)?
-                            .name(),
-                        hash,
+                let left_last_hash = hash
+                    .entry_hash(
+                        left_entries.last().ok_or(Error::InvalidDirectoryEntry)?,
+                        names,
                     )?
                     .major;
-                let right_first_hash = names
-                    .hash(
-                        right_entries
-                            .first()
-                            .ok_or(Error::InvalidDirectoryEntry)?
-                            .name(),
-                        hash,
+                let right_first_hash = hash
+                    .entry_hash(
+                        right_entries.first().ok_or(Error::InvalidDirectoryEntry)?,
+                        names,
                     )?
                     .major;
                 let boundary = right_first_hash | u32::from(left_last_hash == right_first_hash);
@@ -1922,10 +1917,7 @@ impl MutationResolvePass<'_, '_, '_> {
             block_bytes,
             parent_inode.id(),
             parent_inode_id,
-            self.mutation
-                .volume
-                .superblock
-                .default_directory_hash_version(),
+            hash,
             &root_index,
             checksum,
         )?;
@@ -2031,7 +2023,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     let entries = block.entries()?;
                     context.path.hash_range()?.validate_leaf(
                         &entries,
-                        context.root.hash_scheme(),
+                        context.root.hash_profile(),
                         self.mutation.volume.superblock.name_semantics(inode)?,
                     )?;
                     if !entries.is_empty() {
@@ -2058,13 +2050,16 @@ impl MutationResolvePass<'_, '_, '_> {
 /// Returns invalid encoding, normalization allocation or fallible sorting failures.
 fn ordered_directory_entries(
     mut entries: Vec<RawDirectoryEntry>,
-    hash: DirectoryHashScheme,
+    hash: DirectoryIndexHash,
     names: crate::disk_format::name::NameSemantics,
 ) -> Result<Vec<RawDirectoryEntry>> {
-    if names == crate::disk_format::name::NameSemantics::Bytewise {
+    if let DirectoryIndexHash::Computed(scheme) = hash
+        && names == crate::disk_format::name::NameSemantics::Bytewise
+    {
         memory::heap_sort_by(&mut entries, |left, right| {
-            hash.hash(left.name().bytes())
-                .cmp(&hash.hash(right.name().bytes()))
+            scheme
+                .hash(left.name().bytes())
+                .cmp(&scheme.hash(right.name().bytes()))
                 .then(left.name().bytes().cmp(right.name().bytes()))
         })?;
         return Ok(entries);
@@ -2078,7 +2073,7 @@ fn ordered_directory_entries(
         reason = "the unbounded range is exactly the complete owned vector; its capacity is retained for reordered entries"
     )]
     for entry in entries.drain(..) {
-        keyed.try_push((names.hash(entry.name(), hash)?, entry))?;
+        keyed.try_push((hash.entry_hash(&entry, names)?, entry))?;
     }
     memory::heap_sort_by(&mut keyed, |left, right| {
         left.0

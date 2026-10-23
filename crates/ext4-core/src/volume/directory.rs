@@ -248,6 +248,8 @@ mod tests {
 pub(super) enum DirectoryLookup<'name> {
     /// Exact on-disk component.
     Exact(&'name Ext4Name),
+    /// Exact stored identity retains any keyed route paired with its ciphertext.
+    Stored(&'name crate::disk_format::dir::DirectoryEntry),
     /// Keyless ciphertext identity, including long-name digest queries.
     NoKey(&'name crate::protection::fscrypt::FscryptNoKeyName),
 }
@@ -256,6 +258,7 @@ impl DirectoryLookup<'_> {
     pub(super) fn exact(&self) -> Option<&Ext4Name> {
         match self {
             Self::Exact(name) => Some(name),
+            Self::Stored(entry) => Some(entry.name()),
             Self::NoKey(name) => name.direct(),
         }
     }
@@ -264,13 +267,14 @@ impl DirectoryLookup<'_> {
     /// Returns invalid encoding or allocation failure before index selection.
     pub(super) fn major(
         &self,
-        scheme: crate::disk_format::directory_hash::DirectoryHashScheme,
+        scheme: crate::disk_format::dir::DirectoryIndexHash,
         names: crate::disk_format::name::NameSemantics,
     ) -> Result<u32> {
         match *self {
+            Self::Stored(entry) => Ok(scheme.entry_hash(entry, names)?.major),
             Self::Exact(name)
             | Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Ciphertext(name)) => {
-                Ok(names.hash(name, scheme)?.major)
+                Ok(names.hash(name, scheme.computed()?)?.major)
             }
             Self::NoKey(crate::protection::fscrypt::FscryptNoKeyName::Digest { major, .. }) => {
                 Ok(*major)
@@ -287,6 +291,11 @@ impl DirectoryLookup<'_> {
         names: crate::disk_format::name::NameSemantics,
     ) -> Result<Option<crate::disk_format::dir::DirectoryEntry>> {
         match self {
+            Self::Stored(stored) => {
+                return Ok(entries
+                    .into_iter()
+                    .find(|entry| entry.name() == stored.name()));
+            }
             Self::Exact(name) => {
                 let key = names.key(name.bytes())?;
                 for entry in entries {

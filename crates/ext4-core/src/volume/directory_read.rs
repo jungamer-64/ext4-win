@@ -96,7 +96,7 @@ enum HashPhase {
 #[derive(Debug)]
 struct HashWalk {
     /// Root-selected name hashing contract.
-    hash: DirectoryHashScheme,
+    hash: DirectoryIndexHash,
     /// Number of interior levels below the root.
     depth: u8,
     /// Current root-to-leaf path, possibly awaiting descendants.
@@ -396,6 +396,7 @@ impl DirectoryReader {
                         view.superblock.directory_hash_signedness(),
                         view.superblock.directory_indexing().require_supported()?,
                         view.directory_checksum(inode),
+                        DirectoryEntryEncoding::for_inode(inode),
                     )?;
                     let dot_start = match self.cursor.position {
                         DirectoryScanPosition::Start | DirectoryScanPosition::Ordinal(_) => 0,
@@ -427,7 +428,7 @@ impl DirectoryReader {
                         selected,
                     })?;
                     *layout = DirectoryLayout::Hash(memory::try_box(HashWalk {
-                        hash: root.hash_scheme(),
+                        hash: root.hash_profile(),
                         depth: root.indirect_levels(),
                         path: HtreePath { levels },
                         descend_major: major,
@@ -612,10 +613,9 @@ impl HashWalk {
                 if matches!(raw.name().bytes(), b"." | b"..") {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                let hash = view
-                    .superblock
-                    .name_semantics(directory.inode())?
-                    .hash(raw.name(), self.hash)?;
+                let hash = self
+                    .hash
+                    .entry_hash(&raw, view.superblock.name_semantics(directory.inode())?)?;
                 range.validate_hash(hash.major)?;
                 let candidate = Candidate { raw, hash };
                 if candidate.follows(self.after) {
@@ -1022,11 +1022,11 @@ mod tests {
             DxEntry::new(4, 4)?
         ];
         let mut walk = HashWalk {
-            hash: DirectoryHashScheme::from_metadata(
+            hash: DirectoryIndexHash::Computed(DirectoryHashScheme::from_metadata(
                 DirectoryHashSeed::from_words([0; 4]),
                 DirectoryHashVersion::Legacy,
                 DirectoryHashSignedness::Signed,
-            ),
+            )),
             depth: 0,
             path: HtreePath {
                 levels: alloc::vec![HtreePathLevel {

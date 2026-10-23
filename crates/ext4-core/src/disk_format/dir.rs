@@ -1107,14 +1107,14 @@ impl HtreeHashRange {
     pub(crate) fn validate_leaf(
         self,
         entries: &[DirectoryEntry],
-        hash: DirectoryHashScheme,
+        hash: DirectoryIndexHash,
         names: super::name::NameSemantics,
     ) -> Result<()> {
         for entry in entries {
             if matches!(entry.name().bytes(), b"." | b"..") {
                 return Err(Error::InvalidDirectoryEntry);
             }
-            let major = names.hash(entry.name(), hash)?.major;
+            let major = hash.entry_hash(entry, names)?.major;
             self.validate_hash(major)?;
         }
         Ok(())
@@ -1977,6 +1977,92 @@ mod tests {
     use super::*;
 
     /// # Errors
+    /// Returns fixture construction, allocation or index/leaf validation failure.
+    /// # Panics
+    /// Fails if a keyed root hashes ciphertext or accepts an incompatible owning directory.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "format identifiers and stored hashes are independent of encryption-key availability"
+    )]
+    fn keyed_index_profile_uses_stored_plaintext_hashes() -> Result<()> {
+        let checksum = DirectoryChecksum::None;
+        let seed = DirectoryHashSeed::from_words([0; 4]);
+        let index = DxIndex::root(1024, checksum, vec![DxEntry::new(0, 1)?])?;
+        let bytes = create_htree_root(
+            1024,
+            inode(2)?,
+            inode(2)?,
+            DirectoryIndexHash::StoredKeyed,
+            &index,
+            checksum,
+        )?;
+        assert_eq!(bytes.get(28), Some(&6));
+        let root = HtreeRoot::parse(
+            &bytes,
+            inode(2)?,
+            seed,
+            DirectoryHashSignedness::Unsigned,
+            1,
+            checksum,
+            DirectoryEntryEncoding::EncryptedCasefold,
+        )?;
+        assert_eq!(root.hash_profile(), DirectoryIndexHash::StoredKeyed);
+        assert_eq!(
+            root.hash_profile().computed(),
+            Err(Error::UnsupportedDirectoryHash)
+        );
+        assert!(matches!(
+            HtreeRoot::parse(
+                &bytes,
+                inode(2)?,
+                seed,
+                DirectoryHashSignedness::Unsigned,
+                1,
+                checksum,
+                DirectoryEntryEncoding::Standard
+            ),
+            Err(Error::UnsupportedDirectoryHash)
+        ));
+        let hash = DirectoryHash {
+            major: 0x4000_0000,
+            minor: 0x1234_5678,
+        };
+        let entry = DirectoryEntry::encrypted_casefold(
+            inode(12)?,
+            &Ext4Name::from_disk(&[0xff; 17])?,
+            DirectoryEntryKind::File,
+            hash,
+        )?;
+        let names = super::super::name::NameSemantics::from_encoding(1, 1)?;
+        assert_eq!(root.hash_profile().entry_hash(&entry, names)?, hash);
+        HtreeHashRange::root().validate_leaf(&[entry.try_clone()?], root.hash_profile(), names)?;
+        let computed = DirectoryIndexHash::Computed(DirectoryHashScheme::from_metadata(
+            seed,
+            DirectoryHashVersion::HalfMd4,
+            DirectoryHashSignedness::Signed,
+        ));
+        assert_eq!(
+            computed.entry_hash(&entry, names),
+            Err(Error::InvalidDirectoryEntry)
+        );
+        let bytes = create_htree_root(1024, inode(2)?, inode(2)?, computed, &index, checksum)?;
+        assert!(matches!(
+            HtreeRoot::parse(
+                &bytes,
+                inode(2)?,
+                seed,
+                DirectoryHashSignedness::Signed,
+                1,
+                checksum,
+                DirectoryEntryEncoding::EncryptedCasefold
+            ),
+            Err(Error::UnsupportedDirectoryHash)
+        ));
+        Ok(())
+    }
+
+    /// # Errors
     /// Returns fixture allocation or record operation failure.
     /// # Panics
     /// Fails if aligned trailer words or complete stored name/hash relations are changed.
@@ -2210,7 +2296,11 @@ mod tests {
             1_024,
             inode(11)?,
             inode(2)?,
-            DirectoryHashVersion::HalfMd4,
+            DirectoryIndexHash::Computed(DirectoryHashScheme::from_metadata(
+                DirectoryHashSeed::from_words([0; 4]),
+                DirectoryHashVersion::HalfMd4,
+                DirectoryHashSignedness::Signed,
+            )),
             &index,
             checksum,
         )
@@ -2245,6 +2335,7 @@ mod tests {
                 DirectoryHashSignedness::Signed,
                 0,
                 DirectoryChecksum::None,
+                DirectoryEntryEncoding::Standard
             )
             .is_ok()
         );
@@ -2269,6 +2360,7 @@ mod tests {
                 DirectoryHashSignedness::Signed,
                 0,
                 DirectoryChecksum::None,
+                DirectoryEntryEncoding::Standard
             ),
             Err(Error::InvalidDirectoryEntry)
         );
@@ -2293,6 +2385,7 @@ mod tests {
                 DirectoryHashSignedness::Signed,
                 1,
                 DirectoryChecksum::None,
+                DirectoryEntryEncoding::Standard
             ),
             Err(Error::InvalidDirectoryEntry)
         );
@@ -2326,6 +2419,7 @@ mod tests {
                 DirectoryHashSignedness::Signed,
                 0,
                 DirectoryChecksum::None,
+                DirectoryEntryEncoding::Standard
             ),
             Err(Error::InvalidDirectoryEntry)
         );
@@ -2347,6 +2441,7 @@ mod tests {
                 DirectoryHashSignedness::Signed,
                 0,
                 DirectoryChecksum::None,
+                DirectoryEntryEncoding::Standard
             ),
             Err(Error::InvalidDirectoryEntry)
         );
@@ -2376,7 +2471,8 @@ mod tests {
                 seed,
                 DirectoryHashSignedness::Signed,
                 0,
-                checksum
+                checksum,
+                DirectoryEntryEncoding::Standard
             )
             .is_ok()
         );
@@ -2398,7 +2494,8 @@ mod tests {
                 seed,
                 DirectoryHashSignedness::Signed,
                 0,
-                checksum
+                checksum,
+                DirectoryEntryEncoding::Standard
             ),
             Err(Error::ChecksumMismatch)
         );
@@ -2463,7 +2560,8 @@ mod tests {
                 seed,
                 DirectoryHashSignedness::Signed,
                 0,
-                checksum
+                checksum,
+                DirectoryEntryEncoding::Standard
             )
             .is_ok()
         );
@@ -2479,7 +2577,8 @@ mod tests {
                 seed,
                 DirectoryHashSignedness::Signed,
                 0,
-                checksum
+                checksum,
+                DirectoryEntryEncoding::Standard
             ),
             Err(Error::ChecksumMismatch)
         );
@@ -2634,7 +2733,7 @@ mod tests {
             range
                 .validate_leaf(
                     &[lower_clone],
-                    hash,
+                    DirectoryIndexHash::Computed(hash),
                     super::super::name::NameSemantics::Bytewise
                 )
                 .is_ok()
@@ -2645,7 +2744,7 @@ mod tests {
         assert_eq!(
             range.validate_leaf(
                 &[upper_clone],
-                hash,
+                DirectoryIndexHash::Computed(hash),
                 super::super::name::NameSemantics::Bytewise
             ),
             Err(Error::InvalidDirectoryEntry)
@@ -2668,7 +2767,7 @@ mod tests {
                 .descend(&continued, 0)
                 .and_then(|range| range.validate_leaf(
                     &[upper_entry],
-                    hash,
+                    DirectoryIndexHash::Computed(hash),
                     super::super::name::NameSemantics::Bytewise
                 ))
                 .is_ok()
