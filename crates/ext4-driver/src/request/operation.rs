@@ -290,7 +290,7 @@ impl MountRequestOperation {
         admission: MountAdmission,
         devices: MountedStorage,
         transition: MountProbeTransition,
-        catalog: &mut crate::identity::IdentityDirectory,
+        catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> OperationTransition {
         match transition {
             MountProbeTransition::SubmitLower { request, suspended } => {
@@ -309,8 +309,12 @@ impl MountRequestOperation {
             }
             MountProbeTransition::Complete(Err(error)) => Self::complete(owned, Err(error.into())),
             MountProbeTransition::Complete(Ok(prepared)) => {
+                let policy = match catalog.policies.select(prepared.uuid()) {
+                    Ok(policy) => policy,
+                    Err(error) => return Self::complete(owned, Err(error)),
+                };
                 let mount = match memory::boxed_try_with(|| {
-                    Ok(prepared.start(FscryptKeySet::empty(), ext4_core::MountAccess::ReadWrite))
+                    Ok(prepared.start(FscryptKeySet::empty(), policy.policy.mount_access()))
                 }) {
                     Ok(mount) => mount,
                     Err(error) => return Self::complete(owned, Err(error)),
@@ -328,7 +332,7 @@ impl MountRequestOperation {
         admission: MountAdmission,
         devices: MountedStorage,
         transition: MountTransition,
-        catalog: &mut crate::identity::IdentityDirectory,
+        catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> OperationTransition {
         match transition {
             MountTransition::SubmitLower { request, suspended } => {
@@ -475,7 +479,7 @@ impl MountRequestOperation {
         mut self: Box<Self>,
         context: ExclusiveExternalProbeContext,
         transition: ExternalJournalProbeTransition,
-        catalog: &mut crate::identity::IdentityDirectory,
+        catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> OperationTransition {
         match transition {
             ExternalJournalProbeTransition::SubmitLower { request, suspended } => {
@@ -531,14 +535,17 @@ impl MountRequestOperation {
         devices: MountedStorage,
         completed: Box<ext4_core::CompletedMount>,
         trace: OperationalTrace,
-        catalog: &mut crate::identity::IdentityDirectory,
+        catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> DriverResult<IrpCompletion> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
         let Some(driver_object) = admission.file_system_device().driver_object() else {
             return Err(DriverError::InvalidParameter);
         };
         let binding = crate::state::MountedVolumeBinding::from_completed_mount(
-            *completed, devices, trace, catalog,
+            *completed,
+            devices,
+            trace,
+            catalog.identities,
         )?;
 
         let extension_size =
@@ -591,7 +598,7 @@ impl ControlDeviceOperation for MountRequestOperation {
     fn advance_control(
         mut self: Box<Self>,
         event: OperationEvent,
-        catalog: &mut crate::identity::IdentityDirectory,
+        catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, MountRequestState::Terminal);
         match state {
@@ -799,7 +806,10 @@ impl CompletionOperation for MountRequestOperation {
                 suspended: self,
             }
         } else {
-            self.advance_control(event.into_core(), target.control_catalog().directory_mut())
+            self.advance_control(
+                event.into_core(),
+                &mut target.control_catalog().mount_directory(),
+            )
         }
     }
 

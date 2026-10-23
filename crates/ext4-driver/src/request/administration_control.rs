@@ -1,13 +1,14 @@
 //! Administrator commands use the existing passive worker and retained completion protocol.
-use crate::identity::{IdentityCatalog, PreparedIdentityAction};
+use crate::administration::{ControlCatalog, PreparedAdministration};
+use crate::identity::PreparedIdentityAction;
 use crate::irp::reactor::{
     CompletionEvent, CompletionOperation, OperationTransition, ReactorTarget,
 };
 use crate::irp::{IrpCompletion, OwnedIrp, PassiveWork, PassiveWorkCompletion};
 use crate::kernel::status::{DriverError, DriverResult};
+use crate::policy::PreparedPolicyAction;
 use crate::request::operation::AdmitOperationError;
 use alloc::boxed::Box;
-use alloc::vec::Vec;
 
 /// One ownership phase for an administrative IRP.
 #[derive(Debug)]
@@ -17,7 +18,7 @@ enum ControlState {
         /// Retained unique IRP completion authority.
         owned: OwnedIrp,
         /// Fully captured reply or persistence work.
-        action: PreparedIdentityAction,
+        action: PreparedAdministration,
     },
     /// The passive envelope retains this operation until work finishes or is withdrawn before queueing.
     /// Cancellation resumes only after that ownership returns; any saved effect remains queryable.
@@ -27,7 +28,7 @@ enum ControlState {
 }
 /// Device-scoped operation; it carries no mounted-volume or inode mutation authority.
 #[derive(Debug)]
-struct IdentityControlOperation {
+struct AdministrationControlOperation {
     /// Operation-owned transition phase.
     state: ControlState,
 }
@@ -37,7 +38,7 @@ struct IdentityControlOperation {
 /// Returns the still-owned IRP on validation, resource, concurrent-update or output-admission failure.
 pub(crate) fn admit(
     mut owned: OwnedIrp,
-    catalog: &mut IdentityCatalog,
+    catalog: &mut ControlCatalog,
 ) -> Result<Box<dyn CompletionOperation>, AdmitOperationError> {
     let prepared = (|| {
         let mut request = owned.request();
@@ -47,14 +48,14 @@ pub(crate) fn admit(
                 .device_control()
                 .map(|stack| stack.output_buffer_length().as_usize())
         })?;
-        catalog.prepare(request.take_identity()?, capacity)
+        catalog.prepare(request.take_administration()?, capacity)
     })();
     let action = match prepared {
         Ok(action) => action,
         Err(error) => return Err(AdmitOperationError::new(error, owned)),
     };
     match crate::memory::boxed_try_map((owned, action), |(owned, action)| {
-        IdentityControlOperation {
+        AdministrationControlOperation {
             state: ControlState::Ready { owned, action },
         }
     }) {
@@ -68,7 +69,7 @@ pub(crate) fn admit(
 /// Publishes only the prepared reply prefix into the I/O-manager-owned system buffer.
 /// # Errors
 /// Propagates a violated native output contract; the saved effect remains observable by query.
-fn reply(mut owned: OwnedIrp, bytes: Vec<u8>) -> OperationTransition {
+fn reply(mut owned: OwnedIrp, bytes: &[u8]) -> OperationTransition {
     let result: DriverResult<IrpCompletion> = owned.request().with_active(|active| {
         let extent = active
             .current_stack()?
@@ -76,14 +77,14 @@ fn reply(mut owned: OwnedIrp, bytes: Vec<u8>) -> OperationTransition {
             .output_buffer_length()
             .prefix(bytes.len())?;
         let output = active.buffered_output(extent)?;
-        crate::memory::copy_exact(output, &bytes)?;
+        crate::memory::copy_exact(output, bytes)?;
         Ok(IrpCompletion::with_information(
             crate::irp::InformationLength::from_usize(bytes.len())?,
         ))
     });
     OperationTransition::Complete(owned.prepare_result(result))
 }
-impl CompletionOperation for IdentityControlOperation {
+impl CompletionOperation for AdministrationControlOperation {
     fn advance(
         mut self: Box<Self>,
         event: CompletionEvent,
@@ -95,14 +96,14 @@ impl CompletionOperation for IdentityControlOperation {
             (
                 ControlState::Ready {
                     owned,
-                    action: PreparedIdentityAction::Reply(bytes),
+                    action: PreparedAdministration::Identity(PreparedIdentityAction::Reply(bytes)),
                 },
                 CompletionEvent::Core(ext4_core::OperationEvent::Admitted),
-            ) => reply(owned, bytes),
+            ) => reply(owned, &bytes),
             (
                 ControlState::Ready {
                     owned,
-                    action: PreparedIdentityAction::Work(work),
+                    action: PreparedAdministration::Identity(PreparedIdentityAction::Work(work)),
                 },
                 CompletionEvent::Core(ext4_core::OperationEvent::Admitted),
             ) => {
@@ -113,6 +114,30 @@ impl CompletionOperation for IdentityControlOperation {
                 }
             }
             (
+                ControlState::Ready {
+                    owned,
+                    action: PreparedAdministration::Policy(PreparedPolicyAction::Reply(bytes)),
+                },
+                CompletionEvent::Core(ext4_core::OperationEvent::Admitted),
+            ) => reply(owned, &bytes),
+            (
+                ControlState::Ready {
+                    owned,
+                    action: PreparedAdministration::Policy(PreparedPolicyAction::Work(work)),
+                },
+                CompletionEvent::Core(ext4_core::OperationEvent::Admitted),
+            ) => {
+                self.state = ControlState::Waiting(owned);
+                OperationTransition::SubmitPassiveWork {
+                    work: PassiveWork::Policy(work),
+                    suspended: self,
+                }
+            }
+            (
+                ControlState::Waiting(owned),
+                CompletionEvent::PassiveCompleted(PassiveWorkCompletion::Policy(bytes)),
+            ) => reply(owned, &bytes),
+            (
                 ControlState::Ready { owned, .. } | ControlState::Waiting(owned),
                 CompletionEvent::Core(ext4_core::OperationEvent::CancelRequested),
             ) => OperationTransition::Complete(
@@ -121,7 +146,7 @@ impl CompletionOperation for IdentityControlOperation {
             (
                 ControlState::Waiting(owned),
                 CompletionEvent::PassiveCompleted(PassiveWorkCompletion::Identity(bytes)),
-            ) => reply(owned, bytes),
+            ) => reply(owned, &bytes),
             (ControlState::Ready { owned, .. }, _) => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::InternalInvariantViolation)),
             ),

@@ -1171,8 +1171,10 @@ impl<'a> PendingIrpLease<'a> {
     /// Transfers the captured administrative command to its sole operation owner.
     /// # Errors
     /// Rejects a request with another captured kind or a consumed command.
-    pub(crate) fn take_identity(&mut self) -> DriverResult<crate::identity::IdentityCommand> {
-        self.owner.context.take_identity()
+    pub(crate) fn take_administration(
+        &mut self,
+    ) -> DriverResult<crate::administration::AdministrationCommand> {
+        self.owner.context.take_administration()
     }
     /// Observes key-operation authority retained from the original requestor capture.
     /// # Errors

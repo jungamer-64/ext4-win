@@ -21,7 +21,7 @@ pub enum Error {
     /// Malformed encoding, unsupported tag or nonzero reserved field.
     MalformedEncoding,
     /// A successor cannot have a zero or exhausted generation.
-    GenerationExhausted,
+    InvalidGeneration,
     /// Recovery budget is zero or cannot be represented on the target.
     RecoveryBudget,
 }
@@ -227,7 +227,7 @@ impl PolicyReplacement {
         Ok(Self {
             next: PolicySnapshot {
                 uuid,
-                generation: previous.checked_add(1).ok_or(Error::GenerationExhausted)?,
+                generation: previous.checked_add(1).ok_or(Error::InvalidGeneration)?,
                 policy,
             },
         })
@@ -250,7 +250,7 @@ impl PolicyReplacement {
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let next = PolicySnapshot::decode(bytes)?;
         if next.generation == 0 {
-            return Err(Error::GenerationExhausted);
+            return Err(Error::InvalidGeneration);
         }
         Ok(Self { next })
     }
@@ -305,11 +305,11 @@ mod tests {
         );
         assert_eq!(
             PolicyReplacement::decode(&bytes),
-            Err(Error::GenerationExhausted)
+            Err(Error::InvalidGeneration)
         );
         assert_eq!(
             PolicyReplacement::new(u64::MAX, snapshot.uuid, snapshot.policy),
-            Err(Error::GenerationExhausted)
+            Err(Error::InvalidGeneration)
         );
     }
 }

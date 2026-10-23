@@ -39,6 +39,8 @@ pub(crate) enum PassiveWork {
     OpenExternalJournal(crate::kernel::external_journal::SelectedExternalJournal),
     /// Retained UUID update or reconciliation, owned through worker completion.
     Identity(alloc::boxed::Box<crate::identity::IdentityWork>),
+    /// Retained mount-policy save or reconciliation.
+    Policy(alloc::boxed::Box<crate::policy::PolicyWork>),
     /// Read sector geometry without blocking the actor or retaining its mounted-state borrow.
     SectorSize {
         /// Borrowed native admission; the suspended mounted operation and worker rundown
@@ -145,6 +147,8 @@ pub(crate) enum PassiveWorkCompletion {
     Retry(PassiveWork),
     /// Fully prepared response after persistence and publication finish.
     Identity(alloc::vec::Vec<u8>),
+    /// Fixed-size mount-policy persistence observation.
+    Policy([u8; ext4_control::POLICY_REPLY_BYTES]),
     /// Native sector observation, including its exact failure status.
     SectorSize(DriverResult<crate::kernel::storage::SectorSizeInformation>),
     /// MDL chain acquisition and observed byte count.
@@ -207,6 +211,7 @@ impl PassiveWork {
         match self {
             Self::OpenExternalJournal(_)
             | Self::Identity(_)
+            | Self::Policy(_)
             | Self::Uninitialize { .. }
             | Self::CleanupOplock { .. } => Ok(()),
             Self::SectorSize { .. }
@@ -291,6 +296,7 @@ impl PassiveWork {
                 crate::kernel::external_journal::ExclusiveExternalJournal::open(selected),
             ),
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).execute()),
+            Self::Policy(work) => PassiveWorkCompletion::Policy((*work).execute()),
             Self::SectorSize {
                 query,
                 logical,
@@ -382,6 +388,7 @@ impl PassiveWork {
         match self {
             Self::OpenExternalJournal(_) => PassiveWorkCompletion::OpenExternalJournal(Err(error)),
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).failed(error)),
+            Self::Policy(work) => PassiveWorkCompletion::Policy((*work).failed(error)),
             Self::SectorSize { .. } => PassiveWorkCompletion::SectorSize(Err(error)),
             Self::Mdl { owned, .. } => PassiveWorkCompletion::Mdl {
                 owned,

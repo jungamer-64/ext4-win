@@ -10,9 +10,11 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod administration;
 mod identity;
 mod irp;
 mod kernel;
+mod policy;
 /// Generated control-device identity shared with the host lifecycle owner.
 mod lifecycle_control {
     include!(concat!(env!("OUT_DIR"), "/lifecycle-control-v1.rs"));
@@ -94,7 +96,7 @@ pub unsafe extern "system" fn driver_entry(
     );
     let catalog = match unsafe {
         // SAFETY: The Windows loader retains this counted service path through DriverEntry.
-        identity::IdentityCatalog::load(registry_path)
+        administration::ControlCatalog::load(registry_path)
     } {
         Ok(catalog) => catalog,
         Err(error) => return error.ntstatus(),

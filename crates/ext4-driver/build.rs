@@ -37,7 +37,7 @@ const OPERATIONAL_TRACE_HEADER: &str = "operational-trace-v1.h";
 const ARTIFACT_ID_MARKER: &str = "EXT4WIN_ARTIFACT_ID=";
 
 fn main() -> Result<(), Box<dyn Error>> {
-    const IDENTITY_REGISTRY_SOURCE: &str = "native/identity_registry.c";
+    const CONFIGURATION_REGISTRY_SOURCE: &str = "native/configuration_registry.c";
     const IDENTITY_SOURCE: &str = "native/identity.c";
     const SECURITY_CAPTURE_SOURCE: &str = "native/security_capture.c";
     const STREAM_CONTEXT_SOURCE: &str = "native/stream_context.c";
@@ -47,8 +47,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!("cargo:rerun-if-changed={IDENTITY_SOURCE}");
     println!("cargo:rerun-if-changed=native/requestor_subject.h");
-    println!("cargo:rerun-if-changed={IDENTITY_REGISTRY_SOURCE}");
-    println!("cargo:rerun-if-changed=native/identity_persistence.h");
+    println!("cargo:rerun-if-changed={CONFIGURATION_REGISTRY_SOURCE}");
+    println!("cargo:rerun-if-changed=native/configuration_persistence.h");
     println!("cargo:rerun-if-changed={SECURITY_CAPTURE_SOURCE}");
     println!("cargo:rerun-if-changed=native/io_manager_input.h");
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");
@@ -119,7 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     native
         .include(&out_directory)
         .file(IDENTITY_SOURCE)
-        .file(IDENTITY_REGISTRY_SOURCE)
+        .file(CONFIGURATION_REGISTRY_SOURCE)
         .file(SECURITY_CAPTURE_SOURCE)
         .file(STREAM_CONTEXT_SOURCE)
         .file(OPERATIONAL_TRACE_SOURCE)

@@ -20,7 +20,9 @@ use crate::kernel::status::{DriverError, DriverResult};
 use zeroize::Zeroize;
 
 mod native_allocation;
+mod short_lock;
 pub(crate) use native_allocation::NativeAllocation;
+pub(crate) use short_lock::ShortLock;
 
 /// Converts allocator failure into the driver error domain.
 #[inline]

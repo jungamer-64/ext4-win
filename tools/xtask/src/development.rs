@@ -176,9 +176,9 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
 fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
         (
-            "identity-persistence",
-            "identity_persistence.tests.c",
-            "native identity persistence failure contract",
+            "configuration-persistence",
+            "configuration_persistence.tests.c",
+            "native configuration persistence failure contract",
         ),
         (
             "requestor-subject",

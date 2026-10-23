@@ -505,7 +505,7 @@ impl ControlDeviceExtension {
     fn initialize(
         device: KernelDevice,
         trace: OperationalTrace,
-        catalog: crate::identity::IdentityCatalog,
+        catalog: crate::administration::ControlCatalog,
     ) -> Result<(), wdk_sys::NTSTATUS> {
         let extension = NonNull::new(device.extension_address().cast::<ControlDeviceExtension>())
             .ok_or(DriverError::InvalidParameter.ntstatus())?;
@@ -650,7 +650,7 @@ impl ControlDevice {
     pub(crate) fn create(
         driver: PDRIVER_OBJECT,
         trace: OperationalTrace,
-        catalog: crate::identity::IdentityCatalog,
+        catalog: crate::administration::ControlCatalog,
     ) -> Result<Self, wdk_sys::NTSTATUS> {
         let extension_size =
             wdk_sys::ULONG::try_from(core::mem::size_of::<ControlDeviceExtension>())

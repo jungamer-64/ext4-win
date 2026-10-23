@@ -589,7 +589,10 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
             active.current_stack()?.device_control().map(|stack| {
                 matches!(
                     stack.io_control_code(),
-                    ext4_security::QUERY_IDENTITY_IOCTL | ext4_security::REPLACE_IDENTITY_IOCTL
+                    ext4_security::QUERY_IDENTITY_IOCTL
+                        | ext4_security::REPLACE_IDENTITY_IOCTL
+                        | ext4_control::QUERY_POLICY_IOCTL
+                        | ext4_control::REPLACE_POLICY_IOCTL
                 )
             })
         });
@@ -684,7 +687,7 @@ pub(crate) fn admit_owned(
     }
 
     enum Admission {
-        IdentityControl,
+        Administration,
         QueryRemove,
         Cleanup,
         Close,
@@ -707,7 +710,7 @@ pub(crate) fn admit_owned(
     }
 
     let admission = match owned.actor_request() {
-        ActorRequest::Captured(PreparedRequest::IdentityControl(_)) => Admission::IdentityControl,
+        ActorRequest::Captured(PreparedRequest::Administration(_)) => Admission::Administration,
         ActorRequest::Captured(PreparedRequest::Mdl(action)) => Admission::Mdl(*action),
         ActorRequest::Captured(PreparedRequest::Read(_)) => Admission::Read(ReadRequestKind::Read),
         ActorRequest::Captured(PreparedRequest::QueryInformation) => {
@@ -869,7 +872,7 @@ pub(crate) fn admit_owned(
     };
     let handle_class = match &admission {
         Admission::Mdl(_) => HandleRequestClass::Ordinary,
-        Admission::IdentityControl | Admission::Mount(_) | Admission::QueryRemove => {
+        Admission::Administration | Admission::Mount(_) | Admission::QueryRemove => {
             HandleRequestClass::Device
         }
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
@@ -990,8 +993,8 @@ pub(crate) fn admit_owned(
 
     let operation =
         match admission {
-            Admission::IdentityControl => {
-                super::identity_control::admit(owned, target.control_catalog())
+            Admission::Administration => {
+                super::administration_control::admit(owned, target.control_catalog())
             }
             Admission::QueryRemove => {
                 target.with_mounted_access(|_| super::operation::query_remove(owned))

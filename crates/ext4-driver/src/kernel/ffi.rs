@@ -362,19 +362,20 @@ unsafe extern "system" {
 
     /// Releases one owned EA-list or directory-pattern snapshot.
     pub(crate) fn ext4win_release_captured_auxiliary_input(snapshot: wdk_sys::PVOID);
-    /// Opens the service-owned persistent identity root at PASSIVE_LEVEL.
-    pub(crate) fn ext4win_identity_open_root(
+    /// Opens the service-owned persistent configuration root at PASSIVE_LEVEL.
+    pub(crate) fn ext4win_configuration_open_root(
         service: wdk_sys::PCUNICODE_STRING,
+        domain: u32,
         output: *mut wdk_sys::HANDLE,
     ) -> wdk_sys::NTSTATUS;
     /// Enumerates one canonical UUID subkey into 36 UTF-16 units.
-    pub(crate) fn ext4win_identity_enumerate(
+    pub(crate) fn ext4win_configuration_enumerate(
         root: wdk_sys::HANDLE,
         index: u32,
         uuid: *mut u16,
     ) -> wdk_sys::NTSTATUS;
     /// Reads one complete bounded binary table into pool-aligned owned storage.
-    pub(crate) fn ext4win_identity_read(
+    pub(crate) fn ext4win_configuration_read(
         root: wdk_sys::HANDLE,
         uuid: *const u16,
         buffer: wdk_sys::PVOID,
@@ -382,7 +383,7 @@ unsafe extern "system" {
         length: *mut u32,
     ) -> wdk_sys::NTSTATUS;
     /// Saves and flushes a whole table, retaining the accepted-effect phase on failure.
-    pub(crate) fn ext4win_identity_save(
+    pub(crate) fn ext4win_configuration_save(
         root: wdk_sys::HANDLE,
         uuid: *const u16,
         record: *const u8,
@@ -390,11 +391,11 @@ unsafe extern "system" {
         phase: *mut u32,
     ) -> wdk_sys::NTSTATUS;
     /// Establishes durability of a record observed during reconciliation.
-    pub(crate) fn ext4win_identity_flush(
+    pub(crate) fn ext4win_configuration_flush(
         root: wdk_sys::HANDLE,
         uuid: *const u16,
     ) -> wdk_sys::NTSTATUS;
     /// Releases the kernel-only root after all worker and catalog ownership drains.
-    pub(crate) fn ext4win_identity_close(root: wdk_sys::HANDLE);
+    pub(crate) fn ext4win_configuration_close(root: wdk_sys::HANDLE);
 
 }

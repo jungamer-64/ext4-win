@@ -295,6 +295,12 @@ const fn core_error_status(error: Error) -> NTSTATUS {
 }
 
 /// Preserves physical allocation failure and rejects invalid portable representations.
+impl From<ext4_control::Error> for DriverError {
+    fn from(_error: ext4_control::Error) -> Self {
+        Self::InvalidParameter
+    }
+}
+
 impl From<ext4_security::Error> for DriverError {
     fn from(error: ext4_security::Error) -> Self {
         match error {

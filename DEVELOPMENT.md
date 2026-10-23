@@ -127,6 +127,31 @@ arbitrary Windows ACL edits are rejected. Mode changes through file attributes u
 Native token oracles run in portable Windows tests; the elevated `verify-windows-host` gate also
 checks explicit ownership and security privileges.
 
+## Mounted-session policy administration
+
+The secured control endpoint also owns UUID-scoped mount policy. Saving policy requires an
+administrator handle and a matching predecessor generation. Each mount selects one known durable
+snapshot after probing the primary UUID and before recovery. Existing sessions retain their media
+authority; saving policy does not remount a volume or switch it between read-only and read-write.
+
+```console
+cargo run -p ext4ctl -- policy show <volume-path-or-ext4-uuid>
+cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-only --recovery-memory 67108864
+cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-write --auto-trim off
+```
+
+Unspecified fields retain their observed values. Recovery memory is a nonzero logical byte budget;
+budget exhaustion is distinct from physical allocation failure. Read-only sessions replay journal
+and orphan recovery into private memory and issue no lower media write or flush, including at close.
+Filesystem key changes remain mount-local operations and do not grant media-write authority.
+
+The service's `Parameters\MountPolicies\<UUID>\Table` binary value stores one complete policy.
+The shared [control codec](crates/ext4-control/src/lib.rs) owns wire layout and defaults. Replacement
+saves and flushes the record before publication to subsequent mount selection. Unknown means an
+effect may have persisted: query reconciles authoritative storage before another replacement or
+mount selection can proceed. A failed response is not evidence that a save was rejected; the CLI
+does not retry it automatically.
+
 ## Ext4 durability and interoperability
 
 Interoperability uses e2fsprogs as an independent oracle on newly formatted or

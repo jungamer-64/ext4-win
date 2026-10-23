@@ -621,16 +621,16 @@ impl QueueContextOwnership {
     /// Moves the sealed command to its sole control operation.
     /// # Errors
     /// Rejects another request kind or a command already consumed.
-    pub(super) fn take_identity(&mut self) -> DriverResult<crate::identity::IdentityCommand> {
+    pub(super) fn take_administration(
+        &mut self,
+    ) -> DriverResult<crate::administration::AdministrationCommand> {
         let Self::Captured(context) = self else {
             return Err(DriverError::InternalInvariantViolation);
         };
         match &mut context.prepared {
-            PreparedRequest::IdentityControl(command) => {
-                let owned = core::mem::replace(command, crate::identity::IdentityCommand::Consumed);
-                owned.uuid()?;
-                Ok(owned)
-            }
+            PreparedRequest::Administration(command) => command
+                .take()
+                .ok_or(DriverError::InternalInvariantViolation),
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -1021,7 +1021,7 @@ pub(crate) enum PreparedKeyControl {
 #[derive(Debug)]
 pub(crate) enum PreparedRequest {
     /// Owned validated administrator identity command.
-    IdentityControl(crate::identity::IdentityCommand),
+    Administration(Option<crate::administration::AdministrationCommand>),
     /// Cache Manager page acquisition; release notifications bypass this cancellable lane.
     Mdl(super::MdlTransfer),
     /// Create/open request.
@@ -1102,21 +1102,40 @@ impl PreparedRequest {
                 let input = target
                     .buffered_input(control.input_buffer_length())
                     .map_err(IrpCompletion::from_error)?;
+                use crate::administration::AdministrationCommand;
                 let command = match control.io_control_code() {
-                    ext4_security::QUERY_IDENTITY_IOCTL => crate::identity::IdentityCommand::Query(
-                        ext4_core::FilesystemUuid::from_bytes(input.try_into().map_err(|_| {
-                            IrpCompletion::from_error(DriverError::InvalidParameter)
-                        })?),
-                    ),
+                    ext4_security::QUERY_IDENTITY_IOCTL => {
+                        AdministrationCommand::Identity(crate::identity::IdentityCommand::Query(
+                            ext4_core::FilesystemUuid::from_bytes(input.try_into().map_err(
+                                |_| IrpCompletion::from_error(DriverError::InvalidParameter),
+                            )?),
+                        ))
+                    }
                     ext4_security::REPLACE_IDENTITY_IOCTL => {
-                        crate::identity::IdentityCommand::Replace(
+                        AdministrationCommand::Identity(crate::identity::IdentityCommand::Replace(
                             ext4_security::Replacement::decode(input)
                                 .map_err(|error| IrpCompletion::from_error(error.into()))?,
-                        )
+                        ))
+                    }
+                    ext4_control::QUERY_POLICY_IOCTL => {
+                        AdministrationCommand::Policy(crate::policy::PolicyCommand::Query(
+                            ext4_core::FilesystemUuid::from_bytes(input.try_into().map_err(
+                                |_| IrpCompletion::from_error(DriverError::InvalidParameter),
+                            )?),
+                        ))
+                    }
+                    ext4_control::REPLACE_POLICY_IOCTL => {
+                        AdministrationCommand::Policy(crate::policy::PolicyCommand::Replace(
+                            ext4_control::PolicyReplacement::decode(input)
+                                .map_err(|error| IrpCompletion::from_error(error.into()))?,
+                        ))
                     }
                     _ => return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest)),
                 };
-                Ok((Self::IdentityControl(command), QueueCancellationKey::Device))
+                Ok((
+                    Self::Administration(Some(command)),
+                    QueueCancellationKey::Device,
+                ))
             }
             DispatchMajor::Create => Ok((Self::Create, generic_key())),
             DispatchMajor::Read => Ok((

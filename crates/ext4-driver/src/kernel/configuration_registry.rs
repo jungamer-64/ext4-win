@@ -2,14 +2,32 @@
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::memory::DriverVec;
 use ext4_core::FilesystemUuid;
-use ext4_security::PublicationOutcome;
+/// Registry effect, independent of the record domain and administrator acknowledgement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SaveOutcome {
+    /// No value effect was accepted.
+    NotSaved,
+    /// The whole record is durable.
+    Durable,
+    /// A persistent value effect may have happened.
+    Unknown,
+}
+/// Service-owned configuration namespace fixed when a root is opened.
+#[derive(Clone, Copy, Debug)]
+#[repr(u32)]
+pub(crate) enum ConfigurationDomain {
+    /// Principal-to-numeric-identity correspondence.
+    Identity = 0,
+    /// Future-mounted-session policy.
+    MountPolicy = 1,
+}
 
 /// Bytes reserved for KEY_VALUE_PARTIAL_INFORMATION and a maximum whole-table value.
-pub(super) const READ_CAPACITY: usize = ext4_security::MAX_MAPPING_BYTES + 12;
+pub(crate) const QUERY_HEADER_BYTES: usize = 12;
 
-/// Kernel-only handle scoped to the service's IdentityMappings key.
+/// Kernel-only handle scoped to one service configuration namespace.
 #[derive(Debug)]
-pub(super) struct RegistryStore {
+pub(crate) struct RegistryStore {
     /// Retained through catalog ownership and every submitted worker lease.
     #[cfg(not(test))]
     handle: core::ptr::NonNull<core::ffi::c_void>,
@@ -24,13 +42,23 @@ impl RegistryStore {
         unsafe_code,
         reason = "the loader path and owned native handle cross one audited synchronous C boundary"
     )]
-    pub(super) unsafe fn open(path: wdk_sys::PCUNICODE_STRING) -> DriverResult<Self> {
+    pub(crate) unsafe fn open(
+        path: wdk_sys::PCUNICODE_STRING,
+        domain: ConfigurationDomain,
+    ) -> DriverResult<Self> {
         #[cfg(not(test))]
         {
             let mut handle = core::ptr::null_mut();
             let status = unsafe {
                 // SAFETY: The loader retains path; handle is writable out storage.
-                crate::kernel::ffi::ext4win_identity_open_root(path, &mut handle)
+                crate::kernel::ffi::ext4win_configuration_open_root(
+                    path,
+                    match domain {
+                        ConfigurationDomain::Identity => 0,
+                        ConfigurationDomain::MountPolicy => 1,
+                    },
+                    &mut handle,
+                )
             };
             native_success(status)?;
             Ok(Self {
@@ -40,7 +68,7 @@ impl RegistryStore {
         }
         #[cfg(test)]
         {
-            let _path = path;
+            let _inputs = (path, domain);
             Err(DriverError::NotSupported)
         }
     }
@@ -54,13 +82,13 @@ impl RegistryStore {
             reason = "the fixed output array covers the C enumeration contract"
         )
     )]
-    pub(super) fn enumerate(&self, index: u32) -> DriverResult<Option<FilesystemUuid>> {
+    pub(crate) fn enumerate(&self, index: u32) -> DriverResult<Option<FilesystemUuid>> {
         #[cfg(not(test))]
         {
             let mut text = [0_u16; 36];
             let status = unsafe {
                 // SAFETY: The retained root is live and output covers exactly 36 units.
-                crate::kernel::ffi::ext4win_identity_enumerate(
+                crate::kernel::ffi::ext4win_configuration_enumerate(
                     self.handle.as_ptr(),
                     index,
                     text.as_mut_ptr(),
@@ -94,7 +122,7 @@ impl RegistryStore {
             reason = "kernel pool allocation is aligned for KEY_VALUE_PARTIAL_INFORMATION and bounded by the owned vector"
         )
     )]
-    pub(super) fn read(
+    pub(crate) fn read(
         &self,
         uuid: &[u16; 36],
         buffer: &mut DriverVec<u8>,
@@ -106,7 +134,7 @@ impl RegistryStore {
             let mut length = 0;
             let status = unsafe {
                 // SAFETY: Root, fixed UUID and initialized pool buffer remain retained throughout the call.
-                crate::kernel::ffi::ext4win_identity_read(
+                crate::kernel::ffi::ext4win_configuration_read(
                     self.handle.as_ptr(),
                     uuid.as_ptr(),
                     buffer.as_mut_slice().as_mut_ptr().cast(),
@@ -119,7 +147,7 @@ impl RegistryStore {
             }
             native_success(status)?;
             let length = usize::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?;
-            if length > ext4_security::MAX_MAPPING_BYTES || length > buffer.len() {
+            if length > buffer.len().saturating_sub(QUERY_HEADER_BYTES) {
                 return Err(DriverError::InvalidBufferSize);
             }
             Ok(Some(length))
@@ -138,19 +166,19 @@ impl RegistryStore {
             reason = "the prepared complete record and retained key outlive this synchronous PASSIVE_LEVEL call"
         )
     )]
-    pub(super) fn save(&self, uuid: &[u16; 36], record: &[u8]) -> (PublicationOutcome, i32) {
+    pub(crate) fn save(&self, uuid: &[u16; 36], record: &[u8]) -> (SaveOutcome, i32) {
         #[cfg(not(test))]
         {
             let Ok(length) = u32::try_from(record.len()) else {
                 return (
-                    PublicationOutcome::NotSaved,
+                    SaveOutcome::NotSaved,
                     DriverError::InvalidBufferSize.ntstatus(),
                 );
             };
             let mut phase = 0;
             let status = unsafe {
                 // SAFETY: All input buffers are prepared and retained; phase is writable native output.
-                crate::kernel::ffi::ext4win_identity_save(
+                crate::kernel::ffi::ext4win_configuration_save(
                     self.handle.as_ptr(),
                     uuid.as_ptr(),
                     record.as_ptr(),
@@ -158,22 +186,12 @@ impl RegistryStore {
                     &mut phase,
                 )
             };
-            (
-                match phase {
-                    0 => PublicationOutcome::NotSaved,
-                    1 => PublicationOutcome::SavedNotApplied,
-                    _ => PublicationOutcome::Unknown,
-                },
-                status,
-            )
+            (save_outcome(phase), status)
         }
         #[cfg(test)]
         {
             let _inputs = (uuid, record);
-            (
-                PublicationOutcome::NotSaved,
-                DriverError::NotSupported.ntstatus(),
-            )
+            (save_outcome(0), DriverError::NotSupported.ntstatus())
         }
     }
     /// Makes an observed table durable before it can replace live authority.
@@ -186,12 +204,12 @@ impl RegistryStore {
             reason = "the retained root and fixed UUID remain live through the native flush"
         )
     )]
-    pub(super) fn flush(&self, uuid: &[u16; 36]) -> DriverResult<()> {
+    pub(crate) fn flush(&self, uuid: &[u16; 36]) -> DriverResult<()> {
         #[cfg(not(test))]
         {
             let status = unsafe {
                 // SAFETY: The root remains retained through worker completion.
-                crate::kernel::ffi::ext4win_identity_flush(self.handle.as_ptr(), uuid.as_ptr())
+                crate::kernel::ffi::ext4win_configuration_flush(self.handle.as_ptr(), uuid.as_ptr())
             };
             native_success(status)
         }
@@ -211,7 +229,7 @@ impl Drop for RegistryStore {
     fn drop(&mut self) {
         unsafe {
             // SAFETY: No call can retain a borrow after the final counted owner drops.
-            crate::kernel::ffi::ext4win_identity_close(self.handle.as_ptr());
+            crate::kernel::ffi::ext4win_configuration_close(self.handle.as_ptr());
         }
     }
 }
@@ -241,10 +259,19 @@ fn native_success(status: i32) -> DriverResult<()> {
 }
 
 /// UUID key text uses ext4 byte order, with no Windows GUID byte swapping.
-pub(super) fn key_text(uuid: FilesystemUuid) -> [u16; 36] {
+pub(crate) fn key_text(uuid: FilesystemUuid) -> [u16; 36] {
     let mut units = [0; 36];
     for (unit, byte) in units.iter_mut().zip(ext4_security::uuid_text(uuid)) {
         *unit = u16::from(byte);
     }
     units
+}
+
+/// Native persistence phase classification shared by both build modes.
+fn save_outcome(phase: u32) -> SaveOutcome {
+    match phase {
+        0 => SaveOutcome::NotSaved,
+        1 => SaveOutcome::Durable,
+        _ => SaveOutcome::Unknown,
+    }
 }

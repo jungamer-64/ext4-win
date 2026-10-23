@@ -157,7 +157,9 @@ mod tests {
                 let operation = pool.activate(kind, owned);
                 let result = operation.advance(
                     CompletionEvent::Core(ext4_core::OperationEvent::Admitted),
-                    &mut ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
+                    &mut ReactorTarget::ControlDevice(
+                        crate::administration::ControlCatalog::empty(),
+                    ),
                 );
                 let OperationTransition::CompleteFinalization {
                     completion,

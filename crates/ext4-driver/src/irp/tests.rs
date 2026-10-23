@@ -113,8 +113,9 @@ fn context_free_close_completes_at_admission() {
 
     let mut raw_device = wdk_sys::DEVICE_OBJECT::default();
     let device = kernel_device_fixture(&mut raw_device).expect("fixture device is live");
-    let mut target =
-        super::reactor::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty());
+    let mut target = super::reactor::ReactorTarget::ControlDevice(
+        crate::administration::ControlCatalog::empty(),
+    );
     let mut finalization =
         crate::request::operation::prepare_finalization().expect("initial finalization reserve");
     for flags in [0, wdk_sys::FO_CLEANUP_COMPLETE, wdk_sys::FO_VOLUME_OPEN] {

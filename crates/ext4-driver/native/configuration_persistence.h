@@ -1,8 +1,8 @@
-#ifndef EXT4WIN_IDENTITY_PERSISTENCE_H
-#define EXT4WIN_IDENTITY_PERSISTENCE_H
+#ifndef EXT4WIN_CONFIGURATION_PERSISTENCE_H
+#define EXT4WIN_CONFIGURATION_PERSISTENCE_H
 
 /* phase: 0 = no effect accepted, 3 = persistence uncertain, 1 = durable. */
-NTSTATUS ext4win_identity_save(HANDLE root, const WCHAR *uuid,
+NTSTATUS ext4win_configuration_save(HANDLE root, const WCHAR *uuid,
     const UCHAR *record, ULONG length, PULONG phase)
 {
     HANDLE key = NULL;
@@ -11,7 +11,7 @@ NTSTATUS ext4win_identity_save(HANDLE root, const WCHAR *uuid,
     NTSTATUS status;
     PAGED_CODE();
     *phase = 0;
-    status = identity_key(root, &name, KEY_SET_VALUE | KEY_QUERY_VALUE, TRUE, &key);
+    status = configuration_key(root, &name, KEY_SET_VALUE | KEY_QUERY_VALUE, TRUE, &key);
     if (!NT_SUCCESS(status)) { return status; }
     RtlInitUnicodeString(&value, L"Table");
     *phase = 3;

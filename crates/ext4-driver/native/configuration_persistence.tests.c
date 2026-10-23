@@ -33,7 +33,7 @@ void *memset(void *destination, int value, size_t length)
 static NTSTATUS open_status, set_status, flush_status;
 static ULONG opened, set, flushed, closed, invalid;
 static int root_storage, key_storage;
-static NTSTATUS identity_key(HANDLE root, PUNICODE_STRING name,
+static NTSTATUS configuration_key(HANDLE root, PUNICODE_STRING name,
     ACCESS_MASK access, BOOLEAN create, PHANDLE key)
 {
     opened++;
@@ -72,7 +72,7 @@ static NTSTATUS ZwClose(HANDLE key)
     if (key != &key_storage || closed != 1) { invalid++; }
     return 0;
 }
-#include "identity_persistence.h"
+#include "configuration_persistence.h"
 
 int main(void)
 {
@@ -83,21 +83,21 @@ int main(void)
     ULONG index;
     for (index = 0; index < 36; index++) { uuid[index] = L'0'; }
     open_status = -17;
-    status = ext4win_identity_save(&root_storage, uuid, record, 4, &phase);
+    status = ext4win_configuration_save(&root_storage, uuid, record, 4, &phase);
     if (status != -17 || phase != 0 || opened != 1 || set || flushed || closed || invalid) { return 1; }
     open_status = 0;
     opened = 0;
     set_status = -18;
-    status = ext4win_identity_save(&root_storage, uuid, record, 4, &phase);
+    status = ext4win_configuration_save(&root_storage, uuid, record, 4, &phase);
     if (status != -18 || phase != 3 || opened != 1 || set != 1 || flushed || closed != 1 || invalid) { return 2; }
     opened = set = closed = 0;
     set_status = 0;
     flush_status = -19;
-    status = ext4win_identity_save(&root_storage, uuid, record, 4, &phase);
+    status = ext4win_configuration_save(&root_storage, uuid, record, 4, &phase);
     if (status != -19 || phase != 3 || opened != 1 || set != 1 || flushed != 1 || closed != 1 || invalid) { return 3; }
     opened = set = flushed = closed = 0;
     flush_status = 0;
-    status = ext4win_identity_save(&root_storage, uuid, record, 4, &phase);
+    status = ext4win_configuration_save(&root_storage, uuid, record, 4, &phase);
     if (status != 0 || phase != 1 || opened != 1 || set != 1 || flushed != 1 || closed != 1 || invalid) { return 4; }
     return 0;
 }

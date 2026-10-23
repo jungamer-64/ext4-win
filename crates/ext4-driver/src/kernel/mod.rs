@@ -2,6 +2,7 @@
 
 mod cache_transfer;
 pub(crate) mod cng;
+pub(crate) mod configuration_registry;
 #[cfg(not(test))]
 pub(crate) mod device_interface;
 pub(crate) mod external_journal;

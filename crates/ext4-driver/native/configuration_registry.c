@@ -2,7 +2,7 @@
 
 /* Each handle is kernel-only. Callers own the root through worker rundown. */
 static NTSTATUS
-identity_key(HANDLE parent, PUNICODE_STRING name, ACCESS_MASK access,
+configuration_key(HANDLE parent, PUNICODE_STRING name, ACCESS_MASK access,
              BOOLEAN create, PHANDLE output)
 {
     OBJECT_ATTRIBUTES attributes;
@@ -15,26 +15,27 @@ identity_key(HANDLE parent, PUNICODE_STRING name, ACCESS_MASK access,
     return ZwOpenKey(output, access, &attributes);
 }
 
-NTSTATUS ext4win_identity_open_root(PCUNICODE_STRING service, PHANDLE output)
+NTSTATUS ext4win_configuration_open_root(PCUNICODE_STRING service, ULONG domain, PHANDLE output)
 {
     HANDLE service_key = NULL, parameters = NULL;
     UNICODE_STRING name;
     NTSTATUS status;
     PAGED_CODE();
     *output = NULL;
+    if (domain > 1) { return STATUS_INVALID_PARAMETER; }
     if (service == NULL || service->Buffer == NULL ||
         service->Length == 0 || (service->Length & 1) != 0 ||
         service->Length > service->MaximumLength) {
         return STATUS_INVALID_PARAMETER;
     }
     name = *service;
-    status = identity_key(NULL, &name, KEY_CREATE_SUB_KEY, FALSE, &service_key);
+    status = configuration_key(NULL, &name, KEY_CREATE_SUB_KEY, FALSE, &service_key);
     if (!NT_SUCCESS(status)) { return status; }
     RtlInitUnicodeString(&name, L"Parameters");
-    status = identity_key(service_key, &name, KEY_CREATE_SUB_KEY, TRUE, &parameters);
+    status = configuration_key(service_key, &name, KEY_CREATE_SUB_KEY, TRUE, &parameters);
     if (NT_SUCCESS(status)) {
-        RtlInitUnicodeString(&name, L"IdentityMappings");
-        status = identity_key(parameters, &name,
+        RtlInitUnicodeString(&name, domain == 0 ? L"IdentityMappings" : L"MountPolicies");
+        status = configuration_key(parameters, &name,
             KEY_CREATE_SUB_KEY | KEY_ENUMERATE_SUB_KEYS, TRUE, output);
         ZwClose(parameters);
     }
@@ -42,7 +43,7 @@ NTSTATUS ext4win_identity_open_root(PCUNICODE_STRING service, PHANDLE output)
     return status;
 }
 
-NTSTATUS ext4win_identity_enumerate(HANDLE root, ULONG index, PWCHAR uuid)
+NTSTATUS ext4win_configuration_enumerate(HANDLE root, ULONG index, PWCHAR uuid)
 {
     union {
         ULONGLONG alignment;
@@ -61,7 +62,7 @@ NTSTATUS ext4win_identity_enumerate(HANDLE root, ULONG index, PWCHAR uuid)
 }
 
 /* Output storage is pool-aligned and includes the native information header. */
-NTSTATUS ext4win_identity_read(HANDLE root, const WCHAR *uuid,
+NTSTATUS ext4win_configuration_read(HANDLE root, const WCHAR *uuid,
     PVOID buffer, ULONG capacity, PULONG length)
 {
     const ULONG header_length = (ULONG)FIELD_OFFSET(KEY_VALUE_PARTIAL_INFORMATION, Data);
@@ -74,7 +75,7 @@ NTSTATUS ext4win_identity_read(HANDLE root, const WCHAR *uuid,
     PAGED_CODE();
     *length = 0;
     if (capacity < header_length) { return STATUS_INVALID_BUFFER_SIZE; }
-    status = identity_key(root, &name, KEY_QUERY_VALUE, FALSE, &key);
+    status = configuration_key(root, &name, KEY_QUERY_VALUE, FALSE, &key);
     if (!NT_SUCCESS(status)) { return status; }
     RtlInitUnicodeString(&value, L"Table");
     status = ZwQueryValueKey(key, &value, KeyValuePartialInformation,
@@ -92,16 +93,16 @@ NTSTATUS ext4win_identity_read(HANDLE root, const WCHAR *uuid,
     return status;
 }
 
-#include "identity_persistence.h"
+#include "configuration_persistence.h"
 
 /* Successful reconciliation establishes durability for the observed whole record. */
-NTSTATUS ext4win_identity_flush(HANDLE root, const WCHAR *uuid)
+NTSTATUS ext4win_configuration_flush(HANDLE root, const WCHAR *uuid)
 {
     HANDLE key = NULL;
     UNICODE_STRING name = {72, 72, (PWCHAR)uuid};
     NTSTATUS status;
     PAGED_CODE();
-    status = identity_key(root, &name, KEY_QUERY_VALUE, FALSE, &key);
+    status = configuration_key(root, &name, KEY_QUERY_VALUE, FALSE, &key);
     if (NT_SUCCESS(status)) {
         status = ZwFlushKey(key);
         ZwClose(key);
@@ -109,7 +110,7 @@ NTSTATUS ext4win_identity_flush(HANDLE root, const WCHAR *uuid)
     return status;
 }
 
-void ext4win_identity_close(HANDLE root)
+void ext4win_configuration_close(HANDLE root)
 {
     PAGED_CODE();
     ZwClose(root);

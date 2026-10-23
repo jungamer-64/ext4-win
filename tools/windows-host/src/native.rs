@@ -2278,5 +2278,9 @@ mod trace;
 pub use trace::{TraceEvent, TraceSession};
 
 /// Effective token identity and UUID-scoped administrator control.
+mod control;
+pub use control::ControlError;
+mod policy;
+pub use policy::{query_policy, replace_policy};
 mod identity;
 pub use identity::*;

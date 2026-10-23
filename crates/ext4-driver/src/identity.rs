@@ -1,12 +1,15 @@
 //! UUID-scoped immutable identity publication; metadata requests pin one snapshot at admission.
+use crate::kernel::configuration_registry::{
+    ConfigurationDomain, RegistryStore, SaveOutcome, key_text,
+};
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
+use crate::memory::{DriverShared, DriverSharedLease, DriverVec, ShortLock};
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use ext4_core::FilesystemUuid;
 use ext4_security::{IdentityMap, MappingReply, MappingSnapshot, PublicationOutcome, Replacement};
-mod registry;
-use registry::{READ_CAPACITY, RegistryStore, key_text};
+/// Whole identity record and the native query header.
+const READ_CAPACITY: usize =
+    ext4_security::MAX_MAPPING_BYTES + crate::kernel::configuration_registry::QUERY_HEADER_BYTES;
 
 /// Operation-owned table; acquired access remains independent of later slot publication.
 pub(crate) type IdentitySnapshot = DriverSharedLease<MappingSnapshot>;
@@ -60,14 +63,8 @@ struct SlotState {
 /// Shared UUID slot whose critical sections never allocate or perform registry I/O.
 #[derive(Debug)]
 pub(crate) struct IdentitySlot {
-    /// Lock protects ownership acquisition and replacement, preventing reference/free races.
-    #[cfg(not(test))]
-    lock: UnsafeCell<wdk_sys::KSPIN_LOCK>,
-    /// Deterministic short-lock equivalent in the user-mode test process.
-    #[cfg(test)]
-    lock: core::sync::atomic::AtomicBool,
-    /// Published immutable table and commit facts.
-    state: UnsafeCell<SlotState>,
+    /// Shared immutable ownership and commit facts protected by one short native lock.
+    state: ShortLock<SlotState>,
 }
 impl IdentitySlot {
     /// Allocates all snapshot storage before a mount or replacement can publish it.
@@ -76,11 +73,7 @@ impl IdentitySlot {
     fn new(snapshot: MappingSnapshot) -> DriverResult<Self> {
         let saved = snapshot.generation;
         Ok(Self {
-            #[cfg(not(test))]
-            lock: UnsafeCell::new(0),
-            #[cfg(test)]
-            lock: core::sync::atomic::AtomicBool::new(false),
-            state: UnsafeCell::new(SlotState {
+            state: ShortLock::new(SlotState {
                 active: DriverShared::try_new(snapshot)?,
                 saved,
                 outcome: PublicationOutcome::Applied,
@@ -89,55 +82,18 @@ impl IdentitySlot {
             }),
         })
     }
-    /// Lends publication state only inside a bounded, allocation-free critical section.
-    #[expect(
-        unsafe_code,
-        reason = "the native lock serializes every access to slot ownership and scalar commit facts"
-    )]
-    fn locked<R>(&self, operation: impl FnOnce(&mut SlotState) -> R) -> R {
-        #[cfg(not(test))]
-        let irql = unsafe {
-            // SAFETY: An unlocked KSPIN_LOCK has value zero; slot storage outlives this call.
-            crate::kernel::ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
-        };
-        #[cfg(test)]
-        while self
-            .lock
-            .compare_exchange(
-                false,
-                true,
-                core::sync::atomic::Ordering::Acquire,
-                core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        let result = operation(unsafe {
-            // SAFETY: Every state access holds this same exclusive lock; no borrow escapes it.
-            &mut *self.state.get()
-        });
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: Balances the immediately preceding acquisition on this thread.
-            crate::kernel::ffi::KeReleaseSpinLock(self.lock.get(), irql);
-        }
-        #[cfg(test)]
-        self.lock
-            .store(false, core::sync::atomic::Ordering::Release);
-        result
-    }
+
     /// Pins the snapshot once for an open/traverse/query/set operation.
     /// # Errors
     /// Returns finite reference-budget exhaustion.
     pub(crate) fn capture(&self) -> DriverResult<IdentitySnapshot> {
-        self.locked(|state| state.active.try_acquire())
+        self.state.with(|state| state.active.try_acquire())
     }
     /// Captures independent persistence and application facts together with immutable ownership.
     /// # Errors
     /// Returns finite reference-budget exhaustion.
     fn observe(&self) -> DriverResult<IdentityObservation> {
-        self.locked(|state| {
+        self.state.with(|state| {
             Ok(IdentityObservation {
                 active: state.active.try_acquire()?,
                 saved: state.saved,
@@ -148,7 +104,7 @@ impl IdentitySlot {
     }
     /// Publishes a preallocated durable successor; old owners drop outside the critical section.
     fn publish(&self, next: DriverShared<MappingSnapshot>) {
-        let old = self.locked(|state| {
+        let old = self.state.with(|state| {
             state.saved = next.get().generation;
             state.outcome = PublicationOutcome::Applied;
             state.status = 0;
@@ -158,25 +114,12 @@ impl IdentitySlot {
     }
     /// Retains a failed effect phase for reconciliation through the control endpoint.
     fn record_failure(&self, outcome: PublicationOutcome, status: i32) {
-        self.locked(|state| {
+        self.state.with(|state| {
             state.outcome = outcome;
             state.status = status;
         });
     }
 }
-#[expect(
-    unsafe_code,
-    reason = "all interior ownership transitions hold the native spin lock and borrowed snapshots are immutable"
-)]
-// SAFETY: The short lock protects SlotState; the only escaping state is a counted immutable lease.
-unsafe impl Send for IdentitySlot {}
-#[expect(
-    unsafe_code,
-    reason = "all interior ownership transitions hold the native spin lock and borrowed snapshots are immutable"
-)]
-// SAFETY: All shared state access is serialized and every snapshot remains retained independently.
-unsafe impl Sync for IdentitySlot {}
-
 /// Consistent query observation, owned independently of subsequent publication.
 #[derive(Debug)]
 pub(crate) struct IdentityObservation {
@@ -262,25 +205,20 @@ impl IdentityDirectory {
     }
 }
 
-/// Captured control command; Consumed is the terminal state after moving its owned table.
+/// Captured control command owning its validated input.
 #[derive(Debug)]
 pub(crate) enum IdentityCommand {
     /// Observes state and reconciles an uncertain persistence effect.
     Query(FilesystemUuid),
     /// Replaces the entire validated table with a CAS successor.
     Replace(Replacement),
-    /// The operation now owns this request's command.
-    Consumed,
 }
 impl IdentityCommand {
     /// Returns the sole UUID the command authorizes.
-    /// # Errors
-    /// Rejects an already consumed command.
-    pub(crate) fn uuid(&self) -> DriverResult<FilesystemUuid> {
+    pub(crate) fn uuid(&self) -> FilesystemUuid {
         match self {
-            Self::Query(uuid) => Ok(*uuid),
-            Self::Replace(replacement) => Ok(replacement.next().uuid),
-            Self::Consumed => Err(DriverError::InternalInvariantViolation),
+            Self::Query(uuid) => *uuid,
+            Self::Replace(replacement) => replacement.next().uuid,
         }
     }
 }
@@ -297,7 +235,7 @@ impl IdentityCatalog {
     pub(crate) unsafe fn load(path: wdk_sys::PCUNICODE_STRING) -> DriverResult<Self> {
         let registry = unsafe {
             // SAFETY: The caller retains the loader-owned path throughout initialization.
-            RegistryStore::open(path)
+            RegistryStore::open(path, ConfigurationDomain::Identity)
         }?;
         let mut catalog = Self::empty();
         let mut buffer = DriverVec::try_repeated_copy(0, READ_CAPACITY)?;
@@ -329,7 +267,7 @@ impl IdentityCatalog {
         command: IdentityCommand,
         capacity: usize,
     ) -> DriverResult<PreparedIdentityAction> {
-        let uuid = command.uuid()?;
+        let uuid = command.uuid();
         let binding = self.directory.binding(uuid)?;
         let reservation = match UpdateReservation::acquire(binding) {
             Ok(reservation) => reservation,
@@ -433,7 +371,6 @@ impl IdentityCatalog {
                     },
                 )?))
             }
-            IdentityCommand::Consumed => Err(DriverError::InternalInvariantViolation),
         }
     }
 }
@@ -456,7 +393,7 @@ impl UpdateReservation {
     /// # Errors
     /// Rejects concurrent replacement or reconciliation on this UUID.
     fn acquire(binding: IdentityBinding) -> DriverResult<Self> {
-        binding.get().locked(|state| {
+        binding.get().state.with(|state| {
             if state.busy {
                 return Err(DriverError::DeviceBusy);
             }
@@ -468,7 +405,7 @@ impl UpdateReservation {
 }
 impl Drop for UpdateReservation {
     fn drop(&mut self) {
-        self.binding.get().locked(|state| state.busy = false);
+        self.binding.get().state.with(|state| state.busy = false);
     }
 }
 /// Different effects retain precisely the prepared values needed for their completion.
@@ -526,10 +463,15 @@ impl IdentityWork {
                 saved,
             } => {
                 slot.record_failure(PublicationOutcome::Unknown, wdk_sys::STATUS_PENDING);
-                let (phase, status) = self.registry.get().save(&self.key, &record);
+                let (effect, status) = self.registry.get().save(&self.key, &record);
+                let phase = match effect {
+                    SaveOutcome::NotSaved => PublicationOutcome::NotSaved,
+                    SaveOutcome::Durable => PublicationOutcome::SavedNotApplied,
+                    SaveOutcome::Unknown => PublicationOutcome::Unknown,
+                };
                 if phase == PublicationOutcome::SavedNotApplied && status >= 0 {
                     let generation = next.get().generation;
-                    slot.locked(|state| {
+                    slot.state.with(|state| {
                         state.saved = generation;
                         state.outcome = PublicationOutcome::SavedNotApplied;
                         state.status = 0;
@@ -654,7 +596,10 @@ mod tests {
         else {
             return Err(DriverError::InternalInvariantViolation);
         };
-        let mut target = ReactorTarget::ControlDevice(catalog);
+        let mut target = ReactorTarget::ControlDevice(crate::administration::ControlCatalog {
+            identities: catalog,
+            policies: crate::policy::PolicyCatalog::empty(),
+        });
         let work = PassiveWork::Identity(work);
         work.authorize_storage(|| target.with_mounted_access(|access| access.authorize_storage()))?;
         let error = DriverError::from(ext4_core::Error::OperationCancelled);
@@ -667,7 +612,7 @@ mod tests {
         assert_eq!(state.status, error.ntstatus());
         assert_eq!(state.saved_generation, 0);
         assert_eq!(state.active.generation, 0);
-        let catalog = target.control_catalog();
+        let catalog = &mut target.control_catalog().identities;
         let binding = catalog.directory.binding(uuid)?;
         assert_eq!(binding.get().capture()?.get().generation, 0);
 
@@ -804,7 +749,7 @@ mod tests {
         let binding = catalog.directory.binding(uuid)?;
         let reservation = UpdateReservation::acquire(binding)?;
         assert_eq!(reservation.binding.get().capture()?.get().generation, 0);
-        reservation.binding.get().locked(|state| {
+        reservation.binding.get().state.with(|state| {
             state.saved = 1;
             state.outcome = PublicationOutcome::SavedNotApplied;
         });

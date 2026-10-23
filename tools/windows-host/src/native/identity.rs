@@ -1,4 +1,5 @@
 //! Windows account resolution and bounded identity-control requests.
+use super::control::{self, ControlError, Submission};
 use super::{FileHandle, completed, volume_names, wide};
 use core::ptr;
 use ext4_core::FilesystemUuid;
@@ -14,11 +15,8 @@ use std::{
 };
 use windows_sys::Win32::{
     Security::*,
-    System::{
-        IO::DeviceIoControl,
-        Threading::{
-            GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
-        },
+    System::Threading::{
+        GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken, SetThreadToken,
     },
 };
 
@@ -30,53 +28,6 @@ pub struct EffectiveIdentity {
     /// Effective token's primary group.
     pub primary_group: Sid,
 }
-/// Transport failures retain whether an identity replacement may already have committed.
-#[derive(Debug)]
-pub enum IdentityControlError {
-    /// Validation, allocation or handle opening failed before submission.
-    Preparation(io::Error),
-    /// A query failed without an authoritative state reply.
-    Query(io::Error),
-    /// Replacement was submitted and requires query reconciliation before any retry.
-    Unacknowledged {
-        /// Filesystem whose saved/applied generations must be queried.
-        uuid: FilesystemUuid,
-        /// Generation supplied by the failed request.
-        expected_generation: u64,
-        /// Native transport or reply decoding failure.
-        source: io::Error,
-    },
-    /// An authoritative reply arrived before release of the native handle failed.
-    Release {
-        /// Commit facts remain authoritative despite the release failure.
-        state: MappingState,
-        /// Native handle release diagnostic.
-        source: io::Error,
-    },
-}
-impl core::fmt::Display for IdentityControlError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Preparation(error) => write!(f, "identity request was not submitted: {error}"),
-            Self::Query(error) => write!(f, "identity query failed: {error}"),
-            Self::Unacknowledged {
-                expected_generation,
-                source,
-                ..
-            } => write!(
-                f,
-                "replacement outcome unknown (expected generation {expected_generation}); query saved/applied generations before retrying: {source}"
-            ),
-            Self::Release { state, source } => write!(
-                f,
-                "identity reply received ({:?}, saved {}, applied {}), then handle release failed: {source}",
-                state.outcome, state.saved_generation, state.active.generation
-            ),
-        }
-    }
-}
-impl core::error::Error for IdentityControlError {}
-
 /// Converts portable validation failures only at the host presentation boundary.
 fn invalid(error: ext4_security::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}"))
@@ -279,37 +230,6 @@ pub fn identity_volumes() -> io::Result<Vec<(String, FilesystemUuid)>> {
     }
     Ok(volumes)
 }
-/// Sends one bounded synchronous control; input and output never overlap in Rust.
-/// # Errors
-/// Returns native submission or reply-bound errors.
-fn exchange(file: &FileHandle, code: u32, input: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    let input_length = u32::try_from(input.len()).map_err(io::Error::other)?;
-    let output_length = u32::try_from(output.len()).map_err(io::Error::other)?;
-    let mut returned = 0;
-    let success = unsafe {
-        // SAFETY: The retained handle and disjoint initialized buffers remain valid for this synchronous call.
-        DeviceIoControl(
-            file.raw()?,
-            code,
-            input.as_ptr().cast(),
-            input_length,
-            output.as_mut_ptr().cast(),
-            output_length,
-            &mut returned,
-            ptr::null_mut(),
-        )
-    };
-    if success == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let count = usize::try_from(returned).map_err(io::Error::other)?;
-    if count > output.len() {
-        return Err(io::Error::other(
-            "identity control returned an excessive length",
-        ));
-    }
-    Ok(count)
-}
 /// Allocates the maximum complete control reply before any replacement submission.
 /// # Errors
 /// Returns physical allocation failure.
@@ -322,76 +242,39 @@ fn reply_buffer() -> io::Result<Vec<u8>> {
     output.resize(length, 0);
     Ok(output)
 }
-/// Reads the device name from the driver's authoritative lifecycle contract.
-/// # Errors
-/// Rejects an incomplete build-time device identity contract.
-fn control_path() -> io::Result<&'static str> {
-    include_str!("../../../../crates/ext4-driver/lifecycle-control-v1.txt")
-        .lines()
-        .find_map(|line| line.strip_prefix("win32_device_path="))
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| io::Error::other("driver control device identity is missing"))
-}
-
 /// Queries saved and applied generations without inferring a failed replacement's outcome.
 /// # Errors
 /// Preserves preparation, query and post-reply native release failures.
-pub fn query_identity(uuid: FilesystemUuid) -> Result<MappingState, IdentityControlError> {
-    let mut output = reply_buffer().map_err(IdentityControlError::Preparation)?;
-    let file = FileHandle::open(
-        Path::new(control_path().map_err(IdentityControlError::Preparation)?),
-        0x8000_0000,
-        0,
+pub fn query_identity(uuid: FilesystemUuid) -> Result<MappingState, ControlError<MappingState>> {
+    let mut output = reply_buffer().map_err(ControlError::Preparation)?;
+    control::request(
+        QUERY_IDENTITY_IOCTL,
+        &uuid.bytes(),
+        &mut output,
+        Submission::Query,
+        |bytes| MappingState::decode(bytes).map_err(invalid),
     )
-    .map_err(IdentityControlError::Preparation)?;
-    let result =
-        exchange(&file, QUERY_IDENTITY_IOCTL, &uuid.bytes(), &mut output).and_then(|length| {
-            MappingState::decode(
-                output
-                    .get(..length)
-                    .ok_or_else(|| io::Error::other("invalid reply length"))?,
-            )
-            .map_err(invalid)
-        });
-    let close = file.close();
-    let state = result.map_err(IdentityControlError::Query)?;
-    match close {
-        Ok(()) => Ok(state),
-        Err(source) => Err(IdentityControlError::Release { state, source }),
-    }
 }
 /// Replaces the complete table using a generation CAS; no automatic retry is performed.
 /// # Errors
 /// Submission failures preserve an uncertain effect; callers query before deciding on a retry.
-pub fn replace_identity(replacement: Replacement) -> Result<MappingState, IdentityControlError> {
+pub fn replace_identity(
+    replacement: Replacement,
+) -> Result<MappingState, ControlError<MappingState>> {
     let bytes = replacement
         .encode()
-        .map_err(|error| IdentityControlError::Preparation(invalid(error)))?;
-    let mut output = reply_buffer().map_err(IdentityControlError::Preparation)?;
-    let file = FileHandle::open(
-        Path::new(control_path().map_err(IdentityControlError::Preparation)?),
-        0xc000_0000,
-        0,
+        .map_err(|error| ControlError::Preparation(invalid(error)))?;
+    let mut output = reply_buffer().map_err(ControlError::Preparation)?;
+    control::request(
+        REPLACE_IDENTITY_IOCTL,
+        &bytes,
+        &mut output,
+        Submission::Replacement {
+            uuid: replacement.next().uuid,
+            expected_generation: replacement.expected_generation(),
+        },
+        |bytes| MappingState::decode(bytes).map_err(invalid),
     )
-    .map_err(IdentityControlError::Preparation)?;
-    let result = exchange(&file, REPLACE_IDENTITY_IOCTL, &bytes, &mut output).and_then(|length| {
-        MappingState::decode(
-            output
-                .get(..length)
-                .ok_or_else(|| io::Error::other("invalid reply length"))?,
-        )
-        .map_err(invalid)
-    });
-    let close = file.close();
-    let state = result.map_err(|source| IdentityControlError::Unacknowledged {
-        uuid: replacement.next().uuid,
-        expected_generation: replacement.expected_generation(),
-        source,
-    })?;
-    match close {
-        Ok(()) => Ok(state),
-        Err(source) => Err(IdentityControlError::Release { state, source }),
-    }
 }
 
 /// Opens the process token with authority to derive a private impersonation token.

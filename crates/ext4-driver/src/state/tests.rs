@@ -104,7 +104,7 @@ fn retired_device_header_rejects_actor_access_and_retains_its_tag() -> Result<()
             storage.get().cast(),
             DeviceExtensionKind::CONTROL,
             device,
-            super::ReactorTarget::ControlDevice(crate::identity::IdentityCatalog::empty()),
+            super::ReactorTarget::ControlDevice(crate::administration::ControlCatalog::empty()),
             crate::kernel::operational_trace::OperationalTrace::host_test(),
         )?;
     }
