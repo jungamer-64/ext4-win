@@ -434,6 +434,13 @@ impl LiveInodeRecord {
         memory::copy_exact(self.raw.writable_inline_xattr_region()?, body)
     }
 
+    /// Writes a directory comparison state after the transaction validates emptiness and policy.
+    /// # Errors
+    /// Returns a truncated inode flags field.
+    pub(super) fn set_casefold(&mut self, state: crate::DirectoryCasefold) -> Result<()> {
+        self.raw.set_flags(self.raw.flags()?.with_casefold(state))
+    }
+
     /// Marks this directory inode as HTree indexed.
     /// # Errors
     ///

@@ -1349,17 +1349,6 @@ impl DirectoryBlock {
         Ok(records)
     }
 
-    /// Finds one exact name in this leaf block.
-    /// # Errors
-    ///
-    /// Returns an error when the block checksum or dirent stream is invalid.
-    pub(crate) fn find(&self, name: &Ext4Name) -> Result<Option<DirectoryEntry>> {
-        self.entries()?
-            .into_iter()
-            .find(|entry| entry.name() == name)
-            .map_or(Ok(None), |entry| Ok(Some(entry)))
-    }
-
     /// Checks whether a live entry already owns `name`.
     /// # Errors
     ///
@@ -1853,7 +1842,11 @@ mod tests {
             let name = Ext4Name::new(b"file")?;
             assert!(block.insert(inode(12)?, &name, DirectoryEntryKind::File)?);
             assert_eq!(
-                block.find(&name)?.map(|entry| entry.inode()),
+                block
+                    .entries()?
+                    .into_iter()
+                    .find(|entry| entry.name() == &name)
+                    .map(|entry| entry.inode()),
                 Some(inode(12)?)
             );
             assert!(block.insert(

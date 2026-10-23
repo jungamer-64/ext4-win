@@ -1374,7 +1374,7 @@ impl FeatureSet {
         {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & (INCOMPAT_META_BG | INCOMPAT_MMP | INCOMPAT_CASEFOLD) != 0 {
+        if incompat & (INCOMPAT_META_BG | INCOMPAT_MMP) != 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
         if incompat & (INCOMPAT_INLINE_DATA | INCOMPAT_EA_INODE) != 0
@@ -1943,6 +1943,15 @@ impl Superblock {
             casefold,
             features,
         })
+    }
+
+    /// Requires the feature and encoding needed to change a directory's comparison state.
+    /// # Errors
+    /// Rejects a filesystem without a declared casefold encoding.
+    pub(crate) fn require_casefold(self) -> Result<()> {
+        self.casefold
+            .ok_or(Error::UnsupportedWriteFeature)
+            .map(|_names| ())
     }
 
     /// Selects one directory's comparison contract from immutable mounted encoding authority.

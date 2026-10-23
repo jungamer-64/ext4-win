@@ -5,6 +5,15 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 use crate::memory;
 
+/// Whether a directory uses the filesystem's Unicode comparison contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryCasefold {
+    /// Names are compared as opaque bytes.
+    Disabled,
+    /// Names are compared using the mounted filesystem encoding.
+    Enabled,
+}
+
 /// Raw ext4 directory entry name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ext4Name {

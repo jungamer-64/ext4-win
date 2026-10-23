@@ -107,6 +107,40 @@ enum HtreePathTarget<'name> {
 }
 
 impl MutationResolvePass<'_, '_, '_> {
+    /// Selects Unicode comparison for an empty directory on a casefold-enabled filesystem.
+    ///
+    /// The transition shares the directory's mutation intent and journal publication, so it
+    /// cannot race a child insertion. The filesystem's encoding and strictness are unchanged.
+    /// # Errors
+    /// Returns missing feature, nonempty directory, immutable policy, encryption or I/O failure.
+    pub fn set_directory_casefold(
+        &mut self,
+        directory: TransactionDirectory,
+        state: crate::DirectoryCasefold,
+    ) -> Result<()> {
+        self.edit(|pass| {
+            pass.mutation.volume.superblock.require_casefold()?;
+            let index = pass.mutation.ensure_inode_update(directory.inode())?;
+            let mut raw = pass.mutation.staged_live_inode(index)?;
+            let inode = raw.parse()?;
+            if inode.kind() != InodeKind::Directory {
+                return Err(Error::WrongInodeKind);
+            }
+            let _metadata = inode.metadata_mutation()?;
+            let _entries = pass.require_directory_entry_rename_mutation_for_inode(&inode)?;
+            if !pass.directory_is_empty(&inode)? {
+                return Err(Error::DirectoryNotEmpty);
+            }
+            raw.set_casefold(state)?;
+            pass.mutation
+                .volume
+                .superblock
+                .name_semantics(&raw.parse()?)?;
+            raw.touch_metadata(pass.now)?;
+            pass.mutation.replace_live_inode(index, raw)
+        })
+    }
+
     /// Creates an empty regular file under a directory.
     ///
     /// # Errors
@@ -531,16 +565,26 @@ impl MutationResolvePass<'_, '_, '_> {
             if source_parent == target_parent && source_name == target_name {
                 return Ok(());
             }
+            let renames_source = if source_parent == target_parent {
+                match pass.find_child_entry(target_parent, target_name) {
+                    Ok(target) => target.name() == source.name(),
+                    Err(Error::DirectoryEntryNotFound) => false,
+                    Err(error) => return Err(error),
+                }
+            } else {
+                false
+            };
             match destination {
-                NamespaceDestination::Vacant => {
-                    pass.ensure_child_absent(target_parent, target_name)?
+                NamespaceDestination::Vacant if !renames_source => {
+                    pass.ensure_child_absent(target_parent, target_name)?;
                 }
                 NamespaceDestination::Replace { existing_name } => {
                     reject_reserved_directory_name(existing_name)?;
-                    if existing_name != target_name {
+                    if existing_name != target_name && !renames_source {
                         pass.ensure_child_absent(target_parent, target_name)?;
                     }
                 }
+                NamespaceDestination::Vacant => {}
             }
 
             let child_index = pass.mutation.ensure_inode_update(source.inode())?;
@@ -565,7 +609,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     source.inode(),
                     child_inode.kind(),
                 )?;
-                if matches!(existing_target, ExistingRenameTarget::SameInode) {
+                if matches!(existing_target, ExistingRenameTarget::SameInode) && !renames_source {
                     return Ok(());
                 }
             }
@@ -955,6 +999,13 @@ impl MutationResolvePass<'_, '_, '_> {
         self.require_directory_entry_delete_mutation_for_inode(&parent_inode)?;
         let disk_name = self.directory_lookup_name(&parent_inode, name)?;
         if parent_inode.flags().has_inline_data() {
+            let disk_name = if parent_inode.flags().has_casefold() {
+                self.find_child_entry(parent, name)?
+                    .name()
+                    .try_to_owned_name()?
+            } else {
+                disk_name.try_to_owned_name()?
+            };
             if let Some(result) = self.mutation.edit_inline_directory(
                 &mut raw_parent,
                 |inline_parent, first, second| {
@@ -981,7 +1032,7 @@ impl MutationResolvePass<'_, '_, '_> {
         };
         let removed = location
             .block
-            .remove(&disk_name)?
+            .remove(location.entry.name())?
             .ok_or(Error::DirectoryEntryNotFound)?;
         self.stage_directory_block(location.physical, location.block.into_bytes())?;
         raw_parent.touch_contents(self.now)?;
@@ -1009,22 +1060,34 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::WrongInodeKind);
         }
         self.require_directory_entry_rename_mutation_for_inode(&parent_inode)?;
-        let old_disk_name =
-            self.mutation
-                .encrypt_directory_child_name(&parent_inode, old_name, self.crypto)?;
+        let old_disk_name = if parent_inode.flags().has_casefold() {
+            self.find_child_entry(parent, old_name)?
+                .name()
+                .try_to_owned_name()?
+        } else {
+            self.directory_lookup_name(&parent_inode, old_name)?
+        };
+        self.mutation
+            .volume
+            .superblock
+            .name_semantics(&parent_inode)?
+            .key(new_name.bytes())?;
         let new_disk_name =
             self.mutation
                 .encrypt_directory_child_name(&parent_inode, new_name, self.crypto)?;
+        match self.find_child_entry(parent, new_name) {
+            Ok(target) if target.name() != &old_disk_name => return Err(Error::NameAlreadyExists),
+            Ok(_) | Err(Error::DirectoryEntryNotFound) => {}
+            Err(error) => return Err(error),
+        }
+        if old_disk_name == new_disk_name {
+            return self.find_child_entry(parent, old_name);
+        }
         if parent_inode.flags().has_inline_data() {
             if let Some(result) = self.mutation.edit_inline_directory(
                 &mut raw_parent,
                 |inline_parent, first, second| {
                     let _inline_parent = inline_parent;
-                    if first.find(&new_disk_name)?.is_some()
-                        || second.find(&new_disk_name)?.is_some()
-                    {
-                        return Err(Error::NameAlreadyExists);
-                    }
                     let removed = match first.remove(&old_disk_name)? {
                         Some(entry) => entry,
                         None => second
@@ -1051,12 +1114,6 @@ impl MutationResolvePass<'_, '_, '_> {
             self.mutation.require_extent_storage(&mut raw_parent)?;
             parent_inode = raw_parent.parse()?;
         }
-        if self
-            .directory_entry_location(&parent_inode, DirectoryLookup::Exact(&new_disk_name))?
-            .is_some()
-        {
-            return Err(Error::NameAlreadyExists);
-        }
         let Some(mut source) =
             self.directory_entry_location(&parent_inode, DirectoryLookup::Exact(&old_disk_name))?
         else {
@@ -1066,34 +1123,6 @@ impl MutationResolvePass<'_, '_, '_> {
             parent_inode.directory_storage_kind()?,
             DirectoryStorageKind::HTree
         ) {
-            let tree = self.mutation.mutable_extent_tree(&parent_inode)?;
-            let target_context = self.mutation_htree_context(
-                &parent_inode,
-                &tree,
-                HtreePathTarget::Query(DirectoryLookup::Exact(&new_disk_name)),
-            )?;
-            let (target_physical, _target_block) = self.read_mutation_directory_block(
-                &parent_inode,
-                &tree,
-                LogicalBlock::try_from(u64::from(target_context.path.leaf()?))?,
-            )?;
-            if target_physical == source.physical {
-                let renamed = source
-                    .block
-                    .rename(&old_disk_name, &new_disk_name)?
-                    .ok_or(Error::DirectoryEntryNotFound)?;
-                if renamed.inode() != child {
-                    return Err(Error::InvalidDirectoryEntry);
-                }
-                let replacement = source.block.replace(&new_disk_name, child, kind)?;
-                if replacement.is_none() {
-                    return Err(Error::InvalidDirectoryEntry);
-                }
-                self.stage_directory_block(source.physical, source.block.into_bytes())?;
-                raw_parent.touch_contents(self.now)?;
-                self.mutation.replace_live_inode(inode_index, raw_parent)?;
-                return Ok(renamed);
-            }
             let renamed = source
                 .block
                 .remove(&old_disk_name)?
@@ -1164,6 +1193,13 @@ impl MutationResolvePass<'_, '_, '_> {
             self.mutation
                 .encrypt_directory_child_name(&parent_inode, name, self.crypto)?;
         if parent_inode.flags().has_inline_data() {
+            let disk_name = if parent_inode.flags().has_casefold() {
+                self.find_child_entry(parent, name)?
+                    .name()
+                    .try_to_owned_name()?
+            } else {
+                disk_name.try_to_owned_name()?
+            };
             if let Some(result) = self.mutation.edit_inline_directory(
                 &mut raw_parent,
                 |inline_parent, first, second| {
@@ -1198,7 +1234,7 @@ impl MutationResolvePass<'_, '_, '_> {
         };
         let replaced = location
             .block
-            .replace(&disk_name, child, kind)?
+            .replace(location.entry.name(), child, kind)?
             .ok_or(Error::DirectoryEntryNotFound)?;
         self.stage_directory_block(location.physical, location.block.into_bytes())?;
         raw_parent.touch_contents(self.now)?;

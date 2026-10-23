@@ -53,7 +53,7 @@ const EXT4_APPEND_FL: u32 = 0x0000_0020;
 const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
 /// Inode-body payload storage flag.
 const EXT4_INLINE_DATA_FL: u32 = 0x1000_0000;
-/// Inode flag rejected because casefolded lookup semantics are unsupported.
+/// Inode flag selecting the filesystem Unicode directory comparison contract.
 const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
 /// Inode flag selecting fs-verity authenticated file contents.
 const EXT4_VERITY_FL: u32 = 0x0010_0000;
@@ -1300,6 +1300,13 @@ impl InodeFlags {
     pub(crate) const fn has_casefold(self) -> bool {
         self.0 & EXT4_CASEFOLD_FL != 0
     }
+    /// Selects the directory comparison state without changing unrelated inode flags.
+    pub(crate) const fn with_casefold(self, state: super::name::DirectoryCasefold) -> Self {
+        match state {
+            super::name::DirectoryCasefold::Disabled => Self(self.0 & !EXT4_CASEFOLD_FL),
+            super::name::DirectoryCasefold::Enabled => Self(self.0 | EXT4_CASEFOLD_FL),
+        }
+    }
     /// Whether i_block and the inode-body private attribute contain the payload.
     pub(crate) const fn has_inline_data(self) -> bool {
         self.0 & EXT4_INLINE_DATA_FL != 0
@@ -1359,7 +1366,7 @@ impl InodeFlags {
     /// Returns an error when flags imply unsupported directory write semantics.
     pub fn directory_entry_mutation(self) -> Result<DirectoryEntryMutationCapability> {
         self.require_common_mutation()?;
-        if self.0 & (EXT4_APPEND_FL | EXT4_CASEFOLD_FL) != 0 {
+        if self.0 & EXT4_APPEND_FL != 0 {
             return Err(Error::UnsupportedInodeMutation);
         }
         Ok(DirectoryEntryMutationCapability { _private: () })

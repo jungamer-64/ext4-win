@@ -32,7 +32,7 @@ pub use disk_format::inode::{
     Ext4Uid, FileAllocationSize, FileOffset, FileSize, InodeId, NewDirectoryMetadata,
     NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
 };
-pub use disk_format::name::Ext4Name;
+pub use disk_format::name::{DirectoryCasefold, Ext4Name};
 pub use disk_format::superblock::{
     ClusterCount, ClusterSize, Ext4VolumeLabel, ExtVolumeSignature, FilesystemUuid,
     FreeClusterCount, JournalUuid,

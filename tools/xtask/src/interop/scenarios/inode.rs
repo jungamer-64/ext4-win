@@ -12,6 +12,7 @@ pub(super) fn verify_inode_contracts(
     let root = temporary_root.join("inode-contracts");
     fs::create_dir(&root)?;
     verify_attribute_values(linux, &root)?;
+    verify_casefold_names(linux, &root)?;
     verify_bitmap_publication(linux, &root)?;
     verify_64k_directories(linux, &root)?;
     let image = root.join("filesystem.img");
@@ -35,6 +36,112 @@ pub(super) fn verify_inode_contracts(
     verify_inode_retirement(linux, &root, &image)?;
     verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
+    Ok(())
+}
+
+/// Checks stored spellings and folded index placement with an independent formatter and fsck.
+/// # Errors
+/// Returns formatting, namespace, journal, independent content or index-check failure.
+fn verify_casefold_names(linux: LinuxEnvironment, root: &Path) -> TaskResult<()> {
+    for compact in [false, true] {
+        let case = root.join(format!("casefold-inline{compact}"));
+        fs::create_dir(&case)?;
+        let image = case.join("filesystem.img");
+        File::create(&image)?.set_len(32 * 1024 * 1024)?;
+        let features = format!(
+            "casefold,^metadata_csum_seed,^orphan_file,^sparse_super2,{}",
+            if compact {
+                "inline_data"
+            } else {
+                "^inline_data"
+            }
+        );
+        let mut format = linux.command("mke2fs");
+        format.args([
+            "-q",
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "4096",
+            "-I",
+            "256",
+            "-O",
+            &features,
+            "-E",
+            "encoding=utf8-12.1,encoding_flags=strict,lazy_itable_init=0,lazy_journal_init=0",
+            &linux.tool_path(&image)?,
+        ]);
+        run_checked(format, "casefold image format")?;
+        let directory = drive_internal_core_mutation(&image, |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            let directory = pass.create_directory(
+                root,
+                &ext4_core::Ext4Name::new(b"folded")?,
+                ext4_core::NewDirectoryMetadata::new(
+                    mutation_file_metadata()?.owner(),
+                    ext4_core::Ext4Permissions::new(0o755)?,
+                ),
+            )?;
+            pass.set_directory_casefold(directory, ext4_core::DirectoryCasefold::Enabled)?;
+            Ok(directory.id())
+        })?;
+        let payload = case.join("payload.bin");
+        fs::write(&payload, b"independent value")?;
+        request(
+            linux,
+            &image,
+            &format!("write \"{}\" /folded/Straße", linux.tool_path(&payload)?),
+        )?;
+        drive_internal_core_read(&image, |pass| {
+            if !matches!(
+                pass.lookup_child(directory, &ext4_core::Ext4Name::new(b"STRASSE")?)?,
+                ext4_core::ChildLookup::Found(_)
+            ) {
+                return Err(ext4_core::Error::DirectoryEntryNotFound);
+            }
+            Ok(())
+        })?;
+        drive_internal_core_mutation(&image, |pass| {
+            let directory = pass.directory(directory)?;
+            pass.rename_child(
+                directory,
+                &ext4_core::Ext4Name::new(b"strasse")?,
+                directory,
+                &ext4_core::Ext4Name::new(b"STRASSE")?,
+                ext4_core::NamespaceDestination::Vacant,
+            )?;
+            for index in 0..40 {
+                let name = format!("É-{index:02}-{}", "x".repeat(180));
+                pass.create_file(
+                    directory,
+                    &ext4_core::Ext4Name::new(name.as_bytes())?,
+                    mutation_file_metadata()?,
+                )?;
+            }
+            Ok(())
+        })?;
+        debugfs_require_file(
+            linux,
+            &case,
+            &image,
+            "/folded/STRASSE",
+            b"independent value",
+            1,
+            "casefold spelling",
+        )?;
+        verify_internal_e2fsck_clean(linux, &image, "casefold HTree placement")?;
+        drive_internal_core_mutation(&image, |pass| {
+            let directory = pass.directory(directory)?;
+            pass.unlink_file(directory, &ext4_core::Ext4Name::new(b"strasse")?)?;
+            for index in 0..40 {
+                let alias = format!("é-{index:02}-{}", "X".repeat(180));
+                pass.unlink_file(directory, &ext4_core::Ext4Name::new(alias.as_bytes())?)?;
+            }
+            pass.set_directory_casefold(directory, ext4_core::DirectoryCasefold::Disabled)
+        })?;
+        verify_internal_e2fsck_clean(linux, &image, "casefold empty transition")?;
+    }
     Ok(())
 }
 
