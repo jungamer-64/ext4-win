@@ -89,7 +89,7 @@ pub enum NodeId {
 impl NodeId {
     /// Returns the raw inode for on-disk and external boundary encoding.
     #[must_use]
-    pub(crate) const fn inode(&self) -> InodeId {
+    pub const fn inode(&self) -> InodeId {
         match self {
             Self::File(file) => file.inode(),
             Self::Directory(directory) => directory.inode(),
@@ -126,27 +126,25 @@ pub struct NodeMetadataSnapshot {
     data_policy: NodeDataPolicy,
 }
 
-/// Final inode metadata and opaque extended attributes from one resolved mutation.
+/// Final live metadata or allocation retirement from one resolved mutation.
+///
 /// Publication is permitted only after the mutation's commit durability is established.
+/// Retirement invalidates the previous allocation's identity even when consumers must retain
+/// objects belonging to it until their own resource lifetimes end.
 #[derive(Debug)]
-pub struct NodeMetadataUpdate {
-    /// Inode observation from the staged record.
-    pub(super) metadata: NodeMetadataSnapshot,
-    /// Public xattrs read from that same staged record and its staged external block.
-    pub(super) xattrs: crate::XattrSet,
-}
-
-impl NodeMetadataUpdate {
-    /// Inode fields paired with this update's xattrs.
-    #[must_use]
-    pub const fn metadata(&self) -> NodeMetadataSnapshot {
-        self.metadata
-    }
-    /// Opaque values whose ext4 storage structure was validated by the mutation.
-    #[must_use]
-    pub const fn xattrs(&self) -> &crate::XattrSet {
-        &self.xattrs
-    }
+pub enum NodeMetadataUpdate {
+    /// Metadata and opaque attributes validated from the same staged live inode.
+    Live {
+        /// Inode observation from the staged record.
+        metadata: NodeMetadataSnapshot,
+        /// Public xattrs read from that record and its staged external block.
+        xattrs: crate::XattrSet,
+    },
+    /// The allocation was freed and its inode number may be reused after publication.
+    Retired {
+        /// Inode whose previous allocation no longer exists.
+        inode: InodeId,
+    },
 }
 
 /// Inode-owned data protection, independent from a handle's granted security rights.
