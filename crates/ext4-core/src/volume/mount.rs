@@ -1704,8 +1704,8 @@ pub enum MountProbeTransition {
 pub struct ProbedMount {
     /// Captured primary reads become the mount's sole bootstrap transcript.
     filesystem: StorageTranscript,
-    /// Filesystem identity extracted from admitted recovery geometry.
-    uuid: FilesystemUuid,
+    /// Immutable primary admission used for identity and physical ownership selection.
+    primary: Superblock,
 }
 impl MountProbeOperation {
     /// Starts a primary probe without any permission to mutate storage.
@@ -1737,12 +1737,12 @@ impl MountProbeOperation {
                     Superblock::parse_read_write(&repair)?
                 }
             };
-            Ok(primary.uuid())
+            Ok(primary)
         })();
         match result {
-            Ok(uuid) => MountProbeTransition::Complete(Ok(ProbedMount {
+            Ok(primary) => MountProbeTransition::Complete(Ok(ProbedMount {
                 filesystem: self.filesystem,
-                uuid,
+                primary,
             })),
             Err(Error::OperationSuspended) => match self.filesystem.take_pending_request() {
                 Ok(request) => MountProbeTransition::SubmitLower {
@@ -1758,11 +1758,26 @@ impl MountProbeOperation {
 impl ProbedMount {
     /// UUID used to pin the next-mount policy before recovery can accept any effect.
     pub const fn uuid(&self) -> FilesystemUuid {
-        self.uuid
+        self.primary.uuid()
     }
     /// Consumes primary admission and fixes media authority for the entire mounted session.
-    pub fn start(self, fscrypt_keys: FscryptKeySet, access: super::MountAccess) -> MountOperation {
-        MountOperation {
+    /// # Errors
+    /// Rejects ownership placement or allocation before recovery can write storage.
+    pub fn start(
+        self,
+        fscrypt_keys: FscryptKeySet,
+        access: super::MountAccess,
+        owner: super::MmpOwner,
+        now: super::MmpTime,
+    ) -> Result<MountOperation> {
+        let ownership =
+            match super::MmpOperation::acquire(self.primary, owner, access.media_access())? {
+                Some(operation) => MountOwnership::Starting(memory::try_box(operation)?),
+                None => MountOwnership::Unprotected,
+            };
+        Ok(MountOperation {
+            ownership,
+            now,
             access,
             recovery: match access {
                 super::MountAccess::ReadWrite => None,
@@ -1774,13 +1789,20 @@ impl ProbedMount {
             fscrypt_keys: Some(fscrypt_keys),
             state: MountState::Resolving,
             cancel_requested: false,
-        }
+        })
     }
 }
 
 /// One consuming transition of the mount operation.
 #[derive(Debug)]
 pub enum MountTransition {
+    /// Independent media ownership observation requires a complete monotonic delay.
+    WaitForTimer {
+        /// Delay required before another ownership read can establish admission.
+        seconds: u32,
+        /// Sole timer continuation, retaining all mount and storage ownership.
+        suspended: Box<MountOperation>,
+    },
     /// Submit one owned lower request while the whole mount operation is suspended by value.
     SubmitLower {
         /// Request moved into the lower completion envelope.
@@ -1802,6 +1824,10 @@ pub enum MountTransition {
 /// Completion-driven journaled mount operation.
 #[derive(Debug)]
 pub struct MountOperation {
+    /// Independent ownership is established before journal replay and retained through publication.
+    ownership: MountOwnership,
+    /// Host clock sampled at the current consuming event boundary.
+    now: super::MmpTime,
     /// Media authority fixed before the first mount operation.
     access: super::MountAccess,
     /// Private recovery destination; moved into immutable epoch ownership at publication.
@@ -1814,6 +1840,19 @@ pub struct MountOperation {
     state: MountState,
     /// Cancellation recorded after a durability-changing recovery phase has begun.
     cancel_requested: bool,
+}
+
+/// Media ownership cannot be reconstructed from the journal or a mount UUID.
+#[derive(Debug)]
+enum MountOwnership {
+    /// This filesystem does not require a writable ownership lease, or was observed read only.
+    Unprotected,
+    /// The first direct record read has not yet been submitted.
+    Starting(Box<super::MmpOperation>),
+    /// A lower request or monotonic timer owns the pending acquisition or renewal.
+    Pending(Box<super::MmpOperation>),
+    /// Acknowledged media ownership; every later mutation requires freshness.
+    Held(super::MmpLease),
 }
 
 /// Internal mount phase with no independently inspectable flags.
@@ -2051,7 +2090,12 @@ impl MountOperation {
 
     /// Consumes one concrete event and runs until the next lower request or terminal result.
     #[must_use]
-    pub fn advance(mut self: Box<Self>, event: super::OperationEvent) -> MountTransition {
+    pub fn advance(
+        mut self: Box<Self>,
+        event: super::OperationEvent,
+        now: super::MmpTime,
+    ) -> MountTransition {
+        self.now = now;
         let accepted = match event {
             super::OperationEvent::Admitted => match &self.state {
                 MountState::Resolving => Ok(()),
