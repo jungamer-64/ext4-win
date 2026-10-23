@@ -4,9 +4,9 @@ use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::disk::block::BlockAddress;
-use crate::disk_format::inode::InodeId;
 use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
+use crate::disk_format::inode::InodeId;
 use crate::disk_format::superblock::{MetadataChecksum, Superblock};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
@@ -367,10 +367,6 @@ impl InodeXattrSet {
         self.encryption_context = Some(context);
     }
 
-    /// Borrows the inode-body inline payload tail, including its required empty value.
-    pub(crate) fn inline_data(&self) -> Option<&XattrValue> {
-        self.inline_data.as_ref()
-    }
     /// Installs the private inode-body tail after validating inline storage.
     pub(crate) fn set_inline_data(&mut self, value: XattrValue) {
         self.inline_data = Some(value);
@@ -401,7 +397,9 @@ struct XattrEntry {
 /// Returns an error when a non-empty inline region has the wrong magic or malformed xattr entries.
 pub(crate) fn parse_inline_xattrs(region: &[u8]) -> Result<ParsedXattrs<'_>> {
     if region.len() < EXT4_XATTR_INODE_HEADER_BYTES || region.iter().all(|byte| *byte == 0) {
-        return Ok(ParsedXattrs { entries: Vec::new() });
+        return Ok(ParsedXattrs {
+            entries: Vec::new(),
+        });
     }
     if le_u32(region, disk_offset(0))? != EXT4_XATTR_MAGIC {
         return Err(Error::InvalidXattr);
@@ -457,51 +455,6 @@ pub(crate) fn parse_external_xattr_block<'a>(
         XattrValuePlacement::ExternalBlock,
     )
 }
-
-/// Serializes a complete xattr set into one external xattr block.
-/// # Errors
-///
-/// Returns an error when the set is empty, entries cannot fit in the block, or checksum refresh
-/// cannot write the external block checksum field.
-pub(crate) fn serialize_external_xattr_block(
-    set: &InodeXattrSet,
-    block_size: usize,
-    block: BlockAddress,
-    superblock: &Superblock,
-) -> Result<Vec<u8>> {
-    if set.is_empty() {
-        return Err(Error::InvalidXattr);
-    }
-    let mut bytes = memory::repeated_vec(0_u8, block_size)?;
-    put_le_u32(&mut bytes, disk_offset(0), EXT4_XATTR_MAGIC)?;
-    put_le_u32(&mut bytes, disk_offset(4), 1)?;
-    put_le_u32(&mut bytes, disk_offset(8), 1)?;
-    serialize_xattr_entries(
-        set,
-        &mut bytes,
-        EXT4_XATTR_BLOCK_HEADER_BYTES,
-        0,
-        XattrValuePlacement::ExternalBlock,
-    )?;
-    refresh_external_xattr_checksum(&mut bytes, block, superblock)?;
-    Ok(bytes)
-}
-
-/// Verifies that a set fits in one external xattr block.
-/// # Errors
-///
-/// Returns an error when serializing the set would exceed the supplied block size.
-pub(crate) fn ensure_external_xattrs_fit(set: &InodeXattrSet, block_size: usize) -> Result<()> {
-    let mut bytes = memory::repeated_vec(0_u8, block_size)?;
-    serialize_xattr_entries(
-        set,
-        &mut bytes,
-        EXT4_XATTR_BLOCK_HEADER_BYTES,
-        0,
-        XattrValuePlacement::ExternalBlock,
-    )
-}
-
 /// Authenticates the block's recorded sharing against its recovered inode owners.
 /// # Errors
 ///
@@ -588,7 +541,7 @@ pub(crate) fn merge_xattr_sets(left: InodeXattrSet, right: InodeXattrSet) -> Res
 
 /// Placement rules for serialized xattr values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum XattrValuePlacement {
+pub(crate) enum XattrValuePlacement {
     /// Value offsets are relative to the first in-inode entry.
     InInode,
     /// Value offsets are absolute within the external block.
@@ -613,10 +566,19 @@ impl AttributeValueReference {
     /// Admits complete value bytes only after inode-size, value CRC and entry relation agree.
     /// # Errors
     /// Rejects malformed length or either checksum mismatch.
-    pub(crate) fn admit_value(self, header: &crate::disk_format::inode::AttributeInode, bytes: &[u8], seed: u32) -> Result<XattrValue> {
-        if header.data().size().to_usize()? != self.size || bytes.len() != self.size { return Err(Error::InvalidXattr); }
+    pub(crate) fn admit_value(
+        self,
+        header: &crate::disk_format::inode::AttributeInode,
+        bytes: &[u8],
+        seed: u32,
+    ) -> Result<XattrValue> {
+        if header.data().size().to_usize()? != self.size || bytes.len() != self.size {
+            return Err(Error::InvalidXattr);
+        }
         let checksum = ext4_crc32c(seed, bytes);
-        if checksum != header.value_checksum() { return Err(Error::ChecksumMismatch); }
+        if checksum != header.value_checksum() {
+            return Err(Error::ChecksumMismatch);
+        }
         self.verify_checksum(checksum)?;
         XattrValue::new(bytes)
     }
@@ -625,8 +587,12 @@ impl AttributeValueReference {
     /// Rejects a reference to another value with a different checksum.
     pub(crate) fn verify_checksum(self, checksum: u32) -> Result<()> {
         if self.fingerprint == (self.name.rotate_left(16) ^ checksum)
-            || self.fingerprint == (self.signed_name.rotate_left(16) ^ checksum) { Ok(()) }
-        else { Err(Error::InvalidXattr) }
+            || self.fingerprint == (self.signed_name.rotate_left(16) ^ checksum)
+        {
+            Ok(())
+        } else {
+            Err(Error::InvalidXattr)
+        }
     }
 }
 /// Storage-dependent value with local bounds already established.
@@ -653,19 +619,30 @@ pub(crate) struct ParsedXattrs<'a> {
 }
 impl ParsedXattrs<'_> {
     /// External references are physical entries, independent of shared-block owner count.
-    pub(crate) fn attribute_references(&self) -> impl Iterator<Item = AttributeValueReference> + '_ {
-        self.entries.iter().filter_map(|entry| match entry.value { ParsedValue::Inode(reference) => Some(reference), ParsedValue::Local(_) => None })
+    pub(crate) fn attribute_references(
+        &self,
+    ) -> impl Iterator<Item = AttributeValueReference> + '_ {
+        self.entries.iter().filter_map(|entry| match entry.value {
+            ParsedValue::Inode(reference) => Some(reference),
+            ParsedValue::Local(_) => None,
+        })
     }
     /// Borrows only the local inode-body payload; public external values need not be loaded.
     pub(crate) fn inline_data(&self) -> Option<&[u8]> {
-        self.entries.iter().find_map(|entry| match (&entry.slot, &entry.value) {
-            (ParsedDiskXattrSlot::InlineData, ParsedValue::Local(bytes)) => Some(*bytes), _ => None,
-        })
+        self.entries
+            .iter()
+            .find_map(|entry| match (&entry.slot, &entry.value) {
+                (ParsedDiskXattrSlot::InlineData, ParsedValue::Local(bytes)) => Some(*bytes),
+                _ => None,
+            })
     }
     /// Resolves external storage before publishing a complete opaque attribute set.
     /// # Errors
     /// Propagates value admission, allocation and duplicate-slot failures.
-    pub(crate) fn resolve(self, mut resolve: impl FnMut(AttributeValueReference) -> Result<XattrValue>) -> Result<InodeXattrSet> {
+    pub(crate) fn resolve(
+        self,
+        mut resolve: impl FnMut(AttributeValueReference) -> Result<XattrValue>,
+    ) -> Result<InodeXattrSet> {
         let mut public = Vec::new();
         let mut encryption_context = None;
         let mut inline_data = None;
@@ -674,21 +651,28 @@ impl ParsedXattrs<'_> {
                 ParsedValue::Local(bytes) => XattrValue::new(bytes)?,
                 ParsedValue::Inode(reference) => {
                     let value = resolve(reference)?;
-                    if value.bytes().len() != reference.size { return Err(Error::InvalidXattr); }
+                    if value.bytes().len() != reference.size {
+                        return Err(Error::InvalidXattr);
+                    }
                     value
                 }
             };
             match entry.slot {
                 ParsedDiskXattrSlot::Public(name) => public.try_push((name, value))?,
                 ParsedDiskXattrSlot::EncryptionContext => {
-                    if encryption_context.replace(value).is_some() { return Err(Error::InvalidXattr); }
+                    if encryption_context.replace(value).is_some() {
+                        return Err(Error::InvalidXattr);
+                    }
                 }
                 ParsedDiskXattrSlot::InlineData => {
-                    if inline_data.replace(value).is_some() { return Err(Error::InvalidXattr); }
+                    if inline_data.replace(value).is_some() {
+                        return Err(Error::InvalidXattr);
+                    }
                 }
             }
         }
-        let mut set = InodeXattrSet::from_parts(XattrSet::from_entries(public)?, encryption_context);
+        let mut set =
+            InodeXattrSet::from_parts(XattrSet::from_entries(public)?, encryption_context);
         set.inline_data = inline_data;
         Ok(set)
     }
@@ -719,7 +703,7 @@ enum ParsedDiskXattrSlot {
 
 /// Serialized entry paired with its disk-order key.
 #[derive(Debug)]
-struct SerializedDiskXattr {
+struct PreparedDiskXattr {
     /// Sort key encoded in the ext4 entry.
     key: DiskXattrKey,
     /// Value bytes.
@@ -757,7 +741,7 @@ fn parse_xattr_entries<'a>(
     placement: XattrValuePlacement,
 ) -> Result<ParsedXattrs<'a>> {
     let mut cursor = entry_offset;
-    let mut parsed = Vec::new();
+    let mut parsed: Vec<ParsedDiskXattr> = Vec::new();
     let mut previous_key: Option<DiskXattrKey> = None;
     let entries_end;
 
@@ -795,7 +779,9 @@ fn parse_xattr_entries<'a>(
                 .map_err(|_| Error::ArithmeticOverflow)?;
         let entry_hash = le_u32(storage, disk_offset(cursor).checked_add_bytes(12)?)?;
         if (value_inum == 0 && placement == XattrValuePlacement::InInode && entry_hash != 0)
-            || (value_inum != 0 && (value_offset != 0 || value_size == 0 || value_size > XattrValue::MAX_BYTES)) {
+            || (value_inum != 0
+                && (value_offset != 0 || value_size == 0 || value_size > XattrValue::MAX_BYTES))
+        {
             return Err(Error::InvalidXattr);
         }
 
@@ -816,29 +802,77 @@ fn parse_xattr_entries<'a>(
         {
             return Err(Error::InvalidXattr);
         }
-        let reference = if value_inum == 0 { None } else {
-            let name = local.iter().fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte));
-            let signed_name = local.iter().fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from_le_bytes(i32::from(i8::from_le_bytes([*byte])).to_le_bytes()));
-            Some(AttributeValueReference { inode: InodeId::try_from(value_inum)?, size: value_size, fingerprint: entry_hash, name, signed_name })
+        let reference = if value_inum == 0 {
+            None
+        } else {
+            let name = local
+                .iter()
+                .fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte));
+            let signed_name = local.iter().fold(0_u32, |state, byte| {
+                state.rotate_left(5)
+                    ^ u32::from_le_bytes(i32::from(i8::from_le_bytes([*byte])).to_le_bytes())
+            });
+            Some(AttributeValueReference {
+                inode: InodeId::try_from(value_inum)?,
+                size: value_size,
+                fingerprint: entry_hash,
+                name,
+                signed_name,
+            })
         };
         previous_key = Some(key);
         let slot = logical_slot(index, local)?;
-        if matches!(slot, ParsedDiskXattrSlot::InlineData) && (placement != XattrValuePlacement::InInode || reference.is_some()) { return Err(Error::InvalidXattr); }
-        parsed.try_push(ParsedDiskXattr { slot, reference, value_offset, value_size })?;
+        if parsed.iter().any(|entry| {
+            matches!(
+                (&slot, &entry.slot),
+                (
+                    ParsedDiskXattrSlot::EncryptionContext,
+                    ParsedDiskXattrSlot::EncryptionContext
+                ) | (
+                    ParsedDiskXattrSlot::InlineData,
+                    ParsedDiskXattrSlot::InlineData
+                )
+            )
+        }) {
+            return Err(Error::InvalidXattr);
+        }
+
+        if matches!(slot, ParsedDiskXattrSlot::InlineData)
+            && (placement != XattrValuePlacement::InInode || reference.is_some())
+        {
+            return Err(Error::InvalidXattr);
+        }
+        parsed.try_push(ParsedDiskXattr {
+            slot,
+            reference,
+            value_offset,
+            value_size,
+        })?;
         cursor = align_up(name_end)?;
     }
 
     let mut entries = Vec::new();
     for entry in parsed {
-        let value = if let Some(reference) = entry.reference { ParsedValue::Inode(reference) }
-        else if entry.value_size == 0 { ParsedValue::Local(&[]) }
-        else {
-            let start = value_base.checked_add(entry.value_offset).ok_or(Error::ArithmeticOverflow)?;
-            let end = start.checked_add(entry.value_size).ok_or(Error::ArithmeticOverflow)?;
-            if start % 4 != 0 || start < entries_end { return Err(Error::InvalidXattr); }
+        let value = if let Some(reference) = entry.reference {
+            ParsedValue::Inode(reference)
+        } else if entry.value_size == 0 {
+            ParsedValue::Local(&[])
+        } else {
+            let start = value_base
+                .checked_add(entry.value_offset)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let end = start
+                .checked_add(entry.value_size)
+                .ok_or(Error::ArithmeticOverflow)?;
+            if start % 4 != 0 || start < entries_end {
+                return Err(Error::InvalidXattr);
+            }
             ParsedValue::Local(storage.get(start..end).ok_or(Error::InvalidXattr)?)
         };
-        entries.try_push(ParsedAttribute { slot: entry.slot, value })?;
+        entries.try_push(ParsedAttribute {
+            slot: entry.slot,
+            value,
+        })?;
     }
     Ok(ParsedXattrs { entries })
 }
@@ -849,16 +883,16 @@ fn parse_xattr_entries<'a>(
 fn disk_entries(
     set: &InodeXattrSet,
     placement: XattrValuePlacement,
-) -> Result<Vec<SerializedDiskXattr>> {
+) -> Result<Vec<PreparedDiskXattr>> {
     let mut entries = Vec::new();
     for entry in &set.public.entries {
-        entries.try_push(SerializedDiskXattr {
+        entries.try_push(PreparedDiskXattr {
             key: disk_key(&entry.name)?,
             value: entry.value.try_clone()?,
         })?;
     }
     if let Some(value) = &set.encryption_context {
-        entries.try_push(SerializedDiskXattr {
+        entries.try_push(PreparedDiskXattr {
             key: DiskXattrKey {
                 index: EXT4_XATTR_INDEX_ENCRYPTION,
                 local: memory::copied_slice(ENCRYPTION_CONTEXT_NAME)?,
@@ -870,7 +904,7 @@ fn disk_entries(
         if placement != XattrValuePlacement::InInode {
             return Err(Error::NoSpace);
         }
-        entries.try_push(SerializedDiskXattr {
+        entries.try_push(PreparedDiskXattr {
             key: DiskXattrKey {
                 index: EXT4_XATTR_INDEX_SYSTEM,
                 local: memory::copied_slice(b"data")?,
@@ -885,27 +919,409 @@ fn disk_entries(
 /// Maximum inode-body payload tail while keeping every other attribute in the same body.
 /// # Errors
 /// Returns no-space when the entry table or other values already exhaust the body.
-pub(crate) fn inline_data_capacity(set: &InodeXattrSet, capacity: usize) -> Result<usize> {
+pub(crate) fn inline_data_capacity(
+    set: &InodeXattrSet,
+    capacity: usize,
+    values: AttributeValueStorage,
+) -> Result<usize> {
     let entries = disk_entries(set, XattrValuePlacement::InInode)?;
-    let mut occupied = serialized_entries_end(EXT4_XATTR_INODE_HEADER_BYTES, &entries)?;
+    let mut occupied = serialized_entries_end(
+        EXT4_XATTR_INODE_HEADER_BYTES,
+        entries.iter().map(|entry| &entry.key),
+    )?;
     for entry in &entries {
         if entry.key.index == EXT4_XATTR_INDEX_SYSTEM && entry.key.local == b"data" {
             continue;
         }
-        occupied = occupied
-            .checked_add(align_up(entry.value.bytes().len())?)
-            .ok_or(Error::ArithmeticOverflow)?;
+        if values == AttributeValueStorage::LocalOnly {
+            occupied = occupied
+                .checked_add(align_up(entry.value.bytes().len())?)
+                .ok_or(Error::ArithmeticOverflow)?;
+        }
     }
     align_down(capacity)
         .checked_sub(occupied)
         .ok_or(Error::NoSpace)
 }
 
-/// Serializes xattr entries into a pre-zeroed storage image.
+/// Media-format capability for out-of-line attribute values.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttributeValueStorage {
+    /// Every value must fit inside the selected attribute region.
+    LocalOnly,
+    /// Values may be stored in separate allocated value inodes.
+    Inodes,
+}
+/// Location of a completely staged, checksummed external value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AttributeValueLocation {
+    /// Separate value inode, never a namespace object.
+    pub(crate) inode: InodeId,
+    /// Exact opaque value length.
+    pub(crate) size: usize,
+    /// Whole-value CRC using the filesystem seed.
+    pub(crate) checksum: u32,
+}
+/// Selected value placement before inode allocations are admitted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PlannedValueStorage {
+    /// Payload remains in the entry's physical region.
+    Local,
+    /// A new value inode must be completely staged before encoding this entry.
+    Inode,
+}
+/// One prepared immutable value and its selected physical representation.
+#[derive(Debug)]
+struct PlannedAttribute {
+    /// The exact format key to encode.
+    prepared: PreparedDiskXattr,
+    /// Selected by the pure layout admission pass.
+    storage: PlannedValueStorage,
+}
+/// Complete layout admission, consumed before any allocation-bearing value preparation.
+#[derive(Debug)]
+pub(crate) struct XattrStoragePlan {
+    /// Entry identities and placement have one owner and cannot change during binding.
+    entries: Vec<PlannedAttribute>,
+    /// Local offset origin selected by the containing format.
+    placement: XattrValuePlacement,
+    /// Exact region capacity that layout admission proved sufficient.
+    capacity: usize,
+}
+/// Resolved wire value whose representation no longer includes pending allocation.
+#[derive(Debug)]
+enum EncodedValue {
+    /// Complete local value bytes.
+    Local(XattrValue),
+    /// Complete staged external-value identity and checksum.
+    Inode(AttributeValueLocation),
+}
+impl EncodedValue {
+    /// Local bytes participate in the containing region's offset allocation.
+    fn local(&self) -> Option<&[u8]> {
+        match self {
+            Self::Local(value) => Some(value.bytes()),
+            Self::Inode(_) => None,
+        }
+    }
+    /// Value length is independent of its physical representation.
+    fn size(&self) -> usize {
+        match self {
+            Self::Local(value) => value.bytes().len(),
+            Self::Inode(value) => value.size,
+        }
+    }
+    /// Zero selects local storage on disk.
+    fn inode(&self) -> u32 {
+        match self {
+            Self::Local(_) => 0,
+            Self::Inode(value) => value.inode.as_u32(),
+        }
+    }
+}
+/// One fully resolved entry available to the format encoder.
+#[derive(Debug)]
+struct EncodedAttribute {
+    /// Complete key.
+    key: DiskXattrKey,
+    /// Complete local payload or external location.
+    value: EncodedValue,
+}
+/// Every external value has been staged; encoding cannot start another value allocation.
+#[derive(Debug)]
+pub(crate) struct BoundXattrs {
+    /// Disk-order entries with no pending allocation variant.
+    entries: Vec<EncodedAttribute>,
+    /// The selected containing format.
+    placement: XattrValuePlacement,
+    /// Admitted local region size.
+    capacity: usize,
+}
+impl XattrStoragePlan {
+    /// Computes entry and payload charges without staging any persistent resource.
+    /// # Errors
+    /// Rejects exhausted layout capacity or allocation failure.
+    fn prepare(
+        set: &InodeXattrSet,
+        capacity: usize,
+        placement: XattrValuePlacement,
+        values: AttributeValueStorage,
+    ) -> Result<Self> {
+        let prepared = disk_entries(set, placement)?;
+        let offset = match placement {
+            XattrValuePlacement::InInode => EXT4_XATTR_INODE_HEADER_BYTES,
+            XattrValuePlacement::ExternalBlock => EXT4_XATTR_BLOCK_HEADER_BYTES,
+        };
+        let mut charge = serialized_entries_end(offset, prepared.iter().map(|entry| &entry.key))?;
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(prepared.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for prepared in prepared {
+            charge = charge
+                .checked_add(align_up(prepared.value.bytes().len())?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            entries.try_push(PlannedAttribute {
+                prepared,
+                storage: PlannedValueStorage::Local,
+            })?;
+        }
+        while charge > align_down(capacity) {
+            if values == AttributeValueStorage::LocalOnly {
+                return Err(Error::NoSpace);
+            }
+            let candidate = entries
+                .iter_mut()
+                .filter(|entry| {
+                    entry.storage == PlannedValueStorage::Local
+                        && !entry.prepared.value.bytes().is_empty()
+                        && !(entry.prepared.key.index == EXT4_XATTR_INDEX_SYSTEM
+                            && entry.prepared.key.local == b"data")
+                })
+                .max_by_key(|entry| entry.prepared.value.bytes().len())
+                .ok_or(Error::NoSpace)?;
+            charge = charge
+                .checked_sub(align_up(candidate.prepared.value.bytes().len())?)
+                .ok_or(Error::ArithmeticOverflow)?;
+            candidate.storage = PlannedValueStorage::Inode;
+        }
+        Ok(Self {
+            entries,
+            placement,
+            capacity,
+        })
+    }
+    /// Selects an entire containing region before allocating any external value.
+    /// # Errors
+    /// Returns no-space only after all admitted physical representations have been considered.
+    pub(crate) fn for_inode(
+        set: &InodeXattrSet,
+        body: usize,
+        block: usize,
+        values: AttributeValueStorage,
+    ) -> Result<Self> {
+        for (capacity, placement, storage) in [
+            (
+                body,
+                XattrValuePlacement::InInode,
+                AttributeValueStorage::LocalOnly,
+            ),
+            (
+                block,
+                XattrValuePlacement::ExternalBlock,
+                AttributeValueStorage::LocalOnly,
+            ),
+            (body, XattrValuePlacement::InInode, values),
+            (block, XattrValuePlacement::ExternalBlock, values),
+        ] {
+            match Self::prepare(set, capacity, placement, storage) {
+                Ok(plan) => return Ok(plan),
+                Err(Error::NoSpace) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::NoSpace)
+    }
+    /// Consumes layout admission and prepares exactly the external values that layout requires.
+    /// # Errors
+    /// Propagates value preparation, allocation or mismatched prepared-size failure.
+    pub(crate) fn bind(
+        self,
+        mut allocate: impl FnMut(&[u8]) -> Result<AttributeValueLocation>,
+    ) -> Result<BoundXattrs> {
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(self.entries.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for entry in self.entries {
+            let value = match entry.storage {
+                PlannedValueStorage::Local => EncodedValue::Local(entry.prepared.value),
+                PlannedValueStorage::Inode => {
+                    let location = allocate(entry.prepared.value.bytes())?;
+                    if location.size != entry.prepared.value.bytes().len() {
+                        return Err(Error::InvalidXattr);
+                    }
+                    EncodedValue::Inode(location)
+                }
+            };
+            entries.try_push(EncodedAttribute {
+                key: entry.prepared.key,
+                value,
+            })?;
+        }
+        Ok(BoundXattrs {
+            entries,
+            placement: self.placement,
+            capacity: self.capacity,
+        })
+    }
+}
+impl BoundXattrs {
+    /// The containing region fixed by layout admission.
+    pub(crate) const fn placement(&self) -> XattrValuePlacement {
+        self.placement
+    }
+    /// Encodes the complete admitted inode body.
+    /// # Errors
+    /// Rejects wrong placement or physical allocation/encoding failure.
+    pub(crate) fn inline_bytes(&self) -> Result<Vec<u8>> {
+        if self.placement != XattrValuePlacement::InInode {
+            return Err(Error::InvalidXattr);
+        }
+        let mut bytes = memory::repeated_vec(0, self.capacity)?;
+        if self.entries.is_empty() {
+            return Ok(bytes);
+        }
+        put_le_u32(&mut bytes, disk_offset(0), EXT4_XATTR_MAGIC)?;
+        self.write_into(
+            &mut bytes,
+            EXT4_XATTR_INODE_HEADER_BYTES,
+            EXT4_XATTR_INODE_HEADER_BYTES,
+        )?;
+        Ok(bytes)
+    }
+    /// Encodes one complete external block with its physical checksum domain.
+    /// # Errors
+    /// Rejects wrong placement, empty block or physical allocation/encoding failure.
+    pub(crate) fn external_bytes(
+        &self,
+        block: BlockAddress,
+        superblock: &Superblock,
+    ) -> Result<Vec<u8>> {
+        if self.placement != XattrValuePlacement::ExternalBlock || self.entries.is_empty() {
+            return Err(Error::InvalidXattr);
+        }
+        let mut bytes = memory::repeated_vec(0, self.capacity)?;
+        put_le_u32(&mut bytes, disk_offset(0), EXT4_XATTR_MAGIC)?;
+        put_le_u32(&mut bytes, disk_offset(4), 1)?;
+        put_le_u32(&mut bytes, disk_offset(8), 1)?;
+        self.write_into(&mut bytes, EXT4_XATTR_BLOCK_HEADER_BYTES, 0)?;
+        refresh_external_xattr_checksum(&mut bytes, block, superblock)?;
+        Ok(bytes)
+    }
+    /// Writes already bound entries; allocation choices cannot change at this phase.
+    /// # Errors
+    /// Rejects inconsistent region capacity, offsets or field widths.
+    fn write_into(&self, storage: &mut [u8], entry_offset: usize, value_base: usize) -> Result<()> {
+        if storage.len() != self.capacity {
+            return Err(Error::InvalidXattr);
+        }
+        let entries = &self.entries;
+        let placement = self.placement;
+        let entries_end =
+            serialized_entries_end(entry_offset, entries.iter().map(|entry| &entry.key))?;
+        if entries_end > storage.len() {
+            return Err(Error::NoSpace);
+        }
+
+        let mut value_offsets = memory::repeated_vec(0_usize, entries.len())?;
+        let mut value_cursor = storage.len();
+        for (index, entry) in entries.iter().enumerate().rev() {
+            let Some(value) = entry.value.local() else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            let raw_start = value_cursor
+                .checked_sub(value.len())
+                .ok_or(Error::NoSpace)?;
+            let value_start = align_down(raw_start);
+            if value_start < entries_end || value_start < value_base {
+                return Err(Error::NoSpace);
+            }
+            let value_end = value_start
+                .checked_add(value.len())
+                .ok_or(Error::ArithmeticOverflow)?;
+            memory::copy_exact(
+                storage
+                    .get_mut(value_start..value_end)
+                    .ok_or(Error::NoSpace)?,
+                value,
+            )?;
+            *value_offsets
+                .get_mut(index)
+                .ok_or(Error::ArithmeticOverflow)? = value_start
+                .checked_sub(value_base)
+                .ok_or(Error::ArithmeticOverflow)?;
+            value_cursor = value_start;
+        }
+
+        let mut cursor = entry_offset;
+        for (index, entry) in entries.iter().enumerate() {
+            let name_len = entry.key.local.len();
+            if name_len > usize::from(u8::MAX) {
+                return Err(Error::InvalidXattr);
+            }
+            *storage.get_mut(cursor).ok_or(Error::NoSpace)? =
+                u8::try_from(name_len).map_err(|_| Error::ArithmeticOverflow)?;
+            *storage
+                .get_mut(cursor.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
+                .ok_or(Error::NoSpace)? = entry.key.index;
+            put_le_u16(
+                storage,
+                disk_offset(cursor).checked_add_bytes(2)?,
+                u16::try_from(*value_offsets.get(index).ok_or(Error::ArithmeticOverflow)?)
+                    .map_err(|_| Error::NoSpace)?,
+            )?;
+            put_le_u32(
+                storage,
+                disk_offset(cursor).checked_add_bytes(4)?,
+                entry.value.inode(),
+            )?;
+            put_le_u32(
+                storage,
+                disk_offset(cursor).checked_add_bytes(8)?,
+                u32::try_from(entry.value.size()).map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+            let entry_hash = match &entry.value {
+                EncodedValue::Local(value) => match placement {
+                    XattrValuePlacement::InInode => 0,
+                    XattrValuePlacement::ExternalBlock => {
+                        external_entry_fingerprint(&entry.key.local, value.bytes())
+                    }
+                },
+                EncodedValue::Inode(location) => {
+                    entry
+                        .key
+                        .local
+                        .iter()
+                        .fold(0_u32, |state, byte| state.rotate_left(5) ^ u32::from(*byte))
+                        .rotate_left(16)
+                        ^ location.checksum
+                }
+            };
+            put_le_u32(
+                storage,
+                disk_offset(cursor).checked_add_bytes(12)?,
+                entry_hash,
+            )?;
+            let name_start = cursor
+                .checked_add(EXT4_XATTR_ENTRY_BYTES)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let name_end = name_start
+                .checked_add(name_len)
+                .ok_or(Error::ArithmeticOverflow)?;
+            memory::copy_exact(
+                storage
+                    .get_mut(name_start..name_end)
+                    .ok_or(Error::NoSpace)?,
+                &entry.key.local,
+            )?;
+            cursor = align_up(name_end)?;
+        }
+
+        if placement == XattrValuePlacement::ExternalBlock {
+            // A zero block hash opts out of block sharing; each entry still has its required hash.
+            put_le_u32(storage, disk_offset(12), 0)?;
+        }
+        Ok(())
+    }
+}
+
+/// Encodes local-only values through the same admitted layout and resolved-entry path.
 /// # Errors
-///
-/// Returns an error when entry metadata or value payloads cannot fit in `storage`, or an encoded
-/// name, value size, or value offset exceeds the ext4 field width.
+/// Returns layout, allocation or encoding failure before changing persistent storage.
 fn serialize_xattr_entries(
     set: &InodeXattrSet,
     storage: &mut [u8],
@@ -913,98 +1329,14 @@ fn serialize_xattr_entries(
     value_base: usize,
     placement: XattrValuePlacement,
 ) -> Result<()> {
-    let entries = disk_entries(set, placement)?;
-
-    let entries_end = serialized_entries_end(entry_offset, &entries)?;
-    if entries_end > storage.len() {
-        return Err(Error::NoSpace);
-    }
-
-    let mut value_offsets = memory::repeated_vec(0_usize, entries.len())?;
-    let mut value_cursor = storage.len();
-    for (index, entry) in entries.iter().enumerate().rev() {
-        let value = entry.value.bytes();
-        if value.is_empty() {
-            continue;
-        }
-        let raw_start = value_cursor
-            .checked_sub(value.len())
-            .ok_or(Error::NoSpace)?;
-        let value_start = align_down(raw_start);
-        if value_start < entries_end || value_start < value_base {
-            return Err(Error::NoSpace);
-        }
-        let value_end = value_start
-            .checked_add(value.len())
-            .ok_or(Error::ArithmeticOverflow)?;
-        memory::copy_exact(
-            storage
-                .get_mut(value_start..value_end)
-                .ok_or(Error::NoSpace)?,
-            value,
-        )?;
-        *value_offsets
-            .get_mut(index)
-            .ok_or(Error::ArithmeticOverflow)? = value_start
-            .checked_sub(value_base)
-            .ok_or(Error::ArithmeticOverflow)?;
-        value_cursor = value_start;
-    }
-
-    let mut cursor = entry_offset;
-    for (index, entry) in entries.iter().enumerate() {
-        let name_len = entry.key.local.len();
-        if name_len > usize::from(u8::MAX) {
-            return Err(Error::InvalidXattr);
-        }
-        *storage.get_mut(cursor).ok_or(Error::NoSpace)? =
-            u8::try_from(name_len).map_err(|_| Error::ArithmeticOverflow)?;
-        *storage
-            .get_mut(cursor.checked_add(1).ok_or(Error::ArithmeticOverflow)?)
-            .ok_or(Error::NoSpace)? = entry.key.index;
-        put_le_u16(
-            storage,
-            disk_offset(cursor).checked_add_bytes(2)?,
-            u16::try_from(*value_offsets.get(index).ok_or(Error::ArithmeticOverflow)?)
-                .map_err(|_| Error::NoSpace)?,
-        )?;
-        put_le_u32(storage, disk_offset(cursor).checked_add_bytes(4)?, 0)?;
-        put_le_u32(
-            storage,
-            disk_offset(cursor).checked_add_bytes(8)?,
-            u32::try_from(entry.value.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
-        )?;
-        let entry_hash = match placement {
-            XattrValuePlacement::InInode => 0,
-            XattrValuePlacement::ExternalBlock => {
-                external_entry_fingerprint(&entry.key.local, entry.value.bytes())
-            }
-        };
-        put_le_u32(
-            storage,
-            disk_offset(cursor).checked_add_bytes(12)?,
-            entry_hash,
-        )?;
-        let name_start = cursor
-            .checked_add(EXT4_XATTR_ENTRY_BYTES)
-            .ok_or(Error::ArithmeticOverflow)?;
-        let name_end = name_start
-            .checked_add(name_len)
-            .ok_or(Error::ArithmeticOverflow)?;
-        memory::copy_exact(
-            storage
-                .get_mut(name_start..name_end)
-                .ok_or(Error::NoSpace)?,
-            &entry.key.local,
-        )?;
-        cursor = align_up(name_end)?;
-    }
-
-    if placement == XattrValuePlacement::ExternalBlock {
-        // A zero block hash opts out of block sharing; each entry still has its required hash.
-        put_le_u32(storage, disk_offset(12), 0)?;
-    }
-    Ok(())
+    let plan = XattrStoragePlan::prepare(
+        set,
+        storage.len(),
+        placement,
+        AttributeValueStorage::LocalOnly,
+    )?;
+    plan.bind(|_| Err(Error::InvalidXattr))?
+        .write_into(storage, entry_offset, value_base)
 }
 
 /// External entry identity mixes unsigned name octets with five-bit rotations, then
@@ -1031,13 +1363,16 @@ fn external_entry_fingerprint(name: &[u8], value: &[u8]) -> u32 {
 /// # Errors
 ///
 /// Returns an error when entry-header, name-length, terminator, or alignment arithmetic overflows.
-fn serialized_entries_end(entry_offset: usize, entries: &[SerializedDiskXattr]) -> Result<usize> {
+fn serialized_entries_end<'a>(
+    entry_offset: usize,
+    keys: impl Iterator<Item = &'a DiskXattrKey>,
+) -> Result<usize> {
     let mut cursor = entry_offset;
-    for entry in entries {
+    for key in keys {
         cursor = align_up(
             cursor
                 .checked_add(EXT4_XATTR_ENTRY_BYTES)
-                .and_then(|value| value.checked_add(entry.key.local.len()))
+                .and_then(|value| value.checked_add(key.local.len()))
                 .ok_or(Error::ArithmeticOverflow)?,
         )?;
     }
@@ -1234,7 +1569,7 @@ mod tests {
             92 => b'Z',
             _ => 0,
         });
-        let parsed = parse_inline_xattrs(&region)?;
+        let parsed = parse_inline_xattrs(&region)?.resolve(|_| Err(crate::Error::InvalidXattr))?;
         for (name, value) in [(b"a", b"A"), (b"z", b"Z")] {
             let name = XattrName::new(XattrNamespace::User, name)?;
             assert_eq!(
@@ -1243,8 +1578,9 @@ mod tests {
             );
         }
         assert_eq!(
-            super::parse_xattr_entries(&region, 4, 4, super::XattrValuePlacement::ExternalBlock),
-            Err(crate::Error::InvalidXattr)
+            super::parse_xattr_entries(&region, 4, 4, super::XattrValuePlacement::ExternalBlock)
+                .err(),
+            Some(crate::Error::InvalidXattr)
         );
         Ok(())
     }
@@ -1312,7 +1648,8 @@ mod tests {
         let Ok(image) = image else {
             return;
         };
-        let parsed = parse_inline_xattrs(&image);
+        let parsed = parse_inline_xattrs(&image)
+            .and_then(|parsed| parsed.resolve(|_| Err(crate::Error::InvalidXattr)));
         assert!(parsed.is_ok());
         let Ok(parsed) = parsed else {
             return;

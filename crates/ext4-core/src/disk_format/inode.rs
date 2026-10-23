@@ -307,6 +307,8 @@ pub(crate) struct InodeDataEncoding {
     directory_links: DirectoryLinkEncoding,
     /// Whether inode-body payload interpretation is admitted by the superblock.
     inline_data: bool,
+    /// External attribute values are admitted by the mounted feature profile.
+    attribute_values: bool,
 }
 
 impl InodeDataEncoding {
@@ -318,6 +320,7 @@ impl InodeDataEncoding {
         block_size: BlockSize,
         directory_links: DirectoryLinkEncoding,
         inline_data: bool,
+        attribute_values: bool,
     ) -> Self {
         Self {
             file_size,
@@ -326,6 +329,7 @@ impl InodeDataEncoding {
             block_size,
             directory_links,
             inline_data,
+            attribute_values,
         }
     }
 
@@ -1285,9 +1289,13 @@ impl InodeFlags {
     }
 
     /// Whether this inode owns an external attribute value rather than namespace metadata.
-    pub(crate) const fn is_attribute_value(self) -> bool { self.0 & 0x0020_0000 != 0 }
+    pub(crate) const fn is_attribute_value(self) -> bool {
+        self.0 & 0x0020_0000 != 0
+    }
     /// Selects an external attribute value with ordinary extent storage.
-    pub(crate) const fn into_attribute_value(self) -> Self { Self((self.0 & !EXT4_INLINE_DATA_FL) | 0x0020_0000 | EXT4_EXTENTS_FL) }
+    pub(crate) const fn into_attribute_value(self) -> Self {
+        Self((self.0 & !EXT4_INLINE_DATA_FL) | 0x0020_0000 | EXT4_EXTENTS_FL)
+    }
     /// Whether i_block and the inode-body private attribute contain the payload.
     pub(crate) const fn has_inline_data(self) -> bool {
         self.0 & EXT4_INLINE_DATA_FL != 0
@@ -1672,20 +1680,39 @@ impl AttributeInode {
     /// Rejects namespace inodes, unsupported storage/protection, zero references and wrong link count.
     pub(crate) fn parse(id: InodeId, raw: &[u8], encoding: InodeDataEncoding) -> Result<Self> {
         let data = InodeData::parse(id, raw, encoding)?;
-        if !data.flags.is_attribute_value() || data.kind() != InodeKind::File || !data.flags.has_extent_tree()
-            || data.flags.has_inline_data() || data.flags.protection().is_encrypted() || data.flags.protection().is_verity()
-            || le_u16(raw, disk_offset(26))? != 1 { return Err(Error::InvalidXattr); }
+        if !encoding.attribute_values
+            || !data.flags.is_attribute_value()
+            || data.kind() != InodeKind::File
+            || !data.flags.has_extent_tree()
+            || data.flags.has_inline_data()
+            || data.flags.protection().is_encrypted()
+            || data.flags.protection().is_verity()
+            || le_u16(raw, disk_offset(26))? != 1
+        {
+            return Err(Error::InvalidXattr);
+        }
         // The high half occupies i_ctime; the low half occupies Linux i_osd1/i_version.
-        let count = (u64::from(le_u32(raw, disk_offset(12))?) << 32) | u64::from(le_u32(raw, disk_offset(36))?);
+        let count = (u64::from(le_u32(raw, disk_offset(12))?) << 32)
+            | u64::from(le_u32(raw, disk_offset(36))?);
         let references = core::num::NonZeroU64::new(count).ok_or(Error::InvalidXattr)?;
-        Ok(Self { data, references, value_checksum: le_u32(raw, disk_offset(8))? })
+        Ok(Self {
+            data,
+            references,
+            value_checksum: le_u32(raw, disk_offset(8))?,
+        })
     }
     /// Allocation geometry carries no namespace mutation authority.
-    pub(crate) const fn data(&self) -> &InodeData { &self.data }
+    pub(crate) const fn data(&self) -> &InodeData {
+        &self.data
+    }
     /// Positive physical-entry reference count.
-    pub(crate) const fn references(&self) -> u64 { self.references.get() }
+    pub(crate) const fn references(&self) -> u64 {
+        self.references.get()
+    }
     /// Expected checksum of the complete opaque value.
-    pub(crate) const fn value_checksum(&self) -> u32 { self.value_checksum }
+    pub(crate) const fn value_checksum(&self) -> u32 {
+        self.value_checksum
+    }
 }
 
 /// Inode storage facts shared by live access and unlinked-inode recovery.
@@ -1799,8 +1826,13 @@ impl Inode {
     /// Returns an error for malformed storage facts or a zero link count.
     pub(crate) fn parse(id: InodeId, raw: &[u8], encoding: InodeDataEncoding) -> Result<Self> {
         let data = InodeData::parse(id, raw, encoding)?;
-        if data.flags.is_attribute_value() { return Err(Error::InvalidInode); }
-        let owner = Ext4Owner::new(Ext4Uid::from_u32(parse_uid(raw)?), Ext4Gid::from_u32(parse_gid(raw)?));
+        if data.flags.is_attribute_value() {
+            return Err(Error::InvalidInode);
+        }
+        let owner = Ext4Owner::new(
+            Ext4Uid::from_u32(parse_uid(raw)?),
+            Ext4Gid::from_u32(parse_gid(raw)?),
+        );
         let times = parse_times(raw)?;
         let count = le_u16(raw, disk_offset(26))?;
         let links_count = if data.kind() == InodeKind::Directory && count == 1 {
@@ -1813,7 +1845,12 @@ impl Inode {
         } else {
             Ext4LinkCount::new(count)?
         };
-        Ok(Self { data, links_count, owner, times })
+        Ok(Self {
+            data,
+            links_count,
+            owner,
+            times,
+        })
     }
 
     /// Inode identifier.
@@ -2172,6 +2209,7 @@ mod tests {
             BlockSize::from_superblock_log(0)?,
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
             false,
+            false,
         ))
     }
 
@@ -2289,6 +2327,7 @@ mod tests {
             block_size,
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
             false,
+            false,
         );
 
         assert_eq!(
@@ -2391,6 +2430,7 @@ mod tests {
             InodeBlockCountEncoding::LegacySectors,
             block_size,
             crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+            false,
             false,
         );
         let largest_block_aligned_legacy_sectors = u64::from(u32::MAX) - 1;

@@ -3,7 +3,8 @@
 use super::*;
 use crate::disk::storage::StorageTranscript;
 use crate::disk_format::extent::{ExtentAllocation, ExtentAllocationCursor};
-use crate::disk_format::inode::InodeData;
+use crate::disk_format::inode::{AttributeInode, InodeData};
+use crate::disk_format::xattr::{AttributeValueReference, AttributeValueStorage};
 use crate::volume::orphan::ValidatedOrphanInventory;
 
 /// Allocation evidence stays private until every owner and bitmap has been checked.
@@ -14,6 +15,10 @@ pub(in crate::volume) struct AllocationIndexBuild {
     phase: IndexPhase,
     /// Physical ranges gathered once; sorting and conflict checking precede publication.
     ranges: Vec<AllocationRange>,
+    /// One fact for each allocated, non-orphan value inode.
+    attributes: Vec<AttributeOwnership>,
+    /// Physical attribute entries, counting each shared external block once.
+    attribute_references: Vec<AttributeValueReference>,
 }
 
 /// Only the inode phase contains a complete allocation snapshot.
@@ -135,6 +140,46 @@ struct AllocationInventory {
     xattrs: Vec<XattrOwnerCount>,
 }
 
+/// Header facts collected under the immutable recovered mount snapshot.
+#[derive(Debug)]
+struct AttributeOwnership {
+    /// Allocated value identity, ordered by inode bitmap traversal.
+    inode: InodeId,
+    /// Exact count declared by the attribute inode header.
+    references: u64,
+    /// Expected size shared by all of its entries.
+    size: usize,
+    /// Expected whole-value checksum recorded in the value header.
+    checksum: u32,
+}
+/// Checks the complete physical-entry graph before granting mounted allocation authority.
+/// # Errors
+/// Rejects dangling values, wrong size/hash relations and inconsistent shared reference counts.
+fn validate_attribute_ownership(
+    attributes: &[AttributeOwnership],
+    entries: &[AttributeValueReference],
+) -> Result<()> {
+    let mut counts = memory::repeated_vec(0_u64, attributes.len())?;
+    for entry in entries {
+        let index = attributes
+            .binary_search_by_key(&entry.inode, |attribute| attribute.inode)
+            .map_err(|_| Error::InvalidXattr)?;
+        let header = attributes.get(index).ok_or(Error::InvalidXattr)?;
+        if header.size != entry.size {
+            return Err(Error::InvalidXattr);
+        }
+        entry.verify_checksum(header.checksum)?;
+        let count = counts.get_mut(index).ok_or(Error::InvalidXattr)?;
+        *count = count.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+    }
+    for (header, count) in attributes.iter().zip(counts) {
+        if header.references != count {
+            return Err(Error::InvalidXattr);
+        }
+    }
+    Ok(())
+}
+
 /// Number of allocated inodes pointing at one external xattr block, independent of BIGALLOC.
 #[derive(Debug, Eq, PartialEq)]
 struct XattrOwnerCount {
@@ -182,6 +227,8 @@ impl AllocationIndexBuild {
                 layouts: Vec::new(),
             },
             ranges: Vec::new(),
+            attributes: Vec::new(),
+            attribute_references: Vec::new(),
         }
     }
 
@@ -324,7 +371,14 @@ impl AllocationIndexBuild {
                             let raw = read_group_inode_record(
                                 reader, superblock, snapshot, position, table,
                             )?;
-                            *scan = begin_inode_scan(raw, superblock, orphans, &mut self.ranges)?;
+                            *scan = begin_inode_scan(
+                                raw,
+                                superblock,
+                                orphans,
+                                &mut self.ranges,
+                                &mut self.attributes,
+                                &mut self.attribute_references,
+                            )?;
                             *bit = bit.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                             return Ok(None);
                         }
@@ -353,8 +407,20 @@ impl AllocationIndexBuild {
                         superblock,
                         xattr.owners,
                     )?;
+                    if superblock.attribute_value_storage() == AttributeValueStorage::Inodes {
+                        for reference in xattr_storage::parse_external_xattr_block(
+                            &bytes,
+                            xattr.block,
+                            superblock,
+                        )?
+                        .attribute_references()
+                        {
+                            self.attribute_references.try_push(reference)?;
+                        }
+                    }
                     *next = next.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
                 } else {
+                    validate_attribute_ownership(&self.attributes, &self.attribute_references)?;
                     let index =
                         core::mem::replace(&mut inventory.clusters, ClusterReferenceIndex::new());
                     self.phase = IndexPhase::Finished;
@@ -375,6 +441,8 @@ fn begin_inode_scan(
     superblock: &Superblock,
     orphans: &ValidatedOrphanInventory,
     ranges: &mut Vec<AllocationRange>,
+    attributes: &mut Vec<AttributeOwnership>,
+    attribute_references: &mut Vec<AttributeValueReference>,
 ) -> Result<InodeAllocationScan> {
     // Reserved bitmap slots can denote entirely uninitialized inode records.
     if raw.id.as_u32() < superblock.first_inode().as_u32()
@@ -391,7 +459,33 @@ fn begin_inode_scan(
     if let Some(block) = raw.xattr_block()? {
         ranges.try_push(AllocationRange::new(block, 1, BlockOwnership::SharedXattr)?)?;
     }
-    if !orphans.contains(raw.id)
+    let attribute = raw.flags()?.is_attribute_value();
+    if attribute && superblock.attribute_value_storage() != AttributeValueStorage::Inodes {
+        return Err(Error::InvalidXattr);
+    }
+    if superblock.attribute_value_storage() == AttributeValueStorage::Inodes {
+        let body = xattr_storage::parse_inline_xattrs(raw.inline_xattr_region()?)?;
+        for reference in body.attribute_references() {
+            if attribute {
+                return Err(Error::InvalidXattr);
+            }
+            attribute_references.try_push(reference)?;
+        }
+        if attribute && !orphans.contains(raw.id) {
+            let header = AttributeInode::parse(raw.id, raw.bytes, raw.encoding)?;
+            if raw.xattr_block()?.is_some() {
+                return Err(Error::InvalidXattr);
+            }
+            attributes.try_push(AttributeOwnership {
+                inode: raw.id,
+                references: header.references(),
+                size: header.data().size().to_usize()?,
+                checksum: header.value_checksum(),
+            })?;
+        }
+    }
+    if !attribute
+        && !orphans.contains(raw.id)
         && let Err(error) = raw.parse()
     {
         if raw.flags()?.has_inline_data() {

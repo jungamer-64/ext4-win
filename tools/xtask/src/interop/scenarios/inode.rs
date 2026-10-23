@@ -11,6 +11,7 @@ pub(super) fn verify_inode_contracts(
 ) -> TaskResult<()> {
     let root = temporary_root.join("inode-contracts");
     fs::create_dir(&root)?;
+    verify_attribute_values(linux, &root)?;
     verify_bitmap_publication(linux, &root)?;
     verify_64k_directories(linux, &root)?;
     let image = root.join("filesystem.img");
@@ -34,6 +35,119 @@ pub(super) fn verify_inode_contracts(
     verify_inode_retirement(linux, &root, &image)?;
     verify_directory_links(linux, &root, &image)?;
     println!("ext4 inode field and data-journaling contracts: PASS");
+    Ok(())
+}
+
+/// Reads independently created value inodes, then checks production replacement and reclamation.
+/// # Errors
+/// Returns formatting, checksum, value, namespace or independent allocation-oracle failure.
+fn verify_attribute_values(linux: LinuxEnvironment, root: &Path) -> TaskResult<()> {
+    for (compact, inode_size) in [(false, 128_u16), (false, 256), (true, 256)] {
+        let case = root.join(format!(
+            "attribute-values-inline{compact}-inode{inode_size}"
+        ));
+        fs::create_dir(&case)?;
+        let image = case.join("filesystem.img");
+        File::create(&image)?.set_len(32 * 1024 * 1024)?;
+        let features = format!(
+            "ea_inode,^metadata_csum_seed,^orphan_file,^sparse_super2,{}",
+            if compact {
+                "inline_data"
+            } else {
+                "^inline_data"
+            }
+        );
+        let mut format = linux.command("mke2fs");
+        format.args([
+            "-q",
+            "-F",
+            "-t",
+            "ext4",
+            "-b",
+            "4096",
+            "-I",
+            &inode_size.to_string(),
+            "-O",
+            &features,
+            "-E",
+            "lazy_itable_init=0,lazy_journal_init=0",
+            &linux.tool_path(&image)?,
+        ]);
+        run_checked(format, "attribute value image format")?;
+        let baseline = debugfs_free_space(linux, &image)?;
+        let payload = case.join("payload.bin");
+        fs::write(&payload, b"payload")?;
+        request(
+            linux,
+            &image,
+            &format!("write \"{}\" /payload", linux.tool_path(&payload)?),
+        )?;
+        let value = vec![0x61; 65_536];
+        let value_path = case.join("value.bin");
+        fs::write(&value_path, &value)?;
+        request(
+            linux,
+            &image,
+            &format!(
+                "ea_set -f \"{}\" /payload user.ext4win.interop",
+                linux.tool_path(&value_path)?
+            ),
+        )?;
+        verify_internal_e2fsck_clean(linux, &image, "independent attribute value baseline")?;
+        let name = ext4_core::Ext4Name::new(b"payload").map_err(core_task_error)?;
+        drive_internal_core_read(&image, |pass| {
+            let ext4_core::ChildLookup::Found(child) =
+                pass.lookup_child(ext4_core::DirectoryNodeId::ROOT, &name)?
+            else {
+                return Err(ext4_core::Error::DirectoryEntryNotFound);
+            };
+            let observed = pass
+                .read_xattr(*child.node(), &mutation_xattr_name()?)?
+                .ok_or(ext4_core::Error::InvalidXattr)?;
+            if observed.bytes() != value {
+                return Err(ext4_core::Error::InvalidXattr);
+            }
+            Ok(())
+        })?;
+        let replacement = vec![0x42; 32_768];
+        drive_internal_core_mutation(&image, |pass| {
+            let (_, file) = mutation_root_file(pass, &name)?;
+            let node = pass.node(ext4_core::NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                mutation_xattr_name()?,
+                ext4_core::XattrValue::new(&replacement)?,
+            )?;
+            let file = pass.file(file)?;
+            pass.write_file_range(file, ext4_core::FileOffset::ZERO, b"PAYLOAD")
+        })?;
+        debugfs_require_xattr(
+            linux,
+            &case,
+            &image,
+            "/payload",
+            &replacement,
+            "value replacement",
+        )?;
+        debugfs_require_file(
+            linux,
+            &case,
+            &image,
+            "/payload",
+            b"PAYLOAD",
+            1,
+            "value owner payload",
+        )?;
+        verify_internal_e2fsck_clean(linux, &image, "attribute value replacement")?;
+        drive_internal_core_mutation(&image, |pass| {
+            let root = pass.directory(ext4_core::DirectoryNodeId::ROOT)?;
+            pass.unlink_file(root, &name)
+        })?;
+        verify_internal_e2fsck_clean(linux, &image, "attribute value final release")?;
+        if debugfs_free_space(linux, &image)? != baseline {
+            return Err(io::Error::other("attribute value release leaked storage").into());
+        }
+    }
     Ok(())
 }
 

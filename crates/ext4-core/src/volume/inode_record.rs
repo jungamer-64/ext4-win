@@ -45,8 +45,23 @@ pub(super) struct LiveInodeRecord {
     raw: RawInodeRecord<Vec<u8>>,
 }
 
+/// Complete private inline-prefix/size successor applied with its admitted attribute body.
+#[derive(Debug)]
+pub(super) struct InlinePayloadUpdate {
+    /// New i_block contents.
+    prefix: [u8; 60],
+    /// Size encoded under the selected file or directory contract.
+    size: EncodedInodeSize,
+}
+impl InlinePayloadUpdate {
+    /// Retains checked payload fields until the attribute body can be replaced in the same step.
+    pub(super) const fn new(prefix: [u8; 60], size: EncodedInodeSize) -> Self {
+        Self { prefix, size }
+    }
+}
+
 /// Allocated external attribute storage with no namespace owner or timestamp interpretation.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(super) struct AttributeInodeRecord {
     /// Sole writable record image; header validation establishes its attribute role.
     raw: RawInodeRecord<Vec<u8>>,
@@ -78,7 +93,7 @@ pub(super) struct DeletedInodeRecord {
     raw: RawInodeRecord<Vec<u8>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 /// Inode record staged for commit after a typed state transition.
 pub(super) enum StagedInodeRecord {
     /// Live inode metadata rewrite.
@@ -114,7 +129,9 @@ impl From<LiveInodeRecord> for StagedInodeRecord {
 }
 
 impl From<AttributeInodeRecord> for StagedInodeRecord {
-    fn from(record: AttributeInodeRecord) -> Self { Self::Attribute(record) }
+    fn from(record: AttributeInodeRecord) -> Self {
+        Self::Attribute(record)
+    }
 }
 impl From<DeletedInodeRecord> for StagedInodeRecord {
     fn from(record: DeletedInodeRecord) -> Self {
@@ -177,11 +194,27 @@ impl AllocatedInodeRecord {
     /// Initializes a positive-reference attribute value before allocating its extent payload.
     /// # Errors
     /// Propagates metadata, size or field encoding failures.
-    pub(super) fn initialize_attribute_value(mut self, size: FileSize, checksum: u32, block_size: BlockSize) -> Result<AttributeInodeRecord> {
-        self.raw.initialize_file(NewFileMetadata::new(Ext4Owner::new(crate::Ext4Uid::from_u32(0), crate::Ext4Gid::from_u32(0)), Ext4Permissions::new(0o600)?),
-            InodeFlags::from_u32(0), Ext4Timestamp::from_seconds(0), block_size, InodeTimestampEncoding::ExtraFields)?;
-        self.raw.set_flags(InodeFlags::from_u32(0).into_attribute_value())?;
-        self.raw.set_encoded_size(self.raw.encoding.encode_file_size(size)?)?;
+    pub(super) fn initialize_attribute_value(
+        mut self,
+        size: FileSize,
+        checksum: u32,
+        block_size: BlockSize,
+        timestamp_encoding: InodeTimestampEncoding,
+    ) -> Result<AttributeInodeRecord> {
+        self.raw.initialize_file(
+            NewFileMetadata::new(
+                Ext4Owner::new(crate::Ext4Uid::from_u32(0), crate::Ext4Gid::from_u32(0)),
+                Ext4Permissions::new(0o600)?,
+            ),
+            InodeFlags::from_u32(0),
+            Ext4Timestamp::from_seconds(0),
+            block_size,
+            timestamp_encoding,
+        )?;
+        self.raw
+            .set_flags(InodeFlags::from_u32(0).into_attribute_value())?;
+        self.raw
+            .set_encoded_size(self.raw.encoding.encode_file_size(size)?)?;
         put_le_u32(&mut self.raw.bytes, disk_offset(8), checksum)?;
         put_le_u32(&mut self.raw.bytes, disk_offset(12), 0)?;
         put_le_u32(&mut self.raw.bytes, disk_offset(36), 1)?;
@@ -383,15 +416,24 @@ impl LiveInodeRecord {
         self.raw.set_extent_root_bytes(root)?;
         self.raw.set_flags(flags.into_extent_storage())
     }
-    /// Replaces i_block bytes while retaining the inode's inline-data interpretation.
+    /// Applies complete inline payload and body fields within one private record transition.
     /// # Errors
-    /// Rejects non-inline storage or truncated fields.
-    pub(super) fn set_inline_payload(&mut self, bytes: &[u8; 60]) -> Result<()> {
-        if !self.raw.flags()?.has_inline_data() {
+    /// Rejects non-inline storage, mismatched body capacity or truncated fields.
+    pub(super) fn replace_inline_payload(
+        &mut self,
+        update: InlinePayloadUpdate,
+        body: &[u8],
+    ) -> Result<()> {
+        if !self.raw.flags()?.has_inline_data()
+            || body.len() != self.raw.inline_xattr_region()?.len()
+        {
             return Err(Error::InvalidInode);
         }
-        self.raw.set_extent_root_bytes(bytes)
+        self.raw.set_extent_root_bytes(&update.prefix)?;
+        self.raw.set_encoded_size(update.size)?;
+        memory::copy_exact(self.raw.writable_inline_xattr_region()?, body)
     }
+
     /// Marks this directory inode as HTree indexed.
     /// # Errors
     ///
@@ -467,26 +509,6 @@ impl LiveInodeRecord {
     /// Returns an error when either inode size field is not writable.
     pub(super) fn set_encoded_size(&mut self, size: EncodedInodeSize) -> Result<()> {
         self.raw.set_encoded_size(size)
-    }
-
-    /// Writes an allocation count already validated by the mounted inode encoding.
-    /// # Errors
-    ///
-    /// Returns an error when block-count or inode-flag fields are not writable.
-    pub(super) fn set_encoded_allocation_size(
-        &mut self,
-        block_count: EncodedInodeBlockCount,
-    ) -> Result<()> {
-        self.raw.set_encoded_allocation_size(block_count)
-    }
-
-    /// Writes serialized extent root bytes.
-    /// # Errors
-    ///
-    /// Returns an error when the inode record does not contain the full `i_block` extent-root
-    /// storage.
-    pub(super) fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
-        self.raw.set_extent_root_bytes(root)
     }
 
     /// Returns the external xattr block referenced by this inode.
@@ -622,48 +644,95 @@ impl AttributeInodeRecord {
     /// Validated value header; hash and reference fields are never decoded as time.
     /// # Errors
     /// Rejects malformed attribute-inode storage.
-    pub(super) fn parse(&self) -> Result<AttributeInode> { AttributeInode::parse(self.raw.id, &self.raw.bytes, self.raw.encoding) }
+    pub(super) fn parse(&self) -> Result<AttributeInode> {
+        AttributeInode::parse(self.raw.id, &self.raw.bytes, self.raw.encoding)
+    }
     /// Record identity for transaction resource admission.
-    pub(super) const fn id(&self) -> InodeId { self.raw.id }
+    pub(super) const fn id(&self) -> InodeId {
+        self.raw.id
+    }
     /// Fallible independent copy for transaction staging.
     /// # Errors
     /// Propagates allocation failure.
-    pub(super) fn try_clone(&self) -> Result<Self> { Ok(Self { raw: self.raw.try_clone_record()? }) }
+    pub(super) fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            raw: self.raw.try_clone_record()?,
+        })
+    }
     /// Writes a still-positive reference count; terminal release consumes this record separately.
     /// # Errors
     /// Rejects zero and truncated fields.
     pub(super) fn set_references(&mut self, references: core::num::NonZeroU64) -> Result<()> {
-        put_le_u32(&mut self.raw.bytes, disk_offset(12), u32::try_from(references.get() >> 32).map_err(|_| Error::ArithmeticOverflow)?)?;
-        put_le_u32(&mut self.raw.bytes, disk_offset(36), u32::try_from(references.get() & u64::from(u32::MAX)).map_err(|_| Error::ArithmeticOverflow)?)
+        put_le_u32(
+            &mut self.raw.bytes,
+            disk_offset(12),
+            u32::try_from(references.get() >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+        )?;
+        put_le_u32(
+            &mut self.raw.bytes,
+            disk_offset(36),
+            u32::try_from(references.get() & u64::from(u32::MAX))
+                .map_err(|_| Error::ArithmeticOverflow)?,
+        )
     }
     /// Consumes the final reference after all value blocks have been released in this transaction.
     /// # Errors
     /// Rejects nonterminal reference count or failed inode-field encoding.
-    pub(super) fn retire(mut self, now: Ext4Timestamp, block_size: BlockSize) -> Result<DeletedInodeRecord> {
-        if self.parse()?.references() != 1 { return Err(Error::InvalidXattr); }
-        self.raw.set_deletion_time(now.base_seconds_bits()?)?;
+    pub(super) fn retire(mut self, block_size: BlockSize) -> Result<DeletedInodeRecord> {
+        if self.parse()?.references() != 1 {
+            return Err(Error::InvalidXattr);
+        }
+        // Internal value ownership carries no namespace clock. A nonzero retirement marker
+        // records deletion without interpreting the overloaded reference fields as a timestamp.
+        self.raw.set_deletion_time(1)?;
         self.raw.set_deleted_links_count()?;
-        self.raw.set_encoded_size(self.raw.encoding.encode_file_size(FileSize::from_bytes(0))?)?;
-        self.raw.set_encoded_allocation_size(self.raw.encoding.encode_allocation_size(FileAllocationSize::from_bytes(0))?)?;
-        self.raw.set_flags(InodeFlags::from_u32(0).with_extent_tree())?;
+        self.raw.set_encoded_size(
+            self.raw
+                .encoding
+                .encode_file_size(FileSize::from_bytes(0))?,
+        )?;
+        self.raw.set_encoded_allocation_size(
+            self.raw
+                .encoding
+                .encode_allocation_size(FileAllocationSize::from_bytes(0))?,
+        )?;
+        self.raw
+            .set_flags(InodeFlags::from_u32(0).with_extent_tree())?;
         self.raw.set_xattr_block(None)?;
         self.raw.clear_inline_xattr_region()?;
-        let empty = MutableExtentTree::from_extents(Vec::new())?.serialize(block_size, ExtentTreeContext::none())?;
+        let empty = MutableExtentTree::from_extents(Vec::new())?
+            .serialize(block_size, ExtentTreeContext::none())?;
         self.raw.set_extent_root_bytes(empty.inode_root())?;
         Ok(DeletedInodeRecord { raw: self.raw })
     }
 }
 impl ExtentInodeRecord for LiveInodeRecord {
-    fn data(&self) -> Result<InodeData> { InodeData::parse(self.raw.id, &self.raw.bytes, self.raw.encoding) }
-    fn xattr_block(&self) -> Result<Option<BlockAddress>> { self.raw.xattr_block() }
-    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> { self.raw.set_extent_root_bytes(root) }
-    fn set_encoded_allocation_size(&mut self, size: EncodedInodeBlockCount) -> Result<()> { self.raw.set_encoded_allocation_size(size) }
+    fn data(&self) -> Result<InodeData> {
+        InodeData::parse(self.raw.id, &self.raw.bytes, self.raw.encoding)
+    }
+    fn xattr_block(&self) -> Result<Option<BlockAddress>> {
+        self.raw.xattr_block()
+    }
+    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
+        self.raw.set_extent_root_bytes(root)
+    }
+    fn set_encoded_allocation_size(&mut self, size: EncodedInodeBlockCount) -> Result<()> {
+        self.raw.set_encoded_allocation_size(size)
+    }
 }
 impl ExtentInodeRecord for AttributeInodeRecord {
-    fn data(&self) -> Result<InodeData> { InodeData::parse(self.raw.id, &self.raw.bytes, self.raw.encoding) }
-    fn xattr_block(&self) -> Result<Option<BlockAddress>> { self.raw.xattr_block() }
-    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> { self.raw.set_extent_root_bytes(root) }
-    fn set_encoded_allocation_size(&mut self, size: EncodedInodeBlockCount) -> Result<()> { self.raw.set_encoded_allocation_size(size) }
+    fn data(&self) -> Result<InodeData> {
+        InodeData::parse(self.raw.id, &self.raw.bytes, self.raw.encoding)
+    }
+    fn xattr_block(&self) -> Result<Option<BlockAddress>> {
+        self.raw.xattr_block()
+    }
+    fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
+        self.raw.set_extent_root_bytes(root)
+    }
+    fn set_encoded_allocation_size(&mut self, size: EncodedInodeBlockCount) -> Result<()> {
+        self.raw.set_encoded_allocation_size(size)
+    }
 }
 
 impl StagedInodeRecord {
@@ -1171,15 +1240,6 @@ impl RawInodeRecord<Vec<u8>> {
         Ok(())
     }
 
-    /// Returns the in-inode xattr body region.
-    /// # Errors
-    ///
-    /// Returns an error when `i_extra_isize` is truncated or resolves beyond the inode record.
-    pub(super) fn inline_xattr_region(&self) -> Result<&[u8]> {
-        let offset = self.inline_xattr_offset()?;
-        self.bytes.get(offset..).ok_or(Error::InvalidXattr)
-    }
-
     /// Returns the mutable xattr body without changing the declared field boundary.
     /// # Errors
     ///
@@ -1319,6 +1379,7 @@ mod tests {
                 crate::disk_format::inode::InodeBlockCountEncoding::HugeFile,
                 block_size()?,
                 crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+                false,
                 false,
             ),
         })
@@ -1700,6 +1761,14 @@ impl RecoverableOrphanInode {
 }
 
 impl<Bytes: AsRef<[u8]>> RawInodeRecord<Bytes> {
+    /// Borrows the declared inode-body attribute region under either owned or read-ahead storage.
+    /// # Errors
+    /// Rejects truncated or out-of-record extra-field declarations.
+    pub(super) fn inline_xattr_region(&self) -> Result<&[u8]> {
+        let offset = InodeRecordLayout::parse(self.bytes.as_ref())?.xattr_offset();
+        self.bytes.as_ref().get(offset..).ok_or(Error::InvalidXattr)
+    }
+
     /// Authenticates persisted inode bytes before interpreting ownership or storage.
     /// # Errors
     /// Returns a checksum mismatch or a malformed record error; no bytes are modified.

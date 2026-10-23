@@ -66,8 +66,8 @@ pub(super) use super::directory::{
 pub(super) use super::directory_read::DirectoryReader;
 pub(super) use super::event::CommitClaim;
 pub(super) use super::inode_record::{
-    AllocatedInodeRecord, AttributeInodeRecord, DeletedInodeRecord, LiveInodeRecord, RawInodeRecord,
-    RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
+    AllocatedInodeRecord, AttributeInodeRecord, DeletedInodeRecord, InlinePayloadUpdate,
+    LiveInodeRecord, RawInodeRecord, RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
 pub(super) use super::mount::{
     CheckpointAdmission, CommitAdmission, CommittedEpoch, EpochReadView, JournalCoordinatorState,

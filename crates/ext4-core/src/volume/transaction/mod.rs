@@ -935,7 +935,8 @@ impl MutationResolvePass<'_, '_, '_> {
                 xattrs
                     .public_mut()
                     .insert(AclKind::Access.name()?, acl.value()?)?;
-                pass.mutation.store_xattr_set(&mut raw_inode, xattrs)?;
+                pass.mutation
+                    .store_xattr_set(&mut raw_inode, xattrs, None)?;
             }
             raw_inode.set_owner(security.owner())?;
             raw_inode.set_permissions(security.permissions())?;
@@ -1080,7 +1081,7 @@ impl MutationResolvePass<'_, '_, '_> {
         raw_inode.mark_encrypted()?;
         let mut set = self.mutation.xattr_set_for_raw_inode(raw_inode)?;
         set.set_encryption_context(XattrValue::new(&context.to_bytes()?)?);
-        self.mutation.store_xattr_set(raw_inode, set)
+        self.mutation.store_xattr_set(raw_inode, set, None)
     }
 }
 
@@ -1278,7 +1279,10 @@ impl MetadataMutation<'_, '_> {
         tree.set_metadata_blocks(metadata_blocks);
 
         let data = raw_inode.data()?;
-        let serialized = tree.serialize(block_size, crate::volume::orphan::extent_context(self.volume.superblock, &data))?;
+        let serialized = tree.serialize(
+            block_size,
+            crate::volume::orphan::extent_context(self.volume.superblock, &data),
+        )?;
         self.stage_serialized_extent_tree(raw_inode, &serialized)?;
         self.set_inode_allocation_size(raw_inode, Some(&tree))
     }

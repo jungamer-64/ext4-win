@@ -257,15 +257,6 @@ impl MetadataMutation<'_, '_> {
             return Err(Error::ClusterReferenceConflict);
         }
         let mut journal_blocks = self.metadata_blocks()?;
-        let mut data_writes = Vec::new();
-        for write in core::mem::take(&mut self.file_writes) {
-            match write.persistence {
-                FileDataPersistence::Ordered => data_writes.try_push(write.write)?,
-                FileDataPersistence::Journaled => {
-                    journal_blocks.try_push(JournalBlock::new(write.block, write.write.bytes))?
-                }
-            }
-        }
         let _validated_next_state = self.committed_cluster_state()?;
         let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount);
         let key_version = self
@@ -315,6 +306,15 @@ impl MetadataMutation<'_, '_> {
                 MutationResource::VOLUME_METADATA,
                 coordinator.resource_version(MutationResource::VOLUME_METADATA),
             )?;
+        }
+        let mut data_writes = Vec::new();
+        for write in core::mem::take(&mut self.file_writes) {
+            match write.persistence {
+                FileDataPersistence::Ordered => data_writes.try_push(write.write)?,
+                FileDataPersistence::Journaled => {
+                    journal_blocks.try_push(JournalBlock::new(write.block, write.write.bytes))?
+                }
+            }
         }
         Ok(ResolvedMutation {
             observed,

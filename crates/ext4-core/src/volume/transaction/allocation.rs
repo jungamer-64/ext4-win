@@ -85,6 +85,7 @@ impl MetadataMutation<'_, '_> {
     /// # Errors
     /// Returns an error for invalid xattr ownership, allocation bitmaps, or directory accounting.
     pub(super) fn reclaim_inode(&mut self, raw: &RawInodeRecord<Vec<u8>>) -> Result<()> {
+        self.release_inline_attribute_values(raw)?;
         if let Some(block) = raw.xattr_block()? {
             self.release_xattr_block_ref(block)?;
         }

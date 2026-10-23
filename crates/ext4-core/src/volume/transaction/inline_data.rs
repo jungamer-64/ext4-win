@@ -24,7 +24,7 @@ impl MetadataMutation<'_, '_> {
         };
         raw.initialize_inline_storage()?;
         memory::copy_exact(raw.writable_inline_xattr_region()?, &body)?;
-        self.store_xattr_set(raw, set)
+        self.store_xattr_set(raw, set, None)
     }
     /// Edits the two inline directory regions without allowing a record to span them.
     /// None leaves the inode unchanged and requires conversion to ordinary directory blocks.
@@ -48,6 +48,7 @@ impl MetadataMutation<'_, '_> {
         let capacity = match xattr_storage::inline_data_capacity(
             &set,
             raw.writable_inline_xattr_region()?.len(),
+            self.volume.superblock.attribute_value_storage(),
         ) {
             Ok(capacity) => capacity,
             Err(Error::NoSpace) => return Ok(None),
@@ -83,10 +84,7 @@ impl MetadataMutation<'_, '_> {
             first.bytes(),
         )?;
         set.set_inline_data(XattrValue::new(second.bytes())?);
-        let body = xattr_storage::serialize_inline_xattrs(
-            &set,
-            raw.writable_inline_xattr_region()?.len(),
-        )?;
+
         let length = 60_usize
             .checked_add(second.bytes().len())
             .ok_or(Error::ArithmeticOverflow)?;
@@ -97,10 +95,7 @@ impl MetadataMutation<'_, '_> {
             .encode_directory_size(DirectorySize::from_bytes(
                 u64::try_from(length).map_err(|_| Error::ArithmeticOverflow)?,
             ))?;
-        raw.set_inline_payload(&prefix)?;
-        memory::copy_exact(raw.writable_inline_xattr_region()?, &body)?;
-        raw.set_encoded_size(size)?;
-        self.store_xattr_set(raw, set)?;
+        self.store_xattr_set(raw, set, Some(InlinePayloadUpdate::new(prefix, size)))?;
         Ok(Some(result))
     }
     /// Converts complete inode-body storage into ordinary journaled extent metadata.
@@ -183,14 +178,6 @@ impl MetadataMutation<'_, '_> {
         let empty = MutableExtentTree::from_extents(Vec::new())?.serialize(block_size, context)?;
         raw.replace_inline_storage(empty.inode_root())?;
         set.remove_inline_data();
-        let body =
-            xattr_storage::serialize_inline_xattrs(set, raw.writable_inline_xattr_region()?.len());
-        // Other attributes may require the external block, which store_xattr_set owns.
-        match body {
-            Ok(bytes) => memory::copy_exact(raw.writable_inline_xattr_region()?, &bytes)?,
-            Err(Error::NoSpace) => raw.clear_inline_xattr_region()?,
-            Err(error) => return Err(error),
-        }
         raw.set_encoded_size(new_size)?;
         self.stage_extent_tree(raw, tree)
     }
@@ -230,11 +217,17 @@ impl MetadataMutation<'_, '_> {
             return Ok(false);
         }
         set.set_inline_data(XattrValue::new(payload.get(60..).unwrap_or_default())?);
-        let body = match xattr_storage::serialize_inline_xattrs(&set, capacity) {
-            Ok(bytes) => bytes,
+        match xattr_storage::XattrStoragePlan::for_inode(
+            &set,
+            capacity,
+            usize::try_from(self.volume.superblock.block_size().bytes())
+                .map_err(|_| Error::ArithmeticOverflow)?,
+            self.volume.superblock.attribute_value_storage(),
+        ) {
+            Ok(_plan) => {}
             Err(Error::NoSpace) => return Ok(false),
             Err(error) => return Err(error),
-        };
+        }
         let mut prefix = [0; 60];
         let count = core::cmp::min(prefix.len(), payload.len());
         memory::copy_exact(
@@ -248,10 +241,7 @@ impl MetadataMutation<'_, '_> {
             .encode_file_size(FileSize::from_bytes(
                 u64::try_from(payload.len()).map_err(|_| Error::ArithmeticOverflow)?,
             ))?;
-        raw.set_inline_payload(&prefix)?;
-        memory::copy_exact(raw.writable_inline_xattr_region()?, &body)?;
-        raw.set_encoded_size(size)?;
-        self.store_xattr_set(raw, set)?;
+        self.store_xattr_set(raw, set, Some(InlinePayloadUpdate::new(prefix, size)))?;
         Ok(true)
     }
     /// Preserves all inline bytes before an operation requiring extent allocation.
@@ -263,6 +253,6 @@ impl MetadataMutation<'_, '_> {
         }
         let mut set = self.xattr_set_for_raw_inode(raw)?;
         self.convert_inline_data(raw, &mut set)?;
-        self.store_xattr_set(raw, set)
+        self.store_xattr_set(raw, set, None)
     }
 }

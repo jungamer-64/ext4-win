@@ -11,13 +11,20 @@ use sha2::Digest as _;
 /// Selects the on-disk inline-data feature using format constants and an independent CRC.
 /// # Errors
 /// Returns an invalid fixture field or failed production mount.
+fn inline_fixture() -> Result<Fixture> {
+    fixture_with_incompatible_features(0x8000)
+}
+
+/// Declares an explicit format-vector feature profile without changing tracked image inputs.
+/// # Errors
+/// Propagates malformed fixture fields and production mount rejection.
 #[expect(
     clippy::disallowed_methods,
-    reason = "checked fixture fields receive exactly sized format vectors"
+    reason = "checked fixture fields receive exact little-endian values"
 )]
-fn inline_fixture() -> Result<Fixture> {
+fn fixture_with_incompatible_features(features: u32) -> Result<Fixture> {
     let mut disk = Disk::fixture();
-    let flags = fixture_u32(&disk.filesystem, 1120)? | 0x8000;
+    let flags = fixture_u32(&disk.filesystem, 1120)? | features;
     disk.filesystem
         .get_mut(1120..1124)
         .ok_or(Error::DeviceRange)?
@@ -31,6 +38,208 @@ fn inline_fixture() -> Result<Fixture> {
         .ok_or(Error::DeviceRange)?
         .copy_from_slice(&checksum.to_le_bytes());
     Fixture::from_disk(disk)
+}
+
+/// # Errors
+/// Propagates value preparation, commit, read, replacement, release and remount failures.
+/// # Panics
+/// Fails if large values change bytes, expose value inodes as namespace, or leak allocation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe opaque values, hidden inode roles and allocation recovery"
+)]
+fn attribute_value_inodes_replace_delete_and_preserve_inline_payload() -> Result<()> {
+    for features in [0x400, 0x8400] {
+        let mut fixture = fixture_with_incompatible_features(features)?;
+        let file = fixture.a;
+        let before = fixture.epoch.geometry().free_cluster_count();
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, b"large")?,
+                XattrValue::new(&[0x71; 16_384])?,
+            )?;
+            assert!(
+                pass.staged_xattrs(NodeId::File(file))?
+                    .entries()
+                    .any(|(_, value)| value.bytes() == [0x71; 16_384])
+            );
+            Ok(())
+        })?;
+        fixture.remount()?;
+        let value = fixture
+            .read(|pass| {
+                pass.read_xattr(
+                    NodeId::File(file),
+                    &XattrName::new(XattrNamespace::User, b"large")?,
+                )
+            })?
+            .ok_or(Error::InvalidXattr)?;
+        assert_eq!(value.bytes(), &[0x71; 16_384]);
+        let offset = fixture_inode_offset(&fixture.disk, NodeId::File(file))?;
+        let value_inode = fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(168).ok_or(Error::ArithmeticOverflow)?,
+        )?;
+        assert_ne!(value_inode, 0);
+        assert_eq!(
+            fixture
+                .read(|pass| pass.load_node_by_file_index(value_inode))
+                .err(),
+            Some(Error::InvalidInode)
+        );
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, b"large")?,
+                XattrValue::new(&[0x42; 8192])?,
+            )?;
+            let file = pass.file(file)?;
+            pass.write_file_range(file, FileOffset::from_bytes(1), b"b")
+        })?;
+        fixture.remount()?;
+        let mut payload = [0; 2];
+        assert_eq!(
+            fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut payload))?,
+            ReadBytes::from_usize(2)
+        );
+        assert_eq!(payload, *b"ab");
+        let value = fixture
+            .read(|pass| {
+                pass.read_xattr(
+                    NodeId::File(file),
+                    &XattrName::new(XattrNamespace::User, b"large")?,
+                )
+            })?
+            .ok_or(Error::InvalidXattr)?;
+        assert_eq!(value.bytes(), &[0x42; 8192]);
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.remove_xattr(node, &XattrName::new(XattrNamespace::User, b"large")?)?;
+            Ok(())
+        })?;
+        fixture.remount()?;
+        assert_eq!(fixture.epoch.geometry().free_cluster_count(), before);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates independently encoded reference construction, read, release and remount failures.
+/// # Panics
+/// Fails if shared value storage is freed early or an authenticated wrong count grants a mount.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    clippy::disallowed_methods,
+    reason = "checked disk vectors and assertions observe physical-entry ownership independently"
+)]
+fn attribute_value_shared_references_and_corruption() -> Result<()> {
+    let mut fixture = fixture_with_incompatible_features(0x400)?;
+    let a = fixture.a;
+    let b = fixture.b;
+    let before = fixture.epoch.geometry().free_cluster_count();
+    let payload = alloc::vec![0x6d; 65_536];
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"large")?,
+            XattrValue::new(&payload)?,
+        )
+    })?;
+    let a_offset = fixture_inode_offset(&fixture.disk, NodeId::File(a))?;
+    let b_offset = fixture_inode_offset(&fixture.disk, NodeId::File(b))?;
+    let value_number = fixture_u32(&fixture.disk.filesystem, a_offset + 168)?;
+    let table = usize::try_from(fixture_u32(&fixture.disk.filesystem, 4104)?)
+        .map_err(|_| Error::ArithmeticOverflow)?;
+    let value_offset = table * 4096
+        + usize::try_from(value_number - 1).map_err(|_| Error::ArithmeticOverflow)? * 256;
+    let body = fixture
+        .disk
+        .filesystem
+        .get(a_offset + 160..a_offset + 256)
+        .ok_or(Error::DeviceRange)?
+        .to_vec();
+    fixture
+        .disk
+        .filesystem
+        .get_mut(b_offset + 160..b_offset + 256)
+        .ok_or(Error::DeviceRange)?
+        .copy_from_slice(&body);
+    let b_flags = fixture_u32(&fixture.disk.filesystem, b_offset + 32)?;
+    fixture.disk.encode_inode(NodeId::File(b), b_flags, None)?;
+    let value_flags = fixture_u32(&fixture.disk.filesystem, value_offset + 32)?;
+    // There are two physical inode-body entries. The authenticated count of one must fail.
+    fixture.disk.storage_effects = 0;
+    assert_eq!(
+        fixture.disk.mount(MountAccess::ReadWrite).err(),
+        Some(Error::InvalidXattr)
+    );
+    assert_eq!(fixture.disk.storage_effects, 0);
+    fixture
+        .disk
+        .filesystem
+        .get_mut(value_offset + 36..value_offset + 40)
+        .ok_or(Error::DeviceRange)?
+        .copy_from_slice(&2_u32.to_le_bytes());
+    fixture
+        .disk
+        .encode_inode_number(value_number, value_flags, None)?;
+    fixture.remount()?;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.remove_xattr(node, &XattrName::new(XattrNamespace::User, b"large")?)?;
+        Ok(())
+    })?;
+    fixture.remount()?;
+    let value = fixture
+        .read(|pass| {
+            pass.read_xattr(
+                NodeId::File(b),
+                &XattrName::new(XattrNamespace::User, b"large")?,
+            )
+        })?
+        .ok_or(Error::InvalidXattr)?;
+    assert_eq!(value.bytes(), payload);
+    let payload_block = usize::try_from(fixture_u32(&fixture.disk.filesystem, value_offset + 60)?)
+        .map_err(|_| Error::ArithmeticOverflow)?;
+    let byte = fixture
+        .disk
+        .filesystem
+        .get_mut(payload_block * 4096)
+        .ok_or(Error::DeviceRange)?;
+    *byte ^= 1;
+    fixture.remount()?;
+    assert_eq!(
+        fixture
+            .read(|pass| pass.read_xattr(
+                NodeId::File(b),
+                &XattrName::new(XattrNamespace::User, b"large")?
+            ))
+            .err(),
+        Some(Error::ChecksumMismatch)
+    );
+    *fixture
+        .disk
+        .filesystem
+        .get_mut(payload_block * 4096)
+        .ok_or(Error::DeviceRange)? ^= 1;
+    fixture.remount()?;
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.unlink_file(root, &Ext4Name::new(b"concurrent-b")?)
+    })?;
+    fixture.remount()?;
+    // Removing b also releases its original one-byte data block.
+    assert_eq!(
+        fixture.epoch.geometry().free_cluster_count().as_u64(),
+        before.as_u64() + 1
+    );
+    Ok(())
 }
 
 /// # Errors
@@ -1417,12 +1626,23 @@ impl Disk {
     /// Its inode-table address and CRC32C computation come from the disk format, not core encoders.
     /// # Errors
     /// Returns an invalid fixture layout or an out-of-range encoded field.
+    fn encode_inode(&mut self, node: NodeId, flags: u32, context: Option<&[u8; 40]>) -> Result<()> {
+        self.encode_inode_number(node.file_index(), flags, context)
+    }
+
+    /// Seals independently edited namespace or attribute inode fields.
+    /// # Errors
+    /// Propagates fixture bounds and checksum-field failures.
     #[expect(
         clippy::disallowed_methods,
-        reason = "each fixture copy uses a checked range with the exact encoded field width"
+        reason = "checked fixture field copies have equal lengths"
     )]
-    fn encode_inode(&mut self, node: NodeId, flags: u32, context: Option<&[u8; 40]>) -> Result<()> {
-        let number = node.file_index();
+    fn encode_inode_number(
+        &mut self,
+        number: u32,
+        flags: u32,
+        context: Option<&[u8; 40]>,
+    ) -> Result<()> {
         let index = usize::try_from(number.checked_sub(1).ok_or(Error::InvalidInode)?)
             .map_err(|_| Error::ArithmeticOverflow)?;
         let start = index
@@ -3804,21 +4024,41 @@ fn final_unlink_publishes_retirement_before_inode_reuse() -> Result<()> {
 /// Header and inode checksums authenticate the requested count, even when it disagrees with owners.
 /// # Errors
 /// Returns malformed fixture geometry, missing external storage, or field bounds.
+fn shared_xattr_fixture(refcount: u32) -> Result<Fixture> {
+    shared_xattr_fixture_values(refcount, 0, 1, 512)
+}
+
+/// Constructs a shared block with a chosen set of format-level value references.
+/// # Errors
+/// Propagates allocation, mutation, field and independent checksum construction failures.
 #[expect(
     clippy::disallowed_methods,
-    reason = "every independent fixture field copy uses equal checked slice lengths"
+    reason = "checked fixture field copies use matching slice lengths"
 )]
-fn shared_xattr_fixture(refcount: u32) -> Result<Fixture> {
-    let mut fixture = Fixture::new()?;
+fn shared_xattr_fixture_values(
+    refcount: u32,
+    features: u32,
+    count: u8,
+    size: usize,
+) -> Result<Fixture> {
+    let mut fixture = fixture_with_incompatible_features(features)?;
     let a = fixture.a;
     let b = fixture.b;
     fixture.mutate(|pass| {
         let node = pass.node(NodeId::File(a))?;
-        pass.set_xattr(
-            node,
-            XattrName::new(XattrNamespace::User, b"shared")?,
-            XattrValue::new(&[b'A'; 512])?,
-        )
+        for index in 0..count {
+            let name = if index == 0 {
+                b"shared".to_vec()
+            } else {
+                alloc::vec![b'a'.checked_add(index).ok_or(Error::ArithmeticOverflow)?]
+            };
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, &name)?,
+                XattrValue::new(&alloc::vec![b'A'; size])?,
+            )?;
+        }
+        Ok(())
     })?;
     let a_offset = fixture_inode_offset(&fixture.disk, NodeId::File(a))?;
     let b_offset = fixture_inode_offset(&fixture.disk, NodeId::File(b))?;
@@ -3890,6 +4130,51 @@ fn shared_xattr_fixture(refcount: u32) -> Result<Fixture> {
         .copy_from_slice(&checksum.to_le_bytes());
     fixture.disk.storage_effects = 0;
     Ok(fixture)
+}
+
+/// # Errors
+/// Propagates shared format-vector construction, reference release, read and remount failures.
+/// # Panics
+/// Fails if shared-block owners are mistaken for extra physical value entries.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe external value retention after removing a shared block owner"
+)]
+fn attribute_value_entries_in_shared_blocks_have_one_reference() -> Result<()> {
+    let mut fixture = shared_xattr_fixture_values(2, 0x400, 5, 8192)?;
+    fixture.remount()?;
+    let a = fixture.a;
+    let b = fixture.b;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(a))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"shared")?,
+            XattrValue::new(b"replacement")?,
+        )
+    })?;
+    fixture.remount()?;
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.unlink_file(root, &Ext4Name::new(b"concurrent-a")?)
+    })?;
+    fixture.remount()?;
+    let value = fixture
+        .read(|pass| {
+            pass.read_xattr(
+                NodeId::File(b),
+                &XattrName::new(XattrNamespace::User, b"shared")?,
+            )
+        })?
+        .ok_or(Error::InvalidXattr)?;
+    assert_eq!(value.bytes(), &[b'A'; 8192]);
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        pass.unlink_file(root, &Ext4Name::new(b"concurrent-b")?)
+    })?;
+    fixture.remount()?;
+    Ok(())
 }
 
 /// # Errors

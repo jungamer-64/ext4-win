@@ -1311,6 +1311,8 @@ pub(crate) struct FeatureSet {
     verity: bool,
     /// Inode-body payload storage admitted for files and directories.
     inline_data: bool,
+    /// Separate value inodes may be referenced by attribute entries.
+    attribute_values: bool,
     /// File-size encoding supported by inode records.
     file_size_encoding: FileSizeEncoding,
     /// Directory-size encoding selected by the incompatible large-directory feature.
@@ -1372,11 +1374,12 @@ impl FeatureSet {
         {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & (INCOMPAT_META_BG | INCOMPAT_MMP | INCOMPAT_EA_INODE | INCOMPAT_CASEFOLD) != 0
-        {
+        if incompat & (INCOMPAT_META_BG | INCOMPAT_MMP | INCOMPAT_CASEFOLD) != 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & INCOMPAT_INLINE_DATA != 0 && compat & COMPAT_EXT_ATTR == 0 {
+        if incompat & (INCOMPAT_INLINE_DATA | INCOMPAT_EA_INODE) != 0
+            && compat & COMPAT_EXT_ATTR == 0
+        {
             return Err(Error::UnsupportedWriteFeature);
         }
         if incompat & INCOMPAT_CSUM_SEED != 0 && read_only_compat & RO_COMPAT_METADATA_CSUM == 0 {
@@ -1480,6 +1483,7 @@ impl FeatureSet {
             },
             verity: read_only_compat & RO_COMPAT_VERITY != 0,
             inline_data: incompat & INCOMPAT_INLINE_DATA != 0,
+            attribute_values: incompat & INCOMPAT_EA_INODE != 0,
             file_size_encoding: if read_only_compat & RO_COMPAT_LARGE_FILE != 0 {
                 FileSizeEncoding::LargeFile
             } else {
@@ -2131,6 +2135,16 @@ impl Superblock {
         }
     }
 
+    /// Physical attribute-value storage admitted by the filesystem feature set.
+    pub(crate) const fn attribute_value_storage(
+        self,
+    ) -> crate::disk_format::xattr::AttributeValueStorage {
+        if self.features.attribute_values {
+            crate::disk_format::xattr::AttributeValueStorage::Inodes
+        } else {
+            crate::disk_format::xattr::AttributeValueStorage::LocalOnly
+        }
+    }
     /// Whether new files may select inode-body storage without changing feature flags.
     pub(crate) const fn supports_inline_data(self) -> bool {
         self.features.inline_data
@@ -2146,6 +2160,7 @@ impl Superblock {
             self.block_size,
             self.features.directory_links,
             self.features.inline_data,
+            self.features.attribute_values,
         )
     }
 
