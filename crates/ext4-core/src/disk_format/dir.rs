@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
-use crate::disk_format::directory_hash::DirectoryHashScheme;
+use crate::disk_format::directory_hash::{DirectoryHash, DirectoryHashScheme};
 use crate::disk_format::inode::InodeId;
 use crate::disk_format::name::Ext4Name;
 use crate::disk_format::superblock::{
@@ -92,13 +92,36 @@ impl DirectoryEntryKind {
     }
 }
 
+/// Record layout selected by the owning directory's encryption and comparison state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DirectoryEntryEncoding {
+    /// The aligned name is the complete live record payload.
+    Standard,
+    /// Non-dot entries also carry the keyed primary and secondary hashes.
+    EncryptedCasefold,
+}
+
+/// A stored name and the routing information that belongs to that exact ciphertext.
+#[derive(Debug, Eq, PartialEq)]
+enum DirectoryEntryName {
+    /// Ordinary records, including dot entries in every directory.
+    Unhashed(Ext4Name),
+    /// The encrypted spelling and its plaintext comparison-key hash travel together.
+    EncryptedCasefold {
+        /// Filename ciphertext as stored on disk.
+        ciphertext: Ext4Name,
+        /// Keyed hash of its normalized plaintext name.
+        hash: DirectoryHash,
+    },
+}
+
 /// Valid directory entry exposed by the ext4 domain.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct DirectoryEntry {
     /// Non-zero inode referenced by the entry.
     inode: InodeId,
-    /// Validated ext4 name bytes.
-    name: Ext4Name,
+    /// Stored name and its format-required routing data.
+    name: DirectoryEntryName,
     /// File type recorded in the directory entry.
     kind: DirectoryEntryKind,
 }
@@ -129,7 +152,7 @@ impl DirectoryEntry {
     /// # Errors
     /// Returns an error when any directory record has invalid length, alignment,
     /// or name bounds.
-    pub fn parse_all(bytes: &[u8]) -> Result<Vec<Self>> {
+    pub(crate) fn parse_all(bytes: &[u8], encoding: DirectoryEntryEncoding) -> Result<Vec<Self>> {
         let mut entries = Vec::new();
         let mut offset = 0_usize;
 
@@ -217,7 +240,7 @@ impl DirectoryEntry {
 }
 
 /// One live dirent and its byte coordinate inside a directory block.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryRecord {
     /// Byte offset of the record header inside its logical block.
     offset: u32,
@@ -1149,22 +1172,37 @@ pub(crate) struct DirectoryBlock {
     bytes: Vec<u8>,
     /// Inode-local checksum context for leaf-directory mutations.
     checksum: DirectoryChecksum,
+    /// Required interpretation of live non-dot record payloads.
+    encoding: DirectoryEntryEncoding,
 }
 
 impl DirectoryBlock {
     /// Wraps an existing directory block for checked mutation.
-    pub(crate) fn new(bytes: Vec<u8>, checksum: DirectoryChecksum) -> Self {
-        Self { bytes, checksum }
+    pub(crate) fn new(
+        bytes: Vec<u8>,
+        checksum: DirectoryChecksum,
+        encoding: DirectoryEntryEncoding,
+    ) -> Self {
+        Self {
+            bytes,
+            checksum,
+            encoding,
+        }
     }
 
     /// Creates a zero-filled directory block with the filesystem block size.
     /// # Errors
     ///
     /// Returns an error when allocating the block-sized byte buffer fails.
-    pub(crate) fn empty(block_size: usize, checksum: DirectoryChecksum) -> Result<Self> {
+    pub(crate) fn empty(
+        block_size: usize,
+        checksum: DirectoryChecksum,
+        encoding: DirectoryEntryEncoding,
+    ) -> Result<Self> {
         Ok(Self {
             bytes: memory::repeated_vec(0_u8, block_size)?,
             checksum,
+            encoding,
         })
     }
 
@@ -1177,8 +1215,9 @@ impl DirectoryBlock {
         block_size: usize,
         checksum: DirectoryChecksum,
         entries: &[DirectoryEntry],
+        encoding: DirectoryEntryEncoding,
     ) -> Result<Self> {
-        let mut block = Self::empty(block_size, checksum)?;
+        let mut block = Self::empty(block_size, checksum, encoding)?;
         let live_limit = block.live_limit()?;
         if entries.is_empty() {
             block.initialize_free_space()?;
