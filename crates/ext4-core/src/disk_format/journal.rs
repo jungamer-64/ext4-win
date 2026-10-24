@@ -2540,16 +2540,6 @@ impl JournalLocation {
         }
     }
 
-    /// Verifies that the journal ring is backed by the selected location.
-    /// # Errors
-    ///
-    /// Returns an error when the selected physical location does not cover the validated ring.
-    fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
-        match self {
-            Self::Internal(layout) => layout.validate_ring(ring),
-            Self::External(layout) => layout.validate_ring(ring),
-        }
-    }
 
     /// Returns whether a filesystem home block overlaps the internal journal.
     /// # Errors
@@ -2620,21 +2610,6 @@ impl ExternalJournalLayout {
         block_size.offset_of(BlockAddress::new(u64::from(self.superblock_block)))
     }
 
-    /// Verifies that the ring stays inside the device and begins after the superblock.
-    /// # Errors
-    ///
-    /// Returns an error when the ring begins elsewhere or exceeds device capacity.
-    fn validate_ring(self, ring: &JournalRing) -> Result<()> {
-        let expected_first = self
-            .superblock_block
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
-        if ring.first == expected_first && ring.maxlen <= self.capacity_blocks {
-            Ok(())
-        } else {
-            Err(Error::UnsupportedJournal)
-        }
-    }
 }
 
 /// Dedicated ext-family superblock facts required to locate an external JBD2 journal.
@@ -2776,24 +2751,6 @@ impl InternalJournalLayout {
         })
     }
 
-    /// Verifies that extents cover the journal ring from logical block zero.
-    /// # Errors
-    ///
-    /// Returns an error when journal inode extents are not contiguous from block zero through the
-    /// ring end.
-    fn validate_ring(&self, ring: &JournalRing) -> Result<()> {
-        let mut expected = 0_u32;
-        for extent in &self.extents {
-            if extent.logical_start != expected {
-                return Err(Error::UnsupportedJournal);
-            }
-            expected = extent.logical_end;
-            if expected >= ring.maxlen {
-                return Ok(());
-            }
-        }
-        Err(Error::UnsupportedJournal)
-    }
 
     /// Maps a logical journal block through the journal inode extents.
     /// # Errors
