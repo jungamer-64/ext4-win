@@ -719,7 +719,9 @@ impl MountedVolumeAccess<'_> {
         &mut self,
     ) -> DriverResult<crate::kernel::stream::StorageSubmissionLease> {
         self.runtime.require_media_ownership()?;
-        self.storage_access().acquire_submission()
+        let permit = self.storage_access().acquire_submission()?;
+        self.runtime.require_media_ownership()?;
+        Ok(permit)
     }
 
     /// Reconciles the dispatch-published revocation on the sole actor. Surprise removal retains

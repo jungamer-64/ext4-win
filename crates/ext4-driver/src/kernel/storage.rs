@@ -756,7 +756,7 @@ impl<O> PreparedStorageCommand<O> {
 impl<O> StorageCommand<O> {
     /// Borrows the suspended operation carried through every lower phase and retry.
     #[cfg(not(test))]
-    const fn suspended(&self) -> &O {
+    pub(crate) const fn suspended(&self) -> &O {
         match self {
             Self::Read { suspended, .. }
             | Self::Write { suspended, .. }
@@ -1218,6 +1218,12 @@ impl<O> DeviceLengthProbe<O> {
             destination,
             rundown,
         )
+    }
+
+    /// Borrows the unique operation for admission after native request preparation.
+    #[cfg(not(test))]
+    pub(crate) const fn suspended(&self) -> &O {
+        &self.suspended
     }
 
     /// Recovers the caller operation from a build or registration error.

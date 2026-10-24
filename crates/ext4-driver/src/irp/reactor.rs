@@ -327,6 +327,12 @@ pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
         target: &mut ReactorTarget,
     ) -> OperationTransition;
 
+    /// Additional operation-owned expiration, including mount effects before a volume actor exists.
+    #[cfg(not(test))]
+    fn lower_deadline(&self) -> Option<ext4_core::MmpDeadline> {
+        None
+    }
+
     /// Records a terminal lower-storage classification before the matching completion event.
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget);
 }
@@ -3821,9 +3827,9 @@ impl CompletionReactor {
         };
         let cancellation = lower.cancellation_identity();
         self.begin_registering(index);
-        match lower
-            .register_and_submit(|| self.with_target(ReactorTarget::acquire_storage_submission))
-        {
+        match lower.register_and_submit(|probe| {
+            self.acquire_operation_submission(probe.suspended().as_ref())
+        }) {
             Ok(()) => {
                 self.finish_registering_lower(index, PublishedReactorLower::Length(cancellation));
             }
@@ -3833,6 +3839,24 @@ impl CompletionReactor {
                 self.set_ready_length_failure(index, probe.into_suspended(), error);
             }
         }
+    }
+
+    /// Samples operation expiration after private IRP allocation and native submission-gate acquisition.
+    /// # Errors
+    /// Returns ownership expiration, media removal or gate acquisition failure before submission.
+    #[cfg(not(test))]
+    fn acquire_operation_submission(
+        &self,
+        operation: &dyn CompletionOperation,
+    ) -> DriverResult<Option<crate::kernel::stream::StorageSubmissionLease>> {
+        let permit = self.with_target(ReactorTarget::acquire_storage_submission)?;
+        if let Some(deadline) = operation.lower_deadline() {
+            let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
+            if deadline.remaining_millis(now) == 0 {
+                return Err(ext4_core::Error::MmpOwnershipLost.into());
+            }
+        }
+        Ok(permit)
     }
 
     /// Sends one completely prepared command through a fresh private IRP.
@@ -3889,9 +3913,9 @@ impl CompletionReactor {
         };
         let cancellation_identity = lower.cancellation_identity();
         self.begin_registering(index);
-        match lower
-            .register_and_submit(|| self.with_target(ReactorTarget::acquire_storage_submission))
-        {
+        match lower.register_and_submit(|command| {
+            self.acquire_operation_submission(command.suspended().operation.as_ref())
+        }) {
             Ok(()) => {
                 self.finish_registering_lower(
                     index,

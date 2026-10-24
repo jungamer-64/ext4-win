@@ -866,6 +866,20 @@ impl CompletionOperation for MountRequestOperation {
         }
     }
 
+    #[cfg(not(test))]
+    fn lower_deadline(&self) -> Option<ext4_core::MmpDeadline> {
+        let mount = match &self.state {
+            MountRequestState::Mounting { mount, .. }
+            | MountRequestState::OpeningExternalJournal { mount, .. }
+            | MountRequestState::QueryExclusiveJournalLength { mount, .. } => mount,
+            MountRequestState::DiscoveringCandidateLength { context }
+            | MountRequestState::DiscoveringCandidateProbe { context, .. } => &context.mount,
+            MountRequestState::ProbingExclusiveJournal { context, .. } => &context.mount,
+            _ => return None,
+        };
+        mount.submission_deadline()
+    }
+
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {
         target.require_control_device();
         self.record_control_storage_failure(failure);

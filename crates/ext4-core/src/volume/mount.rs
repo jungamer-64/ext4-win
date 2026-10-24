@@ -2158,6 +2158,18 @@ impl ResolvedPrimary {
 }
 
 impl MountOperation {
+    /// Observes the bound retained by the suspended mount for host-side lower admission.
+    /// This observation grants no recovery, ownership-update or publication authority.
+    pub fn submission_deadline(&self) -> Option<super::MmpDeadline> {
+        match &self.ownership {
+            MountOwnership::Held(lease) => Some(lease.deadline()),
+            MountOwnership::Starting(operation) | MountOwnership::Pending { operation, .. } => {
+                operation.submission_deadline()
+            }
+            MountOwnership::Unprotected => None,
+        }
+    }
+
     /// Attaches a token minted by exclusive core validation and resumes external recovery.
     #[must_use]
     pub fn attach_external_journal(

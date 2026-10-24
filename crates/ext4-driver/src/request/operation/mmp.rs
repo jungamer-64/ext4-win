@@ -62,4 +62,19 @@ impl MountedVolumeOperation for ext4_core::MmpOperation {
         // reactor storage retry, and this same actor step consumes their exact transfer outcome.
     }
 }
-impl_mounted_operation_adapter!(ext4_core::MmpOperation);
+impl CompletionOperation for ext4_core::MmpOperation {
+    fn advance(
+        self: Box<Self>,
+        event: CompletionEvent,
+        target: &mut ReactorTarget,
+    ) -> OperationTransition {
+        target.with_mounted_access(|access| self.advance_mounted(event, access))
+    }
+    #[cfg(not(test))]
+    fn lower_deadline(&self) -> Option<ext4_core::MmpDeadline> {
+        self.submission_deadline()
+    }
+    fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {
+        target.with_mounted_access(|access| self.record_mounted_storage_failure(failure, access));
+    }
+}
