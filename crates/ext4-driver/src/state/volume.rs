@@ -555,9 +555,10 @@ impl MountedVolumeBinding {
         mount: CompletedMount,
         storage: MountedStorage,
         trace: OperationalTrace,
+        automatic_trim: ext4_control::AutomaticTrim,
         catalog: &mut crate::identity::IdentityDirectory,
     ) -> DriverResult<Self> {
-        let runtime = VolumeRuntime::try_new(mount, storage, catalog)?;
+        let runtime = VolumeRuntime::try_new(mount, storage, automatic_trim, catalog)?;
         let actor = memory::boxed_try_with(|| {
             Ok(MountedVolumeActorState {
                 volume_control: VolumeControlPlane::mounted(),
@@ -1545,6 +1546,42 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn trim_ready(&self) -> DriverResult<bool> {
         self.authorize_storage()?;
         self.runtime.trim_ready()
+    }
+    /// Background scans cannot borrow a user's lock or survive the start of terminal close.
+    /// # Errors
+    /// Returns lifecycle, media, read-only or ownership failure before any subsequent batch.
+    pub(crate) fn authorize_automatic_trim(&self) -> DriverResult<()> {
+        if self.volume_control.state != MountedVolumeState::Mounted {
+            return Err(DriverError::DeviceBusy);
+        }
+        self.trim_ready().map(|_ready| ())
+    }
+    /// A mounted and unlocked lifecycle may observe its next background cycle.
+    #[cfg(not(test))]
+    pub(crate) fn automatic_trim_wakeup(&mut self) -> Option<AutomaticTrimDeadline> {
+        (self.volume_control.state == MountedVolumeState::Mounted)
+            .then(|| self.runtime.automatic_trim_wakeup())
+            .flatten()
+    }
+    /// Transfers only the due cycle's completion obligation, never allocation authority.
+    pub(crate) fn start_automatic_trim(&mut self) -> Option<AutomaticTrimRun> {
+        if self.volume_control.state != MountedVolumeState::Mounted {
+            return None;
+        }
+        self.runtime.start_automatic_trim()
+    }
+    /// Accepts a stopped or successful cycle even after external authority was revoked.
+    pub(crate) fn complete_automatic_trim(
+        &mut self,
+        run: AutomaticTrimRun,
+        outcome: ext4_control::TrimOutcome,
+    ) {
+        self.runtime.complete_automatic_trim(run, outcome);
+    }
+    /// Reactor drain prevents new cycles while joining any current physical completion.
+    #[cfg(not(test))]
+    pub(crate) fn stop_automatic_trim(&mut self) {
+        self.runtime.stop_automatic_trim();
     }
     /// Admits only a current free-space selection; no global allocation or journal authority escapes.
     /// # Errors

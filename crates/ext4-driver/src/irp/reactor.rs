@@ -918,6 +918,8 @@ enum ActorTimerPurpose {
     DelayedClose,
     /// Drives record heartbeat or revokes an outstanding operation at its acknowledgement deadline.
     Ownership,
+    /// Publishes only a due mounted-policy discard cycle.
+    AutomaticTrim,
 }
 
 /// Address-stable timer/DPC envelope whose immutable purpose selects an actor-owned continuation.
@@ -1109,6 +1111,36 @@ impl ReactorTarget {
         }
     }
 
+    /// Observes only this mounted policy's timer; the control actor has no periodic discard.
+    #[cfg(not(test))]
+    fn automatic_trim_wakeup(&mut self) -> Option<crate::state::AutomaticTrimDeadline> {
+        match self {
+            Self::ControlDevice(_) => None,
+            Self::MountedVolume(binding) => {
+                binding.with_access(|access| access.automatic_trim_wakeup())
+            }
+        }
+    }
+    /// Ordinary scheduler capacity precedes transfer of the cycle's completion obligation.
+    /// # Errors
+    /// Records pre-effect allocation or lifecycle failure without scheduling another cycle.
+    #[cfg(not(test))]
+    fn start_automatic_trim(&mut self) -> DriverResult<Option<Box<dyn CompletionOperation>>> {
+        match self {
+            Self::ControlDevice(_) => Ok(None),
+            Self::MountedVolume(binding) => {
+                binding.with_access(crate::request::operation::automatic_trim)
+            }
+        }
+    }
+    /// Drain ends future admission but retains any running operation until physical completion.
+    #[cfg(not(test))]
+    fn stop_automatic_trim(&mut self) {
+        if let Self::MountedVolume(binding) = self {
+            binding.with_access(|access| access.stop_automatic_trim());
+        }
+    }
+
     /// Returns whether the mounted target owns any handle-free native stream resident.
     #[cfg(not(test))]
     fn delayed_close_pending(&mut self) -> bool {
@@ -1210,6 +1242,12 @@ pub(crate) struct CompletionReactor {
     ownership_timer_state: UnsafeCell<ActorTimerState<ext4_core::MmpDeadline>>,
     /// Callback publication drained before the owning device extension can be released.
     ownership_timer_ready: AtomicU8,
+    /// Policy-owned one-shot timer; automatic scans still use ordinary scheduler capacity.
+    automatic_trim_timer: ActorTimerEnvelope,
+    /// Actor-owned deadline persists until native cancellation or its queued DPC is drained.
+    automatic_trim_timer_state: UnsafeCell<ActorTimerState<crate::state::AutomaticTrimDeadline>>,
+    /// DPC publication joined before the device extension can be released.
+    automatic_trim_timer_ready: AtomicU8,
     /// One address-stable top-level cancel envelope per bounded active slot.
     cancel_envelopes: [ActiveCancelEnvelope; MAX_OPERATIONS],
     /// Device object owning this stable extension.
@@ -1577,6 +1615,30 @@ impl CompletionReactor {
             destination.write(AtomicU8::new(0));
         }
         let destination = unsafe {
+            // SAFETY: Exclusive final-address initialization owns this disjoint native timer.
+            core::ptr::addr_of_mut!((*reactor).automatic_trim_timer)
+        };
+        unsafe {
+            // SAFETY: No callback exists until the subsequent final-address timer initialization.
+            destination.write(ActorTimerEnvelope::inert(ActorTimerPurpose::AutomaticTrim));
+        }
+        let destination = unsafe {
+            // SAFETY: Exclusive initialization owns the actor's timer obligation and observation.
+            core::ptr::addr_of_mut!((*reactor).automatic_trim_timer_state)
+        };
+        unsafe {
+            // SAFETY: This field is initialized once before actor or callback publication.
+            destination.write(UnsafeCell::new(ActorTimerState::Idle));
+        }
+        let destination = unsafe {
+            // SAFETY: Exclusive initialization owns this callback publication atomic.
+            core::ptr::addr_of_mut!((*reactor).automatic_trim_timer_ready)
+        };
+        unsafe {
+            // SAFETY: No DPC or actor can observe this field before initialization completes.
+            destination.write(AtomicU8::new(0));
+        }
+        let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
             core::ptr::addr_of_mut!((*reactor).device)
         };
@@ -1722,6 +1784,9 @@ impl CompletionReactor {
             ownership_timer: _,
             ownership_timer_state: _,
             ownership_timer_ready: _,
+            automatic_trim_timer: _,
+            automatic_trim_timer_state: _,
+            automatic_trim_timer_ready: _,
             device: _,
             trace: _,
             target: _,
@@ -1774,6 +1839,11 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: This independently routed timer shares the same final-address owner lifetime.
             reactor.ownership_timer.initialize(reactor_storage);
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The independent policy timer shares the same final-address teardown lifetime.
+            reactor.automatic_trim_timer.initialize(reactor_storage);
         }
         #[cfg(not(test))]
         for envelope in &reactor.cancel_envelopes {
@@ -2591,6 +2661,8 @@ impl CompletionReactor {
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
             || reactor.ownership_timer_state() != ActorTimerState::Idle
             || reactor.ownership_timer_ready.load(Ordering::Acquire) != 0
+            || reactor.automatic_trim_timer_state() != ActorTimerState::Idle
+            || reactor.automatic_trim_timer_ready.load(Ordering::Acquire) != 0
             || !completion_list_empty
             || !length_completion_list_empty
             || !passive_completion_list_empty
@@ -2631,6 +2703,8 @@ impl CompletionReactor {
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
             || reactor.ownership_timer_state() != ActorTimerState::Idle
             || reactor.ownership_timer_ready.load(Ordering::Acquire) != 0
+            || reactor.automatic_trim_timer_state() != ActorTimerState::Idle
+            || reactor.automatic_trim_timer_ready.load(Ordering::Acquire) != 0
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -2725,6 +2799,7 @@ impl CompletionReactor {
             progressed |= self.maintain_media_ownership();
             progressed |= self.admit_pending_requests();
             progressed |= self.drive_ready_operations();
+            progressed |= self.maintain_automatic_trim();
             progressed |= self.drain_deferred_notifications();
             progressed |= self.maintain_delayed_close();
             if self.with_target(ReactorTarget::recheck_terminal_retirement)
@@ -2743,6 +2818,8 @@ impl CompletionReactor {
                 && self.delayed_close_ready.load(Ordering::Acquire) == 0
                 && self.ownership_timer_state() == ActorTimerState::Idle
                 && self.ownership_timer_ready.load(Ordering::Acquire) == 0
+                && self.automatic_trim_timer_state() == ActorTimerState::Idle
+                && self.automatic_trim_timer_ready.load(Ordering::Acquire) == 0
                 && unsafe {
                     // SAFETY: The sole actor owns this initialized notification backlog.
                     list_is_empty(self.deferred_notification_head.get())
@@ -2979,6 +3056,107 @@ impl CompletionReactor {
         if progressed {
             self.grant_available_commit();
             self.grant_all_available_waits();
+        }
+        progressed
+    }
+
+    /// Borrows the actor's one outstanding native timer obligation.
+    #[expect(
+        unsafe_code,
+        reason = "only the sole actor reads the policy timer state"
+    )]
+    fn automatic_trim_timer_state(&self) -> ActorTimerState<crate::state::AutomaticTrimDeadline> {
+        unsafe {
+            // SAFETY: Native callbacks never read or mutate this actor-owned state.
+            *self.automatic_trim_timer_state.get()
+        }
+    }
+    /// Changes only the actor's arming state; native cancellation or DPC drain precedes disarm.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "only the sole actor changes the policy timer state"
+    )]
+    fn set_automatic_trim_timer_state(
+        &self,
+        state: ActorTimerState<crate::state::AutomaticTrimDeadline>,
+    ) {
+        unsafe {
+            // SAFETY: The sole actor exclusively owns this state throughout the reactor lifetime.
+            *self.automatic_trim_timer_state.get() = state;
+        }
+    }
+    /// A queued DPC retains the obligation when native timer cancellation cannot reclaim it.
+    #[cfg(not(test))]
+    fn cancel_automatic_trim_timer(&self) -> bool {
+        if self.automatic_trim_timer_state() == ActorTimerState::Idle
+            || !self.automatic_trim_timer.cancel()
+        {
+            return false;
+        }
+        self.set_automatic_trim_timer_state(self.automatic_trim_timer_state().disarm());
+        true
+    }
+    /// Drives periodic work without a reserved lane or worker, joining shutdown through the actor.
+    #[cfg(not(test))]
+    fn maintain_automatic_trim(&self) -> bool {
+        let mut progressed = false;
+        if self.automatic_trim_timer_ready.swap(0, Ordering::AcqRel) != 0 {
+            self.set_automatic_trim_timer_state(self.automatic_trim_timer_state().disarm());
+            progressed = true;
+        }
+        let available =
+            self.with_scheduler(|scheduler| scheduler.available(ExecutionClass::Ordinary));
+        if self.state() == ReactorState::Draining {
+            self.with_target(ReactorTarget::stop_automatic_trim);
+        } else if available {
+            match self.with_target(ReactorTarget::start_automatic_trim) {
+                Ok(Some(operation)) => {
+                    let identity = self
+                        .with_scheduler(|scheduler| scheduler.reserve(ExecutionClass::Ordinary))
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        });
+                    self.install_admitted_at(
+                        identity.index(),
+                        AdmittedOperation::new(operation, OperationAdmission::Device),
+                    );
+                    progressed = true;
+                }
+                Ok(None) => {}
+                Err(_error) => {
+                    progressed = true;
+                }
+            }
+        }
+        let next = if self.state() == ReactorState::Running {
+            self.with_target(ReactorTarget::automatic_trim_wakeup)
+                .filter(|deadline| {
+                    available
+                        || deadline.remaining_millis(crate::kernel::time::monotonic_millis()) != 0
+                })
+        } else {
+            None
+        };
+        if let ActorTimerState::Armed(deadline) = self.automatic_trim_timer_state()
+            && Some(deadline) != next
+        {
+            progressed |= self.cancel_automatic_trim_timer();
+        }
+        if self.automatic_trim_timer_state() == ActorTimerState::Idle
+            && let Some(deadline) = next
+        {
+            // The schedule creates only sixty-second deadlines; saturation handles a clock regression.
+            let delay = u32::try_from(
+                deadline
+                    .remaining_millis(crate::kernel::time::monotonic_millis())
+                    .max(1),
+            )
+            .unwrap_or(u32::MAX);
+            self.automatic_trim_timer.arm(delay);
+            self.set_automatic_trim_timer_state(self.automatic_trim_timer_state().arm(deadline));
+            progressed = true;
         }
         progressed
     }
@@ -5037,6 +5215,7 @@ unsafe extern "C" fn actor_timer_dpc(
     let ready = match timer.purpose {
         ActorTimerPurpose::DelayedClose => &reactor.delayed_close_ready,
         ActorTimerPurpose::Ownership => &reactor.ownership_timer_ready,
+        ActorTimerPurpose::AutomaticTrim => &reactor.automatic_trim_timer_ready,
     };
     if ready
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)

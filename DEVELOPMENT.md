@@ -201,6 +201,13 @@ Cancellation, unsupported discard and lower errors stop the scan without resubmi
 reply can follow a physical effect, so the CLI does not retry. Device acknowledgment does not
 guarantee that discarded space reads as zero.
 
+The saved `--auto-trim on` policy selects periodic scans for subsequent writable mounts. The first
+cycle starts after sixty seconds, and each successful cycle schedules the next after completion.
+Automatic and manual scans share discard admission and physical completion ownership. Background
+work uses available ordinary execution capacity; it cannot consume the independent media-ownership
+lane. A failed, cancelled or uncertain cycle stops automatic discard for that mount. Shutdown
+revokes future cycles and joins any running physical command before retiring its exclusions.
+
 ## Ext4 durability and interoperability
 
 Interoperability uses e2fsprogs as an independent oracle on newly formatted or

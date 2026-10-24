@@ -285,6 +285,8 @@ pub(crate) struct VolumeRuntime {
     native_reliability: IoReliabilityOwner,
     /// Mutations admitted before closing and not yet fully checkpointed or abandoned.
     active_mutations: DriverShared<AtomicU32>,
+    /// Sole owner of periodic discard admission, completion and terminal failure.
+    automatic_trim: automatic_trim::AutomaticTrimState,
 }
 
 impl VolumeRuntime {
@@ -296,6 +298,7 @@ impl VolumeRuntime {
     pub(crate) fn try_new(
         mount: CompletedMount,
         storage: MountedStorage,
+        automatic_trim: ext4_control::AutomaticTrim,
         catalog: &mut crate::identity::IdentityDirectory,
     ) -> DriverResult<Self> {
         let (profile, epoch, coordinator, mmp) = mount.into_parts();
@@ -311,6 +314,11 @@ impl VolumeRuntime {
         let crypto = CngProvider::try_open()?;
         let metadata_cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
         Ok(Self {
+            automatic_trim: automatic_trim::AutomaticTrimState::new(
+                automatic_trim,
+                profile.access(),
+                crate::kernel::time::monotonic_millis(),
+            ),
             identity,
             metadata_cache,
             profile,
@@ -1017,3 +1025,6 @@ mod tests {
         );
     }
 }
+
+mod automatic_trim;
+pub(crate) use automatic_trim::{AutomaticTrimDeadline, AutomaticTrimRun};
