@@ -992,7 +992,8 @@ pub(crate) enum PrimarySuperblockRead {
     /// The on-disk image is already fully valid.
     Valid(Superblock),
     /// The first sector contains the next write-session state while the checksum still authenticates
-    /// the previous state. Mount must durably restore this image before interpreting metadata.
+    /// the previous state. Mount restores this image before journal recovery; validated geometry
+    /// may first locate and validate the journal without changing either device.
     TornWriteSession {
         /// Complete primary-superblock image already validated as the previous marker state.
         repair: Vec<u8>,
@@ -1374,7 +1375,7 @@ impl FeatureSet {
         {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if incompat & (INCOMPAT_META_BG | INCOMPAT_MMP) != 0 {
+        if incompat & INCOMPAT_META_BG != 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
         if incompat & (INCOMPAT_INLINE_DATA | INCOMPAT_EA_INODE) != 0

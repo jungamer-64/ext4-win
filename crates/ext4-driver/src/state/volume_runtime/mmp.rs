@@ -277,31 +277,4 @@ impl MediaOwnership {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    /// # Panics
-    /// Fails if retirement loses its cause, admits I/O, or lets a late completion restore authority.
-    #[test]
-    fn revocation_is_independent_of_reliability_and_rejects_late_completions() {
-        let mut ownership = MediaOwnership::from_mount(None);
-        let now = MmpTime::new(1000, 0);
-        assert_eq!(ownership.authorize(now), Ok(()));
-        assert!(matches!(ownership.next_action(now), Ok(None)));
-        assert_eq!(ownership.wakeup(), None);
-        ownership.revoke(Error::MmpCorrupt);
-        assert!(!ownership.permits_io());
-        assert_eq!(
-            ownership.authorize(now),
-            Err(Error::MmpOwnershipLost.into())
-        );
-        assert_eq!(ownership.close_ready(), Err(Error::MmpCorrupt.into()));
-        assert_eq!(
-            ownership.complete(MmpCompletion::ReadOnly, now),
-            Err(Error::MmpOwnershipLost)
-        );
-        ownership.revoke(Error::DeviceIo);
-        assert_eq!(ownership.close_ready(), Err(Error::MmpCorrupt.into()));
-        assert!(matches!(ownership.next_action(now), Ok(None)));
-        assert_eq!(ownership.wakeup(), None);
-    }
-}
+mod tests;

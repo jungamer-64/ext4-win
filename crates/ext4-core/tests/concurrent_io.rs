@@ -8,6 +8,9 @@ use alloc::{boxed::Box, vec::Vec};
 use ext4_core::*;
 use sha2::Digest as _;
 
+#[path = "concurrent_io/mmp.rs"]
+mod mmp;
+
 /// Selects the on-disk inline-data feature using format constants and an independent CRC.
 /// # Errors
 /// Returns an invalid fixture field or failed production mount.
@@ -2133,6 +2136,15 @@ fn context_cipher(key: &[u8], unit: u64, bytes: &mut [u8]) -> Result<()> {
     Ok(())
 }
 
+/// Observable boundaries of the simulated host's mount protocol.
+#[derive(Debug)]
+enum MountBoundary<'a> {
+    /// Independent candidate validation finished; no replay cursor is retained.
+    JournalValidated,
+    /// A concrete transfer is about to reach the simulated device.
+    Lower(&'a StorageRequest),
+}
+
 /// Only these private in-memory copies are mutated; tracked fixture images remain inputs.
 #[derive(Debug)]
 struct Disk {
@@ -2341,6 +2353,17 @@ impl Disk {
     /// # Errors
     /// Returns a mount, external-journal discovery, or storage failure.
     fn mount(&mut self, access: MountAccess) -> Result<CompletedMount> {
+        self.mount_observing(access, |_disk, _boundary, _millis| Ok(()))
+    }
+
+    /// Drives mount with latency or peer changes at the exclusive-discovery boundary.
+    /// # Errors
+    /// Preserves probe, discovery, ownership and recovery failure without retrying effects.
+    fn mount_observing(
+        &mut self,
+        access: MountAccess,
+        mut observe: impl FnMut(&mut Self, MountBoundary<'_>, &mut u64) -> Result<()>,
+    ) -> Result<CompletedMount> {
         let length = u64::try_from(self.filesystem.len()).map_err(|_| Error::DeviceRange)?;
         let mut probe = Box::try_new(ext4_core::MountProbeOperation::new(
             DeviceLength::from_bytes(length),
@@ -2368,10 +2391,13 @@ impl Disk {
         loop {
             step = match step {
                 MountTransition::SubmitLower { request, suspended }
-                | MountTransition::SubmitOwnership { request, suspended } => suspended.advance(
-                    OperationEvent::StorageCompleted(self.complete(request)?),
-                    ext4_core::MmpTime::new(millis, 0),
-                ),
+                | MountTransition::SubmitOwnership { request, suspended } => {
+                    observe(self, MountBoundary::Lower(&request), &mut millis)?;
+                    suspended.advance(
+                        OperationEvent::StorageCompleted(self.complete(request)?),
+                        ext4_core::MmpTime::new(millis, 0),
+                    )
+                }
                 MountTransition::WaitForTimer { seconds, suspended } => {
                     millis = millis.saturating_add(u64::from(seconds).saturating_mul(1000));
                     suspended.advance(
@@ -2407,6 +2433,7 @@ impl Disk {
                             },
                         };
                     };
+                    observe(self, MountBoundary::JournalValidated, &mut millis)?;
                     suspended.attach_external_journal(journal, ext4_core::MmpTime::new(millis, 0))
                 }
             };

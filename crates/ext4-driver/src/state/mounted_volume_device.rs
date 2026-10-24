@@ -136,6 +136,8 @@ impl MountedVolumeDevice {
         )?;
         let sector_bytes =
             u16::try_from(sector_size.as_u32()).map_err(|_| DriverError::InvalidParameter)?;
+        // Retain only the native observation while actor ownership moves to its final address.
+        let publication_reliability = binding.actor.runtime.observe_reliability()?;
         let trace = binding.volume().trace;
         let identity = binding.actor.runtime.identity();
         let serial_number = VolumeSerialNumber::from_uuid(identity.uuid()).as_u32();
@@ -285,29 +287,35 @@ impl MountedVolumeDevice {
             (*device.as_ptr()).SectorSize = sector_bytes;
         }
 
-        let publication =
-            match MountedVpb::publish(vpb, device, serial_number, volume_label, replacement_vpb) {
-                Ok(publication) => publication,
-                Err(error) => {
-                    Self::unregister_shutdown_notification(device);
-                    unsafe {
-                        // SAFETY: Publication failed without changing the VPB. This mount still owns
-                        // the unpublished device; retire joins any shutdown dispatch before VCB release.
-                        let target = header.retire();
-                        drop(target);
-                    }
-                    #[cfg(not(test))]
-                    unsafe {
-                        // SAFETY: This work item was allocated above and was never queued.
-                        ffi::IoFreeWorkItem(retirement_work_item);
-                    }
-                    unsafe {
-                        // SAFETY: Retirement joined the actor; the unqueued work item was freed above.
-                        retirement_slot.write(core::ptr::null_mut());
-                    }
-                    return Err(error);
+        let publication = match (|| {
+            if publication_reliability.policy()
+                == crate::kernel::io_reliability::NativeIoPolicy::Unavailable
+            {
+                return Err(DriverError::Core(ext4_core::Error::MmpOwnershipLost));
+            }
+            MountedVpb::publish(vpb, device, serial_number, volume_label, replacement_vpb)
+        })() {
+            Ok(publication) => publication,
+            Err(error) => {
+                Self::unregister_shutdown_notification(device);
+                unsafe {
+                    // SAFETY: Publication failed without changing the VPB. This mount still owns
+                    // the unpublished device; retire joins any shutdown dispatch before VCB release.
+                    let target = header.retire();
+                    drop(target);
                 }
-            };
+                #[cfg(not(test))]
+                unsafe {
+                    // SAFETY: This work item was allocated above and was never queued.
+                    ffi::IoFreeWorkItem(retirement_work_item);
+                }
+                unsafe {
+                    // SAFETY: Retirement joined the actor; the unqueued work item was freed above.
+                    retirement_slot.write(core::ptr::null_mut());
+                }
+                return Err(error);
+            }
+        };
         let publication_destination = unsafe {
             // SAFETY: The projected UnsafeCell field is initialized and disjoint from actor storage.
             (*publication_slot).get()

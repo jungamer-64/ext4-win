@@ -297,7 +297,7 @@ fn readonly_observation_is_write_free_and_rejects_active_owners() {
             let transition = device.acquire(MediaAccess::ReadOnly)?;
             assert!(matches!(
                 device.run(transition, |_device, _step| Ok(()))?,
-                MmpCompletion::ReadOnly
+                MmpCompletion::Observed(_owner)
             ));
             assert!(device.effects.is_empty());
             assert_eq!(device.bytes, before);

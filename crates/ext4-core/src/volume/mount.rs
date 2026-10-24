@@ -1371,7 +1371,6 @@ pub struct ValidatedExternalJournal {
     requirement: ExternalJournalRequirement,
     /// Validated candidate device length.
     device_length: DeviceLength,
-
 }
 
 impl ValidatedExternalJournal {
@@ -1674,12 +1673,40 @@ impl ExternalJournalProbeOperation {
         }
     }
 
-    /// Consumes one probe event and runs to the next lower read or terminal classification.
+    /// Consumes one candidate event; only identity/geometry evidence survives discovery.
     #[must_use]
     pub fn advance(
-        mut self: Box<Self>,
+        self: Box<Self>,
         event: super::OperationEvent,
     ) -> ExternalJournalProbeTransition {
+        let requirement = self.requirement;
+        let device_length = self.candidate.len();
+        match self.advance_loaded(event) {
+            ExternalJournalLoadTransition::SubmitLower { request, suspended } => {
+                ExternalJournalProbeTransition::SubmitLower { request, suspended }
+            }
+            ExternalJournalLoadTransition::Complete(result) => {
+                ExternalJournalProbeTransition::Complete(result.and_then(|loaded| {
+                    match loaded {
+                        ExternalJournalLoad::Mismatch => Ok(ExternalJournalProbeOutcome::Mismatch),
+                        ExternalJournalLoad::Match(_journal) => {
+                            memory::try_box(ValidatedExternalJournal {
+                                requirement,
+                                device_length,
+                            })
+                            .map(ExternalJournalProbeOutcome::Match)
+                        }
+                    }
+                }))
+            }
+        }
+    }
+
+    /// The mount reloads the cursor under its current ownership before replay admission.
+    fn advance_loaded(
+        mut self: Box<Self>,
+        event: super::OperationEvent,
+    ) -> ExternalJournalLoadTransition {
         let accepted = match event {
             super::OperationEvent::Admitted => Ok(()),
             super::OperationEvent::StorageCompleted(completion) => {
@@ -1689,7 +1716,7 @@ impl ExternalJournalProbeOperation {
             _ => Err(Error::DeviceIo),
         };
         if let Err(error) = accepted {
-            return ExternalJournalProbeTransition::Complete(Err(error));
+            return ExternalJournalLoadTransition::Complete(Err(error));
         }
         let loaded = {
             let mut device = OperationDevice::new(&mut self.candidate);
@@ -1701,31 +1728,30 @@ impl ExternalJournalProbeOperation {
             )
         };
         match loaded {
-            Ok(ExternalJournalLoad::Mismatch) => {
-                ExternalJournalProbeTransition::Complete(Ok(ExternalJournalProbeOutcome::Mismatch))
-            }
-            Ok(ExternalJournalLoad::Match(journal)) => {
-                match memory::try_box(ValidatedExternalJournal {
-                    requirement: self.requirement,
-                    device_length: self.candidate.len(),
-                    journal,
-                }) {
-                    Ok(validated) => ExternalJournalProbeTransition::Complete(Ok(
-                        ExternalJournalProbeOutcome::Match(validated),
-                    )),
-                    Err(error) => ExternalJournalProbeTransition::Complete(Err(error)),
-                }
-            }
             Err(Error::OperationSuspended) => match self.candidate.take_pending_request() {
-                Ok(request) => ExternalJournalProbeTransition::SubmitLower {
+                Ok(request) => ExternalJournalLoadTransition::SubmitLower {
                     request,
                     suspended: self,
                 },
-                Err(error) => ExternalJournalProbeTransition::Complete(Err(error)),
+                Err(error) => ExternalJournalLoadTransition::Complete(Err(error)),
             },
-            Err(error) => ExternalJournalProbeTransition::Complete(Err(error)),
+            result => ExternalJournalLoadTransition::Complete(result),
         }
     }
+}
+
+/// A loaded cursor remains private to the active mount, never in a discovery token.
+#[derive(Debug)]
+enum ExternalJournalLoadTransition {
+    /// This loader owns the exact candidate transcript across its next read.
+    SubmitLower {
+        /// Exact exclusive-candidate read.
+        request: crate::StorageRequest,
+        /// Unique parser and transcript continuation.
+        suspended: Box<ExternalJournalProbeOperation>,
+    },
+    /// Current candidate cursor or independent mismatch/failure.
+    Complete(Result<ExternalJournalLoad>),
 }
 
 /// Read-only primary-device probe. It grants no recovery or media-write authority.
@@ -1840,8 +1866,8 @@ impl ProbedMount {
     ) -> Result<MountOperation> {
         let mount = owner.mount();
         let ownership = match self.mmp {
-            Some(parameters) => MountOwnership::Starting(memory::try_box(
-                super::MmpOperation::acquire(parameters, owner, access.media_access())?,
+            Some(parameters) => MountOwnership::Observing(memory::try_box(
+                super::MmpOperation::acquire(parameters, owner, super::MediaAccess::ReadOnly)?,
             )?),
             None => MountOwnership::Unprotected,
         };
@@ -1859,6 +1885,7 @@ impl ProbedMount {
                 }
             },
             filesystem: self.filesystem,
+            external: None,
             fscrypt_keys: Some(fscrypt_keys),
             state: MountState::Resolving,
             cancel_requested: false,
@@ -1920,6 +1947,8 @@ pub struct MountOperation {
     recovery: Option<super::recovery::RecoveryOverlay>,
     /// Filesystem-device transcript used only for restartable metadata resolution.
     filesystem: StorageTranscript,
+    /// Exclusive-device identity evidence; loaded journal cursors are always read afresh.
+    external: Option<Box<ValidatedExternalJournal>>,
     /// Mount key snapshot moved once into the initial epoch before marker publication.
     fscrypt_keys: Option<FscryptKeySet>,
     /// Explicit mount and durability phase.
@@ -1933,8 +1962,10 @@ pub struct MountOperation {
 enum MountOwnership {
     /// This filesystem does not require a writable ownership lease, or was observed read only.
     Unprotected,
-    /// The first direct record read has not yet been submitted.
-    Starting(Box<super::MmpOperation>),
+    /// Initial write-free owner observation precedes metadata and device discovery.
+    Observing(Box<super::MmpOperation>),
+    /// Discovery may read metadata, but recovery effects still require a fresh writable acquisition.
+    ReadyToClaim(super::MmpOwner),
     /// A lower request or monotonic timer owns the pending acquisition or renewal.
     Pending {
         /// Sole completion or timer continuation for the direct record protocol.
@@ -1949,6 +1980,8 @@ enum MountOwnership {
 /// The physical update continuation cannot independently extend a retained I/O window.
 #[derive(Debug)]
 enum PendingMountOwnership {
+    /// Initial observation grants no filesystem-write authority.
+    Observation,
     /// Acquisition has no pre-existing writable lease.
     Acquisition,
     /// Acknowledged prior validity remains bounded until its exact durable successor arrives.
@@ -1981,10 +2014,15 @@ enum MountState {
     Repaired,
     /// Await a core-minted token for the exact external-journal requirement.
     AwaitingExternal {
-        /// Primary admission state retained across driver discovery.
-        primary: ResolvedPrimary,
-        /// Requirement that the attached token must satisfy exactly.
+        /// Exact requirement that the exclusive candidate must satisfy.
         requirement: ExternalJournalRequirement,
+    },
+    /// Read the external journal afresh within the current mount-ownership phase.
+    LoadingExternal {
+        /// Validated bootstrap geometry; it cannot authorize effects before claim.
+        primary: PrimaryAdmission,
+        /// The exclusive candidate's private read continuation.
+        operation: Box<ExternalJournalProbeOperation>,
     },
     /// Drive bounded journal recovery without a storage transcript.
     Recovering {
@@ -2096,27 +2134,45 @@ struct UnpublishedMount {
 /// Journal resolution result before recovery begins.
 #[derive(Debug)]
 enum JournalResolution {
-    /// A torn write-session transition was recognized and must be restored before journal resolution.
-    RepairWriteSession {
-        /// Fully allocated previous valid primary-superblock image.
-        marker: Vec<u8>,
-    },
-    /// A concrete loaded journal is ready for bounded recovery.
+    /// A concrete internal journal is ready for ownership/recovery admission.
     Loaded {
-        /// Valid primary metadata or provisional recovery-only geometry.
-        primary: ResolvedPrimary,
-        /// Loaded journal.
+        /// Valid primary metadata or authenticated repair image.
+        primary: PrimaryAdmission,
+        /// Current journal cursor.
         journal: Journal<LoadedJournal>,
-        /// Device that owns journal records.
+        /// Device containing this cursor.
         journal_target: StorageTarget,
     },
-    /// Driver discovery is required before external recovery can begin.
-    Discover {
-        /// Valid primary metadata or provisional recovery-only geometry.
-        primary: ResolvedPrimary,
-        /// Exact candidate validation requirement.
+    /// External placement needs either host discovery or a fresh exclusive-device read.
+    External {
+        /// Validated bootstrap metadata, with repair authority still withheld.
+        primary: PrimaryAdmission,
+        /// Exact candidate identity and filesystem home space.
         requirement: ExternalJournalRequirement,
     },
+}
+
+/// Primary observation does not itself grant permission to begin recovery effects.
+#[derive(Debug)]
+enum PrimaryAdmission {
+    /// Journal replay can start after independent ownership admission.
+    Ready(ResolvedPrimary),
+    /// The authenticated prior write-session image must be restored before replay.
+    RepairWriteSession {
+        /// Valid geometry permits write-free journal discovery.
+        superblock: Superblock,
+        /// Exact authenticated image to restore under ownership.
+        marker: Vec<u8>,
+    },
+}
+impl PrimaryAdmission {
+    /// Narrows metadata to the fields needed for journal placement and ownership scope checks.
+    const fn recovery_bootstrap(&self) -> Superblock {
+        match self {
+            Self::Ready(primary) => primary.recovery_bootstrap(),
+            Self::RepairWriteSession { superblock, .. } => *superblock,
+        }
+    }
 }
 
 /// Primary-superblock authority retained through journal discovery and recovery.
@@ -2162,10 +2218,10 @@ impl MountOperation {
     pub fn submission_deadline(&self) -> Option<super::MmpDeadline> {
         match &self.ownership {
             MountOwnership::Held(lease) => Some(lease.deadline()),
-            MountOwnership::Starting(operation) | MountOwnership::Pending { operation, .. } => {
+            MountOwnership::Observing(operation) | MountOwnership::Pending { operation, .. } => {
                 operation.submission_deadline()
             }
-            MountOwnership::Unprotected => None,
+            MountOwnership::Unprotected | MountOwnership::ReadyToClaim(_) => None,
         }
     }
 
@@ -2177,29 +2233,16 @@ impl MountOperation {
         now: super::MmpTime,
     ) -> MountTransition {
         self.now = now;
-        let validated = *validated;
-        let state = core::mem::replace(&mut self.state, MountState::Resolving);
-        let MountState::AwaitingExternal {
-            primary,
-            requirement,
-        } = state
-        else {
+        let MountState::AwaitingExternal { requirement } = self.state else {
             return MountTransition::Complete(Err(Error::DeviceIo));
         };
         if requirement != validated.requirement {
             return MountTransition::Complete(Err(Error::UnsupportedJournal));
         }
-        match primary.begin_recovery(validated.journal) {
-            Ok(operation) => {
-                self.state = MountState::Recovering {
-                    primary,
-                    journal_target: StorageTarget::ExternalJournal,
-                    operation,
-                };
-                self.drive()
-            }
-            Err(error) => MountTransition::Complete(Err(error)),
-        }
+        self.external = Some(validated);
+        self.filesystem = StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
+        self.state = MountState::Resolving;
+        self.drive()
     }
 
     /// Consumes one concrete event and runs until the next lower request or terminal result.
@@ -2212,14 +2255,14 @@ impl MountOperation {
         self.now = now;
         let ownership = core::mem::replace(&mut self.ownership, MountOwnership::Unprotected);
         match ownership {
-            MountOwnership::Starting(operation) => {
+            MountOwnership::Observing(operation) => {
                 let event = match event {
                     super::OperationEvent::Admitted => super::MmpEvent::Start,
                     super::OperationEvent::CancelRequested => super::MmpEvent::Cancel,
                     _ => return MountTransition::Complete(Err(Error::DeviceIo)),
                 };
                 return self.accept_ownership(
-                    PendingMountOwnership::Acquisition,
+                    PendingMountOwnership::Observation,
                     operation.advance(event, now),
                 );
             }
@@ -2310,8 +2353,12 @@ impl MountOperation {
                     (PendingMountOwnership::Acquisition, super::MmpCompletion::Acquired(lease)) => {
                         MountOwnership::Held(lease)
                     }
-                    (PendingMountOwnership::Acquisition, super::MmpCompletion::ReadOnly) => {
-                        MountOwnership::Unprotected
+                    (PendingMountOwnership::Observation, super::MmpCompletion::Observed(owner)) => {
+                        if self.access.media_access() == super::MediaAccess::ReadWrite {
+                            MountOwnership::ReadyToClaim(owner)
+                        } else {
+                            MountOwnership::Unprotected
+                        }
                     }
                     (
                         PendingMountOwnership::Renewal(pending),
@@ -2358,6 +2405,13 @@ impl MountOperation {
             MountState::Resolving => {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::Resolving;
+            }
+            MountState::LoadingExternal {
+                primary,
+                mut operation,
+            } => {
+                operation.candidate.complete(completion)?;
+                self.state = MountState::LoadingExternal { primary, operation };
             }
             MountState::RepairWritePending { expected } => {
                 expected.complete(completion)?;
@@ -2465,7 +2519,9 @@ impl MountOperation {
                 }
                 self.ownership = MountOwnership::Held(lease);
             }
-            MountOwnership::Unprotected => {}
+            ownership @ (MountOwnership::Unprotected | MountOwnership::ReadyToClaim(_)) => {
+                self.ownership = ownership;
+            }
             _ => return MountTransition::Complete(Err(Error::DeviceIo)),
         }
         loop {
@@ -2517,35 +2573,37 @@ impl MountOperation {
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
                 MountState::Resolving => match self.resolve_journal() {
-                    Ok(JournalResolution::RepairWriteSession { marker }) => {
-                        self.state = MountState::RepairWriteReady { marker };
-                    }
                     Ok(JournalResolution::Loaded {
                         primary,
                         journal,
                         journal_target,
-                    }) => match primary.begin_recovery(journal) {
-                        Ok(operation) => {
-                            self.state = MountState::Recovering {
-                                primary,
-                                journal_target,
-                                operation,
-                            };
-                        }
-                        Err(error) => return MountTransition::Complete(Err(error)),
-                    },
-                    Ok(JournalResolution::Discover {
+                    }) => {
+                        return self.admit_journal(primary, journal, journal_target);
+                    }
+                    Ok(JournalResolution::External {
                         primary,
                         requirement,
                     }) => {
-                        self.state = MountState::AwaitingExternal {
-                            primary,
-                            requirement,
-                        };
-                        return MountTransition::DiscoverExternalJournal {
-                            requirement,
-                            suspended: self,
-                        };
+                        if let Some(external) = &self.external {
+                            if external.requirement != requirement {
+                                return MountTransition::Complete(Err(Error::UnsupportedJournal));
+                            }
+                            let operation =
+                                match memory::try_box(ExternalJournalProbeOperation::new(
+                                    requirement,
+                                    external.device_length,
+                                )) {
+                                    Ok(operation) => operation,
+                                    Err(error) => return MountTransition::Complete(Err(error)),
+                                };
+                            self.state = MountState::LoadingExternal { primary, operation };
+                        } else {
+                            self.state = MountState::AwaitingExternal { requirement };
+                            return MountTransition::DiscoverExternalJournal {
+                                requirement,
+                                suspended: self,
+                            };
+                        }
                     }
                     Err(Error::OperationSuspended) => {
                         self.state = MountState::Resolving;
@@ -2594,18 +2652,43 @@ impl MountOperation {
                         StorageTranscript::new(StorageTarget::Filesystem, filesystem_length);
                     self.state = MountState::Resolving;
                 }
-                MountState::AwaitingExternal {
-                    primary,
-                    requirement,
-                } => {
-                    self.state = MountState::AwaitingExternal {
-                        primary,
-                        requirement,
-                    };
+                MountState::AwaitingExternal { requirement } => {
+                    self.state = MountState::AwaitingExternal { requirement };
                     return MountTransition::DiscoverExternalJournal {
                         requirement,
                         suspended: self,
                     };
+                }
+                MountState::LoadingExternal { primary, operation } => {
+                    match operation.advance_loaded(super::OperationEvent::Admitted) {
+                        ExternalJournalLoadTransition::SubmitLower { request, suspended } => {
+                            self.state = MountState::LoadingExternal {
+                                primary,
+                                operation: suspended,
+                            };
+                            return MountTransition::SubmitLower {
+                                request,
+                                suspended: self,
+                            };
+                        }
+                        ExternalJournalLoadTransition::Complete(Ok(
+                            ExternalJournalLoad::Match(journal),
+                        )) => {
+                            return self.admit_journal(
+                                primary,
+                                journal,
+                                StorageTarget::ExternalJournal,
+                            );
+                        }
+                        ExternalJournalLoadTransition::Complete(Ok(
+                            ExternalJournalLoad::Mismatch,
+                        )) => {
+                            return MountTransition::Complete(Err(Error::UnsupportedJournal));
+                        }
+                        ExternalJournalLoadTransition::Complete(Err(error)) => {
+                            return MountTransition::Complete(Err(error));
+                        }
+                    }
                 }
                 MountState::Recovering {
                     primary,
@@ -2953,6 +3036,57 @@ impl MountOperation {
         }
     }
 
+    /// Drops all preflight cursors before acquiring writable ownership, then reloads under that lease.
+    fn admit_journal(
+        mut self: Box<Self>,
+        primary: PrimaryAdmission,
+        journal: Journal<LoadedJournal>,
+        journal_target: StorageTarget,
+    ) -> MountTransition {
+        if matches!(self.ownership, MountOwnership::ReadyToClaim(_)) {
+            let MountOwnership::ReadyToClaim(owner) =
+                core::mem::replace(&mut self.ownership, MountOwnership::Unprotected)
+            else {
+                return MountTransition::Complete(Err(Error::DeviceIo));
+            };
+            let Some(parameters) = self.mmp_parameters else {
+                return MountTransition::Complete(Err(Error::MmpCorrupt));
+            };
+            let operation = match super::MmpOperation::acquire(
+                parameters,
+                owner,
+                super::MediaAccess::ReadWrite,
+            )
+            .and_then(memory::try_box)
+            {
+                Ok(operation) => operation,
+                Err(error) => return MountTransition::Complete(Err(error)),
+            };
+            self.filesystem =
+                StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
+            self.state = MountState::Resolving;
+            let now = self.now;
+            return self.accept_ownership(
+                PendingMountOwnership::Acquisition,
+                operation.advance(super::MmpEvent::Start, now),
+            );
+        }
+        self.state = match primary {
+            PrimaryAdmission::Ready(primary) => match primary.begin_recovery(journal) {
+                Ok(operation) => MountState::Recovering {
+                    primary,
+                    journal_target,
+                    operation,
+                },
+                Err(error) => return MountTransition::Complete(Err(error)),
+            },
+            PrimaryAdmission::RepairWriteSession { marker, .. } => {
+                MountState::RepairWriteReady { marker }
+            }
+        };
+        self.drive()
+    }
+
     /// Resolves primary metadata and either loads an internal journal or emits discovery facts.
     /// # Errors
     ///
@@ -2963,12 +3097,17 @@ impl MountOperation {
             Superblock::read_write_from(&mut filesystem)?
         };
         let primary = match primary_read {
-            PrimarySuperblockRead::Valid(superblock) => ResolvedPrimary::Valid(superblock),
+            PrimarySuperblockRead::Valid(superblock) => {
+                PrimaryAdmission::Ready(ResolvedPrimary::Valid(superblock))
+            }
             PrimarySuperblockRead::TornWriteSession { repair } => {
-                return Ok(JournalResolution::RepairWriteSession { marker: repair });
+                PrimaryAdmission::RepairWriteSession {
+                    superblock: Superblock::parse_read_write(&repair)?,
+                    marker: repair,
+                }
             }
             PrimarySuperblockRead::ChecksumInvalid(provisional) => {
-                ResolvedPrimary::JournalRepairRequired(provisional)
+                PrimaryAdmission::Ready(ResolvedPrimary::JournalRepairRequired(provisional))
             }
         };
         let superblock = primary.recovery_bootstrap();
@@ -2997,7 +3136,7 @@ impl MountOperation {
                     journal_target: StorageTarget::Filesystem,
                 })
             }
-            JournalMode::External(journal_uuid) => Ok(JournalResolution::Discover {
+            JournalMode::External(journal_uuid) => Ok(JournalResolution::External {
                 primary,
                 requirement: ExternalJournalRequirement {
                     journal_uuid,

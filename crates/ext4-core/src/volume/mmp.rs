@@ -736,7 +736,7 @@ impl MmpOperation {
         }
         let (sequence, after) = match self.action {
             Action::Acquire(MediaAccess::ReadOnly) => {
-                return MmpTransition::Complete(Ok(MmpCompletion::ReadOnly));
+                return MmpTransition::Complete(Ok(MmpCompletion::Observed(self.owner)));
             }
             Action::Acquire(MediaAccess::ReadWrite) => (
                 self.owner.sequence,
