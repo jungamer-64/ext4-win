@@ -1685,7 +1685,8 @@ impl MountedVolumeAccess<'_> {
 
     /// Grants the short durable-visibility publication lane.
     #[cfg(not(test))]
-    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> Option<VisibilityLease> {
+    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> DriverResult<Option<VisibilityLease>> {
+        self.authorize_storage()?;
         self.runtime.try_grant_visibility(ticket)
     }
 
@@ -1694,7 +1695,8 @@ impl MountedVolumeAccess<'_> {
     pub(crate) fn try_grant_checkpoint(
         &mut self,
         epoch: ext4_core::EpochSequence,
-    ) -> Option<ext4_core::CheckpointLease> {
+    ) -> DriverResult<Option<ext4_core::CheckpointLease>> {
+        self.authorize_storage()?;
         self.runtime.try_grant_checkpoint(epoch)
     }
 
@@ -1717,12 +1719,14 @@ impl MountedVolumeAccess<'_> {
     }
 
     /// Observes the next due MMP action or its completion watchdog deadline.
+    #[cfg(not(test))]
     pub(crate) fn mmp_wakeup(&self) -> Option<ext4_core::MmpDeadline> {
         self.runtime.mmp_wakeup()
     }
     /// Transfers only a due renewal or a filesystem-close-authorized record release.
     /// # Errors
     /// Revokes the session if no continuous acknowledgement remains.
+    #[cfg(not(test))]
     pub(crate) fn start_mmp_action(&mut self) -> DriverResult<Option<ext4_core::MmpOperation>> {
         self.runtime.start_mmp_action()
     }
@@ -1747,6 +1751,7 @@ impl MountedVolumeAccess<'_> {
     /// Waits for ownership release without restoring journal or mutation authority.
     /// # Errors
     /// Returns the first terminal ownership failure instead of an indefinite close wait.
+    #[cfg(not(test))]
     pub(crate) fn mmp_close_ready(&self) -> DriverResult<bool> {
         self.authorize_storage()?;
         self.runtime.mmp_close_ready()

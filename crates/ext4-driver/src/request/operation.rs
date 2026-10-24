@@ -5173,7 +5173,7 @@ impl MutationRequestOperation {
     fn fail_commit_path(
         self: Box<Self>,
         context: CommitContext,
-        error: Error,
+        error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         if self.write_effect_observed {
@@ -5189,7 +5189,7 @@ impl MutationRequestOperation {
         self.abort_create(
             owned,
             Some(publication),
-            CreateAbortContinuation::Complete(DriverError::from(error)),
+            CreateAbortContinuation::Complete(error),
         )
     }
 

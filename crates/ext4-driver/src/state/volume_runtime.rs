@@ -588,18 +588,24 @@ impl VolumeRuntime {
     }
 
     /// Grants the short visibility swap independently of checkpoint I/O.
+    /// # Errors
+    /// Rejects revoked ownership separately from ordinary visibility contention.
     #[cfg(not(test))]
-    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> Option<VisibilityLease> {
-        self.coordinator.acquire_visibility(ticket)
+    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> DriverResult<Option<VisibilityLease>> {
+        self.authorize_ownership()?;
+        Ok(self.coordinator.acquire_visibility(ticket))
     }
 
     /// Grants the detached checkpoint operation after durable visibility publication.
+    /// # Errors
+    /// Rejects revoked ownership separately from an occupied checkpoint lane.
     #[cfg(not(test))]
     pub(crate) fn try_grant_checkpoint(
         &mut self,
         epoch: EpochSequence,
-    ) -> Option<ext4_core::CheckpointLease> {
-        self.coordinator.acquire_checkpoint(epoch)
+    ) -> DriverResult<Option<ext4_core::CheckpointLease>> {
+        self.authorize_ownership()?;
+        Ok(self.coordinator.acquire_checkpoint(epoch))
     }
 
     /// Allocation-free durable epoch publication after a matching visibility grant.
@@ -676,13 +682,18 @@ impl VolumeRuntime {
         self.authorize_ownership()
     }
     /// Observes the next heartbeat or outstanding record-operation deadline for the actor timer.
+    #[cfg(not(test))]
     pub(crate) fn mmp_wakeup(&self) -> Option<ext4_core::MmpDeadline> {
         self.ownership.wakeup()
     }
     /// Starts only a due renewal or a filesystem-close-authorized release.
     /// # Errors
     /// Records terminal ownership failure before returning a failed handoff.
+    #[cfg(not(test))]
     pub(crate) fn start_mmp_action(&mut self) -> DriverResult<Option<ext4_core::MmpOperation>> {
+        if self.ownership.wakeup().is_none() {
+            return Ok(None);
+        }
         let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
         match self.ownership.next_action(now) {
             Ok(operation) => {
@@ -730,6 +741,7 @@ impl VolumeRuntime {
     /// Readiness for the native close, retaining terminal failure separately from a pending release.
     /// # Errors
     /// Returns the first ownership failure while a close acknowledgment is pending.
+    #[cfg(not(test))]
     pub(crate) fn mmp_close_ready(&self) -> DriverResult<bool> {
         self.ownership.close_ready()
     }
