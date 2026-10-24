@@ -368,6 +368,40 @@ impl PreparedJournalCommit {
     }
 }
 
+/// Immutable filesystem coordinates and blocks owned by a protocol outside the journal.
+/// Replay, commit and checkpoint share this restriction; a journal record cannot manufacture
+/// permission to replace the MMP owner's independently updated physical record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FilesystemHomeSpace {
+    /// Filesystem and journal byte geometry, selected from the primary filesystem.
+    block_size: BlockSize,
+    /// Exclusive filesystem home-block upper bound.
+    block_count: u64,
+    /// A declared ownership record is reserved even when absent from all inode mappings.
+    mmp: Option<BlockAddress>,
+}
+impl FilesystemHomeSpace {
+    /// Captures validated geometry and ownership placement before journal discovery or replay.
+    pub(crate) const fn from_superblock(superblock: &Superblock) -> Self {
+        Self {
+            block_size: superblock.block_size(),
+            block_count: superblock.block_count().as_u64(),
+            mmp: match superblock.mmp() { Some(parameters) => Some(parameters.block), None => None },
+        }
+    }
+    /// Required block width for an independently located journal device.
+    pub(crate) const fn block_size(self) -> BlockSize { self.block_size }
+    /// Rejects format-invalid or independently owned journal destinations before effects.
+    /// # Errors
+    /// Returns journal corruption for out-of-range destinations or ownership-record aliases.
+    fn validate(self, block: BlockAddress) -> Result<()> {
+        if block.get() >= self.block_count || self.mmp == Some(block) {
+            return Err(Error::JournalCorrupt);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// JBD2 journal with typestate-tracked replay and commit phases.
 pub(crate) struct Journal<State = CleanJournal> {
@@ -381,8 +415,8 @@ pub(crate) struct Journal<State = CleanJournal> {
     geometry: JournalGeometry,
     /// Next sequence and clean head.
     cursor: JournalCursor,
-    /// Filesystem block count used to reject journal entries outside the volume.
-    filesystem_blocks: u64,
+    /// Authoritative geometry and independent protocol exclusions for every home write.
+    home_space: FilesystemHomeSpace,
     /// Typestate marker for loaded, clean, or commit-durable journal state.
     state: PhantomData<State>,
 }
@@ -1292,7 +1326,7 @@ impl<State> Journal<State> {
             profile: self.profile,
             geometry: self.geometry,
             cursor: self.cursor,
-            filesystem_blocks: self.filesystem_blocks,
+            home_space: self.home_space,
             state: PhantomData,
         })
     }
@@ -1304,10 +1338,10 @@ impl<State> Journal<State> {
     /// superblock cannot be read or parsed, or the ring layout is inconsistent with the inode size.
     pub(crate) fn from_inode(
         inode: &Inode,
-        block_size: BlockSize,
-        filesystem_blocks: u64,
+        home_space: FilesystemHomeSpace,
         reader: &mut OperationDevice<'_>,
     ) -> Result<Journal<LoadedJournal>> {
+        let block_size = home_space.block_size;
         if inode.size().bytes() == 0 || block_size.bytes() == 0 {
             return Err(Error::UnsupportedJournal);
         }
@@ -1331,8 +1365,12 @@ impl<State> Journal<State> {
         let location = JournalLocation::Internal(InternalJournalLayout::new(
             tree.extents(),
             capacity_blocks,
-            filesystem_blocks,
+            home_space.block_count,
         )?);
+        if let Some(block) = home_space.mmp
+            && location.contains_home_block(block)? {
+            return Err(Error::JournalCorrupt);
+        }
         let mut raw = memory::repeated_vec(
             0_u8,
             usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
@@ -1355,7 +1393,7 @@ impl<State> Journal<State> {
             profile,
             geometry,
             cursor,
-            filesystem_blocks,
+            home_space,
             state: PhantomData,
         })
     }
@@ -1369,8 +1407,7 @@ impl<State> Journal<State> {
         reader: &mut OperationDevice<'_>,
         expected_uuid: JournalUuid,
         filesystem_uuid: FilesystemUuid,
-        expected_block_size: BlockSize,
-        filesystem_blocks: u64,
+        home_space: FilesystemHomeSpace,
     ) -> Result<ExternalJournalLoad> {
         let mut ext_raw = [0_u8; EXTERNAL_EXT_SUPERBLOCK_BYTES];
         reader.read_exact_at(
@@ -1381,7 +1418,7 @@ impl<State> Journal<State> {
             ExternalDeviceSuperblockProbe::Mismatch => return Ok(ExternalJournalLoad::Mismatch),
             ExternalDeviceSuperblockProbe::Match(ext) => ext,
         };
-        if ext.block_size != expected_block_size {
+        if ext.block_size != home_space.block_size {
             return Err(Error::UnsupportedJournal);
         }
         let device_blocks = reader
@@ -1420,7 +1457,7 @@ impl<State> Journal<State> {
             profile,
             geometry,
             cursor,
-            filesystem_blocks,
+            home_space,
             state: PhantomData,
         }))
     }
@@ -1700,15 +1737,12 @@ impl<State> Journal<State> {
             .min(payloads))
     }
 
-    /// Rejects replay targets outside the filesystem or inside the internal journal.
+    /// Rejects targets outside the journal's home space or inside its own physical storage.
     /// # Errors
     ///
-    /// Returns an error when the replay target is beyond the filesystem or overlaps the internal
-    /// journal's home blocks.
+    /// Returns corruption when the destination overlaps independent ownership or journal storage.
     fn validate_replay_target(&self, block: BlockAddress) -> Result<()> {
-        if block.get() >= self.filesystem_blocks {
-            return Err(Error::JournalCorrupt);
-        }
+        self.home_space.validate(block)?;
         if self.location.contains_home_block(block)? {
             return Err(Error::JournalCorrupt);
         }
