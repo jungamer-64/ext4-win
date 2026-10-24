@@ -1344,7 +1344,13 @@ where
         let result = {
             let mut crypto = UnkeyedCryptographicOperation;
             let mut pass = ready
-                .begin_pass(cache.access(epoch), now, &mut crypto)
+                .begin_pass(
+                    coordinator
+                        .mutation_context(cache.access(epoch))
+                        .map_err(core_task_error)?,
+                    now,
+                    &mut crypto,
+                )
                 .map_err(core_task_error)?;
             match mutate(&mut pass) {
                 Ok(output) => {

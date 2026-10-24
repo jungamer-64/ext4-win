@@ -251,6 +251,7 @@ impl MetadataMutation<'_, '_> {
         ticket: u64,
         coordinator: &MutationCoordinatorState,
     ) -> Result<ResolvedMutation> {
+        coordinator.require_session_authority()?;
         if self.volume.mount != Some(&coordinator.mount)
             || self.volume.epoch != Some(coordinator.published_epoch())
         {

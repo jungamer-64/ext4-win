@@ -4743,15 +4743,18 @@ impl MutationRequestOperation {
         let mut publication = None;
         let resolved = {
             let request = &self.request;
-            let mut pass =
-                match ready.begin_pass(cache.access(epoch.epoch()), self.now, &mut self.crypto) {
-                    Ok(pass) => pass,
-                    Err(error) => {
-                        return MutationStep::Transition(
-                            self.complete_error(owned, DriverError::from(error)),
-                        );
-                    }
-                };
+            let context = match operations.mutation_context(cache.access(epoch.epoch())) {
+                Ok(context) => context,
+                Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
+            };
+            let mut pass = match ready.begin_pass(context, self.now, &mut self.crypto) {
+                Ok(pass) => pass,
+                Err(error) => {
+                    return MutationStep::Transition(
+                        self.complete_error(owned, DriverError::from(error)),
+                    );
+                }
+            };
             match Self::execute_resolve(
                 request,
                 DriverResolveState {

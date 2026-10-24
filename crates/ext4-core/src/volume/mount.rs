@@ -773,7 +773,8 @@ pub struct CommittedReadContext<'state> {
 }
 
 /// Coordinator-admitted snapshot for one synchronous mutation pass.
-/// Its constructor checks the live session and the selected committed epoch before staging.
+/// Its constructor checks the session and selected epoch. Staging remains provisional; sealing
+/// and commit preparation revalidate against the current coordinator before any effect.
 #[derive(Debug)]
 pub struct MutationResolveContext<'state> {
     /// Current immutable metadata and cache borrow; no journal publication capability is exposed.
@@ -958,7 +959,7 @@ impl MutationCoordinatorState {
     /// # Errors
     /// Returns write protection, revoked ownership or a foreign/superseded metadata snapshot.
     pub fn mutation_context<'state>(
-        &'state self,
+        &self,
         cache: crate::MetadataCacheAccess<'state>,
     ) -> Result<MutationResolveContext<'state>> {
         self.require_session_authority()?;

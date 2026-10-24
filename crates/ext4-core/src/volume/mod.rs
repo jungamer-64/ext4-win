@@ -34,8 +34,8 @@ pub use mount::{
     CommittedReadContext, CompletedMount, EpochSequence, ExternalJournalProbeOperation,
     ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
     MountOperation, MountProbeOperation, MountProbeTransition, MountTransition, MountedProfile,
-    MutationCoordinatorState, MutationResolveContext, MutationResource, ObservedResourceVersionSet, ProbedMount,
-    ResourceVersion, ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
+    MutationCoordinatorState, MutationResolveContext, MutationResource, ObservedResourceVersionSet,
+    ProbedMount, ResourceVersion, ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
     ChildLookup, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,

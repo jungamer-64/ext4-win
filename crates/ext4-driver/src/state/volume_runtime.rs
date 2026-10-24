@@ -404,6 +404,18 @@ impl VolumeRuntime {
             .read_context(cache.access(self.epochs.current()))?)
     }
 
+    /// Captures provisional staging admission independently of native per-handle state.
+    /// # Errors
+    /// Returns media revocation, unreliable writes or a stale/foreign epoch before staging starts.
+    pub(crate) fn mutation_context<'cache>(
+        &self,
+        cache: ext4_core::MetadataCacheAccess<'cache>,
+    ) -> DriverResult<ext4_core::MutationResolveContext<'cache>> {
+        self.authorize_ownership()?;
+        self.failure.authorize_mutation()?;
+        Ok(self.coordinator.mutation_context(cache)?)
+    }
+
     /// Mutation coordinator under reactor-issued intent/commit capability.
     pub(crate) const fn coordinator(&self) -> &MutationCoordinatorState {
         &self.coordinator

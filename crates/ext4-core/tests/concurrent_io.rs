@@ -11,6 +11,57 @@ use sha2::Digest as _;
 #[path = "concurrent_io/mmp.rs"]
 mod mmp;
 
+/// # Errors
+/// Propagates fixture, context and provisional pass construction failures.
+/// # Panics
+/// Fails if read-only, foreign or revoked sessions can seal ordinary mutation staging.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions exercise current admission and revocation contracts"
+)]
+fn mutation_staging_requires_current_writable_session_admission() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let mut foreign = Fixture::new()?;
+    assert!(matches!(
+        fixture
+            .coordinator
+            .mutation_context(foreign.cache.access(&foreign.epoch)),
+        Err(Error::StaleReadContext)
+    ));
+    let (_profile, read_only, read_only_coordinator, _lease) = fixture
+        .disk
+        .mount(MountAccess::ReadOnly {
+            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+        })?
+        .into_parts();
+    let mut read_only_cache = MetadataCache::default();
+    assert!(matches!(
+        read_only_coordinator.mutation_context(read_only_cache.access(&read_only)),
+        Err(Error::ReadOnlyFilesystem)
+    ));
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let mut ready =
+        MutationResolveOperation::new(&fixture.profile).accept(OperationEvent::Admitted)?;
+    let context = fixture
+        .coordinator
+        .mutation_context(fixture.cache.access(&fixture.epoch))?;
+    fixture.coordinator.revoke_media_ownership();
+    let mut crypto = PlainCrypto;
+    let pass = ready.begin_pass(context, Ext4Timestamp::from_seconds(2), &mut crypto)?;
+    assert!(matches!(
+        pass.resolve(ticket, &fixture.coordinator),
+        Err(Error::MmpOwnershipLost)
+    ));
+    assert!(matches!(
+        fixture
+            .coordinator
+            .mutation_context(foreign.cache.access(&foreign.epoch)),
+        Err(Error::MmpOwnershipLost)
+    ));
+    Ok(())
+}
+
 /// Selects the on-disk inline-data feature using format constants and an independent CRC.
 /// # Errors
 /// Returns an invalid fixture field or failed production mount.
@@ -1081,7 +1132,9 @@ fn mount_sessions_isolate_plans_grants_and_read_provenance() -> Result<()> {
     let mut ready = old_resolver.accept(OperationEvent::Admitted)?;
     assert!(matches!(
         ready.begin_pass(
-            origin.cache.access(&origin.epoch),
+            origin
+                .coordinator
+                .mutation_context(origin.cache.access(&origin.epoch))?,
             Ext4Timestamp::from_seconds(2),
             &mut PlainCrypto
         ),
@@ -2531,7 +2584,7 @@ impl Disk {
             let mut output = None;
             let result = {
                 let mut pass = ready.begin_pass(
-                    cache.access(epoch),
+                    coordinator.mutation_context(cache.access(epoch))?,
                     Ext4Timestamp::from_seconds(2),
                     crypto,
                 )?;
@@ -3115,7 +3168,7 @@ fn current_versions_reject_an_earlier_epoch_at_admission() -> Result<()> {
                 pass.write_file_range(file, FileOffset::ZERO, b"a")
             }
         ),
-        Err(Error::ClusterReferenceConflict)
+        Err(Error::StaleReadContext)
     ));
     fixture.epoch = current;
     Ok(())

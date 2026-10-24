@@ -1528,6 +1528,17 @@ impl MountedVolumeAccess<'_> {
         self.runtime.committed_read(cache)
     }
 
+    /// Admits a staging snapshot while retaining independent native per-handle preparation.
+    /// # Errors
+    /// Returns storage removal, media revocation or a stale/foreign snapshot before staging.
+    pub(crate) fn mutation_context<'cache>(
+        &self,
+        cache: ext4_core::MetadataCacheAccess<'cache>,
+    ) -> DriverResult<ext4_core::MutationResolveContext<'cache>> {
+        self.authorize_storage()?;
+        self.runtime.mutation_context(cache)
+    }
+
     /// Allocates one mutation ticket and active-mutation lifetime lease.
     /// # Errors
     ///
