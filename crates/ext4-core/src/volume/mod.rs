@@ -16,7 +16,7 @@ mod mount;
 pub(crate) use metadata_cache::CacheReadStamp;
 pub use metadata_cache::{MetadataCache, MetadataCacheAccess};
 pub use mmp::{
-    MmpChange, MmpCompletion, MmpEffect, MmpEvent, MmpFailure, MmpLease, MmpOperation, MmpOwner,
+    MmpChange, MmpCompletion, MmpDeadline, MmpEffect, MmpEvent, MmpFailure, MmpLease, MmpOperation, MmpOwner,
     MmpRenewal, MmpRenewingLease, MmpTime, MmpTransition,
 };
 mod node;

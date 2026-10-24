@@ -98,6 +98,19 @@ impl MmpOwner {
     }
 }
 
+/// Read-only expiration observation in the mount's host monotonic clock domain.
+/// Copying a deadline grants no record update, epoch publication, or session renewal authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MmpDeadline {
+    /// Absolute milliseconds from the same origin supplied in every MMP event.
+    monotonic_millis: u64,
+}
+impl MmpDeadline {
+    /// Converts the observation for host timers and atomic native-I/O projections.
+    /// The host must also apply independent session revocation; this number cannot restore a lease.
+    pub const fn monotonic_millis(self) -> u64 { self.monotonic_millis }
+}
+
 /// Sole authority obtained after a durable ownership claim and an independent delayed readback.
 /// Dropping this value never writes a clean marker: only an explicitly completed release may do so.
 #[derive(Debug)]
@@ -110,6 +123,11 @@ pub struct MmpLease {
     valid_until_millis: u64,
 }
 impl MmpLease {
+    /// Observes the acknowledged deadline without granting another ownership operation.
+    pub const fn deadline(&self) -> MmpDeadline {
+        MmpDeadline { monotonic_millis: self.valid_until_millis }
+    }
+
     /// Maximum interval before the host must drive another ownership check.
     pub fn update_seconds(&self) -> u16 {
         self.parameters.heartbeat_seconds()
@@ -180,6 +198,11 @@ pub struct MmpRenewingLease {
     valid_until_millis: u64,
 }
 impl MmpRenewingLease {
+    /// Observes the acknowledged deadline without granting another ownership operation.
+    pub const fn deadline(&self) -> MmpDeadline {
+        MmpDeadline { monotonic_millis: self.valid_until_millis }
+    }
+
     /// Admits I/O only within the previous acknowledgement, including time spent awaiting completion.
     /// # Errors
     /// Returns ownership loss when no previously acknowledged time remains.

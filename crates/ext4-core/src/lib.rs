@@ -57,7 +57,7 @@ pub use volume::{
     ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
     FileNode, FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, HomeBlockDurability,
     JournalPayloadDurability, MediaAccess, MetadataCache, MetadataCacheAccess, MmpChange,
-    MmpCompletion, MmpEffect, MmpEvent, MmpFailure, MmpLease, MmpOperation, MmpOwner, MmpRenewal,
+    MmpCompletion, MmpDeadline, MmpEffect, MmpEvent, MmpFailure, MmpLease, MmpOperation, MmpOwner, MmpRenewal,
     MmpRenewingLease, MmpTime, MmpTransition, MountAccess, MountOperation, MountProbeOperation,
     MountProbeTransition, MountTransition, MountedProfile, MutationCoordinatorState, MutationLease,
     MutationResolveOperation, MutationResolvePass, MutationResolveReady, MutationResolveTransition,
