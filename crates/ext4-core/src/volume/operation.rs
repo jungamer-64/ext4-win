@@ -526,10 +526,11 @@ impl MutationResolveReady {
     /// Rejects a different mount or epoch before interpreting retained lower buffers.
     pub fn begin_pass<'pass>(
         &'pass mut self,
-        cache: crate::MetadataCacheAccess<'pass>,
+        context: super::MutationResolveContext<'pass>,
         now: Ext4Timestamp,
         crypto: &'pass mut dyn CryptographicOperation,
     ) -> Result<MutationResolvePass<'pass, 'pass, 'pass>> {
+        let cache = context.cache;
         let epoch = cache.epoch();
         epoch.require_writable()?;
         if self.mount != epoch.mount

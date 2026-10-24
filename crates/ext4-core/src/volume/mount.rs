@@ -772,6 +772,14 @@ pub struct CommittedReadContext<'state> {
     pub(super) versions: &'state ResourceVersionTable,
 }
 
+/// Coordinator-admitted snapshot for one synchronous mutation pass.
+/// Its constructor checks the live session and the selected committed epoch before staging.
+#[derive(Debug)]
+pub struct MutationResolveContext<'state> {
+    /// Current immutable metadata and cache borrow; no journal publication capability is exposed.
+    pub(super) cache: crate::MetadataCacheAccess<'state>,
+}
+
 /// Dependencies retained by one completion-driven read.
 #[derive(Debug, Default)]
 pub(super) struct ReadObservations {
@@ -944,6 +952,24 @@ impl MutationCoordinatorState {
             cache,
             versions: &self.resource_versions,
         })
+    }
+
+    /// Admits staging against this session's current writable epoch.
+    /// # Errors
+    /// Returns write protection, revoked ownership or a foreign/superseded metadata snapshot.
+    pub fn mutation_context<'state>(
+        &'state self,
+        cache: crate::MetadataCacheAccess<'state>,
+    ) -> Result<MutationResolveContext<'state>> {
+        self.require_session_authority()?;
+        let epoch = cache.epoch();
+        epoch.require_writable()?;
+        if self.mount != epoch.mount
+            || self.journal.epoch() != (epoch.identity().uuid(), epoch.sequence())
+        {
+            return Err(Error::StaleReadContext);
+        }
+        Ok(MutationResolveContext { cache })
     }
 
     /// Allocates one stable FIFO ticket without wrapping.
