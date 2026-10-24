@@ -1371,8 +1371,7 @@ pub struct ValidatedExternalJournal {
     requirement: ExternalJournalRequirement,
     /// Validated candidate device length.
     device_length: DeviceLength,
-    /// Loaded journal whose profile and external layout are already validated.
-    journal: Journal<LoadedJournal>,
+
 }
 
 impl ValidatedExternalJournal {

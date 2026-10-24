@@ -283,8 +283,8 @@ pub struct MmpRenewal {
 pub enum MmpCompletion {
     /// A fresh mount acquired ownership after delayed claim verification and a durable update.
     Acquired(MmpLease),
-    /// Independent observation admitted a write-free mount; no ownership lease was created.
-    ReadOnly,
+    /// Observation created no lease; the retained identity can begin a separate fresh acquisition.
+    Observed(MmpOwner),
     /// A matching retained lease must consume this evidence to extend I/O admission.
     Renewed(MmpRenewal),
     /// Filesystem close and the final clean ownership marker both completed in this session.
