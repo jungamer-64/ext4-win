@@ -562,6 +562,13 @@ fn append_static_ranges(
     superblock: &Superblock,
     allocation: &MountedAllocationSnapshot,
 ) -> Result<()> {
+    if let Some(parameters) = superblock.mmp() {
+        ranges.try_push(AllocationRange::new(
+            parameters.block,
+            1,
+            BlockOwnership::Exclusive,
+        )?)?;
+    }
     let descriptor_blocks = descriptor_table_blocks(superblock)?;
     for group in &allocation.groups {
         if group_has_superblock(superblock, group.group) {

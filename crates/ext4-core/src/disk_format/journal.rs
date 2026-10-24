@@ -386,11 +386,16 @@ impl FilesystemHomeSpace {
         Self {
             block_size: superblock.block_size(),
             block_count: superblock.block_count().as_u64(),
-            mmp: match superblock.mmp() { Some(parameters) => Some(parameters.block), None => None },
+            mmp: match superblock.mmp() {
+                Some(parameters) => Some(parameters.block),
+                None => None,
+            },
         }
     }
     /// Required block width for an independently located journal device.
-    pub(crate) const fn block_size(self) -> BlockSize { self.block_size }
+    pub(crate) const fn block_size(self) -> BlockSize {
+        self.block_size
+    }
     /// Rejects format-invalid or independently owned journal destinations before effects.
     /// # Errors
     /// Returns journal corruption for out-of-range destinations or ownership-record aliases.
@@ -1368,7 +1373,8 @@ impl<State> Journal<State> {
             home_space.block_count,
         )?);
         if let Some(block) = home_space.mmp
-            && location.contains_home_block(block)? {
+            && location.contains_home_block(block)?
+        {
             return Err(Error::JournalCorrupt);
         }
         let mut raw = memory::repeated_vec(
@@ -3391,7 +3397,11 @@ mod tests {
             profile,
             geometry: JournalGeometry { block_size, ring },
             cursor,
-            filesystem_blocks,
+            home_space: super::FilesystemHomeSpace {
+                block_size,
+                block_count: filesystem_blocks,
+                mmp: None,
+            },
             state: PhantomData,
         })
     }
@@ -4005,7 +4015,11 @@ mod tests {
                 superblock,
                 profile,
                 geometry: JournalGeometry { block_size, ring },
-                filesystem_blocks: 100,
+                home_space: super::FilesystemHomeSpace {
+                    block_size,
+                    block_count: 100,
+                    mmp: None,
+                },
                 state: PhantomData,
             };
             let collision = [JournalBlock::new(BlockAddress::new(45), vec![0; 1024])];
@@ -4013,6 +4027,76 @@ mod tests {
                 internal.prepare_transaction(block_size, &collision),
                 Err(Error::JournalCorrupt)
             );
+            Ok(())
+        })();
+        assert_eq!(outcome, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails if commit or either recovery record class can address independently owned MMP data.
+    #[test]
+    fn mmp_home_block_is_excluded_from_commit_and_recovery() {
+        let outcome = (|| -> Result<()> {
+            for block_log in [0, 2] {
+                let mut journal = test_external_journal::<LoadedJournal>(
+                    block_log,
+                    JBD2_FEATURE_INCOMPAT_REVOKE,
+                    64,
+                    7,
+                    3,
+                    3,
+                    100,
+                )?;
+                journal.home_space.mmp = Some(BlockAddress::new(10));
+                let block_size = journal.geometry.block_size;
+                let width =
+                    usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+                for target in [9, 10, 11] {
+                    let metadata = [JournalBlock::new(
+                        BlockAddress::new(target),
+                        vec![0x41; width],
+                    )];
+                    let prepared = journal.prepare_transaction(block_size, &metadata);
+                    if target == 10 {
+                        assert_eq!(prepared, Err(Error::JournalCorrupt));
+                    } else {
+                        prepared?;
+                    }
+                }
+                // Independent JBD2 32-bit descriptor: one explicit UUID and one LAST_TAG entry.
+                let mut descriptor = vec![0_u8; width];
+                for (offset, value) in [(0, 0xc03b_3998), (4, 1), (8, 7), (12, 10), (16, 8)] {
+                    put_be_u32(&mut descriptor, DiskOffset::new(offset), value)?;
+                }
+                crate::memory::copy_exact(
+                    descriptor
+                        .get_mut(20..36)
+                        .ok_or(Error::TruncatedStructure)?,
+                    &TEST_UUID,
+                )?;
+                let mut commit = vec![0_u8; width];
+                for (offset, value) in [(0, 0xc03b_3998), (4, 2), (8, 7)] {
+                    put_be_u32(&mut commit, DiskOffset::new(offset), value)?;
+                }
+                let mut recovery =
+                    JournalRecoveryOperation::new(journal, RecoveryState::NeedsRecovery)?;
+                recovery.scan_control_block(&descriptor)?;
+                recovery.scan_control_block(&commit)?;
+                recovery.finish_scan()?;
+                assert_eq!(
+                    recovery.validate_or_replay_control_block(&descriptor),
+                    Err(Error::JournalCorrupt)
+                );
+                // Independent revoke vector: the counted 20-byte record contains one 32-bit target.
+                let mut revoke = vec![0_u8; width];
+                for (offset, value) in [(0, 0xc03b_3998), (4, 5), (8, 7), (12, 20), (16, 10)] {
+                    put_be_u32(&mut revoke, DiskOffset::new(offset), value)?;
+                }
+                assert_eq!(
+                    recovery.validate_or_replay_control_block(&revoke),
+                    Err(Error::JournalCorrupt)
+                );
+            }
             Ok(())
         })();
         assert_eq!(outcome, Ok(()));

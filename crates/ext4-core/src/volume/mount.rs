@@ -15,8 +15,8 @@ use crate::disk::storage::{
     OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
 };
 use crate::disk_format::journal::{
-    CleanJournal, ExternalJournalLoad, Journal, JournalBlock, JournalRecoveryOperation,
-    LoadedJournal,
+    CleanJournal, ExternalJournalLoad, FilesystemHomeSpace, Journal, JournalBlock,
+    JournalRecoveryOperation, LoadedJournal,
 };
 use crate::disk_format::superblock::{
     ChecksumInvalidSuperblock, FilesystemUuid, JournalMode, JournalUuid, PrimarySuperblockRead,
@@ -719,6 +719,10 @@ pub(super) enum CheckpointAdmission {
 
 /// Journal coordinator phase. A new commit is granted only in `Ready`.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the bounded inline journal moves between coordinator and checkpoint without allocating at publication"
+)]
 pub(super) enum JournalCoordinatorState {
     /// Media ownership has been revoked; neither issued grants nor cached reads can restore it.
     Fenced {
@@ -1336,10 +1340,8 @@ pub struct ExternalJournalRequirement {
     journal_uuid: JournalUuid,
     /// Primary filesystem UUID required as the sole JBD2 user.
     filesystem_uuid: FilesystemUuid,
-    /// Filesystem and journal block size.
-    block_size: BlockSize,
-    /// Filesystem home-block upper bound used by replay validation.
-    filesystem_blocks: u64,
+    /// Complete immutable geometry and ownership exclusions shared by discovery and replay.
+    home_space: FilesystemHomeSpace,
 }
 
 impl ExternalJournalRequirement {
@@ -1358,7 +1360,7 @@ impl ExternalJournalRequirement {
     /// Required external journal block size.
     #[must_use]
     pub const fn block_size(self) -> BlockSize {
-        self.block_size
+        self.home_space.block_size()
     }
 }
 
@@ -1693,8 +1695,7 @@ impl ExternalJournalProbeOperation {
                 &mut device,
                 self.requirement.journal_uuid,
                 self.requirement.filesystem_uuid,
-                self.requirement.block_size,
-                self.requirement.filesystem_blocks,
+                self.requirement.home_space,
             )
         };
         match loaded {
@@ -2964,8 +2965,7 @@ impl MountOperation {
                     let mut filesystem = OperationDevice::new(&mut self.filesystem);
                     Journal::<LoadedJournal>::from_inode(
                         &journal_inode,
-                        superblock.block_size(),
-                        superblock.block_count().as_u64(),
+                        FilesystemHomeSpace::from_superblock(&superblock),
                         &mut filesystem,
                     )?
                 };
@@ -2980,8 +2980,7 @@ impl MountOperation {
                 requirement: ExternalJournalRequirement {
                     journal_uuid,
                     filesystem_uuid: superblock.uuid(),
-                    block_size: superblock.block_size(),
-                    filesystem_blocks: superblock.block_count().as_u64(),
+                    home_space: FilesystemHomeSpace::from_superblock(&superblock),
                 },
             }),
             JournalMode::None => Err(Error::UnsupportedJournal),
