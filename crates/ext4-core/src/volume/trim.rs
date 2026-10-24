@@ -670,3 +670,72 @@ fn select(
     selection.next = geometry.cursor(position);
     Ok(selection)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    /// # Errors
+    /// Propagates checked physical coordinate or alignment failure.
+    /// # Panics
+    /// Fails if inward projection discards a partial device block or silently wraps an offset.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify independent physical alignment boundary values"
+    )]
+    fn device_alignment_never_expands_free_intervals() -> Result<()> {
+        let alignment = TrimAlignment::new(4096)?;
+        let range = alignment.inward(4097, 20_479)?.ok_or(Error::DeviceRange)?;
+        assert_eq!(range.offset(), ByteOffset::new(8192));
+        assert_eq!(range.length_bytes(), 8192);
+        assert!(alignment.inward(1, 4095)?.is_none());
+        assert!(matches!(
+            alignment.inward(u64::MAX, u64::MAX),
+            Err(Error::DeviceRange)
+        ));
+        for invalid in [0, 3, 128 * 1024 * 1024] {
+            assert!(TrimAlignment::new(invalid).is_err());
+        }
+        Ok(())
+    }
+    /// # Errors
+    /// Propagates checked coordinate conversion failure.
+    /// # Panics
+    /// Fails if a byte-budget continuation skips the rest of a cluster or fails to exclude its
+    /// whole allocation unit while either physical half is in flight.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify independent byte and allocation-cluster domains"
+    )]
+    fn byte_budget_retains_progress_inside_a_larger_allocation_cluster() -> Result<()> {
+        let geometry = TrimGeometry {
+            first: 0,
+            cluster_bytes: 128 * 1024 * 1024,
+            end: 256 * 1024 * 1024,
+        };
+        let first = TrimRange {
+            offset: ByteOffset::new(0),
+            length: NonZeroU64::new(TRIM_BATCH_BYTES).ok_or(Error::DeviceRange)?,
+        };
+        let first_end = first.end()?;
+        let first_span = geometry.span(first)?;
+        assert_eq!(first_span.first, ClusterAddress::new(0));
+        assert_eq!(first_span.end, ClusterAddress::new(1));
+        assert_eq!(
+            geometry.cursor(first_end).next,
+            Some(ByteOffset::new(64 * 1024 * 1024))
+        );
+        assert_eq!(geometry.cluster(first_end)?, ClusterAddress::new(0));
+        let second = TrimRange {
+            offset: ByteOffset::new(first_end),
+            length: first.length,
+        };
+        let second_span = geometry.span(second)?;
+        assert_eq!(second_span.first, first_span.first);
+        assert_eq!(second_span.end, first_span.end);
+        assert_eq!(geometry.cluster(second.end()?)?, ClusterAddress::new(1));
+        assert!(geometry.cursor(geometry.end).is_complete());
+        Ok(())
+    }
+}

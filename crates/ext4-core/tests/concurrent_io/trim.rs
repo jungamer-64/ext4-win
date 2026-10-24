@@ -5,11 +5,14 @@ use super::*;
 /// # Errors
 /// Propagates context, storage or authenticated allocation metadata failure.
 fn select(fixture: &mut Fixture) -> Result<TrimSelection> {
-    let mut operation = TrimScanOperation::new(
-        &fixture.profile,
-        TrimCursor::start(),
-        TrimAlignment::new(4096)?,
-    );
+    select_at(fixture, TrimCursor::start())
+}
+
+/// Drives a fresh metadata scan from the previous batch's physical continuation.
+/// # Errors
+/// Propagates current-epoch admission, storage or allocation metadata failure.
+fn select_at(fixture: &mut Fixture, cursor: TrimCursor) -> Result<TrimSelection> {
+    let mut operation = TrimScanOperation::new(&fixture.profile, cursor, TrimAlignment::new(4096)?);
     let mut event = OperationEvent::Admitted;
     loop {
         match operation.advance(
@@ -28,6 +31,97 @@ fn select(fixture: &mut Fixture) -> Result<TrimSelection> {
             TrimScanTransition::Complete(result) => return result,
         }
     }
+}
+
+/// # Errors
+/// Propagates independent fixture, fragmented file allocation, truncate, scan or completion failure.
+/// # Panics
+/// Fails if range exhaustion skips free space, repeats an interval, or retains allocation exclusion
+/// after exact completion.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify bounded physical progress over independently fragmented allocation metadata"
+)]
+fn fragmented_free_space_resumes_after_range_budget_without_repeating_intervals() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let files = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let metadata = NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?);
+        let mut files = Vec::new();
+        files
+            .try_reserve_exact(130)
+            .map_err(|_| Error::OutOfMemory)?;
+        for index in 0..130 {
+            let name = Ext4Name::new(format!("trim-fragment-{index:03}").as_bytes())?;
+            let file = pass.create_file(root, &name, metadata)?;
+            pass.write_file_range(file, FileOffset::ZERO, &[0xa5; 4096])?;
+            files.push(file.id());
+        }
+        Ok(files)
+    })?;
+    fixture.mutate(|pass| {
+        for (index, file) in files.iter().enumerate() {
+            if index.is_multiple_of(2) {
+                let file = pass.file(*file)?;
+                pass.truncate_file(file, FileSize::from_bytes(0))?;
+            }
+        }
+        Ok(())
+    })?;
+    let mut cursor = TrimCursor::start();
+    let mut previous_end = 0;
+    let mut physical_batches = 0;
+    for _segment in 0..8 {
+        if cursor.is_complete() {
+            break;
+        }
+        match select_at(&mut fixture, cursor)?.reserve(&mut fixture.coordinator, &fixture.epoch)? {
+            TrimAdmission::Prepared(batch) => {
+                let (request, pending) = batch.submit();
+                if physical_batches == 0 {
+                    assert_eq!(request.ranges().len(), TRIM_BATCH_RANGES);
+                }
+                for range in request.ranges() {
+                    assert!(range.offset().get() >= previous_end);
+                    previous_end = range
+                        .offset()
+                        .get()
+                        .checked_add(range.length_bytes())
+                        .ok_or(Error::DeviceRange)?;
+                    for block in range.offset().get() / 4096..previous_end / 4096 {
+                        let bit = u8::try_from(block % 8).map_err(|_| Error::DeviceRange)?;
+                        let index = 12_288_usize
+                            .checked_add(
+                                usize::try_from(block / 8).map_err(|_| Error::DeviceRange)?,
+                            )
+                            .ok_or(Error::DeviceRange)?;
+                        assert_eq!(
+                            fixture
+                                .disk
+                                .filesystem
+                                .get(index)
+                                .ok_or(Error::DeviceRange)?
+                                & (1 << bit),
+                            0
+                        );
+                    }
+                }
+                let completion = request.completed(TrimIoOutcome::Acknowledged);
+                let result = pending
+                    .complete(&mut fixture.coordinator, completion)
+                    .map_err(|mismatch| mismatch.reason)?;
+                assert!(!fixture.coordinator.has_pending_trim());
+                cursor = result.next;
+                physical_batches += 1;
+            }
+            TrimAdmission::Advanced(next) => cursor = next,
+            TrimAdmission::Waiting(_) => return Err(Error::ClusterReferenceConflict),
+        }
+    }
+    assert!(cursor.is_complete());
+    assert!(physical_batches >= 2);
+    Ok(())
 }
 
 /// Admits the nonempty fixture selection through the production coordinator.
