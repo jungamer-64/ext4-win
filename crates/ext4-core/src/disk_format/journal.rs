@@ -7,7 +7,7 @@
 //! booleans in the volume layer.
 
 use alloc::vec::Vec;
-use core::marker::PhantomData;
+use core::{marker::PhantomData, num::NonZeroU32};
 
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::ext4_crc32c;
@@ -23,6 +23,9 @@ use crate::disk_format::inode::Inode;
 use crate::disk_format::superblock::{FilesystemUuid, JournalUuid, RecoveryState, Superblock};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
+
+mod fast_commit;
+use fast_commit::{FrameAuthenticator, ScanStep};
 
 // Common JBD2 block header fields. JBD2 stores its control structures big-endian.
 /// Magic value that prefixes every JBD2 control block.
@@ -63,7 +66,8 @@ const JBD2_FEATURE_INCOMPAT_FAST_COMMIT: u32 = 0x0020;
 const JBD2_SUPPORTED_INCOMPAT: u32 = JBD2_FEATURE_INCOMPAT_REVOKE
     | JBD2_FEATURE_INCOMPAT_64BIT
     | JBD2_FEATURE_INCOMPAT_CSUM_V2
-    | JBD2_FEATURE_INCOMPAT_CSUM_V3;
+    | JBD2_FEATURE_INCOMPAT_CSUM_V3
+    | JBD2_FEATURE_INCOMPAT_FAST_COMMIT;
 
 // Descriptor tag flags define how following payload blocks are decoded.
 /// Descriptor tag flag for escaped data blocks that begin with the JBD2 magic.
@@ -231,9 +235,7 @@ impl JournalProfile {
         if superblock.compat & JBD2_FEATURE_COMPAT_CHECKSUM != 0
             || superblock.compat & !JBD2_FEATURE_COMPAT_CHECKSUM != 0
             || superblock.ro_compat != 0
-            || superblock.incompat
-                & (JBD2_FEATURE_INCOMPAT_FAST_COMMIT | JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT)
-                != 0
+            || superblock.incompat & JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT != 0
             || superblock.incompat & !JBD2_SUPPORTED_INCOMPAT != 0
             || superblock.errno != 0
         {
@@ -287,9 +289,49 @@ struct JournalGeometry {
     block_size: BlockSize,
     /// Circular range containing transaction records.
     ring: JournalRing,
+    /// An additional upper boundary exists only for a separately reserved delta-record area.
+    fast_record_end: Option<NonZeroU32>,
+}
+
+/// Physical logical-block count, independent of circular record addresses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalBackingLength(u32);
+
+/// Half-open logical range of delta records; the preceding separator belongs to neither log.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FastCommitArea {
+    /// First record block after the separator.
+    first: u32,
+    /// Exclusive backing boundary shared with the complete journal allocation.
+    end: u32,
 }
 
 impl JournalGeometry {
+    /// Complete allocation length includes the separator and delta area, independently of the ring.
+    const fn backing(self) -> JournalBackingLength {
+        JournalBackingLength(match self.fast_record_end {
+            Some(end) => end.get(),
+            None => self.ring.maxlen,
+        })
+    }
+    /// The fixed separator is never interpreted as either a full or delta journal record.
+    /// # Errors
+    /// Rejects an overflowing separator boundary before any native offset can be produced.
+    fn fast_commits(self) -> Result<Option<FastCommitArea>> {
+        self.fast_record_end
+            .map(|end| {
+                Ok(FastCommitArea {
+                    first: self
+                        .ring
+                        .maxlen
+                        .checked_add(1)
+                        .ok_or(Error::UnsupportedJournal)?,
+                    end: end.get(),
+                })
+            })
+            .transpose()
+    }
+
     /// Validates block size and circular-ring geometry against physical capacity.
     /// # Errors
     ///
@@ -303,9 +345,42 @@ impl JournalGeometry {
         if superblock.block_size != block_size.bytes() {
             return Err(Error::UnsupportedJournal);
         }
+        let maxlen = superblock.maxlen();
+        if maxlen == 0 || maxlen > capacity_blocks || superblock.first() != expected_first {
+            return Err(Error::UnsupportedJournal);
+        }
+        let (record_end, fast_commits) =
+            if superblock.incompat & JBD2_FEATURE_INCOMPAT_FAST_COMMIT != 0 {
+                // Zero selects the format's 256-block reservation. Its first block separates the logs.
+                let reserved = if superblock.fast_commit_blocks == 0 {
+                    256
+                } else {
+                    superblock.fast_commit_blocks
+                };
+                let separator = maxlen
+                    .checked_sub(reserved)
+                    .ok_or(Error::UnsupportedJournal)?;
+                let first = separator.checked_add(1).ok_or(Error::UnsupportedJournal)?;
+                if first > maxlen {
+                    return Err(Error::UnsupportedJournal);
+                }
+                (separator, Some(FastCommitArea { first, end: maxlen }))
+            } else {
+                (maxlen, None)
+            };
+        if expected_first >= record_end
+            || (superblock.start() != 0
+                && (superblock.start() < expected_first || superblock.start() >= record_end))
+        {
+            return Err(Error::UnsupportedJournal);
+        }
         Ok(Self {
             block_size,
-            ring: JournalRing::new(superblock, capacity_blocks, expected_first)?,
+            ring: JournalRing {
+                first: expected_first,
+                maxlen: record_end,
+            },
+            fast_record_end: fast_commits.and_then(|area| NonZeroU32::new(area.end)),
         })
     }
 }
@@ -432,6 +507,10 @@ pub(crate) struct LoadedJournal;
 
 /// Result of probing one external-journal candidate by its expected UUID.
 #[derive(Debug)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "UUID-first probing returns one owning journal payload; indirection adds allocation without a distinct lifetime"
+)]
 pub(crate) enum ExternalJournalLoad {
     /// Candidate UUID differs and discovery may continue.
     Mismatch,
@@ -514,6 +593,13 @@ enum PrimaryRepairValidation {
 enum RecoveryPhase {
     /// Locate the continuous committed prefix and compute allocation maxima.
     Scan,
+    /// Authenticate delta records before any full-journal replay or clean-tail write.
+    InspectFastCommit {
+        /// Independent logical area cursor; it never wraps through descriptor records.
+        logical: u32,
+        /// Framing/CRC observation grants no metadata write permission.
+        authenticator: FrameAuthenticator,
+    },
     /// Revalidate every committed structure, payload, address, and revoke before writes.
     Validate,
     /// Re-read and replay one payload buffer at a time.
@@ -623,6 +709,8 @@ struct RecoveryInFlight {
 enum RecoveryIoAction {
     /// Journal control block read.
     ControlRead,
+    /// One complete block of the separately bounded delta-record area.
+    FastCommitRead,
     /// Journal payload read for the specified prevalidated tag.
     PayloadRead {
         /// Tag whose payload owns the returned buffer.
@@ -731,14 +819,26 @@ impl JournalRecoveryOperation {
         } else {
             None
         };
+        let phase = if already_clean {
+            match (policy, journal.geometry.fast_commits()?) {
+                (RecoveryPolicy::Replay, Some(area)) if area.first < area.end => {
+                    RecoveryPhase::InspectFastCommit {
+                        logical: area.first,
+                        authenticator: FrameAuthenticator::new(
+                            start_sequence,
+                            journal.geometry.block_size,
+                        )?,
+                    }
+                }
+                _ => RecoveryPhase::Complete,
+            }
+        } else {
+            RecoveryPhase::Scan
+        };
         Ok(Self {
             journal,
             policy,
-            phase: if already_clean {
-                RecoveryPhase::Complete
-            } else {
-                RecoveryPhase::Scan
-            },
+            phase,
             walk: RecoveryWalk {
                 cursor: start_cursor,
                 sequence: start_sequence,
@@ -779,6 +879,16 @@ impl JournalRecoveryOperation {
         self.advance_pass_boundary()?;
         let (request, action) = match self.phase {
             RecoveryPhase::Complete => return Ok(None),
+            RecoveryPhase::InspectFastCommit { logical, .. } => (
+                StorageRequest::Read {
+                    target: self.journal.location.storage_target(),
+                    offset: self
+                        .journal
+                        .offset_of(logical, self.journal.geometry.block_size)?,
+                    buffer: self.buffer.take().ok_or(Error::DeviceIo)?,
+                },
+                RecoveryIoAction::FastCommitRead,
+            ),
             RecoveryPhase::FlushFilesystem => (
                 StorageRequest::Flush {
                     target: StorageTarget::Filesystem,
@@ -868,6 +978,38 @@ impl JournalRecoveryOperation {
         let in_flight = self.in_flight.take().ok_or(Error::DeviceIo)?;
         let transfer = in_flight.identity.complete_transfer(completion)?;
         match in_flight.action {
+            RecoveryIoAction::FastCommitRead => {
+                let CompletedStorageTransfer::Read { buffer, .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                let RecoveryPhase::InspectFastCommit {
+                    logical,
+                    mut authenticator,
+                } = self.phase
+                else {
+                    return Err(Error::JournalCorrupt);
+                };
+                let area = self
+                    .journal
+                    .geometry
+                    .fast_commits()?
+                    .ok_or(Error::JournalCorrupt)?;
+                match authenticator.inspect(&buffer)? {
+                    ScanStep::Finished(prefix) => self.finish_fast_scan(prefix)?,
+                    ScanStep::Continue => {
+                        let next = logical.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                        if next == area.end {
+                            self.finish_fast_scan(authenticator.finish())?;
+                        } else {
+                            self.phase = RecoveryPhase::InspectFastCommit {
+                                logical: next,
+                                authenticator,
+                            };
+                        }
+                    }
+                }
+                self.buffer = Some(buffer);
+            }
             RecoveryIoAction::ControlRead => {
                 let CompletedStorageTransfer::Read { buffer, .. } = transfer else {
                     return Err(Error::DeviceIo);
@@ -1100,7 +1242,51 @@ impl JournalRecoveryOperation {
         self.revokes
             .try_reserve_exact(self.summary.revoke_records)
             .map_err(|_| Error::OutOfMemory)?;
-        self.phase = RecoveryPhase::Validate;
+        self.phase = match (self.policy, self.journal.geometry.fast_commits()?) {
+            (RecoveryPolicy::Replay, Some(area)) if area.first < area.end => {
+                RecoveryPhase::InspectFastCommit {
+                    logical: area.first,
+                    authenticator: FrameAuthenticator::new(
+                        self.summary.next_sequence,
+                        self.journal.geometry.block_size,
+                    )?,
+                }
+            }
+            _ => RecoveryPhase::Validate,
+        };
+        self.reset_walk();
+        Ok(())
+    }
+
+    /// Authenticated nonempty deltas require semantic replay before a clean cursor can be issued.
+    /// # Errors
+    /// Rejects an unsupported semantic program before full-journal home writes or tail cleanup.
+    fn finish_fast_scan(&mut self, prefix: Option<fast_commit::AuthenticatedPrefix>) -> Result<()> {
+        if let Some(prefix) = prefix {
+            let area = self
+                .journal
+                .geometry
+                .fast_commits()?
+                .ok_or(Error::JournalCorrupt)?;
+            let capacity = u64::from(
+                area.end
+                    .checked_sub(area.first)
+                    .ok_or(Error::JournalCorrupt)?,
+            )
+            .checked_mul(u64::from(self.journal.geometry.block_size.bytes()))
+            .ok_or(Error::ArithmeticOverflow)?;
+            if prefix.end > capacity {
+                return Err(Error::JournalCorrupt);
+            }
+            if prefix.records != 0 {
+                return Err(Error::UnsupportedJournal);
+            }
+        }
+        self.phase = if self.journal.superblock.start() == 0 {
+            RecoveryPhase::Complete
+        } else {
+            RecoveryPhase::Validate
+        };
         self.reset_walk();
         Ok(())
     }
@@ -1390,7 +1576,7 @@ impl<State> Journal<State> {
             capacity_blocks,
             location.expected_first()?,
         )?;
-        location.validate_ring(&geometry.ring)?;
+        location.validate_backing(geometry.backing())?;
         let cursor = JournalCursor::from_superblock(&superblock, geometry.ring)?;
 
         Ok(Journal {
@@ -1455,7 +1641,7 @@ impl<State> Journal<State> {
             capacity_blocks,
             location.expected_first()?,
         )?;
-        location.validate_ring(&geometry.ring)?;
+        location.validate_backing(geometry.backing())?;
         let cursor = JournalCursor::from_superblock(&superblock, geometry.ring)?;
         Ok(ExternalJournalLoad::Match(Journal {
             location,
@@ -2448,30 +2634,6 @@ struct JournalRing {
 }
 
 impl JournalRing {
-    /// Validates ring geometry from a parsed journal superblock.
-    /// # Errors
-    ///
-    /// Returns an error when `first`, `maxlen`, or `start` falls outside the supported ring shape or
-    /// physical journal capacity.
-    fn new(
-        superblock: &JournalSuperblock,
-        capacity_blocks: u32,
-        expected_first: u32,
-    ) -> Result<Self> {
-        let first = superblock.first();
-        let maxlen = superblock.maxlen();
-        if maxlen == 0
-            || maxlen > capacity_blocks
-            || first != expected_first
-            || first >= maxlen
-            || (superblock.start() != 0
-                && (superblock.start() < first || superblock.start() >= maxlen))
-        {
-            return Err(Error::UnsupportedJournal);
-        }
-        Ok(Self { first, maxlen })
-    }
-
     /// Returns usable block count after the reserved superblock region.
     /// # Errors
     ///
@@ -2540,6 +2702,32 @@ impl JournalLocation {
         }
     }
 
+    /// Validates the complete journal allocation, including any reserved delta records.
+    /// # Errors
+    /// Rejects holes in an internal mapping or an external extent shorter than the declared backing.
+    fn validate_backing(&self, length: JournalBackingLength) -> Result<()> {
+        match self {
+            Self::External(layout) => {
+                if length.0 > layout.capacity_blocks {
+                    return Err(Error::UnsupportedJournal);
+                }
+            }
+            Self::Internal(layout) => {
+                let mut covered = 0;
+                for extent in &layout.extents {
+                    if extent.logical_start != covered {
+                        return Err(Error::UnsupportedJournal);
+                    }
+                    covered = extent.logical_end;
+                    if covered >= length.0 {
+                        return Ok(());
+                    }
+                }
+                return Err(Error::UnsupportedJournal);
+            }
+        }
+        Ok(())
+    }
 
     /// Returns whether a filesystem home block overlaps the internal journal.
     /// # Errors
@@ -2609,7 +2797,6 @@ impl ExternalJournalLayout {
     fn superblock_offset(self, block_size: BlockSize) -> Result<ByteOffset> {
         block_size.offset_of(BlockAddress::new(u64::from(self.superblock_block)))
     }
-
 }
 
 /// Dedicated ext-family superblock facts required to locate an external JBD2 journal.
@@ -2751,7 +2938,6 @@ impl InternalJournalLayout {
         })
     }
 
-
     /// Maps a logical journal block through the journal inode extents.
     /// # Errors
     ///
@@ -2879,6 +3065,8 @@ pub(crate) struct JournalSuperblock {
     uuid: [u8; 16],
     /// JBD2 checksum type byte from the superblock.
     checksum_type: u8,
+    /// Reserved delta-area block count; zero selects the format default when enabled.
+    fast_commit_blocks: u32,
     /// Clean-log head recorded by v2 superblocks.
     head: u32,
     /// Number of filesystems attached to an external journal.
@@ -2907,6 +3095,7 @@ impl JournalSuperblock {
             ro_compat: self.ro_compat,
             uuid: self.uuid,
             checksum_type: self.checksum_type,
+            fast_commit_blocks: self.fast_commit_blocks,
             head: self.head,
             nr_users: self.nr_users,
             first_user: self.first_user,
@@ -2952,6 +3141,7 @@ impl JournalSuperblock {
             ro_compat: be_u32(bytes, disk_offset(0x2C))?,
             uuid,
             checksum_type: *bytes.get(0x50).ok_or(Error::TruncatedStructure)?,
+            fast_commit_blocks: be_u32(bytes, disk_offset(0x54))?,
             head: be_u32(bytes, disk_offset(0x58))?,
             nr_users: be_u32(bytes, disk_offset(0x40))?,
             first_user,
@@ -3273,8 +3463,8 @@ mod tests {
         JBD2_TAG_FLAG_LAST_TAG, JBD2_TAG_FLAG_SAME_UUID, JOURNAL_COMMIT_CHECKSUM_OFFSET,
         JOURNAL_HEADER_BYTES, JOURNAL_SUPERBLOCK_BYTES, Jbd2Header, Journal, JournalBlock,
         JournalCursor, JournalGeometry, JournalLocation, JournalProfile, JournalRecoveryOperation,
-        JournalRing, JournalSequence, JournalSuperblock, JournalSuperblockVersion, LoadedJournal,
-        RecoveryPhase, RecoveryRevoke, journal_superblock_checksum,
+        JournalSequence, JournalSuperblock, JournalSuperblockVersion, LoadedJournal, RecoveryPhase,
+        RecoveryRevoke, journal_superblock_checksum,
     };
 
     /// Stable UUID used by private JBD2 wire fixtures.
@@ -3282,6 +3472,48 @@ mod tests {
         0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC, 0xED, 0xFE,
         0x0F,
     ];
+
+    /// # Panics
+    /// Fails if the circular log enters the separator or delta area, reserved-length subtraction
+    /// wraps, a legacy zero reservation loses its default, or unused fields change ordinary logs.
+    #[test]
+    fn full_and_delta_record_domains_share_only_backing_coverage() {
+        let result = (|| -> Result<()> {
+            let size = BlockSize::from_superblock_log(2)?;
+            let mut raw =
+                test_superblock(size, JBD2_FEATURE_INCOMPAT_FAST_COMMIT, 4096, 1, 9, 0, 1)?;
+            let geometry = JournalGeometry::from_superblock(&raw, size, 4096, 1)?;
+            assert_eq!(geometry.ring.maxlen, 3840);
+            assert_eq!(geometry.ring.next(3839)?, 1);
+            let area = geometry.fast_commits()?.ok_or(Error::UnsupportedJournal)?;
+            assert_eq!((area.first, area.end), (3841, 4096));
+            assert_eq!(geometry.backing().0, 4096);
+            raw.start = 3840;
+            assert_eq!(
+                JournalGeometry::from_superblock(&raw, size, 4096, 1),
+                Err(Error::UnsupportedJournal)
+            );
+            raw.start = 0;
+            for reserved in [u32::MAX, 4096, 4095] {
+                raw.fast_commit_blocks = reserved;
+                assert_eq!(
+                    JournalGeometry::from_superblock(&raw, size, 4096, 1),
+                    Err(Error::UnsupportedJournal)
+                );
+            }
+            raw.fast_commit_blocks = 1;
+            let geometry = JournalGeometry::from_superblock(&raw, size, 4096, 1)?;
+            let area = geometry.fast_commits()?.ok_or(Error::UnsupportedJournal)?;
+            assert_eq!((area.first, area.end), (4096, 4096));
+            raw.incompat = 0;
+            raw.fast_commit_blocks = u32::MAX;
+            let ordinary = JournalGeometry::from_superblock(&raw, size, 4096, 1)?;
+            assert_eq!(ordinary.ring.maxlen, 4096);
+            assert!(ordinary.fast_commits()?.is_none());
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
 
     /// Builds one test JBD2 superblock domain value without passing through its wire parser.
     /// # Errors
@@ -3313,6 +3545,7 @@ mod tests {
             ro_compat: 0,
             uuid: TEST_UUID,
             checksum_type: JBD2_CHECKSUM_CRC32C,
+            fast_commit_blocks: 0,
             head,
             nr_users: 1,
             first_user: TEST_UUID,
@@ -3343,7 +3576,8 @@ mod tests {
         let superblock =
             test_superblock(block_size, incompat, maxlen, first, sequence, start, head)?;
         let profile = JournalProfile::from_superblock(&superblock)?;
-        let ring = JournalRing::new(&superblock, maxlen, first)?;
+        let geometry = JournalGeometry::from_superblock(&superblock, block_size, maxlen, first)?;
+        let ring = geometry.ring;
         let cursor = JournalCursor::from_superblock(&superblock, ring)?;
         Ok(Journal {
             location: JournalLocation::External(ExternalJournalLayout::new(
@@ -3352,7 +3586,7 @@ mod tests {
             )?),
             superblock,
             profile,
-            geometry: JournalGeometry { block_size, ring },
+            geometry,
             cursor,
             home_space: super::FilesystemHomeSpace {
                 block_size,
@@ -3495,7 +3729,6 @@ mod tests {
                     JBD2_CHECKSUM_CRC32C,
                 ),
                 (0, JBD2_FEATURE_INCOMPAT_ASYNC_COMMIT, 0, 0, 0),
-                (0, JBD2_FEATURE_INCOMPAT_FAST_COMMIT, 0, 0, 0),
                 (0, 0x8000_0000, 0, 0, 0),
                 (0, 0, 1, 0, 0),
                 (0, 0, 0, 5, 0),
@@ -3849,7 +4082,7 @@ mod tests {
         let outcome = (|| -> Result<()> {
             let block_size = BlockSize::from_superblock_log(0)?;
             let clean = test_superblock(block_size, 0, 32, 2, 41, 0, 9)?;
-            let ring = JournalRing::new(&clean, 32, 2)?;
+            let ring = JournalGeometry::from_superblock(&clean, block_size, 32, 2)?.ring;
             assert_eq!(
                 JournalCursor::from_superblock(&clean, ring)?,
                 JournalCursor {
@@ -3961,7 +4194,8 @@ mod tests {
             let block_size = BlockSize::from_superblock_log(0)?;
             let superblock = test_superblock(block_size, 0, 16, 1, 7, 0, 1)?;
             let profile = JournalProfile::from_superblock(&superblock)?;
-            let ring = JournalRing::new(&superblock, 16, 1)?;
+            let geometry = JournalGeometry::from_superblock(&superblock, block_size, 16, 1)?;
+            let ring = geometry.ring;
             let internal = Journal::<LoadedJournal> {
                 location: JournalLocation::Internal(InternalJournalLayout::new(
                     &[test_extent(0, 16, 40)?],
@@ -3971,7 +4205,7 @@ mod tests {
                 cursor: JournalCursor::from_superblock(&superblock, ring)?,
                 superblock,
                 profile,
-                geometry: JournalGeometry { block_size, ring },
+                geometry,
                 home_space: super::FilesystemHomeSpace {
                     block_size,
                     block_count: 100,
