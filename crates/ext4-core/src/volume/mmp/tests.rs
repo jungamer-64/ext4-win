@@ -754,3 +754,64 @@ fn late_flush_retains_durable_effect_without_restoring_ownership() {
     })();
     assert_eq!(result, Ok(()));
 }
+
+/// # Panics
+/// Fails if a stale initial observation admits a claim or a claim resets its source deadline.
+#[test]
+fn acquisition_effects_retain_their_observation_freshness() {
+    let result = (|| -> Result<()> {
+        for access in [MediaAccess::ReadOnly, MediaAccess::ReadWrite] {
+            let mut device = Device::new(mmp::CLEAN)?;
+            let MmpTransition::SubmitLower { request, suspended } = device.acquire(access)? else {
+                return Err(Error::DeviceIo);
+            };
+            assert_eq!(
+                suspended
+                    .submission_deadline()
+                    .map(MmpDeadline::monotonic_millis),
+                Some(5000)
+            );
+            let completion = device.complete(request)?;
+            device.millis = 5000;
+            assert!(matches!(
+                suspended.advance(MmpEvent::StorageCompleted(completion), device.now()),
+                MmpTransition::Complete(Err(MmpFailure {
+                    reason: Error::MmpOwnershipLost,
+                    effect: MmpEffect::None
+                }))
+            ));
+            assert!(device.effects.is_empty());
+        }
+        let mut device = Device::new(mmp::CLEAN)?;
+        let MmpTransition::SubmitLower { request, suspended } =
+            device.acquire(MediaAccess::ReadWrite)?
+        else {
+            return Err(Error::DeviceIo);
+        };
+        let completion = device.complete(request)?;
+        device.millis = 4999;
+        let MmpTransition::SubmitLower { request, suspended } =
+            suspended.advance(MmpEvent::StorageCompleted(completion), device.now())
+        else {
+            return Err(Error::DeviceIo);
+        };
+        assert_eq!(
+            suspended
+                .submission_deadline()
+                .map(MmpDeadline::monotonic_millis),
+            Some(5000)
+        );
+        let completion = device.complete(request)?;
+        device.millis = 5000;
+        assert!(matches!(
+            suspended.advance(MmpEvent::StorageCompleted(completion), device.now()),
+            MmpTransition::Complete(Err(MmpFailure {
+                reason: Error::MmpOwnershipLost,
+                effect: MmpEffect::Submitted(MmpChange::Claim)
+            }))
+        ));
+        assert_eq!(device.effects, ["write"]);
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}

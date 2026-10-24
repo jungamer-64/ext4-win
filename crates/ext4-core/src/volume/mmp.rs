@@ -505,13 +505,17 @@ impl MmpOperation {
             return self.failed(Error::OperationCancelled);
         }
         if self
-            .io_deadline()
-            .is_some_and(|deadline| now.monotonic_millis >= deadline)
+            .submission_deadline()
+            .is_some_and(|deadline| now.monotonic_millis >= deadline.monotonic_millis)
         {
             // A valid physical flush acknowledgment remains durable progress even when its
             // late delivery cannot authorize another effect or restore the ownership window.
-            if let (State::Flushing { expected, after }, MmpEvent::StorageCompleted(completion)) =
-                (core::mem::replace(&mut self.state, State::Start), event)
+            if let (
+                State::Flushing {
+                    expected, after, ..
+                },
+                MmpEvent::StorageCompleted(completion),
+            ) = (core::mem::replace(&mut self.state, State::Start), event)
             {
                 if let Err(error) = expected.complete(completion) {
                     return self.failed(error);
@@ -521,7 +525,7 @@ impl MmpOperation {
             return self.failed(Error::MmpOwnershipLost);
         }
         let outcome = match (core::mem::replace(&mut self.state, State::Start), event) {
-            (State::Start, MmpEvent::Start) => return self.read(ReadPurpose::Initial),
+            (State::Start, MmpEvent::Start) => return self.read(ReadPurpose::Initial, now),
             (
                 State::Waiting {
                     purpose,
@@ -532,18 +536,30 @@ impl MmpOperation {
                 if now.monotonic_millis < not_before_millis {
                     return self.failed(Error::InvalidTimestamp);
                 }
-                return self.read(purpose);
+                return self.read(purpose, now);
             }
-            (State::Reading { expected, purpose }, MmpEvent::StorageCompleted(completion)) => {
-                expected.complete_transfer(completion).and_then(|transfer| {
-                    let CompletedStorageTransfer::Read { buffer, .. } = transfer else {
-                        return Err(Error::DeviceIo);
-                    };
-                    let record = MmpRecord::parse(&buffer, self.parameters.seed)?;
-                    Ok((purpose, record, buffer))
-                })
-            }
-            (State::Writing { expected, after }, MmpEvent::StorageCompleted(completion)) => {
+            (
+                State::Reading {
+                    expected,
+                    purpose,
+                    deadline,
+                },
+                MmpEvent::StorageCompleted(completion),
+            ) => expected.complete_transfer(completion).and_then(|transfer| {
+                let CompletedStorageTransfer::Read { buffer, .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                let record = MmpRecord::parse(&buffer, self.parameters.seed)?;
+                Ok((purpose, record, buffer, deadline))
+            }),
+            (
+                State::Writing {
+                    expected,
+                    after,
+                    deadline,
+                },
+                MmpEvent::StorageCompleted(completion),
+            ) => {
                 if let Err(error) = expected.complete(completion) {
                     return self.failed(error);
                 }
@@ -553,13 +569,19 @@ impl MmpOperation {
                 self.state = State::Flushing {
                     expected: StorageRequestIdentity::from_request(&request),
                     after,
+                    deadline,
                 };
                 return MmpTransition::SubmitLower {
                     request,
                     suspended: self,
                 };
             }
-            (State::Flushing { expected, after }, MmpEvent::StorageCompleted(completion)) => {
+            (
+                State::Flushing {
+                    expected, after, ..
+                },
+                MmpEvent::StorageCompleted(completion),
+            ) => {
                 if let Err(error) = expected.complete(completion) {
                     return self.failed(error);
                 }
@@ -572,13 +594,17 @@ impl MmpOperation {
                         MmpTransition::Complete(Ok(MmpCompletion::Released(durability)))
                     }
                     AfterWrite::Claim(seconds) => self.wait(ReadPurpose::VerifyClaim, seconds, now),
-                    AfterWrite::Renewal(deadline) => self.read(ReadPurpose::VerifyLease(deadline)),
+                    AfterWrite::Renewal(deadline) => {
+                        self.read(ReadPurpose::VerifyLease(deadline), now)
+                    }
                 };
             }
             _ => Err(Error::DeviceIo),
         };
         match outcome {
-            Ok((purpose, record, buffer)) => self.observed(purpose, record, buffer, now),
+            Ok((purpose, record, buffer, deadline)) => {
+                self.observed(purpose, record, buffer, deadline, now)
+            }
             Err(error) => self.failed(error),
         }
     }
@@ -590,7 +616,21 @@ impl MmpOperation {
         }))
     }
     /// Requests uncached, full-block bytes with an owned destination.
-    fn read(mut self: Box<Self>, purpose: ReadPurpose) -> MmpTransition {
+    fn read(mut self: Box<Self>, purpose: ReadPurpose, now: MmpTime) -> MmpTransition {
+        let monotonic_millis = match self.action {
+            Action::Renew(deadline) | Action::Release { deadline, .. } => deadline,
+            Action::Acquire(_) => {
+                // A clean/stale observation must not outlive the shortest peer acquisition wait.
+                let fresh_until = now
+                    .monotonic_millis
+                    .saturating_add(u64::from(mmp::MIN_INTERVAL).saturating_mul(1000));
+                match purpose {
+                    ReadPurpose::VerifyLease(candidate) => fresh_until.min(candidate),
+                    _ => fresh_until,
+                }
+            }
+        };
+        let deadline = MmpDeadline { monotonic_millis };
         let request = (|| {
             Ok(StorageRequest::Read {
                 target: StorageTarget::Filesystem,
@@ -607,6 +647,7 @@ impl MmpOperation {
                 self.state = State::Reading {
                     expected: StorageRequestIdentity::from_request(&request),
                     purpose,
+                    deadline,
                 };
                 MmpTransition::SubmitLower {
                     request,
@@ -640,6 +681,7 @@ impl MmpOperation {
         purpose: ReadPurpose,
         record: MmpRecord,
         buffer: Vec<u8>,
+        observation_deadline: MmpDeadline,
         now: MmpTime,
     ) -> MmpTransition {
         match purpose {
@@ -669,7 +711,7 @@ impl MmpOperation {
                 if !self.owns(record) {
                     return self.failed(Error::MmpOwnershipLost);
                 }
-                return self.refresh(buffer, now);
+                return self.refresh(buffer, observation_deadline, now);
             }
             ReadPurpose::Observe(previous) if record != previous => {
                 return self.failed(Error::MmpOwnerActive);
@@ -700,40 +742,50 @@ impl MmpOperation {
                 self.owner.sequence,
                 AfterWrite::Claim(self.parameters.observation_seconds(record.interval)),
             ),
-            Action::Renew(_) => return self.refresh(buffer, now),
+            Action::Renew(_) => return self.refresh(buffer, observation_deadline, now),
             Action::Release { .. } => (mmp::CLEAN, AfterWrite::Release),
         };
-        self.write(buffer, sequence, after, now)
+        self.write(buffer, sequence, after, observation_deadline, now)
     }
-    /// Each further effect must fit the last acknowledged window, or the initial update's window.
-    fn io_deadline(&self) -> Option<u64> {
-        match &self.action {
-            Action::Renew(deadline) | Action::Release { deadline, .. } => Some(*deadline),
-            Action::Acquire(_) => match self.state {
-                State::Writing {
-                    after: AfterWrite::Renewal(deadline),
+    /// Observes the submission bound without granting update or mount authority.
+    /// The host must check this again after private request preparation, immediately before issuing
+    /// the transfer. Completion also checks the same bound before admitting a subsequent effect.
+    pub const fn submission_deadline(&self) -> Option<MmpDeadline> {
+        match self.state {
+            State::Reading { deadline, .. }
+            | State::Writing { deadline, .. }
+            | State::Flushing { deadline, .. } => Some(deadline),
+            State::Start | State::Waiting { .. } => match self.action {
+                Action::Renew(monotonic_millis)
+                | Action::Release {
+                    deadline: monotonic_millis,
                     ..
-                }
-                | State::Flushing {
-                    after: AfterWrite::Renewal(deadline),
-                    ..
-                }
-                | State::Reading {
-                    purpose: ReadPurpose::VerifyLease(deadline),
-                    ..
-                } => Some(deadline),
-                _ => None,
+                } => Some(MmpDeadline { monotonic_millis }),
+                Action::Acquire(_) => None,
             },
         }
     }
     /// Establishes a new deadline from submission time, including lower write/flush/read latency.
-    fn refresh(mut self: Box<Self>, buffer: Vec<u8>, now: MmpTime) -> MmpTransition {
+    fn refresh(
+        mut self: Box<Self>,
+        buffer: Vec<u8>,
+        observation_deadline: MmpDeadline,
+        now: MmpTime,
+    ) -> MmpTransition {
         self.owner.sequence = next_sequence(self.owner.sequence);
         let deadline = now
             .monotonic_millis
             .saturating_add(u64::from(self.parameters.check_seconds()).saturating_mul(1000));
         let sequence = self.owner.sequence;
-        self.write(buffer, sequence, AfterWrite::Renewal(deadline), now)
+        self.write(
+            buffer,
+            sequence,
+            AfterWrite::Renewal(deadline),
+            MmpDeadline {
+                monotonic_millis: observation_deadline.monotonic_millis.min(deadline),
+            },
+            now,
+        )
     }
     /// Full sequence and instance identity are required; wall-clock time grants no ownership.
     fn owns(&self, record: MmpRecord) -> bool {
@@ -745,6 +797,7 @@ impl MmpOperation {
         mut buffer: Vec<u8>,
         sequence: u32,
         after: AfterWrite,
+        deadline: MmpDeadline,
         now: MmpTime,
     ) -> MmpTransition {
         let request = (|| {
@@ -768,6 +821,7 @@ impl MmpOperation {
                 self.state = State::Writing {
                     expected: StorageRequestIdentity::from_request(&request),
                     after,
+                    deadline,
                 };
                 MmpTransition::SubmitLower {
                     request,
