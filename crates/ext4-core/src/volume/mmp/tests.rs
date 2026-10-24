@@ -703,3 +703,54 @@ fn delayed_record_write_cannot_submit_a_post_expiry_flush() {
     })();
     assert_eq!(result, Ok(()));
 }
+
+/// # Panics
+/// Fails if a late successful flush either restores authority or loses its acknowledged durability.
+#[test]
+fn late_flush_retains_durable_effect_without_restoring_ownership() {
+    let result = (|| -> Result<()> {
+        for release in [false, true] {
+            let mut device = Device::new(mmp::CLEAN)?;
+            let lease = device.acquired()?;
+            let operation = if release {
+                let close = Device::closed(&lease)?;
+                lease
+                    .release(close)
+                    .map_err(|(error, _lease, _close)| error)?
+            } else {
+                lease.renew(device.now())?.1
+            };
+            device.effects.clear();
+            let mut transition = memory::try_box(operation)?.advance(MmpEvent::Start, device.now());
+            for _step in 0..2 {
+                let MmpTransition::SubmitLower { request, suspended } = transition else {
+                    return Err(Error::DeviceIo);
+                };
+                let completion = device.complete(request)?;
+                transition =
+                    suspended.advance(MmpEvent::StorageCompleted(completion), device.now());
+            }
+            let MmpTransition::SubmitLower {
+                request: request @ StorageRequest::Flush { .. },
+                suspended,
+            } = transition
+            else {
+                return Err(Error::DeviceIo);
+            };
+            let completion = device.complete(request)?;
+            device.millis = device.millis.saturating_add(5000);
+            let outcome = suspended.advance(MmpEvent::StorageCompleted(completion), device.now());
+            let change = if release {
+                MmpChange::Release
+            } else {
+                MmpChange::Update
+            };
+            assert!(
+                matches!(outcome, MmpTransition::Complete(Err(MmpFailure { reason: Error::MmpOwnershipLost, effect: MmpEffect::Durable(observed) })) if observed == change)
+            );
+            assert_eq!(device.effects, ["write", "flush"]);
+        }
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}

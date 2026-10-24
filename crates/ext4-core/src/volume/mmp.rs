@@ -502,6 +502,16 @@ impl MmpOperation {
             .io_deadline()
             .is_some_and(|deadline| now.monotonic_millis >= deadline)
         {
+            // A valid physical flush acknowledgment remains durable progress even when its
+            // late delivery cannot authorize another effect or restore the ownership window.
+            if let (State::Flushing { expected, after }, MmpEvent::StorageCompleted(completion)) =
+                (core::mem::replace(&mut self.state, State::Start), event)
+            {
+                if let Err(error) = expected.complete(completion) {
+                    return self.failed(error);
+                }
+                self.effect = MmpEffect::Durable(after.change());
+            }
             return self.failed(Error::MmpOwnershipLost);
         }
         let outcome = match (core::mem::replace(&mut self.state, State::Start), event) {
