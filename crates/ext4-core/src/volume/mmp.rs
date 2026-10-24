@@ -149,7 +149,11 @@ impl MmpLease {
     pub fn next_update(&self) -> MmpDeadline {
         let window = u64::from(self.parameters.check_seconds()).saturating_mul(1000);
         let since = self.valid_until_millis.saturating_sub(window);
-        MmpDeadline { monotonic_millis: since.saturating_add(u64::from(self.parameters.heartbeat_seconds()).saturating_mul(1000)) }
+        MmpDeadline {
+            monotonic_millis: since.saturating_add(
+                u64::from(self.parameters.heartbeat_seconds()).saturating_mul(1000),
+            ),
+        }
     }
     /// Schedules renewal early enough to include write, flush and independent read latency.
     pub(crate) fn renewal_due(&self, now: MmpTime) -> bool {
@@ -176,16 +180,19 @@ impl MmpLease {
         };
         Ok((pending, operation))
     }
-    /// Consumes ownership for release after the host has finished all filesystem writes.
-    /// Failure leaves ownership unreleased; it never authorizes a second unverified clean write.
-    pub fn release(self) -> MmpOperation {
-        MmpOperation {
+    /// Consumes the matching filesystem-close completion before releasing physical ownership.
+    /// # Errors
+    /// A foreign completion returns both the still-live lease and unchanged close proof. Once an
+    /// operation is returned it owns both values; a failed or cancelled release cannot recreate them.
+    pub fn release(self, durability: super::CleanCloseDurability) -> core::result::Result<MmpOperation, (Error, Self, super::CleanCloseDurability)> {
+        if self.owner.mount != durability.mount { return Err((Error::ClusterReferenceConflict, self, durability)); }
+        Ok(MmpOperation {
             effect: MmpEffect::None,
             parameters: self.parameters,
             owner: self.owner,
-            action: Action::Release(self.valid_until_millis),
+            action: Action::Release { deadline: self.valid_until_millis, durability },
             state: State::Start,
-        }
+        })
     }
 }
 
@@ -268,8 +275,8 @@ pub enum MmpCompletion {
     ReadOnly,
     /// A matching retained lease must consume this evidence to extend I/O admission.
     Renewed(MmpRenewal),
-    /// The final clean marker and its filesystem-device flush completed.
-    Released,
+    /// Filesystem close and the final clean ownership marker both completed in this session.
+    Released(super::CleanCloseDurability),
 }
 
 /// Ordinary owner sequences advance without entering either reserved ownership marker.
@@ -374,14 +381,19 @@ pub struct MmpOperation {
     state: State,
 }
 /// Each action has a distinct ownership postcondition.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum Action {
     /// Observe without writes, or claim before mounting with write authority.
     Acquire(MediaAccess),
     /// Refresh an existing lease before its monotonic deadline.
     Renew(u64),
-    /// Release only the currently held and unexpired lease.
-    Release(u64),
+    /// Release only the unexpired owner after its matching filesystem close completed.
+    Release {
+        /// Prior acknowledged deadline cannot be extended by release I/O.
+        deadline: u64,
+        /// Completion remains owned until the final physical flush acknowledges both domains.
+        durability: super::CleanCloseDurability,
+    },
 }
 /// Meaning of the next independent read.
 #[derive(Clone, Copy, Debug)]
@@ -481,7 +493,7 @@ impl MmpOperation {
                     purpose: ReadPurpose::Initial,
                     ..
                 }
-        ) && matches!(self.action, Action::Renew(deadline) | Action::Release(deadline) if now.monotonic_millis >= deadline)
+        ) && matches!(self.action, Action::Renew(deadline) | Action::Release { deadline, .. } if now.monotonic_millis >= deadline)
         {
             return self.failed(Error::MmpOwnershipLost);
         }
@@ -530,7 +542,10 @@ impl MmpOperation {
                 }
                 self.effect = MmpEffect::Durable(after.change());
                 return match after {
-                    AfterWrite::Release => MmpTransition::Complete(Ok(MmpCompletion::Released)),
+                    AfterWrite::Release => {
+                        let Action::Release { durability, .. } = self.action else { return self.failed(Error::DeviceIo); };
+                        MmpTransition::Complete(Ok(MmpCompletion::Released(durability)))
+                    },
                     AfterWrite::Claim(seconds) => self.wait(ReadPurpose::VerifyClaim, seconds, now),
                     AfterWrite::Renewal(deadline) => self.read(ReadPurpose::VerifyLease(deadline)),
                 };
@@ -644,7 +659,7 @@ impl MmpOperation {
                         return self.wait(ReadPurpose::Observe(record), seconds, now);
                     }
                 }
-                Action::Renew(_) | Action::Release(_) => {
+                Action::Renew(_) | Action::Release { .. } => {
                     if !self.owns(record) {
                         return self.failed(Error::MmpOwnershipLost);
                     }
@@ -661,7 +676,7 @@ impl MmpOperation {
                 AfterWrite::Claim(self.parameters.observation_seconds(record.interval)),
             ),
             Action::Renew(_) => return self.refresh(buffer, now),
-            Action::Release(_) => (mmp::CLEAN, AfterWrite::Release),
+            Action::Release { .. } => (mmp::CLEAN, AfterWrite::Release),
         };
         self.write(buffer, sequence, after, now)
     }

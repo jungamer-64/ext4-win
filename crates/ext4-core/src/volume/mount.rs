@@ -1419,8 +1419,8 @@ pub struct ExternalJournalProbeOperation {
 /// Read-only sessions leave the medium's existing recovery markers unchanged.
 #[derive(Debug)]
 pub struct CleanCloseDurability {
-    /// Prevents construction outside this module.
-    _private: (),
+    /// Completion belongs to one admitted session even when UUIDs and device lengths match.
+    pub(super) mount: MountIdentity,
 }
 
 /// One consuming transition of the clean-close durability protocol.
@@ -1440,6 +1440,8 @@ pub enum CleanCloseTransition {
 /// Allocation-before-effects clean shutdown/dismount operation.
 #[derive(Debug)]
 pub struct CleanCloseOperation {
+    /// Session whose durable close can authorize the final independent ownership release.
+    mount: MountIdentity,
     /// Authority selected when this close request was constructed.
     access: super::MediaAccess,
     /// Primary filesystem transcript used only to obtain the latest superblock bytes.
@@ -1486,6 +1488,7 @@ impl CleanCloseOperation {
     #[must_use]
     pub const fn new(profile: &MountedProfile) -> Self {
         Self {
+            mount: profile.mount,
             access: profile.access(),
             filesystem: StorageTranscript::new(
                 StorageTarget::Filesystem,
@@ -1565,7 +1568,7 @@ impl CleanCloseOperation {
     /// Drives allocation-free request publication after the marker image has been prepared.
     fn drive(mut self: Box<Self>) -> CleanCloseTransition {
         if matches!(self.access, super::MediaAccess::ReadOnly) {
-            return CleanCloseTransition::Complete(Ok(CleanCloseDurability { _private: () }));
+            return CleanCloseTransition::Complete(Ok(CleanCloseDurability { mount: self.mount }));
         }
         loop {
             match self.phase {
@@ -1629,7 +1632,7 @@ impl CleanCloseOperation {
                 CleanClosePhase::Complete => {
                     let _cancellation_was_recorded = self.cancellation_requested;
                     return CleanCloseTransition::Complete(Ok(CleanCloseDurability {
-                        _private: (),
+                        mount: self.mount,
                     }));
                 }
                 CleanClosePhase::MarkerReadPending
