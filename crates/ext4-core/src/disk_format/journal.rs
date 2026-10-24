@@ -589,7 +589,7 @@ enum PrimaryRepairValidation {
 }
 
 /// Recovery pass and durability state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum RecoveryPhase {
     /// Locate the continuous committed prefix and compute allocation maxima.
     Scan,
