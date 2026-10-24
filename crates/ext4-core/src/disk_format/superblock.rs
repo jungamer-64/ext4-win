@@ -1286,44 +1286,8 @@ pub(crate) enum ResizeInodeFeature {
 /// Validated ext4 capabilities accepted by a mount policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FeatureSet {
-    /// Block group descriptor layout selected by the 64-bit feature.
-    descriptor_layout: BlockGroupDescriptorLayout,
-    /// Journal placement class selected by feature flags.
-    journal: JournalFeature,
-    /// Journal recovery state selected by `INCOMPAT_RECOVER`.
-    recovery_state: RecoveryState,
-    /// Metadata checksum algorithm selected by read-only-compatible features.
-    metadata_checksum: MetadataChecksum,
-    /// Block group descriptor checksum algorithm.
-    descriptor_checksum: BlockGroupDescriptorChecksum,
-    /// Superblock copy placement selected by sparse-super feature bits.
-    sparse_superblock_layout: SparseSuperblockLayout,
-    /// Directory indexing capability.
-    directory_indexing: DirectoryIndexing,
-    /// Mounted directory reference accounting.
-    directory_links: crate::disk_format::inode::DirectoryLinkEncoding,
-    /// Allocation bitmap addressing domain.
-    allocation_bitmap_domain: AllocationBitmapDomain,
-    /// Source used to construct mounted checksum seeds.
-    checksum_seed_source: ChecksumSeedSource,
-    /// Public xattr mutation capability.
-    xattr_mutation: XattrMutationSupport,
-    /// Whether the filesystem declares that verity inodes may be stored.
-    verity: bool,
-    /// Inode-body payload storage admitted for files and directories.
-    inline_data: bool,
-    /// Separate value inodes may be referenced by attribute entries.
-    attribute_values: bool,
-    /// File-size encoding supported by inode records.
-    file_size_encoding: FileSizeEncoding,
-    /// Directory-size encoding selected by the incompatible large-directory feature.
-    directory_size_encoding: DirectorySizeEncoding,
-    /// Inode block-count encoding supported by inode records.
-    inode_block_count_encoding: InodeBlockCountEncoding,
-    /// Timestamp encoding supported by inode records.
-    inode_timestamp_encoding: InodeTimestampEncoding,
-    /// Reserved online-resize metadata inode presence.
-    resize_inode: ResizeInodeFeature,
+    /// Immutable declared masks; typed semantic projections cannot change independently.
+    declared: FilesystemFeatures,
 }
 
 impl FeatureSet {
