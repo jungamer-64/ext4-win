@@ -219,6 +219,8 @@ pub(crate) enum WaitCondition {
     JournalClean,
     /// Filesystem close is complete and its independent MMP release must acknowledge next.
     MmpRelease,
+    /// A checkpointed current epoch and no existing discard owner can admit a bounded batch.
+    TrimAvailable,
     /// Per-handle terminal or durability barrier.
     Barrier {
         /// Typed barrier identity expected by the suspended operation.

@@ -179,7 +179,7 @@ pub(crate) use wdk_sys::ntddk::{
 unsafe extern "system" {
     /// # Safety
     /// Must run on the original requestor dispatch thread before queue insertion.
-    pub(crate) fn ext4win_key_management_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
+    pub(crate) fn ext4win_volume_management_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
     /// Checks symbolic-link creation against the dispatch thread's effective token.
     pub(crate) fn ext4win_symbolic_link_privilege(mode: wdk_sys::KPROCESSOR_MODE) -> u8;
     /// Captures the effective requestor and retains a device-bound cleanup work item.

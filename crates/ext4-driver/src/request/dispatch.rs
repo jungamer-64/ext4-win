@@ -688,6 +688,7 @@ pub(crate) fn admit_owned(
 
     enum Admission {
         Administration,
+        Trim,
         QueryRemove,
         Cleanup,
         Close,
@@ -774,6 +775,7 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
             Admission::FsControl(*minor)
         }
+        ActorRequest::Captured(PreparedRequest::Trim) => Admission::Trim,
         ActorRequest::Captured(PreparedRequest::KeyControl(control)) => {
             Admission::Mutation(match control {
                 crate::irp::PreparedKeyControl::Add => MutationRequestKind::AddEncryptionKey,
@@ -796,6 +798,7 @@ pub(crate) fn admit_owned(
                     Admission::Unsupported
                 }
                 super::file_system_control::FsControlAdmission::User(code) => match code {
+                    crate::irp::FsControlCode::TrimVolume => Admission::Unsupported,
                     crate::irp::FsControlCode::QueryVolumeIdentity => {
                         Admission::Immediate(ImmediateRequestKind::QueryVolumeIdentity)
                     }
@@ -906,7 +909,8 @@ pub(crate) fn admit_owned(
             HandleRequestClass::Ordinary
         }
         Admission::Close => HandleRequestClass::Close,
-        Admission::Immediate(_)
+        Admission::Trim
+        | Admission::Immediate(_)
         | Admission::Notification
         | Admission::ByteRangeLock
         | Admission::OplockControl
@@ -1046,6 +1050,9 @@ pub(crate) fn admit_owned(
                 .with_mounted_access(|access| super::operation::byte_range_lock(owned, access)),
             Admission::OplockControl => {
                 target.with_mounted_access(|_| super::operation::oplock_control(owned))
+            }
+            Admission::Trim => {
+                target.with_mounted_access(|access| super::operation::trim(owned, access))
             }
             Admission::VolumeControl(kind) => {
                 target.with_mounted_access(|_| super::operation::volume_control(owned, kind))

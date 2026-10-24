@@ -405,6 +405,61 @@ pub(super) fn with_restore_privilege<T: Send>(
     })
 }
 
+/// A private privileged thread distinguishes admission failure from loss of its operation outcome.
+#[derive(Debug)]
+pub(super) enum ManagementFailure {
+    /// No filesystem work ran.
+    Preparation(io::Error),
+    /// The joined thread terminated without delivering its filesystem outcome.
+    Unacknowledged(io::Error),
+}
+
+/// Runs volume administration on a joined private thread without changing the caller's token.
+/// Successful work remains available even if explicit impersonation reversion fails.
+/// # Errors
+/// Distinguishes failed privilege admission from a thread that lost an operation outcome.
+pub(super) fn with_volume_management<T: Send>(
+    work: impl FnOnce() -> T + Send,
+) -> Result<(T, io::Result<()>), ManagementFailure> {
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new()
+            .spawn_scoped(scope, || {
+                let prepare = || -> io::Result<_> {
+                    let source = process_token()?;
+                    let token = impersonation(&source)?;
+                    set_privilege(&token, "SeManageVolumePrivilege", true)?;
+                    let assigned = unsafe {
+                        // SAFETY: This new thread has no prior impersonation; the private token is
+                        // retained through work, explicit reversion and thread completion.
+                        SetThreadToken(ptr::null(), token.as_raw_handle())
+                    };
+                    if assigned == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(token)
+                };
+                let _token = prepare().map_err(ManagementFailure::Preparation)?;
+                let result = work();
+                let reverted = unsafe {
+                    // SAFETY: Only this private thread's preceding impersonation is removed.
+                    SetThreadToken(ptr::null(), ptr::null_mut())
+                };
+                let reversion = if reverted == 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                };
+                Ok((result, reversion))
+            })
+            .map_err(ManagementFailure::Preparation)?;
+        thread.join().map_err(|_| {
+            ManagementFailure::Unacknowledged(io::Error::other(
+                "volume-management thread terminated without its outcome",
+            ))
+        })?
+    })
+}
+
 mod file_security;
 pub use file_security::{file_security, set_file_dacl};
 

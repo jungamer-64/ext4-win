@@ -185,6 +185,22 @@ required encrypted-index change share one journal commit. A failed transport ack
 follow a committed transition: observe the directory before considering a retry. The CLI never
 retries an unacknowledged transition automatically.
 
+## Free-space discard
+
+```console
+cargo run -p ext4ctl -- trim <volume-path>
+```
+
+The mounted volume must be writable. The host enables SeManageVolumePrivilege on a private,
+joined thread; the driver captures that authority on the requesting thread. Discard ranges come
+from checkpointed allocation metadata and remain excluded from new allocation until physical
+completion. Each lower request is bounded by the core's discard limits.
+
+The reply retains acknowledged bytes and the bytes in a batch whose result is uncertain.
+Cancellation, unsupported discard and lower errors stop the scan without resubmission. A lost
+reply can follow a physical effect, so the CLI does not retry. Device acknowledgment does not
+guarantee that discarded space reads as zero.
+
 ## Ext4 durability and interoperability
 
 Interoperability uses e2fsprogs as an independent oracle on newly formatted or

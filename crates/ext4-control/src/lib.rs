@@ -13,6 +13,97 @@ pub const SET_DIRECTORY_CASEFOLD_FSCTL: u32 = 0x0009_2418;
 /// Complete directory comparison query reply or transition input.
 pub const CASEFOLD_STATE_BYTES: usize = 4;
 
+/// Buffered mounted-volume discard requiring a writable volume handle and management privilege.
+pub const TRIM_VOLUME_FSCTL: u32 = 0x0009_a420;
+/// Complete progress observation, including a stopped or uncertain physical batch.
+pub const TRIM_REPLY_BYTES: usize = 64;
+
+/// Terminal reason is separate from acknowledged or uncertain physical byte counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrimOutcome {
+    /// The scan reached the filesystem end; device acknowledgment does not imply zero-read behavior.
+    Complete,
+    /// Discard is not supported by the lower stack.
+    Unsupported,
+    /// Cancellation stopped this scan, possibly after acknowledged or uncertain batches.
+    Cancelled,
+    /// A native, metadata, ownership or resource failure stopped the scan.
+    Failed,
+}
+/// Physical progress remains observable even when an administrative operation stops with failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TrimReport {
+    /// Mounted filesystem identity in ext4 byte order.
+    pub uuid: FilesystemUuid,
+    /// Terminal reason; it never implies zero progress by itself.
+    pub outcome: TrimOutcome,
+    /// Native or protocol failure status, zero after a completed scan.
+    pub status: i32,
+    /// Prefix of physical bytes acknowledged by completed lower commands.
+    pub acknowledged_bytes: u64,
+    /// Last batch whose lower execution ended without a reliable acknowledgment.
+    pub uncertain_bytes: u64,
+}
+impl TrimReport {
+    /// Preallocated fixed reply; an effect-bearing operation needs no final allocation.
+    pub fn encode(self) -> [u8; TRIM_REPLY_BYTES] {
+        let mut bytes = [0; TRIM_REPLY_BYTES];
+        let outcome: u32 = match self.outcome {
+            TrimOutcome::Complete => 0,
+            TrimOutcome::Unsupported => 1,
+            TrimOutcome::Cancelled => 2,
+            TrimOutcome::Failed => 3,
+        };
+        let fields = b"E4TR\x01\0\0\0"
+            .iter()
+            .copied()
+            .chain(self.uuid.bytes())
+            .chain(outcome.to_le_bytes())
+            .chain(self.status.to_le_bytes())
+            .chain(self.acknowledged_bytes.to_le_bytes())
+            .chain(self.uncertain_bytes.to_le_bytes());
+        for (destination, source) in bytes.iter_mut().zip(fields) {
+            *destination = source;
+        }
+        bytes
+    }
+    /// Validates a complete reply before exposing progress or deciding whether to start another scan.
+    /// # Errors
+    /// Rejects unknown tags, invalid reserved fields, impossible successful uncertainty and overflow.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != TRIM_REPLY_BYTES
+            || bytes.get(..8) != Some(b"E4TR\x01\0\0\0")
+            || bytes
+                .get(48..)
+                .is_none_or(|reserved| reserved.iter().any(|byte| *byte != 0))
+        {
+            return Err(Error::MalformedEncoding);
+        }
+        let outcome = match u32::from_le_bytes(field(bytes, 24)?) {
+            0 => TrimOutcome::Complete,
+            1 => TrimOutcome::Unsupported,
+            2 => TrimOutcome::Cancelled,
+            3 => TrimOutcome::Failed,
+            _ => return Err(Error::MalformedEncoding),
+        };
+        let status = i32::from_le_bytes(field(bytes, 28)?);
+        let acknowledged_bytes = u64::from_le_bytes(field(bytes, 32)?);
+        let uncertain_bytes = u64::from_le_bytes(field(bytes, 40)?);
+        if (outcome == TrimOutcome::Complete && (status != 0 || uncertain_bytes != 0))
+            || acknowledged_bytes.checked_add(uncertain_bytes).is_none()
+        {
+            return Err(Error::MalformedEncoding);
+        }
+        Ok(Self {
+            uuid: FilesystemUuid::from_bytes(field(bytes, 8)?),
+            outcome,
+            status,
+            acknowledged_bytes,
+            uncertain_bytes,
+        })
+    }
+}
+
 /// Encodes a directory comparison selection independently of native structure layout.
 pub const fn encode_casefold(state: ext4_core::DirectoryCasefold) -> [u8; CASEFOLD_STATE_BYTES] {
     match state {
@@ -300,6 +391,49 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Panics
+    /// Fails if physical progress is encoded inconsistently or impossible success is admitted.
+    #[test]
+    fn trim_progress_wire_contract() {
+        let report = TrimReport {
+            uuid: FilesystemUuid::from_bytes([7; 16]),
+            outcome: TrimOutcome::Cancelled,
+            status: -1,
+            acknowledged_bytes: 4096,
+            uncertain_bytes: 512,
+        };
+        let mut vector = [0; TRIM_REPLY_BYTES];
+        for (destination, source) in vector.iter_mut().zip(b"E4TR\x01\0\0\0") {
+            *destination = *source;
+        }
+        vector[8..24].fill(7);
+        vector[24] = 2;
+        vector[28..32].fill(0xff);
+        vector[33] = 0x10;
+        vector[41] = 2;
+        assert_eq!(report.encode(), vector);
+        assert_eq!(TrimReport::decode(&vector), Ok(report));
+        for bytes in [&vector[..63], &[0; 65][..]] {
+            assert_eq!(TrimReport::decode(bytes), Err(Error::MalformedEncoding));
+        }
+        for position in [0, 4, 24, 48] {
+            let mut invalid = vector;
+            if let Some(value) = invalid.get_mut(position) {
+                *value = 9;
+            }
+            assert_eq!(TrimReport::decode(&invalid), Err(Error::MalformedEncoding));
+        }
+        let mut invalid = vector;
+        invalid[24] = 0;
+        assert_eq!(TrimReport::decode(&invalid), Err(Error::MalformedEncoding));
+        invalid[28..32].fill(0);
+        assert_eq!(TrimReport::decode(&invalid), Err(Error::MalformedEncoding));
+        invalid[40..48].fill(0);
+        assert!(TrimReport::decode(&invalid).is_ok());
+        invalid = vector;
+        invalid[32..40].fill(0xff);
+        assert_eq!(TrimReport::decode(&invalid), Err(Error::MalformedEncoding));
+    }
     /// # Panics
     /// Fails if a directory control admits unknown tags or changes its independent wire vector.
     #[test]

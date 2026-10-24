@@ -3,7 +3,7 @@
 #include "requestor_subject.h"
 /* Evaluated on the requestor dispatch thread, before any reactor queue handoff. */
 BOOLEAN NTAPI
-ext4win_key_management_privilege(KPROCESSOR_MODE requestor_mode)
+ext4win_volume_management_privilege(KPROCESSOR_MODE requestor_mode)
 {
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) { return FALSE; }
     PAGED_CODE();

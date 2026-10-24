@@ -119,6 +119,8 @@ pub enum LowerOperation {
     Flush,
     /// Query `GET_LENGTH_INFORMATION` during mount admission.
     QueryLength,
+    /// Release filesystem-admitted free device ranges through buffered DSM input.
+    Trim,
 }
 
 impl LowerOperation {
@@ -131,7 +133,7 @@ impl LowerOperation {
             Self::Read => IRP_MJ_READ,
             Self::Write => IRP_MJ_WRITE,
             Self::Flush => IRP_MJ_FLUSH_BUFFERS,
-            Self::QueryLength => IRP_MJ_DEVICE_CONTROL,
+            Self::QueryLength | Self::Trim => IRP_MJ_DEVICE_CONTROL,
         };
         u8::try_from(major).map_err(|_| DriverError::InvalidParameter)
     }
@@ -142,13 +144,16 @@ impl LowerOperation {
             Self::Read => wdk_sys::IRP_READ_OPERATION,
             Self::Write => wdk_sys::IRP_WRITE_OPERATION,
             Self::Flush => 0,
-            Self::QueryLength => 0,
+            Self::QueryLength | Self::Trim => 0,
         }
     }
 
     /// Whether the operation exposes a transfer buffer to the lower stack.
     const fn transfers_bytes(self) -> bool {
-        matches!(self, Self::Read | Self::Write | Self::QueryLength)
+        matches!(
+            self,
+            Self::Read | Self::Write | Self::QueryLength | Self::Trim
+        )
     }
 }
 
@@ -1342,6 +1347,17 @@ fn prepare_private_irp(
                 ByteOffset: starting_offset,
             };
         }
+        LowerOperation::Trim => {
+            stack.Parameters.DeviceIoControl =
+                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
+                    OutputBufferLength: 0,
+                    __bindgen_padding_0: 0,
+                    InputBufferLength: transfer_length,
+                    __bindgen_padding_1: 0,
+                    IoControlCode: 0x002d_9404, // IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES, buffered write access.
+                    Type3InputBuffer: core::ptr::null_mut(),
+                };
+        }
         LowerOperation::Flush => {}
         LowerOperation::QueryLength => {
             stack.Parameters.DeviceIoControl =
@@ -1356,7 +1372,10 @@ fn prepare_private_irp(
         }
     }
     if operation.transfers_bytes() {
-        match if operation == LowerOperation::QueryLength {
+        match if matches!(
+            operation,
+            LowerOperation::QueryLength | LowerOperation::Trim
+        ) {
             LowerTransferMethod::Buffered
         } else {
             transfer_method
@@ -1570,6 +1589,11 @@ mod tests {
     /// Panics when operation stack encodings overlap or omit the expected transfer contract.
     #[test]
     fn lower_operations_have_exact_transfer_contracts() {
+        assert!(LowerOperation::Trim.transfers_bytes());
+        assert_eq!(
+            LowerOperation::Trim.major_function(),
+            u8::try_from(wdk_sys::IRP_MJ_DEVICE_CONTROL).map_err(|_| DriverError::InvalidParameter)
+        );
         assert!(LowerOperation::Read.transfers_bytes());
         assert!(LowerOperation::Write.transfers_bytes());
         assert!(!LowerOperation::Flush.transfers_bytes());

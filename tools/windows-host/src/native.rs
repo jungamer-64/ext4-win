@@ -2311,3 +2311,6 @@ pub use identity::*;
 
 mod directory;
 pub use directory::{DirectoryCasefoldError, query_directory_casefold, set_directory_casefold};
+
+mod trim;
+pub use trim::{TrimError, TrimSubmission, trim_volume};

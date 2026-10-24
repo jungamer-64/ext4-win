@@ -376,6 +376,39 @@ impl VolumeRuntime {
             && !self.coordinator.has_pending_trim()
     }
 
+    /// Observes discard admission without waiting for unrelated provisional mutation work.
+    /// # Errors
+    /// Returns revoked ownership or unreliable writes instead of leaving an impossible wait pending.
+    pub(crate) fn trim_ready(&self) -> DriverResult<bool> {
+        self.authorize_ownership()?;
+        self.failure.authorize_mutation()?;
+        if self.profile.access() == ext4_core::MediaAccess::ReadOnly {
+            return Err(ext4_core::Error::ReadOnlyFilesystem.into());
+        }
+        Ok(self.coordinator.journal_is_clean() && !self.coordinator.has_pending_trim())
+    }
+    /// Acquires only the ranges selected by the exact current checkpointed epoch.
+    /// # Errors
+    /// Returns media revocation, stale selection, read-only policy or pre-effect allocation failure.
+    pub(crate) fn reserve_trim(
+        &mut self,
+        selection: ext4_core::TrimSelection,
+    ) -> DriverResult<ext4_core::TrimAdmission> {
+        self.authorize_ownership()?;
+        self.failure.authorize_mutation()?;
+        Ok(selection.reserve(&mut self.coordinator, self.epochs.current())?)
+    }
+    /// Retires completed physical ownership independently of the session's current I/O permissions.
+    /// # Errors
+    /// A foreign native completion retains both owners and cannot release another reservation.
+    pub(crate) fn complete_trim(
+        &mut self,
+        pending: ext4_core::PendingTrim,
+        completion: ext4_core::TrimCompletion,
+    ) -> Result<ext4_core::TrimBatchResult, ext4_core::TrimCompletionMismatch> {
+        pending.complete(&mut self.coordinator, completion)
+    }
+
     /// Acquires one current immutable epoch for a read or resolve operation.
     /// # Errors
     ///

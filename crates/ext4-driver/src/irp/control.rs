@@ -202,6 +202,8 @@ pub(super) const MOUNT_VOLUME_MINOR_FUNCTION: u32 = 1;
 pub(crate) enum FsControlCode {
     /// Returns the mounted ext4 filesystem UUID.
     QueryVolumeIdentity,
+    /// Privileged mounted-volume free-space discard.
+    TrimVolume,
     /// Query the opened directory's comparison state.
     QueryDirectoryCasefold,
     /// Change comparison state on an empty opened directory.
@@ -269,6 +271,7 @@ impl FsControlCode {
     pub(super) fn from_raw(value: wdk_sys::ULONG) -> Result<Self, DriverError> {
         match value {
             ext4_security::QUERY_VOLUME_IDENTITY_FSCTL => Ok(Self::QueryVolumeIdentity),
+            ext4_control::TRIM_VOLUME_FSCTL => Ok(Self::TrimVolume),
             ext4_control::QUERY_DIRECTORY_CASEFOLD_FSCTL => Ok(Self::QueryDirectoryCasefold),
             ext4_control::SET_DIRECTORY_CASEFOLD_FSCTL => Ok(Self::SetDirectoryCasefold),
             FSCTL_REQUEST_OPLOCK_LEVEL_1 => Ok(Self::RequestOplockLevel1),
@@ -336,6 +339,7 @@ impl FsControlCode {
             | Self::OplockBreakAckNoLevel2 => Ok(OplockControlAction::BreakContinuation),
             Self::RequestOplock => Ok(structured_oplock_action(structured_input)),
             Self::QueryVolumeIdentity
+            | Self::TrimVolume
             | Self::QueryDirectoryCasefold
             | Self::SetDirectoryCasefold
             | Self::LockVolume

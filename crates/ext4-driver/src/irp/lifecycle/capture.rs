@@ -966,11 +966,11 @@ impl QueueContext {
         reason = "dispatch capture retains the original requestor context"
     )
 )]
-fn authorize_key_management(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
+fn authorize_volume_management(_target: &ActiveIrp<'_>) -> Result<(), IrpCompletion> {
     #[cfg(not(test))]
     let allowed = unsafe {
         // SAFETY: Request capture calls here before its original dispatch thread queues work.
-        ffi::ext4win_key_management_privilege(_target.requestor_mode())
+        ffi::ext4win_volume_management_privilege(_target.requestor_mode())
     } != 0;
     #[cfg(test)]
     let allowed = false;
@@ -1046,6 +1046,8 @@ pub(crate) enum PreparedRequest {
     FileSystemControl(FileSystemControlMinorFunction),
     /// Requestor privilege checked before queue handoff; ordinary FSCTL cannot grant it.
     KeyControl(PreparedKeyControl),
+    /// Volume-management privilege captured on the original thread for one free-space discard.
+    Trim,
     /// Retrieval request with a copied VCN and uniquely owned locked output pages.
     RetrievalPointers {
         /// Nonnegative file-space allocation-unit index decoded in requestor context.
@@ -1234,6 +1236,10 @@ impl PreparedRequest {
                         if control.fs_control_code() == super::FsControlCode::GetRetrievalPointers {
                             return capture_retrieval_pointers(target, control, generic_key());
                         }
+                        if control.fs_control_code() == super::FsControlCode::TrimVolume {
+                            authorize_volume_management(target)?;
+                            return Ok((Self::Trim, generic_key()));
+                        }
                         let key_control = match control.fs_control_code() {
                             super::FsControlCode::AddEncryptionKey => Some(PreparedKeyControl::Add),
                             super::FsControlCode::RemoveEncryptionKey => {
@@ -1242,7 +1248,7 @@ impl PreparedRequest {
                             _ => None,
                         };
                         if let Some(key_control) = key_control {
-                            authorize_key_management(target)?;
+                            authorize_volume_management(target)?;
                             return Ok((Self::KeyControl(key_control), generic_key()));
                         }
                         generic_key()

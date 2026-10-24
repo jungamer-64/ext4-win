@@ -1517,8 +1517,8 @@ enum CleanClosePhase {
 }
 
 impl CleanCloseOperation {
-    /// Starts finalization after the host has closed admission and drained admitted media effects,
-    /// including any pending discard. The host must retain that exclusion until close completes.
+    /// Prepares finalization. Before advancing it, the host must close admission and drain admitted
+    /// media effects, including pending discard, then retain that exclusion until close completes.
     /// Native cache writeback and operation drain remain host responsibilities.
     #[must_use]
     pub const fn new(profile: &MountedProfile) -> Self {

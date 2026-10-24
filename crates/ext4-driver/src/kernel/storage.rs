@@ -21,6 +21,9 @@ use crate::kernel::status::{DriverError, DriverResult, STATUS_RETRY};
 use crate::memory;
 use crate::state::{KernelDevice, TransferSectorSize};
 
+mod control;
+pub(crate) use control::{DeviceControlCommand, DeviceControlCompletion};
+
 /// Retryable lower status `STATUS_DEVICE_BUSY`.
 const STATUS_DEVICE_BUSY: NTSTATUS = i32::from_ne_bytes(0x8000_0011_u32.to_ne_bytes());
 /// Retryable lower status `STATUS_DEVICE_NOT_READY`.
@@ -284,6 +287,15 @@ pub struct MountedStorageRoute {
 }
 
 impl MountedStorageRoute {
+    /// Physical alignment for an inward-only filesystem discard projection.
+    /// # Errors
+    /// Rejects unsupported lower block granularity before reservation or device effects.
+    pub(crate) fn trim_alignment(self) -> DriverResult<ext4_core::TrimAlignment> {
+        Ok(ext4_core::TrimAlignment::new(
+            self.filesystem.sector_size.as_u32(),
+        )?)
+    }
+
     /// Builds the immutable lower device set.
     #[must_use]
     pub const fn new(
@@ -1183,11 +1195,11 @@ mod tests {
     use alloc::vec;
 
     use super::{
-        DeviceLengthProbe, FailedStorageCommand, LowerStorageDevice, MountedStorageRoute,
-        PreparedStorageCommand, STATUS_CRC_ERROR, STATUS_DEVICE_BUSY, STATUS_DEVICE_NOT_READY,
-        STATUS_IO_TIMEOUT, STATUS_RETRY, StorageCommandStep, StorageFailureClass,
-        StorageRetryDecision, StorageRetryDelay, StorageRetryPolicy, WriteTransferPhase,
-        failed_unsubmitted_request,
+        DeviceControlCommand, DeviceControlCompletion, FailedStorageCommand, LowerStorageDevice,
+        MountedStorageRoute, PreparedStorageCommand, STATUS_CRC_ERROR, STATUS_DEVICE_BUSY,
+        STATUS_DEVICE_NOT_READY, STATUS_IO_TIMEOUT, STATUS_RETRY, StorageCommandStep,
+        StorageFailureClass, StorageRetryDecision, StorageRetryDelay, StorageRetryPolicy,
+        WriteTransferPhase, failed_unsubmitted_request,
     };
     use crate::irp::lower::CompletedLowerIrp;
     use crate::kernel::status::DriverError;
@@ -1720,16 +1732,16 @@ mod tests {
             Ok(())
         );
         let completed = CompletedLowerIrp {
-            suspended: DeviceLengthProbe { suspended: 77_u64 },
+            suspended: DeviceControlCommand::Length { suspended: 77_u64 },
             transfer,
             status: wdk_sys::STATUS_SUCCESS,
             information: core::mem::size_of::<i64>(),
         };
-        let result = completed.finish();
-        assert_eq!(result, Ok((77, DeviceLength::from_bytes(4096))));
-
-        let probe = DeviceLengthProbe { suspended: 78_u64 };
-        assert_eq!(probe.into_suspended(), 78);
+        assert!(
+            matches!(completed.finish_control(), DeviceControlCompletion::Length {
+            suspended: 77, result: Ok(length),
+        } if length == DeviceLength::from_bytes(4096))
+        );
 
         let request = StorageRequest::Flush {
             target: StorageTarget::Filesystem,

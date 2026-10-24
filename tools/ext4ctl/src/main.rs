@@ -2,12 +2,14 @@
 use std::process::ExitCode;
 
 /// User-visible grammar; replacements contain the entire desired table.
-const USAGE: &str = "ext4ctl volumes\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>] [--auto-trim on|off]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
+const USAGE: &str = "ext4ctl volumes\next4ctl trim <volume-path>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>] [--auto-trim on|off]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
 /// Fully parsed action before any replacement can be submitted.
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
     /// Mounted ext4 volumes and UUIDs.
     Volumes,
+    /// Discard free ranges through the currently mounted volume's allocation coordinator.
+    Trim(String),
     /// Observe one opened directory's committed comparison state.
     CasefoldShow(String),
     /// Journal an empty directory's comparison transition.
@@ -52,6 +54,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
     let command = match action.as_str() {
         "volumes" => Command::Volumes,
         "whoami" => Command::Whoami,
+        "trim" => Command::Trim(args.next().ok_or_else(|| USAGE.to_owned())?),
         "casefold" => {
             let action = args.next().ok_or_else(|| USAGE.to_owned())?;
             let path = args.next().ok_or_else(|| USAGE.to_owned())?;
@@ -196,6 +199,44 @@ fn casefold_reply(
         Err(error) => Err(error.to_string()),
     }
 }
+
+/// Presents physical progress before deciding the command's exit status.
+#[cfg(windows)]
+fn show_trim(report: ext4_control::TrimReport) {
+    println!(
+        "UUID {}\noutcome {:?}\nstatus {:#010x}\nacknowledged bytes {}\nuncertain bytes {}",
+        uuid_text(report.uuid),
+        report.outcome,
+        report.status,
+        report.acknowledged_bytes,
+        report.uncertain_bytes
+    );
+}
+
+/// Retains an authoritative report even if host cleanup fails after the driver replied.
+/// # Errors
+/// Stopped, unknown or cleanup-failed operations fail the CLI without automatic resubmission.
+#[cfg(windows)]
+fn trim_reply(
+    result: Result<ext4_control::TrimReport, windows_host::TrimError>,
+) -> Result<(), String> {
+    match result {
+        Ok(report) => {
+            show_trim(report);
+            if report.outcome == ext4_control::TrimOutcome::Complete {
+                Ok(())
+            } else {
+                Err(format!("TRIM stopped: {:?}", report.outcome))
+            }
+        }
+        Err(error) => {
+            if let windows_host::TrimSubmission::Acknowledged(report) = error.submission {
+                show_trim(report);
+            }
+            Err(error.to_string())
+        }
+    }
+}
 /// User-facing spelling shared by observed and acknowledged comparison states.
 #[cfg(windows)]
 const fn casefold_text(state: ext4_core::DirectoryCasefold) -> &'static str {
@@ -275,6 +316,7 @@ fn policy_reply(
 #[cfg(windows)]
 fn execute(command: Command) -> Result<(), String> {
     match command {
+        Command::Trim(volume) => trim_reply(windows_host::trim_volume(&volume))?,
         Command::Volumes => {
             for (name, uuid) in
                 windows_host::identity_volumes().map_err(|error| error.to_string())?
@@ -432,6 +474,18 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Panics
+    /// Fails if a missing volume or extra operand can reach discard submission.
+    #[test]
+    fn trim_requires_one_explicit_volume() {
+        assert_eq!(
+            parse(["trim", "X:"].into_iter().map(str::to_owned)),
+            Ok(Command::Trim("X:".to_owned()))
+        );
+        for args in [vec!["trim"], vec!["trim", "X:", "--retry"]] {
+            assert!(parse(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
     /// # Panics
     /// Panics if partial policy updates lose omission semantics or invalid budgets reach submission.
     #[test]

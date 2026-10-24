@@ -88,6 +88,8 @@ mod cleanup;
 mod close;
 mod keys;
 mod mmp;
+mod trim;
+pub(crate) use trim::trim;
 
 mod volume_close;
 pub(crate) use volume_close::{VolumeCloseRequest, volume_close};
@@ -2569,6 +2571,11 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     Err(error) => Self::fail_lock_cache_drain(owned, transition, error, access),
                 };
             }
+            CompletionEvent::TrimCompleted { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
+                )
+                .bugcheck();
+            }
             CompletionEvent::VolumeFailed(error) => {
                 let state =
                     core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal);
@@ -3031,6 +3038,11 @@ impl MountedVolumeOperation for FlushRequestOperation {
                         Self::complete(owned, Err(error))
                     }
                 };
+            }
+            CompletionEvent::TrimCompleted { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
+                )
+                .bugcheck();
             }
             CompletionEvent::VolumeFailed(error) => {
                 let state = core::mem::replace(&mut self.state, FlushOperationState::Terminal);
@@ -5611,6 +5623,11 @@ impl MutationRequestOperation {
                             .bugcheck()
                     }
                 }
+            }
+            CompletionEvent::TrimCompleted { .. } => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
+                )
+                .bugcheck();
             }
             CompletionEvent::VolumeFailed(error) => {
                 let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);

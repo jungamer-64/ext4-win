@@ -48,14 +48,16 @@ use super::{
 };
 #[cfg(not(test))]
 use crate::kernel::storage::{
-    DeviceLengthProbe, PreparedStorageCommand, RetryingStorageCommand, StorageCommand,
-    StorageCommandStep, StorageRetryDecision, StorageRetryDelay, StorageRetryPolicy,
-    failed_unsubmitted_request,
+    DeviceControlCommand, DeviceControlCompletion, PreparedStorageCommand, RetryingStorageCommand,
+    StorageCommand, StorageCommandStep, StorageRetryDecision, StorageRetryDelay,
+    StorageRetryPolicy, failed_unsubmitted_request,
 };
 use crate::kernel::storage::{MountedStorageRoute, StorageFailureClass};
 
 /// The filesystem close barrier precedes the independent physical ownership-release barrier.
 pub(crate) const MMP_RELEASE_BARRIER: u64 = 4;
+/// Discard admission is independent of handle barriers and filesystem finalization.
+pub(crate) const TRIM_ADMISSION_BARRIER: u64 = 5;
 
 /// Operation representation moved through storage-command envelopes.
 type SuspendedOperation = Box<dyn CompletionOperation>;
@@ -85,10 +87,11 @@ type ReactorStorageEnvelope =
     LowerCompletionEnvelope<ReactorStorageCommand, StorageCompletionRoute>;
 /// Driver-specific length query retaining one suspended mount operation.
 #[cfg(not(test))]
-type ReactorLengthProbe = DeviceLengthProbe<SuspendedOperation>;
+type ReactorDeviceControlCommand = DeviceControlCommand<SuspendedOperation>;
 /// Stable completion envelope linked into the separate length-query inbox.
 #[cfg(not(test))]
-type ReactorLengthEnvelope = LowerCompletionEnvelope<ReactorLengthProbe, LengthCompletionRoute>;
+type ReactorDeviceControlEnvelope =
+    LowerCompletionEnvelope<ReactorDeviceControlCommand, DeviceControlCompletionRoute>;
 
 /// Stable, statically dispatched destination for storage-command completions.
 #[cfg(not(test))]
@@ -101,7 +104,7 @@ struct StorageCompletionRoute {
 /// Stable, statically dispatched destination for device-length completions.
 #[cfg(not(test))]
 #[derive(Clone, Copy)]
-struct LengthCompletionRoute {
+struct DeviceControlCompletionRoute {
     /// Reactor retained live by the envelope's rundown lease.
     reactor: NonNull<CompletionReactor>,
 }
@@ -126,14 +129,14 @@ unsafe impl Sync for StorageCompletionRoute {}
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 // SAFETY: The completion rundown lease keeps the immutable reactor address live across threads.
-unsafe impl Send for LengthCompletionRoute {}
+unsafe impl Send for DeviceControlCompletionRoute {}
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 // SAFETY: Callback publication serializes reactor inbox mutation with its spin lock.
-unsafe impl Sync for LengthCompletionRoute {}
+unsafe impl Sync for DeviceControlCompletionRoute {}
 
 #[cfg(not(test))]
 #[expect(
@@ -163,16 +166,16 @@ unsafe impl LowerCompletionRoute<ReactorStorageCommand> for StorageCompletionRou
 )]
 // SAFETY: Publication retains a separate rundown lease through the final wakeup and locks
 // every inbox mutation; copying this identity does not confer envelope ownership.
-unsafe impl LowerCompletionRoute<ReactorLengthProbe> for LengthCompletionRoute {
+unsafe impl LowerCompletionRoute<ReactorDeviceControlCommand> for DeviceControlCompletionRoute {
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn publish(self, envelope: NonNull<ReactorLengthEnvelope>) {
+    unsafe fn publish(self, envelope: NonNull<ReactorDeviceControlEnvelope>) {
         unsafe {
             // SAFETY: The unlinked envelope retains its destination until publication takes its
             // own lease; this copied route does not borrow storage the actor can reclaim.
-            CompletionReactor::enqueue_length(self.reactor, envelope);
+            CompletionReactor::enqueue_device_control(self.reactor, envelope);
         }
     }
 }
@@ -187,8 +190,8 @@ enum PublishedReactorLower {
         /// Whether top-level cancellation may propagate to this private lower IRP.
         cancellation: EffectCancellation,
     },
-    /// Mount-time device length query.
-    Length(PublishedLowerRequest<ReactorLengthProbe, LengthCompletionRoute>),
+    /// One-shot length observation or effect-bearing discard.
+    DeviceControl(PublishedLowerRequest<ReactorDeviceControlCommand, DeviceControlCompletionRoute>),
 }
 
 /// Cancellation semantics at an effect-bearing lower-storage boundary.
@@ -208,7 +211,7 @@ impl fmt::Debug for PublishedReactorLower {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage { .. } => formatter.write_str("Storage"),
-            Self::Length(_) => formatter.write_str("Length"),
+            Self::DeviceControl(_) => formatter.write_str("DeviceControl"),
         }
     }
 }
@@ -237,7 +240,7 @@ impl PublishedReactorLower {
                 lower: _,
                 cancellation: EffectCancellation::ContinueClosing,
             } => {}
-            Self::Length(lower) => unsafe {
+            Self::DeviceControl(lower) => unsafe {
                 // SAFETY: The active slot retains the length envelope identity through this call.
                 lower.cancel();
             },
@@ -368,6 +371,13 @@ pub(crate) enum CompletionEvent {
     BarrierReleased(BarrierPermit),
     /// One PASSIVE_LEVEL native work item returned to the unique reactor owner.
     PassiveCompleted(crate::irp::PassiveWorkCompletion),
+    /// Returned discard owner; cancellation cannot hide acknowledged or uncertain physical progress.
+    TrimCompleted {
+        /// Unique physical request after all lower access ended.
+        completion: ext4_core::TrimCompletion,
+        /// Native or protocol failure status retained for the administrative response.
+        status: wdk_sys::NTSTATUS,
+    },
     /// The volume can no longer satisfy a pre-effect commit or durability wait.
     VolumeFailed(DriverError),
 }
@@ -376,7 +386,7 @@ impl CompletionEvent {
     /// Native completion must return its resources before cancellation can retire the request.
     fn prefer_cancellation(self, cancelled: bool) -> Self {
         match self {
-            Self::PassiveCompleted(_) => self,
+            Self::PassiveCompleted(_) | Self::TrimCompleted { .. } => self,
             _ if cancelled => Self::Core(OperationEvent::CancelRequested),
             _ => self,
         }
@@ -387,7 +397,10 @@ impl CompletionEvent {
     pub(crate) fn into_core(self) -> OperationEvent {
         match self {
             Self::Core(event) => event,
-            Self::BarrierReleased(_) | Self::PassiveCompleted(_) | Self::VolumeFailed(_) => {
+            Self::BarrierReleased(_)
+            | Self::PassiveCompleted(_)
+            | Self::VolumeFailed(_)
+            | Self::TrimCompleted { .. } => {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             }
         }
@@ -510,6 +523,15 @@ pub(crate) enum OperationTransition {
         /// Lower storage device being mounted.
         target: KernelDevice,
         /// Mount operation moved by value into the stable completion envelope.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// Submit one separately reserved free-space discard without storage retry.
+    SubmitTrim {
+        /// Retained filesystem target and native geometry.
+        devices: MountedStorageRoute,
+        /// Unique physical request; its operation retains the matching release authority.
+        request: ext4_core::TrimRequest,
+        /// Sole consumer of physical completion, including cancellation and shutdown.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Build and submit one owned lower command.
@@ -1132,8 +1154,8 @@ pub(crate) struct CompletionReactor {
     pending_head: UnsafeCell<LIST_ENTRY>,
     /// Completed lower envelopes using their first-field intrusive node.
     completion_head: UnsafeCell<LIST_ENTRY>,
-    /// Completed mount length-query envelopes kept type-separated from storage commands.
-    length_completion_head: UnsafeCell<LIST_ENTRY>,
+    /// Completed mount device-control envelopes kept type-separated from storage commands.
+    control_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Completed native work envelopes kept type-separated from lower I/O.
     passive_completion_head: UnsafeCell<LIST_ENTRY>,
     /// Completed oplock-wait envelopes kept type-separated from all lower and worker callbacks.
@@ -1420,7 +1442,7 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
-            core::ptr::addr_of_mut!((*reactor).length_completion_head)
+            core::ptr::addr_of_mut!((*reactor).control_completion_head)
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
@@ -1674,7 +1696,7 @@ impl CompletionReactor {
             lock: _,
             pending_head: _,
             completion_head: _,
-            length_completion_head: _,
+            control_completion_head: _,
             passive_completion_head: _,
             oplock_completion_head: _,
             ordinary_pending: _,
@@ -1726,7 +1748,7 @@ impl CompletionReactor {
         }
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
-            initialize_list_head(reactor.length_completion_head.get());
+            initialize_list_head(reactor.control_completion_head.get());
         }
         unsafe {
             // SAFETY: This is an exclusive, final-address list head before reactor publication.
@@ -2549,7 +2571,7 @@ impl CompletionReactor {
         };
         let length_completion_list_empty = unsafe {
             // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
-            list_is_empty(reactor.length_completion_head.get())
+            list_is_empty(reactor.control_completion_head.get())
         };
         let passive_completion_list_empty = unsafe {
             // SAFETY: The worker is joined and teardown exclusively owns this initialized list.
@@ -2695,7 +2717,7 @@ impl CompletionReactor {
                 progressed |= self.cancel_delayed_close_timer();
             }
             progressed |= self.drain_storage_completions();
-            progressed |= self.drain_length_completions();
+            progressed |= self.drain_device_control_completions();
             progressed |= self.drain_passive_completions();
             progressed |= self.drain_oplock_completions();
             progressed |= self.drain_active_cancels();
@@ -2754,7 +2776,7 @@ impl CompletionReactor {
         };
         let length_empty = unsafe {
             // SAFETY: The same lock excludes length completion insertion and removal.
-            list_is_empty(self.length_completion_head.get())
+            list_is_empty(self.control_completion_head.get())
         };
         let passive_empty = unsafe {
             // SAFETY: The same lock excludes passive completion insertion and removal.
@@ -3148,6 +3170,13 @@ impl CompletionReactor {
                         return;
                     };
                     self.submit_device_length(index, completion_owner, target, suspended);
+                }
+                OperationTransition::SubmitTrim {
+                    devices,
+                    request,
+                    suspended,
+                } => {
+                    self.submit_trim(index, devices, request, suspended);
                 }
                 OperationTransition::SubmitLower {
                     devices,
@@ -3808,10 +3837,10 @@ impl CompletionReactor {
                 return;
             }
         };
-        let destination = LengthCompletionRoute {
+        let destination = DeviceControlCompletionRoute {
             reactor: NonNull::from(self),
         };
-        let lower = match DeviceLengthProbe::prepare(
+        let lower = match DeviceControlCommand::length(
             completion_owner,
             target,
             suspended,
@@ -3821,7 +3850,7 @@ impl CompletionReactor {
             Ok(lower) => lower,
             Err(error) => {
                 let (error, probe) = error.into_parts();
-                self.set_ready_length_failure(index, probe.into_suspended(), error);
+                self.set_ready_control_completion(index, probe.unsubmitted(error));
                 return;
             }
         };
@@ -3831,12 +3860,15 @@ impl CompletionReactor {
             self.acquire_operation_submission(probe.suspended().as_ref())
         }) {
             Ok(()) => {
-                self.finish_registering_lower(index, PublishedReactorLower::Length(cancellation));
+                self.finish_registering_lower(
+                    index,
+                    PublishedReactorLower::DeviceControl(cancellation),
+                );
             }
             Err(error) => {
                 let (error, probe) = error.into_parts();
                 self.recover_registering(index);
-                self.set_ready_length_failure(index, probe.into_suspended(), error);
+                self.set_ready_control_completion(index, probe.unsubmitted(error));
             }
         }
     }
@@ -3857,6 +3889,69 @@ impl CompletionReactor {
             }
         }
         Ok(permit)
+    }
+
+    /// Submits one discard or returns its physical owner with a provably unsubmitted outcome.
+    #[cfg(not(test))]
+    fn submit_trim(
+        &self,
+        index: usize,
+        devices: MountedStorageRoute,
+        request: ext4_core::TrimRequest,
+        suspended: SuspendedOperation,
+    ) {
+        let command = DeviceControlCommand::Trim { request, suspended };
+        if self.consume_cancellation_before_effect(index) {
+            self.set_ready_control_completion(
+                index,
+                command.unsubmitted(DriverError::Core(ext4_core::Error::OperationCancelled)),
+            );
+            return;
+        }
+        let rundown = match self.completion_rundown.acquire() {
+            Ok(Some(rundown)) => rundown,
+            Ok(None) => {
+                self.set_ready_control_completion(
+                    index,
+                    command.unsubmitted(DriverError::InvalidDeviceRequest),
+                );
+                return;
+            }
+            Err(error) => {
+                self.set_ready_control_completion(index, command.unsubmitted(error));
+                return;
+            }
+        };
+        let DeviceControlCommand::Trim { request, suspended } = command else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let destination = DeviceControlCompletionRoute {
+            reactor: NonNull::from(self),
+        };
+        let lower =
+            match DeviceControlCommand::trim(devices, request, suspended, destination, rundown) {
+                Ok(lower) => lower,
+                Err(error) => {
+                    let (error, command) = error.into_parts();
+                    self.set_ready_control_completion(index, command.unsubmitted(error));
+                    return;
+                }
+            };
+        let cancellation = lower.cancellation_identity();
+        self.begin_registering(index);
+        match lower.register_and_submit(|command| {
+            self.acquire_operation_submission(command.suspended().as_ref())
+        }) {
+            Ok(()) => self.finish_registering_lower(
+                index,
+                PublishedReactorLower::DeviceControl(cancellation),
+            ),
+            Err(error) => {
+                let (error, command) = error.into_parts();
+                self.recover_registering(index);
+                self.set_ready_control_completion(index, command.unsubmitted(error));
+            }
+        }
     }
 
     /// Sends one completely prepared command through a fresh private IRP.
@@ -3968,6 +4063,36 @@ impl CompletionReactor {
                 driver_error_to_core(error),
             ))),
         );
+    }
+
+    /// Routes a returned native command without dropping effect-bearing completion ownership.
+    #[cfg(not(test))]
+    fn set_ready_control_completion(
+        &self,
+        index: usize,
+        completed: DeviceControlCompletion<SuspendedOperation>,
+    ) {
+        match completed {
+            DeviceControlCompletion::Length { suspended, result } => match result {
+                Ok(length) => self.set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::Core(OperationEvent::DeviceLengthCompleted(Ok(length))),
+                ),
+                Err(error) => self.set_ready_length_failure(index, suspended, error),
+            },
+            DeviceControlCompletion::Trim {
+                suspended,
+                completion,
+                status,
+            } => {
+                self.set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::TrimCompleted { completion, status },
+                );
+            }
+        }
     }
 
     /// Links one completed envelope into the allocation-free storage inbox.
@@ -4110,7 +4235,7 @@ impl CompletionReactor {
         progressed
     }
 
-    /// Links one completed length-query envelope into its type-separated inbox.
+    /// Links one completed device-control envelope into its type-separated inbox.
     /// # Safety
     ///
     /// `envelope` must be uniquely completion-owned, unlinked, nonpaged, and protected by this
@@ -4120,7 +4245,10 @@ impl CompletionReactor {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    unsafe fn enqueue_length(reactor: NonNull<Self>, envelope: NonNull<ReactorLengthEnvelope>) {
+    unsafe fn enqueue_device_control(
+        reactor: NonNull<Self>,
+        envelope: NonNull<ReactorDeviceControlEnvelope>,
+    ) {
         let reactor = unsafe {
             // SAFETY: The incoming, still unlinked envelope retains this exact destination.
             reactor.as_ref()
@@ -4142,10 +4270,10 @@ impl CompletionReactor {
             // SAFETY: Stable reactor lock serializes completion callbacks and inbox removal.
             ffi::KeAcquireSpinLockRaiseToDpc(reactor.lock.get())
         };
-        let node = ReactorLengthEnvelope::node_ptr(envelope);
+        let node = ReactorDeviceControlEnvelope::node_ptr(envelope);
         unsafe {
             // SAFETY: The reactor lock is held and `node` is live and unlinked.
-            insert_tail_list(reactor.length_completion_head.get(), node);
+            insert_tail_list(reactor.control_completion_head.get(), node);
         }
         unsafe {
             // SAFETY: Releases the exact acquisition above.
@@ -4157,20 +4285,20 @@ impl CompletionReactor {
         drop(publication);
     }
 
-    /// Removes one completed length-query envelope, if present.
+    /// Removes one completed device-control envelope, if present.
     #[cfg(not(test))]
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn pop_length_completion(&self) -> Option<NonNull<ReactorLengthEnvelope>> {
+    fn pop_device_control_completion(&self) -> Option<NonNull<ReactorDeviceControlEnvelope>> {
         let old_irql = unsafe {
             // SAFETY: Stable reactor lock serializes completion list access.
             ffi::KeAcquireSpinLockRaiseToDpc(self.lock.get())
         };
         let node = unsafe {
             // SAFETY: The reactor lock is held for this initialized completion list.
-            remove_head_list(self.length_completion_head.get())
+            remove_head_list(self.control_completion_head.get())
         };
         unsafe {
             // SAFETY: Releases the exact acquisition above.
@@ -4182,17 +4310,17 @@ impl CompletionReactor {
         })
     }
 
-    /// Reclaims and routes every completed mount-time device-length query.
+    /// Reclaims and routes every completed one-shot device control.
     #[cfg(not(test))]
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn drain_length_completions(&self) -> bool {
+    fn drain_device_control_completions(&self) -> bool {
         let mut progressed = false;
-        while let Some(envelope) = self.pop_length_completion() {
+        while let Some(envelope) = self.pop_device_control_completion() {
             progressed = true;
-            let index = self.take_completed_length_slot(envelope);
+            let index = self.take_completed_device_control_slot(envelope);
             let envelope = unsafe {
                 // SAFETY: Inbox removal and slot detachment grant unique envelope ownership.
                 Box::from_raw(envelope.as_ptr())
@@ -4201,16 +4329,7 @@ impl CompletionReactor {
                 // SAFETY: Completion publication proves lower buffer use and cancel races ended.
                 LowerCompletionEnvelope::reclaim(envelope)
             };
-            match completed.finish() {
-                Ok((suspended, length)) => self.set_ready_operation_event(
-                    index,
-                    suspended,
-                    CompletionEvent::Core(OperationEvent::DeviceLengthCompleted(Ok(length))),
-                ),
-                Err((suspended, error)) => {
-                    self.set_ready_length_failure(index, suspended, error);
-                }
-            }
+            self.set_ready_control_completion(index, completed.finish_control());
         }
         progressed
     }
@@ -4520,14 +4639,17 @@ impl CompletionReactor {
         index
     }
 
-    /// Detaches one completed length-query identity before reclaim frees its envelope.
+    /// Detaches one completed device-control identity before reclaim frees its envelope.
     #[cfg(not(test))]
-    fn take_completed_length_slot(&self, envelope: NonNull<ReactorLengthEnvelope>) -> usize {
+    fn take_completed_device_control_slot(
+        &self,
+        envelope: NonNull<ReactorDeviceControlEnvelope>,
+    ) -> usize {
         let index = self.with_payloads(|payloads| {
             payloads.iter_mut().enumerate().find_map(|(index, slot)| {
                 let identifies = matches!(
                     &slot.payload,
-                    SlotPayload::Lower(PublishedReactorLower::Length(lower))
+                    SlotPayload::Lower(PublishedReactorLower::DeviceControl(lower))
                         if lower.identifies(envelope)
                 );
                 identifies.then(|| {
@@ -4798,6 +4920,10 @@ impl CompletionReactor {
                     Ok(!has_commit_work && access.journal_is_clean())
                 });
                 CompletionEvent::durability_wait(1, readiness)
+            }
+            WaitCondition::TrimAvailable => {
+                let readiness = self.with_mounted_access(|access| access.trim_ready());
+                CompletionEvent::durability_wait(TRIM_ADMISSION_BARRIER, readiness)
             }
             WaitCondition::MmpRelease => {
                 let readiness = self.with_mounted_access(|access| access.mmp_close_ready());
@@ -5627,6 +5753,15 @@ mod tests {
             } => {
                 drop(check);
                 drop(owned);
+                drop(suspended);
+            }
+            OperationTransition::SubmitTrim {
+                devices: _devices,
+                request,
+                suspended,
+                ..
+            } => {
+                drop(request);
                 drop(suspended);
             }
             OperationTransition::SubmitLower {

@@ -1539,6 +1539,34 @@ impl MountedVolumeAccess<'_> {
         self.runtime.mutation_context(cache)
     }
 
+    /// Observes current checkpointed discard admission without granting it.
+    /// # Errors
+    /// Returns storage removal, revoked ownership or write-policy failure.
+    pub(crate) fn trim_ready(&self) -> DriverResult<bool> {
+        self.authorize_storage()?;
+        self.runtime.trim_ready()
+    }
+    /// Admits only a current free-space selection; no global allocation or journal authority escapes.
+    /// # Errors
+    /// Returns media removal, revocation, stale metadata or pre-effect allocation failure.
+    pub(crate) fn reserve_trim(
+        &mut self,
+        selection: ext4_core::TrimSelection,
+    ) -> DriverResult<ext4_core::TrimAdmission> {
+        self.authorize_storage()?;
+        self.runtime.reserve_trim(selection)
+    }
+    /// Returns a unique ended lower request even after independent media authority was revoked.
+    /// # Errors
+    /// A foreign completion retains both owners and changes no allocation exclusion.
+    pub(crate) fn complete_trim(
+        &mut self,
+        pending: ext4_core::PendingTrim,
+        completion: ext4_core::TrimCompletion,
+    ) -> Result<ext4_core::TrimBatchResult, ext4_core::TrimCompletionMismatch> {
+        self.runtime.complete_trim(pending, completion)
+    }
+
     /// Allocates one mutation ticket and active-mutation lifetime lease.
     /// # Errors
     ///
