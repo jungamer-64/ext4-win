@@ -1138,9 +1138,9 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     )]
     pub fn register_and_submit<P>(
         self,
-        authorize: impl FnOnce() -> Result<P, DriverError>,
+        authorize: impl FnOnce(&O) -> Result<P, DriverError>,
     ) -> Result<(), LowerSubmissionError<O>> {
-        let _submission = match authorize() {
+        let _submission = match authorize(&self.envelope.get().suspended) {
             Ok(permit) => permit,
             Err(error) => return Err(self.reject_unsubmitted(error)),
         };
