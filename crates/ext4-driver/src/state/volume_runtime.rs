@@ -26,6 +26,8 @@ pub(crate) enum VolumeFailureState {
     DegradedReadOnly,
     /// Journal replay or durability is unknown and this runtime must be torn down.
     RecoveryRequired,
+    /// Media ownership was revoked; only a fresh acquisition and replay may establish a session.
+    MediaOwnershipLost,
     /// Ext4 commit is durable but its Windows stream projection could not be published.
     CommittedButUnpublished {
         /// Exact Cc/MM status returned to the committing IRP and later operations.
@@ -58,10 +60,11 @@ impl VolumeFailureState {
     /// Rejects a new mutation unless the runtime is fully operational.
     /// # Errors
     ///
-    /// Returns [`DriverError::VolumeDismounted`] after any read-only or terminal volume failure.
+    /// Returns revoked media ownership, an exact native failure, or volume dismount after degradation.
     pub(crate) fn authorize_mutation(self) -> DriverResult<()> {
         match self {
             Self::Operational => Ok(()),
+            Self::MediaOwnershipLost => Err(ext4_core::Error::MmpOwnershipLost.into()),
             Self::DegradedReadOnly | Self::RecoveryRequired | Self::Failed => {
                 Err(DriverError::VolumeDismounted)
             }
@@ -75,13 +78,14 @@ impl VolumeFailureState {
     /// Rejects reads only after read reliability itself has been lost.
     /// # Errors
     ///
-    /// Returns [`DriverError::VolumeDismounted`] when recovery is required or reads are failed.
+    /// Returns revoked ownership, an exact native failure, or dismount when reads require recovery.
     pub(crate) fn authorize_read(self) -> DriverResult<()> {
         match self {
             Self::Operational | Self::DegradedReadOnly | Self::CacheWritebackFailed { .. } => {
                 Ok(())
             }
             Self::RecoveryRequired | Self::Failed => Err(DriverError::VolumeDismounted),
+            Self::MediaOwnershipLost => Err(ext4_core::Error::MmpOwnershipLost.into()),
             Self::CommittedButUnpublished { status, .. } => {
                 Err(DriverError::CacheManagerFailure(status))
             }
@@ -93,6 +97,7 @@ impl VolumeFailureState {
         match self {
             Self::Operational => Self::DegradedReadOnly,
             Self::DegradedReadOnly
+            | Self::MediaOwnershipLost
             | Self::RecoveryRequired
             | Self::CommittedButUnpublished { .. }
             | Self::CacheWritebackFailed { .. }
@@ -104,7 +109,8 @@ impl VolumeFailureState {
     const fn durability_unknown(self) -> Self {
         match self {
             Self::Operational | Self::DegradedReadOnly => Self::RecoveryRequired,
-            Self::RecoveryRequired
+            Self::MediaOwnershipLost
+            | Self::RecoveryRequired
             | Self::CommittedButUnpublished { .. }
             | Self::CacheWritebackFailed { .. }
             | Self::Failed => self,
@@ -113,7 +119,10 @@ impl VolumeFailureState {
 
     /// Moves to terminal failure once reads cannot be trusted.
     const fn read_unreliable(self) -> Self {
-        Self::Failed
+        match self {
+            Self::MediaOwnershipLost => self,
+            _ => Self::Failed,
+        }
     }
 
     /// Records the exact post-commit publication failure as a non-retryable terminal state.
@@ -124,7 +133,7 @@ impl VolumeFailureState {
         unexamined_updates: usize,
     ) -> Self {
         match self {
-            Self::Failed => Self::Failed,
+            Self::Failed | Self::MediaOwnershipLost => self,
             Self::CommittedButUnpublished { .. } => self,
             Self::Operational
             | Self::DegradedReadOnly
@@ -141,7 +150,8 @@ impl VolumeFailureState {
     const fn cache_writeback_failed(self, status: NTSTATUS) -> Self {
         match self {
             Self::Operational | Self::DegradedReadOnly => Self::CacheWritebackFailed { status },
-            Self::RecoveryRequired
+            Self::MediaOwnershipLost
+            | Self::RecoveryRequired
             | Self::CommittedButUnpublished { .. }
             | Self::CacheWritebackFailed { .. }
             | Self::Failed => self,
@@ -421,6 +431,7 @@ impl VolumeRuntime {
     /// # Errors
     /// Returns write protection for a read-only mount.
     pub(crate) fn require_media_write(&self) -> DriverResult<()> {
+        self.failure.authorize_mutation()?;
         if let Some(lease) = &self.mmp {
             lease.authorize(crate::kernel::time::mmp_time()?)?;
         }
@@ -445,7 +456,7 @@ impl VolumeRuntime {
         Ok((ticket, activity))
     }
 
-    /// Mutable coordinator used only by infallible visibility/checkpoint publication.
+    /// Mutable coordinator used only by consuming visibility/checkpoint publication.
     fn coordinator_mut(&mut self) -> &mut MutationCoordinatorState {
         &mut self.coordinator
     }
@@ -505,10 +516,10 @@ impl VolumeRuntime {
         Ok(change.prepare(commit, &mut self.coordinator, self.epochs.current())?)
     }
 
-    /// Retires an unpublished key value and its core-owned acquisition together.
+    /// Retires unpublished secret storage; a fenced coordinator already retired its grants.
     pub(crate) fn abort_key_change(&mut self, change: ext4_core::PreparedKeyChange) {
-        if change.abort(&mut self.coordinator).is_err() {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        if let Err((error, _change)) = change.abort(&mut self.coordinator) {
+            self.reject_publication(error);
         }
     }
 
@@ -520,19 +531,23 @@ impl VolumeRuntime {
         self.epochs.reserve_slot()
     }
 
-    /// Publishes prepared mount keys and releases commit serialization without checkpoint work.
+    /// Publishes mount keys only while this session still owns its media observation.
+    /// # Errors
+    /// Returns revoked ownership before changing the visible key snapshot.
     pub(crate) fn publish_keys(
         &mut self,
         change: ext4_core::PreparedKeyChange,
         visibility: VisibilityLease,
         slot: EpochPublicationSlot,
-    ) {
+    ) -> DriverResult<()> {
+        self.require_publication_ownership()?;
         let epoch = match change.publish(visibility, &mut self.coordinator) {
             Ok(epoch) => epoch,
-            Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            Err((error, _change)) => return Err(self.reject_publication(error).into()),
         };
         self.metadata_cache.publish(&epoch);
         self.epochs.publish(slot, epoch);
+        Ok(())
     }
 
     /// Converts successful scheduler intent arbitration into this mount's capability.
@@ -576,41 +591,83 @@ impl VolumeRuntime {
     }
 
     /// Allocation-free durable epoch publication after a matching visibility grant.
+    /// # Errors
+    /// Returns revoked ownership while retaining the last visible epoch for teardown.
     pub(crate) fn publish_durable(
         &mut self,
         mutation: DurableMutation,
         visibility: VisibilityLease,
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
-    ) -> PendingCheckpoint {
+    ) -> ext4_core::Result<PendingCheckpoint> {
+        self.require_publication_ownership()?;
         let published: PublishedMutation =
             match mutation.publish(visibility, self.coordinator_mut()) {
                 Ok(published) => published,
-                Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+                Err((error, _mutation)) => return Err(self.reject_publication(error)),
             };
         let (epoch, checkpoint) = published.into_parts();
         let sequence = epoch.sequence();
         self.metadata_cache.publish(&epoch);
         self.epochs.publish(durable_slot, epoch);
-        PendingCheckpoint {
+        Ok(PendingCheckpoint {
             epoch: sequence,
             operation: checkpoint,
             publication: checkpoint_slot,
-        }
+        })
     }
 
     /// Installs a completed overlay-free checkpoint and releases journal space.
+    /// # Errors
+    /// Returns ownership loss without restoring the fenced journal cursor.
     pub(crate) fn publish_checkpoint(
         &mut self,
         durability: CheckpointPublication,
         publication: EpochPublicationSlot,
-    ) {
+    ) -> DriverResult<()> {
+        self.require_publication_ownership()?;
         let checkpointed = match durability.publish(self.coordinator_mut()) {
             Ok(epoch) => epoch,
-            Err(_) => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            Err((error, _durability)) => return Err(self.reject_publication(error).into()),
         };
         self.metadata_cache.publish(&checkpointed);
         self.epochs.publish(publication, checkpointed);
+        Ok(())
+    }
+
+    /// Retires every core grant before native observers can admit another callback.
+    /// Dropping the physical lease cannot issue a clean marker against a replacement owner.
+    fn revoke_media_ownership(&mut self) {
+        self.coordinator.revoke_media_ownership();
+        self.mmp = None;
+        self.set_failure(VolumeFailureState::MediaOwnershipLost);
+    }
+
+    /// Checks freshness at the consuming publication boundary, including already issued grants.
+    /// # Errors
+    /// A stale or unverifiable clock revokes the session; later completions cannot restore it.
+    fn require_publication_ownership(&mut self) -> ext4_core::Result<()> {
+        if self.failure == VolumeFailureState::MediaOwnershipLost {
+            return Err(ext4_core::Error::MmpOwnershipLost);
+        }
+        if let Some(lease) = &self.mmp {
+            let valid =
+                crate::kernel::time::mmp_time().is_ok_and(|now| lease.authorize(now).is_ok());
+            if !valid {
+                self.revoke_media_ownership();
+                return Err(ext4_core::Error::MmpOwnershipLost);
+            }
+        }
+        Ok(())
+    }
+
+    /// Revocation is an expected external transition; mismatched internal grants remain fatal.
+    fn reject_publication(&mut self, error: ext4_core::Error) -> ext4_core::Error {
+        if error != ext4_core::Error::MmpOwnershipLost {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        self.revoke_media_ownership();
+        error
     }
 
     /// Requires a healthy runtime before a flush can claim journal durability.
@@ -730,6 +787,29 @@ mod tests {
     use super::VolumeFailureState;
 
     /// # Panics
+    /// Fails if later I/O errors weaken revocation or obscure its actionable failure reason.
+    #[test]
+    fn media_ownership_loss_rejects_all_io_and_cannot_be_weakened() {
+        let lost = VolumeFailureState::MediaOwnershipLost;
+        let error = crate::kernel::status::DriverError::from(ext4_core::Error::MmpOwnershipLost);
+        assert_eq!(lost.authorize_mutation(), Err(error));
+        assert_eq!(lost.authorize_read(), Err(error));
+        assert!(!lost.native_policy().permits(false));
+        assert!(!lost.native_policy().permits(true));
+        assert_eq!(lost.durable_abort(), lost);
+        assert_eq!(lost.durability_unknown(), lost);
+        assert_eq!(lost.read_unreliable(), lost);
+        assert_eq!(
+            lost.publication_failed(wdk_sys::STATUS_IO_DEVICE_ERROR, 0, 1),
+            lost
+        );
+        assert_eq!(
+            lost.cache_writeback_failed(wdk_sys::STATUS_IO_DEVICE_ERROR),
+            lost
+        );
+    }
+
+    /// # Panics
     ///
     /// Panics when failure-state transitions weaken an already stronger failure.
     #[test]
@@ -738,6 +818,7 @@ mod tests {
             VolumeFailureState::Operational,
             VolumeFailureState::DegradedReadOnly,
             VolumeFailureState::RecoveryRequired,
+            VolumeFailureState::MediaOwnershipLost,
             VolumeFailureState::Failed,
             VolumeFailureState::CommittedButUnpublished {
                 status: wdk_sys::STATUS_IO_DEVICE_ERROR,

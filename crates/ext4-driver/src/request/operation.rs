@@ -16,8 +16,8 @@ use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
     CLOSE_HANDLE_BARRIER, CompletionEvent, CompletionOperation, ControlDeviceOperation,
-    PreparedPublication, IntentRequest, MountedVolumeOperation, OperationTransition,
-    PublicationAuthority, ReactorTarget, WaitCondition,
+    IntentRequest, MountedVolumeOperation, OperationTransition, PreparedPublication,
+    PublicationAuthority, PublicationOutcome, ReactorTarget, WaitCondition,
 };
 use crate::irp::{
     AtomicOplockReservation, CreateCompletion, IrpCompletion, NamespaceOplockPlan,
@@ -6224,13 +6224,7 @@ impl PreparedPublication for MutationRequestOperation {
         }
     }
 
-    fn publish(
-        mut self: Box<Self>,
-        access: &mut MountedVolumeAccess<'_>,
-    ) -> (
-        Box<dyn CompletionOperation>,
-        Option<crate::irp::PreparedIrpCompletion>,
-    ) {
+    fn publish(mut self: Box<Self>, access: &mut MountedVolumeAccess<'_>) -> PublicationOutcome {
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
         let completion = match state {
             MutationOperationState::PublishingDurable {
@@ -6250,13 +6244,27 @@ impl PreparedPublication for MutationRequestOperation {
                     stream_metadata,
                     effect,
                 } = publication;
-                let publication = access.publish_durable(
+                let publication = match access.publish_durable(
                     durable,
                     visibility,
                     durable_slot,
                     checkpoint_slot,
                     stream_metadata,
-                );
+                ) {
+                    Ok(publication) => publication,
+                    Err((error, stream_metadata)) => {
+                        access.record_durability_unknown();
+                        let publication = PreparedDriverPublication {
+                            stream_metadata,
+                            effect,
+                        };
+                        return PublicationOutcome::Rejected(self.abort_create(
+                            owned,
+                            Some(publication),
+                            CreateAbortContinuation::Complete(error.into()),
+                        ));
+                    }
+                };
                 let (pending, stream_projection) = publication.into_parts();
                 let completion = effect.publish(owned.request(), access, |access| {
                     crate::request::create::publish_existing_mutation(
@@ -6304,7 +6312,10 @@ impl PreparedPublication for MutationRequestOperation {
                 publication,
                 ..
             } => {
-                access.publish_checkpoint(durability, publication);
+                if access.publish_checkpoint(durability, publication).is_err() {
+                    access.record_durability_unknown();
+                    return PublicationOutcome::Rejected(OperationTransition::Retired);
+                }
                 self.state = MutationOperationState::Terminal;
                 None
             }
@@ -6332,7 +6343,10 @@ impl PreparedPublication for MutationRequestOperation {
                     .bugcheck()
             }
         };
-        (self, completion)
+        PublicationOutcome::Published {
+            operation: self,
+            completion,
+        }
     }
 }
 

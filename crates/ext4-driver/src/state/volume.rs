@@ -1614,13 +1614,15 @@ impl MountedVolumeAccess<'_> {
     }
 
     /// Consumes the matching visibility grant into one mount-local key epoch.
+    /// # Errors
+    /// Returns ownership loss without changing the visible keys.
     pub(crate) fn publish_keys(
         &mut self,
         change: ext4_core::PreparedKeyChange,
         visibility: VisibilityLease,
         slot: EpochPublicationSlot,
-    ) {
-        self.runtime.publish_keys(change, visibility, slot);
+    ) -> DriverResult<()> {
+        self.runtime.publish_keys(change, visibility, slot)
     }
 
     /// Revalidates one resolved mutation under its granted resource intent.
@@ -1722,6 +1724,8 @@ impl MountedVolumeAccess<'_> {
     ///
     /// The core durability/visibility capabilities are required here, so a caller cannot install
     /// prepared stream metadata through the mounted-volume boundary before the commit is durable.
+    /// # Errors
+    /// Returns ownership loss and the unpublished native projection for mandatory cleanup.
     #[inline(never)]
     pub(crate) fn publish_durable(
         &mut self,
@@ -1730,28 +1734,36 @@ impl MountedVolumeAccess<'_> {
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
         stream_metadata: PreparedStreamMetadataPublications,
-    ) -> DurablePublicationOutcome {
+    ) -> Result<DurablePublicationOutcome, (ext4_core::Error, PreparedStreamMetadataPublications)>
+    {
         let checkpoint =
-            self.runtime
-                .publish_durable(mutation, visibility, durable_slot, checkpoint_slot);
+            match self
+                .runtime
+                .publish_durable(mutation, visibility, durable_slot, checkpoint_slot)
+            {
+                Ok(checkpoint) => checkpoint,
+                Err(error) => return Err((error, stream_metadata)),
+            };
         let epoch = checkpoint.epoch();
         let stream_projection = self
             .volume
             .file_control_blocks
             .publish_stream_metadata(stream_metadata, epoch);
-        DurablePublicationOutcome {
+        Ok(DurablePublicationOutcome {
             checkpoint,
             stream_projection,
-        }
+        })
     }
 
     /// Publishes an overlay-free checkpoint and releases journal space.
+    /// # Errors
+    /// Returns revoked ownership without retiring the visible overlay or restoring journal authority.
     pub(crate) fn publish_checkpoint(
         &mut self,
         durability: CheckpointPublication,
         publication: EpochPublicationSlot,
-    ) {
-        self.runtime.publish_checkpoint(durability, publication);
+    ) -> DriverResult<()> {
+        self.runtime.publish_checkpoint(durability, publication)
     }
 
     /// Records a confirmed durable abort as a read-only transition.

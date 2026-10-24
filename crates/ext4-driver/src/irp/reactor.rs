@@ -2885,281 +2885,301 @@ impl CompletionReactor {
 
     /// Applies one operation transition without executing any unrelated operation.
     #[cfg(not(test))]
-    fn apply_transition(&self, index: usize, transition: OperationTransition) {
-        match transition {
-            OperationTransition::SubmitOwnershipLower {
-                devices,
-                request,
-                suspended,
-            } => {
-                self.submit_storage(
-                    index,
+    fn apply_transition(&self, index: usize, mut transition: OperationTransition) {
+        loop {
+            match transition {
+                OperationTransition::SubmitOwnershipLower {
                     devices,
                     request,
                     suspended,
-                    EffectCancellation::Ownership,
-                );
-            }
-            OperationTransition::WaitForTimer { seconds, suspended } => {
-                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
-                    return;
-                };
-                let identity = self
-                    .with_scheduler(|scheduler| scheduler.identity(index))
-                    .unwrap_or_else(|| {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-                    });
-                if !self.with_scheduler(|scheduler| scheduler.begin_observation_timer(identity)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                }
-                self.install_payload(index, SlotPayload::Observation(suspended));
-                self.operation_timers
-                    .get(index)
-                    .unwrap_or_else(|| {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-                    })
-                    .arm(
-                        identity.generation(),
-                        TimerDelay::ObservationSeconds(seconds),
-                    );
-            }
-            OperationTransition::QueryDeviceLength {
-                completion_owner,
-                target,
-                suspended,
-            } => {
-                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
-                    return;
-                };
-                self.submit_device_length(index, completion_owner, target, suspended);
-            }
-            OperationTransition::SubmitLower {
-                devices,
-                request,
-                suspended,
-            } => {
-                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
-                    drop(request);
-                    return;
-                };
-                self.submit_storage(
-                    index,
-                    devices,
-                    request,
-                    suspended,
-                    EffectCancellation::AbortBeforeEffect,
-                );
-            }
-            OperationTransition::SubmitClosingLower {
-                devices,
-                request,
-                suspended,
-            } => {
-                self.submit_storage(
-                    index,
-                    devices,
-                    request,
-                    suspended,
-                    EffectCancellation::ContinueClosing,
-                );
-            }
-            OperationTransition::SubmitPassiveWork { work, suspended } => {
-                self.submit_passive_work(index, work, suspended);
-                self.grant_available_intents();
-            }
-            OperationTransition::CheckOplock {
-                check,
-                owned,
-                suspended,
-            } => {
-                self.submit_oplock_check(index, check, owned, suspended);
-            }
-            OperationTransition::RequestIntent { request, suspended } => {
-                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
-                    drop(request);
-                    return;
-                };
-                let ticket = request.ticket();
-                let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
-                else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                let Some(disposition) =
-                    self.with_scheduler(|scheduler| scheduler.request_intent(identity, request))
-                else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                match disposition {
-                    IntentDisposition::Retained => self.install_payload(
+                } => {
+                    self.submit_storage(
                         index,
-                        SlotPayload::Operation {
-                            operation: suspended,
-                            event: Some(CompletionEvent::Core(OperationEvent::IntentGranted(
-                                self.with_mounted_access(|access| access.grant_intent(ticket)),
-                            ))),
-                        },
-                    ),
-                    IntentDisposition::Queued => self.install_payload(
+                        devices,
+                        request,
+                        suspended,
+                        EffectCancellation::Ownership,
+                    );
+                }
+                OperationTransition::WaitForTimer { seconds, suspended } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        return;
+                    };
+                    let identity = self
+                        .with_scheduler(|scheduler| scheduler.identity(index))
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        });
+                    if !self.with_scheduler(|scheduler| scheduler.begin_observation_timer(identity))
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    self.install_payload(index, SlotPayload::Observation(suspended));
+                    self.operation_timers
+                        .get(index)
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        })
+                        .arm(
+                            identity.generation(),
+                            TimerDelay::ObservationSeconds(seconds),
+                        );
+                }
+                OperationTransition::QueryDeviceLength {
+                    completion_owner,
+                    target,
+                    suspended,
+                } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        return;
+                    };
+                    self.submit_device_length(index, completion_owner, target, suspended);
+                }
+                OperationTransition::SubmitLower {
+                    devices,
+                    request,
+                    suspended,
+                } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        drop(request);
+                        return;
+                    };
+                    self.submit_storage(
+                        index,
+                        devices,
+                        request,
+                        suspended,
+                        EffectCancellation::AbortBeforeEffect,
+                    );
+                }
+                OperationTransition::SubmitClosingLower {
+                    devices,
+                    request,
+                    suspended,
+                } => {
+                    self.submit_storage(
+                        index,
+                        devices,
+                        request,
+                        suspended,
+                        EffectCancellation::ContinueClosing,
+                    );
+                }
+                OperationTransition::SubmitPassiveWork { work, suspended } => {
+                    self.submit_passive_work(index, work, suspended);
+                    self.grant_available_intents();
+                }
+                OperationTransition::CheckOplock {
+                    check,
+                    owned,
+                    suspended,
+                } => {
+                    self.submit_oplock_check(index, check, owned, suspended);
+                }
+                OperationTransition::RequestIntent { request, suspended } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        drop(request);
+                        return;
+                    };
+                    let ticket = request.ticket();
+                    let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
+                    else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    let Some(disposition) = self
+                        .with_scheduler(|scheduler| scheduler.request_intent(identity, request))
+                    else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    match disposition {
+                        IntentDisposition::Retained => self.install_payload(
+                            index,
+                            SlotPayload::Operation {
+                                operation: suspended,
+                                event: Some(CompletionEvent::Core(OperationEvent::IntentGranted(
+                                    self.with_mounted_access(|access| access.grant_intent(ticket)),
+                                ))),
+                            },
+                        ),
+                        IntentDisposition::Queued => self.install_payload(
+                            index,
+                            SlotPayload::Operation {
+                                operation: suspended,
+                                event: None,
+                            },
+                        ),
+                    }
+                    self.grant_available_intents();
+                }
+                OperationTransition::RequestCommit { ticket, suspended } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        return;
+                    };
+                    let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
+                    else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    if !self.with_scheduler(|scheduler| scheduler.request_commit(identity, ticket))
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    self.install_payload(
                         index,
                         SlotPayload::Operation {
                             operation: suspended,
                             event: None,
                         },
-                    ),
-                }
-                self.grant_available_intents();
-            }
-            OperationTransition::RequestCommit { ticket, suspended } => {
-                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
-                    return;
-                };
-                let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
-                else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                if !self.with_scheduler(|scheduler| scheduler.request_commit(identity, ticket)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                }
-                self.install_payload(
-                    index,
-                    SlotPayload::Operation {
-                        operation: suspended,
-                        event: None,
-                    },
-                );
-                self.grant_available_commit();
-            }
-            OperationTransition::DeferOperation { suspended } => {
-                let identity = self
-                    .with_scheduler(|scheduler| scheduler.identity(index))
-                    .unwrap_or_else(|| {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-                    });
-                if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                }
-                self.install_payload(
-                    index,
-                    SlotPayload::Operation {
-                        operation: suspended,
-                        event: None,
-                    },
-                );
-                self.operation_timers
-                    .get(index)
-                    .unwrap_or_else(|| {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-                    })
-                    .arm(
-                        identity.generation(),
-                        TimerDelay::Retry(StorageRetryDelay::TenMilliseconds),
                     );
-            }
-            OperationTransition::ArmRetry { retry } => {
-                self.arm_retry(index, retry);
-            }
-            OperationTransition::Wait {
-                condition,
-                suspended,
-            } => {
-                let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
-                    return;
-                };
-                let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
-                else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                if !self.with_scheduler(|scheduler| scheduler.request_wait(identity, condition)) {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    self.grant_available_commit();
                 }
-                self.install_payload(
-                    index,
-                    SlotPayload::Operation {
-                        operation: suspended,
-                        event: None,
-                    },
-                );
-                self.grant_available_wait(index);
-            }
-            OperationTransition::WaitForClosingDrain {
-                condition,
-                suspended,
-            } => {
-                let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
-                else {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                };
-                if !self
-                    .with_scheduler(|scheduler| scheduler.request_closing_wait(identity, condition))
-                {
-                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                OperationTransition::DeferOperation { suspended } => {
+                    let identity = self
+                        .with_scheduler(|scheduler| scheduler.identity(index))
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        });
+                    if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry))
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    self.install_payload(
+                        index,
+                        SlotPayload::Operation {
+                            operation: suspended,
+                            event: None,
+                        },
+                    );
+                    self.operation_timers
+                        .get(index)
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        })
+                        .arm(
+                            identity.generation(),
+                            TimerDelay::Retry(StorageRetryDelay::TenMilliseconds),
+                        );
                 }
-                self.install_payload(
-                    index,
-                    SlotPayload::Operation {
-                        operation: suspended,
-                        event: None,
-                    },
-                );
-                self.grant_available_wait(index);
-            }
-            OperationTransition::Publish { publication } => {
-                let authority = publication.authority();
-                if matches!(authority, PublicationAuthority::Mutation { .. })
-                    && self.consume_cancellation_before_effect(index)
-                {
+                OperationTransition::ArmRetry { retry } => {
+                    self.arm_retry(index, retry);
+                }
+                OperationTransition::Wait {
+                    condition,
+                    suspended,
+                } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        return;
+                    };
+                    let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
+                    else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    if !self.with_scheduler(|scheduler| scheduler.request_wait(identity, condition))
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    self.install_payload(
+                        index,
+                        SlotPayload::Operation {
+                            operation: suspended,
+                            event: None,
+                        },
+                    );
+                    self.grant_available_wait(index);
+                }
+                OperationTransition::WaitForClosingDrain {
+                    condition,
+                    suspended,
+                } => {
+                    let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
+                    else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    if !self.with_scheduler(|scheduler| {
+                        scheduler.request_closing_wait(identity, condition)
+                    }) {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    self.install_payload(
+                        index,
+                        SlotPayload::Operation {
+                            operation: suspended,
+                            event: None,
+                        },
+                    );
+                    self.grant_available_wait(index);
+                }
+                OperationTransition::Publish { publication } => {
+                    let authority = publication.authority();
+                    if matches!(authority, PublicationAuthority::Mutation { .. })
+                        && self.consume_cancellation_before_effect(index)
+                    {
+                        self.set_ready_operation_event(
+                            index,
+                            publication,
+                            CompletionEvent::Core(OperationEvent::CancelRequested),
+                        );
+                        return;
+                    }
+                    self.consume_publication_authority(index, authority);
+                    let (operation, completion) =
+                        match self.with_mounted_access(|access| publication.publish(access)) {
+                            PublicationOutcome::Published {
+                                operation,
+                                completion,
+                            } => (operation, completion),
+                            PublicationOutcome::Rejected(next) => {
+                                transition = next;
+                                continue;
+                            }
+                        };
+                    if matches!(authority, PublicationAuthority::Mutation { .. }) {
+                        self.retire_cancel_slot(index);
+                        self.release_handle_lane(index);
+                    }
                     self.set_ready_operation_event(
                         index,
-                        publication,
-                        CompletionEvent::Core(OperationEvent::CancelRequested),
+                        operation,
+                        CompletionEvent::Core(OperationEvent::Admitted),
                     );
-                    return;
+                    self.grant_available_intents();
+                    self.grant_available_commit();
+                    self.grant_all_available_waits();
+                    self.grant_all_handle_turns();
+                    if let Some(completion) = completion {
+                        let _status = completion.notify();
+                    }
                 }
-                self.consume_publication_authority(index, authority);
-                let (operation, completion) =
-                    self.with_mounted_access(|access| publication.publish(access));
-                if matches!(authority, PublicationAuthority::Mutation { .. }) {
-                    self.retire_cancel_slot(index);
-                    self.release_handle_lane(index);
-                }
-                self.set_ready_operation_event(
-                    index,
-                    operation,
-                    CompletionEvent::Core(OperationEvent::Admitted),
-                );
-                self.grant_available_intents();
-                self.grant_available_commit();
-                self.grant_all_available_waits();
-                self.grant_all_handle_turns();
-                if let Some(completion) = completion {
+                OperationTransition::CompleteFinalization {
+                    completion,
+                    reusable,
+                } => {
+                    self.with_finalization(|pool| pool.restore(reusable));
+                    self.retire_operation(index);
                     let _status = completion.notify();
                 }
+                OperationTransition::ContinueAfterFinalization { reusable, next } => {
+                    self.with_finalization(|pool| pool.restore(reusable));
+                    self.set_ready_operation_event(
+                        index,
+                        next,
+                        CompletionEvent::Core(OperationEvent::Admitted),
+                    );
+                }
+                OperationTransition::Complete(completion) => {
+                    self.retire_operation(index);
+                    let _status = completion.notify();
+                }
+                OperationTransition::ForwardQueryRemove(forwarding) => {
+                    self.retire_operation(index);
+                    forwarding.queue();
+                }
+                OperationTransition::Retired => self.retire_operation(index),
             }
-            OperationTransition::CompleteFinalization {
-                completion,
-                reusable,
-            } => {
-                self.with_finalization(|pool| pool.restore(reusable));
-                self.retire_operation(index);
-                let _status = completion.notify();
-            }
-            OperationTransition::ContinueAfterFinalization { reusable, next } => {
-                self.with_finalization(|pool| pool.restore(reusable));
-                self.set_ready_operation_event(
-                    index,
-                    next,
-                    CompletionEvent::Core(OperationEvent::Admitted),
-                );
-            }
-            OperationTransition::Complete(completion) => {
-                self.retire_operation(index);
-                let _status = completion.notify();
-            }
-            OperationTransition::ForwardQueryRemove(forwarding) => {
-                self.retire_operation(index);
-                forwarding.queue();
-            }
-            OperationTransition::Retired => self.retire_operation(index),
+            break;
         }
     }
 
@@ -3282,7 +3302,7 @@ impl CompletionReactor {
         }
     }
 
-    /// Consumes exactly the grants required by one infallible publication.
+    /// Consumes scheduler grants before one allocation-free, revocable publication attempt.
     #[cfg(not(test))]
     fn consume_publication_authority(&self, index: usize, authority: PublicationAuthority) {
         match authority {
@@ -5116,8 +5136,8 @@ mod tests {
 
     use super::{
         AdmittedOperation, CompletionEvent, CompletionOperation, CompletionReactor,
-        DelayedCloseTimerState, ExecutionClass, HandleOperationLane, PreparedPublication,
-        MAX_OPERATIONS, OperationAdmission, OperationTransition, PendingIrpSelection,
+        DelayedCloseTimerState, ExecutionClass, HandleOperationLane, MAX_OPERATIONS,
+        OperationAdmission, OperationTransition, PendingIrpSelection, PreparedPublication,
         PublicationAuthority, SlotPayload, SuspendedOperation, driver_error_to_core,
         initialize_list_head, insert_tail_list, list_is_empty, remove_head_list, slot_bit,
     };
@@ -5334,13 +5354,23 @@ mod tests {
     fn publish_prebuilt_value(
         publication: alloc::boxed::Box<dyn PreparedPublication>,
         access: &mut crate::state::MountedVolumeAccess<'_>,
-    ) -> (PublicationAuthority, SuspendedOperation) {
+    ) -> PublicationAuthority {
         let authority = publication.authority();
-        let (operation, completion) = publication.publish(access);
-        if let Some(completion) = completion {
-            let _status = completion.notify();
+        match publication.publish(access) {
+            super::PublicationOutcome::Published {
+                operation,
+                completion,
+            } => {
+                if let Some(completion) = completion {
+                    let _status = completion.notify();
+                }
+                drop(operation);
+            }
+            super::PublicationOutcome::Rejected(next) => {
+                consume_transition(next);
+            }
         }
-        (authority, operation)
+        authority
     }
 
     fn consume_transition(transition: OperationTransition) {
@@ -5513,7 +5543,7 @@ mod tests {
         let _publish: fn(
             alloc::boxed::Box<dyn PreparedPublication>,
             &mut crate::state::MountedVolumeAccess<'_>,
-        ) -> (PublicationAuthority, SuspendedOperation) = publish_prebuilt_value;
+        ) -> PublicationAuthority = publish_prebuilt_value;
         let _consume: fn(OperationTransition) = consume_transition;
     }
 

@@ -340,13 +340,7 @@ impl PreparedPublication for KeyRequestOperation {
         }
     }
 
-    fn publish(
-        mut self: Box<Self>,
-        access: &mut MountedVolumeAccess<'_>,
-    ) -> (
-        Box<dyn CompletionOperation>,
-        Option<crate::irp::PreparedIrpCompletion>,
-    ) {
+    fn publish(mut self: Box<Self>, access: &mut MountedVolumeAccess<'_>) -> PublicationOutcome {
         let KeyState::Publishing {
             context,
             prepared,
@@ -357,14 +351,19 @@ impl PreparedPublication for KeyRequestOperation {
             crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                 .bugcheck();
         };
-        access.publish_keys(prepared, visibility, slot);
+        if let Err(error) = access.publish_keys(prepared, visibility, slot) {
+            return PublicationOutcome::Rejected(Self::fail(context, error));
+        }
         let KeyContext {
             owned,
             request,
             completion,
         } = context;
         drop(request);
-        (self, Some(owned.prepare_completion(completion)))
+        PublicationOutcome::Published {
+            operation: self,
+            completion: Some(owned.prepare_completion(completion)),
+        }
     }
 }
 
