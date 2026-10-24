@@ -2314,3 +2314,6 @@ pub use directory::{DirectoryCasefoldError, query_directory_casefold, set_direct
 
 mod trim;
 pub use trim::{TrimError, TrimSubmission, trim_volume};
+
+mod features;
+pub use features::{FeaturesQueryError, query_volume_features};

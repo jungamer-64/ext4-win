@@ -2,7 +2,7 @@
 use std::process::ExitCode;
 
 /// User-visible grammar; replacements contain the entire desired table.
-const USAGE: &str = "ext4ctl volumes\next4ctl trim <volume-path>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>] [--auto-trim on|off]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
+const USAGE: &str = "ext4ctl volumes\next4ctl features <volume-path>\next4ctl trim <volume-path>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>] [--auto-trim on|off]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
 /// Fully parsed action before any replacement can be submitted.
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
@@ -10,6 +10,8 @@ enum Command {
     Volumes,
     /// Discard free ranges through the currently mounted volume's allocation coordinator.
     Trim(String),
+    /// Observe the mounted format declarations without enabling or changing any feature.
+    Features(String),
     /// Observe one opened directory's committed comparison state.
     CasefoldShow(String),
     /// Journal an empty directory's comparison transition.
@@ -55,6 +57,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
         "volumes" => Command::Volumes,
         "whoami" => Command::Whoami,
         "trim" => Command::Trim(args.next().ok_or_else(|| USAGE.to_owned())?),
+        "features" => Command::Features(args.next().ok_or_else(|| USAGE.to_owned())?),
         "casefold" => {
             let action = args.next().ok_or_else(|| USAGE.to_owned())?;
             let path = args.next().ok_or_else(|| USAGE.to_owned())?;
@@ -213,6 +216,41 @@ fn show_trim(report: ext4_control::TrimReport) {
     );
 }
 
+/// Shows complete masks separately from named declarations and immutable admitted media access.
+#[cfg(windows)]
+fn show_features(state: ext4_control::FeaturesState) {
+    use ext4_core::FilesystemFeature as Feature;
+    println!(
+        "UUID {}\nadmitted access {:?}\ncompatible {:#010x}\nincompatible {:#010x}\nread-only-compatible {:#010x}",
+        uuid_text(state.uuid),
+        state.admitted_access,
+        state.declared.compatible.bits(),
+        state.declared.incompatible.bits(),
+        state.declared.read_only_compatible.bits()
+    );
+    for (name, feature) in [
+        ("casefold", Feature::Casefold),
+        ("inline_data", Feature::InlineData),
+        ("ea_inode", Feature::AttributeValueInodes),
+        ("mmp", Feature::MultipleMountProtection),
+        ("fast_commit", Feature::FastCommit),
+        ("encrypt", Feature::Encryption),
+        ("bigalloc", Feature::BigAllocation),
+        ("metadata_csum", Feature::MetadataChecksums),
+        ("dir_index", Feature::DirectoryIndex),
+        ("verity", Feature::Verity),
+    ] {
+        println!(
+            "{name} {}",
+            if state.declared.contains(feature) {
+                "declared"
+            } else {
+                "absent"
+            }
+        );
+    }
+}
+
 /// Retains an authoritative report even if host cleanup fails after the driver replied.
 /// # Errors
 /// Stopped, unknown or cleanup-failed operations fail the CLI without automatic resubmission.
@@ -317,6 +355,15 @@ fn policy_reply(
 fn execute(command: Command) -> Result<(), String> {
     match command {
         Command::Trim(volume) => trim_reply(windows_host::trim_volume(&volume))?,
+        Command::Features(volume) => match windows_host::query_volume_features(&volume) {
+            Ok(state) => show_features(state),
+            Err(error) => {
+                if let windows_host::FeaturesQueryError::Release { state, .. } = &error {
+                    show_features(*state);
+                }
+                return Err(error.to_string());
+            }
+        },
         Command::Volumes => {
             for (name, uuid) in
                 windows_host::identity_volumes().map_err(|error| error.to_string())?
@@ -474,6 +521,21 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Panics
+    /// Fails if an observation command accepts a feature toggle or omits the mounted target.
+    #[test]
+    fn features_is_an_explicit_mounted_observation() {
+        assert_eq!(
+            parse(["features", "X:"].into_iter().map(str::to_owned)),
+            Ok(Command::Features("X:".to_owned()))
+        );
+        for args in [
+            vec!["features"],
+            vec!["features", "X:", "--enable", "fast_commit"],
+        ] {
+            assert!(parse(args.into_iter().map(str::to_owned)).is_err());
+        }
+    }
     /// # Panics
     /// Fails if a missing volume or extra operand can reach discard submission.
     #[test]

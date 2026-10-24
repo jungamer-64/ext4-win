@@ -185,6 +185,18 @@ required encrypted-index change share one journal commit. A failed transport ack
 follow a committed transition: observe the directory before considering a retry. The CLI never
 retries an unacknowledged transition automatically.
 
+## Declared filesystem features
+
+```console
+cargo run -p ext4ctl -- features <volume-path>
+```
+
+The observation contains the filesystem UUID, complete compatible, incompatible and
+read-only-compatible masks, and media access admitted before recovery. Named entries describe
+on-disk declarations. They do not claim current mutation permission or change any filesystem
+feature. An independent ownership or reliability failure can prevent writes after writable mount
+admission. Read-only recovery reports the committed virtual metadata view.
+
 ## Free-space discard
 
 ```console

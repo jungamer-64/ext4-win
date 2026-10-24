@@ -1166,15 +1166,6 @@ impl ClusterGeometry {
     }
 }
 
-/// Journal placement class selected by validated feature flags.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum JournalFeature {
-    /// The filesystem has no journal.
-    None,
-    /// The filesystem requires one internal or external JBD2 journal.
-    Present,
-}
-
 /// Superblock copy placement selected by sparse-super feature bits.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SparseSuperblockLayout {
@@ -1274,13 +1265,103 @@ pub(crate) enum InodeTimestampEncoding {
     ExtraFields,
 }
 
-/// Presence of the reserved resize inode selected by `COMPAT_RESIZE_INODE`.
+/// Compatible feature-mask domain. Unknown bits remain observable; this value grants no authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResizeInodeFeature {
-    /// No reserved resize inode is defined by the feature profile.
-    Absent,
-    /// Inode 7 owns the reserved online-resize metadata block map.
-    Present,
+pub struct CompatibleFeatures(u32);
+impl CompatibleFeatures {
+    /// Captures a wire observation without admitting its features for mounting.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+    /// Compatible bits in ext4 numbering, independent of the other two feature-mask domains.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+/// Incompatible feature-mask domain, distinct from the equally sized compatible masks.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IncompatibleFeatures(u32);
+impl IncompatibleFeatures {
+    /// Captures a wire observation without admitting its features for mounting.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+    /// Incompatible bits in ext4 numbering.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+/// Read-only-compatible feature-mask domain; its presence does not itself select media authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadOnlyCompatibleFeatures(u32);
+impl ReadOnlyCompatibleFeatures {
+    /// Captures a wire observation without admitting its features for mounting.
+    pub const fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+    /// Read-only-compatible bits in ext4 numbering.
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+}
+/// Declared on-disk facts. Acceptance, session access and operation authority remain independent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemFeatures {
+    /// Compatible on-disk features, including journal format selection.
+    pub compatible: CompatibleFeatures,
+    /// Features that readers must understand before interpreting the filesystem.
+    pub incompatible: IncompatibleFeatures,
+    /// Features whose interpretation constrains write admission.
+    pub read_only_compatible: ReadOnlyCompatibleFeatures,
+}
+/// Named format facts for administrative observation, without a claim of implementation support.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FilesystemFeature {
+    /// Filesystem-wide Unicode directory comparison encoding.
+    Casefold,
+    /// Inode-body file and directory payloads.
+    InlineData,
+    /// Attribute entries may reference separate value inodes.
+    AttributeValueInodes,
+    /// Independent physical-media ownership record.
+    MultipleMountProtection,
+    /// Delta records in a reserved journal area.
+    FastCommit,
+    /// Per-inode fscrypt policies may be present.
+    Encryption,
+    /// Allocation bitmaps address clusters larger than filesystem blocks.
+    BigAllocation,
+    /// CRC32C metadata authentication.
+    MetadataChecksums,
+    /// Hash-indexed directories.
+    DirectoryIndex,
+    /// File-content verification metadata.
+    Verity,
+}
+impl FilesystemFeatures {
+    /// Observes a declaration; callers must not treat this as admission or write permission.
+    pub const fn contains(self, feature: FilesystemFeature) -> bool {
+        match feature {
+            FilesystemFeature::Casefold => self.incompatible.bits() & INCOMPAT_CASEFOLD != 0,
+            FilesystemFeature::InlineData => self.incompatible.bits() & INCOMPAT_INLINE_DATA != 0,
+            FilesystemFeature::AttributeValueInodes => {
+                self.incompatible.bits() & INCOMPAT_EA_INODE != 0
+            }
+            FilesystemFeature::MultipleMountProtection => {
+                self.incompatible.bits() & INCOMPAT_MMP != 0
+            }
+            FilesystemFeature::FastCommit => self.compatible.bits() & COMPAT_FAST_COMMIT != 0,
+            FilesystemFeature::Encryption => self.incompatible.bits() & INCOMPAT_ENCRYPT != 0,
+            FilesystemFeature::BigAllocation => {
+                self.read_only_compatible.bits() & RO_COMPAT_BIGALLOC != 0
+            }
+            FilesystemFeature::MetadataChecksums => {
+                self.read_only_compatible.bits() & RO_COMPAT_METADATA_CSUM != 0
+            }
+            FilesystemFeature::DirectoryIndex => self.compatible.bits() & COMPAT_DIR_INDEX != 0,
+            FilesystemFeature::Verity => self.read_only_compatible.bits() & RO_COMPAT_VERITY != 0,
+        }
+    }
 }
 
 /// Validated ext4 capabilities accepted by a mount policy.
@@ -1377,172 +1458,177 @@ impl FeatureSet {
         Ok(Self::from_raw(compat, incompat, read_only_compat))
     }
 
-    /// Converts validated raw flags into internal write/read capabilities.
-    fn from_raw(compat: u32, incompat: u32, read_only_compat: u32) -> Self {
-        let metadata_checksum = if read_only_compat & RO_COMPAT_METADATA_CSUM != 0 {
-            MetadataChecksum::Crc32c
-        } else {
-            MetadataChecksum::None
-        };
-        let descriptor_checksum = if metadata_checksum == MetadataChecksum::Crc32c {
-            BlockGroupDescriptorChecksum::MetadataCrc32c
-        } else if read_only_compat & RO_COMPAT_GDT_CSUM != 0 {
-            BlockGroupDescriptorChecksum::GdtCrc16
-        } else {
-            BlockGroupDescriptorChecksum::None
-        };
-        let journal = if compat & COMPAT_HAS_JOURNAL == 0 {
-            JournalFeature::None
-        } else {
-            JournalFeature::Present
-        };
-        let recovery_state = if incompat & INCOMPAT_RECOVER != 0 {
-            RecoveryState::NeedsRecovery
-        } else {
-            RecoveryState::Clean
-        };
-
+    /// Keeps one immutable authority for all typed format interpretations.
+    const fn from_raw(compat: u32, incompat: u32, read_only_compat: u32) -> Self {
         Self {
-            descriptor_layout: if incompat & INCOMPAT_64BIT != 0 {
-                BlockGroupDescriptorLayout::SixtyFourBit
-            } else {
-                BlockGroupDescriptorLayout::Standard32
-            },
-            journal,
-            recovery_state,
-            metadata_checksum,
-            descriptor_checksum,
-            sparse_superblock_layout: if read_only_compat & RO_COMPAT_SPARSE_SUPER != 0 {
-                SparseSuperblockLayout::SparseCopies
-            } else {
-                SparseSuperblockLayout::FullCopies
-            },
-            directory_indexing: if compat & COMPAT_DIR_INDEX == 0 {
-                DirectoryIndexing::Disabled
-            } else if incompat & INCOMPAT_LARGEDIR != 0 {
-                DirectoryIndexing::LargeDirectory
-            } else {
-                DirectoryIndexing::Standard
-            },
-            directory_links: if read_only_compat & RO_COMPAT_DIR_NLINK != 0 {
-                crate::disk_format::inode::DirectoryLinkEncoding::Uncounted
-            } else {
-                crate::disk_format::inode::DirectoryLinkEncoding::Counted
-            },
-            allocation_bitmap_domain: if read_only_compat & RO_COMPAT_BIGALLOC != 0 {
-                AllocationBitmapDomain::Clusters
-            } else {
-                AllocationBitmapDomain::Blocks
-            },
-            checksum_seed_source: if incompat & INCOMPAT_CSUM_SEED != 0 {
-                ChecksumSeedSource::SuperblockField
-            } else if metadata_checksum == MetadataChecksum::Crc32c {
-                ChecksumSeedSource::FilesystemUuid
-            } else {
-                ChecksumSeedSource::Zero
-            },
-            xattr_mutation: if compat & COMPAT_EXT_ATTR != 0 {
-                XattrMutationSupport::Enabled
-            } else {
-                XattrMutationSupport::Disabled
-            },
-            verity: read_only_compat & RO_COMPAT_VERITY != 0,
-            inline_data: incompat & INCOMPAT_INLINE_DATA != 0,
-            attribute_values: incompat & INCOMPAT_EA_INODE != 0,
-            file_size_encoding: if read_only_compat & RO_COMPAT_LARGE_FILE != 0 {
-                FileSizeEncoding::LargeFile
-            } else {
-                FileSizeEncoding::Legacy
-            },
-            directory_size_encoding: if incompat & INCOMPAT_LARGEDIR != 0 {
-                DirectorySizeEncoding::LargeDirectory
-            } else {
-                DirectorySizeEncoding::Standard
-            },
-            inode_block_count_encoding: if read_only_compat & RO_COMPAT_HUGE_FILE != 0 {
-                InodeBlockCountEncoding::HugeFile
-            } else {
-                InodeBlockCountEncoding::LegacySectors
-            },
-            inode_timestamp_encoding: if read_only_compat & RO_COMPAT_EXTRA_ISIZE != 0 {
-                InodeTimestampEncoding::ExtraFields
-            } else {
-                InodeTimestampEncoding::LegacySeconds
-            },
-            resize_inode: if compat & COMPAT_RESIZE_INODE != 0 {
-                ResizeInodeFeature::Present
-            } else {
-                ResizeInodeFeature::Absent
+            declared: FilesystemFeatures {
+                compatible: CompatibleFeatures(compat),
+                incompatible: IncompatibleFeatures(incompat),
+                read_only_compatible: ReadOnlyCompatibleFeatures(read_only_compat),
             },
         }
     }
 
-    /// Returns whether the 64-bit descriptor feature is present.
-    pub(crate) const fn has_64bit(self) -> bool {
-        matches!(
-            self.descriptor_layout,
-            BlockGroupDescriptorLayout::SixtyFourBit
-        )
-    }
-
-    /// Returns the descriptor layout selected by validated feature flags.
+    /// Returns the descriptor layout implied by validated feature bits.
     pub(crate) const fn descriptor_layout(self) -> BlockGroupDescriptorLayout {
-        self.descriptor_layout
-    }
-
-    /// Returns whether the filesystem advertises a journal.
-    pub(crate) const fn has_journal(self) -> bool {
-        !matches!(self.journal, JournalFeature::None)
-    }
-
-    /// Returns the metadata checksum mode.
-    pub(crate) const fn metadata_checksum(self) -> MetadataChecksum {
-        self.metadata_checksum
-    }
-
-    /// Returns the block group descriptor checksum mode.
-    pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
-        self.descriptor_checksum
+        if self.declared.incompatible.bits() & INCOMPAT_64BIT != 0 {
+            BlockGroupDescriptorLayout::SixtyFourBit
+        } else {
+            BlockGroupDescriptorLayout::Standard32
+        }
     }
 
     /// Returns the sparse-superblock layout.
     pub(crate) const fn sparse_superblock_layout(self) -> SparseSuperblockLayout {
-        self.sparse_superblock_layout
+        if self.declared.read_only_compatible.bits() & RO_COMPAT_SPARSE_SUPER != 0 {
+            SparseSuperblockLayout::SparseCopies
+        } else {
+            SparseSuperblockLayout::FullCopies
+        }
     }
 
     /// Returns the directory indexing capability.
     pub(crate) const fn directory_indexing(self) -> DirectoryIndexing {
-        self.directory_indexing
+        if self.declared.compatible.bits() & COMPAT_DIR_INDEX == 0 {
+            DirectoryIndexing::Disabled
+        } else if self.declared.incompatible.bits() & INCOMPAT_LARGEDIR != 0 {
+            DirectoryIndexing::LargeDirectory
+        } else {
+            DirectoryIndexing::Standard
+        }
+    }
+
+    /// Mounted directory reference accounting.
+    pub(crate) const fn directory_links(self) -> crate::disk_format::inode::DirectoryLinkEncoding {
+        if self.declared.read_only_compatible.bits() & RO_COMPAT_DIR_NLINK != 0 {
+            crate::disk_format::inode::DirectoryLinkEncoding::Uncounted
+        } else {
+            crate::disk_format::inode::DirectoryLinkEncoding::Counted
+        }
     }
 
     /// Returns the allocation bitmap addressing domain.
     pub(crate) const fn allocation_bitmap_domain(self) -> AllocationBitmapDomain {
-        self.allocation_bitmap_domain
+        if self.declared.read_only_compatible.bits() & RO_COMPAT_BIGALLOC != 0 {
+            AllocationBitmapDomain::Clusters
+        } else {
+            AllocationBitmapDomain::Blocks
+        }
     }
 
     /// Returns the checksum seed source.
     pub(crate) const fn checksum_seed_source(self) -> ChecksumSeedSource {
-        self.checksum_seed_source
+        if self.declared.incompatible.bits() & INCOMPAT_CSUM_SEED != 0 {
+            ChecksumSeedSource::SuperblockField
+        } else if matches!(self.metadata_checksum(), MetadataChecksum::Crc32c) {
+            ChecksumSeedSource::FilesystemUuid
+        } else {
+            ChecksumSeedSource::Zero
+        }
     }
 
     /// Returns the public xattr mutation capability.
     pub(crate) const fn xattr_mutation(self) -> XattrMutationSupport {
-        self.xattr_mutation
+        if self.declared.compatible.bits() & COMPAT_EXT_ATTR != 0 {
+            XattrMutationSupport::Enabled
+        } else {
+            XattrMutationSupport::Disabled
+        }
+    }
+
+    /// Whether the filesystem declares that verity inodes may be stored.
+    pub(crate) const fn verity(self) -> bool {
+        self.declared.read_only_compatible.bits() & RO_COMPAT_VERITY != 0
+    }
+
+    /// Inode-body payload storage admitted for files and directories.
+    pub(crate) const fn inline_data(self) -> bool {
+        self.declared.incompatible.bits() & INCOMPAT_INLINE_DATA != 0
+    }
+
+    /// Separate value inodes may be referenced by attribute entries.
+    pub(crate) const fn attribute_values(self) -> bool {
+        self.declared.incompatible.bits() & INCOMPAT_EA_INODE != 0
+    }
+
+    /// File-size encoding supported by inode records.
+    pub(crate) const fn file_size_encoding(self) -> FileSizeEncoding {
+        if self.declared.read_only_compatible.bits() & RO_COMPAT_LARGE_FILE != 0 {
+            FileSizeEncoding::LargeFile
+        } else {
+            FileSizeEncoding::Legacy
+        }
+    }
+
+    /// Directory-size encoding selected by the incompatible large-directory feature.
+    pub(crate) const fn directory_size_encoding(self) -> DirectorySizeEncoding {
+        if self.declared.incompatible.bits() & INCOMPAT_LARGEDIR != 0 {
+            DirectorySizeEncoding::LargeDirectory
+        } else {
+            DirectorySizeEncoding::Standard
+        }
+    }
+
+    /// Inode block-count encoding supported by inode records.
+    pub(crate) const fn inode_block_count_encoding(self) -> InodeBlockCountEncoding {
+        if self.declared.read_only_compatible.bits() & RO_COMPAT_HUGE_FILE != 0 {
+            InodeBlockCountEncoding::HugeFile
+        } else {
+            InodeBlockCountEncoding::LegacySectors
+        }
     }
 
     /// Returns the inode timestamp encoding capability.
     pub(crate) const fn inode_timestamp_encoding(self) -> InodeTimestampEncoding {
-        self.inode_timestamp_encoding
+        if self.declared.read_only_compatible.bits() & RO_COMPAT_EXTRA_ISIZE != 0 {
+            InodeTimestampEncoding::ExtraFields
+        } else {
+            InodeTimestampEncoding::LegacySeconds
+        }
+    }
+
+    /// Returns the metadata checksum mode.
+    pub(crate) const fn metadata_checksum(self) -> MetadataChecksum {
+        if self.declared.read_only_compatible.bits() & RO_COMPAT_METADATA_CSUM != 0 {
+            MetadataChecksum::Crc32c
+        } else {
+            MetadataChecksum::None
+        }
+    }
+
+    /// Returns the active block group descriptor checksum mode.
+    pub(crate) const fn descriptor_checksum(self) -> BlockGroupDescriptorChecksum {
+        if matches!(self.metadata_checksum(), MetadataChecksum::Crc32c) {
+            BlockGroupDescriptorChecksum::MetadataCrc32c
+        } else if self.declared.read_only_compatible.bits() & RO_COMPAT_GDT_CSUM != 0 {
+            BlockGroupDescriptorChecksum::GdtCrc16
+        } else {
+            BlockGroupDescriptorChecksum::None
+        }
     }
 
     /// Returns the journal recovery state.
     pub(crate) const fn recovery_state(self) -> RecoveryState {
-        self.recovery_state
+        if self.declared.incompatible.bits() & INCOMPAT_RECOVER != 0 {
+            RecoveryState::NeedsRecovery
+        } else {
+            RecoveryState::Clean
+        }
+    }
+
+    /// Returns whether the filesystem advertises a journal.
+    pub(crate) const fn has_journal(self) -> bool {
+        self.declared.compatible.bits() & COMPAT_HAS_JOURNAL != 0
+    }
+
+    /// Returns whether the 64-bit descriptor feature is present.
+    pub(crate) const fn has_64bit(self) -> bool {
+        self.declared.incompatible.bits() & INCOMPAT_64BIT != 0
     }
 
     /// Returns whether the reserved online-resize metadata inode is present.
     pub(crate) const fn has_resize_inode(self) -> bool {
-        matches!(self.resize_inode, ResizeInodeFeature::Present)
+        self.declared.compatible.bits() & COMPAT_RESIZE_INODE != 0
     }
 }
 
@@ -1928,6 +2014,12 @@ impl Superblock {
         })
     }
 
+    /// Declared format features of this validated superblock, without granting mutation authority.
+    #[must_use]
+    pub const fn features(self) -> FilesystemFeatures {
+        self.features.declared
+    }
+
     /// Independent ownership placement selected by the primary superblock.
     pub(crate) const fn mmp(self) -> Option<super::mmp::MmpParameters> {
         self.mmp
@@ -2152,7 +2244,7 @@ impl Superblock {
     /// # Errors
     /// Returns [`Error::UnsupportedVerity`] when the filesystem lacks `RO_COMPAT_VERITY`.
     pub(crate) const fn require_verity(self) -> Result<()> {
-        if self.features.verity {
+        if self.features.verity() {
             Ok(())
         } else {
             Err(Error::UnsupportedVerity)
@@ -2163,7 +2255,7 @@ impl Superblock {
     pub(crate) const fn attribute_value_storage(
         self,
     ) -> crate::disk_format::xattr::AttributeValueStorage {
-        if self.features.attribute_values {
+        if self.features.attribute_values() {
             crate::disk_format::xattr::AttributeValueStorage::Inodes
         } else {
             crate::disk_format::xattr::AttributeValueStorage::LocalOnly
@@ -2171,20 +2263,20 @@ impl Superblock {
     }
     /// Whether new files may select inode-body storage without changing feature flags.
     pub(crate) const fn supports_inline_data(self) -> bool {
-        self.features.inline_data
+        self.features.inline_data()
     }
 
     /// Returns the single mounted encoding for inode size and allocation fields.
     #[must_use]
     pub(crate) const fn inode_data_encoding(self) -> InodeDataEncoding {
         InodeDataEncoding::new(
-            self.features.file_size_encoding,
-            self.features.directory_size_encoding,
-            self.features.inode_block_count_encoding,
+            self.features.file_size_encoding(),
+            self.features.directory_size_encoding(),
+            self.features.inode_block_count_encoding(),
             self.block_size,
-            self.features.directory_links,
-            self.features.inline_data,
-            self.features.attribute_values,
+            self.features.directory_links(),
+            self.features.inline_data(),
+            self.features.attribute_values(),
             self.casefold.is_some(),
         )
     }
@@ -2657,10 +2749,10 @@ mod tests {
         let Ok(standard) = standard else {
             return;
         };
-        assert_eq!(standard.directory_indexing, DirectoryIndexing::Standard);
-        assert_eq!(standard.directory_indexing.require_supported(), Ok(1));
+        assert_eq!(standard.directory_indexing(), DirectoryIndexing::Standard);
+        assert_eq!(standard.directory_indexing().require_supported(), Ok(1));
         assert_eq!(
-            standard.directory_size_encoding,
+            standard.directory_size_encoding(),
             DirectorySizeEncoding::Standard
         );
 
@@ -2673,10 +2765,13 @@ mod tests {
         let Ok(large) = large else {
             return;
         };
-        assert_eq!(large.directory_indexing, DirectoryIndexing::LargeDirectory);
-        assert_eq!(large.directory_indexing.require_supported(), Ok(2));
         assert_eq!(
-            large.directory_size_encoding,
+            large.directory_indexing(),
+            DirectoryIndexing::LargeDirectory
+        );
+        assert_eq!(large.directory_indexing().require_supported(), Ok(2));
+        assert_eq!(
+            large.directory_size_encoding(),
             DirectorySizeEncoding::LargeDirectory
         );
 
@@ -2686,13 +2781,13 @@ mod tests {
         let Ok(size_only) = size_only else {
             return;
         };
-        assert_eq!(size_only.directory_indexing, DirectoryIndexing::Disabled);
+        assert_eq!(size_only.directory_indexing(), DirectoryIndexing::Disabled);
         assert_eq!(
-            size_only.directory_indexing.require_supported(),
+            size_only.directory_indexing().require_supported(),
             Err(Error::UnsupportedDirectoryHash)
         );
         assert_eq!(
-            size_only.directory_size_encoding,
+            size_only.directory_size_encoding(),
             DirectorySizeEncoding::LargeDirectory
         );
     }

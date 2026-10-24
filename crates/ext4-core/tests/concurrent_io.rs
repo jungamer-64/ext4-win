@@ -14,6 +14,35 @@ mod mmp;
 mod trim;
 
 /// # Errors
+/// Propagates fixture mount or truncated independent superblock-vector failure.
+/// # Panics
+/// Fails if a committed feature observation loses a declared mask or changes its on-disk domain.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare independently decoded on-disk flags against the mounted observation"
+)]
+fn committed_feature_observation_matches_independent_superblock_fields() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let features = fixture.epoch.features();
+    for (offset, actual) in [
+        (1116, features.compatible.bits()),
+        (1120, features.incompatible.bits()),
+        (1124, features.read_only_compatible.bits()),
+    ] {
+        let encoded: [u8; 4] = fixture
+            .disk
+            .filesystem
+            .get(offset..offset + 4)
+            .ok_or(Error::DeviceRange)?
+            .try_into()
+            .map_err(|_| Error::DeviceRange)?;
+        assert_eq!(actual, u32::from_le_bytes(encoded));
+    }
+    Ok(())
+}
+
+/// # Errors
 /// Propagates fixture, context and provisional pass construction failures.
 /// # Panics
 /// Fails if read-only, foreign or revoked sessions can seal ordinary mutation staging.

@@ -34,8 +34,9 @@ pub use disk_format::inode::{
 };
 pub use disk_format::name::{DirectoryCasefold, Ext4Name};
 pub use disk_format::superblock::{
-    ClusterCount, ClusterSize, Ext4VolumeLabel, ExtVolumeSignature, FilesystemUuid,
-    FreeClusterCount, JournalUuid,
+    ClusterCount, ClusterSize, CompatibleFeatures, Ext4VolumeLabel, ExtVolumeSignature,
+    FilesystemFeature, FilesystemFeatures, FilesystemUuid, FreeClusterCount, IncompatibleFeatures,
+    JournalUuid, ReadOnlyCompatibleFeatures,
 };
 pub use disk_format::xattr::{XattrName, XattrNamespace, XattrSet, XattrValue};
 pub use error::{Error, Result};

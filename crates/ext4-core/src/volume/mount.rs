@@ -508,6 +508,11 @@ pub struct CommittedEpoch {
 }
 
 impl CommittedEpoch {
+    /// Declared format of this committed view, including recovered metadata on read-only mounts.
+    #[must_use]
+    pub const fn features(&self) -> crate::FilesystemFeatures {
+        self.superblock.features()
+    }
     /// Rejects media mutation independently of mount-local key publication.
     /// # Errors
     /// Returns write protection for sessions admitted without media authority.

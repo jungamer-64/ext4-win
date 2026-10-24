@@ -802,6 +802,9 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::QueryVolumeIdentity => {
                         Admission::Immediate(ImmediateRequestKind::QueryVolumeIdentity)
                     }
+                    crate::irp::FsControlCode::QueryFeatures => {
+                        Admission::Immediate(ImmediateRequestKind::QueryFeatures)
+                    }
                     crate::irp::FsControlCode::QueryDirectoryCasefold => {
                         Admission::Read(ReadRequestKind::QueryDirectoryCasefold)
                     }

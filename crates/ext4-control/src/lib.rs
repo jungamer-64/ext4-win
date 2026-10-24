@@ -18,6 +18,77 @@ pub const TRIM_VOLUME_FSCTL: u32 = 0x0009_a420;
 /// Complete progress observation, including a stopped or uncertain physical batch.
 pub const TRIM_REPLY_BYTES: usize = 64;
 
+/// Buffered observation of declared ext4 features through a mounted filesystem handle.
+pub const QUERY_FEATURES_FSCTL: u32 = 0x0009_2424;
+/// Complete declared-feature observation; no native structure layout crosses the boundary.
+pub const FEATURES_REPLY_BYTES: usize = 48;
+
+/// Format declarations and admitted session access do not grant current mutation permission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FeaturesState {
+    /// Filesystem UUID in ext4 byte order.
+    pub uuid: FilesystemUuid,
+    /// Media access fixed before recovery, independent of later reliability or ownership loss.
+    pub admitted_access: AccessMode,
+    /// Complete on-disk masks from one committed metadata view.
+    pub declared: ext4_core::FilesystemFeatures,
+}
+impl FeaturesState {
+    /// Produces a fixed-size observation with reserved bytes initialized to zero.
+    pub fn encode(self) -> [u8; FEATURES_REPLY_BYTES] {
+        let mut bytes = [0; FEATURES_REPLY_BYTES];
+        let access: u32 = match self.admitted_access {
+            AccessMode::ReadWrite => 0,
+            AccessMode::ReadOnly => 1,
+        };
+        let fields = b"E4VF\x01\0\0\0"
+            .iter()
+            .copied()
+            .chain(self.uuid.bytes())
+            .chain(access.to_le_bytes())
+            .chain(self.declared.compatible.bits().to_le_bytes())
+            .chain(self.declared.incompatible.bits().to_le_bytes())
+            .chain(self.declared.read_only_compatible.bits().to_le_bytes());
+        for (destination, source) in bytes.iter_mut().zip(fields) {
+            *destination = source;
+        }
+        bytes
+    }
+    /// Preserves unknown feature bits as observations without using them for mount admission.
+    /// # Errors
+    /// Rejects malformed length, unsupported protocol version, access tags and reserved fields.
+    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() != FEATURES_REPLY_BYTES
+            || bytes.get(..8) != Some(b"E4VF\x01\0\0\0")
+            || bytes
+                .get(40..)
+                .is_none_or(|reserved| reserved.iter().any(|byte| *byte != 0))
+        {
+            return Err(Error::MalformedEncoding);
+        }
+        let admitted_access = match u32::from_le_bytes(field(bytes, 24)?) {
+            0 => AccessMode::ReadWrite,
+            1 => AccessMode::ReadOnly,
+            _ => return Err(Error::MalformedEncoding),
+        };
+        Ok(Self {
+            uuid: FilesystemUuid::from_bytes(field(bytes, 8)?),
+            admitted_access,
+            declared: ext4_core::FilesystemFeatures {
+                compatible: ext4_core::CompatibleFeatures::from_bits(u32::from_le_bytes(field(
+                    bytes, 28,
+                )?)),
+                incompatible: ext4_core::IncompatibleFeatures::from_bits(u32::from_le_bytes(
+                    field(bytes, 32)?,
+                )),
+                read_only_compatible: ext4_core::ReadOnlyCompatibleFeatures::from_bits(
+                    u32::from_le_bytes(field(bytes, 36)?),
+                ),
+            },
+        })
+    }
+}
+
 /// Terminal reason is separate from acknowledged or uncertain physical byte counts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TrimOutcome {
@@ -391,6 +462,53 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Error> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Panics
+    /// Fails if equal bit numbers cross mask domains, unknown declarations disappear, or invalid
+    /// protocol headers, access tags or reserved bytes become authoritative observations.
+    #[test]
+    fn declared_features_have_independent_wire_domains() {
+        let vector = [
+            b'E', b'4', b'V', b'F', 1, 0, 0, 0, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 1,
+            0, 0, 0, 0, 4, 0, 128, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let state = FeaturesState {
+            uuid: FilesystemUuid::from_bytes([7; 16]),
+            admitted_access: AccessMode::ReadOnly,
+            declared: ext4_core::FilesystemFeatures {
+                compatible: ext4_core::CompatibleFeatures::from_bits(0x8000_0400),
+                incompatible: ext4_core::IncompatibleFeatures::from_bits(0x0400),
+                read_only_compatible: ext4_core::ReadOnlyCompatibleFeatures::from_bits(0x0400),
+            },
+        };
+        assert_eq!(state.encode(), vector);
+        assert_eq!(FeaturesState::decode(&vector), Ok(state));
+        for feature in [
+            ext4_core::FilesystemFeature::FastCommit,
+            ext4_core::FilesystemFeature::AttributeValueInodes,
+            ext4_core::FilesystemFeature::MetadataChecksums,
+        ] {
+            assert!(state.declared.contains(feature));
+        }
+        assert!(
+            !state
+                .declared
+                .contains(ext4_core::FilesystemFeature::Casefold)
+        );
+        for offset in [0, 4, 24, 40] {
+            let mut invalid = vector;
+            if let Some(value) = invalid.get_mut(offset) {
+                *value = 9;
+            }
+            assert_eq!(
+                FeaturesState::decode(&invalid),
+                Err(Error::MalformedEncoding)
+            );
+        }
+        assert_eq!(
+            FeaturesState::decode(&vector[..47]),
+            Err(Error::MalformedEncoding)
+        );
+    }
     /// # Panics
     /// Fails if physical progress is encoded inconsistently or impossible success is admitted.
     #[test]

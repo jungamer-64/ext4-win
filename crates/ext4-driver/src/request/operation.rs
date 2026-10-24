@@ -1815,6 +1815,8 @@ pub(crate) enum ImmediateRequestKind {
     AdvanceValidDataLength,
     /// Mounted ext4 UUID independent of a Windows volume path.
     QueryVolumeIdentity,
+    /// Declared format bits and immutable session media policy from one committed view.
+    QueryFeatures,
     /// Fscrypt key-status query from the committed epoch snapshot.
     GetEncryptionKeyStatus,
 }
@@ -1893,6 +1895,41 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
                         ))
                     })
                 }
+                ImmediateRequestKind::QueryFeatures => (|| {
+                    crate::request::file_system_control::authorize_path_handle(
+                        &mut owned.request(),
+                        access,
+                    )?;
+                    let epoch = access.acquire_epoch()?;
+                    let bytes = ext4_control::FeaturesState {
+                        uuid: epoch.epoch().identity().uuid(),
+                        admitted_access: match access.mounted_profile().access() {
+                            ext4_core::MediaAccess::ReadWrite => {
+                                ext4_control::AccessMode::ReadWrite
+                            }
+                            ext4_core::MediaAccess::ReadOnly => ext4_control::AccessMode::ReadOnly,
+                        },
+                        declared: epoch.epoch().features(),
+                    }
+                    .encode();
+                    owned.request().with_active(|active| {
+                        let control = active.current_stack()?.file_system_control()?;
+                        if !control.input_buffer_length().is_empty() {
+                            return Err(DriverError::InvalidParameter);
+                        }
+                        let output = active.buffered_output(
+                            control
+                                .output_buffer_length()
+                                .prefix(ext4_control::FEATURES_REPLY_BYTES)?,
+                        )?;
+                        memory::copy_exact(output, &bytes)?;
+                        Ok(IrpCompletion::with_information(
+                            crate::irp::InformationLength::from_usize(
+                                ext4_control::FEATURES_REPLY_BYTES,
+                            )?,
+                        ))
+                    })
+                })(),
                 ImmediateRequestKind::GetEncryptionKeyStatus => (|| {
                     let mut request = owned.request();
                     crate::request::file_system_control::authorize_path_handle(
