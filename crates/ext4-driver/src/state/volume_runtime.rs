@@ -1,5 +1,8 @@
 //! Mounted profile, bounded epoch leases, mutation coordination, and volume failure state.
 
+mod mmp;
+use mmp::MediaOwnership;
+
 use core::fmt;
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -26,8 +29,6 @@ pub(crate) enum VolumeFailureState {
     DegradedReadOnly,
     /// Journal replay or durability is unknown and this runtime must be torn down.
     RecoveryRequired,
-    /// Media ownership was revoked; only a fresh acquisition and replay may establish a session.
-    MediaOwnershipLost,
     /// Ext4 commit is durable but its Windows stream projection could not be published.
     CommittedButUnpublished {
         /// Exact Cc/MM status returned to the committing IRP and later operations.
@@ -281,7 +282,7 @@ pub(crate) struct VolumeRuntime {
     /// Journal cursor, allocation state, and resource versions.
     coordinator: MutationCoordinatorState,
     /// Physical media ownership retained independently of journal state.
-    mmp: Option<ext4_core::MmpLease>,
+    ownership: MediaOwnership,
     /// Validated lower-device geometry and completion owner.
     storage: MountedStorage,
     /// Mount admission owner for independently retained CNG algorithm providers.
@@ -323,7 +324,7 @@ impl VolumeRuntime {
             profile,
             epochs: EpochRegistry::try_new(epoch)?,
             coordinator,
-            mmp,
+            ownership: MediaOwnership::from_mount(mmp),
             storage,
             crypto,
             failure: VolumeFailureState::Operational,

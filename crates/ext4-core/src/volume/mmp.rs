@@ -111,6 +111,10 @@ impl MmpDeadline {
     pub const fn monotonic_millis(self) -> u64 {
         self.monotonic_millis
     }
+    /// Converts an absolute observation to a nonnegative timer delay in the same clock domain.
+    pub const fn remaining_millis(self, now: MmpTime) -> u64 {
+        self.monotonic_millis.saturating_sub(now.monotonic_millis)
+    }
 }
 
 /// Sole authority obtained after a durable ownership claim and an independent delayed readback.
@@ -132,10 +136,6 @@ impl MmpLease {
         }
     }
 
-    /// Maximum interval before the host must drive another ownership check.
-    pub fn update_seconds(&self) -> u16 {
-        self.parameters.heartbeat_seconds()
-    }
     /// Checks freshness before admitting a media mutation or publishing its result.
     /// # Errors
     /// Returns ownership loss at or after the monotonic deadline; wall-clock changes do not extend it.
@@ -145,12 +145,15 @@ impl MmpLease {
         }
         Ok(())
     }
-    /// Schedules renewal early enough to include write, flush and independent read latency.
-    pub(crate) fn renewal_due(&self, now: MmpTime) -> bool {
+    /// Next renewal start, leaving independent read, write and flush latency inside the lease.
+    pub fn next_update(&self) -> MmpDeadline {
         let window = u64::from(self.parameters.check_seconds()).saturating_mul(1000);
         let since = self.valid_until_millis.saturating_sub(window);
-        now.monotonic_millis
-            >= since.saturating_add(u64::from(self.update_seconds()).saturating_mul(1000))
+        MmpDeadline { monotonic_millis: since.saturating_add(u64::from(self.parameters.heartbeat_seconds()).saturating_mul(1000)) }
+    }
+    /// Schedules renewal early enough to include write, flush and independent read latency.
+    pub(crate) fn renewal_due(&self, now: MmpTime) -> bool {
+        self.next_update().remaining_millis(now) == 0
     }
     /// Transfers record-update authority while retaining only the previous acknowledged I/O window.
     /// # Errors
