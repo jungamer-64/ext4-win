@@ -968,16 +968,16 @@ impl<O> LowerBuildError<O> {
     }
 }
 
-/// Completion-registration failure that preserves the suspended operation.
+/// Unsubmitted admission or completion-registration failure retaining the suspended operation.
 #[derive(Debug)]
-pub struct LowerRegistrationError<O> {
+pub struct LowerSubmissionError<O> {
     /// Driver-domain registration error.
     error: DriverError,
     /// Operation that was never submitted to a lower driver.
     suspended: O,
 }
 
-impl<O> LowerRegistrationError<O> {
+impl<O> LowerSubmissionError<O> {
     /// Separates the normal error from the still-owned suspended operation.
     pub fn into_parts(self) -> (DriverError, O) {
         (self.error, self.suspended)
@@ -1129,13 +1129,18 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     /// Registers and immediately submits the private IRP.
     /// # Errors
     ///
-    /// Registration failure is the sole error after construction; the pre-submit builder then
-    /// releases the IRP, MDL, envelope, payload, and rundown lease locally.
+    /// Admission is checked after every allocation and retained through IoCallDriver's return.
+    /// Admission or registration failure releases the IRP, MDL and envelope locally and returns the
+    /// still-owned operation. No request has reached a lower driver on either failure.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub fn register_and_submit(self) -> Result<(), LowerRegistrationError<O>> {
+    pub fn register_and_submit<P>(self, authorize: impl FnOnce() -> Result<P, DriverError>) -> Result<(), LowerSubmissionError<O>> {
+        let _submission = match authorize() {
+            Ok(permit) => permit,
+            Err(error) => return Err(self.reject_unsubmitted(error)),
+        };
         let envelope = self.envelope.address();
         let status = unsafe {
             // SAFETY: The envelope is nonpaged and address-stable, and every callback outcome is
@@ -1152,17 +1157,7 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
             )
         };
         if status < wdk_sys::STATUS_SUCCESS {
-            let Self {
-                completion_owner: _,
-                target: _,
-                irp,
-                envelope,
-            } = self;
-            drop(irp);
-            return Err(LowerRegistrationError {
-                error: DriverError::from(Error::DeviceIo),
-                suspended: LowerCompletionEnvelope::reclaim_unsubmitted(envelope),
-            });
+            return Err(self.reject_unsubmitted(DriverError::from(Error::DeviceIo)));
         }
 
         // From this point the release authority moves irreversibly into the completion envelope.
@@ -1173,6 +1168,13 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
         };
         registered.call_driver();
         Ok(())
+    }
+
+    /// Retires an unsubmitted private IRP while preserving the caller's unique completion owner.
+    fn reject_unsubmitted(self, error: DriverError) -> LowerSubmissionError<O> {
+        let Self { completion_owner: _, target: _, irp, envelope } = self;
+        drop(irp);
+        LowerSubmissionError { error, suspended: LowerCompletionEnvelope::reclaim_unsubmitted(envelope) }
     }
 
     /// Irreversibly transfers envelope and IRP release ownership to completion.
@@ -1506,7 +1508,7 @@ mod tests {
         IOCTL_DISK_GET_LENGTH_INFO, LOWER_CANCEL_CALLING, LOWER_COMPLETED_DURING_CANCEL,
         LOWER_COMPLETED_QUEUED, LOWER_DEFERRED_QUEUED, LOWER_SUBMITTED, LowerBuildError,
         LowerCompletionClaim, LowerCompletionEnvelope, LowerCompletionRoute, LowerOperation,
-        LowerRegistrationError, LowerTransferMethod, PublishedLowerRequest,
+        LowerSubmissionError, LowerTransferMethod, PublishedLowerRequest,
         STATUS_MORE_PROCESSING_REQUIRED, claim_completion_during_cancel, claim_lower_completion,
     };
 
@@ -1831,7 +1833,7 @@ mod tests {
 
         let build = LowerBuildError::from_unsubmitted(DriverError::InvalidParameter, 42_u64);
         assert_eq!(build.into_parts(), (DriverError::InvalidParameter, 42));
-        let registration = LowerRegistrationError {
+        let registration = LowerSubmissionError {
             error: DriverError::InsufficientResources,
             suspended: 43_u64,
         };

@@ -97,8 +97,14 @@ impl IoReliabilityOwner {
     }
 
     /// Publishes immediately with the actor's failure transition, without allocation.
-    pub(crate) fn publish(&mut self, policy: NativeIoPolicy, deadline: Option<ext4_core::MmpDeadline>) {
-        self.policy.get().store(NativeIoSnapshot::new(policy, deadline).0, Ordering::Release);
+    pub(crate) fn publish(
+        &mut self,
+        policy: NativeIoPolicy,
+        deadline: Option<ext4_core::MmpDeadline>,
+    ) {
+        self.policy
+            .get()
+            .store(NativeIoSnapshot::new(policy, deadline).0, Ordering::Release);
     }
 }
 
@@ -114,5 +120,49 @@ impl IoReliabilityObservation {
     pub(crate) fn policy(&self) -> NativeIoPolicy {
         NativeIoSnapshot(self.policy.get().load(Ordering::Acquire))
             .policy(crate::kernel::time::monotonic_millis)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails if native reads or writes can outlive a deadline without another actor publication.
+    #[test]
+    fn native_permissions_expire_at_the_observed_monotonic_boundary() {
+        // Independent packed values: absolute 1000 ms deadline and the native policy's low bits.
+        for (word, admitted) in [
+            (4000, NativeIoPolicy::ReadWrite),
+            (4001, NativeIoPolicy::ReadOnly),
+        ] {
+            let snapshot = NativeIoSnapshot(word);
+            assert_eq!(snapshot.policy(|| 0), admitted);
+            assert_eq!(snapshot.policy(|| 999), admitted);
+            assert_eq!(snapshot.policy(|| 1000), NativeIoPolicy::Unavailable);
+            assert_eq!(snapshot.policy(|| u64::MAX), NativeIoPolicy::Unavailable);
+        }
+        for word in [2, 3, 4002, 4003] {
+            let queried = core::cell::Cell::new(false);
+            assert_eq!(
+                NativeIoSnapshot(word).policy(|| { queried.set(true); u64::MAX }),
+                NativeIoPolicy::Unavailable
+            );
+            assert!(!queried.get());
+        }
+        for policy in [
+            NativeIoPolicy::ReadWrite,
+            NativeIoPolicy::ReadOnly,
+            NativeIoPolicy::Unavailable,
+        ] {
+            let snapshot = NativeIoSnapshot::new(policy, None);
+            let queried = core::cell::Cell::new(false);
+            assert_eq!(snapshot.0, u64::from(policy.raw()));
+            assert_eq!(
+                snapshot.policy(|| { queried.set(true); u64::MAX }),
+                policy
+            );
+            assert!(!queried.get());
+        }
     }
 }

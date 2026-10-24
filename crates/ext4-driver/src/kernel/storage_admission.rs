@@ -297,10 +297,10 @@ mod tests {
         let mut owner = IoReliabilityOwner::try_new()?;
         let state = StorageAdmission::new(owner.observe()?);
         assert!(state.reliability.policy().permits(true));
-        owner.publish(NativeIoPolicy::ReadOnly);
+        owner.publish(NativeIoPolicy::ReadOnly, None);
         assert!(state.reliability.policy().permits(false));
         assert!(!state.reliability.policy().permits(true));
-        owner.publish(NativeIoPolicy::Unavailable);
+        owner.publish(NativeIoPolicy::Unavailable, None);
         assert!(!state.reliability.policy().permits(false));
         assert!(!state.reliability.policy().permits(true));
         Ok(())

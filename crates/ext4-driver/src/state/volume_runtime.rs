@@ -308,10 +308,13 @@ impl VolumeRuntime {
         let (profile, epoch, coordinator, mmp) = mount.into_parts();
         let identity = catalog.binding(epoch.identity().uuid())?;
         let mut native_reliability = IoReliabilityOwner::try_new()?;
-        native_reliability.publish(match profile.access() {
-            ext4_core::MediaAccess::ReadWrite => NativeIoPolicy::ReadWrite,
-            ext4_core::MediaAccess::ReadOnly => NativeIoPolicy::ReadOnly,
-        });
+        native_reliability.publish(
+            match profile.access() {
+                ext4_core::MediaAccess::ReadWrite => NativeIoPolicy::ReadWrite,
+                ext4_core::MediaAccess::ReadOnly => NativeIoPolicy::ReadOnly,
+            },
+            mmp.as_ref().map(ext4_core::MmpLease::deadline),
+        );
         let crypto = CngProvider::try_open()?;
         let metadata_cache = ext4_core::MetadataCache::try_new(&epoch).unwrap_or_default();
         Ok(Self {
@@ -359,7 +362,8 @@ impl VolumeRuntime {
             }
             (policy, _) => policy,
         };
-        self.native_reliability.publish(policy);
+        self.native_reliability
+            .publish(policy, self.mmp.as_ref().map(ext4_core::MmpLease::deadline));
         self.failure = failure;
     }
 
@@ -540,7 +544,7 @@ impl VolumeRuntime {
         visibility: VisibilityLease,
         slot: EpochPublicationSlot,
     ) -> DriverResult<()> {
-        self.require_publication_ownership()?;
+        self.require_media_ownership()?;
         let epoch = match change.publish(visibility, &mut self.coordinator) {
             Ok(epoch) => epoch,
             Err((error, _change)) => return Err(self.reject_publication(error).into()),
@@ -600,7 +604,7 @@ impl VolumeRuntime {
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
     ) -> ext4_core::Result<PendingCheckpoint> {
-        self.require_publication_ownership()?;
+        self.require_media_ownership()?;
         let published: PublishedMutation =
             match mutation.publish(visibility, self.coordinator_mut()) {
                 Ok(published) => published,
@@ -625,7 +629,7 @@ impl VolumeRuntime {
         durability: CheckpointPublication,
         publication: EpochPublicationSlot,
     ) -> DriverResult<()> {
-        self.require_publication_ownership()?;
+        self.require_media_ownership()?;
         let checkpointed = match durability.publish(self.coordinator_mut()) {
             Ok(epoch) => epoch,
             Err((error, _durability)) => return Err(self.reject_publication(error).into()),
@@ -643,20 +647,24 @@ impl VolumeRuntime {
         self.set_failure(VolumeFailureState::MediaOwnershipLost);
     }
 
-    /// Checks freshness at the consuming publication boundary, including already issued grants.
+    /// Observes expiration before entering a mounted actor callback, including cache-only work.
+    /// Native callbacks independently apply the same published deadline while the actor sleeps.
+    pub(crate) fn observe_media_ownership(&mut self) {
+        if let Some(lease) = &self.mmp {
+            let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
+            if lease.authorize(now).is_err() {
+                self.revoke_media_ownership();
+            }
+        }
+    }
+
+    /// Revalidates already issued grants at publication and immediately before lower submission.
     /// # Errors
-    /// A stale or unverifiable clock revokes the session; later completions cannot restore it.
-    fn require_publication_ownership(&mut self) -> ext4_core::Result<()> {
+    /// An expired lease revokes this session; later completions cannot restore it.
+    pub(crate) fn require_media_ownership(&mut self) -> ext4_core::Result<()> {
+        self.observe_media_ownership();
         if self.failure == VolumeFailureState::MediaOwnershipLost {
             return Err(ext4_core::Error::MmpOwnershipLost);
-        }
-        if let Some(lease) = &self.mmp {
-            let valid =
-                crate::kernel::time::mmp_time().is_ok_and(|now| lease.authorize(now).is_ok());
-            if !valid {
-                self.revoke_media_ownership();
-                return Err(ext4_core::Error::MmpOwnershipLost);
-            }
         }
         Ok(())
     }

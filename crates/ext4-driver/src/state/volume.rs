@@ -595,6 +595,7 @@ impl MountedVolumeBinding {
         &mut self,
         transition: impl FnOnce(&mut MountedVolumeAccess<'_>) -> R,
     ) -> R {
+        self.actor.runtime.observe_media_ownership();
         transition(&mut MountedVolumeAccess {
             volume: self.volume.as_ref().get_ref(),
             volume_control: &mut self.actor.volume_control,
@@ -712,11 +713,12 @@ impl MountedVolumeAccess<'_> {
     /// Retains one same-thread lower-submission permit through IoCallDriver's return.
     /// # Errors
     ///
-    /// Returns device removed once PnP has closed native submission admission.
+    /// Returns revoked MMP ownership or device removal before another lower transfer can start.
     #[cfg(not(test))]
     pub(crate) fn acquire_storage_submission(
-        &self,
+        &mut self,
     ) -> DriverResult<crate::kernel::stream::StorageSubmissionLease> {
+        self.runtime.require_media_ownership()?;
         self.storage_access().acquire_submission()
     }
 

@@ -108,7 +108,9 @@ pub struct MmpDeadline {
 impl MmpDeadline {
     /// Converts the observation for host timers and atomic native-I/O projections.
     /// The host must also apply independent session revocation; this number cannot restore a lease.
-    pub const fn monotonic_millis(self) -> u64 { self.monotonic_millis }
+    pub const fn monotonic_millis(self) -> u64 {
+        self.monotonic_millis
+    }
 }
 
 /// Sole authority obtained after a durable ownership claim and an independent delayed readback.
@@ -125,7 +127,9 @@ pub struct MmpLease {
 impl MmpLease {
     /// Observes the acknowledged deadline without granting another ownership operation.
     pub const fn deadline(&self) -> MmpDeadline {
-        MmpDeadline { monotonic_millis: self.valid_until_millis }
+        MmpDeadline {
+            monotonic_millis: self.valid_until_millis,
+        }
     }
 
     /// Maximum interval before the host must drive another ownership check.
@@ -200,7 +204,9 @@ pub struct MmpRenewingLease {
 impl MmpRenewingLease {
     /// Observes the acknowledged deadline without granting another ownership operation.
     pub const fn deadline(&self) -> MmpDeadline {
-        MmpDeadline { monotonic_millis: self.valid_until_millis }
+        MmpDeadline {
+            monotonic_millis: self.valid_until_millis,
+        }
     }
 
     /// Admits I/O only within the previous acknowledgement, including time spent awaiting completion.
