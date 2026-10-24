@@ -314,6 +314,12 @@ impl MountRequestOperation {
                     Ok(policy) => policy,
                     Err(error) => return Self::complete(owned, Err(error)),
                 };
+                if policy.policy.mount_access().media_access() == ext4_core::MediaAccess::ReadWrite
+                    && let Some(block_size) = prepared.ownership_block_size()
+                    && let Err(error) = devices.route().require_ownership_blocks(block_size)
+                {
+                    return Self::complete(owned, Err(error));
+                }
                 let now = match crate::kernel::time::mmp_time() {
                     Ok(now) => now,
                     Err(error) => return Self::complete(owned, Err(error)),

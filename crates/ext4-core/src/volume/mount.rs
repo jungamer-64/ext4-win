@@ -1821,6 +1821,14 @@ impl ProbedMount {
     pub const fn uuid(&self) -> FilesystemUuid {
         self.uuid
     }
+    /// Declared ownership-write granularity, observed before the host permits a physical claim.
+    /// A host can reject incompatible lower-sector geometry without granting media-write authority.
+    pub const fn ownership_block_size(&self) -> Option<BlockSize> {
+        match self.mmp {
+            Some(parameters) => Some(parameters.bytes),
+            None => None,
+        }
+    }
     /// Consumes primary admission and fixes media authority for the entire mounted session.
     /// # Errors
     /// Rejects ownership placement or allocation before recovery can write storage.

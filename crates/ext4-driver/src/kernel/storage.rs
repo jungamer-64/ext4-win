@@ -321,6 +321,23 @@ impl MountedStorageRoute {
         }
     }
 
+    /// Ownership-record updates run independently of journal writes. A record's filesystem block
+    /// must cover whole lower logical sectors so read-modify-write cannot overwrite a neighbor.
+    /// # Errors
+    /// Returns unsupported storage before a claim when ownership blocks split a lower sector.
+    pub(crate) fn require_ownership_blocks(
+        self,
+        block_size: ext4_core::BlockSize,
+    ) -> DriverResult<()> {
+        if !block_size
+            .bytes()
+            .is_multiple_of(self.filesystem.sector_size.as_u32())
+        {
+            return Err(DriverError::NotSupported);
+        }
+        Ok(())
+    }
+
     /// Returns the mounted partition target for volume DeviceControl delegation.
     pub(crate) const fn filesystem_control_device(self) -> KernelDevice {
         self.filesystem.device
@@ -1350,6 +1367,38 @@ mod tests {
             _lower: lower,
             devices: MountedStorageRoute::new(completion_owner, filesystem, None),
         })
+    }
+
+    /// # Panics
+    /// Fails if independent record updates can read-modify-write another filesystem block.
+    /// # Errors
+    /// Returns fixture allocation or invalid constant block/sector geometry.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions check independent I/O admission while fixture construction propagates errors"
+    )]
+    fn ownership_admission_requires_whole_logical_sectors() -> Result<(), DriverError> {
+        let mut fixture = storage_fixture().ok_or(DriverError::InsufficientResources)?;
+        for (sector, block_log, admitted) in [(512, 0, true), (4096, 0, false), (4096, 2, true)] {
+            fixture._lower.SectorSize = sector;
+            let filesystem = LowerStorageDevice::from_device(
+                fixture.devices.filesystem.device,
+                DeviceLength::from_bytes(4096),
+            )?;
+            let route =
+                MountedStorageRoute::new(fixture.devices.completion_owner, filesystem, None);
+            let width = ext4_core::BlockSize::from_superblock_log(block_log)?;
+            assert_eq!(
+                route.require_ownership_blocks(width),
+                if admitted {
+                    Ok(())
+                } else {
+                    Err(DriverError::NotSupported)
+                }
+            );
+        }
+        Ok(())
     }
 
     fn failed_command(
