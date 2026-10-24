@@ -16,7 +16,7 @@ use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
     CLOSE_HANDLE_BARRIER, CompletionEvent, CompletionOperation, ControlDeviceOperation,
-    InfalliblePublication, IntentRequest, MountedVolumeOperation, OperationTransition,
+    PreparedPublication, IntentRequest, MountedVolumeOperation, OperationTransition,
     PublicationAuthority, ReactorTarget, WaitCondition,
 };
 use crate::irp::{
@@ -6189,7 +6189,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
     }
 }
 
-impl InfalliblePublication for MutationRequestOperation {
+impl PreparedPublication for MutationRequestOperation {
     fn authority(&self) -> PublicationAuthority {
         match &self.state {
             MutationOperationState::PublishingDurable { .. } => PublicationAuthority::Mutation {

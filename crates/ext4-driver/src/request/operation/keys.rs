@@ -333,7 +333,7 @@ impl MountedVolumeOperation for KeyRequestOperation {
     }
 }
 
-impl InfalliblePublication for KeyRequestOperation {
+impl PreparedPublication for KeyRequestOperation {
     fn authority(&self) -> PublicationAuthority {
         PublicationAuthority::Mutation {
             ticket: self.ticket,

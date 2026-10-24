@@ -441,22 +441,29 @@ pub(crate) enum PublicationAuthority {
 }
 
 /// Prebuilt publication that reuses its existing operation allocation.
-pub(crate) trait InfalliblePublication: CompletionOperation {
+pub(crate) trait PreparedPublication: CompletionOperation {
     /// Scheduler authority consumed by this publication.
     fn authority(&self) -> PublicationAuthority;
 
-    /// Publishes prepared values and returns the same box in its next operation phase.
-    ///
-    /// A mutation publication also transfers its prepared top-level acknowledgment; checkpoint
-    /// publication has none. The caller must end the mounted-volume borrow and release the
-    /// top-level handle lane before notifying upper drivers, while retaining checkpoint work.
-    fn publish(
-        self: Box<Self>,
-        access: &mut MountedVolumeAccess<'_>,
-    ) -> (
-        Box<dyn CompletionOperation>,
-        Option<super::PreparedIrpCompletion>,
-    );
+    /// Applies the allocation-free publication while revalidating revocable session authority.
+    /// Successful mutation publication returns its acknowledgment and detached checkpoint owner.
+    /// Rejection retains native cleanup and handle-lane ownership in the next transition; upper
+    /// completion may be notified only after that transition finishes.
+    fn publish(self: Box<Self>, access: &mut MountedVolumeAccess<'_>) -> PublicationOutcome;
+}
+
+/// Publication and acknowledgment remain distinct when media ownership can be revoked.
+#[derive(Debug)]
+pub(crate) enum PublicationOutcome {
+    /// The prepared epoch and native projection were applied in this actor turn.
+    Published {
+        /// Same operation allocation, retaining any detached checkpoint work.
+        operation: Box<dyn CompletionOperation>,
+        /// Prepared upper acknowledgment, delivered after releasing the mounted borrow and lane.
+        completion: Option<super::PreparedIrpCompletion>,
+    },
+    /// No epoch or native effect was published; mandatory cleanup owns the continuation.
+    Rejected(OperationTransition),
 }
 
 /// One consuming action emitted by an event-driven operation.
@@ -564,7 +571,7 @@ pub(crate) enum OperationTransition {
     /// Apply a prebuilt allocation-free publication and continue one operation.
     Publish {
         /// Publication values and continuation prepared before visibility is granted.
-        publication: Box<dyn InfalliblePublication>,
+        publication: Box<dyn PreparedPublication>,
     },
     /// Release operation authority before notifying upper drivers of the prepared result.
     Complete(super::lifecycle::PreparedIrpCompletion),
@@ -5109,7 +5116,7 @@ mod tests {
 
     use super::{
         AdmittedOperation, CompletionEvent, CompletionOperation, CompletionReactor,
-        DelayedCloseTimerState, ExecutionClass, HandleOperationLane, InfalliblePublication,
+        DelayedCloseTimerState, ExecutionClass, HandleOperationLane, PreparedPublication,
         MAX_OPERATIONS, OperationAdmission, OperationTransition, PendingIrpSelection,
         PublicationAuthority, SlotPayload, SuspendedOperation, driver_error_to_core,
         initialize_list_head, insert_tail_list, list_is_empty, remove_head_list, slot_bit,
@@ -5325,7 +5332,7 @@ mod tests {
     }
 
     fn publish_prebuilt_value(
-        publication: alloc::boxed::Box<dyn InfalliblePublication>,
+        publication: alloc::boxed::Box<dyn PreparedPublication>,
         access: &mut crate::state::MountedVolumeAccess<'_>,
     ) -> (PublicationAuthority, SuspendedOperation) {
         let authority = publication.authority();
@@ -5504,7 +5511,7 @@ mod tests {
             CompletionEvent,
         ) -> OperationTransition = advance_concrete_event;
         let _publish: fn(
-            alloc::boxed::Box<dyn InfalliblePublication>,
+            alloc::boxed::Box<dyn PreparedPublication>,
             &mut crate::state::MountedVolumeAccess<'_>,
         ) -> (PublicationAuthority, SuspendedOperation) = publish_prebuilt_value;
         let _consume: fn(OperationTransition) = consume_transition;
