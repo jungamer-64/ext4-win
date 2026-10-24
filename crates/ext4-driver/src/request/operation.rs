@@ -323,7 +323,7 @@ impl MountRequestOperation {
                     Ok(prepared.start(
                         FscryptKeySet::empty(),
                         policy.policy.mount_access(),
-                        ext4_core::MmpOwner::new(entropy),
+                        ext4_core::MmpOwner::new(entropy)?,
                         now,
                     )?)
                 }) {

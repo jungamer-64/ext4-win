@@ -57,6 +57,8 @@ mod tests;
 /// resulting node identity is an instance identifier, not a claim about a machine hostname.
 #[derive(Debug)]
 pub struct MmpOwner {
+    /// Non-reusable core session identity, independent of probabilistic device-visible identifiers.
+    mount: super::mount::MountIdentity,
     /// Independent mount instance identity, encoded within the fixed nodename field.
     node: [u8; 64],
     /// Initial non-reserved sequence selected independently of other mounts.
@@ -64,7 +66,10 @@ pub struct MmpOwner {
 }
 impl MmpOwner {
     /// Binds fresh cryptographic entropy to one acquisition.
-    pub fn new(entropy: [u8; 16]) -> Self {
+    /// # Errors
+    /// Returns session identity exhaustion before any ownership or filesystem write.
+    pub fn new(entropy: [u8; 16]) -> Result<Self> {
+        let mount = super::mount::MountIdentity::new()?;
         let mut node = [0; 64];
         for (target, source) in node.iter_mut().zip(b"ext4-win:") {
             *target = *source;
@@ -81,10 +86,15 @@ impl MmpOwner {
         }
         let [a, b, c, d, ..] = entropy;
         let raw = u32::from_le_bytes([a, b, c, d]);
-        Self {
+        Ok(Self {
+            mount,
             node,
             sequence: (raw & 0x7fff_ffff).max(1),
-        }
+        })
+    }
+    /// Observes the reserved origin without granting ownership or publication authority.
+    pub(super) const fn mount(&self) -> super::mount::MountIdentity {
+        self.mount
     }
 }
 
@@ -126,6 +136,7 @@ impl MmpLease {
     pub fn renew(self, now: MmpTime) -> Result<(MmpRenewingLease, MmpOperation)> {
         self.authorize(now)?;
         let pending = MmpRenewingLease {
+            mount: self.owner.mount,
             parameters: self.parameters,
             node: self.owner.node,
             sequence: next_sequence(self.owner.sequence),
@@ -157,6 +168,8 @@ impl MmpLease {
 /// The host consumes this value with the matching result before processing later media effects.
 #[derive(Debug)]
 pub struct MmpRenewingLease {
+    /// Exact core session expected by the successor proof, including equal-entropy acquisitions.
+    mount: super::mount::MountIdentity,
     /// Immutable physical and authentication scope of the transferred record update.
     parameters: MmpParameters,
     /// Expected mount-instance identity; observation does not grant another record-update operation.
@@ -178,23 +191,21 @@ impl MmpRenewingLease {
     }
     /// Consumes the retained window and its unique durable successor before extending I/O authority.
     /// # Errors
-    /// Returns the durable proof on a foreign/mismatched completion or an expired new window.
-    #[expect(
-        clippy::result_large_err,
-        reason = "rejection preserves durable update progress without allocation"
-    )]
+    /// Returns the durable proof on a foreign/mismatched completion or expiration of either window.
+    /// An unobserved completion cannot restore I/O admission after its retained window expires.
     pub fn complete(
         self,
         renewal: MmpRenewal,
         now: MmpTime,
     ) -> core::result::Result<MmpLease, (Error, MmpRenewal)> {
-        if self.parameters != renewal.parameters
+        if self.mount != renewal.owner.mount
+            || self.parameters != renewal.parameters
             || self.node != renewal.owner.node
             || self.sequence != renewal.owner.sequence
         {
             return Err((Error::ClusterReferenceConflict, renewal));
         }
-        if now.monotonic_millis >= renewal.valid_until_millis {
+        if self.authorize(now).is_err() || now.monotonic_millis >= renewal.valid_until_millis {
             return Err((Error::MmpOwnershipLost, renewal));
         }
         Ok(MmpLease {

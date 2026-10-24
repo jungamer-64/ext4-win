@@ -54,7 +54,7 @@ impl MountIdentity {
     /// Reserves a fresh origin before any mount publication write.
     /// # Errors
     /// Returns [`Error::MountIdentityExhausted`] without publishing a mount.
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         MOUNT_IDENTITIES.issue()
     }
 }
@@ -519,16 +519,16 @@ impl CommittedEpoch {
     }
 
     /// Builds the initial committed epoch after successful replay and mount validation.
-    /// # Errors
-    /// Returns mount identity exhaustion before any mount publication write.
+    /// The admitted origin was reserved before the first ownership or recovery effect.
     pub(super) fn initial(
         superblock: Superblock,
         fscrypt_keys: FscryptKeySet,
         clusters: ClusterReferenceIndex,
         access: super::MountAccess,
-    ) -> Result<Self> {
-        Ok(Self {
-            mount: MountIdentity::new()?,
+        mount: MountIdentity,
+    ) -> Self {
+        Self {
+            mount,
             access: access.media_access(),
             sequence: EpochSequence::INITIAL,
             superblock,
@@ -536,7 +536,7 @@ impl CommittedEpoch {
             clusters,
             overlay: Vec::new(),
             recovery: None,
-        })
+        }
     }
 
     /// Builds a post-commit epoch from values allocated before the first lower write.
@@ -1827,6 +1827,7 @@ impl ProbedMount {
         owner: super::MmpOwner,
         now: super::MmpTime,
     ) -> Result<MountOperation> {
+        let mount = owner.mount();
         let ownership = match self.mmp {
             Some(parameters) => MountOwnership::Starting(memory::try_box(
                 super::MmpOperation::acquire(parameters, owner, access.media_access())?,
@@ -1834,6 +1835,7 @@ impl ProbedMount {
             None => MountOwnership::Unprotected,
         };
         Ok(MountOperation {
+            mount,
             ownership,
             mmp_parameters: self.mmp,
             primary_uuid: self.uuid,
@@ -1891,6 +1893,8 @@ pub enum MountTransition {
 /// Completion-driven journaled mount operation.
 #[derive(Debug)]
 pub struct MountOperation {
+    /// One origin for physical ownership, committed epochs and all later grants.
+    mount: MountIdentity,
     /// Independent ownership is established before journal replay and retained through publication.
     ownership: MountOwnership,
     /// Immutable placement selected before recovery; replay cannot substitute another ownership domain.
@@ -1921,9 +1925,23 @@ enum MountOwnership {
     /// The first direct record read has not yet been submitted.
     Starting(Box<super::MmpOperation>),
     /// A lower request or monotonic timer owns the pending acquisition or renewal.
-    Pending(Box<super::MmpOperation>),
+    Pending {
+        /// Sole completion or timer continuation for the direct record protocol.
+        operation: Box<super::MmpOperation>,
+        /// Acquisition and renewal retain distinct I/O admission authority.
+        authority: PendingMountOwnership,
+    },
     /// Acknowledged media ownership; every later mutation requires freshness.
     Held(super::MmpLease),
+}
+
+/// The physical update continuation cannot independently extend a retained I/O window.
+#[derive(Debug)]
+enum PendingMountOwnership {
+    /// Acquisition has no pre-existing writable lease.
+    Acquisition,
+    /// Acknowledged prior validity remains bounded until its exact durable successor arrives.
+    Renewal(super::MmpRenewingLease),
 }
 
 /// Internal mount phase with no independently inspectable flags.
@@ -2177,9 +2195,15 @@ impl MountOperation {
                     super::OperationEvent::CancelRequested => super::MmpEvent::Cancel,
                     _ => return MountTransition::Complete(Err(Error::DeviceIo)),
                 };
-                return self.accept_ownership(operation.advance(event, now));
+                return self.accept_ownership(
+                    PendingMountOwnership::Acquisition,
+                    operation.advance(event, now),
+                );
             }
-            MountOwnership::Pending(operation) => {
+            MountOwnership::Pending {
+                operation,
+                authority,
+            } => {
                 let event = match event {
                     super::OperationEvent::StorageCompleted(completion) => {
                         super::MmpEvent::StorageCompleted(completion)
@@ -2188,7 +2212,7 @@ impl MountOperation {
                     super::OperationEvent::CancelRequested => super::MmpEvent::Cancel,
                     _ => return MountTransition::Complete(Err(Error::DeviceIo)),
                 };
-                return self.accept_ownership(operation.advance(event, now));
+                return self.accept_ownership(authority, operation.advance(event, now));
             }
             ownership => self.ownership = ownership,
         }
@@ -2232,26 +2256,48 @@ impl MountOperation {
     }
 
     /// Ownership effects bypass the recovery overlay and every metadata transcript.
-    fn accept_ownership(mut self: Box<Self>, transition: super::MmpTransition) -> MountTransition {
+    fn accept_ownership(
+        mut self: Box<Self>,
+        authority: PendingMountOwnership,
+        transition: super::MmpTransition,
+    ) -> MountTransition {
         match transition {
             super::MmpTransition::SubmitLower { request, suspended } => {
-                self.ownership = MountOwnership::Pending(suspended);
+                self.ownership = MountOwnership::Pending {
+                    operation: suspended,
+                    authority,
+                };
                 MountTransition::SubmitOwnership {
                     request,
                     suspended: self,
                 }
             }
             super::MmpTransition::Wait { seconds, suspended } => {
-                self.ownership = MountOwnership::Pending(suspended);
+                self.ownership = MountOwnership::Pending {
+                    operation: suspended,
+                    authority,
+                };
                 MountTransition::WaitForTimer {
                     seconds,
                     suspended: self,
                 }
             }
-            super::MmpTransition::Complete(Ok(lease)) => {
-                self.ownership = match lease {
-                    Some(lease) => MountOwnership::Held(lease),
-                    None => MountOwnership::Unprotected,
+            super::MmpTransition::Complete(Ok(completion)) => {
+                self.ownership = match (authority, completion) {
+                    (PendingMountOwnership::Acquisition, super::MmpCompletion::Acquired(lease)) => {
+                        MountOwnership::Held(lease)
+                    }
+                    (PendingMountOwnership::Acquisition, super::MmpCompletion::ReadOnly) => {
+                        MountOwnership::Unprotected
+                    }
+                    (
+                        PendingMountOwnership::Renewal(pending),
+                        super::MmpCompletion::Renewed(renewal),
+                    ) => match pending.complete(renewal, self.now) {
+                        Ok(lease) => MountOwnership::Held(lease),
+                        Err((error, _renewal)) => return MountTransition::Complete(Err(error)),
+                    },
+                    _ => return MountTransition::Complete(Err(Error::DeviceIo)),
                 };
                 self.drive()
             }
@@ -2380,12 +2426,19 @@ impl MountOperation {
                     return MountTransition::Complete(Err(error));
                 }
                 if lease.renewal_due(self.now) {
-                    let operation = match memory::try_box(lease.renew()) {
+                    let now = self.now;
+                    let (pending, operation) = match lease.renew(now) {
+                        Ok(update) => update,
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    };
+                    let operation = match memory::try_box(operation) {
                         Ok(operation) => operation,
                         Err(error) => return MountTransition::Complete(Err(error)),
                     };
-                    let now = self.now;
-                    return self.accept_ownership(operation.advance(super::MmpEvent::Start, now));
+                    return self.accept_ownership(
+                        PendingMountOwnership::Renewal(pending),
+                        operation.advance(super::MmpEvent::Start, now),
+                    );
                 }
                 self.ownership = MountOwnership::Held(lease);
             }
@@ -2686,15 +2739,13 @@ impl MountOperation {
                                 Some(keys) => keys,
                                 None => return MountTransition::Complete(Err(Error::DeviceIo)),
                             };
-                            let epoch = match CommittedEpoch::initial(
+                            let epoch = CommittedEpoch::initial(
                                 marked,
                                 keys,
                                 indexed.clusters,
                                 self.access,
-                            ) {
-                                Ok(epoch) => epoch,
-                                Err(error) => return MountTransition::Complete(Err(error)),
-                            };
+                                self.mount,
+                            );
                             let completed = CompletedMount {
                                 mmp: None,
                                 profile: MountedProfile::new(

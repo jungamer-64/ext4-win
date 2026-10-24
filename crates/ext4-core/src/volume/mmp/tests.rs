@@ -51,7 +51,7 @@ impl Device {
         let operation = memory::try_box(MmpOperation {
             effect: MmpEffect::None,
             parameters: Self::parameters()?,
-            owner: MmpOwner::new([0x35; 16]),
+            owner: MmpOwner::new([0x35; 16])?,
             action: Action::Acquire(access),
             state: State::Start,
         })?;
@@ -89,7 +89,7 @@ impl Device {
         &mut self,
         mut transition: MmpTransition,
         mut inject: impl FnMut(&mut Self, usize) -> Result<()>,
-    ) -> Result<Option<MmpLease>> {
+    ) -> Result<MmpCompletion> {
         let mut step = 0_usize;
         loop {
             inject(self, step)?;
@@ -114,8 +114,10 @@ impl Device {
     /// Returns the actual protocol outcome, including ownership competition.
     fn acquired(&mut self) -> Result<MmpLease> {
         let transition = self.acquire(MediaAccess::ReadWrite)?;
-        self.run(transition, |_device, _step| Ok(()))?
-            .ok_or(Error::MmpOwnershipLost)
+        match self.run(transition, |_device, _step| Ok(()))? {
+            MmpCompletion::Acquired(lease) => Ok(lease),
+            _ => Err(Error::MmpOwnershipLost),
+        }
     }
 }
 
@@ -174,14 +176,22 @@ fn acquire_renew_release_preserve_physical_block_and_durability() {
                 .all(|byte| *byte == 0xa5)
         );
         lease.authorize(device.now())?;
-        let operation = memory::try_box(lease.renew())?;
+        let (pending, operation) = lease.renew(device.now())?;
+        let operation = memory::try_box(operation)?;
         let transition = operation.advance(MmpEvent::Start, device.now());
-        let lease = device
-            .run(transition, |_device, _step| Ok(()))?
-            .ok_or(Error::MmpOwnershipLost)?;
+        let MmpCompletion::Renewed(renewal) = device.run(transition, |_device, _step| Ok(()))?
+        else {
+            return Err(Error::MmpOwnershipLost);
+        };
+        let lease = pending
+            .complete(renewal, device.now())
+            .map_err(|(error, _renewal)| error)?;
         let operation = memory::try_box(lease.release())?;
         let transition = operation.advance(MmpEvent::Start, device.now());
-        assert!(device.run(transition, |_device, _step| Ok(()))?.is_none());
+        assert!(matches!(
+            device.run(transition, |_device, _step| Ok(()))?,
+            MmpCompletion::Released
+        ));
         assert_eq!(
             MmpRecord::parse(&device.durable, None)?.sequence,
             mmp::CLEAN
@@ -200,7 +210,10 @@ fn readonly_observation_is_write_free_and_rejects_active_owners() {
             let mut device = Device::new(sequence)?;
             let before = memory::copied_slice(&device.bytes)?;
             let transition = device.acquire(MediaAccess::ReadOnly)?;
-            assert!(device.run(transition, |_device, _step| Ok(()))?.is_none());
+            assert!(matches!(
+                device.run(transition, |_device, _step| Ok(()))?,
+                MmpCompletion::ReadOnly
+            ));
             assert!(device.effects.is_empty());
             assert_eq!(device.bytes, before);
         }
@@ -241,7 +254,7 @@ fn revocation_and_latency_consume_authority() {
             let operation = memory::try_box(if release {
                 lease.release()
             } else {
-                lease.renew()
+                lease.renew(device.now())?.1
             })?;
             let transition = operation.advance(MmpEvent::Start, device.now());
             assert!(matches!(
@@ -255,14 +268,9 @@ fn revocation_and_latency_consume_authority() {
         device.effects.clear();
         device.millis = device.millis.saturating_add(5000);
         assert_eq!(lease.authorize(device.now()), Err(Error::MmpOwnershipLost));
-        let operation = memory::try_box(lease.renew())?;
-        let transition = operation.advance(MmpEvent::Start, device.now());
         assert!(matches!(
-            transition,
-            MmpTransition::Complete(Err(MmpFailure {
-                reason: Error::MmpOwnershipLost,
-                effect: MmpEffect::None
-            }))
+            lease.renew(device.now()),
+            Err(Error::MmpOwnershipLost)
         ));
         assert!(device.effects.is_empty());
         let mut device = Device::new(mmp::CLEAN)?;
@@ -447,6 +455,83 @@ fn delayed_claim_verification_compares_the_instance_identity() {
             }
         }
         assert_eq!(device.effects, ["write", "flush"]);
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if a pending update suspends valid I/O, extends the old window, or revives expired authority.
+#[test]
+fn pending_renewal_retains_only_continuous_acknowledged_authority() {
+    let result = (|| -> Result<()> {
+        let mut device = Device::new(mmp::CLEAN)?;
+        let lease = device.acquired()?;
+        device.millis = device.millis.saturating_add(2000);
+        let (pending, operation) = lease.renew(device.now())?;
+        pending.authorize(device.now())?;
+        let operation = memory::try_box(operation)?;
+        let transition = operation.advance(MmpEvent::Start, device.now());
+        let MmpCompletion::Renewed(renewal) = device.run(transition, |_device, _step| Ok(()))?
+        else {
+            return Err(Error::MmpOwnershipLost);
+        };
+        device.millis = device.millis.saturating_add(2999);
+        pending.authorize(device.now())?;
+        let lease = pending
+            .complete(renewal, device.now())
+            .map_err(|(error, _proof)| error)?;
+        device.millis = device.millis.saturating_add(1);
+        lease.authorize(device.now())?;
+
+        let mut device = Device::new(mmp::CLEAN)?;
+        let lease = device.acquired()?;
+        device.millis = device.millis.saturating_add(2000);
+        let (pending, operation) = lease.renew(device.now())?;
+        let operation = memory::try_box(operation)?;
+        let transition = operation.advance(MmpEvent::Start, device.now());
+        let MmpCompletion::Renewed(renewal) = device.run(transition, |_device, _step| Ok(()))?
+        else {
+            return Err(Error::MmpOwnershipLost);
+        };
+        device.millis = device.millis.saturating_add(3000);
+        assert_eq!(
+            pending.authorize(device.now()),
+            Err(Error::MmpOwnershipLost)
+        );
+        assert!(matches!(
+            pending.complete(renewal, device.now()),
+            Err((Error::MmpOwnershipLost, _))
+        ));
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if equal entropy permits exchanging durable proofs between independent mount sessions.
+#[test]
+fn renewal_proofs_are_bound_to_their_originating_session() {
+    let result = (|| -> Result<()> {
+        let mut first = Device::new(mmp::CLEAN)?;
+        let mut second = Device::new(mmp::CLEAN)?;
+        let (first_pending, _first_operation) = first.acquired()?.renew(first.now())?;
+        let (second_pending, operation) = second.acquired()?.renew(second.now())?;
+        let operation = memory::try_box(operation)?;
+        let transition = operation.advance(MmpEvent::Start, second.now());
+        let MmpCompletion::Renewed(renewal) = second.run(transition, |_device, _step| Ok(()))?
+        else {
+            return Err(Error::MmpOwnershipLost);
+        };
+        let Err((Error::ClusterReferenceConflict, renewal)) =
+            first_pending.complete(renewal, first.now())
+        else {
+            return Err(Error::MmpOwnershipLost);
+        };
+        let lease = second_pending
+            .complete(renewal, second.now())
+            .map_err(|(error, _proof)| error)?;
+        lease.authorize(second.now())?;
         Ok(())
     })();
     assert_eq!(result, Ok(()));

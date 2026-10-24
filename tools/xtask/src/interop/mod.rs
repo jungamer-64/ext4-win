@@ -820,7 +820,7 @@ fn mmp_owner() -> TaskResult<ext4_core::MmpOwner> {
     windows_host::secure_random(&mut entropy)?;
     #[cfg(not(windows))]
     File::open("/dev/urandom")?.read_exact(&mut entropy)?;
-    Ok(ext4_core::MmpOwner::new(entropy))
+    Ok(ext4_core::MmpOwner::new(entropy).map_err(core_task_error)?)
 }
 
 /// Opens and fully mounts one internal-journal image through the public production protocol.

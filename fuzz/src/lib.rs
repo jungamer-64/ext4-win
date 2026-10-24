@@ -201,12 +201,10 @@ fn run_mount(
     };
     let mut millis = 0_u64;
     let now = ext4_core::MmpTime::new(millis, 0);
-    let Ok(operation) = prepared.start(
-        FscryptKeySet::empty(),
-        access,
-        ext4_core::MmpOwner::new([0x35; 16]),
-        now,
-    ) else {
+    let Ok(owner) = ext4_core::MmpOwner::new([0x35; 16]) else {
+        return MountOutcome::Rejected;
+    };
+    let Ok(operation) = prepared.start(FscryptKeySet::empty(), access, owner, now) else {
         return MountOutcome::Rejected;
     };
     let Ok(operation) = Box::try_new(operation) else {

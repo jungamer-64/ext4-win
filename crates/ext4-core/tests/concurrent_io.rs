@@ -2360,7 +2360,7 @@ impl Disk {
         let mut step = Box::try_new(prepared.start(
             FscryptKeySet::empty(),
             access,
-            ext4_core::MmpOwner::new([0x65; 16]),
+            ext4_core::MmpOwner::new([0x65; 16])?,
             now,
         )?)
         .map_err(|_| Error::OutOfMemory)?
