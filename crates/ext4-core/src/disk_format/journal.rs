@@ -25,7 +25,7 @@ use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
 
 mod fast_commit;
-use fast_commit::{FrameAuthenticator, ScanStep};
+use fast_commit::{FrameAuthenticator, ProgramDecoder, ScanStep};
 
 // Common JBD2 block header fields. JBD2 stores its control structures big-endian.
 /// Magic value that prefixes every JBD2 control block.
@@ -304,6 +304,19 @@ struct FastCommitArea {
     first: u32,
     /// Exclusive backing boundary shared with the complete journal allocation.
     end: u32,
+}
+
+impl FastCommitArea {
+    /// Converts a zero-based delta-area index into an absolute journal logical block.
+    /// # Errors
+    /// Rejects arithmetic overflow and an index outside the validated half-open area.
+    fn block_at(self, index: u32) -> Result<u32> {
+        let logical = self.first.checked_add(index).ok_or(Error::JournalCorrupt)?;
+        if logical >= self.end {
+            return Err(Error::JournalCorrupt);
+        }
+        Ok(logical)
+    }
 }
 
 impl JournalGeometry {
@@ -600,6 +613,10 @@ enum RecoveryPhase {
         /// Framing/CRC observation grants no metadata write permission.
         authenticator: FrameAuthenticator,
     },
+    /// Retains an owned, bounded decode continuation until the whole prefix is reauthenticated.
+    DecodeFastCommit(ProgramDecoder),
+    /// A failed consuming transition cannot issue another physical request.
+    Failed,
     /// Revalidate every committed structure, payload, address, and revoke before writes.
     Validate,
     /// Re-read and replay one payload buffer at a time.
@@ -711,6 +728,8 @@ enum RecoveryIoAction {
     ControlRead,
     /// One complete block of the separately bounded delta-record area.
     FastCommitRead,
+    /// Second-pass operand read is joined to its unique decoder owner.
+    FastCommitDecodeRead,
     /// Journal payload read for the specified prevalidated tag.
     PayloadRead {
         /// Tag whose payload owns the returned buffer.
@@ -879,6 +898,25 @@ impl JournalRecoveryOperation {
         self.advance_pass_boundary()?;
         let (request, action) = match self.phase {
             RecoveryPhase::Complete => return Ok(None),
+            RecoveryPhase::Failed => return Err(Error::JournalCorrupt),
+            RecoveryPhase::DecodeFastCommit(ref decoder) => {
+                let area = self
+                    .journal
+                    .geometry
+                    .fast_commits()?
+                    .ok_or(Error::JournalCorrupt)?;
+                let logical = area.block_at(decoder.next_block_index()?)?;
+                (
+                    StorageRequest::Read {
+                        target: self.journal.location.storage_target(),
+                        offset: self
+                            .journal
+                            .offset_of(logical, self.journal.geometry.block_size)?,
+                        buffer: self.buffer.take().ok_or(Error::DeviceIo)?,
+                    },
+                    RecoveryIoAction::FastCommitDecodeRead,
+                )
+            }
             RecoveryPhase::InspectFastCommit { logical, .. } => (
                 StorageRequest::Read {
                     target: self.journal.location.storage_target(),
@@ -978,6 +1016,23 @@ impl JournalRecoveryOperation {
         let in_flight = self.in_flight.take().ok_or(Error::DeviceIo)?;
         let transfer = in_flight.identity.complete_transfer(completion)?;
         match in_flight.action {
+            RecoveryIoAction::FastCommitDecodeRead => {
+                let CompletedStorageTransfer::Read { buffer, .. } = transfer else {
+                    return Err(Error::DeviceIo);
+                };
+                let RecoveryPhase::DecodeFastCommit(mut decoder) =
+                    core::mem::replace(&mut self.phase, RecoveryPhase::Failed)
+                else {
+                    return Err(Error::JournalCorrupt);
+                };
+                if decoder.accept(&buffer)? {
+                    self.accept_delta_program(decoder.finish()?)?;
+                } else {
+                    self.phase = RecoveryPhase::DecodeFastCommit(decoder);
+                }
+                self.buffer = Some(buffer);
+            }
+
             RecoveryIoAction::FastCommitRead => {
                 let CompletedStorageTransfer::Read { buffer, .. } = transfer else {
                     return Err(Error::DeviceIo);
@@ -1034,7 +1089,7 @@ impl JournalRecoveryOperation {
                 }
                 self.validate_primary_repair_payload(tag, &buffer)?;
                 let next = index.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-                if self.phase == RecoveryPhase::Replay
+                if matches!(self.phase, RecoveryPhase::Replay)
                     && tag.flags & JBD2_TAG_FLAG_DELETED == 0
                     && !self.is_revoked(tag.home, tag.sequence)
                 {
@@ -1093,7 +1148,7 @@ impl JournalRecoveryOperation {
     /// Returns an error when lower I/O is still outstanding or the durability sequence has not
     /// reached its terminal state.
     pub(crate) fn into_clean(self) -> Result<Journal<CleanJournal>> {
-        if self.phase != RecoveryPhase::Complete || self.in_flight.is_some() {
+        if !matches!(self.phase, RecoveryPhase::Complete) || self.in_flight.is_some() {
             return Err(Error::DeviceIo);
         }
         self.clean_journal.ok_or(Error::JournalCorrupt)
@@ -1105,7 +1160,7 @@ impl JournalRecoveryOperation {
     /// Returns an error for inconsistent committed-prefix cursors or failed pre-write allocation.
     fn advance_pass_boundary(&mut self) -> Result<()> {
         loop {
-            if self.phase == RecoveryPhase::Scan
+            if matches!(self.phase, RecoveryPhase::Scan)
                 && self.walk.consumed >= self.journal.usable_log_blocks()?
             {
                 self.finish_scan()?;
@@ -1279,7 +1334,12 @@ impl JournalRecoveryOperation {
                 return Err(Error::JournalCorrupt);
             }
             if prefix.records != 0 {
-                return Err(Error::UnsupportedJournal);
+                self.phase = RecoveryPhase::DecodeFastCommit(ProgramDecoder::new(
+                    self.summary.next_sequence,
+                    self.journal.geometry.block_size,
+                    prefix,
+                )?);
+                return Ok(());
             }
         }
         self.phase = if self.journal.superblock.start() == 0 {
@@ -1365,13 +1425,13 @@ impl JournalRecoveryOperation {
         if !self.journal.profile.has_revokes() {
             return Err(Error::JournalCorrupt);
         }
-        let phase = self.phase;
+        let validating = matches!(self.phase, RecoveryPhase::Validate);
         let sequence = self.walk.sequence;
         let journal = &self.journal;
         let revokes = &mut self.revokes;
         journal.for_each_revoke(block, |revoked| {
             journal.validate_replay_target(revoked)?;
-            if phase == RecoveryPhase::Validate {
+            if validating {
                 if let Some(existing) = revokes.iter_mut().find(|entry| entry.block == revoked) {
                     if sequence.is_after(existing.sequence) {
                         existing.sequence = sequence;
@@ -1434,7 +1494,8 @@ impl JournalRecoveryOperation {
     /// Returns an error when a payload targeting the primary block does not itself contain a
     /// checksum-valid read-write superblock.
     fn validate_primary_repair_payload(&mut self, tag: RecoveryTag, payload: &[u8]) -> Result<()> {
-        if self.phase != RecoveryPhase::Validate || tag.flags & JBD2_TAG_FLAG_DELETED != 0 {
+        if !matches!(self.phase, RecoveryPhase::Validate) || tag.flags & JBD2_TAG_FLAG_DELETED != 0
+        {
             return Ok(());
         }
         let home = match self.primary_repair {
@@ -4446,7 +4507,7 @@ mod tests {
             )?;
             torn_recovery.scan_control_block(&descriptor)?;
             torn_recovery.scan_control_block(&torn)?;
-            assert_eq!(torn_recovery.phase, RecoveryPhase::Validate);
+            assert!(matches!(torn_recovery.phase, RecoveryPhase::Validate));
             assert_eq!(torn_recovery.summary.transactions, 0);
 
             let mut committed =
@@ -4519,7 +4580,7 @@ mod tests {
                 JournalRecoveryOperation::new(journal, RecoveryState::NeedsRecovery)?;
             operation.summary.max_transaction_tags = usize::MAX;
             assert_eq!(operation.finish_scan(), Err(Error::OutOfMemory));
-            assert_eq!(operation.phase, RecoveryPhase::Scan);
+            assert!(matches!(operation.phase, RecoveryPhase::Scan));
             Ok(())
         })();
         assert_eq!(outcome, Ok(()));

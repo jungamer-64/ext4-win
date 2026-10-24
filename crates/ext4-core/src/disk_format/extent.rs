@@ -905,7 +905,7 @@ fn parse_node(
 /// # Errors
 ///
 /// Returns an error when any extent field is outside `raw` or the encoded extent length is zero.
-fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
+pub(super) fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
     let logical_start = LogicalBlock::from_u32(le_u32(raw, disk_offset(offset))?);
     let raw_len = le_u16(
         raw,
