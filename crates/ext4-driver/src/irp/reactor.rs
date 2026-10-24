@@ -54,6 +54,9 @@ use crate::kernel::storage::{
 };
 use crate::kernel::storage::{MountedStorageRoute, StorageFailureClass};
 
+/// The filesystem close barrier precedes the independent physical ownership-release barrier.
+pub(crate) const MMP_RELEASE_BARRIER: u64 = 4;
+
 /// Operation representation moved through storage-command envelopes.
 type SuspendedOperation = Box<dyn CompletionOperation>;
 /// Scheduler metadata retained with an operation through lower phases and retries.
@@ -4568,6 +4571,10 @@ impl CompletionReactor {
                     Ok(!has_commit_work && access.journal_is_clean())
                 });
                 CompletionEvent::durability_wait(1, readiness)
+            }
+            WaitCondition::MmpRelease => {
+                let readiness = self.with_mounted_access(|access| access.mmp_close_ready());
+                CompletionEvent::durability_wait(MMP_RELEASE_BARRIER, readiness)
             }
             WaitCondition::Barrier { identity } => {
                 if !self.with_scheduler(|scheduler| {

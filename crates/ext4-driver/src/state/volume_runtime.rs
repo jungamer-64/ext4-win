@@ -65,7 +65,6 @@ impl VolumeFailureState {
     pub(crate) fn authorize_mutation(self) -> DriverResult<()> {
         match self {
             Self::Operational => Ok(()),
-            Self::MediaOwnershipLost => Err(ext4_core::Error::MmpOwnershipLost.into()),
             Self::DegradedReadOnly | Self::RecoveryRequired | Self::Failed => {
                 Err(DriverError::VolumeDismounted)
             }
@@ -86,7 +85,6 @@ impl VolumeFailureState {
                 Ok(())
             }
             Self::RecoveryRequired | Self::Failed => Err(DriverError::VolumeDismounted),
-            Self::MediaOwnershipLost => Err(ext4_core::Error::MmpOwnershipLost.into()),
             Self::CommittedButUnpublished { status, .. } => {
                 Err(DriverError::CacheManagerFailure(status))
             }
@@ -98,7 +96,6 @@ impl VolumeFailureState {
         match self {
             Self::Operational => Self::DegradedReadOnly,
             Self::DegradedReadOnly
-            | Self::MediaOwnershipLost
             | Self::RecoveryRequired
             | Self::CommittedButUnpublished { .. }
             | Self::CacheWritebackFailed { .. }
@@ -110,8 +107,7 @@ impl VolumeFailureState {
     const fn durability_unknown(self) -> Self {
         match self {
             Self::Operational | Self::DegradedReadOnly => Self::RecoveryRequired,
-            Self::MediaOwnershipLost
-            | Self::RecoveryRequired
+            Self::RecoveryRequired
             | Self::CommittedButUnpublished { .. }
             | Self::CacheWritebackFailed { .. }
             | Self::Failed => self,
@@ -120,10 +116,7 @@ impl VolumeFailureState {
 
     /// Moves to terminal failure once reads cannot be trusted.
     const fn read_unreliable(self) -> Self {
-        match self {
-            Self::MediaOwnershipLost => self,
-            _ => Self::Failed,
-        }
+        Self::Failed
     }
 
     /// Records the exact post-commit publication failure as a non-retryable terminal state.
@@ -134,7 +127,7 @@ impl VolumeFailureState {
         unexamined_updates: usize,
     ) -> Self {
         match self {
-            Self::Failed | Self::MediaOwnershipLost => self,
+            Self::Failed => Self::Failed,
             Self::CommittedButUnpublished { .. } => self,
             Self::Operational
             | Self::DegradedReadOnly
@@ -151,8 +144,7 @@ impl VolumeFailureState {
     const fn cache_writeback_failed(self, status: NTSTATUS) -> Self {
         match self {
             Self::Operational | Self::DegradedReadOnly => Self::CacheWritebackFailed { status },
-            Self::MediaOwnershipLost
-            | Self::RecoveryRequired
+            Self::RecoveryRequired
             | Self::CommittedButUnpublished { .. }
             | Self::CacheWritebackFailed { .. }
             | Self::Failed => self,
@@ -355,17 +347,25 @@ impl VolumeRuntime {
         self.native_reliability.observe()
     }
 
-    /// Publishes with the authoritative transition in one non-suspending actor step.
-    fn set_failure(&mut self, failure: VolumeFailureState) {
-        let policy = match (failure.native_policy(), self.profile.access()) {
-            (NativeIoPolicy::ReadWrite, ext4_core::MediaAccess::ReadOnly) => {
-                NativeIoPolicy::ReadOnly
+    /// Recomputes the sole native projection from independent reliability and ownership authority.
+    fn publish_reliability(&mut self) {
+        let policy = if !self.ownership.permits_io() {
+            NativeIoPolicy::Unavailable
+        } else {
+            match (self.failure.native_policy(), self.profile.access()) {
+                (NativeIoPolicy::ReadWrite, ext4_core::MediaAccess::ReadOnly) => {
+                    NativeIoPolicy::ReadOnly
+                }
+                (policy, _) => policy,
             }
-            (policy, _) => policy,
         };
         self.native_reliability
-            .publish(policy, self.mmp.as_ref().map(ext4_core::MmpLease::deadline));
+            .publish(policy, self.ownership.deadline());
+    }
+    /// Publishes with the authoritative transition in one non-suspending actor step.
+    fn set_failure(&mut self, failure: VolumeFailureState) {
         self.failure = failure;
+        self.publish_reliability();
     }
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
@@ -380,6 +380,7 @@ impl VolumeRuntime {
     ///
     /// Returns an error when reads are no longer authorized.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
+        self.authorize_ownership()?;
         self.failure.authorize_read()?;
         self.epochs.acquire_current()
     }
@@ -396,6 +397,7 @@ impl VolumeRuntime {
         &'state self,
         cache: &'state mut ext4_core::MetadataCache,
     ) -> DriverResult<ext4_core::CommittedReadContext<'state>> {
+        self.authorize_ownership()?;
         self.failure.authorize_read()?;
         Ok(self
             .coordinator
@@ -436,10 +438,9 @@ impl VolumeRuntime {
     /// # Errors
     /// Returns write protection for a read-only mount.
     pub(crate) fn require_media_write(&self) -> DriverResult<()> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()?;
-        if let Some(lease) = &self.mmp {
-            lease.authorize(crate::kernel::time::mmp_time()?)?;
-        }
+        self.authorize_ownership()?;
         match self.profile.access() {
             ext4_core::MediaAccess::ReadWrite => Ok(()),
             ext4_core::MediaAccess::ReadOnly => {
@@ -452,6 +453,7 @@ impl VolumeRuntime {
     /// # Errors
     /// Returns unhealthy volume state or finite operation-accounting exhaustion.
     pub(crate) fn admit_key_change(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()?;
         let activity = MutationActivityLease::acquire(&self.active_mutations)?;
         let ticket = self
@@ -472,6 +474,7 @@ impl VolumeRuntime {
     /// Returns an error when mutations are not authorized or stable epoch storage cannot be
     /// allocated.
     pub(crate) fn reserve_epoch_publication(&mut self) -> DriverResult<EpochPublicationSlots> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()?;
         self.epochs.reserve_publication()
     }
@@ -484,6 +487,7 @@ impl VolumeRuntime {
         ticket: u64,
         key: ext4_core::FscryptMasterKey,
     ) -> DriverResult<ext4_core::ResolvedKeyChange> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()?;
         Ok(ext4_core::ResolvedKeyChange::add(
             self.epochs.current(),
@@ -501,6 +505,7 @@ impl VolumeRuntime {
         ticket: u64,
         identifier: FscryptKeyIdentifier,
     ) -> DriverResult<ext4_core::ResolvedKeyChange> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()?;
         Ok(ext4_core::ResolvedKeyChange::remove(
             self.epochs.current(),
@@ -532,6 +537,7 @@ impl VolumeRuntime {
     /// # Errors
     /// Returns mutation admission or stable allocation failure.
     pub(crate) fn reserve_key_publication(&self) -> DriverResult<EpochPublicationSlot> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()?;
         self.epochs.reserve_slot()
     }
@@ -570,6 +576,7 @@ impl VolumeRuntime {
         &mut self,
         ticket: u64,
     ) -> DriverResult<Option<ext4_core::CommitLease>> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()?;
         Ok(self.coordinator.acquire_commit(ticket)?)
     }
@@ -604,12 +611,12 @@ impl VolumeRuntime {
         visibility: VisibilityLease,
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
-    ) -> ext4_core::Result<PendingCheckpoint> {
+    ) -> DriverResult<PendingCheckpoint> {
         self.require_media_ownership()?;
         let published: PublishedMutation =
             match mutation.publish(visibility, self.coordinator_mut()) {
                 Ok(published) => published,
-                Err((error, _mutation)) => return Err(self.reject_publication(error)),
+                Err((error, _mutation)) => return Err(self.reject_publication(error).into()),
             };
         let (epoch, checkpoint) = published.into_parts();
         let sequence = epoch.sequence();
@@ -640,34 +647,110 @@ impl VolumeRuntime {
         Ok(())
     }
 
-    /// Retires every core grant before native observers can admit another callback.
-    /// Dropping the physical lease cannot issue a clean marker against a replacement owner.
-    fn revoke_media_ownership(&mut self) {
-        self.coordinator.revoke_media_ownership();
-        self.mmp = None;
-        self.set_failure(VolumeFailureState::MediaOwnershipLost);
+    /// Samples the monotonic clock only for a physically protected session.
+    /// # Errors
+    /// Returns revoked, expired or finally consumed ownership independently of reliability.
+    fn authorize_ownership(&self) -> DriverResult<()> {
+        let millis = self
+            .ownership
+            .deadline()
+            .map_or(0, |_deadline| crate::kernel::time::monotonic_millis());
+        self.ownership.authorize(ext4_core::MmpTime::new(millis, 0))
     }
-
-    /// Observes expiration before entering a mounted actor callback, including cache-only work.
-    /// Native callbacks independently apply the same published deadline while the actor sleeps.
+    /// Retires every core grant before native observers can admit another callback.
+    /// Dropping physical authority cannot issue a clean marker against a replacement owner.
+    fn revoke_media_ownership(&mut self) {
+        self.fail_mmp(ext4_core::Error::MmpOwnershipLost);
+    }
+    /// Observes expiration at each mounted actor callback, including cache-only work.
     pub(crate) fn observe_media_ownership(&mut self) {
-        if let Some(lease) = &self.mmp {
-            let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
-            if lease.authorize(now).is_err() {
+        if self.authorize_ownership() == Err(ext4_core::Error::MmpOwnershipLost.into()) {
+            self.revoke_media_ownership();
+        }
+    }
+    /// Revalidates issued grants at publication and immediately before lower submission.
+    /// # Errors
+    /// An expired lease revokes this session; later completions cannot restore it.
+    pub(crate) fn require_media_ownership(&mut self) -> DriverResult<()> {
+        self.observe_media_ownership();
+        self.authorize_ownership()
+    }
+    /// Observes the next heartbeat or outstanding record-operation deadline for the actor timer.
+    pub(crate) fn mmp_wakeup(&self) -> Option<ext4_core::MmpDeadline> {
+        self.ownership.wakeup()
+    }
+    /// Starts only a due renewal or a filesystem-close-authorized release.
+    /// # Errors
+    /// Records terminal ownership failure before returning a failed handoff.
+    pub(crate) fn start_mmp_action(&mut self) -> DriverResult<Option<ext4_core::MmpOperation>> {
+        let now = match crate::kernel::time::mmp_time() {
+            Ok(now) => now,
+            Err(error) => {
                 self.revoke_media_ownership();
+                return Err(error);
+            }
+        };
+        match self.ownership.next_action(now) {
+            Ok(operation) => {
+                self.publish_reliability();
+                Ok(operation)
+            }
+            Err(error) => {
+                self.fail_mmp(error);
+                Err(error.into())
             }
         }
     }
-
-    /// Revalidates already issued grants at publication and immediately before lower submission.
+    /// Accepts the completed child before publishing its next deadline to native callbacks.
     /// # Errors
-    /// An expired lease revokes this session; later completions cannot restore it.
-    pub(crate) fn require_media_ownership(&mut self) -> ext4_core::Result<()> {
-        self.observe_media_ownership();
-        if self.failure == VolumeFailureState::MediaOwnershipLost {
-            return Err(ext4_core::Error::MmpOwnershipLost);
+    /// A late or revoked child cannot restore the retired coordinator or native permissions.
+    pub(crate) fn complete_mmp_action(
+        &mut self,
+        completion: ext4_core::MmpCompletion,
+    ) -> DriverResult<()> {
+        let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
+        if let Err(error) = self.ownership.complete(completion, now) {
+            self.fail_mmp(error);
+            return Err(error.into());
         }
+        if self.ownership.close_ready() == Ok(true) {
+            self.coordinator.revoke_media_ownership();
+        }
+        self.publish_reliability();
         Ok(())
+    }
+    /// Transfers the filesystem's completed close protocol into the final record-release handoff.
+    /// # Errors
+    /// Returns a terminal or duplicate close error without requesting another physical release.
+    pub(crate) fn request_mmp_close(
+        &mut self,
+        durability: ext4_core::CleanCloseDurability,
+    ) -> DriverResult<()> {
+        self.ownership
+            .request_close(durability)
+            .map_err(|(error, _durability)| error)?;
+        self.publish_reliability();
+        Ok(())
+    }
+    /// Readiness for the native close, retaining terminal failure separately from a pending release.
+    /// # Errors
+    /// Returns the first ownership failure while a close acknowledgment is pending.
+    pub(crate) fn mmp_close_ready(&self) -> DriverResult<bool> {
+        self.ownership.close_ready()
+    }
+    /// Consumes the combined close acknowledgment only after final physical ownership release.
+    /// # Errors
+    /// Rejects premature, duplicate or failed close completion.
+    pub(crate) fn finish_mmp_close(&mut self) -> DriverResult<ext4_core::CleanCloseDurability> {
+        let durability = self.ownership.finish_close()?;
+        self.publish_reliability();
+        Ok(durability)
+    }
+    /// Observes a failed, uncertain or expired physical ownership operation without retrying it.
+    pub(crate) fn fail_mmp(&mut self, reason: ext4_core::Error) {
+        self.coordinator.revoke_media_ownership();
+        self.ownership.revoke(reason);
+        self.publish_reliability();
     }
 
     /// Revocation is an expected external transition; mismatched internal grants remain fatal.
@@ -684,6 +767,7 @@ impl VolumeRuntime {
     ///
     /// Returns the same terminal status observed by mutation admission.
     pub(crate) fn authorize_durability(&self) -> DriverResult<()> {
+        self.authorize_ownership()?;
         self.failure.authorize_mutation()
     }
 
@@ -796,29 +880,6 @@ mod tests {
     use super::VolumeFailureState;
 
     /// # Panics
-    /// Fails if later I/O errors weaken revocation or obscure its actionable failure reason.
-    #[test]
-    fn media_ownership_loss_rejects_all_io_and_cannot_be_weakened() {
-        let lost = VolumeFailureState::MediaOwnershipLost;
-        let error = crate::kernel::status::DriverError::from(ext4_core::Error::MmpOwnershipLost);
-        assert_eq!(lost.authorize_mutation(), Err(error));
-        assert_eq!(lost.authorize_read(), Err(error));
-        assert!(!lost.native_policy().permits(false));
-        assert!(!lost.native_policy().permits(true));
-        assert_eq!(lost.durable_abort(), lost);
-        assert_eq!(lost.durability_unknown(), lost);
-        assert_eq!(lost.read_unreliable(), lost);
-        assert_eq!(
-            lost.publication_failed(wdk_sys::STATUS_IO_DEVICE_ERROR, 0, 1),
-            lost
-        );
-        assert_eq!(
-            lost.cache_writeback_failed(wdk_sys::STATUS_IO_DEVICE_ERROR),
-            lost
-        );
-    }
-
-    /// # Panics
     ///
     /// Panics when failure-state transitions weaken an already stronger failure.
     #[test]
@@ -827,7 +888,6 @@ mod tests {
             VolumeFailureState::Operational,
             VolumeFailureState::DegradedReadOnly,
             VolumeFailureState::RecoveryRequired,
-            VolumeFailureState::MediaOwnershipLost,
             VolumeFailureState::Failed,
             VolumeFailureState::CommittedButUnpublished {
                 status: wdk_sys::STATUS_IO_DEVICE_ERROR,

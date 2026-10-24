@@ -1716,6 +1716,51 @@ impl MountedVolumeAccess<'_> {
         operation.start(checkpoint, self.runtime.coordinator())
     }
 
+    /// Observes the next due MMP action or its completion watchdog deadline.
+    pub(crate) fn mmp_wakeup(&self) -> Option<ext4_core::MmpDeadline> {
+        self.runtime.mmp_wakeup()
+    }
+    /// Transfers only a due renewal or a filesystem-close-authorized record release.
+    /// # Errors
+    /// Revokes the session if no continuous acknowledgement remains.
+    pub(crate) fn start_mmp_action(&mut self) -> DriverResult<Option<ext4_core::MmpOperation>> {
+        self.runtime.start_mmp_action()
+    }
+    /// Accepts an exact child postcondition before publishing a successor deadline.
+    /// # Errors
+    /// Returns lost ownership for stale, foreign or revoked completions.
+    pub(crate) fn complete_mmp_action(
+        &mut self,
+        completion: ext4_core::MmpCompletion,
+    ) -> DriverResult<()> {
+        self.runtime.complete_mmp_action(completion)
+    }
+    /// Transfers completed filesystem durability to the independent ownership-release protocol.
+    /// # Errors
+    /// Returns a retired ownership chain or a duplicate close request.
+    pub(crate) fn request_mmp_close(
+        &mut self,
+        durability: ext4_core::CleanCloseDurability,
+    ) -> DriverResult<()> {
+        self.runtime.request_mmp_close(durability)
+    }
+    /// Waits for ownership release without restoring journal or mutation authority.
+    /// # Errors
+    /// Returns the first terminal ownership failure instead of an indefinite close wait.
+    pub(crate) fn mmp_close_ready(&self) -> DriverResult<bool> {
+        self.runtime.mmp_close_ready()
+    }
+    /// Consumes combined filesystem and ownership durability before the native close publication.
+    /// # Errors
+    /// Rejects a premature or repeated acknowledgment.
+    pub(crate) fn finish_mmp_close(&mut self) -> DriverResult<ext4_core::CleanCloseDurability> {
+        self.runtime.finish_mmp_close()
+    }
+    /// Irreversibly retires the session while retaining all outstanding completion owners.
+    pub(crate) fn fail_mmp(&mut self, reason: ext4_core::Error) {
+        self.runtime.fail_mmp(reason);
+    }
+
     /// Reports whether no mutation or checkpoint owns journal space.
     #[cfg(not(test))]
     pub(crate) fn journal_is_clean(&self) -> bool {
@@ -1736,8 +1781,7 @@ impl MountedVolumeAccess<'_> {
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
         stream_metadata: PreparedStreamMetadataPublications,
-    ) -> Result<DurablePublicationOutcome, (ext4_core::Error, PreparedStreamMetadataPublications)>
-    {
+    ) -> Result<DurablePublicationOutcome, (DriverError, PreparedStreamMetadataPublications)> {
         let checkpoint =
             match self
                 .runtime

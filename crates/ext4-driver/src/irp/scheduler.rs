@@ -215,6 +215,8 @@ pub(crate) enum WaitCondition {
     VolumeDurability,
     /// Clean close waits until journal space is clean.
     JournalClean,
+    /// Filesystem close is complete and its independent MMP release must acknowledge next.
+    MmpRelease,
     /// Per-handle terminal or durability barrier.
     Barrier {
         /// Typed barrier identity expected by the suspended operation.

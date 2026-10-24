@@ -16,8 +16,8 @@ use wdk_sys::STATUS_SUCCESS;
 
 use crate::irp::reactor::{
     CLOSE_HANDLE_BARRIER, CompletionEvent, CompletionOperation, ControlDeviceOperation,
-    IntentRequest, MountedVolumeOperation, OperationTransition, PreparedPublication,
-    PublicationAuthority, PublicationOutcome, ReactorTarget, WaitCondition,
+    IntentRequest, MMP_RELEASE_BARRIER, MountedVolumeOperation, OperationTransition,
+    PreparedPublication, PublicationAuthority, PublicationOutcome, ReactorTarget, WaitCondition,
 };
 use crate::irp::{
     AtomicOplockReservation, CreateCompletion, IrpCompletion, NamespaceOplockPlan,
@@ -6261,7 +6261,7 @@ impl PreparedPublication for MutationRequestOperation {
                         return PublicationOutcome::Rejected(self.abort_create(
                             owned,
                             Some(publication),
-                            CreateAbortContinuation::Complete(error.into()),
+                            CreateAbortContinuation::Complete(error),
                         ));
                     }
                 };

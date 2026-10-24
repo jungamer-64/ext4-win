@@ -53,6 +53,11 @@ enum CloseState {
         transition: PreparedVolumeStateTransition,
         close: Box<CleanCloseOperation>,
     },
+    /// Filesystem durability is complete; its retained proof awaits final MMP release.
+    ReleasingOwnership {
+        owned: OwnedIrp,
+        transition: PreparedVolumeStateTransition,
+    },
     /// Completion or failure consumed the request and its publication authority.
     Terminal,
 }
@@ -190,16 +195,15 @@ impl VolumeCloseOperation {
                     suspended: self,
                 }
             }
-            CleanCloseTransition::Complete(Ok(_durability)) => {
-                let result = access.publish_volume_state_transition(transition);
-                if result.is_ok() && self.terminal == CleanCloseTerminal::Dismount {
-                    MountedVolumeDevice::publish_dismount(self.device);
-                    MountedVolumeDevice::unregister_shutdown_notification(self.device);
-                    MountedVolumeDevice::complete_dismount(self.device);
+            CleanCloseTransition::Complete(Ok(durability)) => {
+                if let Err(error) = access.request_mmp_close(durability) {
+                    return Self::fail(owned, transition, error, access);
                 }
-                OperationTransition::Complete(
-                    owned.prepare_result(result.map(|()| IrpCompletion::EMPTY)),
-                )
+                self.state = CloseState::ReleasingOwnership { owned, transition };
+                OperationTransition::WaitForClosingDrain {
+                    condition: WaitCondition::MmpRelease,
+                    suspended: self,
+                }
             }
             CleanCloseTransition::Complete(Err(error)) => {
                 Self::fail(owned, transition, DriverError::from(error), access)
@@ -310,12 +314,39 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                 CompletionEvent::Core(event),
             ) => self.drive(owned, transition, close.advance(event), access),
             (
+                CloseState::ReleasingOwnership { owned, transition },
+                CompletionEvent::BarrierReleased(permit),
+            ) => {
+                if permit.into_identity() != MMP_RELEASE_BARRIER {
+                    return Self::fail(
+                        owned,
+                        transition,
+                        DriverError::InternalInvariantViolation,
+                        access,
+                    );
+                }
+                let _durability = match access.finish_mmp_close() {
+                    Ok(durability) => durability,
+                    Err(error) => return Self::fail(owned, transition, error, access),
+                };
+                let result = access.publish_volume_state_transition(transition);
+                if result.is_ok() && self.terminal == CleanCloseTerminal::Dismount {
+                    MountedVolumeDevice::publish_dismount(self.device);
+                    MountedVolumeDevice::unregister_shutdown_notification(self.device);
+                    MountedVolumeDevice::complete_dismount(self.device);
+                }
+                OperationTransition::Complete(
+                    owned.prepare_result(result.map(|()| IrpCompletion::EMPTY)),
+                )
+            }
+            (
                 CloseState::Draining {
                     owned, transition, ..
                 }
                 | CloseState::Sealed {
                     owned, transition, ..
-                },
+                }
+                | CloseState::ReleasingOwnership { owned, transition },
                 CompletionEvent::VolumeFailed(error),
             ) => Self::fail(owned, transition, error, access),
             _ => {
