@@ -373,6 +373,7 @@ impl VolumeRuntime {
     pub(crate) fn journal_is_clean(&self) -> bool {
         self.active_mutations.get().load(Ordering::Acquire) == 0
             && self.coordinator.journal_is_clean()
+            && !self.coordinator.has_pending_trim()
     }
 
     /// Acquires one current immutable epoch for a read or resolve operation.

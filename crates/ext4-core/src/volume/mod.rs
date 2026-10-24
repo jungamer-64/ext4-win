@@ -26,6 +26,12 @@ mod read;
 mod recovery;
 mod scope;
 mod transaction;
+mod trim;
+pub use trim::{
+    PendingTrim, PreparedTrim, TRIM_BATCH_BYTES, TRIM_BATCH_RANGES, TrimAdmission, TrimAlignment,
+    TrimBatchResult, TrimCompletion, TrimCompletionMismatch, TrimCursor, TrimFailure,
+    TrimIoOutcome, TrimRange, TrimRequest, TrimScanOperation, TrimScanTransition, TrimSelection,
+};
 
 pub use directory::{DirectoryScanCursor, ScannedDirectoryEntry};
 pub use event::{CheckpointLease, CommitLease, MutationLease, OperationEvent, VisibilityLease};

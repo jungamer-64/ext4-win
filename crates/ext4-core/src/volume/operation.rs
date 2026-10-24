@@ -546,6 +546,7 @@ impl MutationResolveReady {
             EpochReadView::committed(device, epoch),
             now,
             crypto,
+            context.exclusions,
         ))
     }
 

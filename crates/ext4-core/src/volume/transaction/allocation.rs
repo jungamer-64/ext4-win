@@ -139,7 +139,7 @@ impl MetadataMutation<'_, '_> {
                         .ok_or(Error::InvalidSuperblock)?;
                     cluster_bitmap_bit_state(bitmap.bytes.as_slice(), position)?
                 };
-                if occupied == BitmapBitState::Used {
+                if occupied == BitmapBitState::Used || self.exclusions.contains(cluster) {
                     continue;
                 }
                 // Home writes precede the metadata commit. A committed owner must remain intact

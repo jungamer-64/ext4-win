@@ -34,7 +34,10 @@ pub(in crate::volume) fn prepare_orphan_batch(
     StorageRequestSequence<OrphanBatchCompletion>,
     OrphanProgress,
 )> {
-    let mut mutation = MetadataMutation::begin(volume);
+    let mut mutation = MetadataMutation::begin(
+        volume,
+        super::super::trim::AllocationExclusions::unreserved(),
+    );
     let superblock = mutation.volume.superblock;
     let block_size = superblock.block_size();
     let raw = read_allocated_inode(&mut mutation.volume, target.tracking.inode)?;

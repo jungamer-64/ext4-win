@@ -324,6 +324,8 @@ enum MutationState {
 
 /// Private metadata, allocation, and serialization authority shared by ordinary mutation and recovery.
 struct MetadataMutation<'storage, 'epoch> {
+    /// Provisional allocation exclusions; reservation and commit recheck their current owner.
+    exclusions: super::trim::AllocationExclusions,
     /// Ephemeral view of the selected committed epoch and operation transcript.
     volume: EpochReadView<'storage, 'epoch>,
     /// Unique inode identities staged for rewrite; deleted records reserve their identity
@@ -391,6 +393,10 @@ impl ResolvedMutation {
     /// Tests both exclusive metadata freshness and any consumed mount-key authority.
     fn is_current(&self, coordinator: &MutationCoordinatorState) -> bool {
         coordinator.revalidate(&self.observed)
+            && self
+                .cluster_deltas
+                .iter()
+                .all(|delta| delta.delta <= 0 || !coordinator.trims.contains(delta.cluster))
             && self.key_version.is_none_or(|version| {
                 coordinator.resource_version(MutationResource::KEY_SET) == version
             })
@@ -1165,10 +1171,11 @@ impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
         volume: EpochReadView<'storage, 'epoch>,
         now: Ext4Timestamp,
         crypto: &'crypto mut dyn CryptographicOperation,
+        exclusions: super::trim::AllocationExclusions,
     ) -> Self {
         Self {
             state: MutationState::Ready,
-            mutation: MetadataMutation::begin(volume),
+            mutation: MetadataMutation::begin(volume, exclusions),
             now,
             crypto,
         }
@@ -1177,8 +1184,12 @@ impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
 
 impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
     /// Starts restart-local staging with no payload cryptographic authority.
-    fn begin(volume: EpochReadView<'storage, 'epoch>) -> Self {
+    fn begin(
+        volume: EpochReadView<'storage, 'epoch>,
+        exclusions: super::trim::AllocationExclusions,
+    ) -> Self {
         Self {
+            exclusions,
             volume,
             inode_updates: Vec::new(),
             block_bitmap_updates: Vec::new(),

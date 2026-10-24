@@ -10,6 +10,8 @@ use sha2::Digest as _;
 
 #[path = "concurrent_io/mmp.rs"]
 mod mmp;
+#[path = "concurrent_io/trim.rs"]
+mod trim;
 
 /// # Errors
 /// Propagates fixture, context and provisional pass construction failures.

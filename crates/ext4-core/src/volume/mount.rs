@@ -777,6 +777,8 @@ pub struct CommittedReadContext<'state> {
 /// and commit preparation revalidate against the current coordinator before any effect.
 #[derive(Debug)]
 pub struct MutationResolveContext<'state> {
+    /// Immutable exclusions captured without borrowing unrelated native preparation state.
+    pub(super) exclusions: super::trim::AllocationExclusions,
     /// Current immutable metadata and cache borrow; no journal publication capability is exposed.
     pub(super) cache: crate::MetadataCacheAccess<'state>,
 }
@@ -877,6 +879,8 @@ struct ReadObservation<'pass, 'state> {
 /// Each grant belongs to this mount session and is consumed even when a transition rejects it.
 #[derive(Debug)]
 pub struct MutationCoordinatorState {
+    /// Allocation admission reservations remain independent of committed ownership.
+    pub(super) trims: super::trim::TrimReservations,
     /// Fixed media authority; key-publication grants do not widen it.
     access: super::MediaAccess,
     /// Origin retained independently of on-disk UUID and local sequence numbers.
@@ -922,6 +926,7 @@ impl MutationCoordinatorState {
     /// Builds coordinator state after mount replay has produced a clean journal.
     pub(crate) fn new(journal: Journal<CleanJournal>, current: &CommittedEpoch) -> Self {
         Self {
+            trims: super::trim::TrimReservations::new(),
             mount: current.mount,
             access: current.access,
             journal: JournalCoordinatorState::Ready {
@@ -970,7 +975,10 @@ impl MutationCoordinatorState {
         {
             return Err(Error::StaleReadContext);
         }
-        Ok(MutationResolveContext { cache })
+        Ok(MutationResolveContext {
+            cache,
+            exclusions: self.trims.observe(),
+        })
     }
 
     /// Allocates one stable FIFO ticket without wrapping.
@@ -1509,7 +1517,9 @@ enum CleanClosePhase {
 }
 
 impl CleanCloseOperation {
-    /// Starts close preparation before the first effect-bearing request.
+    /// Starts finalization after the host has closed admission and drained admitted media effects,
+    /// including any pending discard. The host must retain that exclusion until close completes.
+    /// Native cache writeback and operation drain remain host responsibilities.
     #[must_use]
     pub const fn new(profile: &MountedProfile) -> Self {
         Self {
