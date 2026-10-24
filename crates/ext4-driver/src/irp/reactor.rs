@@ -3615,7 +3615,9 @@ impl CompletionReactor {
         };
         let cancellation = lower.cancellation_identity();
         self.begin_registering(index);
-        match lower.register_and_submit() {
+        match lower
+            .register_and_submit(|| self.with_target(ReactorTarget::acquire_storage_submission))
+        {
             Ok(()) => {
                 self.finish_registering_lower(index, PublishedReactorLower::Length(cancellation));
             }
@@ -3634,14 +3636,6 @@ impl CompletionReactor {
         index: usize,
         prepared: PreparedStorageCommand<ScheduledStorageOperation>,
     ) {
-        let _submission = match self.with_target(ReactorTarget::acquire_storage_submission) {
-            Ok(permit) => permit,
-            Err(error) => {
-                let (scheduled, request) = prepared.into_command().into_parts();
-                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
-                return;
-            }
-        };
         let cancellation = prepared.suspended().cancellation;
         if cancellation == EffectCancellation::AbortBeforeEffect
             && prepared.is_effect_bearing()
@@ -3689,7 +3683,9 @@ impl CompletionReactor {
         };
         let cancellation_identity = lower.cancellation_identity();
         self.begin_registering(index);
-        match lower.register_and_submit() {
+        match lower
+            .register_and_submit(|| self.with_target(ReactorTarget::acquire_storage_submission))
+        {
             Ok(()) => {
                 self.finish_registering_lower(
                     index,

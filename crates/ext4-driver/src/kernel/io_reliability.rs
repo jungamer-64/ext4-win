@@ -145,7 +145,10 @@ mod tests {
         for word in [2, 3, 4002, 4003] {
             let queried = core::cell::Cell::new(false);
             assert_eq!(
-                NativeIoSnapshot(word).policy(|| { queried.set(true); u64::MAX }),
+                NativeIoSnapshot(word).policy(|| {
+                    queried.set(true);
+                    u64::MAX
+                }),
                 NativeIoPolicy::Unavailable
             );
             assert!(!queried.get());
@@ -159,7 +162,10 @@ mod tests {
             let queried = core::cell::Cell::new(false);
             assert_eq!(snapshot.0, u64::from(policy.raw()));
             assert_eq!(
-                snapshot.policy(|| { queried.set(true); u64::MAX }),
+                snapshot.policy(|| {
+                    queried.set(true);
+                    u64::MAX
+                }),
                 policy
             );
             assert!(!queried.get());

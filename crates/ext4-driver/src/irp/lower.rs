@@ -1129,14 +1129,17 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     /// Registers and immediately submits the private IRP.
     /// # Errors
     ///
-    /// Admission is checked after every allocation and retained through IoCallDriver's return.
+    /// Admission is checked after private-request allocation and retained through IoCallDriver's return.
     /// Admission or registration failure releases the IRP, MDL and envelope locally and returns the
     /// still-owned operation. No request has reached a lower driver on either failure.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub fn register_and_submit<P>(self, authorize: impl FnOnce() -> Result<P, DriverError>) -> Result<(), LowerSubmissionError<O>> {
+    pub fn register_and_submit<P>(
+        self,
+        authorize: impl FnOnce() -> Result<P, DriverError>,
+    ) -> Result<(), LowerSubmissionError<O>> {
         let _submission = match authorize() {
             Ok(permit) => permit,
             Err(error) => return Err(self.reject_unsubmitted(error)),
@@ -1172,9 +1175,17 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
 
     /// Retires an unsubmitted private IRP while preserving the caller's unique completion owner.
     fn reject_unsubmitted(self, error: DriverError) -> LowerSubmissionError<O> {
-        let Self { completion_owner: _, target: _, irp, envelope } = self;
+        let Self {
+            completion_owner: _,
+            target: _,
+            irp,
+            envelope,
+        } = self;
         drop(irp);
-        LowerSubmissionError { error, suspended: LowerCompletionEnvelope::reclaim_unsubmitted(envelope) }
+        LowerSubmissionError {
+            error,
+            suspended: LowerCompletionEnvelope::reclaim_unsubmitted(envelope),
+        }
     }
 
     /// Irreversibly transfers envelope and IRP release ownership to completion.
