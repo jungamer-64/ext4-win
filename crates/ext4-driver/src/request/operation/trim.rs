@@ -10,25 +10,25 @@ use ext4_core::{
 #[derive(Debug)]
 enum TrimState {
     /// No physical effect remains; a scheduler yield may admit a fresh bounded batch.
-    Ready(OwnedIrp),
+    Ready(TrimOwner),
     /// Metadata read owns a write-free free-space scan.
     Scanning {
         /// Retains the reply buffer and file object across metadata reads.
-        owned: OwnedIrp,
+        owned: TrimOwner,
         /// Pins one metadata epoch; a changed epoch forces a fresh scan.
         scan: TrimScanOperation,
     },
     /// Journal or another discard still occupies admission; a stale selection will be rescanned.
     Waiting {
         /// Retains upper notification authority while no discard lease exists.
-        owned: OwnedIrp,
+        owned: TrimOwner,
         /// A retained selection must be revalidated when admission becomes available.
         selection: Option<TrimSelection>,
     },
     /// Neither cancellation nor media revocation can drop this physical completion obligation.
     InFlight {
         /// Reply delivery must wait for the lower command's physical completion.
-        owned: OwnedIrp,
+        owned: TrimOwner,
         /// Only the matching completion releases allocation exclusions, including after revocation.
         pending: ext4_core::PendingTrim,
     },

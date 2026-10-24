@@ -157,7 +157,7 @@ enum MountRequestState {
         /// Concrete lower storage geometry used by core requests.
         devices: MountedStorage,
         /// Suspended consuming core mount operation.
-        mount: Box<MountOperation>,
+        mount: MountRecovery,
     },
     /// One shared candidate awaits its device-length completion.
     DiscoveringCandidateLength {
@@ -182,7 +182,7 @@ enum MountRequestState {
         /// Primary storage owner.
         devices: MountedStorage,
         /// Core operation awaiting the external journal.
-        mount: Box<MountOperation>,
+        mount: MountRecovery,
         /// Required journal identity and format.
         requirement: ExternalJournalRequirement,
     },
@@ -195,7 +195,7 @@ enum MountRequestState {
         /// Primary storage owner, not yet carrying the external lease.
         devices: MountedStorage,
         /// Core mount suspended in `AwaitingExternal`.
-        mount: Box<MountOperation>,
+        mount: MountRecovery,
         /// Exact filesystem-derived validation requirement.
         requirement: ExternalJournalRequirement,
         /// Exclusive handle and referenced file object.
@@ -222,7 +222,7 @@ struct ExternalMountContext {
     /// Primary storage lifetime owner.
     devices: MountedStorage,
     /// Core mount suspended at external-journal discovery.
-    mount: Box<MountOperation>,
+    mount: MountRecovery,
     /// Exact filesystem-derived UUID/profile/user requirement.
     requirement: ExternalJournalRequirement,
     /// Deduplicated shared-open candidate set.
@@ -241,7 +241,7 @@ struct ExclusiveExternalProbeContext {
     /// Primary storage lifetime owner, not yet carrying the external lease.
     devices: MountedStorage,
     /// Core mount suspended at external-journal discovery.
-    mount: Box<MountOperation>,
+    mount: MountRecovery,
     /// Lower route with an already validated device length.
     external: LowerStorageDevice,
     /// Unique share-zero handle and referenced FILE_OBJECT.
