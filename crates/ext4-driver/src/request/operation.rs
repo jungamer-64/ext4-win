@@ -87,6 +87,7 @@ pub(crate) use mdl::mdl;
 mod cleanup;
 mod close;
 mod keys;
+mod mmp;
 
 mod volume_close;
 pub(crate) use volume_close::{VolumeCloseRequest, volume_close};

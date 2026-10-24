@@ -10,6 +10,8 @@ use crate::memory::DriverVec;
 
 /// Fixed execution storage on one device, partitioned to preserve paging and finalization progress.
 pub(crate) const MAX_OPERATIONS: usize = 64;
+/// Physical ownership maintenance cannot depend on any user, paging or finalization request slot.
+const OWNERSHIP_SLOTS: core::ops::Range<usize> = 45..46;
 
 /// Execution capacity belongs to independent progress responsibilities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,7 +30,7 @@ impl ExecutionClass {
     /// Each class owns disjoint execution and notification slots.
     pub(crate) const fn slots(self) -> core::ops::Range<usize> {
         match self {
-            Self::Ordinary => 0..46,
+            Self::Ordinary => 0..OWNERSHIP_SLOTS.start,
             Self::Paging => 47..63,
             Self::Release => 46..47,
             Self::Finalization => 63..64,
@@ -415,12 +417,38 @@ impl Scheduler {
         if self.draining && class != ExecutionClass::Finalization {
             return None;
         }
-        let (index, slot) = self.slots.iter_mut().enumerate().find(|(index, slot)| {
-            class.slots().contains(index) && matches!(slot.phase, Phase::Vacant)
-        })?;
+        self.reserve_range(class.slots(), class != ExecutionClass::Finalization)
+    }
+
+    /// Reserves the independent, completion-owned physical ownership operation.
+    pub(crate) fn reserve_ownership(&mut self) -> Option<SlotId> {
+        if self.draining {
+            return None;
+        }
+        self.reserve_range(OWNERSHIP_SLOTS, true)
+    }
+
+    /// Whether maintenance can progress while every request class is occupied.
+    pub(crate) fn ownership_available(&self) -> bool {
+        !self.draining
+            && self.slots.iter().enumerate().any(|(index, slot)| {
+                OWNERSHIP_SLOTS.contains(&index) && matches!(slot.phase, Phase::Vacant)
+            })
+    }
+
+    /// Establishes generation and actor ownership once for either request or maintenance admission.
+    fn reserve_range(
+        &mut self,
+        range: core::ops::Range<usize>,
+        cancel_enabled: bool,
+    ) -> Option<SlotId> {
+        let (index, slot) =
+            self.slots.iter_mut().enumerate().find(|(index, slot)| {
+                range.contains(index) && matches!(slot.phase, Phase::Vacant)
+            })?;
         slot.generation = slot.generation.checked_add(1)?;
         slot.cancel_pending = false;
-        slot.cancel_enabled = class != ExecutionClass::Finalization;
+        slot.cancel_enabled = cancel_enabled;
         slot.admission = None;
         slot.predecessor = None;
         slot.phase = Phase::Actor;

@@ -683,13 +683,7 @@ impl VolumeRuntime {
     /// # Errors
     /// Records terminal ownership failure before returning a failed handoff.
     pub(crate) fn start_mmp_action(&mut self) -> DriverResult<Option<ext4_core::MmpOperation>> {
-        let now = match crate::kernel::time::mmp_time() {
-            Ok(now) => now,
-            Err(error) => {
-                self.revoke_media_ownership();
-                return Err(error);
-            }
-        };
+        let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
         match self.ownership.next_action(now) {
             Ok(operation) => {
                 self.publish_reliability();

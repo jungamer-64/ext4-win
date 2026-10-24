@@ -847,19 +847,19 @@ unsafe impl Sync for OperationTimerEnvelope {}
 
 /// Actor-owned arming state for the one shared delayed-close timer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DelayedCloseTimerState {
+enum ActorTimerState<D> {
     /// No timer or DPC event remains outstanding.
     Idle,
-    /// The native timer has been set and its DPC event has not yet been consumed.
-    Armed,
+    /// Native ownership and the exact actor observation persist until cancellation or DPC drain.
+    Armed(D),
 }
 
-impl DelayedCloseTimerState {
+impl<D> ActorTimerState<D> {
     /// Consumes the idle state when the actor sets the native one-shot timer.
-    fn arm(self) -> Self {
+    fn arm(self, deadline: D) -> Self {
         match self {
-            Self::Idle => Self::Armed,
-            Self::Armed => {
+            Self::Idle => Self::Armed(deadline),
+            Self::Armed(_) => {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             }
         }
@@ -868,15 +868,26 @@ impl DelayedCloseTimerState {
     /// Consumes one cancelled or DPC-published native timer obligation.
     fn disarm(self) -> Self {
         match self {
-            Self::Armed => Self::Idle,
+            Self::Armed(_) => Self::Idle,
             Self::Idle => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
         }
     }
 }
 
-/// Address-stable timer/DPC envelope shared by every handle-free native stream resident.
+/// Each independently owned timer publishes only its own actor event.
+#[derive(Clone, Copy, Debug)]
+enum ActorTimerPurpose {
+    /// Rechecks due handle-free native streams.
+    DelayedClose,
+    /// Drives record heartbeat or revokes an outstanding operation at its acknowledgement deadline.
+    Ownership,
+}
+
+/// Address-stable timer/DPC envelope whose immutable purpose selects an actor-owned continuation.
 #[repr(C)]
-struct DelayedCloseTimerEnvelope {
+struct ActorTimerEnvelope {
+    /// Immutable callback route established before timer initialization or publication.
+    purpose: ActorTimerPurpose,
     /// Native one-shot timer.
     timer: UnsafeCell<wdk_sys::KTIMER>,
     /// Native DPC that publishes only the timer-expired event.
@@ -885,10 +896,11 @@ struct DelayedCloseTimerEnvelope {
     reactor: AtomicPtr<CompletionReactor>,
 }
 
-impl DelayedCloseTimerEnvelope {
+impl ActorTimerEnvelope {
     /// Creates inert storage completed after the containing reactor reaches its final address.
-    fn inert() -> Self {
+    fn inert(purpose: ActorTimerPurpose) -> Self {
         Self {
+            purpose,
             timer: UnsafeCell::new(wdk_sys::KTIMER::default()),
             dpc: UnsafeCell::new(wdk_sys::KDPC::default()),
             reactor: AtomicPtr::new(core::ptr::null_mut()),
@@ -914,26 +926,26 @@ impl DelayedCloseTimerEnvelope {
             // SAFETY: The DPC context remains bound to this stable envelope through DPC flush.
             ffi::KeInitializeDpc(
                 self.dpc.get(),
-                Some(delayed_close_timer_dpc),
+                Some(actor_timer_dpc),
                 core::ptr::from_ref(self).cast_mut().cast::<c_void>(),
             );
         }
         self.reactor.store(reactor.as_ptr(), Ordering::Release);
     }
 
-    /// Arms the one shared one-shot poll after the actor observed a nonempty delayed-close set.
+    /// Arms a nonzero relative millisecond delay for the exact idle-to-armed transition.
     #[cfg(not(test))]
     #[expect(
         unsafe_code,
         reason = "the actor exclusively owns the timer's idle-to-armed transition"
     )]
-    fn arm(&self) {
+    fn arm(&self, delay_millis: u32) {
         let already_armed = unsafe {
             // SAFETY: Actor state proves this timer is idle before the one-shot set operation.
             ffi::KeSetTimer(
                 self.timer.get(),
                 wdk_sys::LARGE_INTEGER {
-                    QuadPart: -1_000_000_i64,
+                    QuadPart: i64::from(delay_millis.max(1)).saturating_mul(10_000).saturating_neg(),
                 },
                 self.dpc.get(),
             )
@@ -963,7 +975,7 @@ impl DelayedCloseTimerEnvelope {
 )]
 // SAFETY: Initialization fixes the envelope address before publication. Only the reactor actor
 // arms/cancels it, and the DPC touches atomic callback state until terminal DPC flush.
-unsafe impl Sync for DelayedCloseTimerEnvelope {}
+unsafe impl Sync for ActorTimerEnvelope {}
 
 /// Device-specific authority retained by the WDK reactor shell, outside scheduler state.
 #[derive(Debug)]
@@ -1131,9 +1143,15 @@ pub(crate) struct CompletionReactor {
     /// One address-stable native timer envelope per bounded active slot.
     operation_timers: [OperationTimerEnvelope; MAX_OPERATIONS],
     /// One native timer shared by the complete mounted-volume delayed-close set.
-    delayed_close_timer: DelayedCloseTimerEnvelope,
+    delayed_close_timer: ActorTimerEnvelope,
     /// Arming state mutated only by the sole reactor actor.
-    delayed_close_timer_state: UnsafeCell<DelayedCloseTimerState>,
+    delayed_close_timer_state: UnsafeCell<ActorTimerState<()>>,
+    /// Dedicated record timer never consumes an ordinary scheduler slot or worker.
+    ownership_timer: ActorTimerEnvelope,
+    /// The armed record deadline and its one native cancellation/DPC obligation.
+    ownership_timer_state: UnsafeCell<ActorTimerState<ext4_core::MmpDeadline>>,
+    /// Callback publication drained before the owning device extension can be released.
+    ownership_timer_ready: AtomicU8,
     /// One address-stable top-level cancel envelope per bounded active slot.
     cancel_envelopes: [ActiveCancelEnvelope; MAX_OPERATIONS],
     /// Device object owning this stable extension.
@@ -1466,7 +1484,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
-            destination.write(DelayedCloseTimerEnvelope::inert());
+            destination.write(ActorTimerEnvelope::inert());
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
@@ -1474,7 +1492,31 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
-            destination.write(UnsafeCell::new(DelayedCloseTimerState::Idle));
+            destination.write(UnsafeCell::new(ActorTimerState::Idle));
+        }
+        let destination = unsafe {
+            // SAFETY: Exclusive final-address initialization owns this disjoint native timer.
+            core::ptr::addr_of_mut!((*reactor).ownership_timer)
+        };
+        unsafe {
+            // SAFETY: No callback exists until the subsequent final-address timer initialization.
+            destination.write(ActorTimerEnvelope::inert(ActorTimerPurpose::Ownership));
+        }
+        let destination = unsafe {
+            // SAFETY: Exclusive initialization owns the actor's timer obligation and observation.
+            core::ptr::addr_of_mut!((*reactor).ownership_timer_state)
+        };
+        unsafe {
+            // SAFETY: This field is initialized once before actor or callback publication.
+            destination.write(UnsafeCell::new(ActorTimerState::Idle));
+        }
+        let destination = unsafe {
+            // SAFETY: Exclusive initialization owns this callback publication atomic.
+            core::ptr::addr_of_mut!((*reactor).ownership_timer_ready)
+        };
+        unsafe {
+            // SAFETY: No DPC or actor can observe this field before initialization completes.
+            destination.write(AtomicU8::new(0));
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
@@ -1619,6 +1661,9 @@ impl CompletionReactor {
             thread_handle: _,
             delayed_close_timer: _,
             delayed_close_timer_state: _,
+            ownership_timer: _,
+            ownership_timer_state: _,
+            ownership_timer_ready: _,
             device: _,
             trace: _,
             target: _,
@@ -1666,6 +1711,8 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: The shared timer and reactor have both reached their final addresses.
             reactor.delayed_close_timer.initialize(reactor_storage);
+            // SAFETY: This independently routed timer shares the same final-address owner lifetime.
+            reactor.ownership_timer.initialize(reactor_storage);
         }
         #[cfg(not(test))]
         for envelope in &reactor.cancel_envelopes {
@@ -2479,7 +2526,7 @@ impl CompletionReactor {
             || reactor.paging_pending.load(Ordering::Acquire) != 0
             || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
-            || reactor.delayed_close_timer_state() != DelayedCloseTimerState::Idle
+            || reactor.delayed_close_timer_state() != ActorTimerState::Idle
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
             || !completion_list_empty
             || !length_completion_list_empty
@@ -2517,7 +2564,7 @@ impl CompletionReactor {
             || reactor.paging_pending.load(Ordering::Acquire) != 0
             || reactor.terminal_pending.load(Ordering::Acquire) != 0
             || reactor.has_active()
-            || reactor.delayed_close_timer_state() != DelayedCloseTimerState::Idle
+            || reactor.delayed_close_timer_state() != ActorTimerState::Idle
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -2626,7 +2673,7 @@ impl CompletionReactor {
                 && self.paging_pending.load(Ordering::Acquire) == 0
                 && self.terminal_pending.load(Ordering::Acquire) == 0
                 && !self.has_active()
-                && self.delayed_close_timer_state() == DelayedCloseTimerState::Idle
+                && self.delayed_close_timer_state() == ActorTimerState::Idle
                 && self.delayed_close_ready.load(Ordering::Acquire) == 0
                 && unsafe {
                     // SAFETY: The sole actor owns this initialized notification backlog.
@@ -2683,7 +2730,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "the sole reactor actor owns this interior mutable timer state"
     )]
-    fn delayed_close_timer_state(&self) -> DelayedCloseTimerState {
+    fn delayed_close_timer_state(&self) -> ActorTimerState<()> {
         unsafe {
             // SAFETY: Production callers are the sole reactor actor. Host tests remain
             // single-threaded while inspecting initialized reactor storage.
@@ -2697,7 +2744,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "the sole reactor actor owns this interior mutable timer state"
     )]
-    fn set_delayed_close_timer_state(&self, state: DelayedCloseTimerState) {
+    fn set_delayed_close_timer_state(&self, state: ActorTimerState<()>) {
         unsafe {
             // SAFETY: Only the dedicated reactor actor mutates this field after publication.
             *self.delayed_close_timer_state.get() = state;
@@ -2707,7 +2754,7 @@ impl CompletionReactor {
     /// Cancels the shared timer as reactor drain begins, or waits for its already-queued DPC.
     #[cfg(not(test))]
     fn cancel_delayed_close_timer(&self) -> bool {
-        if self.delayed_close_timer_state() == DelayedCloseTimerState::Idle {
+        if self.delayed_close_timer_state() == ActorTimerState::Idle {
             return false;
         }
         if self.delayed_close_timer.cancel() {
@@ -2723,7 +2770,7 @@ impl CompletionReactor {
     fn maintain_delayed_close(&self) -> bool {
         let mut progressed = false;
         if self.delayed_close_ready.swap(0, Ordering::AcqRel) != 0 {
-            if self.delayed_close_timer_state() != DelayedCloseTimerState::Armed {
+            if self.delayed_close_timer_state() != ActorTimerState::Armed {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
             self.set_delayed_close_timer_state(self.delayed_close_timer_state().disarm());
@@ -2735,7 +2782,7 @@ impl CompletionReactor {
         }
 
         let pending = self.with_target(ReactorTarget::delayed_close_pending);
-        if !pending && self.delayed_close_timer_state() == DelayedCloseTimerState::Armed {
+        if !pending && self.delayed_close_timer_state() == ActorTimerState::Armed {
             progressed |= self.cancel_delayed_close_timer();
         }
         if self.state() == ReactorState::Draining {
@@ -2744,7 +2791,7 @@ impl CompletionReactor {
             }
             return progressed;
         }
-        if pending && self.delayed_close_timer_state() == DelayedCloseTimerState::Idle {
+        if pending && self.delayed_close_timer_state() == ActorTimerState::Idle {
             self.delayed_close_timer.arm();
             self.set_delayed_close_timer_state(self.delayed_close_timer_state().arm());
             progressed = true;
@@ -4651,23 +4698,23 @@ fn driver_error_to_core(error: DriverError) -> ext4_core::Error {
     }
 }
 
-/// DPC callback publishing the one shared delayed-close timer event.
+/// DPC callback publishing only the initialized timer purpose, without consuming actor authority.
 /// # Safety
 ///
-/// `context` must point to the address-stable [`DelayedCloseTimerEnvelope`] installed in the
+/// `context` must point to the address-stable [`ActorTimerEnvelope`] installed in the
 /// reactor whose teardown flushes queued DPCs before releasing the containing extension.
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "the native DPC context identifies one stable reactor-owned timer envelope"
 )]
-unsafe extern "C" fn delayed_close_timer_dpc(
+unsafe extern "C" fn actor_timer_dpc(
     _dpc: *mut wdk_sys::KDPC,
     context: PVOID,
     _argument_one: PVOID,
     _argument_two: PVOID,
 ) {
-    let Some(timer) = NonNull::new(context.cast::<DelayedCloseTimerEnvelope>()) else {
+    let Some(timer) = NonNull::new(context.cast::<ActorTimerEnvelope>()) else {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
     let timer = unsafe {
@@ -4681,8 +4728,11 @@ unsafe extern "C" fn delayed_close_timer_dpc(
         // SAFETY: Reactor teardown cancels the timer and flushes DPCs before storage is released.
         reactor.as_ref()
     };
-    if reactor
-        .delayed_close_ready
+    let ready = match timer.purpose {
+        ActorTimerPurpose::DelayedClose => &reactor.delayed_close_ready,
+        ActorTimerPurpose::Ownership => &reactor.ownership_timer_ready,
+    };
+    if ready
         .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
     {
@@ -5139,7 +5189,7 @@ mod tests {
 
     use super::{
         AdmittedOperation, CompletionEvent, CompletionOperation, CompletionReactor,
-        DelayedCloseTimerState, ExecutionClass, HandleOperationLane, MAX_OPERATIONS,
+        ActorTimerState, ExecutionClass, HandleOperationLane, MAX_OPERATIONS,
         OperationAdmission, OperationTransition, PendingIrpSelection, PreparedPublication,
         PublicationAuthority, SlotPayload, SuspendedOperation, driver_error_to_core,
         initialize_list_head, insert_tail_list, list_is_empty, remove_head_list, slot_bit,
@@ -5287,9 +5337,9 @@ mod tests {
     /// Panics if the shared delayed-close timer loses its one-obligation state transition.
     #[test]
     fn delayed_close_timer_has_one_explicit_arming_obligation() {
-        let armed = DelayedCloseTimerState::Idle.arm();
-        assert_eq!(armed, DelayedCloseTimerState::Armed);
-        assert_eq!(armed.disarm(), DelayedCloseTimerState::Idle);
+        let armed = ActorTimerState::Idle.arm();
+        assert_eq!(armed, ActorTimerState::Armed);
+        assert_eq!(armed.disarm(), ActorTimerState::Idle);
     }
 
     /// # Panics

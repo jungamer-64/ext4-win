@@ -1748,6 +1748,7 @@ impl MountedVolumeAccess<'_> {
     /// # Errors
     /// Returns the first terminal ownership failure instead of an indefinite close wait.
     pub(crate) fn mmp_close_ready(&self) -> DriverResult<bool> {
+        self.authorize_storage()?;
         self.runtime.mmp_close_ready()
     }
     /// Consumes combined filesystem and ownership durability before the native close publication.
