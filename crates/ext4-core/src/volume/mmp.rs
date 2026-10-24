@@ -184,13 +184,25 @@ impl MmpLease {
     /// # Errors
     /// A foreign completion returns both the still-live lease and unchanged close proof. Once an
     /// operation is returned it owns both values; a failed or cancelled release cannot recreate them.
-    pub fn release(self, durability: super::CleanCloseDurability) -> core::result::Result<MmpOperation, (Error, Self, super::CleanCloseDurability)> {
-        if self.owner.mount != durability.mount { return Err((Error::ClusterReferenceConflict, self, durability)); }
+    #[expect(
+        clippy::result_large_err,
+        reason = "foreign-scope rejection returns both ownership values without allocating or losing authority"
+    )]
+    pub fn release(
+        self,
+        durability: super::CleanCloseDurability,
+    ) -> core::result::Result<MmpOperation, (Error, Self, super::CleanCloseDurability)> {
+        if self.owner.mount != durability.mount {
+            return Err((Error::ClusterReferenceConflict, self, durability));
+        }
         Ok(MmpOperation {
             effect: MmpEffect::None,
             parameters: self.parameters,
             owner: self.owner,
-            action: Action::Release { deadline: self.valid_until_millis, durability },
+            action: Action::Release {
+                deadline: self.valid_until_millis,
+                durability,
+            },
             state: State::Start,
         })
     }
@@ -486,14 +498,9 @@ impl MmpOperation {
         if matches!(event, MmpEvent::Cancel) {
             return self.failed(Error::OperationCancelled);
         }
-        if matches!(
-            self.state,
-            State::Start
-                | State::Reading {
-                    purpose: ReadPurpose::Initial,
-                    ..
-                }
-        ) && matches!(self.action, Action::Renew(deadline) | Action::Release { deadline, .. } if now.monotonic_millis >= deadline)
+        if self
+            .io_deadline()
+            .is_some_and(|deadline| now.monotonic_millis >= deadline)
         {
             return self.failed(Error::MmpOwnershipLost);
         }
@@ -543,9 +550,11 @@ impl MmpOperation {
                 self.effect = MmpEffect::Durable(after.change());
                 return match after {
                     AfterWrite::Release => {
-                        let Action::Release { durability, .. } = self.action else { return self.failed(Error::DeviceIo); };
+                        let Action::Release { durability, .. } = self.action else {
+                            return self.failed(Error::DeviceIo);
+                        };
                         MmpTransition::Complete(Ok(MmpCompletion::Released(durability)))
-                    },
+                    }
                     AfterWrite::Claim(seconds) => self.wait(ReadPurpose::VerifyClaim, seconds, now),
                     AfterWrite::Renewal(deadline) => self.read(ReadPurpose::VerifyLease(deadline)),
                 };
@@ -679,6 +688,27 @@ impl MmpOperation {
             Action::Release { .. } => (mmp::CLEAN, AfterWrite::Release),
         };
         self.write(buffer, sequence, after, now)
+    }
+    /// Each further effect must fit the last acknowledged window, or the initial update's window.
+    fn io_deadline(&self) -> Option<u64> {
+        match &self.action {
+            Action::Renew(deadline) | Action::Release { deadline, .. } => Some(*deadline),
+            Action::Acquire(_) => match self.state {
+                State::Writing {
+                    after: AfterWrite::Renewal(deadline),
+                    ..
+                }
+                | State::Flushing {
+                    after: AfterWrite::Renewal(deadline),
+                    ..
+                }
+                | State::Reading {
+                    purpose: ReadPurpose::VerifyLease(deadline),
+                    ..
+                } => Some(deadline),
+                _ => None,
+            },
+        }
     }
     /// Establishes a new deadline from submission time, including lower write/flush/read latency.
     fn refresh(mut self: Box<Self>, buffer: Vec<u8>, now: MmpTime) -> MmpTransition {

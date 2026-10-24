@@ -33,8 +33,6 @@ enum OwnershipPhase {
     Releasing {
         /// No observation may extend the release operation's previously acknowledged window.
         deadline: MmpDeadline,
-        /// Upper close acknowledgment waits for the independent ownership-release result.
-        durability: CleanCloseDurability,
     },
     /// Both filesystem close and any required record release completed, awaiting the native close.
     Released(CleanCloseDurability),
@@ -159,11 +157,12 @@ impl MediaOwnership {
                 durability,
             } => {
                 lease.authorize(now)?;
-                self.0 = OwnershipPhase::Releasing {
-                    deadline: lease.deadline(),
-                    durability,
-                };
-                Ok(Some(lease.release()))
+                let deadline = lease.deadline();
+                let operation = lease
+                    .release(durability)
+                    .map_err(|(error, _lease, _durability)| error)?;
+                self.0 = OwnershipPhase::Releasing { deadline };
+                Ok(Some(operation))
             }
             _ => Err(Error::ClusterReferenceConflict),
         }
@@ -204,13 +203,7 @@ impl MediaOwnership {
                     durability,
                 }
             }
-            (
-                OwnershipPhase::Releasing {
-                    deadline,
-                    durability,
-                },
-                MmpCompletion::Released,
-            ) => {
+            (OwnershipPhase::Releasing { deadline }, MmpCompletion::Released(durability)) => {
                 if deadline.remaining_millis(now) == 0 {
                     return Err(Error::MmpOwnershipLost);
                 }

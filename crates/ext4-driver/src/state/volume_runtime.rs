@@ -729,6 +729,7 @@ impl VolumeRuntime {
         self.ownership
             .request_close(durability)
             .map_err(|(error, _durability)| error)?;
+        self.coordinator.revoke_media_ownership();
         self.publish_reliability();
         Ok(())
     }

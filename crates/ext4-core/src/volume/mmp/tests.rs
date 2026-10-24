@@ -109,6 +109,86 @@ impl Device {
             };
         }
     }
+    /// Completes actual filesystem marker writes and flushes before obtaining release authority.
+    /// # Errors
+    /// Returns independent filesystem-vector, transfer or clean-close protocol failure.
+    fn closed(lease: &MmpLease) -> Result<crate::CleanCloseDurability> {
+        let mut primary = [0_u8; 1024];
+        for (offset, value) in [
+            (0, 16),
+            (4, 128),
+            (24, 2),
+            (28, 2),
+            (32, 32768),
+            (36, 32768),
+            (40, 16),
+            (76, 1),
+            (84, 11),
+            (92, 4),
+            (96, 0x46),
+            (224, 8),
+        ] {
+            put_le_u32(&mut primary, DiskOffset::new(offset), value)?;
+        }
+        for (offset, value) in [(56, 0xef53), (58, 1), (88, 256)] {
+            put_le_u16(&mut primary, DiskOffset::new(offset), value)?;
+        }
+        let superblock = crate::disk_format::superblock::Superblock::parse_read_write(&primary)?;
+        let profile = crate::volume::mount::MountedProfile::new(
+            &lease.owner.mount,
+            superblock,
+            crate::DeviceLength::from_bytes(128 * 4096),
+            StorageTarget::Filesystem,
+            MediaAccess::ReadWrite,
+        );
+        let mut transition = memory::try_box(crate::CleanCloseOperation::new(&profile))?
+            .advance(crate::OperationEvent::Admitted);
+        let mut writes = 0_u32;
+        let mut flushes = 0_u32;
+        loop {
+            transition = match transition {
+                crate::CleanCloseTransition::SubmitLower {
+                    mut request,
+                    suspended,
+                } => {
+                    match &mut request {
+                        StorageRequest::Read { offset, buffer, .. } if offset.get() == 1024 => {
+                            memory::copy_exact(buffer, &primary)?
+                        }
+                        StorageRequest::Write { offset, buffer, .. }
+                            if offset.get() == 1024 && flushes == 1 =>
+                        {
+                            memory::copy_exact(&mut primary, buffer)?;
+                            if crate::disk::endian::le_u32(&primary, DiskOffset::new(96))? & 4 != 0
+                                || crate::disk::endian::le_u16(&primary, DiskOffset::new(58))? & 1
+                                    == 0
+                            {
+                                return Err(Error::InvalidSuperblock);
+                            }
+                            writes = writes.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                        }
+                        StorageRequest::Flush { .. } => {
+                            flushes = flushes.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                        }
+                        _ => return Err(Error::DeviceIo),
+                    }
+                    let count = request.byte_count();
+                    suspended.advance(crate::OperationEvent::StorageCompleted(
+                        StorageCompletion::success(
+                            CompletedStorageTransfer::from_request(request),
+                            count,
+                        ),
+                    ))
+                }
+                crate::CleanCloseTransition::Complete(result) => {
+                    if writes != 1 || flushes != 2 {
+                        return Err(Error::DeviceIo);
+                    }
+                    return result;
+                }
+            };
+        }
+    }
     /// Completes one whole acquire operation with no injected peer activity.
     /// # Errors
     /// Returns the actual protocol outcome, including ownership competition.
@@ -186,11 +266,16 @@ fn acquire_renew_release_preserve_physical_block_and_durability() {
         let lease = pending
             .complete(renewal, device.now())
             .map_err(|(error, _renewal)| error)?;
-        let operation = memory::try_box(lease.release())?;
+        let durability = Device::closed(&lease)?;
+        let operation = memory::try_box(
+            lease
+                .release(durability)
+                .map_err(|(error, _lease, _durability)| error)?,
+        )?;
         let transition = operation.advance(MmpEvent::Start, device.now());
         assert!(matches!(
             device.run(transition, |_device, _step| Ok(()))?,
-            MmpCompletion::Released
+            MmpCompletion::Released(_durability)
         ));
         assert_eq!(
             MmpRecord::parse(&device.durable, None)?.sequence,
@@ -252,7 +337,10 @@ fn revocation_and_latency_consume_authority() {
             device.effects.clear();
             put_le_u32(&mut device.bytes, DiskOffset::new(4), 99)?;
             let operation = memory::try_box(if release {
-                lease.release()
+                let durability = Device::closed(&lease)?;
+                lease
+                    .release(durability)
+                    .map_err(|(error, _lease, _durability)| error)?
             } else {
                 lease.renew(device.now())?.1
             })?;
@@ -532,6 +620,85 @@ fn renewal_proofs_are_bound_to_their_originating_session() {
             .complete(renewal, second.now())
             .map_err(|(error, _proof)| error)?;
         lease.authorize(second.now())?;
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if equal-format foreign filesystem completion can retire another live mount's owner.
+#[test]
+fn release_consumes_only_its_own_completed_filesystem_scope() {
+    let result = (|| -> Result<()> {
+        let mut first = Device::new(mmp::CLEAN)?;
+        let mut second = Device::new(mmp::CLEAN)?;
+        let first_lease = first.acquired()?;
+        let second_lease = second.acquired()?;
+        let close = Device::closed(&second_lease)?;
+        let Err((Error::ClusterReferenceConflict, first_lease, close)) = first_lease.release(close)
+        else {
+            return Err(Error::DeviceIo);
+        };
+        first_lease.authorize(first.now())?;
+        let operation = second_lease
+            .release(close)
+            .map_err(|(error, _lease, _close)| error)?;
+        let transition = memory::try_box(operation)?.advance(MmpEvent::Start, second.now());
+        assert!(matches!(
+            second.run(transition, |_device, _step| Ok(()))?,
+            MmpCompletion::Released(_close)
+        ));
+        assert_eq!(
+            MmpRecord::parse(&second.durable, None)?.sequence,
+            mmp::CLEAN
+        );
+        assert_ne!(MmpRecord::parse(&first.durable, None)?.sequence, mmp::CLEAN);
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
+/// Fails if a late ownership-write completion emits another effect after its admitted window ends.
+#[test]
+fn delayed_record_write_cannot_submit_a_post_expiry_flush() {
+    let result = (|| -> Result<()> {
+        for release in [false, true] {
+            let mut device = Device::new(mmp::CLEAN)?;
+            let lease = device.acquired()?;
+            let operation = if release {
+                let close = Device::closed(&lease)?;
+                lease
+                    .release(close)
+                    .map_err(|(error, _lease, _close)| error)?
+            } else {
+                lease.renew(device.now())?.1
+            };
+            device.effects.clear();
+            let MmpTransition::SubmitLower { request, suspended } =
+                memory::try_box(operation)?.advance(MmpEvent::Start, device.now())
+            else {
+                return Err(Error::DeviceIo);
+            };
+            let completion = device.complete(request)?;
+            let MmpTransition::SubmitLower { request, suspended } =
+                suspended.advance(MmpEvent::StorageCompleted(completion), device.now())
+            else {
+                return Err(Error::DeviceIo);
+            };
+            let completion = device.complete(request)?;
+            device.millis = device.millis.saturating_add(5000);
+            let outcome = suspended.advance(MmpEvent::StorageCompleted(completion), device.now());
+            let change = if release {
+                MmpChange::Release
+            } else {
+                MmpChange::Update
+            };
+            assert!(
+                matches!(outcome, MmpTransition::Complete(Err(MmpFailure { reason: Error::MmpOwnershipLost, effect: MmpEffect::Submitted(observed) })) if observed == change)
+            );
+            assert_eq!(device.effects, ["write"]);
+        }
         Ok(())
     })();
     assert_eq!(result, Ok(()));

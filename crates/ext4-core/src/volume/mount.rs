@@ -3108,6 +3108,7 @@ mod tests {
             OperationEvent::Admitted
         };
         let mut transition = crate::memory::try_box(CleanCloseOperation {
+            mount: super::MountIdentity::new()?,
             access: crate::MediaAccess::ReadWrite,
             filesystem: super::StorageTranscript::new(
                 StorageTarget::Filesystem,
