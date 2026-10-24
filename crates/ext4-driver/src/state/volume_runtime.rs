@@ -591,7 +591,10 @@ impl VolumeRuntime {
     /// # Errors
     /// Rejects revoked ownership separately from ordinary visibility contention.
     #[cfg(not(test))]
-    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> DriverResult<Option<VisibilityLease>> {
+    pub(crate) fn try_grant_visibility(
+        &mut self,
+        ticket: u64,
+    ) -> DriverResult<Option<VisibilityLease>> {
         self.authorize_ownership()?;
         Ok(self.coordinator.acquire_visibility(ticket))
     }

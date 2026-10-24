@@ -1684,13 +1684,20 @@ impl MountedVolumeAccess<'_> {
     }
 
     /// Grants the short durable-visibility publication lane.
+    /// # Errors
+    /// Returns removed storage or revoked ownership separately from contention.
     #[cfg(not(test))]
-    pub(crate) fn try_grant_visibility(&mut self, ticket: u64) -> DriverResult<Option<VisibilityLease>> {
+    pub(crate) fn try_grant_visibility(
+        &mut self,
+        ticket: u64,
+    ) -> DriverResult<Option<VisibilityLease>> {
         self.authorize_storage()?;
         self.runtime.try_grant_visibility(ticket)
     }
 
     /// Grants the detached checkpoint lane for one visible epoch.
+    /// # Errors
+    /// Returns removed storage or revoked ownership separately from checkpoint contention.
     #[cfg(not(test))]
     pub(crate) fn try_grant_checkpoint(
         &mut self,

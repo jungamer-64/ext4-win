@@ -5211,28 +5211,28 @@ impl MutationRequestOperation {
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let OperationEvent::StorageCompleted(completion) = event else {
-            return self.fail_commit_path(context, Error::DeviceIo, access);
+            return self.fail_commit_path(context, Error::DeviceIo.into(), access);
         };
         match phase {
             CommitIoPhase::OrderedWrite { pending } => match pending.complete(completion) {
                 Ok(remaining) => self.observed_write().drive_ordered(context, remaining),
-                Err(error) => self.fail_commit_path(context, error, access),
+                Err(error) => self.fail_commit_path(context, error.into(), access),
             },
             CommitIoPhase::OrderedFlush { pending } => match pending.complete(completion) {
                 Ok(next) => self.drive_journal(context, next),
-                Err(error) => self.fail_commit_path(context, error, access),
+                Err(error) => self.fail_commit_path(context, error.into(), access),
             },
             CommitIoPhase::JournalWrite { pending } => match pending.complete(completion) {
                 Ok(remaining) => self.observed_write().drive_journal(context, remaining),
-                Err(error) => self.fail_commit_path(context, error, access),
+                Err(error) => self.fail_commit_path(context, error.into(), access),
             },
             CommitIoPhase::JournalFlush { pending } => match pending.complete(completion) {
                 Ok(next) => self.submit_commit_record(context, next),
-                Err(error) => self.fail_commit_path(context, error, access),
+                Err(error) => self.fail_commit_path(context, error.into(), access),
             },
             CommitIoPhase::CommitWrite { pending } => match pending.complete(completion) {
                 Ok(next) => self.observed_write().submit_commit_flush(context, next),
-                Err(error) => self.fail_commit_path(context, error, access),
+                Err(error) => self.fail_commit_path(context, error.into(), access),
             },
             CommitIoPhase::CommitFlush { pending } => match pending.complete(completion) {
                 Ok(durable) => {
@@ -5244,7 +5244,7 @@ impl MutationRequestOperation {
                         suspended: this,
                     }
                 }
-                Err(error) => self.fail_commit_path(context, error, access),
+                Err(error) => self.fail_commit_path(context, error.into(), access),
             },
         }
     }
@@ -5591,10 +5591,19 @@ impl MutationRequestOperation {
             }
             CompletionEvent::VolumeFailed(error) => {
                 let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
-                let MutationOperationState::AwaitingCommit { owned, .. } = state else {
-                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                let transition = match state {
+                    MutationOperationState::AwaitingCommit { owned, .. } => self.complete_error(owned, error),
+                    MutationOperationState::AwaitingVisibility { context, .. } => self.fail_commit_path(context, error, access),
+                    MutationOperationState::AwaitingCheckpoint(pending) => {
+                        // The upper request already acknowledged its durable commit. The pending
+                        // checkpoint owns no new effect; foreign media ownership requires recovery.
+                        drop(pending);
+                        access.record_durability_unknown();
+                        OperationTransition::Retired
+                    }
+                    _ => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
                 };
-                return MutationStep::Transition(self.complete_error(owned, error));
+                return MutationStep::Transition(transition);
             }
         };
         let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
@@ -6023,7 +6032,7 @@ impl MutationRequestOperation {
                 let OperationEvent::VisibilityGranted(visibility) = event else {
                     return MutationStep::Transition(self.fail_commit_path(
                         context,
-                        Error::DeviceIo,
+                        Error::DeviceIo.into(),
                         access,
                     ));
                 };
@@ -6034,9 +6043,9 @@ impl MutationRequestOperation {
                 };
                 MutationStep::Transition(OperationTransition::Publish { publication: self })
             }
-            MutationOperationState::PublishingDurable { context, .. } => {
-                MutationStep::Transition(self.fail_commit_path(context, Error::DeviceIo, access))
-            }
+            MutationOperationState::PublishingDurable { context, .. } => MutationStep::Transition(
+                self.fail_commit_path(context, Error::DeviceIo.into(), access),
+            ),
             MutationOperationState::AwaitingCheckpoint(pending) => match event {
                 OperationEvent::Admitted => MutationStep::Transition(OperationTransition::Wait {
                     condition: WaitCondition::Checkpoint {

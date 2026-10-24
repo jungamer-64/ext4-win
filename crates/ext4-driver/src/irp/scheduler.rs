@@ -536,13 +536,14 @@ impl Scheduler {
         true
     }
 
-    /// Moves one ready slot to sole-actor ownership.
+    /// Moves one ready slot to the actor; physical ownership cannot wait behind user continuations.
     pub(crate) fn take_ready(&mut self) -> Option<SlotId> {
-        let (index, slot) = self
-            .slots
-            .iter_mut()
-            .enumerate()
-            .find(|(_, slot)| matches!(slot.phase, Phase::Ready))?;
+        let index = OWNERSHIP_SLOTS.chain(0..MAX_OPERATIONS).find(|index| {
+            self.slots
+                .get(*index)
+                .is_some_and(|slot| matches!(slot.phase, Phase::Ready))
+        })?;
+        let slot = self.slots.get_mut(index)?;
         slot.phase = Phase::Actor;
         Some(SlotId {
             index,
@@ -1154,11 +1155,29 @@ mod tests {
                 assert!(scheduler.available(ExecutionClass::Finalization));
             }
         }
+        assert!(scheduler.ownership_available());
+        let ownership = require_some!(scheduler.reserve_ownership());
+        assert!(!scheduler.ownership_available());
+        assert!(scheduler.reserve_ownership().is_none());
         let first = require_some!(slots.first().copied().flatten());
+        assert_eq!(
+            scheduler.install(first, Admission::Device, false),
+            Some(AdmissionStart::Admitted)
+        );
+        assert_eq!(
+            scheduler.install(ownership, Admission::Device, false),
+            Some(AdmissionStart::Admitted)
+        );
+        assert_eq!(scheduler.take_ready(), Some(ownership));
+        assert!(scheduler.complete(ownership));
+        assert_eq!(scheduler.take_ready(), Some(first));
         assert!(scheduler.complete(first));
         let reused = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
         assert_eq!(reused.index(), first.index());
         assert_eq!(reused.generation(), first.generation() + 1);
+        scheduler.begin_drain();
+        assert!(!scheduler.ownership_available());
+        assert!(scheduler.reserve_ownership().is_none());
     }
 
     /// Verifies conflict-aware FIFO intent admission without head-of-line blocking.

@@ -390,9 +390,18 @@ impl CompletionEvent {
     /// Turns one authoritative readiness observation into a grant, rejection, or continued wait.
     /// Failure is checked even while earlier commit/checkpoint work still occupies its lane.
     fn durability_wait(identity: u64, readiness: DriverResult<bool>) -> Option<Self> {
-        match readiness {
-            Ok(false) => None,
-            Ok(true) => Some(Self::BarrierReleased(BarrierPermit::released(identity))),
+        Self::grant_wait(readiness.map(|ready| ready.then_some(())), |()| {
+            Self::BarrierReleased(BarrierPermit::released(identity))
+        })
+    }
+    /// Contentious grants remain pending; an independently revoked session becomes a concrete event.
+    fn grant_wait<G>(
+        grant: DriverResult<Option<G>>,
+        granted: impl FnOnce(G) -> Self,
+    ) -> Option<Self> {
+        match grant {
+            Ok(None) => None,
+            Ok(Some(grant)) => Some(granted(grant)),
             Err(error) => Some(Self::VolumeFailed(error)),
         }
     }
@@ -945,7 +954,9 @@ impl ActorTimerEnvelope {
             ffi::KeSetTimer(
                 self.timer.get(),
                 wdk_sys::LARGE_INTEGER {
-                    QuadPart: i64::from(delay_millis.max(1)).saturating_mul(10_000).saturating_neg(),
+                    QuadPart: i64::from(delay_millis.max(1))
+                        .saturating_mul(10_000)
+                        .saturating_neg(),
                 },
                 self.dpc.get(),
             )
@@ -1049,6 +1060,25 @@ impl ReactorTarget {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
         binding.with_access(transition)
+    }
+
+    /// Observes ownership timing only while the mounted actor holds the exact session binding.
+    #[cfg(not(test))]
+    fn mmp_wakeup(&mut self) -> Option<ext4_core::MmpDeadline> {
+        match self {
+            Self::ControlDevice(_) => None,
+            Self::MountedVolume(binding) => binding.with_access(|access| access.mmp_wakeup()),
+        }
+    }
+    /// Transfers an action without borrowing the runtime across lower completion.
+    /// # Errors
+    /// Records terminal ownership loss if a continuous update chain cannot be maintained.
+    #[cfg(not(test))]
+    fn start_mmp_action(&mut self) -> DriverResult<Option<ext4_core::MmpOperation>> {
+        match self {
+            Self::ControlDevice(_) => Ok(None),
+            Self::MountedVolume(binding) => binding.with_access(|access| access.start_mmp_action()),
+        }
     }
 
     /// Returns whether the mounted target owns any handle-free native stream resident.
@@ -1484,7 +1514,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
-            destination.write(ActorTimerEnvelope::inert());
+            destination.write(ActorTimerEnvelope::inert(ActorTimerPurpose::DelayedClose));
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
@@ -1711,6 +1741,9 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: The shared timer and reactor have both reached their final addresses.
             reactor.delayed_close_timer.initialize(reactor_storage);
+        }
+        #[cfg(not(test))]
+        unsafe {
             // SAFETY: This independently routed timer shares the same final-address owner lifetime.
             reactor.ownership_timer.initialize(reactor_storage);
         }
@@ -2528,6 +2561,8 @@ impl CompletionReactor {
             || reactor.has_active()
             || reactor.delayed_close_timer_state() != ActorTimerState::Idle
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
+            || reactor.ownership_timer_state() != ActorTimerState::Idle
+            || reactor.ownership_timer_ready.load(Ordering::Acquire) != 0
             || !completion_list_empty
             || !length_completion_list_empty
             || !passive_completion_list_empty
@@ -2566,6 +2601,8 @@ impl CompletionReactor {
             || reactor.has_active()
             || reactor.delayed_close_timer_state() != ActorTimerState::Idle
             || reactor.delayed_close_ready.load(Ordering::Acquire) != 0
+            || reactor.ownership_timer_state() != ActorTimerState::Idle
+            || reactor.ownership_timer_ready.load(Ordering::Acquire) != 0
         {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -2657,6 +2694,7 @@ impl CompletionReactor {
             progressed |= self.drain_oplock_completions();
             progressed |= self.drain_active_cancels();
             progressed |= self.drain_retry_events();
+            progressed |= self.maintain_media_ownership();
             progressed |= self.admit_pending_requests();
             progressed |= self.drive_ready_operations();
             progressed |= self.drain_deferred_notifications();
@@ -2675,6 +2713,8 @@ impl CompletionReactor {
                 && !self.has_active()
                 && self.delayed_close_timer_state() == ActorTimerState::Idle
                 && self.delayed_close_ready.load(Ordering::Acquire) == 0
+                && self.ownership_timer_state() == ActorTimerState::Idle
+                && self.ownership_timer_ready.load(Ordering::Acquire) == 0
                 && unsafe {
                     // SAFETY: The sole actor owns this initialized notification backlog.
                     list_is_empty(self.deferred_notification_head.get())
@@ -2770,7 +2810,7 @@ impl CompletionReactor {
     fn maintain_delayed_close(&self) -> bool {
         let mut progressed = false;
         if self.delayed_close_ready.swap(0, Ordering::AcqRel) != 0 {
-            if self.delayed_close_timer_state() != ActorTimerState::Armed {
+            if self.delayed_close_timer_state() != ActorTimerState::Armed(()) {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
             }
             self.set_delayed_close_timer_state(self.delayed_close_timer_state().disarm());
@@ -2782,7 +2822,7 @@ impl CompletionReactor {
         }
 
         let pending = self.with_target(ReactorTarget::delayed_close_pending);
-        if !pending && self.delayed_close_timer_state() == ActorTimerState::Armed {
+        if !pending && self.delayed_close_timer_state() == ActorTimerState::Armed(()) {
             progressed |= self.cancel_delayed_close_timer();
         }
         if self.state() == ReactorState::Draining {
@@ -2792,9 +2832,125 @@ impl CompletionReactor {
             return progressed;
         }
         if pending && self.delayed_close_timer_state() == ActorTimerState::Idle {
-            self.delayed_close_timer.arm();
-            self.set_delayed_close_timer_state(self.delayed_close_timer_state().arm());
+            self.delayed_close_timer.arm(100);
+            self.set_delayed_close_timer_state(self.delayed_close_timer_state().arm(()));
             progressed = true;
+        }
+        progressed
+    }
+
+    /// Reads actor-owned state on its dedicated thread, after join, or in isolated host fixtures.
+    #[expect(
+        unsafe_code,
+        reason = "actor ownership or completed thread join excludes every timer-state writer"
+    )]
+    fn ownership_timer_state(&self) -> ActorTimerState<ext4_core::MmpDeadline> {
+        unsafe {
+            // SAFETY: DPCs publish only atomics; the actor or post-join owner has exclusive state access.
+            *self.ownership_timer_state.get()
+        }
+    }
+    /// Transfers the one timer obligation with its exact deadline on the sole actor.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the dedicated actor exclusively owns its native timer obligation"
+    )]
+    fn set_ownership_timer_state(&self, state: ActorTimerState<ext4_core::MmpDeadline>) {
+        unsafe {
+            // SAFETY: Only the actor mutates this field; callbacks never borrow it.
+            *self.ownership_timer_state.get() = state;
+        }
+    }
+    /// Cancellation either retires this native obligation or leaves its queued DPC as sole owner.
+    #[cfg(not(test))]
+    fn cancel_ownership_timer(&self) -> bool {
+        if self.ownership_timer_state() == ActorTimerState::Idle {
+            return false;
+        }
+        if !self.ownership_timer.cancel() {
+            return false;
+        }
+        self.set_ownership_timer_state(self.ownership_timer_state().disarm());
+        true
+    }
+    /// Drives due record work and watches its previously acknowledged deadline while I/O is pending.
+    /// No ordinary request, cache worker, intent or journal commit lane is held by this protocol.
+    #[cfg(not(test))]
+    fn maintain_media_ownership(&self) -> bool {
+        let mut progressed = false;
+        if self.ownership_timer_ready.swap(0, Ordering::AcqRel) != 0 {
+            if self.ownership_timer_state() == ActorTimerState::Idle {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            self.set_ownership_timer_state(self.ownership_timer_state().disarm());
+            progressed = true;
+        }
+        if self.state() == ReactorState::Draining {
+            if self.with_target(ReactorTarget::mmp_wakeup).is_some() {
+                self.with_mounted_access(|access| {
+                    access.fail_mmp(ext4_core::Error::OperationCancelled)
+                });
+                progressed = true;
+            }
+        } else if self.with_scheduler(|scheduler| scheduler.ownership_available()) {
+            match self.with_target(ReactorTarget::start_mmp_action) {
+                Ok(Some(operation)) => {
+                    match crate::memory::boxed_try_with(|| Ok(operation)) {
+                        Ok(operation) => {
+                            if let Some(identity) =
+                                self.with_scheduler(Scheduler::reserve_ownership)
+                            {
+                                self.install_admitted_at(
+                                    identity.index(),
+                                    AdmittedOperation::new(operation, OperationAdmission::Device),
+                                );
+                            } else {
+                                self.with_mounted_access(|access| {
+                                    access.fail_mmp(ext4_core::Error::MmpOwnershipLost)
+                                });
+                            }
+                        }
+                        Err(_error) => self.with_mounted_access(|access| {
+                            access.fail_mmp(ext4_core::Error::OutOfMemory)
+                        }),
+                    }
+                    progressed = true;
+                }
+                Ok(None) => {}
+                Err(_error) => {
+                    progressed = true;
+                }
+            }
+        }
+        let next = if self.state() == ReactorState::Running {
+            self.with_target(ReactorTarget::mmp_wakeup)
+        } else {
+            None
+        };
+        if let ActorTimerState::Armed(deadline) = self.ownership_timer_state()
+            && Some(deadline) != next
+        {
+            progressed |= self.cancel_ownership_timer();
+        }
+        if self.ownership_timer_state() == ActorTimerState::Idle
+            && let Some(deadline) = next
+        {
+            let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
+            match u32::try_from(deadline.remaining_millis(now).max(1)) {
+                Ok(delay) => {
+                    self.ownership_timer.arm(delay);
+                    self.set_ownership_timer_state(self.ownership_timer_state().arm(deadline));
+                }
+                Err(_error) => self.with_mounted_access(|access| {
+                    access.fail_mmp(ext4_core::Error::InvalidTimestamp)
+                }),
+            }
+            progressed = true;
+        }
+        if progressed {
+            self.grant_available_commit();
+            self.grant_all_available_waits();
         }
         progressed
     }
@@ -4594,14 +4750,14 @@ impl CompletionReactor {
         };
         let event = match condition {
             WaitCondition::Visibility { ticket } => self.with_mounted_access(|access| {
-                access
-                    .try_grant_visibility(ticket)
-                    .map(|grant| CompletionEvent::Core(OperationEvent::VisibilityGranted(grant)))
+                CompletionEvent::grant_wait(access.try_grant_visibility(ticket), |grant| {
+                    CompletionEvent::Core(OperationEvent::VisibilityGranted(grant))
+                })
             }),
             WaitCondition::Checkpoint { epoch } => self.with_mounted_access(|access| {
-                access
-                    .try_grant_checkpoint(epoch)
-                    .map(|grant| CompletionEvent::Core(OperationEvent::CheckpointGranted(grant)))
+                CompletionEvent::grant_wait(access.try_grant_checkpoint(epoch), |grant| {
+                    CompletionEvent::Core(OperationEvent::CheckpointGranted(grant))
+                })
             }),
             WaitCondition::VolumeDurability => {
                 let has_commit_work = self.with_scheduler(|scheduler| scheduler.has_commit_work());
@@ -5188,11 +5344,11 @@ mod tests {
     use crate::state::{KernelDevice, KernelFileObject};
 
     use super::{
-        AdmittedOperation, CompletionEvent, CompletionOperation, CompletionReactor,
-        ActorTimerState, ExecutionClass, HandleOperationLane, MAX_OPERATIONS,
-        OperationAdmission, OperationTransition, PendingIrpSelection, PreparedPublication,
-        PublicationAuthority, SlotPayload, SuspendedOperation, driver_error_to_core,
-        initialize_list_head, insert_tail_list, list_is_empty, remove_head_list, slot_bit,
+        ActorTimerState, AdmittedOperation, CompletionEvent, CompletionOperation,
+        CompletionReactor, ExecutionClass, HandleOperationLane, MAX_OPERATIONS, OperationAdmission,
+        OperationTransition, PendingIrpSelection, PreparedPublication, PublicationAuthority,
+        SlotPayload, SuspendedOperation, driver_error_to_core, initialize_list_head,
+        insert_tail_list, list_is_empty, remove_head_list, slot_bit,
     };
 
     /// # Panics
@@ -5337,8 +5493,8 @@ mod tests {
     /// Panics if the shared delayed-close timer loses its one-obligation state transition.
     #[test]
     fn delayed_close_timer_has_one_explicit_arming_obligation() {
-        let armed = ActorTimerState::Idle.arm();
-        assert_eq!(armed, ActorTimerState::Armed);
+        let armed = ActorTimerState::Idle.arm(());
+        assert_eq!(armed, ActorTimerState::Armed(()));
         assert_eq!(armed.disarm(), ActorTimerState::Idle);
     }
 
