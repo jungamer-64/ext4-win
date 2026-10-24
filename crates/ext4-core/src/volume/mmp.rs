@@ -450,6 +450,8 @@ enum State {
         expected: StorageRequestIdentity,
         /// Interpretation of authenticated bytes returned by this read.
         purpose: ReadPurpose,
+        /// Freshness bound of the uncached observation, including lower submission latency.
+        deadline: MmpDeadline,
     },
     /// Only completion of this monotonic delay admits the next read.
     Waiting {
@@ -464,6 +466,8 @@ enum State {
         expected: StorageRequestIdentity,
         /// Durable outcome and observation required after this effect.
         after: AfterWrite,
+        /// The source observation cannot authorize a write after this boundary.
+        deadline: MmpDeadline,
     },
     /// Ownership bytes require filesystem-device durability acknowledgement.
     Flushing {
@@ -471,6 +475,8 @@ enum State {
         expected: StorageRequestIdentity,
         /// Durable outcome and observation required after this effect.
         after: AfterWrite,
+        /// The submitted write retains its observation bound through durability completion.
+        deadline: MmpDeadline,
     },
 }
 impl MmpOperation {
