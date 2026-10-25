@@ -36,7 +36,7 @@ pub(in crate::volume) fn prepare_orphan_batch(
 )> {
     let mut mutation = MetadataMutation::begin(
         volume,
-        super::super::trim::AllocationExclusions::unreserved(),
+        AllocationExclusionSource::Discard(super::super::trim::AllocationExclusions::unreserved()),
     );
     let superblock = mutation.volume.superblock;
     let block_size = superblock.block_size();

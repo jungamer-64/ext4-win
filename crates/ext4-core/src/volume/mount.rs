@@ -15,8 +15,8 @@ use crate::disk::storage::{
     OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
 };
 use crate::disk_format::journal::{
-    CleanJournal, DeltaRecoverySeed, ExternalJournalLoad, FilesystemHomeSpace, Journal,
-    JournalBlock, JournalRecoveryCompletion, JournalRecoveryOperation, LoadedJournal,
+    CleanJournal, ExternalJournalLoad, FilesystemHomeSpace, Journal, JournalBlock,
+    JournalRecoveryCompletion, JournalRecoveryOperation, LoadedJournal,
 };
 use crate::disk_format::superblock::{
     ChecksumInvalidSuperblock, FilesystemUuid, JournalMode, JournalUuid, PrimarySuperblockRead,
@@ -1216,6 +1216,25 @@ impl<'storage, 'epoch> EpochReadView<'storage, 'epoch> {
         }
     }
 
+    /// Pairs mount-private allocation evidence with its unchanged recovered filesystem.
+    pub(super) const fn recovering(
+        device: OperationDevice<'storage>,
+        superblock: Superblock,
+        fscrypt_keys: &'epoch FscryptKeySet,
+        clusters: &'epoch ClusterReferenceIndex,
+    ) -> Self {
+        Self {
+            key_dependency: KeySetDependency::Independent,
+            observation: None,
+            device,
+            superblock,
+            fscrypt_keys,
+            clusters: Some(clusters),
+            epoch: None,
+            mount: None,
+        }
+    }
+
     /// Constructs a read view whose lower bytes are checked against committed inode versions.
     pub(super) fn observing(
         device: OperationDevice<'storage>,
@@ -2013,12 +2032,10 @@ enum MountState {
         /// Device containing the journal.
         journal_target: StorageTarget,
     },
-    /// Resolve every delta postimage against a fresh, unpublished filesystem transcript.
-    ResolvingDeltas {
-        /// Strictly validated primary metadata after full journal replay.
-        superblock: Superblock,
-        /// Journal and authenticated program from the same recovery operation.
-        seed: DeltaRecoverySeed,
+    /// Resolve and validate prospective images without granting write authority to its read phases.
+    PreparingDeltas {
+        /// Owns the program, original allocation evidence and candidate validation continuation.
+        operation: Box<super::fast_commit::DeltaReplayOperation>,
         /// Physical journal device selected during admission.
         journal_target: StorageTarget,
     },
@@ -2296,7 +2313,7 @@ impl MountOperation {
                         | MountState::Repaired
                         | MountState::Recovering { .. }
                         | MountState::VerifyingReplayedPrimary { .. }
-                        | MountState::ResolvingDeltas { .. }
+                        | MountState::PreparingDeltas { .. }
                         | MountState::DeltaWrites { .. }
                         | MountState::DeltaWritePending { .. }
                         | MountState::MarkerWriteReady { .. }
@@ -2382,21 +2399,7 @@ impl MountOperation {
     /// Returns an error for a failed, mismatched, short, or phase-inconsistent completion.
     fn accept_completion(&mut self, completion: crate::StorageCompletion) -> Result<()> {
         let completion = if let Some(recovery) = &self.recovery {
-            let (mut transfer, information, result) = completion.into_parts();
-            if result.is_ok()
-                && let crate::CompletedStorageTransfer::Read {
-                    target,
-                    offset,
-                    buffer,
-                } = &mut transfer
-                && information == buffer.len()
-            {
-                recovery.apply(*target, *offset, buffer)?;
-            }
-            match result {
-                Ok(()) => crate::StorageCompletion::success(transfer, information),
-                Err(error) => crate::StorageCompletion::failure(transfer, error),
-            }
+            completion.apply_overlay(recovery)?
         } else {
             completion
         };
@@ -2450,15 +2453,13 @@ impl MountOperation {
                     journal_target,
                 };
             }
-            MountState::ResolvingDeltas {
-                superblock,
-                seed,
+            MountState::PreparingDeltas {
+                mut operation,
                 journal_target,
             } => {
-                self.filesystem.complete(completion)?;
-                self.state = MountState::ResolvingDeltas {
-                    superblock,
-                    seed,
+                operation.complete(completion)?;
+                self.state = MountState::PreparingDeltas {
+                    operation,
                     journal_target,
                 };
             }
@@ -2765,9 +2766,21 @@ impl MountOperation {
                                     })
                                 }
                                 JournalRecoveryCompletion::Deltas(seed) => {
-                                    MountState::ResolvingDeltas {
-                                        superblock,
-                                        seed,
+                                    let operation =
+                                        match super::fast_commit::DeltaReplayOperation::new(
+                                            self.filesystem.len(),
+                                            superblock,
+                                            seed,
+                                        )
+                                        .and_then(memory::try_box)
+                                        {
+                                            Ok(operation) => operation,
+                                            Err(error) => {
+                                                return MountTransition::Complete(Err(error));
+                                            }
+                                        };
+                                    MountState::PreparingDeltas {
+                                        operation,
                                         journal_target,
                                     }
                                 }
@@ -2787,40 +2800,33 @@ impl MountOperation {
                         Err(error) => return MountTransition::Complete(Err(error)),
                     }
                 }
-                MountState::ResolvingDeltas {
-                    superblock,
-                    seed,
+                MountState::PreparingDeltas {
+                    mut operation,
                     journal_target,
                 } => {
-                    let result = {
-                        let device = OperationDevice::new(&mut self.filesystem);
-                        let Some(keys) = self.fscrypt_keys.as_ref() else {
-                            return MountTransition::Complete(Err(Error::DeviceIo));
-                        };
-                        let mut view = EpochReadView::mounting(device, superblock, keys);
-                        super::fast_commit::resolve(&mut view, &seed)
+                    let Some(keys) = self.fscrypt_keys.as_ref() else {
+                        return MountTransition::Complete(Err(Error::DeviceIo));
                     };
-                    match result {
-                        Ok(blocks) => {
-                            match super::fast_commit::prepare(seed, superblock.block_size(), blocks)
-                            {
-                                Ok(sequence) => {
-                                    self.state = MountState::DeltaWrites {
-                                        sequence,
-                                        journal_target,
-                                    }
-                                }
-                                Err(error) => return MountTransition::Complete(Err(error)),
-                            }
-                        }
-                        Err(Error::OperationSuspended) => {
-                            self.state = MountState::ResolvingDeltas {
-                                superblock,
-                                seed,
+                    match operation.next_request(keys) {
+                        Ok(Some(request)) => {
+                            self.state = MountState::PreparingDeltas {
+                                operation,
                                 journal_target,
                             };
-                            return self.submit_pending_read();
+                            return MountTransition::SubmitLower {
+                                request,
+                                suspended: self,
+                            };
                         }
+                        Ok(None) => match (*operation).into_sequence() {
+                            Ok(sequence) => {
+                                self.state = MountState::DeltaWrites {
+                                    sequence,
+                                    journal_target,
+                                }
+                            }
+                            Err(error) => return MountTransition::Complete(Err(error)),
+                        },
                         Err(error) => return MountTransition::Complete(Err(error)),
                     }
                 }

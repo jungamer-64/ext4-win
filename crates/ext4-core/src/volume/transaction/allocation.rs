@@ -2,6 +2,81 @@
 
 use super::*;
 
+/// An exclusion snapshot observes reserved space; it cannot create allocation ownership.
+#[derive(Debug)]
+pub(super) enum AllocationExclusionSource {
+    /// A mounted discard retains its independently completed lower-device reservation.
+    Discard(super::super::trim::AllocationExclusions),
+    /// Every recorded physical ADD remains protected before any recovery metadata allocation.
+    Recovery(Vec<ProtectedClusters>),
+}
+/// Sorted, disjoint allocation intervals derived from an immutable authenticated program.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ProtectedClusters {
+    /// Inclusive cluster coordinate.
+    first: ClusterAddress,
+    /// Exclusive allocation boundary, never dereferenced as a physical cluster.
+    end: ClusterAddress,
+}
+impl AllocationExclusionSource {
+    /// All physical operands are admitted before selecting any new recovery metadata block.
+    /// # Errors
+    /// Rejects out-of-filesystem extents, coordinate overflow or pre-effect allocation failure.
+    pub(super) fn recovery(
+        superblock: Superblock,
+        program: &crate::disk_format::journal::fast_commit::DeltaProgram,
+    ) -> Result<Self> {
+        use crate::disk_format::journal::fast_commit::ParsedDelta;
+        let mut ranges: Vec<ProtectedClusters> = Vec::new();
+        for record in program.records() {
+            if let ParsedDelta::AddRange { extent, .. } = record {
+                let end = extent
+                    .physical_start()
+                    .get()
+                    .checked_add(extent.len().as_u64())
+                    .ok_or(Error::InvalidExtentTree)?;
+                if end > superblock.block_count().as_u64() {
+                    return Err(Error::InvalidExtentTree);
+                }
+                let first = superblock.cluster_of_block(extent.physical_start())?;
+                let last = superblock.cluster_of_block(BlockAddress::new(
+                    end.checked_sub(1).ok_or(Error::InvalidExtentTree)?,
+                ))?;
+                ranges.try_push(ProtectedClusters {
+                    first,
+                    end: ClusterAddress::new(
+                        last.get().checked_add(1).ok_or(Error::ArithmeticOverflow)?,
+                    ),
+                })?;
+            }
+        }
+        memory::heap_sort_by(&mut ranges, |a, b| a.first.cmp(&b.first))?;
+        let mut merged: Vec<ProtectedClusters> = Vec::new();
+        for range in ranges {
+            if let Some(previous) = merged.last_mut()
+                && range.first <= previous.end
+            {
+                previous.end = previous.end.max(range.end);
+            } else {
+                merged.try_push(range)?;
+            }
+        }
+        Ok(Self::Recovery(merged))
+    }
+    /// Membership does not mutate a bitmap, reference count or reservation owner.
+    fn contains(&self, cluster: ClusterAddress) -> bool {
+        match self {
+            Self::Discard(snapshot) => snapshot.contains(cluster),
+            Self::Recovery(ranges) => {
+                let index = ranges.partition_point(|range| range.end <= cluster);
+                ranges
+                    .get(index)
+                    .is_some_and(|range| range.first <= cluster)
+            }
+        }
+    }
+}
+
 impl MetadataMutation<'_, '_> {
     /// Allocates an unmapped logical block in its extent stream's physical cluster.
     /// Existing mappings in the same logical cluster select both the physical cluster and the
@@ -139,7 +214,7 @@ impl MetadataMutation<'_, '_> {
                         .ok_or(Error::InvalidSuperblock)?;
                     cluster_bitmap_bit_state(bitmap.bytes.as_slice(), position)?
                 };
-                if occupied == BitmapBitState::Used || self.exclusions.contains(cluster) {
+                if occupied == BitmapBitState::Used || self.allocation.contains(cluster) {
                     continue;
                 }
                 // Home writes precede the metadata commit. A committed owner must remain intact

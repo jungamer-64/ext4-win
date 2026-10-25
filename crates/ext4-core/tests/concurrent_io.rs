@@ -8,6 +8,8 @@ use alloc::{boxed::Box, vec::Vec};
 use ext4_core::*;
 use sha2::Digest as _;
 
+#[path = "concurrent_io/fast_commit.rs"]
+mod fast_commit;
 #[path = "concurrent_io/mmp.rs"]
 mod mmp;
 #[path = "concurrent_io/trim.rs"]

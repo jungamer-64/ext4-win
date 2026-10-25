@@ -4,6 +4,9 @@ use super::scope::*;
 use crate::volume::inode_record::ExtentInodeRecord;
 
 mod allocation;
+mod fast_commit;
+use allocation::AllocationExclusionSource;
+pub(super) use fast_commit::resolve_delta_ranges;
 mod commit;
 mod file_data;
 mod fscrypt;
@@ -325,7 +328,7 @@ enum MutationState {
 /// Private metadata, allocation, and serialization authority shared by ordinary mutation and recovery.
 struct MetadataMutation<'storage, 'epoch> {
     /// Provisional allocation exclusions; reservation and commit recheck their current owner.
-    exclusions: super::trim::AllocationExclusions,
+    allocation: AllocationExclusionSource,
     /// Ephemeral view of the selected committed epoch and operation transcript.
     volume: EpochReadView<'storage, 'epoch>,
     /// Unique inode identities staged for rewrite; deleted records reserve their identity
@@ -1210,7 +1213,10 @@ impl<'storage, 'epoch, 'crypto> MutationResolvePass<'storage, 'epoch, 'crypto> {
     ) -> Self {
         Self {
             state: MutationState::Ready,
-            mutation: MetadataMutation::begin(volume, exclusions),
+            mutation: MetadataMutation::begin(
+                volume,
+                AllocationExclusionSource::Discard(exclusions),
+            ),
             now,
             crypto,
         }
@@ -1221,10 +1227,10 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
     /// Starts restart-local staging with no payload cryptographic authority.
     fn begin(
         volume: EpochReadView<'storage, 'epoch>,
-        exclusions: super::trim::AllocationExclusions,
+        allocation: AllocationExclusionSource,
     ) -> Self {
         Self {
-            exclusions,
+            allocation,
             volume,
             inode_updates: Vec::new(),
             block_bitmap_updates: Vec::new(),

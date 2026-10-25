@@ -921,14 +921,18 @@ pub(super) fn parse_extent(raw: &[u8], offset: usize) -> Result<Extent> {
         disk_offset(offset.checked_add(8).ok_or(Error::ArithmeticOverflow)?),
     )?);
     let physical_start = BlockAddress::new((start_hi << 32) | start_lo);
-    Ok(match initialization {
+    let extent = match initialization {
         ExtentInitialization::Initialized => {
             Extent::initialized(logical_start, len, physical_start)
         }
         ExtentInitialization::Uninitialized => {
             Extent::uninitialized(logical_start, len, physical_start)
         }
-    })
+    };
+    if extent.end_logical() > LOGICAL_BLOCK_EXCLUSIVE_END {
+        return Err(Error::InvalidExtentTree);
+    }
+    Ok(extent)
 }
 
 /// Decodes ext4's asymmetric initialized/uninitialized `ee_len` domain.

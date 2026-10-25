@@ -462,6 +462,45 @@ impl LiveInodeRecord {
         self.raw.into_live()
     }
 
+    /// Extent replay restores inode metadata while the range program owns mappings and allocation.
+    /// # Errors
+    /// Rejects kind, storage flag, generation, xattr-owner or prefix-layout substitution.
+    pub(super) fn restore_extent_delta_metadata(mut self, encoded: &[u8]) -> Result<Self> {
+        let base = self.raw.bytes();
+        let prefix = if base.len() == 128 {
+            128
+        } else {
+            128_usize
+                .checked_add(usize::from(le_u16(base, disk_offset(128))?))
+                .ok_or(Error::InvalidInode)?
+        };
+        if encoded.len() != prefix
+            || prefix > base.len()
+            || le_u16(encoded, disk_offset(26))? == 0
+            || InodeMode::from_disk(le_u16(base, disk_offset(0))?)?.kind()
+                != InodeMode::from_disk(le_u16(encoded, disk_offset(0))?)?.kind()
+            || base.get(32..36) != encoded.get(32..36)
+            || base.get(100..108) != encoded.get(100..108)
+            || base.get(118..120) != encoded.get(118..120)
+            || (prefix > 128 && base.get(128..130) != encoded.get(128..130))
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        if !matches!(self.parse()?.storage(), InodeStorage::Extents(_)) {
+            return Err(Error::UnsupportedJournal);
+        }
+        for span in [0..28, 32..40, 100..116, 118..prefix] {
+            memory::copy_exact(
+                self.raw
+                    .bytes
+                    .get_mut(span.clone())
+                    .ok_or(Error::InvalidInode)?,
+                encoded.get(span).ok_or(Error::InvalidInode)?,
+            )?;
+        }
+        self.raw.into_live()
+    }
+
     /// Storage facts passed to the final allocation release boundary without copying the record.
     pub(super) const fn raw(&self) -> &RawInodeRecord<Vec<u8>> {
         &self.raw
@@ -1430,6 +1469,47 @@ impl RawInodeRecord<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// # Panics
+    /// Fails if recorded roots or block charges override reconstructed extent ownership.
+    #[test]
+    fn extent_delta_metadata_preserves_mapping_and_derived_block_charge() {
+        let result = (|| -> Result<()> {
+            let original = initialized_file(12)?;
+            let root = memory::copied_slice(
+                original
+                    .raw
+                    .bytes()
+                    .get(40..100)
+                    .ok_or(Error::InvalidInode)?,
+            )?;
+            let mut encoded = memory::copied_slice(original.raw.bytes())?;
+            put_le_u16(
+                &mut encoded,
+                disk_offset(INODE_MODE_OFFSET),
+                MODE_REGULAR | 0o600,
+            )?;
+            encoded
+                .get_mut(40..100)
+                .ok_or(Error::InvalidInode)?
+                .fill(0xa5);
+            encoded
+                .get_mut(28..32)
+                .ok_or(Error::InvalidInode)?
+                .fill(0xff);
+            encoded
+                .get_mut(116..118)
+                .ok_or(Error::InvalidInode)?
+                .fill(0xff);
+            let replayed = original.restore_extent_delta_metadata(&encoded)?;
+            assert_eq!(mode(replayed.raw()), Ok(MODE_REGULAR | 0o600));
+            assert_eq!(replayed.raw.bytes().get(40..100), Some(root.as_slice()));
+            assert_eq!(le_u32(replayed.raw.bytes(), disk_offset(28))?, 0);
+            assert_eq!(le_u16(replayed.raw.bytes(), disk_offset(116))?, 0);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
     /// # Panics
     /// Fails if metadata replay changes allocation, inode identity, attributes or repeated results.
     #[test]

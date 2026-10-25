@@ -122,15 +122,29 @@ impl<'a> Tlv<'a> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct LogicalRange {
     /// File-relative start, never a physical filesystem block.
-    pub(crate) first: LogicalBlock,
+    first: LogicalBlock,
     /// Exclusive logical block coordinate, including the one-past boundary.
-    pub(crate) end: u64,
+    end: u64,
 }
 impl LogicalRange {
+    /// Retains only the logical coordinate domain of an extent, validating its exclusive bound.
+    /// # Errors
+    /// Rejects an extent crossing the file-address domain even when its physical fields fit.
+    pub(crate) fn from_extent(extent: Extent) -> Result<Self> {
+        Self::new(extent.logical_start().as_u32(), extent.len().as_u32())
+    }
+    /// Inclusive file-relative block coordinate.
+    pub(crate) const fn first(self) -> LogicalBlock {
+        self.first
+    }
+    /// Exclusive logical boundary, which can be one past the u32 address domain.
+    pub(crate) const fn end(self) -> u64 {
+        self.end
+    }
     /// Establishes nonempty checked range arithmetic at the wire boundary.
     /// # Errors
     /// Rejects zero length or a range beyond the complete logical block address domain.
-    fn new(first: u32, length: u32) -> Result<Self> {
+    pub(crate) fn new(first: u32, length: u32) -> Result<Self> {
         let end = u64::from(first)
             .checked_add(u64::from(length))
             .ok_or(Error::JournalCorrupt)?;

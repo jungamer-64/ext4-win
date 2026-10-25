@@ -192,6 +192,23 @@ impl MetadataMutation<'_, '_> {
         Ok(images)
     }
 
+    /// Recovery has no precommit data writes: allocator zeroes and metadata share one full commit.
+    /// # Errors
+    /// Returns suspended source reads, serialization or pre-effect image allocation failure.
+    pub(super) fn recovery_images(
+        &mut self,
+    ) -> Result<super::super::metadata_image::MetadataImages> {
+        let mut images =
+            super::super::metadata_image::MetadataImages::new(self.volume.superblock.block_size());
+        for write in &self.file_writes {
+            images.patch(&mut self.volume, write.write.offset, &write.write.bytes)?;
+        }
+        for write in self.metadata_writes()? {
+            images.patch(&mut self.volume, write.offset, &write.bytes)?;
+        }
+        Ok(images)
+    }
+
     /// Applies accumulated free-count deltas to a superblock image.
     /// # Errors
     ///

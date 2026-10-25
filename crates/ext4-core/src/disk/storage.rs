@@ -193,7 +193,16 @@ impl StorageCompletion {
     /// # Errors
     /// Returns overlay coordinate or copy failure; writes, flushes and failed reads retain their outcome.
     pub(crate) fn apply_overlay(mut self, overlay: &dyn StorageReadOverlay) -> Result<Self> {
-        if self.result.is_ok() && let CompletedStorageTransfer::Read { target, offset, buffer } = &mut self.transfer && self.information == buffer.len() { overlay.apply(*target, *offset, buffer)?; }
+        if self.result.is_ok()
+            && let CompletedStorageTransfer::Read {
+                target,
+                offset,
+                buffer,
+            } = &mut self.transfer
+            && self.information == buffer.len()
+        {
+            overlay.apply(*target, *offset, buffer)?;
+        }
         Ok(self)
     }
 
