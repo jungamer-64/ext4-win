@@ -1565,6 +1565,23 @@ fn inline_records_reject_changed_attributes_and_missing_bodies_before_effects() 
     Ok(())
 }
 
+/// An empty inline directory uses a parent word and two independently bounded dirent regions.
+/// # Errors
+/// Returns full-record or inline dirent field bounds.
+fn inline_directory_operand(
+    fixture: &Fixture,
+    inode: u32,
+    parent: u32,
+    links: u16,
+) -> Result<Vec<u8>> {
+    let mut image = inline_file_operand(fixture, inode, &[0; 60], None)?;
+    put(&mut image, 4, &(0x4000_u16 | 0o755).to_le_bytes())?;
+    put(&mut image, 30, &links.to_le_bytes())?;
+    put(&mut image, 44, &parent.to_le_bytes())?;
+    put(&mut image, 52, &56_u16.to_le_bytes())?;
+    Ok(image)
+}
+
 /// # Errors
 /// Propagates complete inline file/directory operands, production creation and namespace reads.
 /// # Panics
@@ -1577,11 +1594,7 @@ fn inline_records_reject_changed_attributes_and_missing_bodies_before_effects() 
 fn inline_creation_recovers_complete_bodies_without_data_allocation() -> Result<()> {
     let mut fixture = inline_fixture()?;
     let file = inline_file_operand(&fixture, 64, &[0x51; 80], None)?;
-    let mut directory = inline_file_operand(&fixture, 65, &[0; 60], None)?;
-    put(&mut directory, 4, &(0x4000_u16 | 0o755).to_le_bytes())?;
-    put(&mut directory, 30, &2_u16.to_le_bytes())?;
-    put(&mut directory, 44, &2_u32.to_le_bytes())?;
-    put(&mut directory, 52, &56_u16.to_le_bytes())?;
+    let directory = inline_directory_operand(&fixture, 65, 2, 2)?;
     let file_name = birth_binding(2, 64, b"inline-born");
     let directory_name = birth_binding(2, 65, b"inline-dir-born");
     let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
@@ -1627,5 +1640,294 @@ fn inline_creation_recovers_complete_bodies_without_data_allocation() -> Result<
             free_inodes.checked_sub(2).ok_or(Error::InvalidSuperblock)?
         );
     }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates ordinary inline setup, independent comparison records and production recovery.
+/// # Panics
+/// Fails if a second-region alias duplicates into a vacant first region or conditional unlink loses identity.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe namespace identity across both resident regions under casefold"
+)]
+fn inline_namespace_searches_both_regions_before_alias_replacement() -> Result<()> {
+    let mut fixture = casefold_fixture(0x8000, 1)?;
+    let (parent, file) = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let parent = pass.create_directory(
+            root,
+            &Ext4Name::new(b"inline-folded")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )?;
+        pass.set_directory_casefold(parent, DirectoryCasefold::Enabled)?;
+        let metadata = NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?);
+        let filler = Ext4Name::new(&[b'x'; 40])?;
+        pass.create_file(parent, &filler, metadata)?;
+        let file = pass.create_file(parent, &Ext4Name::new("Straße".as_bytes())?, metadata)?;
+        pass.unlink_file(parent, &filler)?;
+        Ok((parent.id(), file.id()))
+    })?;
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::Directory(parent))?;
+    assert_eq!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            offset.checked_add(44).ok_or(Error::DeviceRange)?
+        )?,
+        0
+    );
+    let image = inode_operand(&fixture.disk, NodeId::File(file))?;
+    let binding = namespace_operand(parent, NodeId::File(file), b"STRASSE");
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(4, &binding), (6, &image)])?;
+        fixture.remount()?;
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(parent, &Ext4Name::new(b"strasse")?))?, ChildLookup::Found(entry) if *entry.node() == NodeId::File(file) && entry.name().bytes() == b"STRASSE")
+        );
+        let mut reader = DirectoryReader::new(parent, DirectoryScanCursor::start());
+        let mut children = 0;
+        while let Some(entry) = fixture.read(|pass| pass.next_directory_entry(&mut reader))? {
+            if !matches!(entry.entry().name().bytes(), b"." | b"..") {
+                children += 1;
+            }
+        }
+        assert_eq!(children, 1);
+        assert_ne!(
+            fixture_u32(
+                &fixture.disk.filesystem,
+                offset.checked_add(32).ok_or(Error::DeviceRange)?
+            )? & 0x1000_0000,
+            0
+        );
+    }
+    let free = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let unlink = namespace_operand(parent, NodeId::File(file), "straße".as_bytes());
+    install_delta(&mut fixture, &[(5, &unlink)])?;
+    fixture.remount()?;
+    assert!(matches!(
+        fixture.read(|pass| pass.lookup_child(parent, &Ext4Name::new(b"STRASSE")?))?,
+        ChildLookup::NotFound
+    ));
+    assert_eq!(
+        fixture_u32(&fixture.disk.filesystem, 1040)?,
+        free.checked_add(1).ok_or(Error::InvalidSuperblock)?
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Propagates inline setup, independently selected source layouts and production growth/replay.
+/// # Panics
+/// Fails if replay requires the source directory representation or allocates again on repeated input.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe directory layout derived from final namespace rather than a source inode image"
+)]
+fn inline_namespace_growth_preserves_replay_across_recorded_storage_layouts() -> Result<()> {
+    for mapped_source in [false, true] {
+        let mut fixture = inline_fixture()?;
+        let parent = fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            pass.create_directory(
+                root,
+                &Ext4Name::new(b"delta-inline-growth")?,
+                NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+            )
+            .map(|directory| directory.id())
+        })?;
+        let mut parent_image = inode_operand(&fixture.disk, NodeId::Directory(parent))?;
+        if mapped_source {
+            put(&mut parent_image, 36, &0x80000_u32.to_le_bytes())?;
+            put(&mut parent_image, 8, &8192_u32.to_le_bytes())?;
+            parent_image.truncate(164);
+        }
+        let file = fixture.a;
+        let mut image = inode_operand(&fixture.disk, NodeId::File(file))?;
+        put(&mut image, 30, &2_u16.to_le_bytes())?;
+        let name = [b'g'; 200];
+        let link = namespace_operand(parent, NodeId::File(file), &name);
+        let free = fixture_u32(&fixture.disk.filesystem, 1036)?;
+        let offset = fixture_inode_offset(&fixture.disk, NodeId::Directory(parent))?;
+        for _ in 0..2 {
+            install_delta(&mut fixture, &[(6, &parent_image), (4, &link), (6, &image)])?;
+            fixture.remount()?;
+            assert!(
+                matches!(fixture.read(|pass| pass.lookup_child(parent, &Ext4Name::new(&name)?))?, ChildLookup::Found(entry) if *entry.node() == NodeId::File(file))
+            );
+            assert_eq!(
+                fixture_u32(
+                    &fixture.disk.filesystem,
+                    offset.checked_add(32).ok_or(Error::DeviceRange)?
+                )? & 0x1008_0000,
+                0x80000
+            );
+            assert_eq!(
+                fixture_u32(
+                    &fixture.disk.filesystem,
+                    offset.checked_add(4).ok_or(Error::DeviceRange)?
+                )?,
+                4096
+            );
+            assert_eq!(
+                fixture_u32(&fixture.disk.filesystem, 1036)?,
+                free.checked_sub(1).ok_or(Error::InvalidSuperblock)?
+            );
+            assert_eq!(
+                fixture.read(|pass| Ok(pass.load_file(file)?.links_count().on_disk_count()))?,
+                2
+            );
+        }
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates independent nested resident births, namespace recovery and payload reads.
+/// # Panics
+/// Fails if a resident parent needs a block mapping or source counts override final child structure.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe complete nested resident namespace and derived directory counts"
+)]
+fn nested_inline_births_initialize_regions_before_child_bindings() -> Result<()> {
+    let mut fixture = inline_fixture()?;
+    let a = inline_directory_operand(&fixture, 64, 2, 2)?;
+    let b = inline_directory_operand(&fixture, 65, 64, 2)?;
+    let c = inline_file_operand(&fixture, 66, &[0x31; 80], None)?;
+    let root_binding = birth_binding(2, 64, b"inline-tree");
+    let nested_binding = birth_binding(64, 65, b"nested");
+    let file_binding = birth_binding(65, 66, b"file");
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    for _ in 0..2 {
+        install_delta(
+            &mut fixture,
+            &[
+                (6, &a),
+                (3, &root_binding),
+                (6, &b),
+                (3, &nested_binding),
+                (6, &c),
+                (3, &file_binding),
+            ],
+        )?;
+        fixture.remount()?;
+        let ChildLookup::Found(top) = fixture.read(|pass| {
+            pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"inline-tree")?)
+        })?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::Directory(top) = *top.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        let ChildLookup::Found(nested) =
+            fixture.read(|pass| pass.lookup_child(top, &Ext4Name::new(b"nested")?))?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::Directory(nested) = *nested.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(nested, &Ext4Name::new(b"..")?))?, ChildLookup::Found(entry) if *entry.node() == NodeId::Directory(top))
+        );
+        let ChildLookup::Found(child) =
+            fixture.read(|pass| pass.lookup_child(nested, &Ext4Name::new(b"file")?))?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::File(file) = *child.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        let mut bytes = [0; 80];
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
+        assert_eq!(bytes, [0x31; 80]);
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_directory(top)?.links_count().on_disk_count()))?,
+            3
+        );
+        assert_eq!(fixture_u32(&fixture.disk.filesystem, 1036)?, free_blocks);
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_sub(3).ok_or(Error::InvalidSuperblock)?
+        );
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates attribute-inode ownership setup, independent inline operands and recovered reads.
+/// # Panics
+/// Fails if payload replay drops an external value binding or accepts a different value owner's body.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe external attribute ownership independently of resident payload bytes"
+)]
+fn inline_payload_replay_preserves_external_attribute_ownership() -> Result<()> {
+    let mut fixture = fixture_with_incompatible_features(0x8400)?;
+    let a = fixture.a;
+    let b = fixture.b;
+    fixture.mutate(|pass| {
+        for (file, value) in [(a, 0x61), (b, 0x62)] {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, b"large")?,
+                XattrValue::new(&[value; 16_384])?,
+            )?;
+        }
+        Ok(())
+    })?;
+    let free = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let mut image = inode_operand(&fixture.disk, NodeId::File(a))?;
+    put(&mut image, 8, &32_u32.to_le_bytes())?;
+    put(&mut image, 44, &[0x44; 32])?;
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(6, &image)])?;
+        fixture.remount()?;
+        let mut bytes = [0; 32];
+        fixture.read(|pass| pass.read_file(a, FileOffset::ZERO, &mut bytes))?;
+        assert_eq!(bytes, [0x44; 32]);
+        for (file, expected) in [(a, 0x61), (b, 0x62)] {
+            let value = fixture
+                .read(|pass| {
+                    pass.read_xattr(
+                        NodeId::File(file),
+                        &XattrName::new(XattrNamespace::User, b"large")?,
+                    )
+                })?
+                .ok_or(Error::InvalidXattr)?;
+            assert_eq!(value.bytes(), [expected; 16_384]);
+        }
+        assert_eq!(fixture_u32(&fixture.disk.filesystem, 1036)?, free);
+    }
+    let other = inode_operand(&fixture.disk, NodeId::File(b))?;
+    let extra = u16::from_le_bytes(
+        image
+            .get(132..134)
+            .ok_or(Error::DeviceRange)?
+            .try_into()
+            .map_err(|_| Error::DeviceRange)?,
+    );
+    let body = 132_usize
+        .checked_add(usize::from(extra))
+        .ok_or(Error::DeviceRange)?;
+    put(
+        &mut image,
+        body,
+        other.get(body..).ok_or(Error::DeviceRange)?,
+    )?;
+    install_delta(&mut fixture, &[(6, &image)])?;
+    fixture.disk.storage_effects = 0;
+    assert_eq!(
+        fixture.disk.mount(MountAccess::ReadWrite).map(|_| ()),
+        Err(Error::UnsupportedJournal)
+    );
+    assert_eq!(fixture.disk.storage_effects, 0);
     Ok(())
 }

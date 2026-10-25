@@ -1347,6 +1347,46 @@ impl LoggedBinding<'_> {
             _ => Ok(LoggedLeafResult::Vacant),
         }
     }
+    /// Searches both resident regions before inserting, so a later-region binding cannot duplicate.
+    /// NoSpace leaves only temporary region copies changed; the caller can convert the original body.
+    /// # Errors
+    /// Returns malformed entries, comparison failures or insufficient combined region capacity.
+    fn apply_inline(
+        &self,
+        first: &mut DirectoryBlock,
+        second: &mut DirectoryBlock,
+        names: crate::disk_format::name::NameSemantics,
+    ) -> Result<()> {
+        let contains = |block: &DirectoryBlock| -> Result<bool> {
+            for entry in block.entries()? {
+                if names.equivalent(entry.name(), self.name())? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        let observed = if contains(first)? {
+            Some(self.apply(first, names)?)
+        } else if contains(second)? {
+            Some(self.apply(second, names)?)
+        } else {
+            None
+        };
+        match observed {
+            Some(LoggedLeafResult::FoundUnchanged | LoggedLeafResult::FoundChanged) => {
+                return Ok(());
+            }
+            Some(LoggedLeafResult::FoundRemoved) | None => {}
+            Some(LoggedLeafResult::Vacant | LoggedLeafResult::VacantInserted) => {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        }
+        match self {
+            Self::AbsentIf { .. } => Ok(()),
+            Self::Present(entry) if first.insert(entry)? || second.insert(entry)? => Ok(()),
+            Self::Present(_) => Err(Error::NoSpace),
+        }
+    }
 }
 
 impl MetadataMutation<'_, '_> {
@@ -1857,7 +1897,7 @@ impl MetadataMutation<'_, '_> {
 
     /// Replays plaintext bindings using staged leaves and final inode counts.
     /// # Errors
-    /// Rejects encrypted/inline parents, directory hard links, or malformed routes and identities.
+    /// Rejects encrypted parents, directory hard links, or malformed routes and identities.
     pub(super) fn replay_directory_binding(
         &mut self,
         parent: InodeId,
@@ -1876,11 +1916,8 @@ impl MetadataMutation<'_, '_> {
                 Err(Error::UnsupportedJournal)
             };
         }
-        let parent = self.raw_inode_for_policy(parent)?.parse()?;
-        if parent.kind() != InodeKind::Directory
-            || parent.protection().is_encrypted()
-            || parent.flags().has_inline_data()
-        {
+        let mut parent = self.raw_inode_for_policy(parent)?.parse()?;
+        if parent.kind() != InodeKind::Directory || parent.protection().is_encrypted() {
             return Err(Error::UnsupportedJournal);
         }
         let binding = match change {
@@ -1900,6 +1937,24 @@ impl MetadataMutation<'_, '_> {
                 name,
             },
         };
+        if parent.flags().has_inline_data() {
+            let index = self.ensure_inode_update(parent.id())?;
+            let mut raw = self.staged_live_inode(index)?;
+            let names = self.volume.superblock.name_semantics(&parent)?;
+            if self
+                .edit_inline_directory(&mut raw, |_, first, second| {
+                    binding.apply_inline(first, second, names)
+                })?
+                .is_some()
+            {
+                return self.replace_live_inode(index, raw);
+            }
+            let mut attributes = self.xattr_set_for_raw_inode(&raw)?;
+            self.convert_inline_data(&mut raw, &mut attributes)?;
+            self.store_xattr_set(&mut raw, attributes, None)?;
+            parent = raw.parse()?;
+            self.replace_live_inode(index, raw)?;
+        }
         let names = self.volume.superblock.name_semantics(&parent)?;
         let tree = self.mutable_extent_tree(&parent)?;
         if tree.contains_uninitialized() {
@@ -2120,12 +2175,8 @@ impl MetadataMutation<'_, '_> {
             let index = StagedInodeIndex::new(offset);
             let mut raw = self.staged_live_inode(index)?;
             let inode = raw.parse()?;
-            let recorded = program.records().iter().any(|record| matches!(record, crate::disk_format::journal::fast_commit::ParsedDelta::Inode { inode: id, .. } if *id == inode.id()));
             let normalize_uncounted = inode.links_count().known_count().is_none()
                 && !inode.flags().has_indexed_directory();
-            if recorded && !normalize_uncounted {
-                continue;
-            }
             let mut structural_change = normalize_uncounted;
             for record in program.records() {
                 if let crate::disk_format::journal::fast_commit::ParsedDelta::Namespace {

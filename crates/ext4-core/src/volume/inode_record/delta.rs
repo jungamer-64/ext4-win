@@ -77,7 +77,7 @@ impl<'a> DeltaInodeImage<'a> {
         let recorded_flags =
             InodeFlags::from_u32(le_u32(self.bytes, disk_offset(INODE_FLAGS_OFFSET))?);
         let flags_match = if directory {
-            inode.flags().without_indexed_directory() == recorded_flags.without_indexed_directory()
+            inode.flags().same_directory_policy(recorded_flags)
         } else {
             inode.flags() == recorded_flags
         };
@@ -88,6 +88,7 @@ impl<'a> DeltaInodeImage<'a> {
             || inode.kind()
                 != InodeMode::from_disk(le_u16(self.bytes, disk_offset(INODE_MODE_OFFSET))?)?.kind()
             || !flags_match
+            || (directory && !recorded_flags.has_extent_tree() && !recorded_flags.has_inline_data())
             || original.get(100..108) != self.bytes.get(100..108)
             || original.get(118..120) != self.bytes.get(118..120)
         {
@@ -95,7 +96,8 @@ impl<'a> DeltaInodeImage<'a> {
         }
         match &self.payload {
             DeltaPayload::Mapping => {
-                if !matches!(inode.storage(), InodeStorage::Extents(_))
+                if !directory
+                    && !matches!(inode.storage(), InodeStorage::Extents(_))
                     && original.get(40..100) != self.bytes.get(40..100)
                 {
                     return Err(Error::UnsupportedJournal);

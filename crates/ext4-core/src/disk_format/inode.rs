@@ -1278,6 +1278,12 @@ impl InodeFlags {
         Self(self.0 & !EXT4_INDEX_FL)
     }
 
+    /// Directory storage and routing may be reconstructed independently of recorded metadata policy.
+    pub(crate) const fn same_directory_policy(self, other: Self) -> bool {
+        let layout = EXT4_INDEX_FL | EXT4_EXTENTS_FL | EXT4_INLINE_DATA_FL;
+        self.0 & !layout == other.0 & !layout
+    }
+
     /// Returns flags with the indexed-directory bit set.
     #[must_use]
     pub const fn with_indexed_directory(self) -> Self {
