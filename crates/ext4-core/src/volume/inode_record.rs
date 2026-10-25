@@ -448,59 +448,6 @@ impl LiveInodeRecord {
         Ok(Some((self.raw.offset(), prefix)))
     }
 
-    /// Applies a metadata-only postcondition while retaining the admitted storage identity.
-    /// # Errors
-    /// Rejects layout, mapping, allocation, attribute, or inode-kind changes requiring range replay.
-    pub(super) fn apply_metadata_delta(mut self, encoded: &[u8]) -> Result<Self> {
-        let mut post = memory::copied_slice(self.raw.bytes())?;
-        let prefix = post.get_mut(..encoded.len()).ok_or(Error::InvalidInode)?;
-        memory::copy_exact(prefix, encoded)?;
-        if metadata_delta_prefix(self.raw.bytes(), &post)? != Some(encoded.len()) {
-            return Err(Error::UnsupportedJournal);
-        }
-        self.raw.bytes = post;
-        self.raw.into_live()
-    }
-
-    /// Extent replay restores inode metadata while the range program owns mappings and allocation.
-    /// # Errors
-    /// Rejects kind, storage flag, generation, xattr-owner or prefix-layout substitution.
-    pub(super) fn restore_extent_delta_metadata(mut self, encoded: &[u8]) -> Result<Self> {
-        let base = self.raw.bytes();
-        let prefix = if base.len() == 128 {
-            128
-        } else {
-            128_usize
-                .checked_add(usize::from(le_u16(base, disk_offset(128))?))
-                .ok_or(Error::InvalidInode)?
-        };
-        if encoded.len() != prefix
-            || prefix > base.len()
-            || le_u16(encoded, disk_offset(26))? == 0
-            || InodeMode::from_disk(le_u16(base, disk_offset(0))?)?.kind()
-                != InodeMode::from_disk(le_u16(encoded, disk_offset(0))?)?.kind()
-            || base.get(32..36) != encoded.get(32..36)
-            || base.get(100..108) != encoded.get(100..108)
-            || base.get(118..120) != encoded.get(118..120)
-            || (prefix > 128 && base.get(128..130) != encoded.get(128..130))
-        {
-            return Err(Error::UnsupportedJournal);
-        }
-        if !matches!(self.parse()?.storage(), InodeStorage::Extents(_)) {
-            return Err(Error::UnsupportedJournal);
-        }
-        for span in [0..28, 32..40, 100..116, 118..prefix] {
-            memory::copy_exact(
-                self.raw
-                    .bytes
-                    .get_mut(span.clone())
-                    .ok_or(Error::InvalidInode)?,
-                encoded.get(span).ok_or(Error::InvalidInode)?,
-            )?;
-        }
-        self.raw.into_live()
-    }
-
     /// Storage facts passed to the final allocation release boundary without copying the record.
     pub(super) const fn raw(&self) -> &RawInodeRecord<Vec<u8>> {
         &self.raw
