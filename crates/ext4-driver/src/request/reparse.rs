@@ -476,58 +476,6 @@ impl SymlinkReparseData {
     }
 }
 
-/// Parses a Windows symbolic-link reparse buffer into driver-owned reparse metadata.
-/// # Errors
-///
-/// Returns an error when the tag, paths, flags, or UTF-16 target are unsupported or malformed.
-fn parse_symlink_reparse_buffer(input: &[u8]) -> DriverResult<WindowsSymlinkReparsePoint> {
-    let input_len = input.len();
-    let input = LittleEndianInput::new(input);
-    let tag = input.read_u32(wire_offset(0))?;
-    if tag != wdk_sys::IO_REPARSE_TAG_SYMLINK {
-        return Err(DriverError::ReparseTagNotHandled);
-    }
-    let reparse_data_length = usize::from(input.read_u16(wire_offset(4))?);
-    let total_length = REPARSE_DATA_BUFFER_HEADER_SIZE
-        .checked_add(reparse_data_length)
-        .ok_or(DriverError::InvalidParameter)?;
-    if total_length > MAXIMUM_REPARSE_DATA_BUFFER_SIZE {
-        return Err(DriverError::InvalidParameter);
-    }
-    if input_len < total_length {
-        return Err(DriverError::BufferTooSmall);
-    }
-    if reparse_data_length < SYMLINK_REPARSE_BUFFER_HEADER_SIZE {
-        return Err(DriverError::InvalidParameter);
-    }
-
-    let substitute_name_offset = usize::from(input.read_u16(wire_offset(8))?);
-    let substitute_name_length = usize::from(input.read_u16(wire_offset(10))?);
-    let print_name_offset = usize::from(input.read_u16(wire_offset(12))?);
-    let print_name_length = usize::from(input.read_u16(wire_offset(14))?);
-    let flags = input.read_u32(wire_offset(16))?;
-    if flags & !wdk_sys::SYMLINK_FLAG_RELATIVE != 0 {
-        return Err(DriverError::NotSupported);
-    }
-
-    let path_buffer_length = reparse_data_length
-        .checked_sub(SYMLINK_REPARSE_BUFFER_HEADER_SIZE)
-        .ok_or(DriverError::InvalidParameter)?;
-    let substitute_range = symlink_path_range(
-        path_buffer_length,
-        substitute_name_offset,
-        substitute_name_length,
-    )?;
-    let _print_range =
-        symlink_path_range(path_buffer_length, print_name_offset, print_name_length)?;
-    let units = reparse_path_units(input, substitute_range)?;
-    let target = utf16_to_utf8_bytes(units.as_slice())?;
-    Ok(WindowsSymlinkReparsePoint::new(
-        SymlinkTarget::new(target.as_slice())?,
-        flags & wdk_sys::SYMLINK_FLAG_RELATIVE != 0,
-    ))
-}
-
 /// Parses the exact header accepted by `FSCTL_DELETE_REPARSE_POINT` for symbolic links.
 /// # Errors
 ///
@@ -548,33 +496,6 @@ fn parse_delete_reparse_buffer(input: &[u8]) -> DriverResult<()> {
         return Err(DriverError::InvalidParameter);
     }
     Ok(())
-}
-
-/// Validates and returns one path range inside a symbolic-link reparse buffer.
-/// # Errors
-///
-/// Returns an error when the range is not UTF-16 aligned, overflows, or lies outside `PathBuffer`.
-fn symlink_path_range(
-    path_buffer_length: usize,
-    offset: usize,
-    length: usize,
-) -> DriverResult<WireRange> {
-    if !offset.is_multiple_of(2) || !length.is_multiple_of(2) {
-        return Err(DriverError::InvalidParameter);
-    }
-    let path_buffer_end = SYMLINK_PATH_BUFFER_OFFSET
-        .checked_add(path_buffer_length)
-        .ok_or(DriverError::InvalidParameter)?;
-    let start = SYMLINK_PATH_BUFFER_OFFSET
-        .checked_add(offset)
-        .ok_or(DriverError::InvalidParameter)?;
-    let end = start
-        .checked_add(length)
-        .ok_or(DriverError::InvalidParameter)?;
-    if end > path_buffer_end {
-        return Err(DriverError::InvalidParameter);
-    }
-    wire_range(start, length)
 }
 
 /// Reads UTF-16 units from a validated symbolic-link path range.

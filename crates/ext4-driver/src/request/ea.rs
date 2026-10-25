@@ -673,68 +673,6 @@ fn requested_eas(
     }
 }
 
-/// Parses a FILE_FULL_EA_INFORMATION list.
-/// # Errors
-///
-/// Returns an error when record offsets, name terminators, name/value ranges, flags, or alignment
-/// are inconsistent.
-fn parse_full_ea_list(input: &[u8]) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    let fields = LittleEndianInput::new(input);
-    let mut offset = 0;
-    let mut entries = DriverVec::new();
-    loop {
-        if offset >= input.len() {
-            return Err(DriverError::EaListInconsistent);
-        }
-        let next = usize::try_from(fields.read_u32(wire_offset(offset))?)
-            .map_err(|_| DriverError::EaListInconsistent)?;
-        let flags = fields.read_u8(wire_offset(
-            offset.checked_add(4).ok_or(DriverError::InvalidParameter)?,
-        ))?;
-        let name_len = usize::from(fields.read_u8(wire_offset(
-            offset.checked_add(5).ok_or(DriverError::InvalidParameter)?,
-        ))?);
-        let value_len = usize::from(fields.read_u16(wire_offset(
-            offset.checked_add(6).ok_or(DriverError::InvalidParameter)?,
-        ))?);
-        let name_start = offset
-            .checked_add(FILE_FULL_EA_NAME_OFFSET)
-            .ok_or(DriverError::InvalidParameter)?;
-        let name_end = name_start
-            .checked_add(name_len)
-            .ok_or(DriverError::InvalidParameter)?;
-        let value_start = name_end
-            .checked_add(1)
-            .ok_or(DriverError::InvalidParameter)?;
-        let value_end = value_start
-            .checked_add(value_len)
-            .ok_or(DriverError::InvalidParameter)?;
-        let name = input
-            .get(name_start..name_end)
-            .ok_or(DriverError::EaListInconsistent)?;
-        if input.get(name_end).copied() != Some(0) {
-            return Err(DriverError::EaListInconsistent);
-        }
-        let value = input
-            .get(value_start..value_end)
-            .ok_or(DriverError::EaListInconsistent)?;
-        entries
-            .try_push_owned(WindowsEaRecord::from_wire(flags, name, value)?)
-            .map_err(|error| error.into_parts().0)?;
-
-        let raw_len = full_ea_record_length(name.len(), value.len())?;
-        if next == 0 {
-            return Ok(entries);
-        }
-        if !next.is_multiple_of(EA_RECORD_ALIGNMENT) || next < align_to_four(raw_len)? {
-            return Err(DriverError::EaListInconsistent);
-        }
-        offset = offset
-            .checked_add(next)
-            .ok_or(DriverError::EaListInconsistent)?;
-    }
-}
-
 /// Parses a FILE_GET_EA_INFORMATION list.
 /// # Errors
 ///
