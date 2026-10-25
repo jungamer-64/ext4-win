@@ -105,7 +105,11 @@ fn install_delta(fixture: &mut Fixture, records: &[(u16, &[u8])]) -> Result<()> 
     let raw_sb = journal
         .get_mut(JOURNAL_SUPER..JOURNAL_SUPER + 4096)
         .ok_or(Error::DeviceRange)?;
-    let tid = be32(raw_sb, 0x18)?;
+    if be32(raw_sb, 0x1c)? != 0 {
+        return Err(Error::JournalCorrupt);
+    }
+    // A clean journal persists the last committed sequence; its running transaction is the successor.
+    let tid = be32(raw_sb, 0x18)?.wrapping_add(1);
     let end = be32(raw_sb, 0x10)?;
     let flags = be32(raw_sb, 0x28)? | 0x20;
     put(raw_sb, 0x28, &flags.to_be_bytes())?;
@@ -580,8 +584,9 @@ fn creation_rejects_root_and_unretired_occupied_generations() -> Result<()> {
         } else {
             Error::UnsupportedJournal
         };
-        assert!(
-            matches!(fixture.disk.mount(MountAccess::ReadWrite), Err(error) if error == expected)
+        assert_eq!(
+            fixture.disk.mount(MountAccess::ReadWrite).map(|_| ()),
+            Err(expected)
         );
         assert_eq!(fixture.disk.storage_effects, 0);
     }

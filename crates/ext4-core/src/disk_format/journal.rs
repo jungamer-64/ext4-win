@@ -3401,7 +3401,7 @@ pub(crate) struct JournalSuperblock {
     maxlen: u32,
     /// First usable logical block recorded by `s_first`.
     first: u32,
-    /// Next transaction sequence recorded by `s_sequence`.
+    /// Dirty logs retain the first replay TID; clean logs retain the last checkpointed TID.
     sequence: JournalSequence,
     /// First pending transaction block recorded by `s_start`.
     start: u32,
@@ -3845,7 +3845,7 @@ mod tests {
             let size = journal.geometry.block_size;
             let data = fast_commit::encode(
                 size,
-                JournalSequence::new(7),
+                JournalSequence::new(8),
                 1,
                 [Ok(fast_commit::DeltaRecord::Inode {
                     inode: InodeId::try_from(12)?,
@@ -3902,7 +3902,7 @@ mod tests {
                     )?;
                     assert_eq!(
                         full.durable_journal.cursor.sequence,
-                        JournalSequence::new(8)
+                        JournalSequence::new(9)
                     );
                     assert!(!full.precommit_writes.is_empty());
                 }
@@ -3934,7 +3934,7 @@ mod tests {
             let size = journal.geometry.block_size;
             let old_delta = fast_commit::encode(
                 size,
-                JournalSequence::new(7),
+                JournalSequence::new(8),
                 1,
                 [Ok(fast_commit::DeltaRecord::Inode {
                     inode: InodeId::try_from(12)?,
@@ -3953,7 +3953,7 @@ mod tests {
                     2,
                     JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
                     512,
-                    7,
+                    8,
                     2,
                     2,
                     1000,
@@ -4047,7 +4047,7 @@ mod tests {
             assert_eq!(prepared.durable_journal.cursor.head, journal.cursor.head);
             assert_eq!(
                 prepared.durable_journal.cursor.sequence,
-                JournalSequence::new(8)
+                JournalSequence::new(9)
             );
             assert_eq!(prepared.overlay.len(), 1);
             assert_eq!(prepared.checkpoint.home_writes.len(), 1);
