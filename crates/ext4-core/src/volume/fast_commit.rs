@@ -45,6 +45,8 @@ enum DeltaReplayPhase {
         seed: DeltaRecoverySeed,
         /// Completed source ownership permits deltas but does not establish candidate validity.
         clusters: ClusterReferenceIndex,
+        /// Tracker membership remains independent of namespace retirement authority.
+        orphans: ValidatedOrphanInventory,
     },
     /// Validate tracking in the prospective images, before any persistence operation.
     CandidateOrphans {
