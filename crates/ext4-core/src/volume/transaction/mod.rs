@@ -378,7 +378,7 @@ pub struct ResolvedMutation {
     /// Ordered data images that must be durable before journal metadata is written.
     data_writes: Vec<RangeWrite>,
     /// Complete metadata and journaled data images supplied to JBD2 serialization.
-    journal_blocks: Vec<JournalBlock>,
+    image: crate::disk_format::journal::JournalCommitImage,
     /// Cluster-reference changes merged into the latest disjoint committed epoch at commit grant.
     cluster_deltas: Vec<ClusterReferenceDelta>,
     /// Free-cluster counter change merged at commit grant.
@@ -549,6 +549,41 @@ impl<Next> StorageRequestSequence<Next> {
             remaining: requests.into_iter(),
             next,
         }
+    }
+
+    /// Keeps mount-private recovery unpublished until a replacement commit and checkpoint are durable.
+    /// # Errors
+    /// Returns pre-effect request allocation or checked-size failure.
+    pub(in crate::volume) fn checkpoint(
+        prepared: crate::disk_format::journal::PreparedJournalCommit,
+        next: impl FnOnce(Journal<CleanJournal>) -> Next,
+    ) -> Result<Self> {
+        let (writes, commit, target, _durable, _overlay, checkpoint) = prepared.into_parts();
+        let (homes, clean, journal) = checkpoint.into_parts();
+        let capacity = writes
+            .len()
+            .checked_add(homes.len())
+            .and_then(|count| count.checked_add(6))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(capacity)
+            .map_err(|_| Error::OutOfMemory)?;
+        for write in writes {
+            requests.try_push(write.into_request())?;
+        }
+        requests.try_push(crate::StorageRequest::Flush { target })?;
+        requests.try_push(commit.into_request())?;
+        requests.try_push(crate::StorageRequest::Flush { target })?;
+        for write in homes {
+            requests.try_push(write.into_request())?;
+        }
+        requests.try_push(crate::StorageRequest::Flush {
+            target: crate::StorageTarget::Filesystem,
+        })?;
+        requests.try_push(clean.into_request())?;
+        requests.try_push(crate::StorageRequest::Flush { target })?;
+        Ok(Self::new(requests, next(journal)))
     }
 
     /// Transfers one request; its remaining sequence requires that exact completion.

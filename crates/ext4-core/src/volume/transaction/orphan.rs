@@ -173,48 +173,16 @@ pub(in crate::volume) fn prepare_orphan_batch(
     if metadata.len() > ORPHAN_METADATA_BUDGET {
         return Err(Error::TransactionTooLarge);
     }
-    let prepared = journal.prepare_commit(block_size, metadata)?;
-    let (writes, commit, journal_target, _durable_journal, _overlay, checkpoint) =
-        prepared.into_parts();
-    let (homes, clean, journal) = checkpoint.into_parts();
-    let mut requests = Vec::new();
-    let capacity = writes
-        .len()
-        .checked_add(homes.len())
-        .and_then(|count| count.checked_add(6))
-        .ok_or(Error::ArithmeticOverflow)?;
-    requests
-        .try_reserve_exact(capacity)
-        .map_err(|_| Error::OutOfMemory)?;
-    for write in writes {
-        requests.try_push(write.into_request())?;
-    }
-    requests.try_push(crate::StorageRequest::Flush {
-        target: journal_target,
-    })?;
-    requests.try_push(commit.into_request())?;
-    requests.try_push(crate::StorageRequest::Flush {
-        target: journal_target,
-    })?;
-    for write in homes {
-        requests.try_push(write.into_request())?;
-    }
-    requests.try_push(crate::StorageRequest::Flush {
-        target: crate::StorageTarget::Filesystem,
-    })?;
-    requests.try_push(clean.into_request())?;
-    requests.try_push(crate::StorageRequest::Flush {
-        target: journal_target,
-    })?;
+    let prepared = journal.prepare_commit(
+        block_size,
+        crate::disk_format::journal::JournalCommitImage::full(metadata),
+    )?;
     Ok((
-        StorageRequestSequence::new(
-            requests,
-            OrphanBatchCompletion {
-                journal,
-                clusters,
-                superblock: next_superblock,
-            },
-        ),
+        StorageRequestSequence::checkpoint(prepared, |journal| OrphanBatchCompletion {
+            journal,
+            clusters,
+            superblock: next_superblock,
+        })?,
         progress,
     ))
 }

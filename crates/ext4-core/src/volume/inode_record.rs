@@ -376,7 +376,92 @@ impl AllocatedInodeRecord {
     }
 }
 
+/// Lossless metadata projection excludes storage ownership and inline attribute bodies.
+/// # Errors
+/// Returns malformed prefix width or truncated inode fields.
+fn metadata_delta_prefix(base: &[u8], post: &[u8]) -> Result<Option<usize>> {
+    if base.len() != post.len() || base.len() < 128 {
+        return Err(Error::InvalidInode);
+    }
+    if le_u16(base, disk_offset(26))? == 0
+        || (le_u16(base, disk_offset(0))? & 0xf000) != (le_u16(post, disk_offset(0))? & 0xf000)
+    {
+        return Ok(None);
+    }
+    for span in [26..36, 40..108, 116..120] {
+        if base.get(span.clone()) != post.get(span) {
+            return Ok(None);
+        }
+    }
+    let prefix = if base.len() == 128 {
+        128
+    } else {
+        let extra = le_u16(base, disk_offset(128))?;
+        if extra != le_u16(post, disk_offset(128))? {
+            return Ok(None);
+        }
+        128_usize
+            .checked_add(usize::from(extra))
+            .ok_or(Error::InvalidInode)?
+    };
+    if prefix > base.len() {
+        return Err(Error::InvalidInode);
+    }
+    Ok(Some(prefix))
+}
+
 impl LiveInodeRecord {
+    /// A lossless metadata delta leaves all mapping, allocation and attribute-body bytes unchanged.
+    /// Location and prefix admission are checked against the same immutable containing block.
+    /// # Errors
+    /// Rejects malformed record width or metadata coordinates before journal encoding.
+    pub(super) fn metadata_delta_region(
+        &self,
+        block_start: ByteOffset,
+        base_block: &[u8],
+        post_block: &[u8],
+    ) -> Result<Option<(ByteOffset, usize)>> {
+        let Some(relative) = self.raw.offset().get().checked_sub(block_start.get()) else {
+            return Ok(None);
+        };
+        let relative = usize::try_from(relative).map_err(|_| Error::ArithmeticOverflow)?;
+        let end = relative
+            .checked_add(self.raw.bytes().len())
+            .ok_or(Error::ArithmeticOverflow)?;
+        let Some(base) = base_block.get(relative..end) else {
+            return Ok(None);
+        };
+        let Some(post) = post_block.get(relative..end) else {
+            return Ok(None);
+        };
+        let Some(prefix) = metadata_delta_prefix(base, post)? else {
+            return Ok(None);
+        };
+        let prefix_end = relative
+            .checked_add(prefix)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if base_block.get(..relative) != post_block.get(..relative)
+            || base_block.get(prefix_end..) != post_block.get(prefix_end..)
+        {
+            return Ok(None);
+        }
+        Ok(Some((self.raw.offset(), prefix)))
+    }
+
+    /// Applies a metadata-only postcondition while retaining the admitted storage identity.
+    /// # Errors
+    /// Rejects layout, mapping, allocation, attribute, or inode-kind changes requiring range replay.
+    pub(super) fn apply_metadata_delta(mut self, encoded: &[u8]) -> Result<Self> {
+        let mut post = memory::copied_slice(self.raw.bytes())?;
+        let prefix = post.get_mut(..encoded.len()).ok_or(Error::InvalidInode)?;
+        memory::copy_exact(prefix, encoded)?;
+        if metadata_delta_prefix(self.raw.bytes(), &post)? != Some(encoded.len()) {
+            return Err(Error::UnsupportedJournal);
+        }
+        self.raw.bytes = post;
+        self.raw.into_live()
+    }
+
     /// Storage facts passed to the final allocation release boundary without copying the record.
     pub(super) const fn raw(&self) -> &RawInodeRecord<Vec<u8>> {
         &self.raw
@@ -1345,6 +1430,33 @@ impl RawInodeRecord<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    /// # Panics
+    /// Fails if metadata replay changes allocation, inode identity, attributes or repeated results.
+    #[test]
+    fn metadata_delta_replay_is_idempotent_and_preserves_storage() {
+        let result = (|| -> Result<()> {
+            let original = initialized_file(12)?;
+            let mut encoded = memory::copied_slice(original.raw.bytes())?;
+            put_le_u16(
+                &mut encoded,
+                disk_offset(INODE_MODE_OFFSET),
+                MODE_REGULAR | 0o600,
+            )?;
+            let replayed = original.apply_metadata_delta(&encoded)?;
+            assert_eq!(mode(replayed.raw()), Ok(MODE_REGULAR | 0o600));
+            let replayed = replayed.apply_metadata_delta(&encoded)?;
+            assert_eq!(replayed.raw.bytes(), encoded);
+            let mut changed_mapping = memory::copied_slice(&encoded)?;
+            *changed_mapping.get_mut(40).ok_or(Error::InvalidInode)? ^= 1;
+            assert_eq!(
+                replayed.apply_metadata_delta(&changed_mapping),
+                Err(Error::UnsupportedJournal)
+            );
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
     /// # Errors
     /// Returns fixture construction or timestamp encoding failure.
     /// # Panics

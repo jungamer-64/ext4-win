@@ -15,8 +15,8 @@ use crate::disk::storage::{
     OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
 };
 use crate::disk_format::journal::{
-    CleanJournal, ExternalJournalLoad, FilesystemHomeSpace, Journal, JournalBlock,
-    JournalRecoveryOperation, LoadedJournal,
+    CleanJournal, DeltaRecoverySeed, ExternalJournalLoad, FilesystemHomeSpace, Journal,
+    JournalBlock, JournalRecoveryCompletion, JournalRecoveryOperation, LoadedJournal,
 };
 use crate::disk_format::superblock::{
     ChecksumInvalidSuperblock, FilesystemUuid, JournalMode, JournalUuid, PrimarySuperblockRead,
@@ -2077,9 +2077,32 @@ enum MountState {
     },
     /// Journal replay repaired the primary block; strict revalidation must precede publication.
     VerifyingReplayedPrimary {
-        /// Clean journal retained while the repaired primary is re-read.
-        journal: Journal<CleanJournal>,
+        /// Pending semantic replay remains owned until the fresh filesystem admits its operands.
+        completion: JournalRecoveryCompletion,
         /// Device containing the journal.
+        journal_target: StorageTarget,
+    },
+    /// Resolve every delta postimage against a fresh, unpublished filesystem transcript.
+    ResolvingDeltas {
+        /// Strictly validated primary metadata after full journal replay.
+        superblock: Superblock,
+        /// Journal and authenticated program from the same recovery operation.
+        seed: DeltaRecoverySeed,
+        /// Physical journal device selected during admission.
+        journal_target: StorageTarget,
+    },
+    /// Fully allocated full-commit conversion and home checkpoint requests.
+    DeltaWrites {
+        /// Only matching lower completions can advance this sequence.
+        sequence: StorageRequestSequence<Journal<CleanJournal>>,
+        /// Physical journal target retained for mount publication.
+        journal_target: StorageTarget,
+    },
+    /// A submitted delta-conversion transfer remains owned even after cancellation.
+    DeltaWritePending {
+        /// Consuming continuation revealed by the exact transfer completion.
+        pending: crate::PendingStorageTransfer<StorageRequestSequence<Journal<CleanJournal>>>,
+        /// Physical journal target retained for mount publication.
         journal_target: StorageTarget,
     },
     /// Validate both persistent orphan trackers before granting write authority.
@@ -2342,6 +2365,9 @@ impl MountOperation {
                         | MountState::Repaired
                         | MountState::Recovering { .. }
                         | MountState::VerifyingReplayedPrimary { .. }
+                        | MountState::ResolvingDeltas { .. }
+                        | MountState::DeltaWrites { .. }
+                        | MountState::DeltaWritePending { .. }
                         | MountState::MarkerWriteReady { .. }
                         | MountState::MarkerWritePending { .. }
                         | MountState::MarkerFlushReady(_)
@@ -2484,12 +2510,33 @@ impl MountOperation {
                 self.state = MountState::PreparingMarker(indexed);
             }
             MountState::VerifyingReplayedPrimary {
-                journal,
+                completion: recovered,
                 journal_target,
             } => {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::VerifyingReplayedPrimary {
-                    journal,
+                    completion: recovered,
+                    journal_target,
+                };
+            }
+            MountState::ResolvingDeltas {
+                superblock,
+                seed,
+                journal_target,
+            } => {
+                self.filesystem.complete(completion)?;
+                self.state = MountState::ResolvingDeltas {
+                    superblock,
+                    seed,
+                    journal_target,
+                };
+            }
+            MountState::DeltaWritePending {
+                pending,
+                journal_target,
+            } => {
+                self.state = MountState::DeltaWrites {
+                    sequence: pending.complete(completion)?,
                     journal_target,
                 };
             }
@@ -2528,6 +2575,7 @@ impl MountOperation {
             | MountState::MarkerWriteReady { .. }
             | MountState::MarkerFlushReady(_)
             | MountState::OrphanWrites { .. }
+            | MountState::DeltaWrites { .. }
             | MountState::Published(_)) => {
                 self.state = state;
                 return Err(Error::DeviceIo);
@@ -2748,8 +2796,8 @@ impl MountOperation {
                             suspended: self,
                         };
                     }
-                    Ok(None) => match (*operation).into_clean() {
-                        Ok(journal) => {
+                    Ok(None) => match (*operation).into_recovered() {
+                        Ok(completion) => {
                             if self.cancel_requested {
                                 return MountTransition::Complete(Err(Error::OperationCancelled));
                             }
@@ -2759,7 +2807,7 @@ impl MountOperation {
                                 filesystem_length,
                             );
                             self.state = MountState::VerifyingReplayedPrimary {
-                                journal,
+                                completion,
                                 journal_target,
                             };
                         }
@@ -2768,7 +2816,7 @@ impl MountOperation {
                     Err(error) => return MountTransition::Complete(Err(error)),
                 },
                 MountState::VerifyingReplayedPrimary {
-                    journal,
+                    completion,
                     journal_target,
                 } => {
                     let primary = {
@@ -2777,11 +2825,22 @@ impl MountOperation {
                     };
                     match primary {
                         Ok(PrimarySuperblockRead::Valid(superblock)) => {
-                            self.state = MountState::ScanningOrphans(MountPublicationSeed {
-                                superblock,
-                                journal,
-                                journal_target,
-                            });
+                            self.state = match completion {
+                                JournalRecoveryCompletion::Clean(journal) => {
+                                    MountState::ScanningOrphans(MountPublicationSeed {
+                                        superblock,
+                                        journal,
+                                        journal_target,
+                                    })
+                                }
+                                JournalRecoveryCompletion::Deltas(seed) => {
+                                    MountState::ResolvingDeltas {
+                                        superblock,
+                                        seed,
+                                        journal_target,
+                                    }
+                                }
+                            };
                         }
                         Ok(
                             PrimarySuperblockRead::TornWriteSession { .. }
@@ -2789,13 +2848,78 @@ impl MountOperation {
                         ) => return MountTransition::Complete(Err(Error::ChecksumMismatch)),
                         Err(Error::OperationSuspended) => {
                             self.state = MountState::VerifyingReplayedPrimary {
-                                journal,
+                                completion,
                                 journal_target,
                             };
                             return self.submit_pending_read();
                         }
                         Err(error) => return MountTransition::Complete(Err(error)),
                     }
+                }
+                MountState::ResolvingDeltas {
+                    superblock,
+                    seed,
+                    journal_target,
+                } => {
+                    let result = {
+                        let device = OperationDevice::new(&mut self.filesystem);
+                        let Some(keys) = self.fscrypt_keys.as_ref() else {
+                            return MountTransition::Complete(Err(Error::DeviceIo));
+                        };
+                        let mut view = EpochReadView::mounting(device, superblock, keys);
+                        super::fast_commit::resolve(&mut view, &seed)
+                    };
+                    match result {
+                        Ok(blocks) => {
+                            match super::fast_commit::prepare(seed, superblock.block_size(), blocks)
+                            {
+                                Ok(sequence) => {
+                                    self.state = MountState::DeltaWrites {
+                                        sequence,
+                                        journal_target,
+                                    }
+                                }
+                                Err(error) => return MountTransition::Complete(Err(error)),
+                            }
+                        }
+                        Err(Error::OperationSuspended) => {
+                            self.state = MountState::ResolvingDeltas {
+                                superblock,
+                                seed,
+                                journal_target,
+                            };
+                            return self.submit_pending_read();
+                        }
+                        Err(error) => return MountTransition::Complete(Err(error)),
+                    }
+                }
+                MountState::DeltaWrites {
+                    sequence,
+                    journal_target,
+                } => match sequence.advance() {
+                    StorageRequestSequenceStep::Submit { request, suspended } => {
+                        self.state = MountState::DeltaWritePending {
+                            pending: suspended,
+                            journal_target,
+                        };
+                        return MountTransition::SubmitLower {
+                            request,
+                            suspended: self,
+                        };
+                    }
+                    StorageRequestSequenceStep::Finished(journal) => {
+                        self.filesystem = StorageTranscript::new(
+                            StorageTarget::Filesystem,
+                            self.filesystem.len(),
+                        );
+                        self.state = MountState::VerifyingReplayedPrimary {
+                            completion: JournalRecoveryCompletion::Clean(journal),
+                            journal_target,
+                        };
+                    }
+                },
+                MountState::DeltaWritePending { .. } => {
+                    return MountTransition::Complete(Err(Error::DeviceIo));
                 }
                 MountState::ScanningOrphans(publication) => {
                     let result = {

@@ -3,6 +3,46 @@
 use super::*;
 
 impl MetadataMutation<'_, '_> {
+    /// Selects the inode projection only when every changed byte belongs to its metadata prefix.
+    /// The full image remains authoritative; versions of its complete block are rechecked at commit.
+    /// # Errors
+    /// Propagates metadata read, coordinate or malformed inode failure before any write authority.
+    fn commit_image(
+        &mut self,
+        blocks: Vec<JournalBlock>,
+    ) -> Result<crate::disk_format::journal::JournalCommitImage> {
+        use crate::disk_format::journal::JournalCommitImage;
+        if !self
+            .volume
+            .superblock
+            .features()
+            .contains(crate::FilesystemFeature::FastCommit)
+            || blocks.len() != 1
+        {
+            return Ok(JournalCommitImage::full(blocks));
+        }
+        let [StagedInodeRecord::Live(inode)] = self.inode_updates.as_slice() else {
+            return Ok(JournalCommitImage::full(blocks));
+        };
+        let block = blocks.first().ok_or(Error::InvalidWriteRange)?;
+        let size = self.volume.superblock.block_size();
+        let block_start = size.offset_of(block.block())?;
+        let mut base = match memory::repeated_vec(0, block.bytes().len()) {
+            Ok(base) => base,
+            Err(Error::OutOfMemory) => return Ok(JournalCommitImage::full(blocks)),
+            Err(error) => return Err(error),
+        };
+        self.volume
+            .device
+            .read_metadata_exact_at(block_start, &mut base)?;
+        let Some((offset, prefix)) =
+            inode.metadata_delta_region(block_start, &base, block.bytes())?
+        else {
+            return Ok(JournalCommitImage::full(blocks));
+        };
+        JournalCommitImage::inode(blocks, size, inode.id(), offset, prefix)
+    }
+
     /// Serializes all staged metadata mutations into byte-range writes.
     /// # Errors
     ///
@@ -142,63 +182,11 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when a metadata write does not fit within one block or an original metadata
     /// block cannot be read before patching.
     pub(super) fn metadata_blocks(&mut self) -> Result<Vec<JournalBlock>> {
-        let block_size = self.volume.superblock.block_size();
-        let block_bytes =
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        let block_bytes_u64 = u64::from(block_size.bytes());
-        let mut blocks = Vec::new();
-
+        let mut images = super::super::metadata_image::MetadataImages::new();
         for write in self.metadata_writes()? {
-            let block = BlockAddress::new(
-                write
-                    .offset
-                    .get()
-                    .checked_div(block_bytes_u64)
-                    .ok_or(Error::InvalidSuperblock)?,
-            );
-            let in_block = usize::try_from(
-                write
-                    .offset
-                    .get()
-                    .checked_rem(block_bytes_u64)
-                    .ok_or(Error::InvalidSuperblock)?,
-            )
-            .map_err(|_| Error::ArithmeticOverflow)?;
-            let end = in_block
-                .checked_add(write.bytes.len())
-                .ok_or(Error::ArithmeticOverflow)?;
-            if end > block_bytes {
-                return Err(Error::InvalidWriteRange);
-            }
-
-            let index = if let Some(index) = blocks
-                .iter()
-                .position(|metadata: &JournalBlock| metadata.block() == block)
-            {
-                index
-            } else {
-                let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-                self.volume
-                    .device
-                    .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
-                blocks.try_push(JournalBlock::new(block, bytes))?;
-                blocks
-                    .len()
-                    .checked_sub(1)
-                    .ok_or(Error::ArithmeticOverflow)?
-            };
-            memory::copy_exact(
-                blocks
-                    .get_mut(index)
-                    .ok_or(Error::InvalidSuperblock)?
-                    .bytes_mut()
-                    .get_mut(in_block..end)
-                    .ok_or(Error::DeviceRange)?,
-                &write.bytes,
-            )?;
+            images.patch(&mut self.volume, write.offset, &write.bytes)?;
         }
-
-        Ok(blocks)
+        Ok(images.into_blocks())
     }
 
     /// Applies accumulated free-count deltas to a superblock image.
@@ -322,7 +310,7 @@ impl MetadataMutation<'_, '_> {
             key_version,
             node_metadata_updates,
             data_writes,
-            journal_blocks,
+            image: self.commit_image(journal_blocks)?,
             cluster_deltas: core::mem::take(&mut self.cluster_deltas),
             free_clusters_delta: self.free_clusters_delta,
             free_inodes_delta: self.free_inodes_delta,
@@ -408,10 +396,8 @@ impl ReservedMutation {
             })?;
         }
 
-        let prepared = journal.prepare_commit(
-            current_epoch.superblock.block_size(),
-            self.resolved.journal_blocks,
-        )?;
+        let prepared =
+            journal.prepare_commit(current_epoch.superblock.block_size(), self.resolved.image)?;
         let (
             planned_journal_writes,
             planned_commit_write,

@@ -11,23 +11,49 @@ use crate::disk_format::{
     name::Ext4Name,
 };
 use crate::memory;
+
+mod encode;
 use crate::{Error, Result};
 use alloc::vec::Vec;
+pub(super) use encode::{DeltaRecord, encode};
 
 /// Context-free wire interpretation, independent of inode allocation and mutation permission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tag {
+    /// Logical-to-physical extent assignment, wire opcode 1.
     AddRange,
+    /// Logical interval removal, wire opcode 2.
     RemoveRange,
+    /// New inode and namespace initialization, wire opcode 3.
     Create,
+    /// Existing inode binding without a link-count increment, wire opcode 4.
     Link,
+    /// Conditional binding removal, wire opcode 5.
     Unlink,
+    /// Inode metadata prefix whose extent root is interpreted separately, wire opcode 6.
     Inode,
+    /// Block-filling bytes included in the running checksum, wire opcode 7.
     Padding,
+    /// Commit TID and checksum followed by excluded padding, wire opcode 8.
     Tail,
+    /// Required feature mask and full-journal TID, wire opcode 9.
     Head,
 }
 impl Tag {
+    /// Projects the wire opcode at the single serialization boundary.
+    const fn code(self) -> u16 {
+        match self {
+            Self::AddRange => 1,
+            Self::RemoveRange => 2,
+            Self::Create => 3,
+            Self::Link => 4,
+            Self::Unlink => 5,
+            Self::Inode => 6,
+            Self::Padding => 7,
+            Self::Tail => 8,
+            Self::Head => 9,
+        }
+    }
     /// The fixed opcode and value-length contract is shared by authentication and decoding.
     /// # Errors
     /// Rejects unknown opcodes and structurally invalid values before any payload interpretation.
@@ -120,8 +146,11 @@ impl LogicalRange {
 /// Create includes inode/directory initialization; linking and unlinking existing identities do not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum NamespaceChange {
+    /// Includes allocation and directory initialization as well as the final binding.
     Create,
+    /// Establishes a binding; inode link counts come from the final inode postimage.
     Link,
+    /// Removes the name only when its existing target is the recorded inode.
     Unlink,
 }
 
@@ -206,9 +235,9 @@ pub(crate) struct DeltaProgram {
     records: Vec<ParsedDelta>,
 }
 impl DeltaProgram {
-    /// Moves the immutable program into its sole filesystem recovery consumer.
-    pub(crate) fn into_records(self) -> Vec<ParsedDelta> {
-        self.records
+    /// Borrows the exact authenticated operands while their unique recovery owner remains live.
+    pub(crate) fn records(&self) -> &[ParsedDelta] {
+        &self.records
     }
 }
 
@@ -482,6 +511,86 @@ mod tests {
         }
         block
     }
+    /// # Panics
+    /// Fails if the encoder disagrees with independent bytes or a changed reread is accepted.
+    #[test]
+    fn generated_batch_matches_independent_vector_and_reauthenticates_reread() {
+        let result = (|| -> Result<()> {
+            let size = BlockSize::from_superblock_log(2)?;
+            let tid = JournalSequence::new(0x1234_5678);
+            let encoded = encode(
+                size,
+                tid,
+                1,
+                [Ok(DeltaRecord::Namespace {
+                    change: NamespaceChange::Link,
+                    parent: InodeId::try_from(2)?,
+                    inode: InodeId::try_from(12)?,
+                    name: b"x",
+                })],
+            )?;
+            assert_eq!(encoded.len(), 1);
+            assert_eq!(
+                encoded.first().map(Vec::as_slice),
+                Some(first_block().as_slice())
+            );
+            let prefix = AuthenticatedPrefix {
+                end: 4096,
+                records: 1,
+            };
+            let mut decoder = ProgramDecoder::new(tid, size, prefix)?;
+            assert!(decoder.accept(&first_block())?);
+            let program = decoder.finish()?;
+            assert!(
+                matches!(program.records(), [ParsedDelta::Namespace { change: NamespaceChange::Link, parent, inode, name }] if parent.as_u32() == 2 && inode.as_u32() == 12 && name.bytes() == b"x")
+            );
+            let mut changed = first_block();
+            changed[24] = b'y';
+            assert!(matches!(
+                ProgramDecoder::new(tid, size, prefix)?.accept(&changed),
+                Err(Error::ChecksumMismatch)
+            ));
+            assert!(matches!(
+                encode(size, tid, 0, core::iter::empty()),
+                Err(Error::TransactionTooLarge)
+            ));
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails if a complete earlier tail is lost when uncommitted bytes remain in its last block.
+    #[test]
+    fn second_pass_stops_at_a_midblock_authenticated_boundary() {
+        let result = (|| -> Result<()> {
+            let mut block = first_block();
+            // TAIL value length 8 instead of block padding; independently calculated CRC below.
+            block[27] = 8;
+            block[28] = 0;
+            memory::copy_exact(
+                block.get_mut(33..37).ok_or(Error::JournalCorrupt)?,
+                &0x57db_c73b_u32.to_le_bytes(),
+            )?;
+            let mut scan = FrameAuthenticator::new(
+                JournalSequence::new(0x1234_5678),
+                BlockSize::from_superblock_log(2)?,
+            )?;
+            scan.inspect(&block)?;
+            let prefix = scan.finish().ok_or(Error::JournalCorrupt)?;
+            assert_eq!(prefix.end, 37);
+            let mut decoder = ProgramDecoder::new(
+                JournalSequence::new(0x1234_5678),
+                BlockSize::from_superblock_log(2)?,
+                prefix,
+            )?;
+            assert!(decoder.accept(&block)?);
+            assert_eq!(decoder.finish()?.records().len(), 1);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
     /// # Panics
     /// Fails if TID binding, per-tail CRC restart or padding exclusion differs from wire vectors.
     #[test]
