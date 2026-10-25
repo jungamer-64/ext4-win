@@ -220,68 +220,6 @@ impl AllocatedInodeRecord {
         put_le_u32(&mut self.raw.bytes, disk_offset(36), 1)?;
         self.raw.into_attribute()
     }
-    /// Establishes a new namespace identity from its authenticated metadata prefix.
-    /// Root and allocation fields are reconstructed; absent attribute bodies are never invented.
-    /// # Errors
-    /// Rejects malformed prefix/layout, unsupported storage, external attributes or protected payloads.
-    pub(super) fn initialize_delta_inode(
-        mut self,
-        encoded: &[u8],
-        block_size: BlockSize,
-    ) -> Result<LiveInodeRecord> {
-        if encoded.len() < 128 || encoded.len() > self.raw.bytes.len() {
-            return Err(Error::InvalidInode);
-        }
-        let prefix = if encoded.len() == 128 {
-            128
-        } else {
-            128_usize
-                .checked_add(usize::from(le_u16(encoded, disk_offset(128))?))
-                .ok_or(Error::InvalidInode)?
-        };
-        if prefix != encoded.len() {
-            return Err(Error::InvalidInode);
-        }
-        memory::copy_exact(
-            self.raw
-                .bytes
-                .get_mut(..prefix)
-                .ok_or(Error::InvalidInode)?,
-            encoded,
-        )?;
-        let kind = InodeMode::from_disk(self.raw.mode()?)?.kind();
-        if kind != InodeKind::Symlink || self.raw.flags()?.has_extent_tree() {
-            let tree = MutableExtentTree::from_extents(Vec::new())?;
-            let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
-            self.raw.set_extent_root_bytes(serialized.inode_root())?;
-        }
-        if kind == InodeKind::Directory {
-            self.raw
-                .set_flags(self.raw.flags()?.without_indexed_directory())?;
-            self.raw.set_encoded_size(
-                self.raw
-                    .encoding
-                    .encode_directory_size(DirectorySize::from_bytes(0))?,
-            )?;
-        }
-        self.raw.set_encoded_allocation_size(
-            self.raw
-                .encoding
-                .encode_allocation_size(FileAllocationSize::from_bytes(0))?,
-        )?;
-        let inode = self.raw.parse()?;
-        if !matches!(
-            inode.storage(),
-            InodeStorage::Extents(_) | InodeStorage::FastSymlink(_)
-        ) || inode.protection().is_encrypted()
-            || inode.protection().is_verity()
-            || self.raw.xattr_block()?.is_some()
-        {
-            return Err(Error::UnsupportedJournal);
-        }
-        self.raw.into_live()
-    }
-
     /// Initializes this allocation as an empty extent-backed file.
     /// # Errors
     ///
@@ -508,65 +446,6 @@ impl LiveInodeRecord {
             return Ok(None);
         }
         Ok(Some((self.raw.offset(), prefix)))
-    }
-
-    /// Restores final namespace metadata while extent reconstruction owns roots and allocation.
-    /// # Errors
-    /// Rejects zero-link, kind, storage flag, generation, attribute-owner or prefix-layout changes.
-    pub(super) fn restore_delta_metadata(mut self, encoded: &[u8]) -> Result<Self> {
-        let inode = self.parse()?;
-        let directory = inode.kind() == InodeKind::Directory;
-        let recorded_flags =
-            InodeFlags::from_u32(le_u32(encoded, disk_offset(INODE_FLAGS_OFFSET))?);
-        let flags_match = if directory {
-            inode.flags().without_indexed_directory() == recorded_flags.without_indexed_directory()
-        } else {
-            inode.flags() == recorded_flags
-        };
-        let base = self.raw.bytes();
-        let prefix = if base.len() == 128 {
-            128
-        } else {
-            128_usize
-                .checked_add(usize::from(le_u16(base, disk_offset(128))?))
-                .ok_or(Error::InvalidInode)?
-        };
-        if encoded.len() != prefix
-            || prefix > base.len()
-            || le_u16(encoded, disk_offset(26))? == 0
-            || InodeMode::from_disk(le_u16(base, disk_offset(0))?)?.kind()
-                != InodeMode::from_disk(le_u16(encoded, disk_offset(0))?)?.kind()
-            || !flags_match
-            || base.get(100..108) != encoded.get(100..108)
-            || base.get(118..120) != encoded.get(118..120)
-            || (prefix > 128 && base.get(128..130) != encoded.get(128..130))
-        {
-            return Err(Error::UnsupportedJournal);
-        }
-        if !matches!(self.parse()?.storage(), InodeStorage::Extents(_))
-            && base.get(40..100) != encoded.get(40..100)
-        {
-            return Err(Error::UnsupportedJournal);
-        }
-        for span in [0..28, 32..40, 100..116, 118..prefix] {
-            memory::copy_exact(
-                self.raw
-                    .bytes
-                    .get_mut(span.clone())
-                    .ok_or(Error::InvalidInode)?,
-                encoded.get(span).ok_or(Error::InvalidInode)?,
-            )?;
-        }
-        if directory {
-            // Directory size and routing are derived from rebuilt blocks, not an absent source layout.
-            self.raw.set_flags(inode.flags())?;
-            self.raw.set_encoded_size(
-                self.raw
-                    .encoding
-                    .encode_directory_size(DirectorySize::from_bytes(inode.size().bytes()))?,
-            )?;
-        }
-        self.raw.into_live()
     }
 
     /// Storage facts passed to the final allocation release boundary without copying the record.
