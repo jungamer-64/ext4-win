@@ -369,6 +369,7 @@ pub(crate) fn verify_ro_interop(repository_root: &Path) -> TaskResult<()> {
                 }
                 _ => {}
             }
+            let original = sha256_file(&source)?;
             for recovery in [ReadOnlyRecovery::Replay, ReadOnlyRecovery::NoLoad] {
                 for access in [DeviceWriteAccess::Writable, DeviceWriteAccess::ReadOnly] {
                     let name = format!("{state}-{recovery:?}-{access:?}");
@@ -384,9 +385,13 @@ pub(crate) fn verify_ro_interop(repository_root: &Path) -> TaskResult<()> {
                         access,
                     )?;
                     let (actual, effects) = core_observation(linux, &core, recovery, access)?;
-                    if actual != expected || (access == DeviceWriteAccess::ReadOnly && effects != 0)
+                    let native_changed = sha256_file(&native)? != original;
+                    let core_changed = sha256_file(&core)? != original;
+                    if actual != expected
+                        || native_changed != core_changed
+                        || (access == DeviceWriteAccess::ReadOnly && effects != 0)
                     {
-                        return Err(io::Error::other(format!("RO kernel mismatch {name}: core {actual:?}, kernel {expected:?}, effects {effects}")).into());
+                        return Err(io::Error::other(format!("RO kernel mismatch {name}: core {actual:?}, kernel {expected:?}, effects {effects}, media changed core {core_changed}, kernel {native_changed}")).into());
                     }
                     if recovery == ReadOnlyRecovery::Replay
                         && access == DeviceWriteAccess::Writable

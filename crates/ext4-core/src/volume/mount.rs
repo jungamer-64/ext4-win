@@ -1884,7 +1884,6 @@ impl ProbedMount {
             external: None,
             fscrypt_keys: Some(fscrypt_keys),
             state: MountState::Resolving,
-            cancel_requested: false,
         })
     }
 }
@@ -1988,8 +1987,6 @@ pub struct MountOperation {
     fscrypt_keys: Option<FscryptKeySet>,
     /// Explicit mount and durability phase.
     state: MountState,
-    /// Cancellation recorded after a durability-changing recovery phase has begun.
-    cancel_requested: bool,
 }
 
 /// Media ownership cannot be reconstructed from the journal or a mount UUID.
@@ -2305,6 +2302,8 @@ impl MountOperation {
     }
 
     /// Consumes one concrete event and runs until the next lower request or terminal result.
+    /// The executor must drain lower ownership before cancellation. If it withholds a completed
+    /// effect's acknowledgement, cancellation retains an uncertain media outcome and cannot retry.
     #[must_use]
     pub fn advance(
         mut self: Box<Self>,
@@ -2349,27 +2348,7 @@ impl MountOperation {
             super::OperationEvent::StorageCompleted(completion) => {
                 self.accept_completion(completion)
             }
-            super::OperationEvent::CancelRequested => {
-                if matches!(
-                    self.state,
-                    MountState::ReadOnlyWrites { .. }
-                        | MountState::ReadOnlyPending { .. }
-                        | MountState::Recovering { .. }
-                        | MountState::VerifyingReplayedPrimary { .. }
-                        | MountState::PreparingDeltas { .. }
-                        | MountState::DeltaWrites { .. }
-                        | MountState::DeltaWritePending { .. }
-                        | MountState::SessionWrites { .. }
-                        | MountState::SessionPending { .. }
-                        | MountState::OrphanWrites { .. }
-                        | MountState::OrphanWritePending { .. }
-                ) {
-                    self.cancel_requested = true;
-                    Ok(())
-                } else {
-                    Err(Error::OperationCancelled)
-                }
-            }
+            super::OperationEvent::CancelRequested => Err(Error::OperationCancelled),
             _ => Err(Error::DeviceIo),
         };
         if let Err(error) = accepted {
@@ -2804,9 +2783,6 @@ impl MountOperation {
                     }
                     Ok(None) => match (*operation).into_recovered() {
                         Ok(completion) => {
-                            if self.cancel_requested {
-                                return self.fail(Error::OperationCancelled);
-                            }
                             let filesystem_length = self.filesystem.len();
                             self.filesystem = StorageTranscript::new(
                                 StorageTarget::Filesystem,
@@ -3155,9 +3131,6 @@ impl MountOperation {
                     return self.fail(Error::DeviceIo);
                 }
                 MountState::RecoveringOrphans(mut mount) => {
-                    if self.cancel_requested {
-                        return self.fail(Error::OperationCancelled);
-                    }
                     let Some(target) = mount.orphans.current() else {
                         self.state = if matches!(
                             self.access,
@@ -3259,11 +3232,7 @@ impl MountOperation {
                             Err(error) => return self.fail(error),
                         };
                     }
-                    return if self.cancel_requested {
-                        self.fail(Error::OperationCancelled)
-                    } else {
-                        MountTransition::Complete(Ok(completed))
-                    };
+                    return MountTransition::Complete(Ok(completed));
                 }
             }
         }

@@ -1315,107 +1315,173 @@ fn ro_orphan_cleanup_uses_selected_persistence_and_physical_access() -> Result<(
 }
 
 /// # Errors
-/// Returns fixture/probe preparation failure before the injected lower failure.
+/// Returns fixture/probe preparation failure before the injected interruption.
 /// # Panics
-/// Fails if a rejected recovery write is reported as unchanged media or retried.
+/// Fails if failure or cancellation loses physical progress, publishes a mount or retries.
 #[test]
 #[expect(
     clippy::panic_in_result_fn,
     reason = "assertions check the authoritative physical effect outcome"
 )]
-fn read_only_recovery_failure_retains_uncertain_effect() -> Result<()> {
+fn read_only_recovery_failure_and_cancellation_preserve_effects() -> Result<()> {
     use ext4_core::{
         DeviceWriteAccess, MountMediaOutcome, MountProbeOperation, MountProbeTransition,
         ReadOnlyRecovery,
     };
-    let mut disk = Fixture::new()?.disk;
-    let length = DeviceLength::from_bytes(
-        u64::try_from(disk.filesystem.len()).map_err(|_| Error::DeviceRange)?,
-    );
-    let mut probe = Box::try_new(MountProbeOperation::new(length))
-        .map_err(|_| Error::OutOfMemory)?
-        .advance(OperationEvent::Admitted);
-    let prepared = loop {
-        probe = match probe {
-            MountProbeTransition::SubmitLower { request, suspended } => {
-                suspended.advance(OperationEvent::StorageCompleted(disk.complete(request)?))
-            }
-            MountProbeTransition::Complete(result) => break result?,
+    for (reason, media) in [
+        (Error::DeviceIo, MountMediaOutcome::OutcomeUnknown),
+        (Error::OperationCancelled, MountMediaOutcome::Unchanged),
+        (Error::OperationCancelled, MountMediaOutcome::OutcomeUnknown),
+        (
+            Error::OperationCancelled,
+            MountMediaOutcome::RecoveryIncomplete,
+        ),
+    ] {
+        let mut fixture = Fixture::new()?;
+        let ticket = fixture.coordinator.admit_mutation()?;
+        let (resolved, ()) = fixture.disk.resolve(
+            &fixture.profile,
+            &fixture.epoch,
+            &fixture.coordinator,
+            ticket,
+            &mut PlainCrypto,
+            |pass| pass.set_volume_label(Ext4VolumeLabel::new(b"interrupted")?),
+        )?;
+        let prepared = resolved
+            .reserve(
+                fixture.coordinator.grant_intent(ticket),
+                &fixture.coordinator,
+            )?
+            .prepare_commit(
+                fixture
+                    .coordinator
+                    .acquire_commit(ticket)?
+                    .ok_or(Error::ClusterReferenceConflict)?,
+                &mut fixture.coordinator,
+                &fixture.epoch,
+                &mut fixture.cache,
+            )?;
+        let ordered = fixture.disk.sequence(prepared.start())?;
+        let payloads = fixture.disk.transfer(ordered.submit())?;
+        let payload = fixture.disk.sequence(payloads)?;
+        let commit = fixture.disk.transfer(payload.submit())?;
+        let durability = fixture.disk.transfer(commit.submit())?;
+        drop(fixture.disk.transfer(durability.submit())?);
+        let mut disk = fixture.disk;
+        disk.storage_effects = 0;
+        let length = DeviceLength::from_bytes(
+            u64::try_from(disk.filesystem.len()).map_err(|_| Error::DeviceRange)?,
+        );
+        let mut probe = Box::try_new(MountProbeOperation::new(length))
+            .map_err(|_| Error::OutOfMemory)?
+            .advance(OperationEvent::Admitted);
+        let prepared = loop {
+            probe = match probe {
+                MountProbeTransition::SubmitLower { request, suspended } => {
+                    suspended.advance(OperationEvent::StorageCompleted(disk.complete(request)?))
+                }
+                MountProbeTransition::Complete(result) => break result?,
+            };
         };
-    };
-    let now = ext4_core::MmpTime::new(0, 0);
-    let mut step = Box::try_new(prepared.start(
-        FscryptKeySet::empty(),
-        MountAccess::ReadOnly {
-            recovery: ReadOnlyRecovery::Replay,
-        },
-        DeviceWriteAccess::Writable,
-        ext4_core::MmpOwner::new([3; 16])?,
-        now,
-    )?)
-    .map_err(|_| Error::OutOfMemory)?
-    .advance(OperationEvent::Admitted, now);
-    let mut failed_effects = 0;
-    loop {
-        step = match step {
-            MountTransition::SubmitLower { request, suspended } => {
-                let completion = if matches!(request, StorageRequest::Read { .. }) {
-                    disk.complete(request)?
-                } else {
-                    failed_effects += 1;
-                    StorageCompletion::failure(
-                        CompletedStorageTransfer::from_request(request),
-                        Error::DeviceIo,
-                    )
-                };
-                suspended.advance(OperationEvent::StorageCompleted(completion), now)
-            }
-            MountTransition::DiscoverExternalJournal {
-                requirement,
-                suspended,
-            } => {
-                let length = DeviceLength::from_bytes(
-                    u64::try_from(disk.journal.len()).map_err(|_| Error::DeviceRange)?,
-                );
-                let mut probe = Box::try_new(ext4_core::ExternalJournalProbeOperation::new(
+        let now = ext4_core::MmpTime::new(0, 0);
+        let mut step = Box::try_new(prepared.start(
+            FscryptKeySet::empty(),
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Replay,
+            },
+            DeviceWriteAccess::Writable,
+            ext4_core::MmpOwner::new([3; 16])?,
+            now,
+        )?)
+        .map_err(|_| Error::OutOfMemory)?
+        .advance(OperationEvent::Admitted, now);
+        let mut interruptions = 0;
+        loop {
+            step = match step {
+                MountTransition::SubmitLower { request, suspended } => {
+                    let read = matches!(request, StorageRequest::Read { .. });
+                    if reason == Error::OperationCancelled
+                        && (media == MountMediaOutcome::Unchanged
+                            || (media == MountMediaOutcome::RecoveryIncomplete
+                                && disk.storage_effects > 0
+                                && read))
+                    {
+                        // The read was never submitted; all preceding effects were acknowledged.
+                        drop(request);
+                        interruptions += 1;
+                        step = suspended.advance(OperationEvent::CancelRequested, now);
+                        continue;
+                    }
+                    if !read
+                        && reason == Error::OperationCancelled
+                        && media == MountMediaOutcome::OutcomeUnknown
+                    {
+                        // Match the executor: lower ownership ends before its acknowledgement is
+                        // replaced by cancellation. The mount cannot infer the completed effect.
+                        drop(disk.complete(request)?);
+                        interruptions += 1;
+                        step = suspended.advance(OperationEvent::CancelRequested, now);
+                        continue;
+                    }
+                    let completion = if read || media == MountMediaOutcome::RecoveryIncomplete {
+                        disk.complete(request)?
+                    } else {
+                        interruptions += 1;
+                        StorageCompletion::failure(
+                            CompletedStorageTransfer::from_request(request),
+                            Error::DeviceIo,
+                        )
+                    };
+                    suspended.advance(OperationEvent::StorageCompleted(completion), now)
+                }
+                MountTransition::DiscoverExternalJournal {
                     requirement,
-                    length,
-                ))
-                .map_err(|_| Error::OutOfMemory)?
-                .advance(OperationEvent::Admitted);
-                let token = loop {
-                    probe = match probe {
-                        ext4_core::ExternalJournalProbeTransition::SubmitLower {
-                            request,
-                            suspended,
-                        } => suspended
-                            .advance(OperationEvent::StorageCompleted(disk.complete(request)?)),
-                        ext4_core::ExternalJournalProbeTransition::Complete(result) => {
-                            match result? {
-                                ext4_core::ExternalJournalProbeOutcome::Match(token) => {
-                                    break token;
-                                }
-                                ext4_core::ExternalJournalProbeOutcome::Mismatch => {
-                                    return Err(Error::UnsupportedJournal);
+                    suspended,
+                } => {
+                    let length = DeviceLength::from_bytes(
+                        u64::try_from(disk.journal.len()).map_err(|_| Error::DeviceRange)?,
+                    );
+                    let mut probe = Box::try_new(ext4_core::ExternalJournalProbeOperation::new(
+                        requirement,
+                        length,
+                    ))
+                    .map_err(|_| Error::OutOfMemory)?
+                    .advance(OperationEvent::Admitted);
+                    let token = loop {
+                        probe = match probe {
+                            ext4_core::ExternalJournalProbeTransition::SubmitLower {
+                                request,
+                                suspended,
+                            } => suspended
+                                .advance(OperationEvent::StorageCompleted(disk.complete(request)?)),
+                            ext4_core::ExternalJournalProbeTransition::Complete(result) => {
+                                match result? {
+                                    ext4_core::ExternalJournalProbeOutcome::Match(token) => {
+                                        break token;
+                                    }
+                                    ext4_core::ExternalJournalProbeOutcome::Mismatch => {
+                                        return Err(Error::UnsupportedJournal);
+                                    }
                                 }
                             }
-                        }
+                        };
                     };
-                };
-                suspended.attach_external_journal(token, DeviceWriteAccess::Writable, now)
-            }
-            MountTransition::Complete(result) => {
-                let Err(failure) = result else {
-                    return Err(Error::DeviceIo);
-                };
-                assert_eq!(failure.reason, Error::DeviceIo);
-                assert_eq!(failure.media, MountMediaOutcome::OutcomeUnknown);
-                assert_eq!(failed_effects, 1);
-                return Ok(());
-            }
-            _ => return Err(Error::DeviceIo),
-        };
+                    suspended.attach_external_journal(token, DeviceWriteAccess::Writable, now)
+                }
+                MountTransition::Complete(result) => {
+                    let Err(failure) = result else {
+                        return Err(Error::DeviceIo);
+                    };
+                    assert_eq!(failure.reason, reason);
+                    assert_eq!(failure.media, media);
+                    assert_eq!(interruptions, 1);
+                    break;
+                }
+                _ => return Err(Error::DeviceIo),
+            };
+        }
     }
+    Ok(())
 }
 
 /// # Errors
