@@ -23,8 +23,6 @@ enum ReplayInode {
         /// The logged birth parent supplies the mandatory dot-dot postcondition.
         parent: InodeId,
     },
-    /// A target with no recorded final metadata needs a census of the final namespace.
-    Unrecorded(LiveInodeRecord),
     /// A free bitmap slot grants no access to a stale inode-table body.
     Absent(InodeId),
 }
@@ -32,9 +30,7 @@ impl ReplayInode {
     /// Identity is independent of whether the storage initialization obligation has completed.
     fn id(&self) -> InodeId {
         match self {
-            Self::Live { raw, .. } | Self::NewDirectory { raw, .. } | Self::Unrecorded(raw) => {
-                raw.id()
-            }
+            Self::Live { raw, .. } | Self::NewDirectory { raw, .. } => raw.id(),
             Self::Absent(id) => *id,
         }
     }
@@ -132,12 +128,6 @@ pub(in crate::volume) fn resolve_delta_postconditions(
     for inode in inodes {
         let (mut raw, tree) = match inode {
             ReplayInode::Live { raw, tree } => (raw, tree),
-            ReplayInode::Unrecorded(raw) => {
-                mutation
-                    .inode_updates
-                    .try_push(StagedInodeRecord::Live(raw))?;
-                continue;
-            }
             ReplayInode::Absent(_) => continue,
             ReplayInode::NewDirectory { mut raw, parent } => {
                 let mut tree = MutableExtentTree::from_extents(Vec::new())?;
