@@ -16,17 +16,17 @@ struct ReplayInode {
 
 /// Applies complete, ordered mapping assignments while deriving bitmap changes from final ownership.
 /// # Errors
-/// Rejects unsupported creation/terminal unlink, invalid allocation, layout, capacity or source-I/O failure.
+/// Rejects unsupported object creation/terminal unlink, invalid allocation, layout, capacity or source-I/O failure.
 pub(in crate::volume) fn resolve_delta_postconditions(
     volume: EpochReadView<'_, '_>,
     program: &DeltaProgram,
 ) -> Result<ResolvedDeltaImages> {
     for record in program.records() {
-        if let ParsedDelta::Namespace { change, inode, .. } = record
-            && (*change == NamespaceChange::Create
-                || !program.records().iter().any(
-                    |record| matches!(record, ParsedDelta::Inode { inode: id, .. } if id == inode),
-                ))
+        if let ParsedDelta::Namespace { inode, .. } = record
+            && !program
+                .records()
+                .iter()
+                .any(|record| matches!(record, ParsedDelta::Inode { inode: id, .. } if id == inode))
         {
             return Err(Error::UnsupportedJournal);
         }
@@ -122,7 +122,24 @@ fn prepare_inode(
     if inodes.iter().any(|inode| inode.raw.id() == id) {
         return Ok(());
     }
-    let mut raw = mutation.volume.read_live_inode_record(id)?;
+    let encoded = program
+        .records()
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            ParsedDelta::Inode { inode, encoded } if *inode == id => Some(encoded.as_slice()),
+            _ => None,
+        });
+    let created = program.records().iter().any(|record| matches!(record, ParsedDelta::Namespace { change: NamespaceChange::Create, inode, .. } if *inode == id));
+    let raw = if created {
+        mutation.recover_file_inode(id, encoded.ok_or(Error::UnsupportedJournal)?)?
+    } else {
+        let mut raw = mutation.volume.read_live_inode_record(id)?;
+        if let Some(encoded) = encoded {
+            raw = raw.restore_delta_metadata(encoded)?;
+        }
+        raw
+    };
     let inode = raw.parse()?;
     let tree = if matches!(inode.storage(), InodeStorage::Extents(_)) {
         Some(mutation.mutable_extent_tree(&inode)?)
@@ -130,17 +147,6 @@ fn prepare_inode(
         None
     };
     if tree.is_none() && program.records().iter().any(|record| matches!(record, ParsedDelta::AddRange { inode, .. } | ParsedDelta::RemoveRange { inode, .. } if *inode == id)) { return Err(Error::UnsupportedJournal); }
-    if let Some(encoded) = program
-        .records()
-        .iter()
-        .rev()
-        .find_map(|record| match record {
-            ParsedDelta::Inode { inode, encoded } if *inode == id => Some(encoded),
-            _ => None,
-        })
-    {
-        raw = raw.restore_delta_metadata(encoded)?;
-    }
     inodes.try_push(ReplayInode { raw, tree })?;
     Ok(())
 }
@@ -214,6 +220,43 @@ fn replace_range(
 }
 
 impl MetadataMutation<'_, '_> {
+    /// A recorded new file claims its exact ordinary inode slot; replay cannot replace another generation.
+    /// # Errors
+    /// Returns reserved identities, conflicting generations, unsupported metadata or bitmap/I/O failure.
+    fn recover_file_inode(&mut self, id: InodeId, encoded: &[u8]) -> Result<LiveInodeRecord> {
+        self.volume.superblock.require_namespace_inode(id)?;
+        if id == InodeId::ROOT {
+            return Err(Error::CannotRemoveRoot);
+        }
+        let position = InodeBitmapPosition::from_inode(&self.volume.superblock, id)?;
+        let group = position.group();
+        let descriptor = BlockGroupDescriptor::read_from(
+            &mut self.volume.device,
+            &self.volume.superblock,
+            group,
+        )?;
+        let index = self.ensure_inode_bitmap_update(group, &descriptor)?;
+        let bitmap = self
+            .inode_bitmap_updates
+            .get_mut(index)
+            .ok_or(Error::InvalidInode)?;
+        if inode_bitmap_bit_state(&bitmap.bytes, position)? == BitmapBitState::Used {
+            let raw = self.volume.read_live_inode_record(id)?;
+            if raw.parse()?.kind() != InodeKind::File
+                || le_u32(raw.raw().bytes(), disk_offset(INODE_GENERATION_OFFSET))?
+                    != le_u32(encoded, disk_offset(INODE_GENERATION_OFFSET))?
+            {
+                return Err(Error::UnsupportedJournal);
+            }
+            return raw.restore_delta_metadata(encoded);
+        }
+        set_inode_bitmap_bit(&mut bitmap.bytes, position, BitmapBitState::Used)?;
+        self.record_group_free_inodes_delta(group, -1)?;
+        let block_size = self.volume.superblock.block_size();
+        self.empty_allocated_inode_record(id)?
+            .initialize_delta_file(encoded, block_size)
+    }
+
     /// Reference changes visit mapped allocation units only; sparse logical holes consume no work.
     /// # Errors
     /// Rejects invalid physical bounds, reference underflow, overflow or allocation failure.

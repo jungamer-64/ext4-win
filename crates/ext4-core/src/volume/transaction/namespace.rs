@@ -1954,7 +1954,7 @@ impl LoggedBinding<'_> {
 impl MetadataMutation<'_, '_> {
     /// Replays existing file/symlink bindings using staged plaintext leaves and final inode counts.
     /// # Errors
-    /// Rejects creation, encrypted/inline parents, directory targets, required growth or malformed routes.
+    /// Rejects encrypted/inline parents, directory targets, required growth or malformed routes.
     pub(super) fn replay_directory_binding(
         &mut self,
         parent: InodeId,
@@ -1974,12 +1974,9 @@ impl MetadataMutation<'_, '_> {
             return Err(Error::UnsupportedJournal);
         }
         let binding = match change {
-            NamespaceChange::Create => return Err(Error::UnsupportedJournal),
-            NamespaceChange::Link => LoggedBinding::Present(RawDirectoryEntry::new(
-                target,
-                name,
-                directory_entry_kind(child.kind()),
-            )?),
+            NamespaceChange::Create | NamespaceChange::Link => LoggedBinding::Present(
+                RawDirectoryEntry::new(target, name, directory_entry_kind(child.kind()))?,
+            ),
             NamespaceChange::Unlink => LoggedBinding::AbsentIf {
                 inode: target,
                 name,

@@ -220,6 +220,55 @@ impl AllocatedInodeRecord {
         put_le_u32(&mut self.raw.bytes, disk_offset(36), 1)?;
         self.raw.into_attribute()
     }
+    /// Establishes a new ordinary extent-file identity from its authenticated metadata prefix.
+    /// Root and allocation fields are reconstructed; absent attribute bodies are never invented.
+    /// # Errors
+    /// Rejects malformed prefix/layout, non-file storage, external attributes or protected payloads.
+    pub(super) fn initialize_delta_file(
+        mut self,
+        encoded: &[u8],
+        block_size: BlockSize,
+    ) -> Result<LiveInodeRecord> {
+        if encoded.len() < 128 || encoded.len() > self.raw.bytes.len() {
+            return Err(Error::InvalidInode);
+        }
+        let prefix = if encoded.len() == 128 {
+            128
+        } else {
+            128_usize
+                .checked_add(usize::from(le_u16(encoded, disk_offset(128))?))
+                .ok_or(Error::InvalidInode)?
+        };
+        if prefix != encoded.len() {
+            return Err(Error::InvalidInode);
+        }
+        memory::copy_exact(
+            self.raw
+                .bytes
+                .get_mut(..prefix)
+                .ok_or(Error::InvalidInode)?,
+            encoded,
+        )?;
+        let tree = MutableExtentTree::from_extents(Vec::new())?;
+        let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
+        self.raw.set_extent_root_bytes(serialized.inode_root())?;
+        self.raw.set_encoded_allocation_size(
+            self.raw
+                .encoding
+                .encode_allocation_size(FileAllocationSize::from_bytes(0))?,
+        )?;
+        let inode = self.raw.parse()?;
+        if inode.kind() != InodeKind::File
+            || !matches!(inode.storage(), InodeStorage::Extents(_))
+            || inode.protection().is_encrypted()
+            || inode.protection().is_verity()
+            || self.raw.xattr_block()?.is_some()
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        self.raw.into_live()
+    }
+
     /// Initializes this allocation as an empty extent-backed file.
     /// # Errors
     ///

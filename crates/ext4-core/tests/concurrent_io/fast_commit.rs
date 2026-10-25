@@ -464,3 +464,126 @@ fn conditional_unlink_preserves_a_different_inode_at_the_same_name() -> Result<(
     }
     Ok(())
 }
+
+/// Builds a fresh file's recorded identity without copying a production allocation algorithm.
+/// # Errors
+/// Returns malformed fixture metadata, record layout or independent checksum construction failure.
+fn inject_creation(fixture: &mut Fixture, inode: u32) -> Result<()> {
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::File(fixture.a))?;
+    let mut raw = fixture
+        .disk
+        .filesystem
+        .get(offset..offset.checked_add(256).ok_or(Error::DeviceRange)?)
+        .ok_or(Error::DeviceRange)?
+        .to_vec();
+    put(&mut raw, 0, &(0x8000_u16 | 0o640).to_le_bytes())?;
+    put(&mut raw, 4, &8_u32.to_le_bytes())?;
+    put(&mut raw, 100, &0x1234_abcd_u32.to_le_bytes())?;
+    put(&mut raw, 108, &0_u32.to_le_bytes())?;
+    raw.get_mut(40..100).ok_or(Error::DeviceRange)?.fill(0xa5);
+    let prefix = 128_usize
+        .checked_add(usize::from(u16::from_le_bytes(
+            raw.get(128..130)
+                .ok_or(Error::DeviceRange)?
+                .try_into()
+                .map_err(|_| Error::DeviceRange)?,
+        )))
+        .ok_or(Error::DeviceRange)?;
+    let mut image = inode.to_le_bytes().to_vec();
+    image.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
+    let mut binding = 2_u32.to_le_bytes().to_vec();
+    binding.extend_from_slice(&inode.to_le_bytes());
+    binding.extend_from_slice(b"delta-created");
+    let mut add = [0; 16];
+    put(&mut add, 0, &inode.to_le_bytes())?;
+    put(&mut add, 8, &1_u16.to_le_bytes())?;
+    put(&mut add, 12, &1000_u32.to_le_bytes())?;
+    install_delta(fixture, &[(3, &binding), (1, &add), (6, &image)])
+}
+
+/// # Errors
+/// Propagates independent create records, production recovery and new file-read failures.
+/// # Panics
+/// Fails if exact inode allocation, reconstructed generation or repeated accounting differs.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare new namespace identity, data and allocation counters"
+)]
+fn new_file_creation_claims_the_logged_inode_once() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    assert!(!allocated(&fixture.disk, 1000)?);
+    put(&mut fixture.disk.filesystem, 1000 * 4096, b"replayed")?;
+    for _ in 0..2 {
+        inject_creation(&mut fixture, 64)?;
+        fixture.remount()?;
+        let ChildLookup::Found(child) = fixture.read(|pass| {
+            pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"delta-created")?)
+        })?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        assert_eq!(child.node().file_index(), 64);
+        let NodeId::File(file) = *child.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        let mut bytes = [0; 8];
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
+        assert_eq!(&bytes, b"replayed");
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(file)?.security().permissions().as_u16()))?,
+            0o640
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_sub(1).ok_or(Error::InvalidSuperblock)?
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1036)?,
+            free_blocks.checked_sub(1).ok_or(Error::InvalidSuperblock)?
+        );
+        let offset = fixture_inode_offset(&fixture.disk, NodeId::File(file))?;
+        assert_eq!(
+            fixture_u32(
+                &fixture.disk.filesystem,
+                offset.checked_add(100).ok_or(Error::DeviceRange)?
+            )?,
+            0x1234_abcd
+        );
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates fixture construction, independent records or production admission failures.
+/// # Panics
+/// Fails if creation replaces root or an occupied generation without any retirement postcondition.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe preserved root and occupied identity ownership before writes"
+)]
+fn creation_rejects_root_and_unretired_occupied_generations() -> Result<()> {
+    for root in [true, false] {
+        let mut fixture = Fixture::new()?;
+        let id = if root {
+            2
+        } else {
+            NodeId::File(fixture.a).file_index()
+        };
+        inject_creation(&mut fixture, id)?;
+        fixture.disk.storage_effects = 0;
+        let expected = if root {
+            Error::CannotRemoveRoot
+        } else {
+            Error::UnsupportedJournal
+        };
+        assert!(
+            matches!(fixture.disk.mount(MountAccess::ReadWrite), Err(error) if error == expected)
+        );
+        assert_eq!(fixture.disk.storage_effects, 0);
+    }
+    Ok(())
+}
