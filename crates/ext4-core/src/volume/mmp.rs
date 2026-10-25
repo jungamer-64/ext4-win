@@ -305,10 +305,15 @@ const fn next_sequence(sequence: u32) -> u32 {
 pub struct MmpTime {
     /// Monotonic milliseconds from a stable host origin for this mount's entire lifetime.
     monotonic_millis: u64,
-    /// UTC seconds are written only for diagnostics.
+    /// UTC seconds for persistent ownership records and mount timestamps.
     unix_seconds: u64,
 }
 impl MmpTime {
+    /// Wall-clock sample, independent of monotonic ownership admission.
+    pub(crate) const fn unix_seconds(self) -> u64 {
+        self.unix_seconds
+    }
+
     /// Keeps clock domains distinct throughout ownership admission and record encoding.
     pub const fn new(monotonic_millis: u64, unix_seconds: u64) -> Self {
         Self {

@@ -929,9 +929,13 @@ impl JournalRecoveryOperation {
         journal: Journal<LoadedJournal>,
         recovery_state: RecoveryState,
     ) -> Result<Self> {
-        let policy = match recovery_state {
-            RecoveryState::Clean => RecoveryPolicy::Discard,
-            RecoveryState::NeedsRecovery => RecoveryPolicy::Replay,
+        // A committed session close can clear RECOVER in its home image before the journal
+        // checkpoint is retired. A nonempty full log still owns recovery, including on media
+        // without superblock checksums. Clean sessions must not resurrect stale fast commits
+        // from an empty full log.
+        let policy = match (recovery_state, journal.superblock.start()) {
+            (RecoveryState::Clean, 0) => RecoveryPolicy::Discard,
+            (RecoveryState::Clean | RecoveryState::NeedsRecovery, _) => RecoveryPolicy::Replay,
         };
         Self::new_with_primary_repair(journal, policy, PrimaryRepairValidation::NotRequired)
     }
@@ -1729,6 +1733,14 @@ impl RecoveryTag {
 }
 
 impl Journal<CleanJournal> {
+    /// Copies encoding state for finalization after the host has drained all journal users.
+    /// The snapshot supplies no independent admission or media ownership authority.
+    /// # Errors
+    /// Returns allocation failure before any close effect is issued.
+    pub(crate) fn try_clone(&self) -> Result<Self> {
+        self.copy_without_state()
+    }
+
     /// Delta durability and full-image checkpoint use the same coordinator and epoch boundaries.
     /// The clean superblock advances past the delta TID only after home blocks have been flushed.
     /// # Errors

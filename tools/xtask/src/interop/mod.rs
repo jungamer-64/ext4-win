@@ -980,6 +980,17 @@ fn run_internal_mount_until_boundary(
     }
 }
 
+/// Samples the host wall clock at the close boundary.
+/// # Errors
+/// Returns an unavailable or unrepresentable Unix timestamp.
+fn current_ext4_time() -> TaskResult<ext4_core::Ext4Timestamp> {
+    Ok(ext4_core::Ext4Timestamp::new(
+        i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())?,
+        0,
+    )
+    .map_err(core_task_error)?)
+}
+
 /// Runs a clean close for one mounted profile through the same storage boundary.
 ///
 /// # Errors
@@ -988,9 +999,10 @@ fn run_internal_mount_until_boundary(
 fn complete_core_clean_close<S: HostStorage>(
     storage: &mut S,
     profile: &ext4_core::MountedProfile,
+    coordinator: &ext4_core::MutationCoordinatorState,
 ) -> TaskResult<()> {
     let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(profile))?
-        .advance(ext4_core::OperationEvent::Admitted);
+        .start(coordinator, current_ext4_time()?);
     loop {
         match close {
             ext4_core::CleanCloseTransition::SubmitLower { request, suspended } => {
@@ -1078,10 +1090,10 @@ fn run_external_clean_close_until_boundary(
 ) -> TaskResult<EffectBoundaryRun> {
     let mut storage = CrashStorageAdapter::open_external(filesystem, journal)?;
     let completed = mount_external_core(&mut storage)?;
-    let (profile, _epoch, _coordinator, _mmp) = completed.into_parts();
+    let (profile, _epoch, coordinator, _mmp) = completed.into_parts();
     let mut controller = EffectBoundaryController::new(cut)?;
     let mut close = Box::try_new(ext4_core::CleanCloseOperation::new(&profile))?
-        .advance(ext4_core::OperationEvent::Admitted);
+        .start(&coordinator, current_ext4_time()?);
     loop {
         match close {
             ext4_core::CleanCloseTransition::SubmitLower { request, suspended } => {
@@ -1243,8 +1255,8 @@ fn complete_boundary_transfer<Next>(
 fn drive_core_mount_and_clean_close(image: &Path) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_internal(image)?;
     let completed = mount_internal_core(&mut storage)?;
-    let (profile, _epoch, _coordinator, _mmp) = completed.into_parts();
-    complete_core_clean_close(&mut storage, &profile)
+    let (profile, _epoch, coordinator, _mmp) = completed.into_parts();
+    complete_core_clean_close(&mut storage, &profile, &coordinator)
 }
 
 /// Executes production external discovery, validation, recovery, and clean close against two
@@ -1260,8 +1272,8 @@ fn drive_external_core_mount_and_clean_close(
 ) -> TaskResult<()> {
     let mut storage = FileStorageAdapter::open_external(filesystem, external_journal)?;
     let completed = mount_external_core(&mut storage)?;
-    let (profile, _epoch, _coordinator, _mmp) = completed.into_parts();
-    complete_core_clean_close(&mut storage, &profile)
+    let (profile, _epoch, coordinator, _mmp) = completed.into_parts();
+    complete_core_clean_close(&mut storage, &profile, &coordinator)
 }
 
 /// Runs the public core validator for one exclusively selected external-journal file.
@@ -1495,7 +1507,7 @@ where
         prepare_core_mutation(storage, &profile, &epoch, &mut coordinator, ticket, mutate)?;
     let _checkpointed_epoch =
         complete_prepared_mutation(storage, &mut coordinator, ticket, prepared)?;
-    complete_core_clean_close(storage, &profile)?;
+    complete_core_clean_close(storage, &profile, &coordinator)?;
     Ok(output)
 }
 
@@ -1581,7 +1593,7 @@ where
             }
         }
     };
-    complete_core_clean_close(&mut storage, &profile)?;
+    complete_core_clean_close(&mut storage, &profile, &coordinator)?;
     Ok((output, lower_reads))
 }
 
@@ -1906,7 +1918,7 @@ fn drive_directory_enumeration(
         first,
         started.elapsed()
     );
-    complete_core_clean_close(&mut storage, &profile)?;
+    complete_core_clean_close(&mut storage, &profile, &coordinator)?;
     Ok(())
 }
 
@@ -2061,7 +2073,7 @@ fn verify_directory_read_faults(
     println!(
         "directory cancellation/read failure boundaries: PASS ({read_count} lower reads each)"
     );
-    complete_core_clean_close(&mut storage, &profile)
+    complete_core_clean_close(&mut storage, &profile, &coordinator)
 }
 
 /// Captures one request's names and publishable cursor, then releases its mounted epoch.
@@ -2109,6 +2121,6 @@ fn read_directory_request(
             }
         }
     };
-    complete_core_clean_close(&mut storage, &profile)?;
+    complete_core_clean_close(&mut storage, &profile, &coordinator)?;
     Ok((names, cursor))
 }

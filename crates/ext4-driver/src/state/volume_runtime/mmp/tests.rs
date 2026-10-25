@@ -147,10 +147,14 @@ impl Device {
     /// Completes actual filesystem finalization before release admission.
     /// # Errors
     /// Preserves read/write/flush failure.
-    fn close(&mut self, profile: &MountedProfile) -> Result<CleanCloseDurability> {
+    fn close(
+        &mut self,
+        profile: &MountedProfile,
+        coordinator: &ext4_core::MutationCoordinatorState,
+    ) -> Result<CleanCloseDurability> {
         let mut step = Box::try_new(CleanCloseOperation::new(profile))
             .map_err(|_| Error::OutOfMemory)?
-            .advance(OperationEvent::Admitted);
+            .start(coordinator, ext4_core::Ext4Timestamp::from_seconds(900));
         loop {
             step = match step {
                 CleanCloseTransition::SubmitLower { request, suspended } => {
@@ -308,7 +312,7 @@ fn ownership_disk(sequence: u32) -> Result<Device> {
 fn close_waits_for_the_pending_renewal_before_physical_release() {
     let result = (|| -> Result<()> {
         let mut device = ownership_disk(0xff4d_4d50)?;
-        let (profile, _epoch, _coordinator, lease) = device.mount()?.into_parts();
+        let (profile, _epoch, coordinator, lease) = device.mount()?.into_parts();
         let lease = lease.ok_or(Error::MmpOwnershipLost)?;
         device.millis = lease.next_update().monotonic_millis();
         let old_deadline = lease.deadline();
@@ -316,7 +320,7 @@ fn close_waits_for_the_pending_renewal_before_physical_release() {
         let operation = owner.next_action(device.now())?.ok_or(Error::DeviceIo)?;
         assert_eq!(owner.wakeup(), Some(old_deadline));
         assert_eq!(owner.authorize(device.now()), Ok(()));
-        let close = device.close(&profile)?;
+        let close = device.close(&profile, &coordinator)?;
         owner
             .request_close(close)
             .map_err(|(_error, _close)| Error::DeviceIo)?;

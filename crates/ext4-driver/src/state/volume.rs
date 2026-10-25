@@ -1495,6 +1495,15 @@ impl MountedVolumeAccess<'_> {
         self.runtime.profile()
     }
 
+    /// Pins the final drained journal cursor under the host's terminal durability barrier.
+    pub(crate) fn start_clean_close(
+        &self,
+        close: alloc::boxed::Box<ext4_core::CleanCloseOperation>,
+        now: ext4_core::Ext4Timestamp,
+    ) -> ext4_core::CleanCloseTransition {
+        close.start(self.runtime.coordinator(), now)
+    }
+
     /// Validated lower-device route for one core storage request.
     pub(crate) fn storage_route(&self) -> MountedStorageRoute {
         self.runtime.storage()

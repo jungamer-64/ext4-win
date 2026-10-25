@@ -243,6 +243,7 @@ impl DeltaReplayOperation {
                         )?;
                         self.phase = DeltaReplayPhase::Ready(StorageRequestSequence::checkpoint(
                             prepared,
+                            &[],
                             |journal| journal,
                         )?);
                         Ok(())

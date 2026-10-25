@@ -48,7 +48,7 @@ impl MetadataMutation<'_, '_> {
     ///
     /// Returns an error when staged bitmap, directory, extent, xattr, group, superblock, or inode
     /// metadata cannot be serialized to device byte ranges.
-    fn metadata_writes(&mut self) -> Result<Vec<RangeWrite>> {
+    fn metadata_writes(&mut self, write_time: Option<Ext4Timestamp>) -> Result<Vec<RangeWrite>> {
         let mut writes = Vec::new();
         for bitmap in &self.block_bitmap_updates {
             writes.try_push(RangeWrite {
@@ -162,7 +162,7 @@ impl MetadataMutation<'_, '_> {
         {
             writes.try_push(RangeWrite {
                 offset: ByteOffset::new(SUPERBLOCK_OFFSET),
-                bytes: self.updated_superblock_bytes()?,
+                bytes: self.updated_superblock_bytes(write_time)?,
             })?;
         }
         for inode in &self.inode_updates {
@@ -183,10 +183,11 @@ impl MetadataMutation<'_, '_> {
     /// block cannot be read before patching.
     pub(super) fn metadata_images(
         &mut self,
+        write_time: Option<Ext4Timestamp>,
     ) -> Result<super::super::metadata_image::MetadataImages> {
         let mut images =
             super::super::metadata_image::MetadataImages::new(self.volume.superblock.block_size());
-        for write in self.metadata_writes()? {
+        for write in self.metadata_writes(write_time)? {
             images.patch(&mut self.volume, write.offset, &write.bytes)?;
         }
         Ok(images)
@@ -203,18 +204,19 @@ impl MetadataMutation<'_, '_> {
         for write in &self.file_writes {
             images.patch(&mut self.volume, write.write.offset, &write.write.bytes)?;
         }
-        for write in self.metadata_writes()? {
+        for write in self.metadata_writes(None)? {
             images.patch(&mut self.volume, write.offset, &write.bytes)?;
         }
         Ok(images)
     }
 
-    /// Applies accumulated free-count deltas to a superblock image.
+    /// Stamps ordinary superblock writes without adding a shared block to inode-only commits.
+    /// Recovery preserves the replayed event clock instead of inventing a new write time.
     /// # Errors
     ///
     /// Returns an error when the primary superblock cannot be read, free counters underflow or
     /// overflow, the label cannot be written, or the checksum cannot be refreshed.
-    fn updated_superblock_bytes(&mut self) -> Result<Vec<u8>> {
+    fn updated_superblock_bytes(&mut self, write_time: Option<Ext4Timestamp>) -> Result<Vec<u8>> {
         let mut bytes = memory::repeated_vec(0_u8, 1024)?;
         self.volume
             .device
@@ -243,6 +245,9 @@ impl MetadataMutation<'_, '_> {
         if let Some(label) = self.volume_label_update {
             label.write_to(&mut bytes)?;
         }
+        if let Some(now) = write_time {
+            Superblock::update_write_time(&mut bytes, u64::try_from(now.seconds()).unwrap_or(0))?;
+        }
         Superblock::refresh_checksum(&mut bytes)?;
         Ok(bytes)
     }
@@ -258,6 +263,7 @@ impl MetadataMutation<'_, '_> {
         mut self,
         ticket: u64,
         coordinator: &MutationCoordinatorState,
+        now: Ext4Timestamp,
     ) -> Result<ResolvedMutation> {
         coordinator.require_session_authority()?;
         if self.volume.mount != Some(&coordinator.mount)
@@ -265,7 +271,7 @@ impl MetadataMutation<'_, '_> {
         {
             return Err(Error::ClusterReferenceConflict);
         }
-        let mut journal_blocks = self.metadata_images()?.into_blocks();
+        let mut journal_blocks = self.metadata_images(Some(now))?.into_blocks();
         let _validated_next_state = self.committed_cluster_state()?;
         let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount);
         let key_version = self
@@ -766,7 +772,7 @@ impl MutationResolvePass<'_, '_, '_> {
         coordinator: &MutationCoordinatorState,
     ) -> Result<ResolvedMutation> {
         match self.state {
-            MutationState::Ready => self.mutation.resolve(ticket, coordinator),
+            MutationState::Ready => self.mutation.resolve(ticket, coordinator, self.now),
             MutationState::Editing => Err(Error::OperationCancelled),
             MutationState::Rejected(error) => Err(error),
         }

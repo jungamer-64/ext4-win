@@ -298,12 +298,12 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                         access,
                     );
                 }
-                self.drive(
-                    owned,
-                    transition,
-                    close.advance(OperationEvent::Admitted),
-                    access,
-                )
+                let now = match crate::kernel::time::current_ext4_timestamp() {
+                    Ok(now) => now,
+                    Err(error) => return Self::fail(owned, transition, error, access),
+                };
+                let close = access.start_clean_close(close, now);
+                self.drive(owned, transition, close, access)
             }
             (
                 CloseState::Closing {

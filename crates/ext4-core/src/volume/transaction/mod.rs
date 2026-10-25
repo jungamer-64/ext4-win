@@ -554,11 +554,12 @@ impl<Next> StorageRequestSequence<Next> {
         }
     }
 
-    /// Keeps mount-private recovery unpublished until a replacement commit and checkpoint are durable.
+    /// Completes a full commit, home checkpoint and journal retirement after required device barriers.
     /// # Errors
     /// Returns pre-effect request allocation or checked-size failure.
     pub(in crate::volume) fn checkpoint(
         prepared: crate::disk_format::journal::PreparedJournalCommit,
+        flush_before: &[crate::StorageTarget],
         next: impl FnOnce(Journal<CleanJournal>) -> Next,
     ) -> Result<Self> {
         let (writes, commit, target, _durable, _overlay, checkpoint) = prepared.into_parts();
@@ -567,11 +568,15 @@ impl<Next> StorageRequestSequence<Next> {
             .len()
             .checked_add(homes.len())
             .and_then(|count| count.checked_add(6))
+            .and_then(|count| count.checked_add(flush_before.len()))
             .ok_or(Error::ArithmeticOverflow)?;
         let mut requests = Vec::new();
         requests
             .try_reserve_exact(capacity)
             .map_err(|_| Error::OutOfMemory)?;
+        for target in flush_before {
+            requests.try_push(crate::StorageRequest::Flush { target: *target })?;
+        }
         for write in writes {
             requests.try_push(write.into_request())?;
         }

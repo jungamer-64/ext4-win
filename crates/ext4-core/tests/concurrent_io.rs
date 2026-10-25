@@ -12,6 +12,8 @@ use sha2::Digest as _;
 mod fast_commit;
 #[path = "concurrent_io/mmp.rs"]
 mod mmp;
+#[path = "concurrent_io/session.rs"]
+mod session;
 #[path = "concurrent_io/trim.rs"]
 mod trim;
 
@@ -1059,7 +1061,7 @@ fn read_only_recovery_preserves_media_and_mount_local_keys() -> Result<()> {
     ));
     let close = Box::try_new(CleanCloseOperation::new(&fixture.profile))
         .map_err(|_| Error::OutOfMemory)?
-        .advance(OperationEvent::Admitted);
+        .start(&fixture.coordinator, Ext4Timestamp::from_seconds(900));
     assert!(matches!(close, CleanCloseTransition::Complete(Ok(_))));
     assert_eq!(fixture.disk.storage_effects, 0);
     assert_eq!(fixture.disk.filesystem, filesystem);
@@ -2448,6 +2450,18 @@ impl Disk {
     fn mount_observing(
         &mut self,
         access: MountAccess,
+        observe: impl FnMut(&mut Self, MountBoundary<'_>, &mut u64) -> Result<()>,
+    ) -> Result<CompletedMount> {
+        self.mount_at(access, 0, observe)
+    }
+
+    /// Drives the production mount protocol with an explicit wall-clock sample.
+    /// # Errors
+    /// Preserves admission, discovery, recovery and physical completion failure.
+    fn mount_at(
+        &mut self,
+        access: MountAccess,
+        unix_seconds: u64,
         mut observe: impl FnMut(&mut Self, MountBoundary<'_>, &mut u64) -> Result<()>,
     ) -> Result<CompletedMount> {
         let length = u64::try_from(self.filesystem.len()).map_err(|_| Error::DeviceRange)?;
@@ -2465,7 +2479,7 @@ impl Disk {
             };
         };
         let mut millis = 0_u64;
-        let now = ext4_core::MmpTime::new(millis, 0);
+        let now = ext4_core::MmpTime::new(millis, unix_seconds);
         let mut step = Box::try_new(prepared.start(
             FscryptKeySet::empty(),
             access,
@@ -2481,14 +2495,14 @@ impl Disk {
                     observe(self, MountBoundary::Lower(&request), &mut millis)?;
                     suspended.advance(
                         OperationEvent::StorageCompleted(self.complete(request)?),
-                        ext4_core::MmpTime::new(millis, 0),
+                        ext4_core::MmpTime::new(millis, unix_seconds),
                     )
                 }
                 MountTransition::WaitForTimer { seconds, suspended } => {
                     millis = millis.saturating_add(u64::from(seconds).saturating_mul(1000));
                     suspended.advance(
                         OperationEvent::TimerElapsed,
-                        ext4_core::MmpTime::new(millis, 0),
+                        ext4_core::MmpTime::new(millis, unix_seconds),
                     )
                 }
                 MountTransition::Complete(result) => return result.map(|mounted| *mounted),
@@ -2520,7 +2534,10 @@ impl Disk {
                         };
                     };
                     observe(self, MountBoundary::JournalValidated, &mut millis)?;
-                    suspended.attach_external_journal(journal, ext4_core::MmpTime::new(millis, 0))
+                    suspended.attach_external_journal(
+                        journal,
+                        ext4_core::MmpTime::new(millis, unix_seconds),
+                    )
                 }
             };
         }

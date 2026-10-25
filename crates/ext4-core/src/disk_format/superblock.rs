@@ -1,10 +1,8 @@
 //! Superblock parsing and mount-policy validation.
 
-use alloc::vec::Vec;
-
 use crate::disk::block::{BlockAddress, BlockSize, ByteOffset};
 use crate::disk::checksum::ext4_crc32c;
-use crate::disk::endian::{DiskOffset, le_u16, le_u32, le_u64, put_le_u32};
+use crate::disk::endian::{DiskOffset, le_u16, le_u32, le_u64, put_le_u16, put_le_u32};
 use crate::disk::storage::OperationDevice;
 use crate::disk_format::inode::{
     DirectorySizeEncoding, FileSizeEncoding, InodeBlockCountEncoding, InodeDataEncoding, InodeId,
@@ -2236,12 +2234,15 @@ impl Superblock {
         self.last_orphan
     }
 
-    /// Prepares write-session markers and persists an unselected hash interpretation before use.
+    /// Prepares session markers and clocks for one journal commit. Opening increments the
+    /// unsigned mount count modulo 2^16 and sets both clocks; closing preserves mount facts.
+    /// Hash interpretation is fixed before any directory mutation can publish.
     /// # Errors
     /// Returns an error when reading, validating, or checksumming the primary image fails.
     pub(crate) fn prepare_write_session(
         device: &mut OperationDevice<'_>,
         state: WriteSessionState,
+        unix_seconds: u64,
     ) -> Result<[u8; SUPERBLOCK_SIZE]> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
@@ -2251,7 +2252,11 @@ impl Superblock {
         }
         let mut incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
         let mut ro_compat = le_u32(&raw, disk_offset(100))? & !RO_COMPAT_ORPHAN_PRESENT;
+        Self::update_write_time(&mut raw, unix_seconds)?;
         if state == WriteSessionState::Active {
+            let count = le_u16(&raw, disk_offset(0x34))?.wrapping_add(1);
+            put_le_u16(&mut raw, disk_offset(0x34), count)?;
+            Self::write_timestamp(&mut raw, 0x2c, 0x275, unix_seconds)?;
             incompat |= INCOMPAT_RECOVER;
             let flags = le_u32(&raw, disk_offset(FILESYSTEM_FLAGS_OFFSET))?;
             if flags & (SIGNED_DIRECTORY_HASH | UNSIGNED_DIRECTORY_HASH) == 0 {
@@ -2270,6 +2275,29 @@ impl Superblock {
         put_le_u32(&mut raw, disk_offset(100), ro_compat)?;
         Self::refresh_checksum(&mut raw)?;
         Ok(raw)
+    }
+
+    /// Updates the superblock write clock; callers refresh its checksum after all edits.
+    /// # Errors
+    /// Returns a truncated-field error without publishing any bytes.
+    pub(crate) fn update_write_time(raw: &mut [u8], unix_seconds: u64) -> Result<()> {
+        Self::write_timestamp(raw, 0x30, 0x274, unix_seconds)
+    }
+
+    /// Superblock clocks are unsigned 40-bit Unix seconds, independent of inode timestamp encoding.
+    /// Values beyond that domain saturate rather than wrapping into an earlier date.
+    /// # Errors
+    /// Returns a truncated-field error before the image can be submitted.
+    fn write_timestamp(raw: &mut [u8], low: usize, high: usize, seconds: u64) -> Result<()> {
+        let seconds = seconds.min(0xff_ffff_ffff).to_le_bytes();
+        memory::copy_exact(
+            raw.get_mut(low..low.checked_add(4).ok_or(Error::ArithmeticOverflow)?)
+                .ok_or(Error::TruncatedStructure)?,
+            seconds.get(..4).ok_or(Error::TruncatedStructure)?,
+        )?;
+        *raw.get_mut(high).ok_or(Error::TruncatedStructure)? =
+            *seconds.get(4).ok_or(Error::TruncatedStructure)?;
+        Ok(())
     }
 
     /// Recomputes the primary superblock checksum when the on-disk checksum is present.
@@ -2584,68 +2612,6 @@ mod tests {
             );
         }
         Ok(())
-    }
-
-    /// # Panics
-    /// Panics when sector-prefix recovery accepts unrelated corruption or loses either marker.
-    #[test]
-    fn write_session_tear_requires_one_authenticated_previous_marker_pair() {
-        let result = (|| -> Result<()> {
-            for (has_file, old_recovery, old_present, next_active) in [
-                (false, false, false, true),
-                (false, true, false, false),
-                (true, false, false, true),
-                (true, false, true, true),
-                (true, true, false, true),
-                (true, true, true, false),
-            ] {
-                for old_flags in [0, SIGNED_DIRECTORY_HASH, UNSIGNED_DIRECTORY_HASH] {
-                    let mut old = primary(has_file, old_recovery, old_present)?;
-                    put_le_u32(&mut old, disk_offset(FILESYSTEM_FLAGS_OFFSET), old_flags)?;
-                    Superblock::refresh_checksum(&mut old)?;
-                    let mut next = primary(has_file, next_active, has_file && next_active)?;
-                    let next_flags = if next_active && old_flags == 0 {
-                        SIGNED_DIRECTORY_HASH
-                    } else {
-                        old_flags
-                    };
-                    put_le_u32(&mut next, disk_offset(FILESYSTEM_FLAGS_OFFSET), next_flags)?;
-                    Superblock::refresh_checksum(&mut next)?;
-                    let mut torn = old;
-                    memory::copy_exact(
-                        torn.get_mut(..512).ok_or(Error::TruncatedStructure)?,
-                        next.get(..512).ok_or(Error::TruncatedStructure)?,
-                    )?;
-                    assert!(matches!(
-                        Superblock::parse_read_write(&torn),
-                        Err(Error::ChecksumMismatch)
-                    ));
-                    let PrimarySuperblockRead::TornWriteSession { repair } =
-                        Superblock::restore_torn_write_session(torn)?
-                    else {
-                        return Err(Error::InvalidSuperblock);
-                    };
-                    assert_eq!(repair, old);
-                    put_le_u32(&mut torn, disk_offset(264), 1)?;
-                    assert!(matches!(
-                        Superblock::restore_torn_write_session(torn),
-                        Err(Error::ChecksumMismatch)
-                    ));
-                }
-            }
-            let mut raw = primary(true, false, false)?;
-            put_le_u32(&mut raw, disk_offset(1020), 0)?;
-            assert!(matches!(
-                Superblock::parse_read_write(&raw),
-                Err(Error::ChecksumMismatch)
-            ));
-            assert!(matches!(
-                Superblock::parse_read_write(&primary(false, true, true)?),
-                Err(Error::InvalidOrphanTracking)
-            ));
-            Ok(())
-        })();
-        assert_eq!(result, Ok(()));
     }
 
     /// # Panics

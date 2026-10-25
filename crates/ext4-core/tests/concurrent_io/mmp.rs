@@ -122,6 +122,100 @@ fn ownership_action(
 }
 
 /// # Errors
+/// Returns independent fixture construction, ownership or journal-recovery failure.
+/// # Panics
+/// Fails if a torn session image authorizes physical recovery before its MMP claim.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe journal-authenticated MMP admission and physical write ordering"
+)]
+fn torn_session_primary_is_authenticated_before_physical_ownership() -> Result<()> {
+    let mut disk = ownership_disk(0xff4d_4d50)?;
+    let mut logged_primary = None;
+    let result = disk.mount_at(MountAccess::ReadWrite, 200, |disk, boundary, _| {
+        if let MountBoundary::Lower(StorageRequest::Write {
+            target: StorageTarget::ExternalJournal,
+            offset,
+            buffer,
+        }) = boundary
+            && buffer.get(1080..1082) == Some([0x53, 0xef].as_slice())
+        {
+            logged_primary = Some(usize::try_from(offset.get()).map_err(|_| Error::DeviceRange)?);
+        }
+        if let MountBoundary::Lower(StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset,
+            buffer,
+        }) = boundary
+            && offset.get() == 0
+            && buffer.len() == 4096
+        {
+            put(
+                &mut disk.filesystem,
+                0,
+                buffer.get(..1536).ok_or(Error::DeviceRange)?,
+            )?;
+            return Err(Error::DeviceIo);
+        }
+        Ok(())
+    });
+    assert!(matches!(result, Err(Error::DeviceIo)));
+    // Independent owner-release evidence makes this copied crash fixture available to a new host.
+    put(
+        &mut disk.filesystem,
+        OWNERSHIP_OFFSET + 4,
+        &0xff4d_4d50_u32.to_le_bytes(),
+    )?;
+    let seed = fixture_crc32c(
+        u32::MAX,
+        disk.filesystem.get(1128..1144).ok_or(Error::DeviceRange)?,
+    );
+    let crc = fixture_crc32c(
+        seed,
+        disk.filesystem
+            .get(OWNERSHIP_OFFSET..OWNERSHIP_OFFSET + 1020)
+            .ok_or(Error::DeviceRange)?,
+    );
+    put(
+        &mut disk.filesystem,
+        OWNERSHIP_OFFSET + 1020,
+        &crc.to_le_bytes(),
+    )?;
+    disk.storage_effects = 0;
+    let mut invalid = Disk {
+        filesystem: disk.filesystem.clone(),
+        journal: disk.journal.clone(),
+        storage_effects: 0,
+    };
+    let payload = logged_primary
+        .ok_or(Error::DeviceRange)?
+        .checked_add(1024)
+        .ok_or(Error::DeviceRange)?;
+    *invalid.journal.get_mut(payload).ok_or(Error::DeviceRange)? ^= 1;
+    assert!(invalid.mount(MountAccess::ReadWrite).is_err());
+    assert_eq!(invalid.storage_effects, 0);
+    let mut claimed = false;
+    let _mounted = disk.mount_at(MountAccess::ReadWrite, 300, |_, boundary, _| {
+        if let MountBoundary::Lower(StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset,
+            ..
+        }) = boundary
+        {
+            if offset.get() == u64::try_from(OWNERSHIP_OFFSET).map_err(|_| Error::DeviceRange)? {
+                claimed = true;
+            } else if offset.get() == 0 {
+                assert!(claimed);
+            }
+        }
+        Ok(())
+    })?;
+    assert!(claimed);
+    Ok(())
+}
+
+/// # Errors
 /// Propagates independently encoded mount, journal, ownership and close failures.
 /// # Panics
 /// Fails if discovery consumes ownership time or release precedes filesystem completion.
@@ -140,7 +234,7 @@ fn delayed_external_discovery_precedes_claim_and_complete_close_releases_it() ->
         *millis = millis.saturating_add(60_000);
         Ok(())
     })?;
-    let (profile, _epoch, _coordinator, lease) = mounted.into_parts();
+    let (profile, _epoch, coordinator, lease) = mounted.into_parts();
     let lease = lease.ok_or(Error::MmpOwnershipLost)?;
     let now = MmpTime::new(71_000, 0);
     lease.authorize(now)?;
@@ -158,7 +252,7 @@ fn delayed_external_discovery_precedes_claim_and_complete_close_releases_it() ->
         .map_err(|(error, _proof)| error)?;
     let mut close = Box::try_new(CleanCloseOperation::new(&profile))
         .map_err(|_| Error::OutOfMemory)?
-        .advance(OperationEvent::Admitted);
+        .start(&coordinator, Ext4Timestamp::from_seconds(900));
     let durability = loop {
         close = match close {
             CleanCloseTransition::SubmitLower { request, suspended } => {

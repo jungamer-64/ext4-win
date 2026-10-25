@@ -11,9 +11,7 @@ use super::transaction::{
     ORPHAN_METADATA_BUDGET, OrphanBatchCompletion, StorageRequestSequence,
     StorageRequestSequenceStep, prepare_orphan_batch,
 };
-use crate::disk::storage::{
-    OperationDevice, StorageReadOverlay, StorageRequestIdentity, StorageTarget, StorageTranscript,
-};
+use crate::disk::storage::{OperationDevice, StorageReadOverlay, StorageTarget, StorageTranscript};
 use crate::disk_format::journal::{
     CleanJournal, ExternalJournalLoad, FilesystemHomeSpace, Journal, JournalBlock,
     JournalRecoveryCompletion, JournalRecoveryOperation, LoadedJournal,
@@ -1414,7 +1412,7 @@ pub struct CleanCloseDurability {
 /// One consuming transition of the clean-close durability protocol.
 #[derive(Debug)]
 pub enum CleanCloseTransition {
-    /// Submit one preallocated read, flush, or marker write.
+    /// Submit one prepared source read or journal/checkpoint transfer.
     SubmitLower {
         /// Owned lower-storage request.
         request: crate::StorageRequest,
@@ -1425,56 +1423,91 @@ pub enum CleanCloseTransition {
     Complete(Result<CleanCloseDurability>),
 }
 
+/// Prepares a complete primary block while retaining bytes outside the superblock payload.
+/// All log/checkpoint requests are allocated before the first effect; journal replay is the
+/// sole repair authority for a torn home image, including its clocks and checksum.
+/// # Errors
+/// Returns source-read suspension, invalid coordinates, serialization or allocation failure.
+fn prepare_session_checkpoint(
+    device: &mut OperationDevice<'_>,
+    raw: &[u8; 1024],
+    block_size: BlockSize,
+    journal: &Journal<CleanJournal>,
+    flush_before: &[StorageTarget],
+) -> Result<StorageRequestSequence<Journal<CleanJournal>>> {
+    let block = Superblock::primary_block(block_size);
+    let mut bytes = memory::repeated_vec(
+        0,
+        usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+    )?;
+    device.read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+    let offset = usize::try_from(
+        1024_u64
+            .checked_sub(block_size.offset_of(block)?.get())
+            .ok_or(Error::InvalidSuperblock)?,
+    )
+    .map_err(|_| Error::ArithmeticOverflow)?;
+    memory::copy_exact(
+        bytes
+            .get_mut(offset..offset.checked_add(1024).ok_or(Error::ArithmeticOverflow)?)
+            .ok_or(Error::InvalidSuperblock)?,
+        raw,
+    )?;
+    let mut blocks = Vec::new();
+    blocks.try_push(JournalBlock::new(block, bytes))?;
+    let prepared = journal.prepare_commit(
+        block_size,
+        crate::disk_format::journal::JournalCommitImage::full(blocks),
+    )?;
+    StorageRequestSequence::checkpoint(prepared, flush_before, |journal| journal)
+}
+
 /// Allocation-before-effects clean shutdown/dismount operation.
 #[derive(Debug)]
 pub struct CleanCloseOperation {
-    /// Session whose durable close can authorize the final independent ownership release.
+    /// Exact mount whose drained journal may authorize finalization.
     mount: MountIdentity,
-    /// Authority selected when this close request was constructed.
+    /// Read-only sessions have no media effects, including flushes.
     access: super::MediaAccess,
-    /// Primary filesystem transcript used only to obtain the latest superblock bytes.
+    /// Transcript retained until every source byte has been read before effects.
     filesystem: StorageTranscript,
-    /// Journal flush target selected by validated mount placement.
+    /// Validated primary block width.
+    block_size: BlockSize,
+    /// Independent journal device, when present, must be flushed before close publication.
     journal_target: StorageTarget,
-    /// Current preparation, I/O, or terminal phase.
+    /// Owns exactly one preparation or lower-transfer continuation.
     phase: CleanClosePhase,
-    /// Preallocated clean primary-superblock write image.
-    marker: Option<Vec<u8>>,
-    /// Cancellation observed after closing began; it never interrupts durability.
-    cancellation_requested: bool,
 }
 
-/// Exact clean-close phase, separating ready requests from outstanding completions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Frozen after native writeback and every journal user has drained.
+#[derive(Debug)]
+struct CleanClosePreparation {
+    /// Exact drained cursor; no later mutation may advance it during close.
+    journal: Journal<CleanJournal>,
+    /// One close event clock, retained unchanged across suspended source reads.
+    unix_seconds: u64,
+}
+
+/// Source preparation and effect submission cannot share a live continuation.
+#[derive(Debug)]
 enum CleanClosePhase {
-    /// Read and pre-encode the latest primary marker before effects.
-    PrepareMarker,
-    /// Primary-superblock read is owned by the lower stack.
-    MarkerReadPending,
-    /// Filesystem data and metadata flush is ready.
-    FilesystemFlushReady,
-    /// Filesystem flush is owned by the lower stack.
-    FilesystemFlushPending(StorageRequestIdentity),
-    /// External-journal flush is ready.
-    JournalFlushReady,
-    /// External-journal flush is owned by the lower stack.
-    JournalFlushPending(StorageRequestIdentity),
-    /// Preallocated clean marker write is ready.
-    MarkerWriteReady,
-    /// Clean marker write is owned by the lower stack.
-    MarkerWritePending(StorageRequestIdentity),
-    /// Final primary-filesystem flush is ready.
-    MarkerFlushReady,
-    /// Final primary-filesystem flush is owned by the lower stack.
-    MarkerFlushPending(StorageRequestIdentity),
-    /// Every required durability boundary completed successfully.
+    /// Admission and native writeback have not yet drained.
+    Ready,
+    /// Latest drained journal cursor and close clock, sampled before any close effect.
+    Preparing(CleanClosePreparation),
+    /// Source read must complete before preparation resumes.
+    ReadPending(CleanClosePreparation),
+    /// Fully prepared flush, log, checkpoint and clean-journal requests.
+    Writing(StorageRequestSequence<Journal<CleanJournal>>),
+    /// Matching completion alone can reveal the remaining sequence.
+    Pending(crate::PendingStorageTransfer<StorageRequestSequence<Journal<CleanJournal>>>),
+    /// Completion consumed this operation's close authority.
     Complete,
 }
 
 impl CleanCloseOperation {
-    /// Prepares finalization. Before advancing it, the host must close admission and drain admitted
-    /// media effects, including pending discard, then retain that exclusion until close completes.
-    /// Native cache writeback and operation drain remain host responsibilities.
+    /// Allocates no journal snapshot until the host seals admission and drains native writeback,
+    /// mutations, checkpoints and discard. That exclusion must last through finalization.
     #[must_use]
     pub const fn new(profile: &MountedProfile) -> Self {
         Self {
@@ -1484,108 +1517,110 @@ impl CleanCloseOperation {
                 StorageTarget::Filesystem,
                 profile.filesystem_length(),
             ),
+            block_size: profile.block_size(),
             journal_target: profile.journal_target(),
-            phase: CleanClosePhase::PrepareMarker,
-            marker: None,
-            cancellation_requested: false,
+            phase: CleanClosePhase::Ready,
         }
     }
 
-    /// Consumes one event and runs until the next lower request or terminal durability result.
+    /// Starts finalization using the latest drained journal cursor and current wall clock.
+    /// A failure after submission can leave a committed close for subsequent mount recovery;
+    /// the host must retain exclusion and must not retry an uncertain close.
     #[must_use]
-    pub fn advance(mut self: Box<Self>, event: super::OperationEvent) -> CleanCloseTransition {
-        let accepted = match event {
-            super::OperationEvent::Admitted if self.phase == CleanClosePhase::PrepareMarker => {
-                Ok(())
-            }
-            super::OperationEvent::StorageCompleted(completion) => self.complete_lower(completion),
-            super::OperationEvent::CancelRequested => {
-                self.cancellation_requested = true;
-                Ok(())
-            }
-            _ => Err(Error::DeviceIo),
-        };
-        if let Err(error) = accepted {
-            return CleanCloseTransition::Complete(Err(error));
+    pub fn start(
+        mut self: Box<Self>,
+        coordinator: &MutationCoordinatorState,
+        now: Ext4Timestamp,
+    ) -> CleanCloseTransition {
+        if !matches!(self.phase, CleanClosePhase::Ready) || self.mount != coordinator.mount {
+            return CleanCloseTransition::Complete(Err(Error::ClusterReferenceConflict));
         }
-        self.drive()
-    }
-
-    /// Validates one exact lower completion and advances to the next ready phase.
-    /// # Errors
-    ///
-    /// Returns an error for a failed, mismatched, short, or phase-inconsistent completion.
-    fn complete_lower(&mut self, completion: crate::StorageCompletion) -> Result<()> {
-        match self.phase {
-            CleanClosePhase::MarkerReadPending => {
-                self.filesystem.complete(completion)?;
-                self.phase = CleanClosePhase::PrepareMarker;
-                Ok(())
-            }
-            CleanClosePhase::FilesystemFlushPending(expected) => {
-                expected.complete(completion)?;
-                self.phase = if self.journal_target == StorageTarget::ExternalJournal {
-                    CleanClosePhase::JournalFlushReady
-                } else {
-                    CleanClosePhase::MarkerWriteReady
-                };
-                Ok(())
-            }
-            CleanClosePhase::JournalFlushPending(expected) => {
-                expected.complete(completion)?;
-                self.phase = CleanClosePhase::MarkerWriteReady;
-                Ok(())
-            }
-            CleanClosePhase::MarkerWritePending(expected) => {
-                expected.complete(completion)?;
-                self.phase = CleanClosePhase::MarkerFlushReady;
-                Ok(())
-            }
-            CleanClosePhase::MarkerFlushPending(expected) => {
-                expected.complete(completion)?;
-                self.phase = CleanClosePhase::Complete;
-                Ok(())
-            }
-            CleanClosePhase::PrepareMarker
-            | CleanClosePhase::FilesystemFlushReady
-            | CleanClosePhase::JournalFlushReady
-            | CleanClosePhase::MarkerWriteReady
-            | CleanClosePhase::MarkerFlushReady
-            | CleanClosePhase::Complete => Err(Error::DeviceIo),
-        }
-    }
-
-    /// Drives allocation-free request publication after the marker image has been prepared.
-    fn drive(mut self: Box<Self>) -> CleanCloseTransition {
         if matches!(self.access, super::MediaAccess::ReadOnly) {
             return CleanCloseTransition::Complete(Ok(CleanCloseDurability { mount: self.mount }));
         }
+        if let Err(error) = coordinator.require_session_authority() {
+            return CleanCloseTransition::Complete(Err(error));
+        }
+        let JournalCoordinatorState::Ready {
+            journal,
+            admission: CommitAdmission::Available,
+            ..
+        } = &coordinator.journal
+        else {
+            return CleanCloseTransition::Complete(Err(Error::ClusterReferenceConflict));
+        };
+        let journal = match journal.try_clone() {
+            Ok(journal) => journal,
+            Err(error) => return CleanCloseTransition::Complete(Err(error)),
+        };
+        // Unsigned superblock clocks clamp dates before the Unix epoch to zero.
+        self.phase = CleanClosePhase::Preparing(CleanClosePreparation {
+            journal,
+            unix_seconds: u64::try_from(now.seconds()).unwrap_or(0),
+        });
+        self.drive()
+    }
+
+    /// Completes one exact transfer. The host retains cancellation until durability completes.
+    #[must_use]
+    pub fn advance(mut self: Box<Self>, event: super::OperationEvent) -> CleanCloseTransition {
+        let super::OperationEvent::StorageCompleted(completion) = event else {
+            return CleanCloseTransition::Complete(Err(Error::DeviceIo));
+        };
+        let result = match core::mem::replace(&mut self.phase, CleanClosePhase::Complete) {
+            CleanClosePhase::ReadPending(preparation) => self
+                .filesystem
+                .complete(completion)
+                .map(|()| CleanClosePhase::Preparing(preparation)),
+            CleanClosePhase::Pending(pending) => {
+                pending.complete(completion).map(CleanClosePhase::Writing)
+            }
+            _ => Err(Error::DeviceIo),
+        };
+        match result {
+            Ok(phase) => {
+                self.phase = phase;
+                self.drive()
+            }
+            Err(error) => CleanCloseTransition::Complete(Err(error)),
+        }
+    }
+
+    /// Reads every source and prepares every request before issuing the initial durability barrier.
+    fn drive(mut self: Box<Self>) -> CleanCloseTransition {
         loop {
-            match self.phase {
-                CleanClosePhase::PrepareMarker => {
-                    let raw = {
-                        let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                        Superblock::prepare_write_session(
-                            &mut filesystem,
+            match core::mem::replace(&mut self.phase, CleanClosePhase::Complete) {
+                CleanClosePhase::Preparing(preparation) => {
+                    let result = (|| {
+                        let mut device = OperationDevice::new(&mut self.filesystem);
+                        let raw = Superblock::prepare_write_session(
+                            &mut device,
                             WriteSessionState::Closed,
+                            preparation.unix_seconds,
+                        )?;
+                        let flushes = [StorageTarget::Filesystem, StorageTarget::ExternalJournal];
+                        let flush_before = if self.journal_target == StorageTarget::ExternalJournal
+                        {
+                            &flushes[..]
+                        } else {
+                            &flushes[..1]
+                        };
+                        prepare_session_checkpoint(
+                            &mut device,
+                            &raw,
+                            self.block_size,
+                            &preparation.journal,
+                            flush_before,
                         )
-                    };
-                    match raw {
-                        Ok(raw) => {
-                            self.marker = match memory::copied_slice(&raw) {
-                                Ok(marker) => Some(marker),
-                                Err(error) => return CleanCloseTransition::Complete(Err(error)),
-                            };
-                            self.phase = CleanClosePhase::FilesystemFlushReady;
-                        }
+                    })();
+                    match result {
+                        Ok(sequence) => self.phase = CleanClosePhase::Writing(sequence),
                         Err(Error::OperationSuspended) => {
                             let request = match self.filesystem.take_pending_request() {
                                 Ok(request) => request,
-                                Err(error) => {
-                                    return CleanCloseTransition::Complete(Err(error));
-                                }
+                                Err(error) => return CleanCloseTransition::Complete(Err(error)),
                             };
-                            self.phase = CleanClosePhase::MarkerReadPending;
+                            self.phase = CleanClosePhase::ReadPending(preparation);
                             return CleanCloseTransition::SubmitLower {
                                 request,
                                 suspended: self,
@@ -1594,63 +1629,22 @@ impl CleanCloseOperation {
                         Err(error) => return CleanCloseTransition::Complete(Err(error)),
                     }
                 }
-                CleanClosePhase::FilesystemFlushReady => {
-                    return self.submit_flush(StorageTarget::Filesystem);
-                }
-                CleanClosePhase::JournalFlushReady => {
-                    return self.submit_flush(StorageTarget::ExternalJournal);
-                }
-                CleanClosePhase::MarkerWriteReady => {
-                    let Some(marker) = self.marker.take() else {
-                        return CleanCloseTransition::Complete(Err(Error::DeviceIo));
-                    };
-                    let request = crate::StorageRequest::Write {
-                        target: StorageTarget::Filesystem,
-                        offset: crate::ByteOffset::new(1024),
-                        buffer: marker,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.phase = CleanClosePhase::MarkerWritePending(expected);
-                    return CleanCloseTransition::SubmitLower {
-                        request,
-                        suspended: self,
-                    };
-                }
-                CleanClosePhase::MarkerFlushReady => {
-                    return self.submit_flush(StorageTarget::Filesystem);
-                }
-                CleanClosePhase::Complete => {
-                    let _cancellation_was_recorded = self.cancellation_requested;
-                    return CleanCloseTransition::Complete(Ok(CleanCloseDurability {
-                        mount: self.mount,
-                    }));
-                }
-                CleanClosePhase::MarkerReadPending
-                | CleanClosePhase::FilesystemFlushPending(_)
-                | CleanClosePhase::JournalFlushPending(_)
-                | CleanClosePhase::MarkerWritePending(_)
-                | CleanClosePhase::MarkerFlushPending(_) => {
-                    return CleanCloseTransition::Complete(Err(Error::DeviceIo));
-                }
+                CleanClosePhase::Writing(sequence) => match sequence.advance() {
+                    StorageRequestSequenceStep::Submit { request, suspended } => {
+                        self.phase = CleanClosePhase::Pending(suspended);
+                        return CleanCloseTransition::SubmitLower {
+                            request,
+                            suspended: self,
+                        };
+                    }
+                    StorageRequestSequenceStep::Finished(_journal) => {
+                        return CleanCloseTransition::Complete(Ok(CleanCloseDurability {
+                            mount: self.mount,
+                        }));
+                    }
+                },
+                _ => return CleanCloseTransition::Complete(Err(Error::DeviceIo)),
             }
-        }
-    }
-
-    /// Emits one allocation-free flush and records its exact next pending state.
-    fn submit_flush(mut self: Box<Self>, target: StorageTarget) -> CleanCloseTransition {
-        let request = crate::StorageRequest::Flush { target };
-        let expected = StorageRequestIdentity::from_request(&request);
-        self.phase = match self.phase {
-            CleanClosePhase::FilesystemFlushReady => {
-                CleanClosePhase::FilesystemFlushPending(expected)
-            }
-            CleanClosePhase::JournalFlushReady => CleanClosePhase::JournalFlushPending(expected),
-            CleanClosePhase::MarkerFlushReady => CleanClosePhase::MarkerFlushPending(expected),
-            _ => return CleanCloseTransition::Complete(Err(Error::DeviceIo)),
-        };
-        CleanCloseTransition::SubmitLower {
-            request,
-            suspended: self,
         }
     }
 }
@@ -1803,16 +1797,7 @@ impl MountProbeOperation {
             let mut device = OperationDevice::new(&mut self.filesystem);
             let primary = match Superblock::read_write_from(&mut device)? {
                 PrimarySuperblockRead::Valid(value) => value,
-                PrimarySuperblockRead::ChecksumInvalid(value) => {
-                    let primary = value.recovery_bootstrap();
-                    if primary.mmp().is_some() {
-                        return Err(Error::MmpCorrupt);
-                    }
-                    primary
-                }
-                PrimarySuperblockRead::TornWriteSession { repair } => {
-                    Superblock::parse_read_write(&repair)?
-                }
+                PrimarySuperblockRead::ChecksumInvalid(value) => value.recovery_bootstrap(),
             };
             Ok(primary)
         })();
@@ -1935,7 +1920,8 @@ pub struct MountOperation {
     now: super::MmpTime,
     /// Media authority fixed before the first mount operation.
     access: super::MountAccess,
-    /// Private recovery destination; moved into immutable epoch ownership at publication.
+    /// Private replay destination. Writable bootstrap discards it before claiming ownership;
+    /// read-only publication seals it into the epoch.
     recovery: Option<super::recovery::RecoveryOverlay>,
     /// Filesystem-device transcript used only for restartable metadata resolution.
     filesystem: StorageTranscript,
@@ -1985,25 +1971,6 @@ enum PendingMountOwnership {
 enum MountState {
     /// Resolve the primary superblock and internal journal placement.
     Resolving,
-    /// A validated previous write-session image is ready to replace a torn primary superblock.
-    RepairWriteReady {
-        /// Complete repaired primary-superblock image.
-        marker: Vec<u8>,
-    },
-    /// The repair write is owned by the lower stack.
-    RepairWritePending {
-        /// Expected repair-write completion.
-        expected: StorageRequestIdentity,
-    },
-    /// The repair write completed and must be made durable before metadata is interpreted.
-    RepairFlushReady,
-    /// The repair flush is owned by the lower stack.
-    RepairFlushPending {
-        /// Expected filesystem flush completion.
-        expected: StorageRequestIdentity,
-    },
-    /// The repaired primary superblock is durable and must be read through a fresh transcript.
-    Repaired,
     /// Await a core-minted token for the exact external-journal requirement.
     AwaitingExternal {
         /// Exact requirement that the exclusive candidate must satisfy.
@@ -2012,7 +1979,7 @@ enum MountState {
     /// Read the external journal afresh within the current mount-ownership phase.
     LoadingExternal {
         /// Validated bootstrap geometry; it cannot authorize effects before claim.
-        primary: PrimaryAdmission,
+        primary: ResolvedPrimary,
         /// The exclusive candidate's private read continuation.
         operation: Box<ExternalJournalProbeOperation>,
     },
@@ -2059,28 +2026,19 @@ enum MountState {
     Indexing(ValidatedMountSeed),
     /// Prepare the marker image and all publication allocations before its first write.
     PreparingMarker(IndexedMountSeed),
-    /// Marker write is ready for lower submission.
-    MarkerWriteReady {
-        /// Fully allocated mount result, publishable only after marker flush.
+    /// The complete session image is journaled and checkpointed before publication.
+    SessionWrites {
+        /// Fully allocated mounted state, still private.
         completed: UnpublishedMount,
-        /// Owned primary-superblock marker image.
-        marker: Vec<u8>,
+        /// Log, commit, checkpoint and clean-journal durability.
+        sequence: StorageRequestSequence<Journal<CleanJournal>>,
     },
-    /// Marker write is owned by the lower stack.
-    MarkerWritePending {
-        /// Fully allocated mount result.
+    /// Only the matching lower completion can advance session publication.
+    SessionPending {
+        /// Fully allocated mounted state, still private.
         completed: UnpublishedMount,
-        /// Expected marker write completion.
-        expected: StorageRequestIdentity,
-    },
-    /// Marker write completed and its filesystem flush is ready.
-    MarkerFlushReady(UnpublishedMount),
-    /// Marker flush is owned by the lower stack.
-    MarkerFlushPending {
-        /// Fully allocated mount result.
-        completed: UnpublishedMount,
-        /// Expected filesystem flush completion.
-        expected: StorageRequestIdentity,
+        /// Sole consuming continuation for this transfer.
+        pending: crate::PendingStorageTransfer<StorageRequestSequence<Journal<CleanJournal>>>,
     },
     /// Resolve one bounded batch, with no published namespace or scheduler authority.
     RecoveringOrphans(UnpublishedMount),
@@ -2150,7 +2108,7 @@ enum JournalResolution {
     /// A concrete internal journal is ready for ownership/recovery admission.
     Loaded {
         /// Valid primary metadata or authenticated repair image.
-        primary: PrimaryAdmission,
+        primary: ResolvedPrimary,
         /// Current journal cursor.
         journal: Journal<LoadedJournal>,
         /// Device containing this cursor.
@@ -2159,33 +2117,10 @@ enum JournalResolution {
     /// External placement needs either host discovery or a fresh exclusive-device read.
     External {
         /// Validated bootstrap metadata, with repair authority still withheld.
-        primary: PrimaryAdmission,
+        primary: ResolvedPrimary,
         /// Exact candidate identity and filesystem home space.
         requirement: ExternalJournalRequirement,
     },
-}
-
-/// Primary observation does not itself grant permission to begin recovery effects.
-#[derive(Debug)]
-enum PrimaryAdmission {
-    /// Journal replay can start after independent ownership admission.
-    Ready(ResolvedPrimary),
-    /// The authenticated prior write-session image must be restored before replay.
-    RepairWriteSession {
-        /// Valid geometry permits write-free journal discovery.
-        superblock: Superblock,
-        /// Exact authenticated image to restore under ownership.
-        marker: Vec<u8>,
-    },
-}
-impl PrimaryAdmission {
-    /// Narrows metadata to the fields needed for journal placement and ownership scope checks.
-    const fn recovery_bootstrap(&self) -> Superblock {
-        match self {
-            Self::Ready(primary) => primary.recovery_bootstrap(),
-            Self::RepairWriteSession { superblock, .. } => *superblock,
-        }
-    }
 }
 
 /// Primary-superblock authority retained through journal discovery and recovery.
@@ -2306,20 +2241,13 @@ impl MountOperation {
             super::OperationEvent::CancelRequested => {
                 if matches!(
                     self.state,
-                    MountState::RepairWriteReady { .. }
-                        | MountState::RepairWritePending { .. }
-                        | MountState::RepairFlushReady
-                        | MountState::RepairFlushPending { .. }
-                        | MountState::Repaired
-                        | MountState::Recovering { .. }
+                    MountState::Recovering { .. }
                         | MountState::VerifyingReplayedPrimary { .. }
                         | MountState::PreparingDeltas { .. }
                         | MountState::DeltaWrites { .. }
                         | MountState::DeltaWritePending { .. }
-                        | MountState::MarkerWriteReady { .. }
-                        | MountState::MarkerWritePending { .. }
-                        | MountState::MarkerFlushReady(_)
-                        | MountState::MarkerFlushPending { .. }
+                        | MountState::SessionWrites { .. }
+                        | MountState::SessionPending { .. }
                         | MountState::OrphanWrites { .. }
                         | MountState::OrphanWritePending { .. }
                 ) {
@@ -2415,14 +2343,6 @@ impl MountOperation {
                 operation.candidate.complete(completion)?;
                 self.state = MountState::LoadingExternal { primary, operation };
             }
-            MountState::RepairWritePending { expected } => {
-                expected.complete(completion)?;
-                self.state = MountState::RepairFlushReady;
-            }
-            MountState::RepairFlushPending { expected } => {
-                expected.complete(completion)?;
-                self.state = MountState::Repaired;
-            }
             MountState::ScanningOrphans(publication) => {
                 self.filesystem.complete(completion)?;
                 self.state = MountState::ScanningOrphans(publication);
@@ -2484,28 +2404,14 @@ impl MountOperation {
                     operation,
                 };
             }
-            MountState::MarkerWritePending {
-                completed,
-                expected,
-            } => {
-                expected.complete(completion)?;
-                self.state = MountState::MarkerFlushReady(completed);
-            }
-            MountState::MarkerFlushPending {
-                completed,
-                expected,
-            } => {
-                expected.complete(completion)?;
-                self.filesystem =
-                    StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
-                self.state = MountState::RecoveringOrphans(completed);
+            MountState::SessionPending { completed, pending } => {
+                self.state = MountState::SessionWrites {
+                    completed,
+                    sequence: pending.complete(completion)?,
+                };
             }
             state @ (MountState::AwaitingExternal { .. }
-            | MountState::RepairWriteReady { .. }
-            | MountState::RepairFlushReady
-            | MountState::Repaired
-            | MountState::MarkerWriteReady { .. }
-            | MountState::MarkerFlushReady(_)
+            | MountState::SessionWrites { .. }
             | MountState::OrphanWrites { .. }
             | MountState::DeltaWrites { .. }
             | MountState::Published(_)) => {
@@ -2516,7 +2422,7 @@ impl MountOperation {
         Ok(())
     }
 
-    /// Executes private recovery effects without ever publishing them to backing storage.
+    /// Routes private replay through its bounded overlay and transfers admitted physical requests.
     fn drive(mut self: Box<Self>) -> MountTransition {
         let ownership = core::mem::replace(&mut self.ownership, MountOwnership::Unprotected);
         match ownership {
@@ -2633,47 +2539,6 @@ impl MountOperation {
                     }
                     Err(error) => return MountTransition::Complete(Err(error)),
                 },
-                MountState::RepairWriteReady { marker } => {
-                    let request = crate::StorageRequest::Write {
-                        target: StorageTarget::Filesystem,
-                        offset: ByteOffset::new(1024),
-                        buffer: marker,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = MountState::RepairWritePending { expected };
-                    return MountTransition::SubmitLower {
-                        request,
-                        suspended: self,
-                    };
-                }
-                MountState::RepairWritePending { expected } => {
-                    self.state = MountState::RepairWritePending { expected };
-                    return MountTransition::Complete(Err(Error::DeviceIo));
-                }
-                MountState::RepairFlushReady => {
-                    let request = crate::StorageRequest::Flush {
-                        target: StorageTarget::Filesystem,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = MountState::RepairFlushPending { expected };
-                    return MountTransition::SubmitLower {
-                        request,
-                        suspended: self,
-                    };
-                }
-                MountState::RepairFlushPending { expected } => {
-                    self.state = MountState::RepairFlushPending { expected };
-                    return MountTransition::Complete(Err(Error::DeviceIo));
-                }
-                MountState::Repaired => {
-                    if self.cancel_requested {
-                        return MountTransition::Complete(Err(Error::OperationCancelled));
-                    }
-                    let filesystem_length = self.filesystem.len();
-                    self.filesystem =
-                        StorageTranscript::new(StorageTarget::Filesystem, filesystem_length);
-                    self.state = MountState::Resolving;
-                }
                 MountState::AwaitingExternal { requirement } => {
                     self.state = MountState::AwaitingExternal { requirement };
                     return MountTransition::DiscoverExternalJournal {
@@ -2757,6 +2622,14 @@ impl MountOperation {
                     };
                     match primary {
                         Ok(PrimarySuperblockRead::Valid(superblock)) => {
+                            if superblock.mmp() != self.mmp_parameters
+                                || superblock.uuid() != self.primary_uuid
+                            {
+                                return MountTransition::Complete(Err(Error::MmpCorrupt));
+                            }
+                            if matches!(self.ownership, MountOwnership::ReadyToClaim(_)) {
+                                return self.claim_ownership();
+                            }
                             self.state = match completion {
                                 JournalRecoveryCompletion::Clean(journal) => {
                                     MountState::ScanningOrphans(MountPublicationSeed {
@@ -2786,10 +2659,9 @@ impl MountOperation {
                                 }
                             };
                         }
-                        Ok(
-                            PrimarySuperblockRead::TornWriteSession { .. }
-                            | PrimarySuperblockRead::ChecksumInvalid(_),
-                        ) => return MountTransition::Complete(Err(Error::ChecksumMismatch)),
+                        Ok(PrimarySuperblockRead::ChecksumInvalid(_)) => {
+                            return MountTransition::Complete(Err(Error::ChecksumMismatch));
+                        }
                         Err(Error::OperationSuspended) => {
                             self.state = MountState::VerifyingReplayedPrimary {
                                 completion,
@@ -2923,6 +2795,7 @@ impl MountOperation {
                             super::MountAccess::ReadWrite => Superblock::prepare_write_session(
                                 &mut filesystem,
                                 WriteSessionState::Active,
+                                self.now.unix_seconds(),
                             ),
                             super::MountAccess::ReadOnly { .. } => {
                                 let mut raw = [0_u8; 1024];
@@ -2943,6 +2816,25 @@ impl MountOperation {
                                 }
                                 Ok(_) => return MountTransition::Complete(Err(Error::MmpCorrupt)),
                                 Err(error) => return MountTransition::Complete(Err(error)),
+                            };
+                            let sequence = if matches!(self.access, super::MountAccess::ReadWrite) {
+                                let mut device = OperationDevice::new(&mut self.filesystem);
+                                match prepare_session_checkpoint(
+                                    &mut device,
+                                    &raw,
+                                    marked.block_size(),
+                                    &indexed.publication.journal,
+                                    &[],
+                                ) {
+                                    Ok(sequence) => Some(sequence),
+                                    Err(Error::OperationSuspended) => {
+                                        self.state = MountState::PreparingMarker(indexed);
+                                        return self.submit_pending_read();
+                                    }
+                                    Err(error) => return MountTransition::Complete(Err(error)),
+                                }
+                            } else {
+                                None
                             };
                             let keys = match self.fscrypt_keys.take() {
                                 Some(keys) => keys,
@@ -2974,21 +2866,16 @@ impl MountOperation {
                                 Ok(completed) => completed,
                                 Err(error) => return MountTransition::Complete(Err(error)),
                             };
-                            let marker = match memory::copied_slice(&raw) {
-                                Ok(marker) => marker,
-                                Err(error) => return MountTransition::Complete(Err(error)),
-                            };
                             let completed = UnpublishedMount {
                                 completed,
                                 orphans: indexed.orphans.into_queue(),
                             };
-                            self.state = match self.access {
-                                super::MountAccess::ReadWrite => {
-                                    MountState::MarkerWriteReady { completed, marker }
-                                }
-                                super::MountAccess::ReadOnly { .. } => {
-                                    MountState::RecoveringOrphans(completed)
-                                }
+                            self.state = match sequence {
+                                Some(sequence) => MountState::SessionWrites {
+                                    completed,
+                                    sequence,
+                                },
+                                None => MountState::RecoveringOrphans(completed),
                             };
                         }
                         Err(Error::OperationSuspended) => {
@@ -2998,54 +2885,37 @@ impl MountOperation {
                         Err(error) => return MountTransition::Complete(Err(error)),
                     }
                 }
-                MountState::MarkerWriteReady { completed, marker } => {
-                    let request = crate::StorageRequest::Write {
-                        target: StorageTarget::Filesystem,
-                        offset: ByteOffset::new(1024),
-                        buffer: marker,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = MountState::MarkerWritePending {
-                        completed,
-                        expected,
-                    };
-                    return MountTransition::SubmitLower {
-                        request,
-                        suspended: self,
-                    };
-                }
-                MountState::MarkerWritePending {
-                    completed,
-                    expected,
-                } => {
-                    self.state = MountState::MarkerWritePending {
-                        completed,
-                        expected,
-                    };
-                    return MountTransition::Complete(Err(Error::DeviceIo));
-                }
-                MountState::MarkerFlushReady(completed) => {
-                    let request = crate::StorageRequest::Flush {
-                        target: StorageTarget::Filesystem,
-                    };
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = MountState::MarkerFlushPending {
-                        completed,
-                        expected,
-                    };
-                    return MountTransition::SubmitLower {
-                        request,
-                        suspended: self,
-                    };
-                }
-                MountState::MarkerFlushPending {
-                    completed,
-                    expected,
-                } => {
-                    self.state = MountState::MarkerFlushPending {
-                        completed,
-                        expected,
-                    };
+                MountState::SessionWrites {
+                    mut completed,
+                    sequence,
+                } => match sequence.advance() {
+                    StorageRequestSequenceStep::Submit { request, suspended } => {
+                        self.state = MountState::SessionPending {
+                            completed,
+                            pending: suspended,
+                        };
+                        return MountTransition::SubmitLower {
+                            request,
+                            suspended: self,
+                        };
+                    }
+                    StorageRequestSequenceStep::Finished(journal) => {
+                        completed.completed.coordinator.journal = JournalCoordinatorState::Ready {
+                            admission: CommitAdmission::Available,
+                            journal,
+                            epoch: (
+                                completed.completed.epoch.identity().uuid(),
+                                completed.completed.epoch.sequence(),
+                            ),
+                        };
+                        self.filesystem = StorageTranscript::new(
+                            StorageTarget::Filesystem,
+                            self.filesystem.len(),
+                        );
+                        self.state = MountState::RecoveringOrphans(completed);
+                    }
+                },
+                MountState::SessionPending { .. } => {
                     return MountTransition::Complete(Err(Error::DeviceIo));
                 }
                 MountState::RecoveringOrphans(mut mount) => {
@@ -3142,52 +3012,57 @@ impl MountOperation {
     /// Drops all preflight cursors before acquiring writable ownership, then reloads under that lease.
     fn admit_journal(
         mut self: Box<Self>,
-        primary: PrimaryAdmission,
+        primary: ResolvedPrimary,
         journal: Journal<LoadedJournal>,
         journal_target: StorageTarget,
     ) -> MountTransition {
         if matches!(self.ownership, MountOwnership::ReadyToClaim(_)) {
-            let MountOwnership::ReadyToClaim(owner) =
-                core::mem::replace(&mut self.ownership, MountOwnership::Unprotected)
-            else {
-                return MountTransition::Complete(Err(Error::DeviceIo));
-            };
-            let Some(parameters) = self.mmp_parameters else {
-                return MountTransition::Complete(Err(Error::MmpCorrupt));
-            };
-            let operation = match super::MmpOperation::acquire(
-                parameters,
-                owner,
-                super::MediaAccess::ReadWrite,
-            )
-            .and_then(memory::try_box)
+            if matches!(primary, ResolvedPrimary::Valid(_)) {
+                return self.claim_ownership();
+            }
+            // A checksum-invalid primary supplies placement only. Authenticate its committed
+            // journal replacement in private memory before it can authorize any MMP write.
+            self.recovery = Some(super::recovery::RecoveryOverlay::new(
+                super::RecoveryMemoryLimit::DEFAULT,
+            ));
+        }
+        self.state = match primary.begin_recovery(journal) {
+            Ok(operation) => MountState::Recovering {
+                primary,
+                journal_target,
+                operation,
+            },
+            Err(error) => return MountTransition::Complete(Err(error)),
+        };
+        self.drive()
+    }
+
+    /// Acquires physical ownership only from a checksum-authenticated primary identity.
+    /// Private replay observations are discarded; physical recovery is read afresh under the lease.
+    fn claim_ownership(mut self: Box<Self>) -> MountTransition {
+        self.recovery = None;
+        let MountOwnership::ReadyToClaim(owner) =
+            core::mem::replace(&mut self.ownership, MountOwnership::Unprotected)
+        else {
+            return MountTransition::Complete(Err(Error::DeviceIo));
+        };
+        let Some(parameters) = self.mmp_parameters else {
+            return MountTransition::Complete(Err(Error::MmpCorrupt));
+        };
+        let operation =
+            match super::MmpOperation::acquire(parameters, owner, super::MediaAccess::ReadWrite)
+                .and_then(memory::try_box)
             {
                 Ok(operation) => operation,
                 Err(error) => return MountTransition::Complete(Err(error)),
             };
-            self.filesystem =
-                StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
-            self.state = MountState::Resolving;
-            let now = self.now;
-            return self.accept_ownership(
-                PendingMountOwnership::Acquisition,
-                operation.advance(super::MmpEvent::Start, now),
-            );
-        }
-        self.state = match primary {
-            PrimaryAdmission::Ready(primary) => match primary.begin_recovery(journal) {
-                Ok(operation) => MountState::Recovering {
-                    primary,
-                    journal_target,
-                    operation,
-                },
-                Err(error) => return MountTransition::Complete(Err(error)),
-            },
-            PrimaryAdmission::RepairWriteSession { marker, .. } => {
-                MountState::RepairWriteReady { marker }
-            }
-        };
-        self.drive()
+        self.filesystem = StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
+        self.state = MountState::Resolving;
+        let now = self.now;
+        self.accept_ownership(
+            PendingMountOwnership::Acquisition,
+            operation.advance(super::MmpEvent::Start, now),
+        )
     }
 
     /// Resolves primary metadata and either loads an internal journal or emits discovery facts.
@@ -3200,17 +3075,9 @@ impl MountOperation {
             Superblock::read_write_from(&mut filesystem)?
         };
         let primary = match primary_read {
-            PrimarySuperblockRead::Valid(superblock) => {
-                PrimaryAdmission::Ready(ResolvedPrimary::Valid(superblock))
-            }
-            PrimarySuperblockRead::TornWriteSession { repair } => {
-                PrimaryAdmission::RepairWriteSession {
-                    superblock: Superblock::parse_read_write(&repair)?,
-                    marker: repair,
-                }
-            }
+            PrimarySuperblockRead::Valid(superblock) => ResolvedPrimary::Valid(superblock),
             PrimarySuperblockRead::ChecksumInvalid(provisional) => {
-                PrimaryAdmission::Ready(ResolvedPrimary::JournalRepairRequired(provisional))
+                ResolvedPrimary::JournalRepairRequired(provisional)
             }
         };
         let superblock = primary.recovery_bootstrap();
@@ -3265,18 +3132,8 @@ impl MountOperation {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec;
-    use alloc::vec::Vec;
 
-    use crate::disk::endian::{DiskOffset, le_u32, put_le_u16, put_le_u32};
-    use crate::memory::FallibleVec;
-    use crate::{
-        ByteOffset, CompletedStorageTransfer, DeviceLength, Error, Result, StorageCompletion,
-        StorageRequest, StorageTarget,
-    };
-
-    use super::{CleanCloseOperation, CleanCloseTransition};
-    use crate::volume::OperationEvent;
+    use crate::{Error, Result};
 
     /// # Panics
     /// Panics if the final identity cannot be issued or exhaustion reopens admission.
@@ -3333,226 +3190,6 @@ mod tests {
             });
             assert_eq!(table.slots.capacity(), capacity);
             assert_eq!(table.version(resource), super::ResourceVersion(2));
-            Ok(())
-        })();
-        assert_eq!(result, Ok(()));
-    }
-
-    /// Request shape observed by the clean-close host adapter.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ObservedCloseRequest {
-        ReadFilesystem,
-        FlushFilesystem,
-        FlushExternalJournal,
-        WriteCleanMarker,
-    }
-
-    /// Terminal result retained by the fault-injection adapter.
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum ObservedCloseOutcome {
-        Durable,
-        Failed(Error),
-    }
-
-    /// Drives the production clean-close state machine, optionally failing one effect completion.
-    /// # Errors
-    ///
-    /// Returns an error for allocation, wire mutation, or an unexpected request shape.
-    fn run_clean_close(
-        journal_target: StorageTarget,
-        fail_effect: Option<usize>,
-        cancellation_at_closing: bool,
-    ) -> Result<(Vec<ObservedCloseRequest>, ObservedCloseOutcome)> {
-        let initial_event = if cancellation_at_closing {
-            OperationEvent::CancelRequested
-        } else {
-            OperationEvent::Admitted
-        };
-        let mut transition = crate::memory::try_box(CleanCloseOperation {
-            mount: super::MountIdentity::new()?,
-            access: crate::MediaAccess::ReadWrite,
-            filesystem: super::StorageTranscript::new(
-                StorageTarget::Filesystem,
-                DeviceLength::from_bytes(16_384),
-            ),
-            journal_target,
-            phase: super::CleanClosePhase::PrepareMarker,
-            marker: None,
-            cancellation_requested: false,
-        })?
-        .advance(initial_event);
-        let mut observed = Vec::new();
-        observed
-            .try_reserve_exact(5)
-            .map_err(|_| Error::OutOfMemory)?;
-        let mut effect_index = 0_usize;
-        loop {
-            match transition {
-                CleanCloseTransition::SubmitLower {
-                    mut request,
-                    suspended,
-                } => {
-                    let shape = match &mut request {
-                        StorageRequest::Read {
-                            target,
-                            offset,
-                            buffer,
-                        } => {
-                            if *target != StorageTarget::Filesystem
-                                || *offset != ByteOffset::new(1024)
-                                || buffer.len() != 1024
-                            {
-                                return Err(Error::DeviceIo);
-                            }
-                            let mut primary = [0_u8; 1024];
-                            put_le_u32(&mut primary, DiskOffset::new(76), 1)?;
-                            for (offset, value) in [
-                                (0, 128),
-                                (4, 4096),
-                                (20, 1),
-                                (32, 8192),
-                                (36, 8192),
-                                (40, 128),
-                                (84, 11),
-                                (92, 0x1004),
-                                (96, 0x46),
-                                (100, 0x10000),
-                                (224, 8),
-                                (0x280, 12),
-                            ] {
-                                put_le_u32(&mut primary, DiskOffset::new(offset), value)?;
-                            }
-                            put_le_u16(&mut primary, DiskOffset::new(56), 0xef53)?;
-                            put_le_u16(&mut primary, DiskOffset::new(58), 1)?;
-                            put_le_u16(&mut primary, DiskOffset::new(88), 256)?;
-                            crate::memory::copy_exact(buffer, &primary)?;
-                            ObservedCloseRequest::ReadFilesystem
-                        }
-                        StorageRequest::Flush { target } => {
-                            effect_index = effect_index
-                                .checked_add(1)
-                                .ok_or(Error::ArithmeticOverflow)?;
-                            match target {
-                                StorageTarget::Filesystem => ObservedCloseRequest::FlushFilesystem,
-                                StorageTarget::ExternalJournal => {
-                                    ObservedCloseRequest::FlushExternalJournal
-                                }
-                            }
-                        }
-                        StorageRequest::Write {
-                            target,
-                            offset,
-                            buffer,
-                        } => {
-                            effect_index = effect_index
-                                .checked_add(1)
-                                .ok_or(Error::ArithmeticOverflow)?;
-                            if *target != StorageTarget::Filesystem
-                                || *offset != ByteOffset::new(1024)
-                                || le_u32(buffer, DiskOffset::new(96))? != 0x42
-                                || le_u32(buffer, DiskOffset::new(100))? != 0
-                            {
-                                return Err(Error::DeviceIo);
-                            }
-                            ObservedCloseRequest::WriteCleanMarker
-                        }
-                    };
-                    observed.try_push(shape)?;
-                    let information = request.byte_count();
-                    let transfer = CompletedStorageTransfer::from_request(request);
-                    let completion = if fail_effect == Some(effect_index) && effect_index != 0 {
-                        StorageCompletion::failure(transfer, Error::DeviceIo)
-                    } else {
-                        StorageCompletion::success(transfer, information)
-                    };
-                    transition = suspended.advance(OperationEvent::StorageCompleted(completion));
-                }
-                CleanCloseTransition::Complete(result) => {
-                    let outcome = match result {
-                        Ok(_durability) => ObservedCloseOutcome::Durable,
-                        Err(error) => ObservedCloseOutcome::Failed(error),
-                    };
-                    return Ok((observed, outcome));
-                }
-            }
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when internal-journal close clears the marker outside the required flush ordering.
-    #[test]
-    fn internal_journal_clean_close_obeys_durability_order() {
-        let result = (|| -> Result<()> {
-            let (observed, outcome) = run_clean_close(StorageTarget::Filesystem, None, false)?;
-            assert_eq!(
-                observed,
-                vec![
-                    ObservedCloseRequest::ReadFilesystem,
-                    ObservedCloseRequest::FlushFilesystem,
-                    ObservedCloseRequest::WriteCleanMarker,
-                    ObservedCloseRequest::FlushFilesystem,
-                ]
-            );
-            assert_eq!(outcome, ObservedCloseOutcome::Durable);
-            Ok(())
-        })();
-        assert_eq!(result, Ok(()));
-    }
-
-    /// # Panics
-    ///
-    /// Panics when external-journal close omits its flush before the primary marker write.
-    #[test]
-    fn external_journal_clean_close_flushes_both_devices_in_order() {
-        let result = (|| -> Result<()> {
-            let (observed, outcome) = run_clean_close(StorageTarget::ExternalJournal, None, false)?;
-            assert_eq!(
-                observed,
-                vec![
-                    ObservedCloseRequest::ReadFilesystem,
-                    ObservedCloseRequest::FlushFilesystem,
-                    ObservedCloseRequest::FlushExternalJournal,
-                    ObservedCloseRequest::WriteCleanMarker,
-                    ObservedCloseRequest::FlushFilesystem,
-                ]
-            );
-            assert_eq!(outcome, ObservedCloseOutcome::Durable);
-            Ok(())
-        })();
-        assert_eq!(result, Ok(()));
-    }
-
-    /// # Panics
-    ///
-    /// Panics when any failed durability boundary publishes a clean terminal outcome.
-    #[test]
-    fn clean_close_fault_matrix_never_publishes_uncertain_durability() {
-        let result = (|| -> Result<()> {
-            for effect in 1..=3 {
-                let (_observed, outcome) =
-                    run_clean_close(StorageTarget::Filesystem, Some(effect), false)?;
-                assert_eq!(outcome, ObservedCloseOutcome::Failed(Error::DeviceIo));
-            }
-            for effect in 1..=4 {
-                let (_observed, outcome) =
-                    run_clean_close(StorageTarget::ExternalJournal, Some(effect), false)?;
-                assert_eq!(outcome, ObservedCloseOutcome::Failed(Error::DeviceIo));
-            }
-            Ok(())
-        })();
-        assert_eq!(result, Ok(()));
-    }
-
-    /// # Panics
-    ///
-    /// Panics when cancellation recorded after entering Closing interrupts the durability sequence.
-    #[test]
-    fn cancellation_after_closing_is_recorded_without_interrupting_close() {
-        let result = (|| -> Result<()> {
-            let (observed, outcome) = run_clean_close(StorageTarget::ExternalJournal, None, true)?;
-            assert_eq!(observed.len(), 5);
-            assert_eq!(outcome, ObservedCloseOutcome::Durable);
             Ok(())
         })();
         assert_eq!(result, Ok(()));
