@@ -273,6 +273,9 @@ fn validate_creation_ancestry(program: &DeltaProgram) -> Result<()> {
         else {
             continue;
         };
+        if *inode == InodeId::ROOT {
+            return Err(Error::CannotRemoveRoot);
+        }
         let mut seen = Vec::new();
         seen.try_push(*inode)?;
         let mut cursor = *parent;
