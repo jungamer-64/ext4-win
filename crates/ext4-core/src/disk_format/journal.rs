@@ -1277,7 +1277,7 @@ impl JournalRecoveryOperation {
         Ok(())
     }
 
-    /// Consumes a completed operation into the clean journal typestate.
+    /// Separates completed full recovery from any still-owned semantic replay obligation.
     /// # Errors
     ///
     /// Returns an error when lower I/O is still outstanding or the durability sequence has not
@@ -3822,6 +3822,192 @@ mod tests {
         0x10, 0x21, 0x32, 0x43, 0x54, 0x65, 0x76, 0x87, 0x98, 0xA9, 0xBA, 0xCB, 0xDC, 0xED, 0xFE,
         0x0F,
     ];
+
+    /// # Panics
+    /// Fails if an authenticated program is published as clean or a changed reread causes effects.
+    #[test]
+    fn semantic_recovery_obligation_survives_the_consuming_read_handoff() {
+        let result = (|| -> Result<()> {
+            use super::{JournalRecoveryCompletion, fast_commit};
+            use crate::disk_format::inode::InodeId;
+            use crate::{CompletedStorageTransfer, StorageCompletion, StorageRequest};
+            let journal = test_external_journal::<LoadedJournal>(
+                2,
+                JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
+                512,
+                7,
+                0,
+                2,
+                1000,
+            )?;
+            let size = journal.geometry.block_size;
+            let data = fast_commit::encode(
+                size,
+                JournalSequence::new(7),
+                1,
+                [Ok(fast_commit::DeltaRecord::Inode {
+                    inode: InodeId::try_from(12)?,
+                    encoded: &[0; 128],
+                })],
+            )?;
+            for change_reread in [false, true] {
+                let mut operation = JournalRecoveryOperation::new(
+                    journal.copy_without_state()?,
+                    RecoveryState::NeedsRecovery,
+                )?;
+                let mut delta_reads = 0_usize;
+                let outcome = loop {
+                    let Some(mut request) = operation.next_request()? else {
+                        break Ok(());
+                    };
+                    let StorageRequest::Read { offset, buffer, .. } = &mut request else {
+                        return Err(Error::JournalCorrupt);
+                    };
+                    buffer.fill(0);
+                    if offset.get() == 257 * 4096 {
+                        delta_reads = delta_reads
+                            .checked_add(1)
+                            .ok_or(Error::ArithmeticOverflow)?;
+                        crate::memory::copy_exact(
+                            buffer,
+                            data.first().ok_or(Error::JournalCorrupt)?,
+                        )?;
+                        if change_reread && delta_reads == 2 {
+                            *buffer.get_mut(24).ok_or(Error::JournalCorrupt)? ^= 1;
+                        }
+                    }
+                    let length = request.byte_count();
+                    if let Err(error) = operation.complete(StorageCompletion::success(
+                        CompletedStorageTransfer::from_request(request),
+                        length,
+                    )) {
+                        break Err(error);
+                    }
+                };
+                assert_eq!(delta_reads, 2);
+                if change_reread {
+                    assert_eq!(outcome, Err(Error::ChecksumMismatch));
+                } else {
+                    outcome?;
+                    let JournalRecoveryCompletion::Deltas(seed) = operation.into_recovered()?
+                    else {
+                        return Err(Error::JournalCorrupt);
+                    };
+                    assert_eq!(seed.program().records().len(), 1);
+                    let full = seed.prepare_commit(
+                        size,
+                        vec![JournalBlock::new(BlockAddress::new(10), vec![0x44; 4096])],
+                    )?;
+                    assert_eq!(
+                        full.durable_journal.cursor.sequence,
+                        JournalSequence::new(8)
+                    );
+                    assert!(!full.precommit_writes.is_empty());
+                }
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails if a full commit leaves earlier same-TID deltas with an independent replay effect.
+    #[test]
+    fn committed_full_transaction_invalidates_the_earlier_delta_tid() {
+        let result = (|| -> Result<()> {
+            use super::{CleanJournal, JournalCommitImage, JournalRecoveryCompletion, fast_commit};
+            use crate::disk_format::inode::InodeId;
+            use crate::{
+                CompletedStorageTransfer, StorageCompletion, StorageRequest, StorageTarget,
+            };
+            let journal = test_external_journal::<CleanJournal>(
+                2,
+                JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
+                512,
+                7,
+                0,
+                2,
+                1000,
+            )?;
+            let size = journal.geometry.block_size;
+            let old_delta = fast_commit::encode(
+                size,
+                JournalSequence::new(7),
+                1,
+                [Ok(fast_commit::DeltaRecord::Inode {
+                    inode: InodeId::try_from(12)?,
+                    encoded: &[0; 128],
+                })],
+            )?;
+            let full = journal.prepare_commit(
+                size,
+                JournalCommitImage::full(vec![JournalBlock::new(
+                    BlockAddress::new(10),
+                    vec![0x44; 4096],
+                )]),
+            )?;
+            let mut operation = JournalRecoveryOperation::new(
+                test_external_journal::<LoadedJournal>(
+                    2,
+                    JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
+                    512,
+                    7,
+                    2,
+                    2,
+                    1000,
+                )?,
+                RecoveryState::NeedsRecovery,
+            )?;
+            let mut homes = 0_usize;
+            let mut delta_reads = 0_usize;
+            while let Some(mut request) = operation.next_request()? {
+                match &mut request {
+                    StorageRequest::Read { offset, buffer, .. } => {
+                        buffer.fill(0);
+                        if offset.get() == 257 * 4096 {
+                            delta_reads = delta_reads
+                                .checked_add(1)
+                                .ok_or(Error::ArithmeticOverflow)?;
+                            crate::memory::copy_exact(
+                                buffer,
+                                old_delta.first().ok_or(Error::JournalCorrupt)?,
+                            )?;
+                        } else if let Some(image) = full
+                            .precommit_writes
+                            .iter()
+                            .chain(core::iter::once(&full.commit_write))
+                            .find(|write| write.offset == *offset)
+                        {
+                            crate::memory::copy_exact(buffer, &image.bytes)?;
+                        }
+                    }
+                    StorageRequest::Write {
+                        target: StorageTarget::Filesystem,
+                        offset,
+                        buffer,
+                    } => {
+                        assert_eq!(offset.get(), 10 * 4096);
+                        assert!(buffer.iter().all(|byte| *byte == 0x44));
+                        homes = homes.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                    }
+                    StorageRequest::Write { .. } | StorageRequest::Flush { .. } => {}
+                }
+                let length = request.byte_count();
+                operation.complete(StorageCompletion::success(
+                    CompletedStorageTransfer::from_request(request),
+                    length,
+                ))?;
+            }
+            assert_eq!(homes, 1);
+            assert_eq!(delta_reads, 1);
+            assert!(matches!(
+                operation.into_recovered()?,
+                JournalRecoveryCompletion::Clean(_)
+            ));
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
 
     /// # Panics
     /// Fails if delta commits advance the full ring, lose their home postimage, or lack full fallback.

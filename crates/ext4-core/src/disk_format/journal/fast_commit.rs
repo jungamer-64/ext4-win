@@ -512,6 +512,145 @@ mod tests {
         block
     }
     /// # Panics
+    /// Fails if wire-coordinate origins, unwritten lengths or inode/namespace operands are conflated.
+    #[test]
+    fn independent_all_opcode_vector_retains_typed_operands() {
+        let result = (|| -> Result<()> {
+            let size = BlockSize::from_superblock_log(0)?;
+            let tid = JournalSequence::new(0x1234_5678);
+            let mut block = [0; 1024];
+            let head = [9, 0, 8, 0, 0, 0, 0, 0, 0x78, 0x56, 0x34, 0x12];
+            let add = [
+                1, 0, 16, 0, 12, 0, 0, 0, 0xfe, 0xff, 0xff, 0xff, 1, 0x80, 0xff, 0xff, 0xfe, 0xff,
+                0xff, 0xff,
+            ];
+            let del = [2, 0, 12, 0, 12, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 1, 0, 0, 0];
+            let names = [
+                3, 0, 9, 0, 2, 0, 0, 0, 12, 0, 0, 0, b'x', 4, 0, 9, 0, 2, 0, 0, 0, 12, 0, 0, 0,
+                b'x', 5, 0, 9, 0, 2, 0, 0, 0, 12, 0, 0, 0, b'x',
+            ];
+            let inode = [6, 0, 132, 0, 12, 0, 0, 0];
+            for (start, bytes) in [
+                (0_usize, head.as_slice()),
+                (12, add.as_slice()),
+                (32, del.as_slice()),
+                (48, names.as_slice()),
+                (87, inode.as_slice()),
+                (223, [8, 0, 0x1d, 3, 0x78, 0x56, 0x34, 0x12].as_slice()),
+                (231, &0xb916d604_u32.to_le_bytes()),
+            ] {
+                let end = start
+                    .checked_add(bytes.len())
+                    .ok_or(Error::ArithmeticOverflow)?;
+                memory::copy_exact(
+                    block.get_mut(start..end).ok_or(Error::JournalCorrupt)?,
+                    bytes,
+                )?;
+            }
+            let mut decoder = ProgramDecoder::new(
+                tid,
+                size,
+                AuthenticatedPrefix {
+                    end: 1024,
+                    records: 6,
+                },
+            )?;
+            assert!(decoder.accept(&block)?);
+            let program = decoder.finish()?;
+            let [
+                ParsedDelta::AddRange { inode, extent },
+                ParsedDelta::RemoveRange { range, .. },
+                ParsedDelta::Namespace {
+                    change: NamespaceChange::Create,
+                    ..
+                },
+                ParsedDelta::Namespace {
+                    change: NamespaceChange::Link,
+                    ..
+                },
+                ParsedDelta::Namespace {
+                    change: NamespaceChange::Unlink,
+                    ..
+                },
+                ParsedDelta::Inode { encoded, .. },
+            ] = program.records()
+            else {
+                return Err(Error::JournalCorrupt);
+            };
+            assert_eq!(inode.as_u32(), 12);
+            assert_eq!(extent.logical_start().as_u32(), 0xffff_fffe);
+            assert_eq!(extent.physical_start().get(), 0xffff_ffff_fffe);
+            assert_eq!(extent.len().as_u16(), 1);
+            assert_eq!(
+                extent.initialization(),
+                crate::disk_format::extent::ExtentInitialization::Uninitialized
+            );
+            assert_eq!(range.first.as_u32(), u32::MAX);
+            assert_eq!(range.end, 1_u64 << 32);
+            assert_eq!(encoded.len(), 128);
+            let generated = encode(
+                size,
+                tid,
+                1,
+                program
+                    .records()
+                    .iter()
+                    .map(|record| Ok(DeltaRecord::from(record))),
+            )?;
+            assert_eq!(generated.first().map(Vec::as_slice), Some(block.as_slice()));
+            assert!(matches!(
+                LogicalRange::new(u32::MAX, 2),
+                Err(Error::JournalCorrupt)
+            ));
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails if physical-area exhaustion leaks a partial batch or PAD bytes escape authentication.
+    #[test]
+    fn multi_block_padding_has_an_independent_crc_and_finite_capacity() {
+        let result = (|| -> Result<()> {
+            let size = BlockSize::from_superblock_log(0)?;
+            let tid = JournalSequence::new(0x1234_5678);
+            let inode = InodeId::try_from(12)?;
+            let bytes = [0; 128];
+            let input = [Ok(DeltaRecord::Inode {
+                inode,
+                encoded: &bytes,
+            }); 8];
+            assert!(matches!(
+                encode(size, tid, 1, input),
+                Err(Error::TransactionTooLarge)
+            ));
+            let blocks = encode(size, tid, 2, input)?;
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(
+                blocks.first().and_then(|block| block.get(964..968)),
+                Some([7, 0, 56, 0].as_slice())
+            );
+            assert_eq!(
+                blocks.get(1).and_then(|block| block.get(144..148)),
+                Some(0x76755acf_u32.to_le_bytes().as_slice())
+            );
+            let mut decoder = ProgramDecoder::new(
+                tid,
+                size,
+                AuthenticatedPrefix {
+                    end: 2048,
+                    records: 8,
+                },
+            )?;
+            assert!(!decoder.accept(blocks.first().ok_or(Error::JournalCorrupt)?)?);
+            assert!(decoder.accept(blocks.get(1).ok_or(Error::JournalCorrupt)?)?);
+            assert_eq!(decoder.finish()?.records().len(), 8);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
     /// Fails if the encoder disagrees with independent bytes or a changed reread is accepted.
     #[test]
     fn generated_batch_matches_independent_vector_and_reauthenticates_reread() {
