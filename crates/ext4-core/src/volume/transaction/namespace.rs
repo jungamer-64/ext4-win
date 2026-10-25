@@ -128,7 +128,7 @@ impl MutationResolvePass<'_, '_, '_> {
             }
             let _metadata = inode.metadata_mutation()?;
             let _entries = pass.require_directory_entry_rename_mutation_for_inode(&inode)?;
-            if !pass.directory_is_empty(&inode)? {
+            if !pass.mutation.directory_is_empty(&inode)? {
                 return Err(Error::DirectoryNotEmpty);
             }
             raw.set_casefold(state)?;
@@ -574,7 +574,7 @@ impl MutationResolvePass<'_, '_, '_> {
                 return Err(Error::WrongInodeKind);
             }
             let _namespace = inode.namespace_mutation()?;
-            if !pass.directory_is_empty(&inode)? {
+            if !pass.mutation.directory_is_empty(&inode)? {
                 return Err(Error::DirectoryNotEmpty);
             }
             let _removed = pass.remove_directory_entry(parent.inode(), name)?;
@@ -1270,68 +1270,7 @@ impl MutationResolvePass<'_, '_, '_> {
         }
     }
 
-    /// Returns whether a directory contains only `.` and `..`.
-    /// # Errors
-    ///
-    /// Returns an error when the directory layout cannot be loaded or parsed.
-    fn directory_is_empty(&mut self, inode: &Inode) -> Result<bool> {
-        if let InodeStorage::InlineData(data) = inode.storage() {
-            return Ok(data.directory_entries(inode.id())?.len() == 2);
-        }
-        let tree = self.mutation.mutable_extent_tree(inode)?;
-        match inode.directory_storage_kind()? {
-            DirectoryStorageKind::Linear => {
-                let block_count = round_up_div(
-                    inode.size().bytes(),
-                    u64::from(self.mutation.volume.superblock.block_size().bytes()),
-                )?;
-                for logical in 0..block_count {
-                    let (_physical, block) = self.mutation.read_mutation_directory_block(
-                        inode,
-                        &tree,
-                        LogicalBlock::try_from(logical)?,
-                    )?;
-                    if block
-                        .entries()?
-                        .iter()
-                        .any(|entry| !matches!(entry.name().bytes(), b"." | b".."))
-                    {
-                        return Ok(false);
-                    }
-                }
-            }
-            DirectoryStorageKind::HTree => {
-                let mut context =
-                    self.mutation
-                        .mutation_htree_context(inode, &tree, HtreePathTarget::First)?;
-                loop {
-                    let (_physical, block) = self.mutation.read_mutation_directory_block(
-                        inode,
-                        &tree,
-                        LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
-                    )?;
-                    let entries = block.entries()?;
-                    context.path.hash_range()?.validate_leaf(
-                        &entries,
-                        context.root.hash_profile(),
-                        self.mutation.volume.superblock.name_semantics(inode)?,
-                    )?;
-                    if !entries.is_empty() {
-                        return Ok(false);
-                    }
-                    if !self.mutation.advance_mutation_htree_path(
-                        inode,
-                        &tree,
-                        &mut context.path,
-                        context.root.indirect_levels(),
-                    )? {
-                        break;
-                    }
-                }
-            }
-        }
-        Ok(true)
-    }
+
 }
 
 /// A logged binding supplies a postcondition; link-count arithmetic is not part of leaf editing.
