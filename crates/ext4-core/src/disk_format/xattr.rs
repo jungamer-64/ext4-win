@@ -596,7 +596,7 @@ impl AttributeValueReference {
     }
 }
 /// Storage-dependent value with local bounds already established.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 enum ParsedValue<'a> {
     /// Borrowed from a validated non-overlapping local value region.
     Local(&'a [u8]),
@@ -604,7 +604,7 @@ enum ParsedValue<'a> {
     Inode(AttributeValueReference),
 }
 /// One structural entry before external value resolution.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 struct ParsedAttribute<'a> {
     /// Logical namespace or filesystem-private slot.
     slot: ParsedDiskXattrSlot,
@@ -636,6 +636,20 @@ impl ParsedXattrs<'_> {
                 _ => None,
             })
     }
+    /// Payload replacement cannot change any other attribute value or external-inode binding.
+    /// Parsed tables have unique slots; physical entry order does not define attribute identity.
+    pub(crate) fn same_non_payload_bindings(&self, other: &Self) -> bool {
+        let attributes =
+            |entry: &&ParsedAttribute<'_>| !matches!(entry.slot, ParsedDiskXattrSlot::InlineData);
+        self.entries.iter().filter(attributes).count()
+            == other.entries.iter().filter(attributes).count()
+            && self
+                .entries
+                .iter()
+                .filter(attributes)
+                .all(|entry| other.entries.iter().any(|candidate| candidate == entry))
+    }
+
     /// Resolves external storage before publishing a complete opaque attribute set.
     /// # Errors
     /// Propagates value admission, allocation and duplicate-slot failures.
@@ -691,7 +705,7 @@ struct ParsedDiskXattr {
 }
 
 /// Parsed xattr slot before values have been copied into owned sets.
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 enum ParsedDiskXattrSlot {
     /// User-visible xattr.
     Public(XattrName),

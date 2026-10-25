@@ -610,6 +610,11 @@ fn inode_operand(disk: &Disk, node: NodeId) -> Result<Vec<u8>> {
                 .map_err(|_| Error::DeviceRange)?,
         )))
         .ok_or(Error::DeviceRange)?;
+    let prefix = if fixture_u32(raw, 32)? & 0x1000_0000 != 0 {
+        raw.len()
+    } else {
+        prefix
+    };
     let mut value = node.file_index().to_le_bytes().to_vec();
     value.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
     Ok(value)
@@ -1351,5 +1356,276 @@ fn read_only_terminal_replay_has_zero_backing_effects() -> Result<()> {
     assert_eq!(fixture.disk.storage_effects, 0);
     assert_eq!(fixture.disk.filesystem, filesystem);
     assert_eq!(fixture.disk.journal, journal);
+    Ok(())
+}
+
+/// Independent complete inode and xattr vectors use an unsorted physical attribute-entry order.
+/// # Errors
+/// Returns template bounds or insufficient space in this fixture's 256-byte record.
+fn inline_file_operand(
+    fixture: &Fixture,
+    inode: u32,
+    payload: &[u8],
+    public_value: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let mut value = inode_operand(&fixture.disk, NodeId::File(fixture.a))?;
+    if value.len() != 260 {
+        return Err(Error::InvalidInode);
+    }
+    put(&mut value, 0, &inode.to_le_bytes())?;
+    put(
+        &mut value,
+        8,
+        &u32::try_from(payload.len())
+            .map_err(|_| Error::DeviceRange)?
+            .to_le_bytes(),
+    )?;
+    put(&mut value, 112, &0_u32.to_le_bytes())?;
+    value.get_mut(44..104).ok_or(Error::DeviceRange)?.fill(0);
+    let first = payload.len().min(60);
+    put(
+        &mut value,
+        44,
+        payload.get(..first).ok_or(Error::DeviceRange)?,
+    )?;
+    let extra = u16::from_le_bytes(
+        value
+            .get(132..134)
+            .ok_or(Error::DeviceRange)?
+            .try_into()
+            .map_err(|_| Error::DeviceRange)?,
+    );
+    let body_start = 132_usize
+        .checked_add(usize::from(extra))
+        .ok_or(Error::DeviceRange)?;
+    let body = value.get_mut(body_start..).ok_or(Error::DeviceRange)?;
+    body.fill(0);
+    put(body, 0, &0xea02_0000_u32.to_le_bytes())?;
+    let mut cursor = 4_usize;
+    let mut end = body.len();
+    for (index, name, bytes) in [
+        (
+            7_u8,
+            b"data".as_slice(),
+            payload.get(60..).unwrap_or_default(),
+        ),
+        (1_u8, b"keep".as_slice(), public_value.unwrap_or_default()),
+    ] {
+        if index == 1 && public_value.is_none() {
+            continue;
+        }
+        let aligned = bytes.len().checked_add(3).ok_or(Error::DeviceRange)? & !3;
+        end = end.checked_sub(aligned).ok_or(Error::DeviceRange)?;
+        if cursor.checked_add(24).ok_or(Error::DeviceRange)? > end {
+            return Err(Error::NoSpace);
+        }
+        put(body, cursor, &[4, index])?;
+        put(
+            body,
+            cursor.checked_add(2).ok_or(Error::DeviceRange)?,
+            &u16::try_from(end.checked_sub(4).ok_or(Error::DeviceRange)?)
+                .map_err(|_| Error::DeviceRange)?
+                .to_le_bytes(),
+        )?;
+        put(
+            body,
+            cursor.checked_add(8).ok_or(Error::DeviceRange)?,
+            &u32::try_from(bytes.len())
+                .map_err(|_| Error::DeviceRange)?
+                .to_le_bytes(),
+        )?;
+        put(
+            body,
+            cursor.checked_add(16).ok_or(Error::DeviceRange)?,
+            name,
+        )?;
+        put(body, end, bytes)?;
+        cursor = cursor.checked_add(20).ok_or(Error::DeviceRange)?;
+    }
+    Ok(value)
+}
+
+/// # Errors
+/// Propagates independent inline record construction, recovery, payload and attribute reads.
+/// # Panics
+/// Fails if full resident bytes, semantic attributes, repeated replay or read-only isolation differ.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare independent complete inline vectors with recovered data and ownership"
+)]
+fn inline_records_restore_full_payload_and_preserve_attribute_bindings() -> Result<()> {
+    for access in [
+        MountAccess::ReadWrite,
+        MountAccess::ReadOnly {
+            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+        },
+    ] {
+        let mut fixture = inline_fixture()?;
+        let file = fixture.a;
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, b"keep")?,
+                XattrValue::new(b"kept")?,
+            )
+        })?;
+        let payload = [0x59; 80];
+        let image = inline_file_operand(
+            &fixture,
+            NodeId::File(file).file_index(),
+            &payload,
+            Some(b"kept"),
+        )?;
+        let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+        let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+        for _ in 0..2 {
+            install_delta(&mut fixture, &[(6, &image)])?;
+            let original_fs = fixture.disk.filesystem.clone();
+            let original_journal = fixture.disk.journal.clone();
+            fixture.disk.storage_effects = 0;
+            let (profile, epoch, coordinator, _) = fixture.disk.mount(access)?.into_parts();
+            fixture.profile = profile;
+            fixture.cache = MetadataCache::try_new(&epoch)?;
+            fixture.epoch = epoch;
+            fixture.coordinator = coordinator;
+            let mut bytes = [0; 80];
+            assert_eq!(
+                fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?,
+                ReadBytes::from_usize(80)
+            );
+            assert_eq!(bytes, payload);
+            let keep = fixture
+                .read(|pass| {
+                    pass.read_xattr(
+                        NodeId::File(file),
+                        &XattrName::new(XattrNamespace::User, b"keep")?,
+                    )
+                })?
+                .ok_or(Error::InvalidXattr)?;
+            assert_eq!(keep.bytes(), b"kept");
+            assert_eq!(fixture_u32(&fixture.disk.filesystem, 1040)?, free_inodes);
+            assert_eq!(fixture_u32(&fixture.disk.filesystem, 1036)?, free_blocks);
+            if matches!(access, MountAccess::ReadOnly { .. }) {
+                assert_eq!(fixture.disk.storage_effects, 0);
+                assert_eq!(fixture.disk.filesystem, original_fs);
+                assert_eq!(fixture.disk.journal, original_journal);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates fixture attributes and independent malformed inline operands.
+/// # Panics
+/// Fails if inline payload replay can rebind other attributes or admit an omitted body before effects.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe complete resident admission before persistent writes"
+)]
+fn inline_records_reject_changed_attributes_and_missing_bodies_before_effects() -> Result<()> {
+    for variant in 0..3 {
+        let mut fixture = inline_fixture()?;
+        let file = fixture.a;
+        fixture.mutate(|pass| {
+            let node = pass.node(NodeId::File(file))?;
+            pass.set_xattr(
+                node,
+                XattrName::new(XattrNamespace::User, b"keep")?,
+                XattrValue::new(b"kept")?,
+            )
+        })?;
+        let mut image = inline_file_operand(
+            &fixture,
+            NodeId::File(file).file_index(),
+            &[0x59; 80],
+            Some(if variant == 0 { b"evil" } else { b"kept" }),
+        )?;
+        let expected = if variant == 0 {
+            Error::UnsupportedJournal
+        } else {
+            Error::InvalidInode
+        };
+        if variant == 1 {
+            image.truncate(164);
+        } else if variant == 2 {
+            image.get_mut(164..).ok_or(Error::DeviceRange)?.fill(0);
+        }
+        install_delta(&mut fixture, &[(6, &image)])?;
+        fixture.disk.storage_effects = 0;
+        assert_eq!(
+            fixture.disk.mount(MountAccess::ReadWrite).map(|_| ()),
+            Err(expected)
+        );
+        assert_eq!(fixture.disk.storage_effects, 0);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates complete inline file/directory operands, production creation and namespace reads.
+/// # Panics
+/// Fails if full inline creation loses payload, dot parentage, or consumes ordinary data blocks.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe complete resident births and stable allocation"
+)]
+fn inline_creation_recovers_complete_bodies_without_data_allocation() -> Result<()> {
+    let mut fixture = inline_fixture()?;
+    let file = inline_file_operand(&fixture, 64, &[0x51; 80], None)?;
+    let mut directory = inline_file_operand(&fixture, 65, &[0; 60], None)?;
+    put(&mut directory, 4, &(0x4000_u16 | 0o755).to_le_bytes())?;
+    put(&mut directory, 30, &2_u16.to_le_bytes())?;
+    put(&mut directory, 44, &2_u32.to_le_bytes())?;
+    put(&mut directory, 52, &56_u16.to_le_bytes())?;
+    let file_name = birth_binding(2, 64, b"inline-born");
+    let directory_name = birth_binding(2, 65, b"inline-dir-born");
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    for _ in 0..2 {
+        install_delta(
+            &mut fixture,
+            &[
+                (6, &file),
+                (3, &file_name),
+                (6, &directory),
+                (3, &directory_name),
+            ],
+        )?;
+        fixture.remount()?;
+        let ChildLookup::Found(entry) = fixture.read(|pass| {
+            pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"inline-born")?)
+        })?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::File(id) = *entry.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        let mut bytes = [0; 80];
+        fixture.read(|pass| pass.read_file(id, FileOffset::ZERO, &mut bytes))?;
+        assert_eq!(bytes, [0x51; 80]);
+        let ChildLookup::Found(entry) = fixture.read(|pass| {
+            pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"inline-dir-born")?)
+        })?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::Directory(id) = *entry.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(id, &Ext4Name::new(b"..")?))?, ChildLookup::Found(entry) if *entry.node() == NodeId::Directory(DirectoryNodeId::ROOT))
+        );
+        assert_eq!(fixture_u32(&fixture.disk.filesystem, 1036)?, free_blocks);
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_sub(2).ok_or(Error::InvalidSuperblock)?
+        );
+    }
     Ok(())
 }

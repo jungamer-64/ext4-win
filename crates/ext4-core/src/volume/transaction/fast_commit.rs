@@ -4,6 +4,7 @@ use crate::disk_format::journal::fast_commit::{
     DeltaProgram, LogicalRange, NamespaceChange, ParsedDelta,
 };
 use crate::volume::fast_commit::ResolvedDeltaImages;
+use crate::volume::inode_record::DeltaInodeImage;
 use crate::volume::orphan::ValidatedOrphanInventory;
 
 /// A changed inode owns its original tree until final data accounting is known for the whole log.
@@ -132,7 +133,12 @@ pub(in crate::volume) fn resolve_delta_postconditions(
             ReplayInode::NewDirectory { mut raw, parent } => {
                 let mut tree = MutableExtentTree::from_extents(Vec::new())?;
                 mutation.initialize_delta_directory(&mut raw, &mut tree, parent)?;
-                (raw, Some(tree))
+                let tree = if raw.parse()?.flags().has_inline_data() {
+                    None
+                } else {
+                    Some(tree)
+                };
+                (raw, tree)
             }
         };
         if let Some(tree) = tree {
@@ -228,7 +234,7 @@ fn prepare_inode(
     } else {
         let mut raw = mutation.volume.read_live_inode_record(id)?;
         if let Some(encoded) = encoded {
-            raw = raw.restore_delta_metadata(encoded)?;
+            raw = DeltaInodeImage::parse(encoded, usize::from(mutation.volume.superblock.inode_size().as_u16()))?.restore(raw)?;
         }
         let inode = raw.parse()?;
         let tree = if matches!(inode.storage(), InodeStorage::Extents(_)) {
@@ -370,6 +376,10 @@ impl MetadataMutation<'_, '_> {
         parent: InodeId,
         encoded: &[u8],
     ) -> Result<ReplayInode> {
+        let image = DeltaInodeImage::parse(
+            encoded,
+            usize::from(self.volume.superblock.inode_size().as_u16()),
+        )?;
         self.volume.superblock.require_namespace_inode(id)?;
         if id == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
@@ -389,11 +399,11 @@ impl MetadataMutation<'_, '_> {
         if inode_bitmap_bit_state(&bitmap.bytes, position)? == BitmapBitState::Used {
             let raw = self.volume.read_live_inode_record(id)?;
             if le_u32(raw.raw().bytes(), disk_offset(INODE_GENERATION_OFFSET))?
-                != le_u32(encoded, disk_offset(INODE_GENERATION_OFFSET))?
+                != image.generation()?
             {
                 return Err(Error::UnsupportedJournal);
             }
-            let raw = raw.restore_delta_metadata(encoded)?;
+            let raw = image.restore(raw)?;
             let tree = if matches!(raw.parse()?.storage(), InodeStorage::Extents(_)) {
                 Some(self.mutable_extent_tree(&raw.parse()?)?)
             } else {
@@ -409,9 +419,8 @@ impl MetadataMutation<'_, '_> {
         set_inode_bitmap_bit(&mut bitmap.bytes, position, BitmapBitState::Used)?;
         self.record_group_free_inodes_delta(group, -1)?;
         let block_size = self.volume.superblock.block_size();
-        let raw = self
-            .empty_allocated_inode_record(id)?
-            .initialize_delta_inode(encoded, block_size)?;
+        let allocation = self.empty_allocated_inode_record(id)?;
+        let raw = image.initialize(allocation, block_size)?;
         if raw.parse()?.kind() == InodeKind::Directory {
             self.record_group_used_dirs_delta(group, 1)?;
             Ok(ReplayInode::NewDirectory { raw, parent })

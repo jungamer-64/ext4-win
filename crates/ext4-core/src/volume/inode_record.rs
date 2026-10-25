@@ -3,6 +3,9 @@
 use super::scope::*;
 use crate::disk_format::inode::{AttributeInode, InodeData, InodeRecordLayout};
 
+mod delta;
+pub(super) use delta::DeltaInodeImage;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Raw inode image paired with its identity and device offset. Read-only consumers may borrow
 /// immutable table storage; mutation typestates own their independently writable bytes.
@@ -376,10 +379,10 @@ impl AllocatedInodeRecord {
     }
 }
 
-/// Lossless metadata projection excludes storage ownership and inline attribute bodies.
+/// Stable metadata admits no payload/attribute changes; inline wire records include the full body.
 /// # Errors
 /// Returns malformed prefix width or truncated inode fields.
-fn metadata_delta_prefix(base: &[u8], post: &[u8]) -> Result<Option<usize>> {
+fn metadata_delta_record_len(base: &[u8], post: &[u8]) -> Result<Option<usize>> {
     if base.len() != post.len() || base.len() < 128 {
         return Err(Error::InvalidInode);
     }
@@ -407,12 +410,21 @@ fn metadata_delta_prefix(base: &[u8], post: &[u8]) -> Result<Option<usize>> {
     if prefix > base.len() {
         return Err(Error::InvalidInode);
     }
-    Ok(Some(prefix))
+    if base.get(prefix..) != post.get(prefix..) {
+        return Ok(None);
+    }
+    let length =
+        if InodeFlags::from_u32(le_u32(base, disk_offset(INODE_FLAGS_OFFSET))?).has_inline_data() {
+            base.len()
+        } else {
+            prefix
+        };
+    Ok(Some(length))
 }
 
 impl LiveInodeRecord {
     /// A lossless metadata delta leaves all mapping, allocation and attribute-body bytes unchanged.
-    /// Location and prefix admission are checked against the same immutable containing block.
+    /// Location and complete wire width are bound to the same immutable containing block.
     /// # Errors
     /// Rejects malformed record width or metadata coordinates before journal encoding.
     pub(super) fn metadata_delta_region(
@@ -434,7 +446,7 @@ impl LiveInodeRecord {
         let Some(post) = post_block.get(relative..end) else {
             return Ok(None);
         };
-        let Some(prefix) = metadata_delta_prefix(base, post)? else {
+        let Some(prefix) = metadata_delta_record_len(base, post)? else {
             return Ok(None);
         };
         let prefix_end = relative
@@ -1458,6 +1470,68 @@ impl RawInodeRecord<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     /// # Panics
+    /// Fails if inline metadata emits an incomplete wire record or admits an unlogged body mutation.
+    #[test]
+    fn inline_metadata_delta_retains_the_complete_unchanged_body() {
+        let result = (|| -> Result<()> {
+            let mut raw = raw_record(12)?;
+            raw.bytes = memory::repeated_vec(0, 256)?;
+            raw.encoding = InodeDataEncoding::new(
+                crate::disk_format::inode::FileSizeEncoding::LargeFile,
+                crate::disk_format::inode::DirectorySizeEncoding::LargeDirectory,
+                crate::disk_format::inode::InodeBlockCountEncoding::HugeFile,
+                block_size()?,
+                crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+                true,
+                false,
+                false,
+            );
+            let mut original = raw.into_allocated().initialize_file(
+                NewFileMetadata::new(owner(), permissions()?),
+                InodeFlags::from_u32(0),
+                now(),
+                block_size()?,
+                InodeTimestampEncoding::ExtraFields,
+            )?;
+            let mut set = InodeXattrSet::empty();
+            set.set_inline_data(XattrValue::new(&[])?);
+            let body = xattr_storage::serialize_inline_xattrs(
+                &set,
+                original.raw.inline_xattr_region()?.len(),
+            )?;
+            original.initialize_inline_storage()?;
+            memory::copy_exact(original.raw.writable_inline_xattr_region()?, &body)?;
+            let mut successor = original.raw.try_clone_record()?.into_live()?;
+            successor.set_permissions(Ext4Permissions::new(0o600)?)?;
+            assert_eq!(
+                successor.metadata_delta_region(
+                    ByteOffset::new(0),
+                    original.raw.bytes(),
+                    successor.raw.bytes()
+                )?,
+                Some((ByteOffset::new(0), 256))
+            );
+            let replayed = DeltaInodeImage::parse(successor.raw.bytes(), 256)?
+                .restore(original.raw.try_clone_record()?.into_live()?)?;
+            assert_eq!(
+                replayed.parse()?.security().permissions(),
+                Ext4Permissions::new(0o600)?
+            );
+            *successor.raw.bytes.last_mut().ok_or(Error::InvalidInode)? ^= 1;
+            assert_eq!(
+                successor.metadata_delta_region(
+                    ByteOffset::new(0),
+                    original.raw.bytes(),
+                    successor.raw.bytes()
+                )?,
+                None
+            );
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
     /// Fails if recorded roots or block charges override reconstructed extent ownership.
     #[test]
     fn extent_delta_metadata_preserves_mapping_and_derived_block_charge() {
@@ -1488,7 +1562,8 @@ mod tests {
                 .get_mut(116..118)
                 .ok_or(Error::InvalidInode)?
                 .fill(0xff);
-            let replayed = original.restore_delta_metadata(&encoded)?;
+            let replayed =
+                DeltaInodeImage::parse(&encoded, original.raw.bytes.len())?.restore(original)?;
             assert_eq!(mode(replayed.raw()), Ok(MODE_REGULAR | 0o600));
             assert_eq!(replayed.raw.bytes().get(40..100), Some(root.as_slice()));
             assert_eq!(le_u32(replayed.raw.bytes(), disk_offset(28))?, 0);
@@ -1510,9 +1585,11 @@ mod tests {
                 disk_offset(INODE_MODE_OFFSET),
                 MODE_REGULAR | 0o600,
             )?;
-            let replayed = original.restore_delta_metadata(&encoded)?;
+            let replayed =
+                DeltaInodeImage::parse(&encoded, original.raw.bytes.len())?.restore(original)?;
             assert_eq!(mode(replayed.raw()), Ok(MODE_REGULAR | 0o600));
-            let replayed = replayed.restore_delta_metadata(&encoded)?;
+            let replayed =
+                DeltaInodeImage::parse(&encoded, replayed.raw.bytes.len())?.restore(replayed)?;
             assert_eq!(replayed.raw.bytes(), encoded);
             let mut changed_mapping = memory::copied_slice(&encoded)?;
             *changed_mapping.get_mut(40).ok_or(Error::InvalidInode)? ^= 1;
@@ -1523,7 +1600,8 @@ mod tests {
                     .get(40..100)
                     .ok_or(Error::InvalidInode)?,
             )?;
-            let replayed = replayed.restore_delta_metadata(&changed_mapping)?;
+            let replayed = DeltaInodeImage::parse(&changed_mapping, replayed.raw.bytes.len())?
+                .restore(replayed)?;
             assert_eq!(replayed.raw.bytes().get(40..100), Some(root.as_slice()));
             Ok(())
         })();

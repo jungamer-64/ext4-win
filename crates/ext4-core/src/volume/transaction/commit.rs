@@ -3,7 +3,7 @@
 use super::*;
 
 impl MetadataMutation<'_, '_> {
-    /// Selects the inode projection only when every changed byte belongs to its metadata prefix.
+    /// Selects a complete inode operand only when every changed byte belongs to stable metadata.
     /// The full image remains authoritative; versions of its complete block are rechecked at commit.
     /// # Errors
     /// Propagates metadata read, coordinate or malformed inode failure before any write authority.
@@ -35,12 +35,12 @@ impl MetadataMutation<'_, '_> {
         self.volume
             .device
             .read_metadata_exact_at(block_start, &mut base)?;
-        let Some((offset, prefix)) =
+        let Some((offset, record_len)) =
             inode.metadata_delta_region(block_start, &base, block.bytes())?
         else {
             return Ok(JournalCommitImage::full(blocks));
         };
-        JournalCommitImage::inode(blocks, size, inode.id(), offset, prefix)
+        JournalCommitImage::inode(blocks, size, inode.id(), offset, record_len)
     }
 
     /// Serializes all staged metadata mutations into byte-range writes.

@@ -1990,6 +1990,18 @@ impl MetadataMutation<'_, '_> {
         tree: &mut MutableExtentTree,
         parent: InodeId,
     ) -> Result<()> {
+        if raw.parse()?.flags().has_inline_data() {
+            self.edit_inline_directory(raw, |dot_parent, first, second| {
+                *dot_parent = parent;
+                first.initialize_free_space()?;
+                if !second.bytes().is_empty() {
+                    second.initialize_free_space()?;
+                }
+                Ok(())
+            })?
+            .ok_or(Error::NoSpace)?;
+            return Ok(());
+        }
         let logical = LogicalBlock::from_u32(0);
         let physical = self.allocate_extent_block(tree, logical)?;
         tree.insert_or_extend_initialized(logical, physical)?;
