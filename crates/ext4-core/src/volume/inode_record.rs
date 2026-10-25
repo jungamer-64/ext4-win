@@ -765,6 +765,16 @@ impl LiveInodeRecord {
         self.raw.set_links_count(links)
     }
 
+    /// Installs the positive namespace census for a file or symlink without a clock mutation.
+    /// # Errors
+    /// Rejects directories or malformed link fields.
+    pub(super) fn replace_file_links(&mut self, links: Ext4LinkCount) -> Result<()> {
+        if self.parse()?.kind() == InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        self.raw.set_links_count(links)
+    }
+
     /// Increments link count.
     /// # Errors
     ///
@@ -826,8 +836,28 @@ impl LiveInodeRecord {
         now: Ext4Timestamp,
         block_size: BlockSize,
     ) -> Result<DeletedInodeRecord> {
+        self.raw.touch_metadata(now)?;
+        self.finish_deletion(now.base_seconds_bits()?, block_size)
+    }
+
+    /// Final namespace absence supplies retirement authority; recovery has no new event clock.
+    /// # Errors
+    /// Returns malformed inode fields or failed deletion serialization.
+    pub(super) fn retire_replayed(self, block_size: BlockSize) -> Result<DeletedInodeRecord> {
+        let recorded = le_u32(&self.raw.bytes, disk_offset(INODE_CTIME_OFFSET))?.max(1);
+        self.finish_deletion(recorded, block_size)
+    }
+
+    /// Serializes one terminal storage state shared by live deletion and authenticated recovery.
+    /// # Errors
+    /// Returns malformed size, allocation, attribute or extent fields.
+    fn finish_deletion(
+        mut self,
+        deletion_time: u32,
+        block_size: BlockSize,
+    ) -> Result<DeletedInodeRecord> {
         let kind = self.parse()?.kind();
-        self.raw.set_deletion_time(now.base_seconds_bits()?)?;
+        self.raw.set_deletion_time(deletion_time)?;
         self.raw.set_deleted_links_count()?;
         let size = match kind {
             InodeKind::Directory => self
@@ -848,7 +878,8 @@ impl LiveInodeRecord {
         let tree = MutableExtentTree::from_extents(Vec::new())?;
         let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
         self.raw.set_extent_root_bytes(serialized.inode_root())?;
-        self.raw.touch_metadata(now)?;
+        self.raw.set_xattr_block(None)?;
+        self.raw.clear_inline_xattr_region()?;
         Ok(DeletedInodeRecord { raw: self.raw })
     }
 }

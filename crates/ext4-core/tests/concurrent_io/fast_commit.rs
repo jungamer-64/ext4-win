@@ -888,3 +888,316 @@ fn cyclic_directory_births_are_rejected_before_allocation_publication() -> Resul
     assert_eq!(fixture.disk.storage_effects, 0);
     Ok(())
 }
+
+/// Reads an inode's group-zero allocation bit independently of the mount implementation.
+/// # Errors
+/// Returns invalid fixture bitmap geometry or a truncated byte.
+fn inode_allocated(disk: &Disk, inode: u32) -> Result<bool> {
+    let bit = inode.checked_sub(1).ok_or(Error::InvalidInode)?;
+    let bitmap = usize::try_from(fixture_u32(&disk.filesystem, 4100)?)
+        .map_err(|_| Error::DeviceRange)?
+        .checked_mul(4096)
+        .ok_or(Error::DeviceRange)?;
+    let byte = bitmap
+        .checked_add(usize::try_from(bit / 8).map_err(|_| Error::DeviceRange)?)
+        .ok_or(Error::DeviceRange)?;
+    Ok(*disk.filesystem.get(byte).ok_or(Error::DeviceRange)? & (1_u8 << (bit % 8)) != 0)
+}
+
+/// # Errors
+/// Propagates independent unlink operands and production recovery failures.
+/// # Panics
+/// Fails if terminal replay leaks allocation, frees another file or repeats a counter transition.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe terminal ownership and repeatable counter postconditions"
+)]
+fn terminal_unlink_without_inode_metadata_retires_allocation_once() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let id = NodeId::File(fixture.a).file_index();
+    let inode = fixture_inode_offset(&fixture.disk, NodeId::File(fixture.a))?;
+    let block = fixture_u32(
+        &fixture.disk.filesystem,
+        inode.checked_add(60).ok_or(Error::DeviceRange)?,
+    )?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let unlink = namespace_operand(
+        DirectoryNodeId::ROOT,
+        NodeId::File(fixture.a),
+        b"concurrent-a",
+    );
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(5, &unlink)])?;
+        fixture.remount()?;
+        assert!(matches!(
+            fixture
+                .read(|pass| pass
+                    .lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?))?,
+            ChildLookup::NotFound
+        ));
+        assert!(!inode_allocated(&fixture.disk, id)?);
+        assert!(!allocated(&fixture.disk, block)?);
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_add(1).ok_or(Error::InvalidSuperblock)?
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1036)?,
+            free_blocks.checked_add(1).ok_or(Error::InvalidSuperblock)?
+        );
+        let mut bytes = [0; 1];
+        let retained = fixture.b;
+        fixture.read(|pass| pass.read_file(retained, FileOffset::ZERO, &mut bytes))?;
+        assert_eq!(&bytes, b"b");
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates ordinary cross-directory hard-link creation and production delta recovery.
+/// # Panics
+/// Fails if missing inode metadata implies deletion despite a remaining binding in another directory.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe the complete final namespace rather than procedural link arithmetic"
+)]
+fn unlink_census_preserves_a_hard_link_in_an_unchanged_parent() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    let parent = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let parent = pass.create_directory(
+            root,
+            &Ext4Name::new(b"retained-parent")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )?;
+        let source = pass.hard_link_source(HardLinkNodeId::File(file))?;
+        pass.create_hard_link(
+            source,
+            parent,
+            &Ext4Name::new(b"retained")?,
+            NamespaceDestination::Vacant,
+        )?;
+        Ok(parent.id())
+    })?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let unlink = namespace_operand(DirectoryNodeId::ROOT, NodeId::File(file), b"concurrent-a");
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(5, &unlink)])?;
+        fixture.remount()?;
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(file)?.links_count()))?,
+            Ext4LinkCount::ONE
+        );
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(parent, &Ext4Name::new(b"retained")?))?, ChildLookup::Found(entry) if *entry.node() == NodeId::File(file))
+        );
+        assert_eq!(fixture_u32(&fixture.disk.filesystem, 1040)?, free_inodes);
+        assert_eq!(fixture_u32(&fixture.disk.filesystem, 1036)?, free_blocks);
+        assert!(inode_allocated(
+            &fixture.disk,
+            NodeId::File(file).file_index()
+        )?);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates ordinary nested-directory creation and independent unlink record construction.
+/// # Panics
+/// Fails if nested terminal replay needs live table bodies after their bitmap slots are free.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe directory retirement and stable repeated namespace absence"
+)]
+fn nested_directory_unlinks_release_bodies_and_parent_counts_once() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let (outer, inner, file) = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let metadata = NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?);
+        let outer = pass.create_directory(root, &Ext4Name::new(b"retired-tree")?, metadata)?;
+        let inner = pass.create_directory(outer, &Ext4Name::new(b"inner")?, metadata)?;
+        let file = pass.create_file(
+            inner,
+            &Ext4Name::new(b"file")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        Ok((outer.id(), inner.id(), file.id()))
+    })?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let root_links =
+        fixture.read(|pass| Ok(pass.load_directory(DirectoryNodeId::ROOT)?.links_count()))?;
+    let a = namespace_operand(
+        DirectoryNodeId::ROOT,
+        NodeId::Directory(outer),
+        b"retired-tree",
+    );
+    let b = namespace_operand(outer, NodeId::Directory(inner), b"inner");
+    let c = namespace_operand(inner, NodeId::File(file), b"file");
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(5, &a), (5, &b), (5, &c)])?;
+        fixture.remount()?;
+        assert!(matches!(
+            fixture
+                .read(|pass| pass
+                    .lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"retired-tree")?))?,
+            ChildLookup::NotFound
+        ));
+        for node in [
+            NodeId::Directory(outer),
+            NodeId::Directory(inner),
+            NodeId::File(file),
+        ] {
+            assert!(!inode_allocated(&fixture.disk, node.file_index())?);
+        }
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_add(3).ok_or(Error::InvalidSuperblock)?
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1036)?,
+            free_blocks.checked_add(2).ok_or(Error::InvalidSuperblock)?
+        );
+        assert_eq!(
+            fixture.read(|pass| Ok(pass
+                .load_directory(DirectoryNodeId::ROOT)?
+                .links_count()
+                .on_disk_count()))?,
+            root_links
+                .on_disk_count()
+                .checked_sub(1)
+                .ok_or(Error::InvalidInode)?
+        );
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates fixture namespace creation and independent deletion operands.
+/// # Panics
+/// Fails if unlinking a nonempty directory publishes partial namespace or storage reclamation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe rejection before journal or home effects"
+)]
+fn terminal_directory_replay_requires_final_namespace_emptiness() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let directory = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let directory = pass.create_directory(
+            root,
+            &Ext4Name::new(b"nonempty")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )?;
+        pass.create_file(
+            directory,
+            &Ext4Name::new(b"retained")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        Ok(directory.id())
+    })?;
+    let unlink = namespace_operand(
+        DirectoryNodeId::ROOT,
+        NodeId::Directory(directory),
+        b"nonempty",
+    );
+    install_delta(&mut fixture, &[(5, &unlink)])?;
+    fixture.disk.storage_effects = 0;
+    assert!(matches!(
+        fixture.disk.mount(MountAccess::ReadWrite),
+        Err(Error::DirectoryNotEmpty)
+    ));
+    assert_eq!(fixture.disk.storage_effects, 0);
+    Ok(())
+}
+
+/// # Errors
+/// Propagates an independently recorded earlier inode image and terminal namespace operand.
+/// # Panics
+/// Fails if an earlier positive count resurrects storage after a later unlink or on repeated replay.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare final namespace ownership with an earlier metadata image"
+)]
+fn later_unlink_supersedes_an_earlier_positive_inode_count() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = NodeId::File(fixture.a);
+    let image = inode_operand(&fixture.disk, file)?;
+    let unlink = namespace_operand(DirectoryNodeId::ROOT, file, b"concurrent-a");
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(6, &image), (5, &unlink)])?;
+        fixture.remount()?;
+        assert!(!inode_allocated(&fixture.disk, file.file_index())?);
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_add(1).ok_or(Error::InvalidSuperblock)?
+        );
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates attribute-inode construction, namespace recovery and surviving attribute reads.
+/// # Panics
+/// Fails if terminal unlink leaks attribute storage or retires another inode's value ownership.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe complete terminal data and attribute reclamation"
+)]
+fn terminal_replay_releases_attributes_and_preserves_another_value_owner() -> Result<()> {
+    let mut fixture = fixture_with_incompatible_features(0x400)?;
+    let retained = fixture.b;
+    let victim = fixture.a;
+    let value = [0x73; 16_384];
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(retained))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"large")?,
+            XattrValue::new(&value)?,
+        )
+    })?;
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(victim))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"large")?,
+            XattrValue::new(&value)?,
+        )
+    })?;
+    let unlink = namespace_operand(DirectoryNodeId::ROOT, NodeId::File(victim), b"concurrent-a");
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(5, &unlink)])?;
+        fixture.remount()?;
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1036)?,
+            free_blocks.checked_add(1).ok_or(Error::InvalidSuperblock)?
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_add(1).ok_or(Error::InvalidSuperblock)?
+        );
+        let observed = fixture
+            .read(|pass| {
+                pass.read_xattr(
+                    NodeId::File(retained),
+                    &XattrName::new(XattrNamespace::User, b"large")?,
+                )
+            })?
+            .ok_or(Error::InvalidXattr)?;
+        assert_eq!(observed.bytes(), value);
+    }
+    Ok(())
+}

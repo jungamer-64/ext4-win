@@ -1857,7 +1857,7 @@ impl MetadataMutation<'_, '_> {
 
     /// Replays plaintext bindings using staged leaves and final inode counts.
     /// # Errors
-    /// Rejects encrypted/inline parents, directory targets, required growth or malformed routes.
+    /// Rejects encrypted/inline parents, directory hard links, or malformed routes and identities.
     pub(super) fn replay_directory_binding(
         &mut self,
         parent: InodeId,
@@ -1867,19 +1867,34 @@ impl MetadataMutation<'_, '_> {
     ) -> Result<()> {
         use crate::disk_format::journal::fast_commit::NamespaceChange;
         reject_reserved_directory_name(name)?;
+        self.volume.superblock.require_namespace_inode(parent)?;
+        self.volume.superblock.require_namespace_inode(target)?;
+        if self.replay_inode_bit(parent)? == BitmapBitState::Free {
+            return if change == NamespaceChange::Unlink {
+                Ok(())
+            } else {
+                Err(Error::UnsupportedJournal)
+            };
+        }
         let parent = self.raw_inode_for_policy(parent)?.parse()?;
-        let child = self.raw_inode_for_policy(target)?.parse()?;
         if parent.kind() != InodeKind::Directory
             || parent.protection().is_encrypted()
             || parent.flags().has_inline_data()
-            || (child.kind() == InodeKind::Directory && change == NamespaceChange::Link)
         {
             return Err(Error::UnsupportedJournal);
         }
         let binding = match change {
-            NamespaceChange::Create | NamespaceChange::Link => LoggedBinding::Present(
-                RawDirectoryEntry::new(target, name, directory_entry_kind(child.kind()))?,
-            ),
+            NamespaceChange::Create | NamespaceChange::Link => {
+                let child = self.raw_inode_for_policy(target)?.parse()?;
+                if child.kind() == InodeKind::Directory && change == NamespaceChange::Link {
+                    return Err(Error::UnsupportedJournal);
+                }
+                LoggedBinding::Present(RawDirectoryEntry::new(
+                    target,
+                    name,
+                    directory_entry_kind(child.kind()),
+                )?)
+            }
             NamespaceChange::Unlink => LoggedBinding::AbsentIf {
                 inode: target,
                 name,
@@ -2107,7 +2122,9 @@ impl MetadataMutation<'_, '_> {
                     ..
                 } = record
                     && *parent == inode.id()
-                    && self.raw_inode_for_policy(*child)?.parse()?.kind() == InodeKind::Directory
+                    && (self.replay_inode_bit(*child)? == BitmapBitState::Free
+                        || self.raw_inode_for_policy(*child)?.parse()?.kind()
+                            == InodeKind::Directory)
                 {
                     structural_change = true;
                     break;

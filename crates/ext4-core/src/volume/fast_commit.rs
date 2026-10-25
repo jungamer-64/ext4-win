@@ -157,6 +157,7 @@ impl DeltaReplayOperation {
                             superblock,
                             seed,
                             clusters,
+                            orphans,
                         };
                         Ok(())
                     }
@@ -174,6 +175,7 @@ impl DeltaReplayOperation {
                     superblock,
                     seed,
                     clusters,
+                    orphans,
                 } => {
                     let view = EpochReadView::recovering(
                         OperationDevice::new(&mut self.transcript),
@@ -181,7 +183,11 @@ impl DeltaReplayOperation {
                         keys,
                         &clusters,
                     );
-                    match super::transaction::resolve_delta_postconditions(view, seed.program()) {
+                    match super::transaction::resolve_delta_postconditions(
+                        view,
+                        seed.program(),
+                        &orphans,
+                    ) {
                         Ok(candidate) => {
                             self.transcript = StorageTranscript::new(
                                 StorageTarget::Filesystem,
@@ -195,6 +201,7 @@ impl DeltaReplayOperation {
                                 superblock,
                                 seed,
                                 clusters,
+                                orphans,
                             };
                             Err(error)
                         }

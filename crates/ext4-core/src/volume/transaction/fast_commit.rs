@@ -4,6 +4,7 @@ use crate::disk_format::journal::fast_commit::{
     DeltaProgram, LogicalRange, NamespaceChange, ParsedDelta,
 };
 use crate::volume::fast_commit::ResolvedDeltaImages;
+use crate::volume::orphan::ValidatedOrphanInventory;
 
 /// A changed inode owns its original tree until final data accounting is known for the whole log.
 #[derive(Debug)]
@@ -31,20 +32,25 @@ impl ReplayInode {
     /// Identity is independent of whether the storage initialization obligation has completed.
     fn id(&self) -> InodeId {
         match self {
-            Self::Live { raw, .. } | Self::NewDirectory { raw, .. } => raw.id(),
+            Self::Live { raw, .. } | Self::NewDirectory { raw, .. } | Self::Unrecorded(raw) => {
+                raw.id()
+            }
+            Self::Absent(id) => *id,
         }
     }
 }
 
 /// Applies complete, ordered mapping assignments while deriving bitmap changes from final ownership.
 /// # Errors
-/// Rejects unsupported object creation/terminal unlink, invalid allocation, layout, capacity or source-I/O failure.
+/// Rejects unsupported metadata/tracker combinations, invalid allocation, namespace, capacity or source I/O.
 pub(in crate::volume) fn resolve_delta_postconditions(
     volume: EpochReadView<'_, '_>,
     program: &DeltaProgram,
+    orphans: &ValidatedOrphanInventory,
 ) -> Result<ResolvedDeltaImages> {
     for record in program.records() {
-        if let ParsedDelta::Namespace { inode, .. } = record
+        if let ParsedDelta::Namespace { change, inode, .. } = record
+            && *change != NamespaceChange::Unlink
             && !program
                 .records()
                 .iter()
@@ -108,9 +114,31 @@ pub(in crate::volume) fn resolve_delta_postconditions(
             .cluster;
         mutation.reconcile_replay_cluster(cluster)?;
     }
+    let mut census = Vec::new();
+    for record in program.records() {
+        if let ParsedDelta::Namespace {
+            change: NamespaceChange::Unlink,
+            inode,
+            ..
+        } = record
+            && !census.contains(inode)
+        {
+            if orphans.contains(*inode) {
+                return Err(Error::UnsupportedJournal);
+            }
+            census.try_push(*inode)?;
+        }
+    }
     for inode in inodes {
         let (mut raw, tree) = match inode {
             ReplayInode::Live { raw, tree } => (raw, tree),
+            ReplayInode::Unrecorded(raw) => {
+                mutation
+                    .inode_updates
+                    .try_push(StagedInodeRecord::Live(raw))?;
+                continue;
+            }
+            ReplayInode::Absent(_) => continue,
             ReplayInode::NewDirectory { mut raw, parent } => {
                 let mut tree = MutableExtentTree::from_extents(Vec::new())?;
                 mutation.initialize_delta_directory(&mut raw, &mut tree, parent)?;
@@ -154,6 +182,7 @@ pub(in crate::volume) fn resolve_delta_postconditions(
         }
     }
     mutation.recount_replayed_directory_links(program)?;
+    mutation.reconcile_unrecorded_namespace(&census, orphans)?;
     let (_references, superblock) = mutation.committed_cluster_state()?;
     let images = mutation.recovery_images()?;
     Ok(ResolvedDeltaImages { superblock, images })
@@ -193,6 +222,19 @@ fn prepare_inode(
             parent,
             encoded.ok_or(Error::UnsupportedJournal)?,
         )?)?;
+    } else if program.records().iter().any(|record| matches!(
+        record, ParsedDelta::Namespace { change: NamespaceChange::Unlink, inode, .. } if *inode == id
+    )) && mutation.replay_inode_bit(id)? == BitmapBitState::Free {
+        mutation.volume.superblock.require_namespace_inode(id)?;
+        inodes.try_push(ReplayInode::Absent(id))?;
+    } else if encoded.is_none() && program.records().iter().any(|record| matches!(
+        record, ParsedDelta::Namespace { change: NamespaceChange::Unlink, inode, .. } if *inode == id
+    )) {
+        mutation.volume.superblock.require_namespace_inode(id)?;
+        if id == InodeId::ROOT {
+            return Err(Error::CannotRemoveRoot);
+        }
+        inodes.try_push(ReplayInode::Unrecorded(mutation.volume.read_live_inode_record(id)?))?;
     } else {
         let mut raw = mutation.volume.read_live_inode_record(id)?;
         if let Some(encoded) = encoded {
@@ -209,6 +251,7 @@ fn prepare_inode(
     let planned = inodes.last().ok_or(Error::InvalidInode)?;
     let range = program.records().iter().any(|record| matches!(record, ParsedDelta::AddRange { inode, .. } | ParsedDelta::RemoveRange { inode, .. } if *inode == id));
     if range
+        && !matches!(planned, ReplayInode::Absent(_))
         && !matches!(planned, ReplayInode::Live { raw, tree: Some(_) } if raw.parse()?.kind() != InodeKind::Directory)
     {
         return Err(Error::UnsupportedJournal);
@@ -387,6 +430,130 @@ impl MetadataMutation<'_, '_> {
             };
             Ok(ReplayInode::Live { raw, tree })
         }
+    }
+
+    /// Bitmap observation precedes any interpretation of a potentially retired table record.
+    /// # Errors
+    /// Returns malformed bitmap coordinates, metadata or source reads.
+    pub(super) fn replay_inode_bit(&mut self, id: InodeId) -> Result<BitmapBitState> {
+        let position = InodeBitmapPosition::from_inode(&self.volume.superblock, id)?;
+        let descriptor = BlockGroupDescriptor::read_from(
+            &mut self.volume.device,
+            &self.volume.superblock,
+            position.group(),
+        )?;
+        let index = self.ensure_inode_bitmap_update(position.group(), &descriptor)?;
+        inode_bitmap_bit_state(
+            &self
+                .inode_bitmap_updates
+                .get(index)
+                .ok_or(Error::InvalidInode)?
+                .bytes,
+            position,
+        )
+    }
+
+    /// Unlink operands can follow an earlier batch's inode image. Count final bindings before retirement.
+    /// The census is an observation of immutable staged namespace bytes; subsequent edits affect only
+    /// inode counts and allocation. Dot entries do not confer external namespace ownership.
+    /// # Errors
+    /// Rejects references to free targets, nonempty terminal directories, tracked targets, malformed
+    /// namespace, reference overflow, source reads or allocation failure before any storage effect.
+    fn reconcile_unrecorded_namespace(
+        &mut self,
+        targets: &[InodeId],
+        orphans: &ValidatedOrphanInventory,
+    ) -> Result<()> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        let mut references = memory::repeated_vec(0_u32, targets.len())?;
+        let superblock = self.volume.superblock;
+        for group in 0..superblock.block_group_count()?.as_u32() {
+            let group = BlockGroupId::from_u32(group);
+            let descriptor =
+                BlockGroupDescriptor::read_from(&mut self.volume.device, &superblock, group)?;
+            let bitmap = self.ensure_inode_bitmap_update(group, &descriptor)?;
+            for bit in 0..crate::volume::block_group::inode_count_in_group(&superblock, group)? {
+                let position = InodeBitmapPosition::new(group, bit);
+                let id = position.inode_id(&superblock)?;
+                if superblock.require_namespace_inode(id).is_err() || orphans.contains(id) {
+                    continue;
+                }
+                if inode_bitmap_bit_state(
+                    &self
+                        .inode_bitmap_updates
+                        .get(bitmap)
+                        .ok_or(Error::InvalidInode)?
+                        .bytes,
+                    position,
+                )? == BitmapBitState::Free
+                {
+                    continue;
+                }
+                let inode = if self.inode_updates.iter().any(|raw| raw.id() == id) {
+                    self.raw_inode_for_policy(id)?.parse()?
+                } else {
+                    let raw = self.volume.read_raw_inode_record(id)?;
+                    if raw.mode()? & 0xf000 != 0x4000 {
+                        continue;
+                    }
+                    raw.into_live()?.parse()?
+                };
+                if inode.kind() != InodeKind::Directory {
+                    continue;
+                }
+                let _complete = self.visit_directory_entries(&inode, |_, entries| {
+                    for entry in entries {
+                        if matches!(entry.name().bytes(), b"." | b"..") {
+                            continue;
+                        }
+                        if let Some(index) =
+                            targets.iter().position(|target| *target == entry.inode())
+                        {
+                            let count = references.get_mut(index).ok_or(Error::InvalidInode)?;
+                            *count = count.checked_add(1).ok_or(Error::InvalidInode)?;
+                        }
+                    }
+                    Ok(core::ops::ControlFlow::Continue(()))
+                })?;
+            }
+        }
+        for (id, references) in targets.iter().zip(references) {
+            if self.replay_inode_bit(*id)? == BitmapBitState::Free {
+                if references != 0 {
+                    return Err(Error::InvalidDirectoryEntry);
+                }
+                continue;
+            }
+            let mut raw = self.raw_inode_for_policy(*id)?;
+            let index = self.ensure_inode_update(*id)?;
+            let inode = raw.parse()?;
+            if references != 0 {
+                if inode.kind() == InodeKind::Directory {
+                    if references != 1 {
+                        return Err(Error::InvalidDirectoryEntry);
+                    }
+                } else {
+                    raw.replace_file_links(Ext4LinkCount::new(
+                        u16::try_from(references).map_err(|_| Error::InvalidInode)?,
+                    )?)?;
+                    self.replace_live_inode(index, raw)?;
+                }
+            } else {
+                if inode.kind() == InodeKind::Directory && !self.directory_is_empty(&inode)? {
+                    return Err(Error::DirectoryNotEmpty);
+                }
+                self.release_inode_data(&inode)?;
+                self.reclaim_inode(raw.raw())?;
+                let deleted = raw.retire_replayed(superblock.block_size())?;
+                *self
+                    .inode_updates
+                    .get_mut(index.get())
+                    .ok_or(Error::InvalidInode)? = StagedInodeRecord::Deleted(deleted);
+            }
+        }
+        Ok(())
     }
 
     /// Reference changes visit mapped allocation units only; sparse logical holes consume no work.
