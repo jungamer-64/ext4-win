@@ -225,14 +225,6 @@ pub enum AccessMode {
     /// Private recovery with no lower write or flush.
     ReadOnly,
 }
-/// Background free-space discard admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AutomaticTrim {
-    /// Discard is scheduled only by an explicit request.
-    Disabled,
-    /// The mounted owner schedules bounded batches every sixty seconds.
-    EveryMinute,
-}
 /// Allocation-free validated policy value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MountPolicy {
@@ -240,15 +232,12 @@ pub struct MountPolicy {
     pub access: AccessMode,
     /// Logical private-recovery budget independent of physical allocation failure.
     pub recovery_memory: RecoveryMemoryLimit,
-    /// Background discard selection.
-    pub automatic_trim: AutomaticTrim,
 }
 impl MountPolicy {
-    /// Writable defaults with bounded recovery and automatic discard disabled.
+    /// Writable defaults with bounded recovery.
     pub const DEFAULT: Self = Self {
         access: AccessMode::ReadWrite,
         recovery_memory: RecoveryMemoryLimit::DEFAULT,
-        automatic_trim: AutomaticTrim::Disabled,
     };
     /// Fixes core media authority at the mount selection boundary.
     pub const fn mount_access(self) -> MountAccess {

@@ -1026,5 +1026,3 @@ mod tests {
     }
 }
 
-mod automatic_trim;
-pub(crate) use automatic_trim::{AutomaticTrimDeadline, AutomaticTrimRun};
