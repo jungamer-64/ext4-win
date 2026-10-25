@@ -2,7 +2,7 @@
 use std::process::ExitCode;
 
 /// User-visible grammar; replacements contain the entire desired table.
-const USAGE: &str = "ext4ctl volumes\next4ctl features <volume-path>\next4ctl trim <volume-path>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>] [--auto-trim on|off]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
+const USAGE: &str = "ext4ctl volumes\next4ctl features <volume-path>\next4ctl trim <volume-path|ext4-uuid>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
 /// Fully parsed action before any replacement can be submitted.
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
@@ -35,8 +35,6 @@ enum Command {
         access: Option<ext4_control::AccessMode>,
         /// Explicit logical recovery-memory budget.
         recovery_memory: Option<ext4_core::RecoveryMemoryLimit>,
-        /// Explicit background discard selection.
-        automatic_trim: Option<ext4_control::AutomaticTrim>,
     },
     /// Full replacement, including empty tables for clear.
     Replace {
@@ -82,7 +80,6 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
                 "set" => {
                     let mut access = None;
                     let mut recovery_memory = None;
-                    let mut automatic_trim = None;
                     while let Some(option) = args.next() {
                         let value = args
                             .next()
@@ -104,30 +101,18 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
                                         .map_err(|error| error.to_string())?,
                                 );
                             }
-                            "--auto-trim" if automatic_trim.is_none() => {
-                                automatic_trim = Some(match value.as_str() {
-                                    "on" => ext4_control::AutomaticTrim::EveryMinute,
-                                    "off" => ext4_control::AutomaticTrim::Disabled,
-                                    _ => {
-                                        return Err(format!(
-                                            "invalid automatic trim selection: {value}"
-                                        ));
-                                    }
-                                })
-                            }
                             _ => {
                                 return Err(format!("unknown or repeated policy option: {option}"));
                             }
                         }
                     }
-                    if access.is_none() && recovery_memory.is_none() && automatic_trim.is_none() {
+                    if access.is_none() && recovery_memory.is_none() {
                         return Err("policy set requires at least one option".to_owned());
                     }
                     Command::PolicySet {
                         target,
                         access,
                         recovery_memory,
-                        automatic_trim,
                     }
                 }
                 _ => return Err(USAGE.to_owned()),
@@ -317,14 +302,13 @@ fn show(state: &ext4_security::MappingState) {
 #[cfg(windows)]
 fn show_policy(state: &ext4_control::PolicyState) {
     println!(
-        "UUID {}\nsaved generation {}\noutcome {:?}\nstatus {:#010x}\naccess {:?}\nrecovery memory {} bytes\nautomatic trim {:?}\napplies to subsequent mounts",
+        "UUID {}\nsaved generation {}\noutcome {:?}\nstatus {:#010x}\naccess {:?}\nrecovery memory {} bytes\napplies to subsequent mounts",
         uuid_text(state.selected.uuid),
         state.selected.generation,
         state.outcome,
         state.status,
         state.selected.policy.access,
-        state.selected.policy.recovery_memory.bytes(),
-        state.selected.policy.automatic_trim
+        state.selected.policy.recovery_memory.bytes()
     );
 }
 /// Retains an authoritative policy reply even when native handle release failed.
@@ -402,7 +386,6 @@ fn execute(command: Command) -> Result<(), String> {
             target,
             access,
             recovery_memory,
-            automatic_trim,
         } => {
             let uuid = target_uuid(&target)?;
             let observed = policy_reply(windows_host::query_policy(uuid))?;
@@ -418,9 +401,6 @@ fn execute(command: Command) -> Result<(), String> {
             }
             if let Some(recovery_memory) = recovery_memory {
                 policy.recovery_memory = recovery_memory;
-            }
-            if let Some(automatic_trim) = automatic_trim {
-                policy.automatic_trim = automatic_trim;
             }
             let replacement =
                 ext4_control::PolicyReplacement::new(observed.selected.generation, uuid, policy)
@@ -562,7 +542,6 @@ mod tests {
                 target: "X:".to_owned(),
                 access: Some(ext4_control::AccessMode::ReadOnly),
                 recovery_memory: None,
-                automatic_trim: None
             })
         );
         for args in [
@@ -584,7 +563,6 @@ mod tests {
                 "--access",
                 "read-write",
             ],
-            vec!["policy", "set", "X:", "--auto-trim", "yes"],
             vec!["policy", "show", "X:", "--access", "read-write"],
         ] {
             assert!(parse(args.into_iter().map(str::to_owned)).is_err());

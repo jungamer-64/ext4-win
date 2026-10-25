@@ -275,10 +275,6 @@ impl PolicySnapshot {
             AccessMode::ReadWrite => 0,
             AccessMode::ReadOnly => 1,
         };
-        let trim: u32 = match self.policy.automatic_trim {
-            AutomaticTrim::Disabled => 0,
-            AutomaticTrim::EveryMinute => 1,
-        };
         let budget = u64::try_from(self.policy.recovery_memory.bytes()).unwrap_or(u64::MAX);
         let fields = b"E4MP\x01\0\0\0"
             .iter()
@@ -286,7 +282,7 @@ impl PolicySnapshot {
             .chain(self.uuid.bytes())
             .chain(self.generation.to_le_bytes())
             .chain(access.to_le_bytes())
-            .chain(trim.to_le_bytes())
+            .chain([0; 4])
             .chain(budget.to_le_bytes());
         for (target, value) in bytes.iter_mut().zip(fields) {
             *target = value;
@@ -305,14 +301,12 @@ impl PolicySnapshot {
         {
             return Err(Error::MalformedEncoding);
         }
+        if field::<4>(bytes, 36)? != [0; 4] {
+            return Err(Error::MalformedEncoding);
+        }
         let access = match u32::from_le_bytes(field(bytes, 32)?) {
             0 => AccessMode::ReadWrite,
             1 => AccessMode::ReadOnly,
-            _ => return Err(Error::MalformedEncoding),
-        };
-        let automatic_trim = match u32::from_le_bytes(field(bytes, 36)?) {
-            0 => AutomaticTrim::Disabled,
-            1 => AutomaticTrim::EveryMinute,
             _ => return Err(Error::MalformedEncoding),
         };
         let budget = usize::try_from(u64::from_le_bytes(field(bytes, 40)?))
@@ -325,7 +319,6 @@ impl PolicySnapshot {
             policy: MountPolicy {
                 access,
                 recovery_memory,
-                automatic_trim,
             },
         })
     }
@@ -583,14 +576,16 @@ mod tests {
         for length in 0..POLICY_RECORD_BYTES {
             assert!(PolicySnapshot::decode(bytes.get(..length).unwrap_or_default()).is_err());
         }
-        let mut reserved = bytes;
-        if let Some(value) = reserved.get_mut(48) {
-            *value = 1;
+        for offset in [36, 48] {
+            let mut reserved = bytes;
+            if let Some(value) = reserved.get_mut(offset) {
+                *value = 1;
+            }
+            assert_eq!(
+                PolicySnapshot::decode(&reserved),
+                Err(Error::MalformedEncoding)
+            );
         }
-        assert_eq!(
-            PolicySnapshot::decode(&reserved),
-            Err(Error::MalformedEncoding)
-        );
         assert_eq!(
             PolicyReplacement::decode(&bytes),
             Err(Error::InvalidGeneration)

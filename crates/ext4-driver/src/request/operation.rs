@@ -89,8 +89,6 @@ mod close;
 mod keys;
 mod mmp;
 mod trim;
-#[cfg(not(test))]
-pub(crate) use trim::automatic_trim;
 pub(crate) use trim::trim;
 
 mod volume_close;
@@ -159,7 +157,7 @@ enum MountRequestState {
         /// Concrete lower storage geometry used by core requests.
         devices: MountedStorage,
         /// Suspended consuming core mount operation.
-        mount: MountRecovery,
+        mount: Box<MountOperation>,
     },
     /// One shared candidate awaits its device-length completion.
     DiscoveringCandidateLength {
@@ -184,7 +182,7 @@ enum MountRequestState {
         /// Primary storage owner.
         devices: MountedStorage,
         /// Core operation awaiting the external journal.
-        mount: MountRecovery,
+        mount: Box<MountOperation>,
         /// Required journal identity and format.
         requirement: ExternalJournalRequirement,
     },
@@ -197,7 +195,7 @@ enum MountRequestState {
         /// Primary storage owner, not yet carrying the external lease.
         devices: MountedStorage,
         /// Core mount suspended in `AwaitingExternal`.
-        mount: MountRecovery,
+        mount: Box<MountOperation>,
         /// Exact filesystem-derived validation requirement.
         requirement: ExternalJournalRequirement,
         /// Exclusive handle and referenced file object.
@@ -214,15 +212,6 @@ enum MountRequestState {
     Terminal,
 }
 
-/// The core recovery continuation and host policy share the same selected mount lifetime.
-#[derive(Debug)]
-struct MountRecovery {
-    /// Consuming core operation retains fixed filesystem media authority.
-    operation: Box<MountOperation>,
-    /// Host scheduling policy selected with that authority, before recovery effects.
-    automatic_trim: ext4_control::AutomaticTrim,
-}
-
 /// Shared ownership carried while all distinct volume candidates are probed.
 #[derive(Debug)]
 struct ExternalMountContext {
@@ -233,7 +222,7 @@ struct ExternalMountContext {
     /// Primary storage lifetime owner.
     devices: MountedStorage,
     /// Core mount suspended at external-journal discovery.
-    mount: MountRecovery,
+    mount: Box<MountOperation>,
     /// Exact filesystem-derived UUID/profile/user requirement.
     requirement: ExternalJournalRequirement,
     /// Deduplicated shared-open candidate set.
@@ -252,7 +241,7 @@ struct ExclusiveExternalProbeContext {
     /// Primary storage lifetime owner, not yet carrying the external lease.
     devices: MountedStorage,
     /// Core mount suspended at external-journal discovery.
-    mount: MountRecovery,
+    mount: Box<MountOperation>,
     /// Lower route with an already validated device length.
     external: LowerStorageDevice,
     /// Unique share-zero handle and referenced FILE_OBJECT.
@@ -351,14 +340,7 @@ impl MountRequestOperation {
                     Err(error) => return Self::complete(owned, Err(error)),
                 };
                 let transition = mount.advance(OperationEvent::Admitted, now);
-                self.drive_mount(
-                    owned,
-                    admission,
-                    devices,
-                    transition,
-                    policy.policy.automatic_trim,
-                    catalog,
-                )
+                self.drive_mount(owned, admission, devices, transition, catalog)
             }
         }
     }
@@ -370,7 +352,6 @@ impl MountRequestOperation {
         admission: MountAdmission,
         devices: MountedStorage,
         transition: MountTransition,
-        automatic_trim: ext4_control::AutomaticTrim,
         catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> OperationTransition {
         match transition {
@@ -379,10 +360,7 @@ impl MountRequestOperation {
                     owned,
                     admission,
                     devices,
-                    mount: MountRecovery {
-                        operation: suspended,
-                        automatic_trim,
-                    },
+                    mount: suspended,
                 };
                 OperationTransition::WaitForTimer {
                     seconds,
@@ -395,10 +373,7 @@ impl MountRequestOperation {
                     owned,
                     admission,
                     devices,
-                    mount: MountRecovery {
-                        operation: suspended,
-                        automatic_trim,
-                    },
+                    mount: suspended,
                 };
                 OperationTransition::SubmitOwnershipLower {
                     devices: route,
@@ -412,10 +387,7 @@ impl MountRequestOperation {
                     owned,
                     admission,
                     devices,
-                    mount: MountRecovery {
-                        operation: suspended,
-                        automatic_trim,
-                    },
+                    mount: suspended,
                 };
                 OperationTransition::SubmitLower {
                     devices: route,
@@ -436,10 +408,7 @@ impl MountRequestOperation {
                     owned,
                     admission,
                     devices,
-                    mount: MountRecovery {
-                        operation: suspended,
-                        automatic_trim,
-                    },
+                    mount: suspended,
                     requirement,
                     candidates,
                     candidate_index: 0,
@@ -448,14 +417,7 @@ impl MountRequestOperation {
             }
             MountTransition::Complete(Ok(completed)) => Self::complete(
                 owned,
-                Self::publish_mount(
-                    admission,
-                    devices,
-                    completed,
-                    self.trace,
-                    automatic_trim,
-                    catalog,
-                ),
+                Self::publish_mount(admission, devices, completed, self.trace, catalog),
             ),
             MountTransition::Complete(Err(Error::InvalidMagic | Error::InvalidSuperblock)) => {
                 Self::complete(owned, Err(DriverError::UnrecognizedVolume))
@@ -588,16 +550,12 @@ impl MountRequestOperation {
                     Ok(now) => now,
                     Err(error) => return Self::complete(context.owned, Err(error)),
                 };
-                let transition = context
-                    .mount
-                    .operation
-                    .attach_external_journal(validated, now);
+                let transition = context.mount.attach_external_journal(validated, now);
                 self.drive_mount(
                     context.owned,
                     context.admission,
                     devices,
                     transition,
-                    context.mount.automatic_trim,
                     catalog,
                 )
             }
@@ -627,7 +585,6 @@ impl MountRequestOperation {
         devices: MountedStorage,
         completed: Box<ext4_core::CompletedMount>,
         trace: OperationalTrace,
-        automatic_trim: ext4_control::AutomaticTrim,
         catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> DriverResult<IrpCompletion> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
@@ -638,7 +595,6 @@ impl MountRequestOperation {
             *completed,
             devices,
             trace,
-            automatic_trim,
             catalog.identities,
         )?;
 
@@ -756,15 +712,8 @@ impl ControlDeviceOperation for MountRequestOperation {
                     Ok(now) => now,
                     Err(error) => return Self::complete(owned, Err(error)),
                 };
-                let transition = mount.operation.advance(event, now);
-                self.drive_mount(
-                    owned,
-                    admission,
-                    devices,
-                    transition,
-                    mount.automatic_trim,
-                    catalog,
-                )
+                let transition = mount.advance(event, now);
+                self.drive_mount(owned, admission, devices, transition, catalog)
             }
             MountRequestState::DiscoveringCandidateLength { context } => match event {
                 OperationEvent::DeviceLengthCompleted(Ok(length)) => {
@@ -930,7 +879,7 @@ impl CompletionOperation for MountRequestOperation {
             MountRequestState::ProbingExclusiveJournal { context, .. } => &context.mount,
             _ => return None,
         };
-        mount.operation.submission_deadline()
+        mount.submission_deadline()
     }
 
     fn record_storage_failure(&mut self, failure: StorageFailureClass, target: &mut ReactorTarget) {

@@ -43,6 +43,11 @@ pub(crate) fn verify_portable(repository_root: &Path) -> TaskResult<()> {
         ),
         "host boundary rustdoc gate",
     )?;
+    #[cfg(windows)]
+    run_checked(
+        trim_schedule_command(repository_root),
+        "native Windows TRIM task definition contract",
+    )?;
     println!("portable development gates: PASS");
     Ok(())
 }
@@ -54,6 +59,12 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
     #[cfg(windows)]
     {
         windows_host::require_administrator()?;
+        let mut trim_schedule = trim_schedule_command(root);
+        trim_schedule.arg("-Registration");
+        run_checked(
+            trim_schedule,
+            "native Windows TRIM task registration and cleanup",
+        )?;
         run_checked(
             cargo_command(
                 root,
@@ -130,6 +141,16 @@ pub(crate) fn verify_windows_host(root: &Path) -> TaskResult<()> {
         )
         .into())
     }
+}
+
+/// Invokes the current Task Scheduler contract harness without loading a filesystem driver.
+#[cfg(windows)]
+fn trim_schedule_command(root: &Path) -> Command {
+    let mut command = Command::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-NonInteractive", "-File"])
+        .arg(root.join("tools/ext4ctl/trim-schedule.tests.ps1"));
+    command
 }
 
 /// Checks, tests, lints, and documents the Windows kernel driver crate.

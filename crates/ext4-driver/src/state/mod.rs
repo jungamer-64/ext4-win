@@ -96,8 +96,8 @@ use volume::MountedVolumeRef;
 use volume::MountedVolumeState;
 pub(crate) use volume::*;
 pub(crate) use volume_runtime::{
-    AutomaticTrimDeadline, AutomaticTrimRun, EpochLease, EpochPublicationSlot,
-    EpochPublicationSlots, MutationActivityLease, PendingCheckpoint, VolumeRuntime,
+    EpochLease, EpochPublicationSlot, EpochPublicationSlots, MutationActivityLease,
+    PendingCheckpoint, VolumeRuntime,
 };
 
 #[cfg(test)]

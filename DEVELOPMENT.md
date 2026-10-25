@@ -155,7 +155,7 @@ authority; saving policy does not remount a volume or switch it between read-onl
 ```console
 cargo run -p ext4ctl -- policy show <volume-path-or-ext4-uuid>
 cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-only --recovery-memory 67108864
-cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-write --auto-trim off
+cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-write
 ```
 
 Unspecified fields retain their observed values. Recovery memory is a nonzero logical byte budget;
@@ -200,7 +200,7 @@ admission. Read-only recovery reports the committed virtual metadata view.
 ## Free-space discard
 
 ```console
-cargo run -p ext4ctl -- trim <volume-path>
+cargo run -p ext4ctl -- trim <volume-path-or-ext4-uuid>
 ```
 
 The mounted volume must be writable. The host enables SeManageVolumePrivilege on a private,
@@ -213,12 +213,35 @@ Cancellation, unsupported discard and lower errors stop the scan without resubmi
 reply can follow a physical effect, so the CLI does not retry. Device acknowledgment does not
 guarantee that discarded space reads as zero.
 
-The saved `--auto-trim on` policy selects periodic scans for subsequent writable mounts. The first
-cycle starts after sixty seconds, and each successful cycle schedules the next after completion.
-Automatic and manual scans share discard admission and physical completion ownership. Background
-work uses available ordinary execution capacity; it cannot consume the independent media-ownership
-lane. A failed, cancelled or uncertain cycle stops automatic discard for that mount. Shutdown
-revokes future cycles and joins any running physical command before retiring its exclusions.
+Periodic TRIM belongs to Windows Task Scheduler. The driver accepts individual scans and owns
+their physical completion; mounted-session policy contains no scheduling state. UUID targets are
+resolved on each invocation and checked on the writable handle before submission. An unmounted
+UUID or multiple mounted copies of that UUID cause a failure before discard.
+
+Build `ext4ctl` with `cargo build --release --package ext4ctl` and install the executable in a
+stable directory writable only by administrators and SYSTEM. From an elevated PowerShell session,
+use the [task registration script](tools/ext4ctl/trim-schedule.ps1) with the UUID reported by
+`ext4ctl volumes`:
+
+```powershell
+.\tools\ext4ctl\trim-schedule.ps1 -Action Register -FilesystemUuid <ext4-uuid> -Executable <installed-ext4ctl.exe>
+.\tools\ext4ctl\trim-schedule.ps1 -Action Show -FilesystemUuid <ext4-uuid>
+.\tools\ext4ctl\trim-schedule.ps1 -Action Remove -FilesystemUuid <ext4-uuid>
+```
+
+Registration creates `ext4win-TRIM-<ext4-uuid>` without replacing an existing task or starting it.
+The default is Sunday at 03:00 local time; `-Day` and `-At HH:mm` select another weekly trigger.
+`-Action Export` with the same arguments returns the native task XML without registration.
+Subsequent cadence changes and execution history belong to Task Scheduler. The action runs one
+`ext4ctl trim <ext4-uuid>` as SYSTEM, starts a missed invocation when available, and ignores a
+new trigger while an instance runs. It does not restart on failure or impose an execution time
+limit. Each future invocation starts a fresh metadata scan; it never resumes an uncertain batch.
+Removing a task prevents future starts and lets an existing scan finish. A completed `ext4ctl`
+invocation returns a nonzero process exit code on failure; Task Scheduler also reports its own
+running and not-yet-run states. Run the one-shot command to inspect current progress rather than
+automatically retrying an unacknowledged operation. The `verify-portable` gate checks native task
+definitions on Windows; `verify-windows-host` also registers, observes and removes a temporary
+task with a future trigger and an inert action that cannot submit discard.
 
 ## Ext4 durability and interoperability
 
