@@ -1206,3 +1206,150 @@ fn terminal_replay_releases_attributes_and_preserves_another_value_owner() -> Re
     }
     Ok(())
 }
+
+/// # Errors
+/// Propagates a sparse range assignment followed by a terminal unlink without an inode operand.
+/// # Panics
+/// Fails if superseded mappings survive retirement or unused ADD storage stays allocated.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe final ownership after ordered range and namespace operands"
+)]
+fn terminal_unlink_consumes_range_assignments_without_a_final_inode_image() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = NodeId::File(fixture.a);
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let unlink = namespace_operand(DirectoryNodeId::ROOT, file, b"concurrent-a");
+    let mut add = [0; 16];
+    put(&mut add, 0, &file.file_index().to_le_bytes())?;
+    put(&mut add, 8, &1_u16.to_le_bytes())?;
+    put(&mut add, 12, &1000_u32.to_le_bytes())?;
+    let mut del = [0; 12];
+    put(&mut del, 0, &file.file_index().to_le_bytes())?;
+    put(&mut del, 4, &1_u32.to_le_bytes())?;
+    put(&mut del, 8, &u32::MAX.to_le_bytes())?;
+    for _ in 0..2 {
+        install_delta(&mut fixture, &[(1, &add), (2, &del), (5, &unlink)])?;
+        fixture.remount()?;
+        assert!(!inode_allocated(&fixture.disk, file.file_index())?);
+        assert!(!allocated(&fixture.disk, 1000)?);
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1036)?,
+            free_blocks.checked_add(1).ok_or(Error::InvalidSuperblock)?
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_add(1).ok_or(Error::InvalidSuperblock)?
+        );
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates terminal deletion, injected home-write interruption and production remount recovery.
+/// # Panics
+/// Fails if a partially checkpointed deletion loses the full transaction's retirement postcondition.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe roll-forward of namespace, inode and allocation together"
+)]
+fn interrupted_terminal_checkpoint_recovers_one_complete_retirement() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = NodeId::File(fixture.a);
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let unlink = namespace_operand(DirectoryNodeId::ROOT, file, b"concurrent-a");
+    install_delta(&mut fixture, &[(5, &unlink)])?;
+    let mut homes = 0_usize;
+    let outcome = fixture
+        .disk
+        .mount_observing(MountAccess::ReadWrite, |_, boundary, _| {
+            if matches!(
+                boundary,
+                MountBoundary::Lower(StorageRequest::Write {
+                    target: StorageTarget::Filesystem,
+                    ..
+                })
+            ) {
+                homes = homes.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                if homes == 2 {
+                    return Err(Error::DeviceIo);
+                }
+            }
+            Ok(())
+        });
+    assert_eq!(outcome.map(|_| ()), Err(Error::DeviceIo));
+    assert_eq!(homes, 2);
+    fixture.remount()?;
+    assert!(!inode_allocated(&fixture.disk, file.file_index())?);
+    assert!(matches!(
+        fixture.read(
+            |pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?)
+        )?,
+        ChildLookup::NotFound
+    ));
+    assert_eq!(
+        fixture_u32(&fixture.disk.filesystem, 1040)?,
+        free_inodes.checked_add(1).ok_or(Error::InvalidSuperblock)?
+    );
+    let replacement = namespace_operand(DirectoryNodeId::ROOT, file, b"concurrent-b");
+    install_delta(&mut fixture, &[(5, &replacement)])?;
+    fixture.remount()?;
+    let retained = fixture.b;
+    assert!(
+        matches!(fixture.read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-b")?))?, ChildLookup::Found(entry) if *entry.node() == NodeId::File(retained))
+    );
+    assert_eq!(
+        fixture_u32(&fixture.disk.filesystem, 1040)?,
+        free_inodes.checked_add(1).ok_or(Error::InvalidSuperblock)?
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Propagates delta installation and production read-only recovery.
+/// # Panics
+/// Fails if virtual terminal reclamation touches backing storage or leaves the deleted binding visible.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare the recovered namespace with unchanged backing images"
+)]
+fn read_only_terminal_replay_has_zero_backing_effects() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let unlink = namespace_operand(
+        DirectoryNodeId::ROOT,
+        NodeId::File(fixture.a),
+        b"concurrent-a",
+    );
+    install_delta(&mut fixture, &[(5, &unlink)])?;
+    let filesystem = fixture.disk.filesystem.clone();
+    let journal = fixture.disk.journal.clone();
+    fixture.disk.storage_effects = 0;
+    let (profile, epoch, coordinator, _) = fixture
+        .disk
+        .mount(MountAccess::ReadOnly {
+            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+        })?
+        .into_parts();
+    fixture.profile = profile;
+    fixture.cache = MetadataCache::try_new(&epoch)?;
+    fixture.epoch = epoch;
+    fixture.coordinator = coordinator;
+    assert!(matches!(
+        fixture.read(
+            |pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?)
+        )?,
+        ChildLookup::NotFound
+    ));
+    let retained = fixture.b;
+    let mut bytes = [0; 1];
+    fixture.read(|pass| pass.read_file(retained, FileOffset::ZERO, &mut bytes))?;
+    assert_eq!(&bytes, b"b");
+    assert_eq!(fixture.disk.storage_effects, 0);
+    assert_eq!(fixture.disk.filesystem, filesystem);
+    assert_eq!(fixture.disk.journal, journal);
+    Ok(())
+}

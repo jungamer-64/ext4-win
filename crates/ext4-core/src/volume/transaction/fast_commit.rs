@@ -172,7 +172,7 @@ pub(in crate::volume) fn resolve_delta_postconditions(
         }
     }
     mutation.recount_replayed_directory_links(program)?;
-    mutation.reconcile_unrecorded_namespace(&census, orphans)?;
+    mutation.reconcile_unlinked_inodes(&census, orphans)?;
     let (_references, superblock) = mutation.committed_cluster_state()?;
     let images = mutation.recovery_images()?;
     Ok(ResolvedDeltaImages { superblock, images })
@@ -189,6 +189,14 @@ fn prepare_inode(
 ) -> Result<()> {
     if inodes.iter().any(|inode| inode.id() == id) {
         return Ok(());
+    }
+    if program.records().iter().any(|record| matches!(
+        record, ParsedDelta::Namespace { change: NamespaceChange::Unlink, inode, .. } if *inode == id
+    )) {
+        mutation.volume.superblock.require_namespace_inode(id)?;
+        if id == InodeId::ROOT {
+            return Err(Error::CannotRemoveRoot);
+        }
     }
     let encoded = program
         .records()
@@ -217,14 +225,6 @@ fn prepare_inode(
     )) && mutation.replay_inode_bit(id)? == BitmapBitState::Free {
         mutation.volume.superblock.require_namespace_inode(id)?;
         inodes.try_push(ReplayInode::Absent(id))?;
-    } else if encoded.is_none() && program.records().iter().any(|record| matches!(
-        record, ParsedDelta::Namespace { change: NamespaceChange::Unlink, inode, .. } if *inode == id
-    )) {
-        mutation.volume.superblock.require_namespace_inode(id)?;
-        if id == InodeId::ROOT {
-            return Err(Error::CannotRemoveRoot);
-        }
-        inodes.try_push(ReplayInode::Unrecorded(mutation.volume.read_live_inode_record(id)?))?;
     } else {
         let mut raw = mutation.volume.read_live_inode_record(id)?;
         if let Some(encoded) = encoded {
@@ -452,7 +452,7 @@ impl MetadataMutation<'_, '_> {
     /// # Errors
     /// Rejects references to free targets, nonempty terminal directories, tracked targets, malformed
     /// namespace, reference overflow, source reads or allocation failure before any storage effect.
-    fn reconcile_unrecorded_namespace(
+    fn reconcile_unlinked_inodes(
         &mut self,
         targets: &[InodeId],
         orphans: &ValidatedOrphanInventory,
