@@ -546,6 +546,8 @@ const FILE_FS_SECTOR_SIZE_INFORMATION_CLASS: wdk_sys::FS_INFORMATION_CLASS = 11;
 /// Decoded query-file information class.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum QueryFileInformationClass {
+    /// Enumerates the unnamed data stream without advertising named-stream support.
+    Stream,
     /// Windows `FileBasicInformation`.
     Basic,
     /// Windows `FileAllInformation`.
@@ -579,6 +581,7 @@ impl QueryFileInformationClass {
     /// Returns an error when the file information class is not implemented for fixed file queries.
     pub(super) fn from_raw(value: wdk_sys::FILE_INFORMATION_CLASS) -> Result<Self, DriverError> {
         match value {
+            wdk_sys::_FILE_INFORMATION_CLASS::FileStreamInformation => Ok(Self::Stream),
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => Ok(Self::Basic),
             wdk_sys::_FILE_INFORMATION_CLASS::FileAllInformation => Ok(Self::All),
             wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation => Ok(Self::Standard),

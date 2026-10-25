@@ -140,6 +140,7 @@ pub(super) fn query_file_information(
                 return Ok(QueryFilePlan::HardLinks { length, target });
             }
             QueryFileInformationClass::Basic
+            | QueryFileInformationClass::Stream
             | QueryFileInformationClass::Ea
             | QueryFileInformationClass::Standard
             | QueryFileInformationClass::StandardLink
@@ -229,6 +230,9 @@ pub(super) fn query_file_information(
     request.with_active(|active| {
         let buffer = active.buffered_output(length)?;
         match information_class {
+            QueryFileInformationClass::Stream => {
+                pack_stream_information(buffer, metadata.kind, stream_sizes)
+            }
             QueryFileInformationClass::Basic => pack_basic_information(buffer, metadata),
             QueryFileInformationClass::Standard => {
                 pack_standard_information(buffer, metadata, deletion, stream_sizes)
@@ -251,6 +255,36 @@ pub(super) fn query_file_information(
             | QueryFileInformationClass::HardLink => Err(DriverError::InternalInvariantViolation),
         }
     })
+}
+
+/// Enumerates the unnamed data stream. Directories have no data streams; ext4 xattrs are EAs,
+/// not alternate streams. Sizes come from the same committed stream authority as standard info.
+/// # Errors
+/// Returns buffer-too-small without publishing an incomplete stream record.
+fn pack_stream_information(
+    output: &mut [u8],
+    kind: FileMetadataKind,
+    sizes: crate::kernel::stream::StreamSizes,
+) -> DriverResult<IrpCompletion> {
+    if output.len() < size_of::<wdk_sys::FILE_STREAM_INFORMATION>() {
+        return Err(DriverError::BufferTooSmall);
+    }
+    if kind == FileMetadataKind::Directory {
+        return Ok(IrpCompletion::EMPTY);
+    }
+    const NAME: [u16; 7] = [58, 58, 36, 68, 65, 84, 65];
+    let name_offset = core::mem::offset_of!(wdk_sys::FILE_STREAM_INFORMATION, StreamName);
+    let length = name_offset + NAME.len() * size_of::<u16>();
+    let bytes = output
+        .get_mut(..length)
+        .ok_or(DriverError::BufferTooSmall)?;
+    bytes.fill(0);
+    let mut writer = LittleEndianOutput::new(bytes);
+    writer.write_u32(WireOffset::new(4), 14)?;
+    writer.write_i64(WireOffset::new(8), sizes.file_size())?;
+    writer.write_i64(WireOffset::new(16), sizes.allocation_charge())?;
+    write_utf16(bytes, name_offset, &NAME)?;
+    IrpCompletion::from_usize(length)
 }
 
 /// Packs the persisted Windows EA byte charge.
