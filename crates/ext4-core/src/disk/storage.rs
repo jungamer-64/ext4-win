@@ -189,6 +189,14 @@ impl StorageCompletion {
         self.transfer.target()
     }
 
+    /// Applies immutable prospective bytes only to an exact successful read completion.
+    /// # Errors
+    /// Returns overlay coordinate or copy failure; writes, flushes and failed reads retain their outcome.
+    pub(crate) fn apply_overlay(mut self, overlay: &dyn StorageReadOverlay) -> Result<Self> {
+        if self.result.is_ok() && let CompletedStorageTransfer::Read { target, offset, buffer } = &mut self.transfer && self.information == buffer.len() { overlay.apply(*target, *offset, buffer)?; }
+        Ok(self)
+    }
+
     /// Consumes the completion into its owned parts.
     pub fn into_parts(self) -> (CompletedStorageTransfer, usize, Result<()>) {
         (self.transfer, self.information, self.result)
