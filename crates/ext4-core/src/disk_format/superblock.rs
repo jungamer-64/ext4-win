@@ -981,23 +981,11 @@ pub(crate) struct OrphanFile {
     pub(crate) present: bool,
 }
 
-/// Validated result of reading the primary superblock at the mount boundary.
-///
-/// A write-session update changes RECOVER and ORPHAN_PRESENT in the first sector and `s_checksum` in
-/// the second. If power is lost after only the first sector reaches stable storage, the retained
-/// checksum identifies the previous valid marker image exactly. Only that constrained tear is
-/// repairable; every other checksum mismatch remains corruption.
+/// Primary checksum admission; only authenticated journal payloads can repair damaged metadata.
 #[derive(Debug)]
 pub(crate) enum PrimarySuperblockRead {
     /// The on-disk image is already fully valid.
     Valid(Superblock),
-    /// The first sector contains the next write-session state while the checksum still authenticates
-    /// the previous state. Mount restores this image before journal recovery; validated geometry
-    /// may first locate and validate the journal without changing either device.
-    TornWriteSession {
-        /// Complete primary-superblock image already validated as the previous marker state.
-        repair: Vec<u8>,
-    },
     /// Every structural field needed to locate and validate JBD2 is supported, but the primary
     /// checksum is invalid. A committed journal payload must repair the primary block before this
     /// provisional value may become mounted state.
@@ -1705,91 +1693,15 @@ impl Superblock {
         device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
         match Self::parse_read_write(&raw) {
             Ok(superblock) => Ok(PrimarySuperblockRead::Valid(superblock)),
-            Err(Error::ChecksumMismatch) => match Self::restore_torn_write_session(raw) {
-                Ok(restored) => Ok(restored),
-                Err(Error::ChecksumMismatch) => Self::parse_with_policy(
-                    &raw,
-                    FeatureSet::read_write,
-                    SuperblockChecksumValidation::DeferredToJournalReplay,
-                )
-                .map(ChecksumInvalidSuperblock)
-                .map(PrimarySuperblockRead::ChecksumInvalid),
-                Err(error) => Err(error),
-            },
+            Err(Error::ChecksumMismatch) => Self::parse_with_policy(
+                &raw,
+                FeatureSet::read_write,
+                SuperblockChecksumValidation::DeferredToJournalReplay,
+            )
+            .map(ChecksumInvalidSuperblock)
+            .map(PrimarySuperblockRead::ChecksumInvalid),
             Err(error) => Err(error),
         }
-    }
-
-    /// Recovers only a sector-prefix tear of a write-session transition.
-    ///
-    /// Session markers and hash selection reside in the first sector; the checksum is in the
-    /// second. An active image may replace any admitted marker pair and select signed hashing
-    /// when no interpretation was recorded. A closed image can only replace an active session.
-    /// Every predecessor must authenticate against the unchanged checksum.
-    /// # Errors
-    /// Returns a checksum error unless one permitted previous image validates, or an allocation error.
-    fn restore_torn_write_session(raw: [u8; SUPERBLOCK_SIZE]) -> Result<PrimarySuperblockRead> {
-        let has_file = le_u32(&raw, disk_offset(92))? & COMPAT_ORPHAN_FILE != 0;
-        let recovery = le_u32(&raw, disk_offset(96))? & INCOMPAT_RECOVER != 0;
-        let present = le_u32(&raw, disk_offset(100))? & RO_COMPAT_ORPHAN_PRESENT != 0;
-        let flags = le_u32(&raw, disk_offset(FILESYSTEM_FLAGS_OFFSET))?;
-        let active = recovery && (!has_file || present);
-        let unselected_flags = if active
-            && flags & (SIGNED_DIRECTORY_HASH | UNSIGNED_DIRECTORY_HASH) == SIGNED_DIRECTORY_HASH
-        {
-            flags & !SIGNED_DIRECTORY_HASH
-        } else {
-            flags
-        };
-        for old_flags in [flags, unselected_flags] {
-            for (old_recovery, old_present) in
-                [(false, false), (true, false), (false, true), (true, true)]
-            {
-                if !has_file && (present || old_present) {
-                    continue;
-                }
-                let closed = !recovery && !present;
-                let prior_active = old_recovery && (!has_file || old_present);
-                if (!active && !(closed && prior_active))
-                    || (recovery, present, flags) == (old_recovery, old_present, old_flags)
-                {
-                    continue;
-                }
-                let mut candidate = raw;
-                let incompat = le_u32(&raw, disk_offset(96))? & !INCOMPAT_RECOVER;
-                let ro_compat = le_u32(&raw, disk_offset(100))? & !RO_COMPAT_ORPHAN_PRESENT;
-                put_le_u32(
-                    &mut candidate,
-                    disk_offset(96),
-                    incompat | if old_recovery { INCOMPAT_RECOVER } else { 0 },
-                )?;
-                put_le_u32(
-                    &mut candidate,
-                    disk_offset(100),
-                    ro_compat
-                        | if old_present {
-                            RO_COMPAT_ORPHAN_PRESENT
-                        } else {
-                            0
-                        },
-                )?;
-                put_le_u32(
-                    &mut candidate,
-                    disk_offset(FILESYSTEM_FLAGS_OFFSET),
-                    old_flags,
-                )?;
-                match Self::parse_read_write(&candidate) {
-                    Ok(_) => {
-                        return Ok(PrimarySuperblockRead::TornWriteSession {
-                            repair: memory::copied_slice(&candidate)?,
-                        });
-                    }
-                    Err(Error::ChecksumMismatch) => {}
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        Err(Error::ChecksumMismatch)
     }
 
     /// Parses and validates a 1024-byte superblock payload for read-write mode.
