@@ -24,6 +24,8 @@ use crate::disk_format::superblock::{FilesystemUuid, JournalUuid, RecoveryState,
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
 
+mod overlay;
+pub(crate) use overlay::JournalOverlay;
 pub(crate) mod fast_commit;
 use fast_commit::{DeltaProgram, FrameAuthenticator, ProgramDecoder, ScanStep};
 

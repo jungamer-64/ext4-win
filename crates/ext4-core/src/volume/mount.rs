@@ -604,99 +604,30 @@ impl CommittedEpoch {
 
 impl StorageReadOverlay for CommittedEpoch {
     fn read(&self, target: StorageTarget, offset: ByteOffset, out: &mut [u8]) -> Result<bool> {
-        if target != StorageTarget::Filesystem {
-            return Ok(false);
+        let overlay = crate::disk_format::journal::JournalOverlay::new(
+            self.superblock.block_size(),
+            &self.overlay,
+        );
+        if overlay.read(target, offset, out)? {
+            return Ok(true);
         }
-        let end = offset
-            .get()
-            .checked_add(u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?)
-            .ok_or(Error::ArithmeticOverflow)?;
         if let Some(recovery) = &self.recovery
             && recovery.read(target, offset, out)?
         {
+            overlay.apply(target, offset, out)?;
             return Ok(true);
-        }
-        for image in &self.overlay {
-            let start = self.superblock.block_size().offset_of(image.block())?.get();
-            let image_end = start
-                .checked_add(
-                    u64::try_from(image.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
-                )
-                .ok_or(Error::ArithmeticOverflow)?;
-            if offset.get() >= start && end <= image_end {
-                let from = usize::try_from(
-                    offset
-                        .get()
-                        .checked_sub(start)
-                        .ok_or(Error::ArithmeticOverflow)?,
-                )
-                .map_err(|_| Error::ArithmeticOverflow)?;
-                let to = from
-                    .checked_add(out.len())
-                    .ok_or(Error::ArithmeticOverflow)?;
-                memory::copy_exact(out, image.bytes().get(from..to).ok_or(Error::DeviceRange)?)?;
-                return Ok(true);
-            }
         }
         Ok(false)
     }
     fn apply(&self, target: StorageTarget, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
-        if target != StorageTarget::Filesystem || out.is_empty() {
-            return Ok(());
-        }
         if let Some(recovery) = &self.recovery {
             recovery.apply(target, offset, out)?;
         }
-        let request_start = offset.get();
-        let request_end = request_start
-            .checked_add(u64::try_from(out.len()).map_err(|_| Error::ArithmeticOverflow)?)
-            .ok_or(Error::ArithmeticOverflow)?;
-        for image in &self.overlay {
-            let image_start = self.superblock.block_size().offset_of(image.block())?.get();
-            let image_end = image_start
-                .checked_add(
-                    u64::try_from(image.bytes().len()).map_err(|_| Error::ArithmeticOverflow)?,
-                )
-                .ok_or(Error::ArithmeticOverflow)?;
-            let overlap_start = core::cmp::max(request_start, image_start);
-            let overlap_end = core::cmp::min(request_end, image_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
-            let target_start = usize::try_from(
-                overlap_start
-                    .checked_sub(request_start)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .map_err(|_| Error::ArithmeticOverflow)?;
-            let target_end = usize::try_from(
-                overlap_end
-                    .checked_sub(request_start)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .map_err(|_| Error::ArithmeticOverflow)?;
-            let source_start = usize::try_from(
-                overlap_start
-                    .checked_sub(image_start)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .map_err(|_| Error::ArithmeticOverflow)?;
-            let source_end = usize::try_from(
-                overlap_end
-                    .checked_sub(image_start)
-                    .ok_or(Error::ArithmeticOverflow)?,
-            )
-            .map_err(|_| Error::ArithmeticOverflow)?;
-            memory::copy_exact(
-                out.get_mut(target_start..target_end)
-                    .ok_or(Error::DeviceRange)?,
-                image
-                    .bytes()
-                    .get(source_start..source_end)
-                    .ok_or(Error::DeviceRange)?,
-            )?;
-        }
-        Ok(())
+        crate::disk_format::journal::JournalOverlay::new(
+            self.superblock.block_size(),
+            &self.overlay,
+        )
+        .apply(target, offset, out)
     }
 }
 

@@ -138,7 +138,7 @@ pub(in crate::volume) fn prepare_orphan_batch(
         OrphanProgress::Remaining(allocation)
     };
     let (clusters, mut next_superblock) = mutation.committed_cluster_state()?;
-    let mut metadata = mutation.metadata_blocks()?;
+    let mut metadata = mutation.metadata_images()?.into_blocks();
     if matches!(progress, OrphanProgress::Complete) {
         match target.tracking.source {
             OrphanSource::File {

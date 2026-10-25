@@ -13,7 +13,10 @@ pub(super) struct MetadataImages {
 impl MetadataImages {
     /// Starts an effect-free image set.
     pub(super) const fn new(block_size: BlockSize) -> Self {
-        Self { block_size, blocks: Vec::new() }
+        Self {
+            block_size,
+            blocks: Vec::new(),
+        }
     }
 
     /// Reads a containing block at most once and applies one admitted, non-crossing edit.
@@ -26,7 +29,9 @@ impl MetadataImages {
         bytes: &[u8],
     ) -> Result<()> {
         let size = volume.superblock.block_size();
-        if size != self.block_size { return Err(Error::InvalidWriteRange); }
+        if size != self.block_size {
+            return Err(Error::InvalidWriteRange);
+        }
         let width = u64::from(size.bytes());
         let block = BlockAddress::new(
             offset
@@ -76,5 +81,26 @@ impl MetadataImages {
     /// Transfers the sole postimages to a journal planner after resolution has completed.
     pub(super) fn into_blocks(self) -> Vec<JournalBlock> {
         self.blocks
+    }
+}
+
+impl crate::disk::storage::StorageReadOverlay for MetadataImages {
+    fn read(
+        &self,
+        target: crate::StorageTarget,
+        offset: ByteOffset,
+        out: &mut [u8],
+    ) -> Result<bool> {
+        crate::disk_format::journal::JournalOverlay::new(self.block_size, &self.blocks)
+            .read(target, offset, out)
+    }
+    fn apply(
+        &self,
+        target: crate::StorageTarget,
+        offset: ByteOffset,
+        out: &mut [u8],
+    ) -> Result<()> {
+        crate::disk_format::journal::JournalOverlay::new(self.block_size, &self.blocks)
+            .apply(target, offset, out)
     }
 }

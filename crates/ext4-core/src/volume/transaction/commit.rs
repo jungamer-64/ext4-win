@@ -181,8 +181,11 @@ impl MetadataMutation<'_, '_> {
     ///
     /// Returns an error when a metadata write does not fit within one block or an original metadata
     /// block cannot be read before patching.
-    pub(super) fn metadata_images(&mut self) -> Result<super::super::metadata_image::MetadataImages> {
-        let mut images = super::super::metadata_image::MetadataImages::new(self.volume.superblock.block_size());
+    pub(super) fn metadata_images(
+        &mut self,
+    ) -> Result<super::super::metadata_image::MetadataImages> {
+        let mut images =
+            super::super::metadata_image::MetadataImages::new(self.volume.superblock.block_size());
         for write in self.metadata_writes()? {
             images.patch(&mut self.volume, write.offset, &write.bytes)?;
         }
@@ -245,7 +248,7 @@ impl MetadataMutation<'_, '_> {
         {
             return Err(Error::ClusterReferenceConflict);
         }
-        let mut journal_blocks = self.metadata_blocks()?;
+        let mut journal_blocks = self.metadata_images()?.into_blocks();
         let _validated_next_state = self.committed_cluster_state()?;
         let mut observed = ObservedResourceVersionSet::new(ticket, &coordinator.mount);
         let key_version = self

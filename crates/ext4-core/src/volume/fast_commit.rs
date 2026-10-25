@@ -13,7 +13,7 @@ pub(super) fn resolve(
     seed: &DeltaRecoverySeed,
 ) -> Result<Vec<JournalBlock>> {
     seed.require_filesystem(&volume.superblock)?;
-    let mut images = MetadataImages::new();
+    let mut images = MetadataImages::new(volume.superblock.block_size());
     let records = seed.program().records();
     for (index, record) in records.iter().enumerate() {
         let ParsedDelta::Inode { inode, encoded } = record else {
