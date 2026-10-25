@@ -501,6 +501,15 @@ impl LiveInodeRecord {
     /// # Errors
     /// Rejects zero-link, kind, storage flag, generation, attribute-owner or prefix-layout changes.
     pub(super) fn restore_delta_metadata(mut self, encoded: &[u8]) -> Result<Self> {
+        let inode = self.parse()?;
+        let directory = inode.kind() == InodeKind::Directory;
+        let recorded_flags =
+            InodeFlags::from_u32(le_u32(encoded, disk_offset(INODE_FLAGS_OFFSET))?);
+        let flags_match = if directory {
+            inode.flags().without_indexed_directory() == recorded_flags.without_indexed_directory()
+        } else {
+            inode.flags() == recorded_flags
+        };
         let base = self.raw.bytes();
         let prefix = if base.len() == 128 {
             128
@@ -514,7 +523,7 @@ impl LiveInodeRecord {
             || le_u16(encoded, disk_offset(26))? == 0
             || InodeMode::from_disk(le_u16(base, disk_offset(0))?)?.kind()
                 != InodeMode::from_disk(le_u16(encoded, disk_offset(0))?)?.kind()
-            || base.get(32..36) != encoded.get(32..36)
+            || !flags_match
             || base.get(100..108) != encoded.get(100..108)
             || base.get(118..120) != encoded.get(118..120)
             || (prefix > 128 && base.get(128..130) != encoded.get(128..130))
@@ -533,6 +542,15 @@ impl LiveInodeRecord {
                     .get_mut(span.clone())
                     .ok_or(Error::InvalidInode)?,
                 encoded.get(span).ok_or(Error::InvalidInode)?,
+            )?;
+        }
+        if directory {
+            // Directory size and routing are derived from rebuilt blocks, not an absent source layout.
+            self.raw.set_flags(inode.flags())?;
+            self.raw.set_encoded_size(
+                self.raw
+                    .encoding
+                    .encode_directory_size(DirectorySize::from_bytes(inode.size().bytes()))?,
             )?;
         }
         self.raw.into_live()

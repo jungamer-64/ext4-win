@@ -942,89 +942,10 @@ impl MutationResolvePass<'_, '_, '_> {
         {
             return Err(Error::NameAlreadyExists);
         }
-        if matches!(
-            parent_inode.directory_storage_kind()?,
-            DirectoryStorageKind::HTree
-        ) {
-            return self.insert_htree_directory_entry(
-                inode_index,
-                raw_parent,
-                &parent_inode,
-                entry,
-            );
-        }
-
-        let mut tree = self.mutation.mutable_extent_tree(&parent_inode)?;
-        if tree.contains_uninitialized() {
-            return Err(Error::UnsupportedInodeMutation);
-        }
-        let block_size = self.mutation.volume.superblock.block_size();
-        let block_size_u64 = u64::from(block_size.bytes());
-        let block_count = round_up_div(parent_inode.size().bytes(), block_size_u64)?;
-        for logical in 0..block_count {
-            let (physical, mut block) = self.mutation.read_mutation_directory_block(
-                &parent_inode,
-                &tree,
-                LogicalBlock::try_from(logical)?,
-            )?;
-            if block.insert(&entry)? {
-                self.mutation
-                    .stage_directory_block(physical, block.into_bytes())?;
-                raw_parent.touch_contents(self.now)?;
-                self.mutation.replace_live_inode(inode_index, raw_parent)?;
-                return Ok(());
-            }
-        }
-
-        if block_count == 1
-            && !matches!(
-                self.mutation.volume.superblock.directory_indexing(),
-                DirectoryIndexing::Disabled
-            )
-        {
-            return self.convert_linear_directory_to_htree(
-                inode_index,
-                raw_parent,
-                &parent_inode,
-                tree,
-                entry,
-            );
-        }
-
-        let logical_block = LogicalBlock::try_from(block_count)?;
-        let new_physical = self.mutation.allocate_extent_block(&tree, logical_block)?;
-        tree.insert_or_extend_initialized(logical_block, new_physical)?;
-
-        let mut block = DirectoryBlock::empty(
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-            self.mutation.volume.directory_checksum(&parent_inode),
-            DirectoryEntryEncoding::for_inode(&parent_inode),
-        )?;
-        block.initialize_free_space()?;
-        let inserted = block.insert(&entry)?;
-        if !inserted {
-            return Err(Error::InvalidDirectoryEntry);
-        }
         self.mutation
-            .stage_directory_block(new_physical, block.into_bytes())?;
-        let new_parent_size = FileSize::from_bytes(
-            parent_inode
-                .size()
-                .bytes()
-                .checked_add(block_size_u64)
-                .ok_or(Error::ArithmeticOverflow)?,
-        );
-        let encoded_size = self
-            .mutation
-            .volume
-            .superblock
-            .inode_data_encoding()
-            .encode_directory_size(DirectorySize::from_bytes(new_parent_size.bytes()))?;
-        raw_parent.set_encoded_size(encoded_size)?;
+            .insert_encoded_directory_entry(&mut raw_parent, entry)?;
         raw_parent.touch_contents(self.now)?;
-        self.mutation.stage_extent_tree(&mut raw_parent, tree)?;
-        self.mutation.replace_live_inode(inode_index, raw_parent)?;
-        Ok(())
+        self.mutation.replace_live_inode(inode_index, raw_parent)
     }
 
     /// Removes a child entry from a mutable directory.
@@ -1172,7 +1093,13 @@ impl MutationResolvePass<'_, '_, '_> {
                 .ok_or(Error::DirectoryEntryNotFound)?;
             self.mutation
                 .stage_directory_block(location.physical, location.block.into_bytes())?;
-            self.insert_htree_directory_entry(inode_index, raw_parent, &parent_inode, replacement)?;
+            self.mutation.insert_htree_directory_entry(
+                &mut raw_parent,
+                &parent_inode,
+                replacement,
+            )?;
+            raw_parent.touch_contents(self.now)?;
+            self.mutation.replace_live_inode(inode_index, raw_parent)?;
             return Ok(removed);
         }
         match location.block.rename(source.name(), &replacement) {
@@ -1425,6 +1352,8 @@ enum LoggedLeafResult {
     FoundUnchanged,
     /// An observed binding was replaced or removed in this private block image.
     FoundChanged,
+    /// A replacement removed the old binding but needs another leaf or layout growth.
+    FoundRemoved,
     /// No equivalent name exists here; this private block can hold a future insertion.
     VacantInserted,
     /// This leaf lacks the binding and cannot supply an insertion image.
@@ -1462,7 +1391,7 @@ impl LoggedBinding<'_> {
                         .remove(existing.name())?
                         .ok_or(Error::InvalidDirectoryEntry)?;
                     if !block.insert(wanted)? {
-                        return Err(Error::UnsupportedJournal);
+                        return Ok(LoggedLeafResult::FoundRemoved);
                     }
                 }
                 Self::AbsentIf { inode, .. } => {
@@ -1484,6 +1413,82 @@ impl LoggedBinding<'_> {
 }
 
 impl MetadataMutation<'_, '_> {
+    /// Edits already encoded names; callers own access checks, cryptography, timestamps and inode publication.
+    /// # Errors
+    /// Returns malformed storage, unsupported indexing, allocation or serialization failure.
+    fn insert_encoded_directory_entry(
+        &mut self,
+        raw_parent: &mut LiveInodeRecord,
+        entry: RawDirectoryEntry,
+    ) -> Result<()> {
+        let parent_inode = raw_parent.parse()?;
+        if matches!(
+            parent_inode.directory_storage_kind()?,
+            DirectoryStorageKind::HTree
+        ) {
+            return self.insert_htree_directory_entry(raw_parent, &parent_inode, entry);
+        }
+
+        let mut tree = self.mutable_extent_tree(&parent_inode)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        let block_size = self.volume.superblock.block_size();
+        let block_size_u64 = u64::from(block_size.bytes());
+        let block_count = round_up_div(parent_inode.size().bytes(), block_size_u64)?;
+        for logical in 0..block_count {
+            let (physical, mut block) = self.read_mutation_directory_block(
+                &parent_inode,
+                &tree,
+                LogicalBlock::try_from(logical)?,
+            )?;
+            if block.insert(&entry)? {
+                self.stage_directory_block(physical, block.into_bytes())?;
+                return Ok(());
+            }
+        }
+
+        if block_count == 1
+            && !matches!(
+                self.volume.superblock.directory_indexing(),
+                DirectoryIndexing::Disabled
+            )
+        {
+            return self.convert_linear_directory_to_htree(raw_parent, &parent_inode, tree, entry);
+        }
+
+        let logical_block = LogicalBlock::try_from(block_count)?;
+        let new_physical = self.allocate_extent_block(&tree, logical_block)?;
+        tree.insert_or_extend_initialized(logical_block, new_physical)?;
+
+        let mut block = DirectoryBlock::empty(
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+            self.volume.directory_checksum(&parent_inode),
+            DirectoryEntryEncoding::for_inode(&parent_inode),
+        )?;
+        block.initialize_free_space()?;
+        let inserted = block.insert(&entry)?;
+        if !inserted {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        self.stage_directory_block(new_physical, block.into_bytes())?;
+        let new_parent_size = FileSize::from_bytes(
+            parent_inode
+                .size()
+                .bytes()
+                .checked_add(block_size_u64)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        let encoded_size = self
+            .volume
+            .superblock
+            .inode_data_encoding()
+            .encode_directory_size(DirectorySize::from_bytes(new_parent_size.bytes()))?;
+        raw_parent.set_encoded_size(encoded_size)?;
+        self.stage_extent_tree(raw_parent, tree)?;
+        Ok(())
+    }
+
     /// Inserts one child through the selected HTree leaf and propagates only required splits.
     /// # Errors
     ///
@@ -1491,8 +1496,7 @@ impl MetadataMutation<'_, '_> {
     /// configured index depth is exhausted, allocation fails, or staging cannot complete.
     fn insert_htree_directory_entry(
         &mut self,
-        inode_index: StagedInodeIndex,
-        mut raw_parent: LiveInodeRecord,
+        raw_parent: &mut LiveInodeRecord,
         parent_inode: &Inode,
         entry: RawDirectoryEntry,
     ) -> Result<()> {
@@ -1515,16 +1519,11 @@ impl MetadataMutation<'_, '_> {
         context.path.hash_range()?.validate_leaf(
             &leaf.entries()?,
             context.root.hash_profile(),
-            self
-                .volume
-                .superblock
-                .name_semantics(parent_inode)?,
+            self.volume.superblock.name_semantics(parent_inode)?,
         )?;
         if leaf.insert(&entry)? {
-            self
-                .stage_directory_block(leaf_physical, leaf.into_bytes())?;
-            raw_parent.touch_contents(self.now)?;
-            return self.replace_live_inode(inode_index, raw_parent);
+            self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
+            return Ok(());
         }
 
         if context
@@ -1544,10 +1543,7 @@ impl MetadataMutation<'_, '_> {
         let hash = context.root.hash_profile();
         let mut entries = leaf.entries()?;
         entries.try_push(entry)?;
-        let names = self
-            .volume
-            .superblock
-            .name_semantics(parent_inode)?;
+        let names = self.volume.superblock.name_semantics(parent_inode)?;
         let entries = ordered_directory_entries(entries, hash, names)?;
         let split_at = self.directory_leaf_split(&entries, checksum)?;
         let (left_entries, right_entries) = entries
@@ -1586,10 +1582,8 @@ impl MetadataMutation<'_, '_> {
         )?;
         let (right_logical, right_physical) =
             self.allocate_directory_block(&mut tree, &mut next_logical)?;
-        self
-            .stage_directory_block(leaf_physical, left.into_bytes())?;
-        self
-            .stage_directory_block(right_physical, right.into_bytes())?;
+        self.stage_directory_block(leaf_physical, left.into_bytes())?;
+        self.stage_directory_block(right_physical, right.into_bytes())?;
         self.propagate_htree_route(
             parent_inode,
             &mut tree,
@@ -1597,7 +1591,7 @@ impl MetadataMutation<'_, '_> {
             &mut context,
             DxEntry::new(boundary, right_logical)?,
         )?;
-        self.finish_directory_growth(inode_index, raw_parent, tree, next_logical, false)
+        self.finish_directory_growth(raw_parent, tree, next_logical)
     }
 
     /// Selects the deterministic byte-balanced split that leaves both leaf halves representable.
@@ -1733,10 +1727,8 @@ impl MetadataMutation<'_, '_> {
                     &root_index,
                     checksum,
                 )?;
-                self
-                    .stage_directory_block(left_physical, left_bytes)?;
-                self
-                    .stage_directory_block(right_physical, right_bytes)?;
+                self.stage_directory_block(left_physical, left_bytes)?;
+                self.stage_directory_block(right_physical, right_bytes)?;
                 self.stage_directory_block(
                     level.physical,
                     memory::copied_slice(&context.root_bytes)?,
@@ -1747,14 +1739,12 @@ impl MetadataMutation<'_, '_> {
             let right = split.into_right();
             let mut left_bytes = memory::repeated_vec(0_u8, block_bytes)?;
             write_htree_node(&mut left_bytes, &level.index, checksum)?;
-            self
-                .stage_directory_block(level.physical, left_bytes)?;
+            self.stage_directory_block(level.physical, left_bytes)?;
             let (right_logical, right_physical) =
                 self.allocate_directory_block(tree, next_logical)?;
             let mut right_bytes = memory::repeated_vec(0_u8, block_bytes)?;
             write_htree_node(&mut right_bytes, &right, checksum)?;
-            self
-                .stage_directory_block(right_physical, right_bytes)?;
+            self.stage_directory_block(right_physical, right_bytes)?;
             route = DxEntry::new(boundary, right_logical)?;
         }
         Err(Error::InvalidDirectoryEntry)
@@ -1767,8 +1757,7 @@ impl MetadataMutation<'_, '_> {
     /// represented, allocation fails, or the staged directory growth cannot be published.
     fn convert_linear_directory_to_htree(
         &mut self,
-        inode_index: StagedInodeIndex,
-        raw_parent: LiveInodeRecord,
+        raw_parent: &mut LiveInodeRecord,
         parent_inode: &Inode,
         mut tree: MutableExtentTree,
         entry: RawDirectoryEntry,
@@ -1800,10 +1789,7 @@ impl MetadataMutation<'_, '_> {
         } else {
             DirectoryIndexHash::Computed(DirectoryHashScheme::from_metadata(
                 self.volume.superblock.directory_hash_seed(),
-                self
-                    .volume
-                    .superblock
-                    .default_directory_hash_version(),
+                self.volume.superblock.default_directory_hash_version(),
                 self.volume.superblock.directory_hash_signedness(),
             ))
         };
@@ -1814,10 +1800,7 @@ impl MetadataMutation<'_, '_> {
             }
         }
         children.try_push(entry)?;
-        let names = self
-            .volume
-            .superblock
-            .name_semantics(parent_inode)?;
+        let names = self.volume.superblock.name_semantics(parent_inode)?;
         let children = ordered_directory_entries(children, hash, names)?;
         let block_bytes = usize::try_from(self.volume.superblock.block_size().bytes())
             .map_err(|_| Error::ArithmeticOverflow)?;
@@ -1833,8 +1816,7 @@ impl MetadataMutation<'_, '_> {
                 let (leaf_logical, leaf_physical) =
                     self.allocate_directory_block(&mut tree, &mut next_logical)?;
                 routes.try_push(DxEntry::new(0, leaf_logical)?)?;
-                self
-                    .stage_directory_block(leaf_physical, leaf.into_bytes())?;
+                self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
             }
             Err(Error::NoSpace) => {
                 let split_at = self.directory_leaf_split(&children, checksum)?;
@@ -1872,10 +1854,8 @@ impl MetadataMutation<'_, '_> {
                     self.allocate_directory_block(&mut tree, &mut next_logical)?;
                 routes.try_push(DxEntry::new(0, left_logical)?)?;
                 routes.try_push(DxEntry::new(boundary, right_logical)?)?;
-                self
-                    .stage_directory_block(left_physical, left.into_bytes())?;
-                self
-                    .stage_directory_block(right_physical, right.into_bytes())?;
+                self.stage_directory_block(left_physical, left.into_bytes())?;
+                self.stage_directory_block(right_physical, right.into_bytes())?;
             }
             Err(error) => return Err(error),
         }
@@ -1889,7 +1869,8 @@ impl MetadataMutation<'_, '_> {
             checksum,
         )?;
         self.stage_directory_block(root_physical, root)?;
-        self.finish_directory_growth(inode_index, raw_parent, tree, next_logical, true)
+        raw_parent.mark_indexed_directory()?;
+        self.finish_directory_growth(raw_parent, tree, next_logical)
     }
 
     /// Allocates and maps the next directory logical block.
@@ -1913,27 +1894,19 @@ impl MetadataMutation<'_, '_> {
         Ok((logical, physical))
     }
 
-    /// Publishes directory size/extent/timestamp changes after local block staging succeeds.
+    /// Derives directory size and allocation from the staged layout; the caller owns timestamps.
     /// # Errors
     ///
-    /// Returns an error when size encoding, timestamps, extent staging, or inode replacement
-    /// cannot represent the completed growth.
+    /// Returns an error when size encoding or extent staging cannot represent the completed growth.
     fn finish_directory_growth(
         &mut self,
-        inode_index: StagedInodeIndex,
-        mut raw_parent: LiveInodeRecord,
+        raw_parent: &mut LiveInodeRecord,
         tree: MutableExtentTree,
         block_count: u64,
-        mark_indexed: bool,
     ) -> Result<()> {
-        if mark_indexed {
-            raw_parent.mark_indexed_directory()?;
-        }
         let size = FileSize::from_bytes(
             block_count
-                .checked_mul(u64::from(
-                    self.volume.superblock.block_size().bytes(),
-                ))
+                .checked_mul(u64::from(self.volume.superblock.block_size().bytes()))
                 .ok_or(Error::ArithmeticOverflow)?,
         );
         let encoded = self
@@ -1942,11 +1915,8 @@ impl MetadataMutation<'_, '_> {
             .inode_data_encoding()
             .encode_directory_size(DirectorySize::from_bytes(size.bytes()))?;
         raw_parent.set_encoded_size(encoded)?;
-        raw_parent.touch_contents(self.now)?;
-        self.stage_extent_tree(&mut raw_parent, tree)?;
-        self.replace_live_inode(inode_index, raw_parent)
+        self.stage_extent_tree(raw_parent, tree)
     }
-
 
     /// Replays existing file/symlink bindings using staged plaintext leaves and final inode counts.
     /// # Errors
@@ -2001,6 +1971,10 @@ impl MetadataMutation<'_, '_> {
                         LoggedLeafResult::FoundChanged => {
                             return self.stage_directory_block(physical, block.into_bytes());
                         }
+                        LoggedLeafResult::FoundRemoved => {
+                            self.stage_directory_block(physical, block.into_bytes())?;
+                            return self.finish_logged_binding(parent.id(), binding);
+                        }
                         LoggedLeafResult::VacantInserted if insertion.is_none() => {
                             insertion = Some((physical, block))
                         }
@@ -2027,6 +2001,10 @@ impl MetadataMutation<'_, '_> {
                         LoggedLeafResult::FoundChanged => {
                             return self.stage_directory_block(physical, block.into_bytes());
                         }
+                        LoggedLeafResult::FoundRemoved => {
+                            self.stage_directory_block(physical, block.into_bytes())?;
+                            return self.finish_logged_binding(parent.id(), binding);
+                        }
                         LoggedLeafResult::VacantInserted if insertion.is_none() => {
                             insertion = Some((physical, block))
                         }
@@ -2046,10 +2024,23 @@ impl MetadataMutation<'_, '_> {
         }
         if let Some((physical, block)) = insertion {
             self.stage_directory_block(physical, block.into_bytes())
-        } else if matches!(binding, LoggedBinding::AbsentIf { .. }) {
-            Ok(())
         } else {
-            Err(Error::UnsupportedJournal)
+            self.finish_logged_binding(parent.id(), binding)
+        }
+    }
+
+    /// A searched, absent name can require layout growth while preserving recorded inode timestamps.
+    /// # Errors
+    /// Returns allocation, layout or inode staging failure before persistence.
+    fn finish_logged_binding(&mut self, parent: InodeId, binding: LoggedBinding<'_>) -> Result<()> {
+        match binding {
+            LoggedBinding::AbsentIf { .. } => Ok(()),
+            LoggedBinding::Present(entry) => {
+                let index = self.ensure_inode_update(parent)?;
+                let mut raw = self.staged_live_inode(index)?;
+                self.insert_encoded_directory_entry(&mut raw, entry)?;
+                self.replace_live_inode(index, raw)
+            }
         }
     }
 

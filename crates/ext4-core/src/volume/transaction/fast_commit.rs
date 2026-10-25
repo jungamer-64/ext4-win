@@ -86,6 +86,22 @@ pub(in crate::volume) fn resolve_delta_postconditions(
     for inode in inodes {
         let mut raw = inode.raw;
         if let Some(tree) = inode.tree {
+            if raw.parse()?.kind() == InodeKind::Directory {
+                let blocks = tree
+                    .extents()
+                    .last()
+                    .map_or(0, |extent| extent.end_logical());
+                let size = blocks
+                    .checked_mul(u64::from(mutation.volume.superblock.block_size().bytes()))
+                    .ok_or(Error::ArithmeticOverflow)?;
+                raw.set_encoded_size(
+                    mutation
+                        .volume
+                        .superblock
+                        .inode_data_encoding()
+                        .encode_directory_size(DirectorySize::from_bytes(size))?,
+                )?;
+            }
             mutation.stage_extent_tree(&mut raw, tree)?;
         } else {
             mutation.set_inode_allocation_size(&mut raw, None)?;

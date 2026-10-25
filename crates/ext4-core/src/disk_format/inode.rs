@@ -1273,6 +1273,11 @@ impl InodeFlags {
         Self(self.0 & !EXT4_HUGE_FILE_FL)
     }
 
+    /// Clears only the directory routing representation; namespace metadata remains unchanged.
+    pub(crate) const fn without_indexed_directory(self) -> Self {
+        Self(self.0 & !EXT4_INDEX_FL)
+    }
+
     /// Returns flags with the indexed-directory bit set.
     #[must_use]
     pub const fn with_indexed_directory(self) -> Self {

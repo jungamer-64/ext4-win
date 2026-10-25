@@ -587,3 +587,111 @@ fn creation_rejects_root_and_unretired_occupied_generations() -> Result<()> {
     }
     Ok(())
 }
+
+/// Encodes the fixture's inode prefix independently of production inode serialization.
+/// # Errors
+/// Returns a malformed table coordinate, metadata width or vector allocation failure.
+fn inode_operand(disk: &Disk, node: NodeId) -> Result<Vec<u8>> {
+    let offset = fixture_inode_offset(disk, node)?;
+    let raw = disk
+        .filesystem
+        .get(offset..offset.checked_add(256).ok_or(Error::DeviceRange)?)
+        .ok_or(Error::DeviceRange)?;
+    let prefix = 128_usize
+        .checked_add(usize::from(u16::from_le_bytes(
+            raw.get(128..130)
+                .ok_or(Error::DeviceRange)?
+                .try_into()
+                .map_err(|_| Error::DeviceRange)?,
+        )))
+        .ok_or(Error::DeviceRange)?;
+    let mut value = node.file_index().to_le_bytes().to_vec();
+    value.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
+    Ok(value)
+}
+
+/// Encodes one raw namespace component without performing an ordinary mutation.
+fn namespace_operand(parent: DirectoryNodeId, child: NodeId, name: &[u8]) -> Vec<u8> {
+    let mut value = NodeId::Directory(parent)
+        .file_index()
+        .to_le_bytes()
+        .to_vec();
+    value.extend_from_slice(&child.file_index().to_le_bytes());
+    value.extend_from_slice(name);
+    value
+}
+
+/// # Errors
+/// Propagates base-directory construction, independent vector construction or mount recovery failure.
+/// # Panics
+/// Fails if replay reads a source-only layout, omits HTree growth or allocates twice on reapplication.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe rebuilt directory routing, stable allocation and recovered bindings"
+)]
+fn namespace_replay_derives_growth_before_using_recorded_parent_layout() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        for index in 0_u8..16 {
+            let mut name = [b'x'; 240];
+            *name.get_mut(0).ok_or(Error::InvalidName)? =
+                b'a'.checked_add(index).ok_or(Error::InvalidName)?;
+            pass.create_file(
+                root,
+                &Ext4Name::new(&name)?,
+                NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+            )?;
+        }
+        Ok(())
+    })?;
+    let root_offset =
+        fixture_inode_offset(&fixture.disk, NodeId::Directory(DirectoryNodeId::ROOT))?;
+    let flags = fixture_u32(
+        &fixture.disk.filesystem,
+        root_offset.checked_add(32).ok_or(Error::DeviceRange)?,
+    )?;
+    assert_eq!(flags & 0x1000, 0);
+    let mut parent = inode_operand(&fixture.disk, NodeId::Directory(DirectoryNodeId::ROOT))?;
+    put(&mut parent, 36, &(flags | 0x1000).to_le_bytes())?;
+    put(&mut parent, 8, &12288_u32.to_le_bytes())?;
+    let file = fixture.a;
+    let child = NodeId::File(file);
+    let image = inode_operand(&fixture.disk, child)?;
+    let name = [b'z'; 250];
+    let link = namespace_operand(DirectoryNodeId::ROOT, child, &name);
+    let unlink = namespace_operand(DirectoryNodeId::ROOT, child, b"concurrent-a");
+    let records = [
+        (4, link.as_slice()),
+        (5, unlink.as_slice()),
+        (6, image.as_slice()),
+        (6, parent.as_slice()),
+    ];
+    install_delta(&mut fixture, &records)?;
+    fixture.remount()?;
+    let free = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    assert_ne!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            root_offset.checked_add(32).ok_or(Error::DeviceRange)?
+        )? & 0x1000,
+        0
+    );
+    assert!(
+        fixture_u32(
+            &fixture.disk.filesystem,
+            root_offset.checked_add(4).ok_or(Error::DeviceRange)?
+        )? >= 8192
+    );
+    install_delta(&mut fixture, &records)?;
+    fixture.remount()?;
+    assert_eq!(fixture_u32(&fixture.disk.filesystem, 1036)?, free);
+    assert!(
+        matches!(fixture.read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(&name)?))?, ChildLookup::Found(entry) if *entry.node() == child)
+    );
+    let mut bytes = [0; 1];
+    fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
+    assert_eq!(&bytes, b"a");
+    Ok(())
+}
