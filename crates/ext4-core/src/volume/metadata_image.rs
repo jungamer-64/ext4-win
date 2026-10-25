@@ -5,13 +5,15 @@ use super::scope::*;
 /// Coalesces byte-range edits under one block-coordinate conversion and one authoritative image.
 #[derive(Debug)]
 pub(super) struct MetadataImages {
+    /// Byte width shared by every admitted postimage.
+    block_size: BlockSize,
     /// No block address occurs twice; later patches replace bytes in the same owned image.
     blocks: Vec<JournalBlock>,
 }
 impl MetadataImages {
     /// Starts an effect-free image set.
-    pub(super) const fn new() -> Self {
-        Self { blocks: Vec::new() }
+    pub(super) const fn new(block_size: BlockSize) -> Self {
+        Self { block_size, blocks: Vec::new() }
     }
 
     /// Reads a containing block at most once and applies one admitted, non-crossing edit.
@@ -24,6 +26,7 @@ impl MetadataImages {
         bytes: &[u8],
     ) -> Result<()> {
         let size = volume.superblock.block_size();
+        if size != self.block_size { return Err(Error::InvalidWriteRange); }
         let width = u64::from(size.bytes());
         let block = BlockAddress::new(
             offset

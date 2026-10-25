@@ -181,12 +181,12 @@ impl MetadataMutation<'_, '_> {
     ///
     /// Returns an error when a metadata write does not fit within one block or an original metadata
     /// block cannot be read before patching.
-    pub(super) fn metadata_blocks(&mut self) -> Result<Vec<JournalBlock>> {
-        let mut images = super::super::metadata_image::MetadataImages::new();
+    pub(super) fn metadata_images(&mut self) -> Result<super::super::metadata_image::MetadataImages> {
+        let mut images = super::super::metadata_image::MetadataImages::new(self.volume.superblock.block_size());
         for write in self.metadata_writes()? {
             images.patch(&mut self.volume, write.offset, &write.bytes)?;
         }
-        Ok(images.into_blocks())
+        Ok(images)
     }
 
     /// Applies accumulated free-count deltas to a superblock image.
