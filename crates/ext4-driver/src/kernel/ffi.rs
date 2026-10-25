@@ -2,6 +2,21 @@
 
 pub(crate) use wdk_sys::ntddk::RtlCopyVolatileMemory;
 
+#[expect(
+    unsafe_code,
+    reason = "the native boundary owns concurrent access to the OS FILE_OBJECT flag word"
+)]
+unsafe extern "system" {
+    /// Observes only flag bits; retaining the file does not grant access to its other fields.
+    /// # Safety
+    /// `file` must remain a live FILE_OBJECT throughout this native atomic load.
+    pub(crate) fn ext4win_file_flags(file: wdk_sys::PFILE_OBJECT) -> wdk_sys::ULONG;
+    /// Adds bits without losing concurrent cache or lifecycle updates.
+    /// # Safety
+    /// `file` must remain live and the caller must own the transition represented by `flags`.
+    pub(crate) fn ext4win_file_set_flags(file: wdk_sys::PFILE_OBJECT, flags: wdk_sys::ULONG);
+}
+
 // The WDK copy has an external shared-memory contract and is not a compiler memcpy intrinsic.
 // Host tests execute the corresponding user-mode implementation of that same platform contract.
 #[cfg_attr(not(test), link(name = "volatileaccessk", kind = "static"))]

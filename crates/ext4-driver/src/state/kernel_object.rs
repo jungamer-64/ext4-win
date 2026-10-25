@@ -365,6 +365,32 @@ impl KernelFileObject {
         self.file_object
     }
 
+    /// Observes the native shared flag word without borrowing FILE_OBJECT storage.
+    #[expect(
+        unsafe_code,
+        reason = "the retaining operation encloses the native atomic flag load"
+    )]
+    fn flags(self) -> wdk_sys::ULONG {
+        unsafe {
+            // SAFETY: The identity's retaining operation keeps the FILE_OBJECT live. Native
+            // flag access is atomic and creates no Rust reference to externally mutable storage.
+            ffi::ext4win_file_flags(self.as_ptr())
+        }
+    }
+
+    /// Publishes owned flag transitions without overwriting independent native updates.
+    #[expect(
+        unsafe_code,
+        reason = "create or cleanup owns the selected flag bits while retaining the FILE_OBJECT"
+    )]
+    fn set_flags(self, flags: wdk_sys::ULONG) {
+        unsafe {
+            // SAFETY: The retaining operation owns these bits' transition. The native
+            // interlocked update preserves every concurrent update to the same flag word.
+            ffi::ext4win_file_set_flags(self.as_ptr(), flags);
+        }
+    }
+
     /// Requires one non-null I/O Manager VPB before another FILE_OBJECT's driver contexts are read.
     #[expect(
         unsafe_code,
@@ -397,10 +423,7 @@ impl KernelFileObject {
         sections: *mut wdk_sys::SECTION_OBJECT_POINTERS,
         flags: wdk_sys::ULONG,
     ) {
-        unsafe {
-            // SAFETY: Sole create attachment owns these flag bits and preserves existing OS flags.
-            (*self.as_ptr()).Flags |= flags;
-        }
+        self.set_flags(flags);
         unsafe {
             // SAFETY: The caller transfers the prepared stream header's lifetime to this open.
             (*self.as_ptr()).FsContext = header;
@@ -431,16 +454,8 @@ impl KernelFileObject {
 
 impl ActiveFileObject<'_> {
     /// Copies flags without borrowing the externally mutable FILE_OBJECT.
-    #[expect(
-        unsafe_code,
-        reason = "the active IRP retains the FILE_OBJECT for this field read"
-    )]
     pub(crate) fn flags(self) -> wdk_sys::ULONG {
-        unsafe {
-            // SAFETY: The active owner retains this initialized field; lifecycle and position
-            // mutations remain serialized by the existing handle protocol.
-            (*self.as_ptr()).Flags
-        }
+        self.address().flags()
     }
 
     /// Copies the filesystem-owned stream header identity.
@@ -509,16 +524,8 @@ impl ActiveFileObject<'_> {
     }
 
     /// Publishes completion of every cleanup-owned release as the final cleanup mutation.
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
     pub(crate) fn mark_cleanup_complete(self) {
-        unsafe {
-            // SAFETY: Cleanup is the unique lifecycle transition that publishes this
-            // filesystem-owned flag while the active IRP keeps the FILE_OBJECT live.
-            (*self.as_ptr()).Flags |= wdk_sys::FO_CLEANUP_COMPLETE;
-        }
+        self.address().set_flags(wdk_sys::FO_CLEANUP_COMPLETE);
     }
 
     /// Decodes the I/O Manager's close reason from stable FILE_OBJECT flags.
@@ -659,5 +666,106 @@ impl KernelVpb {
     /// Returns the non-null VPB pointer for mount-time device initialization.
     pub(crate) const fn as_non_null(self) -> NonNull<wdk_sys::VPB> {
         self.vpb
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Retains native storage without creating a Rust borrow of its concurrently updated word.
+    struct SharedFlagFile {
+        /// Only Flags is accessed after scoped threads start, through the production boundary.
+        file: UnsafeCell<FILE_OBJECT>,
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the fixture exposes only native atomic flag operations until every scoped thread joins"
+    )]
+    // SAFETY: Construction precedes sharing; every subsequent access uses the native flag
+    // boundary, and scoped joins precede destruction. No other FILE_OBJECT field is accessed.
+    unsafe impl Sync for SharedFlagFile {}
+
+    impl SharedFlagFile {
+        /// The scoped owner retains the cell's initialized FILE_OBJECT through every native call.
+        fn identity(&self) -> KernelFileObject {
+            KernelFileObject {
+                file_object: NonNull::from(&self.file).cast(),
+            }
+        }
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the regression executes the same native clear operation used by cache uninitialization"
+    )]
+    unsafe extern "system" {
+        /// # Safety
+        /// The live FILE_OBJECT must be retained and the caller must own the cleared bits.
+        fn ext4win_file_clear_flags(file: wdk_sys::PFILE_OBJECT, flags: wdk_sys::ULONG);
+    }
+
+    /// # Errors
+    /// Returns failure of either joined flag-update worker.
+    /// # Panics
+    /// Fails if cache updates lose lifecycle or OS bits, or snapshots observe a revoked cleanup bit.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the scoped native fixture owns its cache bit while Rust exercises production flag observations"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture and join failures propagate while assertions check concurrent native flag semantics"
+    )]
+    fn cache_flags_preserve_concurrent_cleanup_and_admission_observations() -> DriverResult<()> {
+        let stable = wdk_sys::FO_HANDLE_CREATED | wdk_sys::FO_SYNCHRONOUS_IO;
+        let shared = SharedFlagFile {
+            file: UnsafeCell::new(FILE_OBJECT {
+                Flags: stable,
+                ..FILE_OBJECT::default()
+            }),
+        };
+        let start = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| -> DriverResult<()> {
+            let cache = scope.spawn(|| {
+                let file = shared.identity();
+                start.wait();
+                for _ in 0..16_384 {
+                    file.set_flags(wdk_sys::FO_CACHE_SUPPORTED);
+                    unsafe {
+                        // SAFETY: The scoped fixture retains the exact file, and this worker
+                        // uniquely owns cache support transitions through the production C API.
+                        ext4win_file_clear_flags(file.as_ptr(), wdk_sys::FO_CACHE_SUPPORTED);
+                    }
+                }
+            });
+            let cleanup = scope.spawn(|| {
+                let file = shared.identity();
+                start.wait();
+                for _ in 0..16_384 {
+                    file.set_flags(wdk_sys::FO_CLEANUP_COMPLETE);
+                }
+            });
+            let file = shared.identity();
+            let mut cleanup_observed = false;
+            start.wait();
+            for _ in 0..16_384 {
+                let flags = file.flags();
+                assert_eq!(flags & stable, stable);
+                let cleaned = flags & wdk_sys::FO_CLEANUP_COMPLETE != 0;
+                assert!(!cleanup_observed || cleaned);
+                cleanup_observed |= cleaned;
+            }
+            cache
+                .join()
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            cleanup
+                .join()
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            assert_eq!(file.flags(), stable | wdk_sys::FO_CLEANUP_COMPLETE);
+            Ok(())
+        })
     }
 }

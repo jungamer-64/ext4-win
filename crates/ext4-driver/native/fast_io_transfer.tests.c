@@ -78,6 +78,8 @@ static void ext4win_trace_fallback(PEXT4WIN_STREAM_CONTEXT observed, unsigned ev
 { ext4win_trace_selected(observed, event); }
 static BOOLEAN ext4win_handle_allows_cached_write(PVOID context)
 { assert(context == &file); return TRUE; }
+static ULONG ext4win_file_flags(PFILE_OBJECT observed)
+{ assert(observed == &file); return observed->Flags; }
 
 static BOOLEAN CcCopyRead(PFILE_OBJECT observed, PLARGE_INTEGER position, ULONG length,
     BOOLEAN wait, PVOID output, PIO_STATUS_BLOCK result)

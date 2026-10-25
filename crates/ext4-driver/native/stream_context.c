@@ -1,6 +1,7 @@
 #include <ntifs.h>
 #include "executive_resource.h"
 #include "operational_trace.h"
+#include "file_object_flags.h"
 
 #define EXT4WIN_STREAM_POOL_TAG ((ULONG)0x53743445UL)
 #define EXT4WIN_STREAM_SIGNATURE ((ULONG)0x53463445UL)
@@ -311,7 +312,7 @@ ext4win_stream_fast_io_candidate(
     volume = stream->VolumeStream;
     if (volume == NULL) { return FALSE; }
     *stream_out = stream;
-    return ext4win_fast_io_admit(file_object->Flags, file_object->PrivateCacheMap != NULL,
+    return ext4win_fast_io_admit(ext4win_file_flags(file_object), file_object->PrivateCacheMap != NULL,
         ext4win_storage_media_state(volume->RustState), ext4win_storage_close_phase(volume->RustState),
         (UCHAR)ext4win_section_phase(stream->SectionState), ext4win_storage_io_policy(volume->RustState));
 }
@@ -839,7 +840,7 @@ ext4win_stream_cache_initialize(
                     FALSE,
                     &ext4win_cache_callbacks,
                     &stream->Header);
-                file_object->Flags |= FO_CACHE_SUPPORTED;
+                ext4win_file_set_flags(file_object, FO_CACHE_SUPPORTED);
             }
             __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
                 status = GetExceptionCode();
@@ -1043,7 +1044,7 @@ ext4win_stream_cache_uninitialize(
     status = STATUS_SUCCESS;
     __try {
         (VOID)CcUninitializeCacheMap(file_object, NULL, NULL);
-        file_object->Flags &= ~FO_CACHE_SUPPORTED;
+        ext4win_file_clear_flags(file_object, FO_CACHE_SUPPORTED);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = GetExceptionCode();
@@ -1079,7 +1080,7 @@ ext4win_acquire_fast_io_query_stream(
     PEXT4WIN_STREAM_CONTEXT stream;
 
     if (!ext4win_stream_fast_io_stream(file_object, &stream) || (stream->VolumeStream == NULL)) { return FALSE; }
-    if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
+    if (!ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
         (UCHAR)ext4win_section_phase(stream->SectionState),
@@ -1090,7 +1091,7 @@ ext4win_acquire_fast_io_query_stream(
     else if (!ext4win_acquire_resource_shared(&stream->MainResource, FALSE)) {
         return FALSE;
     }
-    if (!ext4win_fast_io_query_admit(file_object->Flags, file_object->ReadAccess,
+    if (!ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
         (UCHAR)ext4win_section_phase(stream->SectionState),
@@ -1452,7 +1453,7 @@ ext4win_prepare_mdl_write(
     BOOLEAN handled;
 
     if ((mdl_chain == NULL) || (io_status == NULL) || (file_offset == NULL) ||
-        ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
+        ((ext4win_file_flags(file_object) & FO_WRITE_THROUGH) != 0) ||
         !ext4win_stream_fast_io_candidate(file_object, &stream) ||
         !ext4win_handle_allows_cached_write(file_object->FsContext2)) {
         return FALSE;
@@ -1668,7 +1669,7 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     output->WritableData = (stream->MetadataValid != 0) && (stream->PublishedMetadata.WritableData != 0);
     output->Archive = (stream->MetadataValid != 0) && ((stream->PublishedMetadata.FileAttributes & FILE_ATTRIBUTE_ARCHIVE) != 0);
     ExReleaseFastMutex(&stream->HeaderMutex);
-    output->Flags = file->Flags;
+    output->Flags = ext4win_file_flags(file);
     output->Cached = file->PrivateCacheMap != NULL;
     output->Media = ext4win_storage_media_state(volume->RustState);
     output->Close = ext4win_storage_close_phase(volume->RustState);

@@ -67,7 +67,7 @@ ext4win_fast_io_read(
     __try {
         handled = CcCopyRead(file_object, file_offset, length, wait, buffer, io_status);
         if (handled && NT_SUCCESS(io_status->Status) &&
-            ((file_object->Flags & FO_SYNCHRONOUS_IO) != 0)) {
+            ((ext4win_file_flags(file_object) & FO_SYNCHRONOUS_IO) != 0)) {
             file_object->CurrentByteOffset.QuadPart = file_offset->QuadPart + io_status->Information;
         }
     }
@@ -104,7 +104,7 @@ ext4win_fast_io_write(
 
     if ((buffer == NULL) || (io_status == NULL) || (file_offset == NULL) ||
         !wait ||
-        ((file_object->Flags & FO_WRITE_THROUGH) != 0) ||
+        ((ext4win_file_flags(file_object) & FO_WRITE_THROUGH) != 0) ||
         !ext4win_stream_fast_io_candidate(file_object, &stream) ||
         !ext4win_handle_allows_cached_write(file_object->FsContext2)) {
         return FALSE;
@@ -121,7 +121,7 @@ ext4win_fast_io_write(
         if (handled) {
             io_status->Status = STATUS_SUCCESS;
             io_status->Information = length;
-            if ((file_object->Flags & FO_SYNCHRONOUS_IO) != 0) {
+            if ((ext4win_file_flags(file_object) & FO_SYNCHRONOUS_IO) != 0) {
                 file_object->CurrentByteOffset.QuadPart = file_offset->QuadPart + length;
             }
         }
