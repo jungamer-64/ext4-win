@@ -78,6 +78,29 @@ fn inject_range(fixture: &mut Fixture, physical: u32) -> Result<u32> {
             .map_err(|_| Error::DeviceRange)?,
     ));
     let prefix = 128_usize.checked_add(extra).ok_or(Error::DeviceRange)?;
+    let mut add = [0; 16];
+    put(&mut add, 0, &inode.to_le_bytes())?;
+    put(&mut add, 8, &1_u16.to_le_bytes())?;
+    put(&mut add, 12, &physical.to_le_bytes())?;
+    // A deletion spanning sparse logical space must visit mapped extents, not every logical block.
+    let mut del = [0; 12];
+    put(&mut del, 0, &inode.to_le_bytes())?;
+    put(&mut del, 4, &1_u32.to_le_bytes())?;
+    put(&mut del, 8, &u32::MAX.to_le_bytes())?;
+    let mut image = Vec::new();
+    image
+        .try_reserve_exact(prefix.checked_add(4).ok_or(Error::DeviceRange)?)
+        .map_err(|_| Error::OutOfMemory)?;
+    image.extend_from_slice(&inode.to_le_bytes());
+    image.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
+    install_delta(fixture, &[(1, &add), (2, &del), (6, &image)])?;
+    Ok(prior)
+}
+
+/// Installs a complete reserved-area wire vector without a production journal encoder.
+/// # Errors
+/// Returns fixture geometry, record width or independent checksum construction failure.
+fn install_delta(fixture: &mut Fixture, records: &[(u16, &[u8])]) -> Result<()> {
     let journal = &mut fixture.disk.journal;
     let raw_sb = journal
         .get_mut(JOURNAL_SUPER..JOURNAL_SUPER + 4096)
@@ -100,24 +123,9 @@ fn inject_range(fixture: &mut Fixture, physical: u32) -> Result<u32> {
     let mut head = [0; 8];
     put(&mut head, 4, &tid.to_le_bytes())?;
     record(&mut block, &mut at, 9, &head)?;
-    let mut add = [0; 16];
-    put(&mut add, 0, &inode.to_le_bytes())?;
-    put(&mut add, 8, &1_u16.to_le_bytes())?;
-    put(&mut add, 12, &physical.to_le_bytes())?;
-    record(&mut block, &mut at, 1, &add)?;
-    // A deletion spanning sparse logical space must visit mapped extents, not every logical block.
-    let mut del = [0; 12];
-    put(&mut del, 0, &inode.to_le_bytes())?;
-    put(&mut del, 4, &1_u32.to_le_bytes())?;
-    put(&mut del, 8, &u32::MAX.to_le_bytes())?;
-    record(&mut block, &mut at, 2, &del)?;
-    let mut image = Vec::new();
-    image
-        .try_reserve_exact(prefix.checked_add(4).ok_or(Error::DeviceRange)?)
-        .map_err(|_| Error::OutOfMemory)?;
-    image.extend_from_slice(&inode.to_le_bytes());
-    image.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
-    record(&mut block, &mut at, 6, &image)?;
+    for (tag, value) in records {
+        record(&mut block, &mut at, *tag, value)?;
+    }
     put(&mut block, at, &8_u16.to_le_bytes())?;
     let length = 4096_usize
         .checked_sub(at)
@@ -139,7 +147,7 @@ fn inject_range(fixture: &mut Fixture, physical: u32) -> Result<u32> {
     let crc = fixture_crc32c(0, block.get(..crc_end).ok_or(Error::DeviceRange)?);
     put(&mut block, crc_end, &crc.to_le_bytes())?;
     put(journal, first, &block)?;
-    Ok(prior)
+    Ok(())
 }
 
 /// Reads the independently encoded group-zero block bitmap.
@@ -272,5 +280,187 @@ fn conflicting_mapping_is_rejected_before_any_recovery_write() -> Result<()> {
         Err(Error::ClusterReferenceConflict)
     ));
     assert_eq!(fixture.disk.storage_effects, 0);
+    Ok(())
+}
+
+/// Records an existing inode's final count and a name transition as independent TLV postconditions.
+/// # Errors
+/// Returns inode geometry, metadata width, record bounds or checksum construction failure.
+fn inject_binding(
+    fixture: &mut Fixture,
+    parent: DirectoryNodeId,
+    target: FileNodeId,
+    from: &[u8],
+    to: &[u8],
+) -> Result<()> {
+    let inode = NodeId::File(target).file_index();
+    let offset = fixture_inode_offset(&fixture.disk, NodeId::File(target))?;
+    let raw = fixture
+        .disk
+        .filesystem
+        .get(offset..offset.checked_add(256).ok_or(Error::DeviceRange)?)
+        .ok_or(Error::DeviceRange)?;
+    let prefix = 128_usize
+        .checked_add(usize::from(u16::from_le_bytes(
+            raw.get(128..130)
+                .ok_or(Error::DeviceRange)?
+                .try_into()
+                .map_err(|_| Error::DeviceRange)?,
+        )))
+        .ok_or(Error::DeviceRange)?;
+    let mut image = inode.to_le_bytes().to_vec();
+    image.extend_from_slice(raw.get(..prefix).ok_or(Error::DeviceRange)?);
+    let binding = |name: &[u8]| -> Vec<u8> {
+        let mut value = NodeId::Directory(parent)
+            .file_index()
+            .to_le_bytes()
+            .to_vec();
+        value.extend_from_slice(&inode.to_le_bytes());
+        value.extend_from_slice(name);
+        value
+    };
+    let link = binding(to);
+    let unlink = binding(from);
+    install_delta(fixture, &[(4, &link), (5, &unlink), (6, &image)])
+}
+
+/// # Errors
+/// Propagates ordinary HTree construction, independent log injection and mount failures.
+/// # Panics
+/// Fails if namespace replay changes final link counts or routes an indexed entry incorrectly.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare final name bindings and independent inode link-count fields"
+)]
+fn namespace_postconditions_preserve_final_counts_in_linear_and_indexed_directories() -> Result<()>
+{
+    for indexed in [false, true] {
+        let mut fixture = Fixture::new()?;
+        if indexed {
+            fixture.mutate(|pass| {
+                let root = pass.directory(DirectoryNodeId::ROOT)?;
+                for index in 0_u8..24 {
+                    let mut name = [b'x'; 240];
+                    *name.get_mut(0).ok_or(Error::InvalidName)? =
+                        b'a'.checked_add(index).ok_or(Error::InvalidName)?;
+                    pass.create_file(
+                        root,
+                        &Ext4Name::new(&name)?,
+                        NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+                    )?;
+                }
+                Ok(())
+            })?;
+            let root =
+                fixture_inode_offset(&fixture.disk, NodeId::Directory(DirectoryNodeId::ROOT))?;
+            assert_ne!(
+                fixture_u32(
+                    &fixture.disk.filesystem,
+                    root.checked_add(32).ok_or(Error::DeviceRange)?
+                )? & 0x1000,
+                0
+            );
+        }
+        let file = fixture.a;
+        for _ in 0..2 {
+            inject_binding(
+                &mut fixture,
+                DirectoryNodeId::ROOT,
+                file,
+                b"concurrent-a",
+                b"delta-renamed",
+            )?;
+            fixture.remount()?;
+            assert!(matches!(
+                fixture.read(|pass| pass
+                    .lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"concurrent-a")?))?,
+                ChildLookup::NotFound
+            ));
+            assert!(
+                matches!(fixture.read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"delta-renamed")?))?, ChildLookup::Found(child) if *child.node() == NodeId::File(file))
+            );
+            let offset = fixture_inode_offset(&fixture.disk, NodeId::File(file))?
+                .checked_add(26)
+                .ok_or(Error::DeviceRange)?;
+            let end = offset.checked_add(2).ok_or(Error::DeviceRange)?;
+            let links = u16::from_le_bytes(
+                fixture
+                    .disk
+                    .filesystem
+                    .get(offset..end)
+                    .ok_or(Error::DeviceRange)?
+                    .try_into()
+                    .map_err(|_| Error::DeviceRange)?,
+            );
+            assert_eq!(links, 1);
+        }
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates casefold admission, child creation, independent log injection and mount failures.
+/// # Panics
+/// Fails if logged plaintext names lose their parent's comparison rules or recorded spelling.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare recovered spelling and Unicode lookup equivalence"
+)]
+fn namespace_postconditions_use_the_admitted_parent_comparison() -> Result<()> {
+    let mut fixture = casefold_fixture(0, 1)?;
+    let (parent, file) = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let directory = pass.create_directory(
+            root,
+            &Ext4Name::new(b"delta-folded")?,
+            NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+        )?;
+        pass.set_directory_casefold(directory, DirectoryCasefold::Enabled)?;
+        let file = pass.create_file(
+            directory,
+            &Ext4Name::new(b"original")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o644)?),
+        )?;
+        Ok((directory.id(), file.id()))
+    })?;
+    inject_binding(&mut fixture, parent, file, b"original", "Straße".as_bytes())?;
+    fixture.remount()?;
+    assert!(
+        matches!(fixture.read(|pass| pass.lookup_child(parent, &Ext4Name::new(b"STRASSE")?))?, ChildLookup::Found(child) if child.name().bytes() == "Straße".as_bytes() && *child.node() == NodeId::File(file))
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Propagates independent records and production mount recovery failures.
+/// # Panics
+/// Fails if replay removes a replacement binding owned by a different inode.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify conditional unlink through the final namespace"
+)]
+fn conditional_unlink_preserves_a_different_inode_at_the_same_name() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = fixture.a;
+    let b = fixture.b;
+    inject_binding(
+        &mut fixture,
+        DirectoryNodeId::ROOT,
+        b,
+        b"concurrent-a",
+        b"concurrent-b",
+    )?;
+    fixture.remount()?;
+    for (name, target) in [
+        (b"concurrent-a".as_slice(), a),
+        (b"concurrent-b".as_slice(), b),
+    ] {
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(name)?))?, ChildLookup::Found(child) if *child.node() == NodeId::File(target))
+        );
+    }
     Ok(())
 }

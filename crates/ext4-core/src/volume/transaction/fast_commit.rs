@@ -1,6 +1,8 @@
 //! Reconstructs logical mapping postconditions before publishing any allocation or inode state.
 use super::*;
-use crate::disk_format::journal::fast_commit::{DeltaProgram, LogicalRange, ParsedDelta};
+use crate::disk_format::journal::fast_commit::{
+    DeltaProgram, LogicalRange, NamespaceChange, ParsedDelta,
+};
 use crate::volume::fast_commit::ResolvedDeltaImages;
 
 /// A changed inode owns its original tree until final data accounting is known for the whole log.
@@ -8,64 +10,42 @@ use crate::volume::fast_commit::ResolvedDeltaImages;
 struct ReplayInode {
     /// Final metadata is private and cannot be observed before the full replacement commit.
     raw: LiveInodeRecord,
-    /// Only range-targeted inodes need tree reconstruction and a derived allocation charge.
+    /// Extent storage always derives its allocation charge independently of recorded i_blocks.
     tree: Option<MutableExtentTree>,
 }
 
 /// Applies complete, ordered mapping assignments while deriving bitmap changes from final ownership.
 /// # Errors
-/// Rejects unsupported namespace edits, invalid allocation, layout, capacity or source-I/O failure.
-pub(in crate::volume) fn resolve_delta_ranges(
+/// Rejects unsupported creation/terminal unlink, invalid allocation, layout, capacity or source-I/O failure.
+pub(in crate::volume) fn resolve_delta_postconditions(
     volume: EpochReadView<'_, '_>,
     program: &DeltaProgram,
 ) -> Result<ResolvedDeltaImages> {
-    if program
-        .records()
-        .iter()
-        .any(|record| matches!(record, ParsedDelta::Namespace { .. }))
-    {
-        return Err(Error::UnsupportedJournal);
+    for record in program.records() {
+        if let ParsedDelta::Namespace { change, inode, .. } = record
+            && (*change == NamespaceChange::Create
+                || !program.records().iter().any(
+                    |record| matches!(record, ParsedDelta::Inode { inode: id, .. } if id == inode),
+                ))
+        {
+            return Err(Error::UnsupportedJournal);
+        }
     }
     let allocation = AllocationExclusionSource::recovery(volume.superblock, program)?;
     let mut mutation = MetadataMutation::begin(volume, allocation);
     let mut inodes: Vec<ReplayInode> = Vec::new();
     for record in program.records() {
-        let id = match record {
+        match record {
             ParsedDelta::AddRange { inode, .. }
             | ParsedDelta::RemoveRange { inode, .. }
-            | ParsedDelta::Inode { inode, .. } => *inode,
-            ParsedDelta::Namespace { .. } => return Err(Error::UnsupportedJournal),
-        };
-        if inodes.iter().any(|inode| inode.raw.id() == id) {
-            continue;
-        }
-        let mut raw = mutation.volume.read_live_inode_record(id)?;
-        let ranges = program.records().iter().any(|record| matches!(record, ParsedDelta::AddRange { inode, .. } | ParsedDelta::RemoveRange { inode, .. } if *inode == id));
-        let tree = if ranges {
-            let inode = raw.parse()?;
-            if inode.kind() != InodeKind::File {
-                return Err(Error::UnsupportedJournal);
+            | ParsedDelta::Inode { inode, .. } => {
+                prepare_inode(&mut mutation, &mut inodes, program, *inode)?
             }
-            Some(mutation.mutable_extent_tree(&inode)?)
-        } else {
-            None
-        };
-        if let Some(encoded) = program
-            .records()
-            .iter()
-            .rev()
-            .find_map(|record| match record {
-                ParsedDelta::Inode { inode, encoded } if *inode == id => Some(encoded),
-                _ => None,
-            })
-        {
-            raw = if ranges {
-                raw.restore_extent_delta_metadata(encoded)?
-            } else {
-                raw.apply_metadata_delta(encoded)?
-            };
+            ParsedDelta::Namespace { parent, inode, .. } => {
+                prepare_inode(&mut mutation, &mut inodes, program, *parent)?;
+                prepare_inode(&mut mutation, &mut inodes, program, *inode)?;
+            }
         }
-        inodes.try_push(ReplayInode { raw, tree })?;
     }
     for inode in &mut inodes {
         let Some(tree) = &mut inode.tree else {
@@ -107,14 +87,62 @@ pub(in crate::volume) fn resolve_delta_ranges(
         let mut raw = inode.raw;
         if let Some(tree) = inode.tree {
             mutation.stage_extent_tree(&mut raw, tree)?;
+        } else {
+            mutation.set_inode_allocation_size(&mut raw, None)?;
         }
         mutation
             .inode_updates
             .try_push(StagedInodeRecord::Live(raw))?;
     }
+    for record in program.records() {
+        if let ParsedDelta::Namespace {
+            change,
+            parent,
+            inode,
+            name,
+        } = record
+        {
+            mutation.replay_directory_binding(*parent, *inode, name, *change)?;
+        }
+    }
     let (_references, superblock) = mutation.committed_cluster_state()?;
     let images = mutation.recovery_images()?;
     Ok(ResolvedDeltaImages { superblock, images })
+}
+
+/// Shares final metadata admission across both operands of a namespace edit and range targets.
+/// # Errors
+/// Returns source reads, unsupported storage, invalid final metadata or allocation failure.
+fn prepare_inode(
+    mutation: &mut MetadataMutation<'_, '_>,
+    inodes: &mut Vec<ReplayInode>,
+    program: &DeltaProgram,
+    id: InodeId,
+) -> Result<()> {
+    if inodes.iter().any(|inode| inode.raw.id() == id) {
+        return Ok(());
+    }
+    let mut raw = mutation.volume.read_live_inode_record(id)?;
+    let inode = raw.parse()?;
+    let tree = if matches!(inode.storage(), InodeStorage::Extents(_)) {
+        Some(mutation.mutable_extent_tree(&inode)?)
+    } else {
+        None
+    };
+    if tree.is_none() && program.records().iter().any(|record| matches!(record, ParsedDelta::AddRange { inode, .. } | ParsedDelta::RemoveRange { inode, .. } if *inode == id)) { return Err(Error::UnsupportedJournal); }
+    if let Some(encoded) = program
+        .records()
+        .iter()
+        .rev()
+        .find_map(|record| match record {
+            ParsedDelta::Inode { inode, encoded } if *inode == id => Some(encoded),
+            _ => None,
+        })
+    {
+        raw = raw.restore_delta_metadata(encoded)?;
+    }
+    inodes.try_push(ReplayInode { raw, tree })?;
+    Ok(())
 }
 
 /// Preserves extent initialization and checked coordinate origins while retaining one subinterval.

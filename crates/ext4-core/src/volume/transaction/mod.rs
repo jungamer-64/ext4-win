@@ -6,7 +6,7 @@ use crate::volume::inode_record::ExtentInodeRecord;
 mod allocation;
 mod fast_commit;
 use allocation::AllocationExclusionSource;
-pub(super) use fast_commit::resolve_delta_ranges;
+pub(super) use fast_commit::resolve_delta_postconditions;
 mod commit;
 mod file_data;
 mod fscrypt;

@@ -448,6 +448,47 @@ impl LiveInodeRecord {
         Ok(Some((self.raw.offset(), prefix)))
     }
 
+    /// Restores final namespace metadata while extent reconstruction owns roots and allocation.
+    /// # Errors
+    /// Rejects zero-link, kind, storage flag, generation, attribute-owner or prefix-layout changes.
+    pub(super) fn restore_delta_metadata(mut self, encoded: &[u8]) -> Result<Self> {
+        let base = self.raw.bytes();
+        let prefix = if base.len() == 128 {
+            128
+        } else {
+            128_usize
+                .checked_add(usize::from(le_u16(base, disk_offset(128))?))
+                .ok_or(Error::InvalidInode)?
+        };
+        if encoded.len() != prefix
+            || prefix > base.len()
+            || le_u16(encoded, disk_offset(26))? == 0
+            || InodeMode::from_disk(le_u16(base, disk_offset(0))?)?.kind()
+                != InodeMode::from_disk(le_u16(encoded, disk_offset(0))?)?.kind()
+            || base.get(32..36) != encoded.get(32..36)
+            || base.get(100..108) != encoded.get(100..108)
+            || base.get(118..120) != encoded.get(118..120)
+            || (prefix > 128 && base.get(128..130) != encoded.get(128..130))
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        if !matches!(self.parse()?.storage(), InodeStorage::Extents(_))
+            && base.get(40..100) != encoded.get(40..100)
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        for span in [0..28, 32..40, 100..116, 118..prefix] {
+            memory::copy_exact(
+                self.raw
+                    .bytes
+                    .get_mut(span.clone())
+                    .ok_or(Error::InvalidInode)?,
+                encoded.get(span).ok_or(Error::InvalidInode)?,
+            )?;
+        }
+        self.raw.into_live()
+    }
+
     /// Storage facts passed to the final allocation release boundary without copying the record.
     pub(super) const fn raw(&self) -> &RawInodeRecord<Vec<u8>> {
         &self.raw
@@ -1447,7 +1488,7 @@ mod tests {
                 .get_mut(116..118)
                 .ok_or(Error::InvalidInode)?
                 .fill(0xff);
-            let replayed = original.restore_extent_delta_metadata(&encoded)?;
+            let replayed = original.restore_delta_metadata(&encoded)?;
             assert_eq!(mode(replayed.raw()), Ok(MODE_REGULAR | 0o600));
             assert_eq!(replayed.raw.bytes().get(40..100), Some(root.as_slice()));
             assert_eq!(le_u32(replayed.raw.bytes(), disk_offset(28))?, 0);
@@ -1469,16 +1510,21 @@ mod tests {
                 disk_offset(INODE_MODE_OFFSET),
                 MODE_REGULAR | 0o600,
             )?;
-            let replayed = original.apply_metadata_delta(&encoded)?;
+            let replayed = original.restore_delta_metadata(&encoded)?;
             assert_eq!(mode(replayed.raw()), Ok(MODE_REGULAR | 0o600));
-            let replayed = replayed.apply_metadata_delta(&encoded)?;
+            let replayed = replayed.restore_delta_metadata(&encoded)?;
             assert_eq!(replayed.raw.bytes(), encoded);
             let mut changed_mapping = memory::copied_slice(&encoded)?;
             *changed_mapping.get_mut(40).ok_or(Error::InvalidInode)? ^= 1;
-            assert_eq!(
-                replayed.apply_metadata_delta(&changed_mapping),
-                Err(Error::UnsupportedJournal)
-            );
+            let root = memory::copied_slice(
+                replayed
+                    .raw
+                    .bytes()
+                    .get(40..100)
+                    .ok_or(Error::InvalidInode)?,
+            )?;
+            let replayed = replayed.restore_delta_metadata(&changed_mapping)?;
+            assert_eq!(replayed.raw.bytes().get(40..100), Some(root.as_slice()));
             Ok(())
         })();
         assert_eq!(result, Ok(()));

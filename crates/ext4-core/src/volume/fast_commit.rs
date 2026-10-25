@@ -5,7 +5,7 @@ use super::orphan::ValidatedOrphanInventory;
 use super::scope::*;
 use super::transaction::StorageRequestSequence;
 use crate::disk::storage::{StorageTarget, StorageTranscript};
-use crate::disk_format::journal::{DeltaRecoverySeed, fast_commit::ParsedDelta};
+use crate::disk_format::journal::DeltaRecoverySeed;
 
 /// Effect-free postimages carry no journal or mount-publication authority.
 #[derive(Debug)]
@@ -19,8 +19,8 @@ pub(super) struct ResolvedDeltaImages {
 /// Each phase owns its snapshot and its unique recovery continuation across lower reads.
 #[derive(Debug)]
 enum DeltaReplayPhase {
-    /// Classify dependencies and resolve metadata-only programs without an allocation snapshot.
-    Inspect {
+    /// Admit the original orphan inventory before interpreting prospective metadata.
+    ReadOrphans {
         /// Descriptor and inode decoding stay bound to freshly revalidated checkpoint geometry.
         superblock: Superblock,
         /// The original durable log remains authoritative while preparation can fail.
@@ -90,7 +90,7 @@ impl DeltaReplayOperation {
         seed.require_filesystem(&superblock)?;
         Ok(Self {
             transcript: StorageTranscript::new(StorageTarget::Filesystem, length),
-            phase: DeltaReplayPhase::Inspect { superblock, seed },
+            phase: DeltaReplayPhase::ReadOrphans { superblock, seed },
         })
     }
 
@@ -103,7 +103,7 @@ impl DeltaReplayOperation {
             | DeltaReplayPhase::IndexCandidate { candidate, .. } => {
                 completion.apply_overlay(&candidate.images)?
             }
-            DeltaReplayPhase::Inspect { .. }
+            DeltaReplayPhase::ReadOrphans { .. }
             | DeltaReplayPhase::IndexBase { .. }
             | DeltaReplayPhase::Resolve { .. } => completion,
             DeltaReplayPhase::Ready(_) | DeltaReplayPhase::Failed => return Err(Error::DeviceIo),
@@ -121,50 +121,29 @@ impl DeltaReplayOperation {
         loop {
             let phase = core::mem::replace(&mut self.phase, DeltaReplayPhase::Failed);
             let result = match phase {
-                DeltaReplayPhase::Inspect { superblock, seed } => {
+                DeltaReplayPhase::ReadOrphans { superblock, seed } => {
                     let mut view = EpochReadView::mounting(
                         OperationDevice::new(&mut self.transcript),
                         superblock,
                         keys,
                     );
-                    if seed
-                        .program()
-                        .records()
-                        .iter()
-                        .all(|record| matches!(record, ParsedDelta::Inode { .. }))
-                    {
-                        match resolve_metadata(&mut view, &seed) {
-                            Ok(candidate) => {
-                                self.transcript = StorageTranscript::new(
-                                    StorageTarget::Filesystem,
-                                    self.transcript.len(),
-                                );
-                                self.phase = DeltaReplayPhase::CandidateOrphans { seed, candidate };
-                                Ok(())
-                            }
-                            Err(error) => {
-                                self.phase = DeltaReplayPhase::Inspect { superblock, seed };
-                                Err(error)
-                            }
+                    match ValidatedOrphanInventory::load(&mut view) {
+                        Ok(orphans) => {
+                            self.phase = DeltaReplayPhase::IndexBase {
+                                superblock,
+                                seed,
+                                orphans,
+                                index: memory::try_box(AllocationIndexBuild::new())?,
+                            };
+                            Ok(())
                         }
-                    } else {
-                        match ValidatedOrphanInventory::load(&mut view) {
-                            Ok(orphans) => {
-                                self.phase = DeltaReplayPhase::IndexBase {
-                                    superblock,
-                                    seed,
-                                    orphans,
-                                    index: memory::try_box(AllocationIndexBuild::new())?,
-                                };
-                                Ok(())
-                            }
-                            Err(error) => {
-                                self.phase = DeltaReplayPhase::Inspect { superblock, seed };
-                                Err(error)
-                            }
+                        Err(error) => {
+                            self.phase = DeltaReplayPhase::ReadOrphans { superblock, seed };
+                            Err(error)
                         }
                     }
                 }
+
                 DeltaReplayPhase::IndexBase {
                     superblock,
                     seed,
@@ -200,7 +179,7 @@ impl DeltaReplayOperation {
                         keys,
                         &clusters,
                     );
-                    match super::transaction::resolve_delta_ranges(view, seed.program()) {
+                    match super::transaction::resolve_delta_postconditions(view, seed.program()) {
                         Ok(candidate) => {
                             self.transcript = StorageTranscript::new(
                                 StorageTarget::Filesystem,
@@ -297,38 +276,4 @@ impl DeltaReplayOperation {
             _ => Err(Error::DeviceIo),
         }
     }
-}
-
-/// Metadata-only records retain their original storage identity and attribute body.
-/// # Errors
-/// Returns suspended I/O, allocation, layout or unsupported semantic replay failure.
-fn resolve_metadata(
-    volume: &mut EpochReadView<'_, '_>,
-    seed: &DeltaRecoverySeed,
-) -> Result<ResolvedDeltaImages> {
-    let mut images = MetadataImages::new(volume.superblock.block_size());
-    let records = seed.program().records();
-    for (index, record) in records.iter().enumerate() {
-        let ParsedDelta::Inode { inode, encoded } = record else {
-            return Err(Error::UnsupportedJournal);
-        };
-        if records
-            .get(index.checked_add(1).ok_or(Error::ArithmeticOverflow)?..)
-            .ok_or(Error::JournalCorrupt)?
-            .iter()
-            .any(|later| matches!(later, ParsedDelta::Inode { inode: other, .. } if other == inode))
-        {
-            continue;
-        }
-        let live = volume
-            .read_live_inode_record(*inode)?
-            .apply_metadata_delta(encoded)?;
-        let mut staged = StagedInodeRecord::Live(live);
-        staged.refresh_checksum(&volume.superblock)?;
-        images.patch(volume, staged.offset(), staged.bytes())?;
-    }
-    Ok(ResolvedDeltaImages {
-        superblock: volume.superblock,
-        images,
-    })
 }

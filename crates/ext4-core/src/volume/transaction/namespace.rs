@@ -142,8 +142,11 @@ impl MutationResolvePass<'_, '_, '_> {
             {
                 let tree = pass.mutation.mutable_extent_tree(&inode)?;
                 let checksum = pass.mutation.volume.directory_checksum(&inode);
-                let (physical, block) =
-                    pass.read_mutation_directory_block(&inode, &tree, LogicalBlock::from_u32(0))?;
+                let (physical, block) = pass.mutation.read_mutation_directory_block(
+                    &inode,
+                    &tree,
+                    LogicalBlock::from_u32(0),
+                )?;
                 let root = HtreeRoot::parse(
                     block.bytes(),
                     inode.id(),
@@ -178,7 +181,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     root.index(),
                     checksum,
                 )?;
-                pass.stage_directory_block(physical, bytes)?;
+                pass.mutation.stage_directory_block(physical, bytes)?;
             }
             raw.touch_metadata(pass.now)?;
             pass.mutation.replace_live_inode(index, raw)
@@ -428,7 +431,8 @@ impl MutationResolvePass<'_, '_, '_> {
                     DirectoryEntryEncoding::Standard,
                 )?;
                 directory.initialize_dot_entries(inode_id, parent.inode())?;
-                pass.stage_directory_block(block, directory.into_bytes())?;
+                pass.mutation
+                    .stage_directory_block(block, directory.into_bytes())?;
 
                 raw_inode
             };
@@ -831,8 +835,11 @@ impl MutationResolvePass<'_, '_, '_> {
             && matches!(name.bytes(), b"." | b"..")
         {
             let tree = self.mutation.mutable_extent_tree(&inode)?;
-            let (_physical, block) =
-                self.read_mutation_directory_block(&inode, &tree, LogicalBlock::from_u32(0))?;
+            let (_physical, block) = self.mutation.read_mutation_directory_block(
+                &inode,
+                &tree,
+                LogicalBlock::from_u32(0),
+            )?;
             let root = HtreeRoot::parse(
                 block.bytes(),
                 inode.id(),
@@ -955,13 +962,14 @@ impl MutationResolvePass<'_, '_, '_> {
         let block_size_u64 = u64::from(block_size.bytes());
         let block_count = round_up_div(parent_inode.size().bytes(), block_size_u64)?;
         for logical in 0..block_count {
-            let (physical, mut block) = self.read_mutation_directory_block(
+            let (physical, mut block) = self.mutation.read_mutation_directory_block(
                 &parent_inode,
                 &tree,
                 LogicalBlock::try_from(logical)?,
             )?;
             if block.insert(&entry)? {
-                self.stage_directory_block(physical, block.into_bytes())?;
+                self.mutation
+                    .stage_directory_block(physical, block.into_bytes())?;
                 raw_parent.touch_contents(self.now)?;
                 self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 return Ok(());
@@ -997,7 +1005,8 @@ impl MutationResolvePass<'_, '_, '_> {
         if !inserted {
             return Err(Error::InvalidDirectoryEntry);
         }
-        self.stage_directory_block(new_physical, block.into_bytes())?;
+        self.mutation
+            .stage_directory_block(new_physical, block.into_bytes())?;
         let new_parent_size = FileSize::from_bytes(
             parent_inode
                 .size()
@@ -1078,7 +1087,8 @@ impl MutationResolvePass<'_, '_, '_> {
             .block
             .remove(location.entry.name())?
             .ok_or(Error::DirectoryEntryNotFound)?;
-        self.stage_directory_block(location.physical, location.block.into_bytes())?;
+        self.mutation
+            .stage_directory_block(location.physical, location.block.into_bytes())?;
         raw_parent.touch_contents(self.now)?;
         self.mutation.replace_live_inode(inode_index, raw_parent)?;
         Ok(removed)
@@ -1160,13 +1170,15 @@ impl MutationResolvePass<'_, '_, '_> {
                 .block
                 .remove(source.name())?
                 .ok_or(Error::DirectoryEntryNotFound)?;
-            self.stage_directory_block(location.physical, location.block.into_bytes())?;
+            self.mutation
+                .stage_directory_block(location.physical, location.block.into_bytes())?;
             self.insert_htree_directory_entry(inode_index, raw_parent, &parent_inode, replacement)?;
             return Ok(removed);
         }
         match location.block.rename(source.name(), &replacement) {
             Ok(Some(removed)) => {
-                self.stage_directory_block(location.physical, location.block.into_bytes())?;
+                self.mutation
+                    .stage_directory_block(location.physical, location.block.into_bytes())?;
                 raw_parent.touch_contents(self.now)?;
                 self.mutation.replace_live_inode(inode_index, raw_parent)?;
                 Ok(removed)
@@ -1177,7 +1189,8 @@ impl MutationResolvePass<'_, '_, '_> {
                     .block
                     .remove(source.name())?
                     .ok_or(Error::DirectoryEntryNotFound)?;
-                self.stage_directory_block(location.physical, location.block.into_bytes())?;
+                self.mutation
+                    .stage_directory_block(location.physical, location.block.into_bytes())?;
                 self.add_directory_entry(parent, new_name, child, kind)?;
                 Ok(removed)
             }
@@ -1213,8 +1226,11 @@ impl MutationResolvePass<'_, '_, '_> {
             inode = raw.parse()?;
         }
         let tree = self.mutation.mutable_extent_tree(&inode)?;
-        let (physical, mut block) =
-            self.read_mutation_directory_block(&inode, &tree, LogicalBlock::from_u32(0))?;
+        let (physical, mut block) = self.mutation.read_mutation_directory_block(
+            &inode,
+            &tree,
+            LogicalBlock::from_u32(0),
+        )?;
         let (previous, bytes) = match inode.directory_storage_kind()? {
             DirectoryStorageKind::Linear => {
                 let previous = block.reparent(directory, parent)?;
@@ -1231,217 +1247,10 @@ impl MutationResolvePass<'_, '_, '_> {
                 (previous, bytes)
             }
         };
-        self.stage_directory_block(physical, bytes)?;
+        self.mutation.stage_directory_block(physical, bytes)?;
         raw.touch_contents(self.now)?;
         self.mutation.replace_live_inode(index, raw)?;
         Ok(previous)
-    }
-
-    /// Stages the latest image for a mutated directory block.
-    /// # Errors
-    ///
-    /// Returns an error when recording a new staged block image cannot allocate.
-    fn stage_directory_block(&mut self, block: BlockAddress, bytes: Vec<u8>) -> Result<()> {
-        if let Some(image) = self
-            .mutation
-            .directory_updates
-            .iter_mut()
-            .find(|image| image.block == block)
-        {
-            image.bytes = bytes;
-        } else {
-            self.mutation
-                .directory_updates
-                .try_push(BlockImage { block, bytes })?;
-        }
-        Ok(())
-    }
-
-    /// Reads one logical directory block, preferring this transaction's newest staged image.
-    /// # Errors
-    ///
-    /// Returns an error when the logical block is outside the semantic directory size, is not
-    /// physically mapped, has an invalid staged length, or cannot be read or allocated.
-    fn read_mutation_directory_block(
-        &mut self,
-        inode: &Inode,
-        tree: &MutableExtentTree,
-        logical: LogicalBlock,
-    ) -> Result<(BlockAddress, DirectoryBlock)> {
-        let block_count = round_up_div(
-            inode.size().bytes(),
-            u64::from(self.mutation.volume.superblock.block_size().bytes()),
-        )?;
-        if logical.as_u64() >= block_count {
-            return Err(Error::InvalidDirectoryEntry);
-        }
-        let physical = match tree.map_logical(logical) {
-            BlockMapping::Physical(physical) => physical,
-            BlockMapping::Uninitialized | BlockMapping::Hole => {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-        };
-        let block_size = self.mutation.volume.superblock.block_size();
-        let block_bytes =
-            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
-        let bytes = if let Some(staged) = self
-            .mutation
-            .directory_updates
-            .iter()
-            .find(|image| image.block == physical)
-        {
-            if staged.bytes.len() != block_bytes {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            memory::copied_slice(&staged.bytes)?
-        } else {
-            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
-            self.mutation
-                .volume
-                .device
-                .read_metadata_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
-            bytes
-        };
-        Ok((
-            physical,
-            DirectoryBlock::new(
-                bytes,
-                self.mutation.volume.directory_checksum(inode),
-                DirectoryEntryEncoding::for_inode(inode),
-            ),
-        ))
-    }
-
-    /// Builds one staged-aware HTree path for a primary hash.
-    /// # Errors
-    ///
-    /// Returns an error when the root or an interior node is malformed, the configured depth is
-    /// unsupported, a route cycles, or a selected block cannot be read.
-    fn mutation_htree_context(
-        &mut self,
-        inode: &Inode,
-        tree: &MutableExtentTree,
-        target: HtreePathTarget<'_>,
-    ) -> Result<HtreeMutationContext> {
-        let checksum = self.mutation.volume.directory_checksum(inode);
-        let (root_physical, root_block) =
-            self.read_mutation_directory_block(inode, tree, LogicalBlock::try_from(0_u64)?)?;
-        let root = HtreeRoot::parse(
-            root_block.bytes(),
-            inode.id(),
-            self.mutation.volume.superblock.directory_hash_seed(),
-            self.mutation.volume.superblock.directory_hash_signedness(),
-            self.mutation
-                .volume
-                .superblock
-                .directory_indexing()
-                .require_supported()?,
-            checksum,
-            DirectoryEntryEncoding::for_inode(inode),
-        )?;
-        let major = match target {
-            HtreePathTarget::Query(query) => query.major(
-                root.hash_profile(),
-                self.mutation.volume.superblock.name_semantics(inode)?,
-            )?,
-            HtreePathTarget::First => 0,
-        };
-        let mut levels = Vec::new();
-        levels.try_push(MutationHtreeLevel {
-            logical: 0,
-            physical: root_physical,
-            selected: root.index().select(major),
-            index: root.index().try_clone()?,
-        })?;
-        for _ in 0..root.indirect_levels() {
-            let logical = levels
-                .last()
-                .and_then(|level| level.index.entry(level.selected))
-                .map(|entry| entry.block())
-                .ok_or(Error::InvalidDirectoryEntry)?;
-            if levels.iter().any(|level| level.logical == logical) {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let (physical, block) = self.read_mutation_directory_block(
-                inode,
-                tree,
-                LogicalBlock::try_from(u64::from(logical))?,
-            )?;
-            let index = DxIndex::parse_node(block.bytes(), checksum)?;
-            levels.try_push(MutationHtreeLevel {
-                logical,
-                physical,
-                selected: index.select(major),
-                index,
-            })?;
-        }
-        Ok(HtreeMutationContext {
-            root,
-            root_bytes: root_block.into_bytes(),
-            path: MutationHtreePath { levels },
-        })
-    }
-
-    /// Advances a mutation path to the next leaf while keeping only the active root-to-leaf route.
-    /// # Errors
-    ///
-    /// Returns an error when the path is malformed, an interior route cycles, or a selected block
-    /// cannot be read and validated.
-    fn advance_mutation_htree_path(
-        &mut self,
-        inode: &Inode,
-        tree: &MutableExtentTree,
-        path: &mut MutationHtreePath,
-        indirect_levels: u8,
-    ) -> Result<bool> {
-        let expected_levels = usize::from(indirect_levels)
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
-        let Some(level_to_advance) = path.levels.iter().rposition(|level| {
-            level
-                .selected
-                .checked_add(1)
-                .is_some_and(|next| next < level.index.len())
-        }) else {
-            return Ok(false);
-        };
-        let level = path
-            .levels
-            .get_mut(level_to_advance)
-            .ok_or(Error::InvalidDirectoryEntry)?;
-        level.selected = level
-            .selected
-            .checked_add(1)
-            .ok_or(Error::ArithmeticOverflow)?;
-        path.levels.truncate(
-            level_to_advance
-                .checked_add(1)
-                .ok_or(Error::ArithmeticOverflow)?,
-        );
-        let checksum = self.mutation.volume.directory_checksum(inode);
-        while path.levels.len() < expected_levels {
-            let logical = path
-                .levels
-                .last()
-                .and_then(|level| level.index.entry(level.selected))
-                .map(|entry| entry.block())
-                .ok_or(Error::InvalidDirectoryEntry)?;
-            if path.levels.iter().any(|level| level.logical == logical) {
-                return Err(Error::InvalidDirectoryEntry);
-            }
-            let (physical, block) = self.read_mutation_directory_block(
-                inode,
-                tree,
-                LogicalBlock::try_from(u64::from(logical))?,
-            )?;
-            path.levels.try_push(MutationHtreeLevel {
-                logical,
-                physical,
-                index: DxIndex::parse_node(block.bytes(), checksum)?,
-                selected: 0,
-            })?;
-        }
-        Ok(true)
     }
 
     /// Finds an exact entry and returns only its mutable leaf block.
@@ -1462,7 +1271,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     u64::from(self.mutation.volume.superblock.block_size().bytes()),
                 )?;
                 for logical in 0..block_count {
-                    let (physical, block) = self.read_mutation_directory_block(
+                    let (physical, block) = self.mutation.read_mutation_directory_block(
                         inode,
                         &tree,
                         LogicalBlock::try_from(logical)?,
@@ -1488,14 +1297,17 @@ impl MutationResolvePass<'_, '_, '_> {
                 {
                     return Err(Error::InvalidDirectoryEntry);
                 }
-                let mut context =
-                    self.mutation_htree_context(inode, &tree, HtreePathTarget::Query(query))?;
+                let mut context = self.mutation.mutation_htree_context(
+                    inode,
+                    &tree,
+                    HtreePathTarget::Query(query),
+                )?;
                 let major = query.major(
                     context.root.hash_profile(),
                     self.mutation.volume.superblock.name_semantics(inode)?,
                 )?;
                 loop {
-                    let (physical, block) = self.read_mutation_directory_block(
+                    let (physical, block) = self.mutation.read_mutation_directory_block(
                         inode,
                         &tree,
                         LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
@@ -1517,7 +1329,7 @@ impl MutationResolvePass<'_, '_, '_> {
                             entry,
                         }));
                     }
-                    if !self.advance_mutation_htree_path(
+                    if !self.mutation.advance_mutation_htree_path(
                         inode,
                         &tree,
                         &mut context.path,
@@ -1548,13 +1360,13 @@ impl MutationResolvePass<'_, '_, '_> {
             return Err(Error::UnsupportedInodeMutation);
         }
         let checksum = self.mutation.volume.directory_checksum(parent_inode);
-        let mut context = self.mutation_htree_context(
+        let mut context = self.mutation.mutation_htree_context(
             parent_inode,
             &tree,
             HtreePathTarget::Query(DirectoryLookup::Stored(&entry)),
         )?;
         let leaf_logical = context.path.leaf()?;
-        let (leaf_physical, mut leaf) = self.read_mutation_directory_block(
+        let (leaf_physical, mut leaf) = self.mutation.read_mutation_directory_block(
             parent_inode,
             &tree,
             LogicalBlock::try_from(u64::from(leaf_logical))?,
@@ -1568,7 +1380,8 @@ impl MutationResolvePass<'_, '_, '_> {
                 .name_semantics(parent_inode)?,
         )?;
         if leaf.insert(&entry)? {
-            self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
+            self.mutation
+                .stage_directory_block(leaf_physical, leaf.into_bytes())?;
             raw_parent.touch_contents(self.now)?;
             return self.mutation.replace_live_inode(inode_index, raw_parent);
         }
@@ -1634,8 +1447,10 @@ impl MutationResolvePass<'_, '_, '_> {
         )?;
         let (right_logical, right_physical) =
             self.allocate_directory_block(&mut tree, &mut next_logical)?;
-        self.stage_directory_block(leaf_physical, left.into_bytes())?;
-        self.stage_directory_block(right_physical, right.into_bytes())?;
+        self.mutation
+            .stage_directory_block(leaf_physical, left.into_bytes())?;
+        self.mutation
+            .stage_directory_block(right_physical, right.into_bytes())?;
         self.propagate_htree_route(
             parent_inode,
             &mut tree,
@@ -1733,14 +1548,14 @@ impl MutationResolvePass<'_, '_, '_> {
                         &level.index,
                         checksum,
                     )?;
-                    self.stage_directory_block(
+                    self.mutation.stage_directory_block(
                         level.physical,
                         memory::copied_slice(&context.root_bytes)?,
                     )?;
                 } else {
                     let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
                     write_htree_node(&mut bytes, &level.index, checksum)?;
-                    self.stage_directory_block(level.physical, bytes)?;
+                    self.mutation.stage_directory_block(level.physical, bytes)?;
                 }
                 return Ok(());
             };
@@ -1780,9 +1595,11 @@ impl MutationResolvePass<'_, '_, '_> {
                     &root_index,
                     checksum,
                 )?;
-                self.stage_directory_block(left_physical, left_bytes)?;
-                self.stage_directory_block(right_physical, right_bytes)?;
-                self.stage_directory_block(
+                self.mutation
+                    .stage_directory_block(left_physical, left_bytes)?;
+                self.mutation
+                    .stage_directory_block(right_physical, right_bytes)?;
+                self.mutation.stage_directory_block(
                     level.physical,
                     memory::copied_slice(&context.root_bytes)?,
                 )?;
@@ -1792,12 +1609,14 @@ impl MutationResolvePass<'_, '_, '_> {
             let right = split.into_right();
             let mut left_bytes = memory::repeated_vec(0_u8, block_bytes)?;
             write_htree_node(&mut left_bytes, &level.index, checksum)?;
-            self.stage_directory_block(level.physical, left_bytes)?;
+            self.mutation
+                .stage_directory_block(level.physical, left_bytes)?;
             let (right_logical, right_physical) =
                 self.allocate_directory_block(tree, next_logical)?;
             let mut right_bytes = memory::repeated_vec(0_u8, block_bytes)?;
             write_htree_node(&mut right_bytes, &right, checksum)?;
-            self.stage_directory_block(right_physical, right_bytes)?;
+            self.mutation
+                .stage_directory_block(right_physical, right_bytes)?;
             route = DxEntry::new(boundary, right_logical)?;
         }
         Err(Error::InvalidDirectoryEntry)
@@ -1817,7 +1636,7 @@ impl MutationResolvePass<'_, '_, '_> {
         entry: RawDirectoryEntry,
     ) -> Result<()> {
         let checksum = self.mutation.volume.directory_checksum(parent_inode);
-        let (root_physical, block) = self.read_mutation_directory_block(
+        let (root_physical, block) = self.mutation.read_mutation_directory_block(
             parent_inode,
             &tree,
             LogicalBlock::try_from(0_u64)?,
@@ -1877,7 +1696,8 @@ impl MutationResolvePass<'_, '_, '_> {
                 let (leaf_logical, leaf_physical) =
                     self.allocate_directory_block(&mut tree, &mut next_logical)?;
                 routes.try_push(DxEntry::new(0, leaf_logical)?)?;
-                self.stage_directory_block(leaf_physical, leaf.into_bytes())?;
+                self.mutation
+                    .stage_directory_block(leaf_physical, leaf.into_bytes())?;
             }
             Err(Error::NoSpace) => {
                 let split_at = self.directory_leaf_split(&children, checksum)?;
@@ -1915,8 +1735,10 @@ impl MutationResolvePass<'_, '_, '_> {
                     self.allocate_directory_block(&mut tree, &mut next_logical)?;
                 routes.try_push(DxEntry::new(0, left_logical)?)?;
                 routes.try_push(DxEntry::new(boundary, right_logical)?)?;
-                self.stage_directory_block(left_physical, left.into_bytes())?;
-                self.stage_directory_block(right_physical, right.into_bytes())?;
+                self.mutation
+                    .stage_directory_block(left_physical, left.into_bytes())?;
+                self.mutation
+                    .stage_directory_block(right_physical, right.into_bytes())?;
             }
             Err(error) => return Err(error),
         }
@@ -1929,7 +1751,7 @@ impl MutationResolvePass<'_, '_, '_> {
             &root_index,
             checksum,
         )?;
-        self.stage_directory_block(root_physical, root)?;
+        self.mutation.stage_directory_block(root_physical, root)?;
         self.finish_directory_growth(inode_index, raw_parent, tree, next_logical, true)
     }
 
@@ -2005,7 +1827,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     u64::from(self.mutation.volume.superblock.block_size().bytes()),
                 )?;
                 for logical in 0..block_count {
-                    let (_physical, block) = self.read_mutation_directory_block(
+                    let (_physical, block) = self.mutation.read_mutation_directory_block(
                         inode,
                         &tree,
                         LogicalBlock::try_from(logical)?,
@@ -2021,9 +1843,10 @@ impl MutationResolvePass<'_, '_, '_> {
             }
             DirectoryStorageKind::HTree => {
                 let mut context =
-                    self.mutation_htree_context(inode, &tree, HtreePathTarget::First)?;
+                    self.mutation
+                        .mutation_htree_context(inode, &tree, HtreePathTarget::First)?;
                 loop {
-                    let (_physical, block) = self.read_mutation_directory_block(
+                    let (_physical, block) = self.mutation.read_mutation_directory_block(
                         inode,
                         &tree,
                         LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
@@ -2037,7 +1860,7 @@ impl MutationResolvePass<'_, '_, '_> {
                     if !entries.is_empty() {
                         return Ok(false);
                     }
-                    if !self.advance_mutation_htree_path(
+                    if !self.mutation.advance_mutation_htree_path(
                         inode,
                         &tree,
                         &mut context.path,
@@ -2047,6 +1870,394 @@ impl MutationResolvePass<'_, '_, '_> {
                     }
                 }
             }
+        }
+        Ok(true)
+    }
+}
+
+/// A logged binding supplies a postcondition; link-count arithmetic is not part of leaf editing.
+enum LoggedBinding<'a> {
+    /// The exact recorded spelling and inode must be present after replay.
+    Present(RawDirectoryEntry),
+    /// Only a binding to the recorded inode may be removed.
+    AbsentIf {
+        /// A replacement inode with the same name must remain untouched.
+        inode: InodeId,
+        /// Interpretation belongs to the admitted parent, not a global comparison policy.
+        name: &'a Ext4Name,
+    },
+}
+/// A prospective insertion is retained until every hash-collision leaf has been searched.
+enum LoggedLeafResult {
+    /// The existing binding already meets its postcondition or belongs to a different unlink target.
+    FoundUnchanged,
+    /// An observed binding was replaced or removed in this private block image.
+    FoundChanged,
+    /// No equivalent name exists here; this private block can hold a future insertion.
+    VacantInserted,
+    /// This leaf lacks the binding and cannot supply an insertion image.
+    Vacant,
+}
+impl LoggedBinding<'_> {
+    /// Borrows the recorded component under the parent's actual plaintext comparison contract.
+    fn name(&self) -> &Ext4Name {
+        match self {
+            Self::Present(entry) => entry.name(),
+            Self::AbsentIf { name, .. } => name,
+        }
+    }
+    /// Enforces an observed binding without changing any inode or accounting state.
+    /// # Errors
+    /// Rejects malformed directory data, normalization failure or an unrepresentable replacement.
+    fn apply(
+        &self,
+        block: &mut DirectoryBlock,
+        names: crate::disk_format::name::NameSemantics,
+    ) -> Result<LoggedLeafResult> {
+        for existing in block.entries()? {
+            if !names.equivalent(existing.name(), self.name())? {
+                continue;
+            }
+            match self {
+                Self::Present(wanted) => {
+                    if existing.inode() == wanted.inode()
+                        && existing.name() == wanted.name()
+                        && existing.kind() == wanted.kind()
+                    {
+                        return Ok(LoggedLeafResult::FoundUnchanged);
+                    }
+                    block
+                        .remove(existing.name())?
+                        .ok_or(Error::InvalidDirectoryEntry)?;
+                    if !block.insert(wanted)? {
+                        return Err(Error::UnsupportedJournal);
+                    }
+                }
+                Self::AbsentIf { inode, .. } => {
+                    if existing.inode() != *inode {
+                        return Ok(LoggedLeafResult::FoundUnchanged);
+                    }
+                    block
+                        .remove(existing.name())?
+                        .ok_or(Error::InvalidDirectoryEntry)?;
+                }
+            }
+            return Ok(LoggedLeafResult::FoundChanged);
+        }
+        match self {
+            Self::Present(entry) if block.insert(entry)? => Ok(LoggedLeafResult::VacantInserted),
+            _ => Ok(LoggedLeafResult::Vacant),
+        }
+    }
+}
+
+impl MetadataMutation<'_, '_> {
+    /// Replays existing file/symlink bindings using staged plaintext leaves and final inode counts.
+    /// # Errors
+    /// Rejects creation, encrypted/inline parents, directory targets, required growth or malformed routes.
+    pub(super) fn replay_directory_binding(
+        &mut self,
+        parent: InodeId,
+        target: InodeId,
+        name: &Ext4Name,
+        change: crate::disk_format::journal::fast_commit::NamespaceChange,
+    ) -> Result<()> {
+        use crate::disk_format::journal::fast_commit::NamespaceChange;
+        reject_reserved_directory_name(name)?;
+        let parent = self.raw_inode_for_policy(parent)?.parse()?;
+        let child = self.raw_inode_for_policy(target)?.parse()?;
+        if parent.kind() != InodeKind::Directory
+            || parent.protection().is_encrypted()
+            || parent.flags().has_inline_data()
+            || child.kind() == InodeKind::Directory
+        {
+            return Err(Error::UnsupportedJournal);
+        }
+        let binding = match change {
+            NamespaceChange::Create => return Err(Error::UnsupportedJournal),
+            NamespaceChange::Link => LoggedBinding::Present(RawDirectoryEntry::new(
+                target,
+                name,
+                directory_entry_kind(child.kind()),
+            )?),
+            NamespaceChange::Unlink => LoggedBinding::AbsentIf {
+                inode: target,
+                name,
+            },
+        };
+        let names = self.volume.superblock.name_semantics(&parent)?;
+        let tree = self.mutable_extent_tree(&parent)?;
+        if tree.contains_uninitialized() {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let mut insertion = None;
+        match parent.directory_storage_kind()? {
+            DirectoryStorageKind::Linear => {
+                let count = round_up_div(
+                    parent.size().bytes(),
+                    u64::from(self.volume.superblock.block_size().bytes()),
+                )?;
+                for logical in 0..count {
+                    let (physical, mut block) = self.read_mutation_directory_block(
+                        &parent,
+                        &tree,
+                        LogicalBlock::try_from(logical)?,
+                    )?;
+                    match binding.apply(&mut block, names)? {
+                        LoggedLeafResult::FoundUnchanged => return Ok(()),
+                        LoggedLeafResult::FoundChanged => {
+                            return self.stage_directory_block(physical, block.into_bytes());
+                        }
+                        LoggedLeafResult::VacantInserted if insertion.is_none() => {
+                            insertion = Some((physical, block))
+                        }
+                        LoggedLeafResult::Vacant | LoggedLeafResult::VacantInserted => {}
+                    }
+                }
+            }
+            DirectoryStorageKind::HTree => {
+                let query = DirectoryLookup::Name(binding.name());
+                let mut context =
+                    self.mutation_htree_context(&parent, &tree, HtreePathTarget::Query(query))?;
+                let major = query.major(context.root.hash_profile(), names)?;
+                loop {
+                    let logical = LogicalBlock::try_from(u64::from(context.path.leaf()?))?;
+                    let (physical, mut block) =
+                        self.read_mutation_directory_block(&parent, &tree, logical)?;
+                    context.path.hash_range()?.validate_leaf(
+                        &block.entries()?,
+                        context.root.hash_profile(),
+                        names,
+                    )?;
+                    match binding.apply(&mut block, names)? {
+                        LoggedLeafResult::FoundUnchanged => return Ok(()),
+                        LoggedLeafResult::FoundChanged => {
+                            return self.stage_directory_block(physical, block.into_bytes());
+                        }
+                        LoggedLeafResult::VacantInserted if insertion.is_none() => {
+                            insertion = Some((physical, block))
+                        }
+                        LoggedLeafResult::Vacant | LoggedLeafResult::VacantInserted => {}
+                    }
+                    if !self.advance_mutation_htree_path(
+                        &parent,
+                        &tree,
+                        &mut context.path,
+                        context.root.indirect_levels(),
+                    )? || context.path.boundary()? & !1 != major
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some((physical, block)) = insertion {
+            self.stage_directory_block(physical, block.into_bytes())
+        } else if matches!(binding, LoggedBinding::AbsentIf { .. }) {
+            Ok(())
+        } else {
+            Err(Error::UnsupportedJournal)
+        }
+    }
+
+    /// Stages the latest image for a mutated directory block.
+    /// # Errors
+    ///
+    /// Returns an error when recording a new staged block image cannot allocate.
+    fn stage_directory_block(&mut self, block: BlockAddress, bytes: Vec<u8>) -> Result<()> {
+        if let Some(image) = self
+            .directory_updates
+            .iter_mut()
+            .find(|image| image.block == block)
+        {
+            image.bytes = bytes;
+        } else {
+            self.directory_updates
+                .try_push(BlockImage { block, bytes })?;
+        }
+        Ok(())
+    }
+
+    /// Reads one logical directory block, preferring this transaction's newest staged image.
+    /// # Errors
+    ///
+    /// Returns an error when the logical block is outside the semantic directory size, is not
+    /// physically mapped, has an invalid staged length, or cannot be read or allocated.
+    fn read_mutation_directory_block(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        logical: LogicalBlock,
+    ) -> Result<(BlockAddress, DirectoryBlock)> {
+        let block_count = round_up_div(
+            inode.size().bytes(),
+            u64::from(self.volume.superblock.block_size().bytes()),
+        )?;
+        if logical.as_u64() >= block_count {
+            return Err(Error::InvalidDirectoryEntry);
+        }
+        let physical = match tree.map_logical(logical) {
+            BlockMapping::Physical(physical) => physical,
+            BlockMapping::Uninitialized | BlockMapping::Hole => {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+        };
+        let block_size = self.volume.superblock.block_size();
+        let block_bytes =
+            usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let bytes = if let Some(staged) = self
+            .directory_updates
+            .iter()
+            .find(|image| image.block == physical)
+        {
+            if staged.bytes.len() != block_bytes {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            memory::copied_slice(&staged.bytes)?
+        } else {
+            let mut bytes = memory::repeated_vec(0_u8, block_bytes)?;
+            self.volume
+                .device
+                .read_metadata_exact_at(block_size.offset_of(physical)?, &mut bytes)?;
+            bytes
+        };
+        Ok((
+            physical,
+            DirectoryBlock::new(
+                bytes,
+                self.volume.directory_checksum(inode),
+                DirectoryEntryEncoding::for_inode(inode),
+            ),
+        ))
+    }
+
+    /// Builds one staged-aware HTree path for a primary hash.
+    /// # Errors
+    ///
+    /// Returns an error when the root or an interior node is malformed, the configured depth is
+    /// unsupported, a route cycles, or a selected block cannot be read.
+    fn mutation_htree_context(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        target: HtreePathTarget<'_>,
+    ) -> Result<HtreeMutationContext> {
+        let checksum = self.volume.directory_checksum(inode);
+        let (root_physical, root_block) =
+            self.read_mutation_directory_block(inode, tree, LogicalBlock::try_from(0_u64)?)?;
+        let root = HtreeRoot::parse(
+            root_block.bytes(),
+            inode.id(),
+            self.volume.superblock.directory_hash_seed(),
+            self.volume.superblock.directory_hash_signedness(),
+            self.volume
+                .superblock
+                .directory_indexing()
+                .require_supported()?,
+            checksum,
+            DirectoryEntryEncoding::for_inode(inode),
+        )?;
+        let major = match target {
+            HtreePathTarget::Query(query) => query.major(
+                root.hash_profile(),
+                self.volume.superblock.name_semantics(inode)?,
+            )?,
+            HtreePathTarget::First => 0,
+        };
+        let mut levels = Vec::new();
+        levels.try_push(MutationHtreeLevel {
+            logical: 0,
+            physical: root_physical,
+            selected: root.index().select(major),
+            index: root.index().try_clone()?,
+        })?;
+        for _ in 0..root.indirect_levels() {
+            let logical = levels
+                .last()
+                .and_then(|level| level.index.entry(level.selected))
+                .map(|entry| entry.block())
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            if levels.iter().any(|level| level.logical == logical) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let (physical, block) = self.read_mutation_directory_block(
+                inode,
+                tree,
+                LogicalBlock::try_from(u64::from(logical))?,
+            )?;
+            let index = DxIndex::parse_node(block.bytes(), checksum)?;
+            levels.try_push(MutationHtreeLevel {
+                logical,
+                physical,
+                selected: index.select(major),
+                index,
+            })?;
+        }
+        Ok(HtreeMutationContext {
+            root,
+            root_bytes: root_block.into_bytes(),
+            path: MutationHtreePath { levels },
+        })
+    }
+
+    /// Advances a mutation path to the next leaf while keeping only the active root-to-leaf route.
+    /// # Errors
+    ///
+    /// Returns an error when the path is malformed, an interior route cycles, or a selected block
+    /// cannot be read and validated.
+    fn advance_mutation_htree_path(
+        &mut self,
+        inode: &Inode,
+        tree: &MutableExtentTree,
+        path: &mut MutationHtreePath,
+        indirect_levels: u8,
+    ) -> Result<bool> {
+        let expected_levels = usize::from(indirect_levels)
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let Some(level_to_advance) = path.levels.iter().rposition(|level| {
+            level
+                .selected
+                .checked_add(1)
+                .is_some_and(|next| next < level.index.len())
+        }) else {
+            return Ok(false);
+        };
+        let level = path
+            .levels
+            .get_mut(level_to_advance)
+            .ok_or(Error::InvalidDirectoryEntry)?;
+        level.selected = level
+            .selected
+            .checked_add(1)
+            .ok_or(Error::ArithmeticOverflow)?;
+        path.levels.truncate(
+            level_to_advance
+                .checked_add(1)
+                .ok_or(Error::ArithmeticOverflow)?,
+        );
+        let checksum = self.volume.directory_checksum(inode);
+        while path.levels.len() < expected_levels {
+            let logical = path
+                .levels
+                .last()
+                .and_then(|level| level.index.entry(level.selected))
+                .map(|entry| entry.block())
+                .ok_or(Error::InvalidDirectoryEntry)?;
+            if path.levels.iter().any(|level| level.logical == logical) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            let (physical, block) = self.read_mutation_directory_block(
+                inode,
+                tree,
+                LogicalBlock::try_from(u64::from(logical))?,
+            )?;
+            path.levels.try_push(MutationHtreeLevel {
+                logical,
+                physical,
+                index: DxIndex::parse_node(block.bytes(), checksum)?,
+                selected: 0,
+            })?;
         }
         Ok(true)
     }
