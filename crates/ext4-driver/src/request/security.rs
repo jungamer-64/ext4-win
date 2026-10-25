@@ -2,17 +2,16 @@
 use super::DriverMutationPass;
 use crate::irp::{CapturedRequestorOutput, IrpCompletion, PendingIrpLease};
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::DriverVec;
 use crate::security_descriptor::{SecurityDescriptorRef, SecuritySelection};
 use crate::state::OpenedObject;
 use ext4_core::{CommittedReadPass, Ext4Access, NodeId};
 use ext4_security::{Components, Descriptor, IdentityMap};
 
-/// Complete pool-aligned self-relative descriptor retained through native checks.
+/// Complete DWORD-aligned native descriptor retained through access checks.
 #[derive(Debug)]
 pub(crate) struct CreateSecurityDescriptor<'a> {
-    /// Immutable owned image; kernel pool allocations satisfy native alignment.
-    bytes: DriverVec<u8>,
+    /// RTL-built image owns its native alignment and complete initialized storage.
+    descriptor: Descriptor,
     /// Validated policy retained for request-specific group-class checks.
     access: Ext4Access,
     /// Immutable identity interpretation pinned by the operation.
@@ -25,7 +24,7 @@ impl<'a> CreateSecurityDescriptor<'a> {
     pub(crate) fn from_access(access: Ext4Access, map: &'a IdentityMap) -> DriverResult<Self> {
         let descriptor = Descriptor::encode(&access, map, Components::ALL)?;
         Ok(Self {
-            bytes: DriverVec::try_copied_from_slice(descriptor.bytes())?,
+            descriptor,
             access,
             map,
         })
@@ -43,13 +42,13 @@ impl<'a> CreateSecurityDescriptor<'a> {
     /// Borrows the encoded descriptor during one native check.
     #[expect(
         unsafe_code,
-        reason = "the shared encoder establishes native layout and pool storage establishes alignment"
+        reason = "the shared native descriptor owner establishes layout, alignment and complete storage"
     )]
     pub(crate) fn as_native(&self) -> SecurityDescriptorRef<'_> {
         unsafe {
-            // SAFETY: The immutable complete encoder image is contained in pool-aligned storage.
+            // SAFETY: The immutable RTL-built image owns DWORD-aligned storage.
             SecurityDescriptorRef::from_validated_bytes(
-                self.bytes.as_slice(),
+                self.descriptor.bytes(),
                 &self.access,
                 self.map,
             )

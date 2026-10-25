@@ -177,7 +177,7 @@ pub(crate) fn set_reparse_point(
             let file_object = current.file_object()?;
             let stack = current.file_system_control()?;
             let input = active.buffered_input(stack.input_buffer_length())?;
-            let reparse_point = parse_symlink_reparse_buffer(input)?;
+            let reparse_point = ReparseInput::new(input)?.into_symlink()?;
             let opened = OpenedObject::decode(file_object)?;
             opened.require_reparse_write_access()?;
             let node = opened.node();
@@ -476,6 +476,43 @@ impl SymlinkReparseData {
     }
 }
 
+/// Windows-validated reparse snapshot; tag and ext4 target meaning are separate admission.
+struct ReparseInput<'a> {
+    /// Buffered I/O Manager input retained for validation and interpretation together.
+    bytes: &'a [u8],
+}
+impl<'a> ReparseInput<'a> {
+    /// # Errors
+    /// Returns the exact FsRtl validation failure before filesystem mutation.
+    fn new(bytes: &'a [u8]) -> DriverResult<Self> {
+        crate::kernel::input_validation::reparse(bytes)?;
+        Ok(Self { bytes })
+    }
+    /// # Errors
+    /// Rejects unsupported tags/flags, non-UTF-8 targets, or allocation failures.
+    fn into_symlink(self) -> DriverResult<WindowsSymlinkReparsePoint> {
+        let input = LittleEndianInput::new(self.bytes);
+        if input.read_u32(wire_offset(0))? != wdk_sys::IO_REPARSE_TAG_SYMLINK {
+            return Err(DriverError::ReparseTagNotHandled);
+        }
+        let flags = input.read_u32(wire_offset(16))?;
+        if flags & !wdk_sys::SYMLINK_FLAG_RELATIVE != 0 {
+            return Err(DriverError::NotSupported);
+        }
+        let offset = usize::from(input.read_u16(wire_offset(8))?);
+        let length = usize::from(input.read_u16(wire_offset(10))?);
+        let start = SYMLINK_PATH_BUFFER_OFFSET
+            .checked_add(offset)
+            .ok_or(DriverError::InvalidReparseData)?;
+        let units = reparse_path_units(input, wire_range(start, length)?)?;
+        let target = utf16_to_utf8_bytes(units.as_slice())?;
+        Ok(WindowsSymlinkReparsePoint::new(
+            SymlinkTarget::new(target.as_slice())?,
+            flags & wdk_sys::SYMLINK_FLAG_RELATIVE != 0,
+        ))
+    }
+}
+
 /// Parses the exact header accepted by `FSCTL_DELETE_REPARSE_POINT` for symbolic links.
 /// # Errors
 ///
@@ -586,10 +623,17 @@ mod tests {
     use ext4_core::SymlinkTarget;
 
     use super::{
-        MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MAXIMUM_SYMLINK_PATH_CODE_UNITS,
+        MAXIMUM_REPARSE_DATA_BUFFER_SIZE, MAXIMUM_SYMLINK_PATH_CODE_UNITS, ReparseInput,
         SYMLINK_PATH_BUFFER_OFFSET, SymlinkReparseData, UnparsedPathLength,
-        parse_delete_reparse_buffer, parse_symlink_reparse_buffer, wire_offset,
+        parse_delete_reparse_buffer, wire_offset,
     };
+
+    /// Interprets prepared snapshots without substituting for FsRtl format validation.
+    /// # Errors
+    /// Returns unsupported tag, flags, target or allocation failure.
+    fn decode_symlink_fixture(input: &[u8]) -> super::DriverResult<WindowsSymlinkReparsePoint> {
+        ReparseInput { bytes: input }.into_symlink()
+    }
 
     /// Builds Windows-xattr symbolic-link test data through its production conversion path.
     /// # Errors
@@ -684,7 +728,7 @@ mod tests {
             Ok(wdk_sys::SYMLINK_FLAG_RELATIVE)
         );
 
-        let parsed = parse_symlink_reparse_buffer(output.as_slice());
+        let parsed = decode_symlink_fixture(output.as_slice());
         assert!(parsed.is_ok());
         let Ok(parsed) = parsed else {
             return;
@@ -710,7 +754,7 @@ mod tests {
             Ok(wdk_sys::SYMLINK_FLAG_RELATIVE)
         );
 
-        let parsed = parse_symlink_reparse_buffer(output.as_slice());
+        let parsed = decode_symlink_fixture(output.as_slice());
         assert!(parsed.is_ok());
         let Ok(parsed) = parsed else {
             return;
@@ -732,7 +776,7 @@ mod tests {
         };
         let mut output = vec![0; 128];
         assert_eq!(data.pack_fsctl(output.as_mut_slice()), Ok(42));
-        let parsed = parse_symlink_reparse_buffer(output.as_slice());
+        let parsed = decode_symlink_fixture(output.as_slice());
         assert!(parsed.is_ok());
         if let Ok(parsed) = parsed {
             assert_eq!(parsed.target().bytes(), br"\dir\child\");
@@ -852,7 +896,7 @@ mod tests {
             Ok(36)
         );
 
-        let parsed = parse_symlink_reparse_buffer(input.as_slice());
+        let parsed = decode_symlink_fixture(input.as_slice());
         assert!(parsed.is_ok());
         let Ok(parsed) = parsed else {
             return;
@@ -865,7 +909,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn rejects_unhandled_reparse_tag_on_set() {
+    fn symlink_interpretation_rejects_other_tags() {
         let mut input = vec![0; 128];
         assert_eq!(
             pack_fsctl_target(b"target", true, input.as_mut_slice()),
@@ -877,7 +921,7 @@ mod tests {
         );
 
         assert_eq!(
-            parse_symlink_reparse_buffer(input.as_slice()),
+            decode_symlink_fixture(input.as_slice()),
             Err(DriverError::ReparseTagNotHandled)
         );
     }
@@ -898,36 +942,8 @@ mod tests {
         );
 
         assert_eq!(
-            parse_symlink_reparse_buffer(input.as_slice()),
+            decode_symlink_fixture(input.as_slice()),
             Err(DriverError::NotSupported)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn rejects_symlink_input_larger_than_windows_reparse_limit() {
-        let mut input = [0_u8; 8];
-        let oversized_data_length =
-            u16::try_from(MAXIMUM_REPARSE_DATA_BUFFER_SIZE - input.len() + 1);
-        assert!(oversized_data_length.is_ok());
-        let Ok(oversized_data_length) = oversized_data_length else {
-            return;
-        };
-        let mut output = LittleEndianOutput::new(&mut input);
-        assert_eq!(
-            output.write_u32(wire_offset(0), wdk_sys::IO_REPARSE_TAG_SYMLINK),
-            Ok(())
-        );
-        assert_eq!(
-            output.write_u16(wire_offset(4), oversized_data_length),
-            Ok(())
-        );
-
-        assert_eq!(
-            parse_symlink_reparse_buffer(&input),
-            Err(DriverError::InvalidParameter)
         );
     }
 

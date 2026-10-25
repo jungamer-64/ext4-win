@@ -142,7 +142,9 @@ Security queries support variable SID lengths and report the required size for s
 Security mutations accept the owner/group/mode projection for inodes without an access ACL.
 An inode with an access ACL accepts owner/group updates and an unchanged projected DACL;
 arbitrary Windows ACL edits are rejected. Mode changes through file attributes update its ACL mask.
-Native token oracles run in portable Windows tests; the elevated `verify-windows-host` gate also
+Windows RTL constructs descriptor images from the POSIX-derived ACE order; native format
+construction does not select or reorder access policy. Descriptor construction and native token
+oracles run in portable Windows tests; the elevated `verify-windows-host` gate also
 checks explicit ownership and security privileges.
 
 ## Mounted-session policy administration

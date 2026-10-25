@@ -93,7 +93,12 @@ impl IrpCompletion {
     pub(crate) fn from_error(error: DriverError) -> Self {
         Self {
             status: error.ntstatus(),
-            information: InformationLength::ZERO,
+            information: match error {
+                DriverError::InvalidEaBuffer { offset } => InformationLength {
+                    bytes: offset.into(),
+                },
+                _ => InformationLength::ZERO,
+            },
         }
     }
 

@@ -126,6 +126,21 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("operational ETW registration", "ext4win_trace_register"),
     ("operational ETW event emission", "ext4win_trace_write"),
     ("operational ETW unregister", "ext4win_trace_unregister"),
+    ("native full-EA admission", "IoCheckEaBufferValidity"),
+    (
+        "native reparse admission",
+        "FsRtlValidateReparsePointBuffer",
+    ),
+    ("native ACL initialization", "RtlCreateAcl"),
+    ("native ACE placement", "RtlAddAce"),
+    (
+        "native descriptor initialization",
+        "RtlCreateSecurityDescriptor",
+    ),
+    (
+        "native self-relative descriptor construction",
+        "RtlAbsoluteToSelfRelativeSD",
+    ),
     ("kernel ETW provider registration", "EtwRegister"),
     ("kernel ETW event enable query", "EtwEventEnabled"),
     ("kernel ETW event write", "EtwWrite"),
@@ -2418,6 +2433,12 @@ mod tests {
              ext4win_trace_register\n\
              ext4win_trace_write\n\
              ext4win_trace_unregister\n\
+             IoCheckEaBufferValidity\n\
+             FsRtlValidateReparsePointBuffer\n\
+             RtlCreateAcl\n\
+             RtlAddAce\n\
+             RtlCreateSecurityDescriptor\n\
+             RtlAbsoluteToSelfRelativeSD\n\
              EtwRegister\n\
              EtwEventEnabled\n\
              EtwWrite\n\

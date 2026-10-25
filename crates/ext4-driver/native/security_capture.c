@@ -10,6 +10,7 @@
 /* Requestor output mappings and Type3 input are probed in their original context.
  * I/O Manager input snapshots have a separate native ownership contract. */
 #include "io_manager_input.h"
+#include "input_validation.h"
 
 typedef struct _EXT4WIN_REQUESTOR_OUTPUT {
     PMDL Mdl;

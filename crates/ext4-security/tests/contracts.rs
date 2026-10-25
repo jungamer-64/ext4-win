@@ -1,7 +1,7 @@
 //! Independent ownership, permission and boundary vectors for the shared security contract.
-use ext4_core::{
-    Ext4Access, Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, FilesystemUuid,
-};
+#[cfg(windows)]
+use ext4_core::Ext4Access;
+use ext4_core::{Ext4Gid, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Uid, FilesystemUuid};
 use ext4_security::*;
 
 /// Constructs one core-valid fixture.
@@ -49,6 +49,7 @@ fn alloc_groups() -> Result<Vec<GroupMapping>, Error> {
     reason = "test assertions report contract failures while fixture setup propagates validation errors"
 )]
 #[test]
+#[cfg(windows)]
 fn variable_descriptor_roundtrip() -> Result<(), Error> {
     let map = map()?;
     for mode in 0..=0o7777 {
@@ -95,6 +96,7 @@ fn variable_descriptor_roundtrip() -> Result<(), Error> {
     reason = "fixture failures propagate while the observable descriptor bound uses assertions"
 )]
 #[test]
+#[cfg(windows)]
 fn maximum_sid_descriptor_fits_the_reserved_budget() -> Result<(), Error> {
     let map = IdentityMap::new(
         vec![UserMapping {
@@ -270,21 +272,25 @@ fn synthetic_identity_remains_bijective() -> Result<(), Error> {
     );
     let map = map()?;
     assert_eq!(map.uid(Sid::unix(1, 1000)?), Err(Error::UnmappedIdentity));
-    let unmapped = Ext4Owner::new(Ext4Uid::from_u32(2000), Ext4Gid::from_u32(200));
-    let security = Ext4Security::new(
-        unmapped,
-        Ext4Permissions::new(0o640).map_err(|_| Error::InvalidEncoding)?,
-    );
-    let descriptor = Descriptor::encode(&Ext4Access::from_mode(security), &map, Components::ALL)?;
-    assert_eq!(
-        Descriptor::decode(
-            descriptor.bytes(),
-            &map,
-            Components::ALL,
-            &Ext4Access::from_mode(security)
-        )?,
-        security
-    );
+    #[cfg(windows)]
+    {
+        let unmapped = Ext4Owner::new(Ext4Uid::from_u32(2000), Ext4Gid::from_u32(200));
+        let security = Ext4Security::new(
+            unmapped,
+            Ext4Permissions::new(0o640).map_err(|_| Error::InvalidEncoding)?,
+        );
+        let descriptor =
+            Descriptor::encode(&Ext4Access::from_mode(security), &map, Components::ALL)?;
+        assert_eq!(
+            Descriptor::decode(
+                descriptor.bytes(),
+                &map,
+                Components::ALL,
+                &Ext4Access::from_mode(security)
+            )?,
+            security
+        );
+    }
     Ok(())
 }
 
@@ -297,6 +303,7 @@ fn synthetic_identity_remains_bijective() -> Result<(), Error> {
     clippy::panic_in_result_fn,
     reason = "assertions compare the validated ACL with independent descriptor mutations"
 )]
+#[cfg(windows)]
 fn extended_acl_descriptor_preserves_policy() -> Result<(), Error> {
     let acl = ext4_core::PosixAcl::parse(&[
         1, 0, 0, 0, 1, 0, 6, 0, 2, 0, 6, 0, 233, 3, 0, 0, 4, 0, 6, 0, 16, 0, 4, 0, 32, 0, 0, 0,
@@ -311,8 +318,18 @@ fn extended_acl_descriptor_preserves_policy() -> Result<(), Error> {
         access.security()
     );
     let mut changed = descriptor.bytes().to_vec();
-    let last = changed.len().checked_sub(1).ok_or(Error::InvalidEncoding)?;
-    *changed.get_mut(last).ok_or(Error::InvalidEncoding)? ^= 1;
+    let offset = u32::from_le_bytes(
+        changed
+            .get(16..20)
+            .ok_or(Error::InvalidEncoding)?
+            .try_into()
+            .map_err(|_| Error::InvalidEncoding)?,
+    );
+    let mask = usize::try_from(offset)
+        .map_err(|_| Error::InvalidEncoding)?
+        .checked_add(12)
+        .ok_or(Error::InvalidEncoding)?;
+    *changed.get_mut(mask).ok_or(Error::InvalidEncoding)? ^= 1;
     assert_eq!(
         Descriptor::decode(&changed, &map, Components::ALL, &access),
         Err(Error::UnrepresentableDescriptor)
@@ -329,6 +346,7 @@ fn extended_acl_descriptor_preserves_policy() -> Result<(), Error> {
     clippy::panic_in_result_fn,
     reason = "assertions verify the native ACL's independent sixteen-bit size limit"
 )]
+#[cfg(windows)]
 fn descriptor_reports_native_acl_size_exhaustion() -> Result<(), Error> {
     let mut bytes = vec![1, 0, 0, 0, 1, 0, 6, 0];
     for id in 1_u32..=2000 {

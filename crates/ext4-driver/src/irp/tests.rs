@@ -3535,3 +3535,17 @@ fn destructive_create_actions_use_native_information_values() {
     assert_eq!(super::CreateAction::Overwritten.as_ulong(), 3);
     assert_eq!(super::CreateAction::Superseded.as_ulong(), 0);
 }
+
+/// # Panics
+/// Fails when native EA rejection loses the offending record's byte offset.
+#[test]
+fn ea_validation_failure_preserves_record_offset() {
+    let completion = IrpCompletion::from_error(DriverError::InvalidEaBuffer { offset: 28 });
+    assert_eq!(completion.status(), wdk_sys::STATUS_EA_LIST_INCONSISTENT);
+    assert_eq!(completion.information().as_ulong_ptr(), 28);
+    let status = i32::from_ne_bytes(0xC000_0276_u32.to_ne_bytes());
+    assert_eq!(
+        IrpCompletion::from_error(DriverError::ReparseValidationFailed(status)).status(),
+        status
+    );
+}

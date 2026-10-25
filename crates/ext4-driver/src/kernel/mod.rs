@@ -10,6 +10,7 @@ mod fast_io;
 pub(crate) mod fatal;
 pub(crate) mod ffi;
 pub(crate) mod file_information;
+pub(crate) mod input_validation;
 pub(crate) mod io_reliability;
 pub(crate) mod name_expression;
 pub(crate) mod operational_trace;

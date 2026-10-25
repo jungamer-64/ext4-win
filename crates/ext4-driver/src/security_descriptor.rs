@@ -77,7 +77,7 @@ impl<'a> SecurityDescriptorRef<'a> {
 pub(crate) enum PreparedDescriptor<'a> {
     /// Existing complete projection for a single-class check.
     Borrowed(&'a [u8]),
-    /// Composite-request image allocated by the driver's nonpaged, pool-aligned global allocator.
+    /// Composite-request native image with explicitly aligned owned storage.
     Encoded(ext4_security::Descriptor),
 }
 #[cfg(not(test))]

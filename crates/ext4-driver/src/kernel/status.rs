@@ -101,6 +101,13 @@ pub(crate) enum DriverError {
     InvalidEaName,
     /// EA list structure is internally inconsistent.
     EaListInconsistent,
+    /// I/O Manager rejected this full-EA record at the reported byte offset.
+    InvalidEaBuffer {
+        /// Byte offset of the offending FILE_FULL_EA_INFORMATION record.
+        offset: u32,
+    },
+    /// Windows rejected the reparse representation with this exact native status.
+    ReparseValidationFailed(NTSTATUS),
     /// Opened node has no extended attributes.
     NoEasOnFile,
     /// A file-space query starts beyond the visible payload allocation span.
@@ -191,7 +198,8 @@ impl DriverError {
             Self::InvalidReparseData => ntstatus(0xC000_0278),
             Self::ReparseTagNotHandled => ntstatus(0xC000_0279),
             Self::InvalidEaName => STATUS_INVALID_EA_NAME,
-            Self::EaListInconsistent => STATUS_EA_LIST_INCONSISTENT,
+            Self::EaListInconsistent | Self::InvalidEaBuffer { .. } => STATUS_EA_LIST_INCONSISTENT,
+            Self::ReparseValidationFailed(status) => status,
             Self::NoEasOnFile => STATUS_NO_EAS_ON_FILE,
             Self::EndOfFile => ntstatus(0xC000_0011),
             Self::NoMoreEas => ntstatus(0x8000_0012),
@@ -310,6 +318,7 @@ impl From<ext4_security::Error> for DriverError {
             ext4_security::Error::AllocationFailed => Self::InsufficientResources,
             ext4_security::Error::UnmappedIdentity => Self::AccessDenied,
             ext4_security::Error::UnrepresentableDescriptor => Self::NotSupported,
+            ext4_security::Error::NativeFailure(status) => Self::SecurityCheckFailed(status),
             ext4_security::Error::InvalidEncoding
             | ext4_security::Error::DuplicateIdentity
             | ext4_security::Error::RecordTooLarge => Self::InvalidParameter,

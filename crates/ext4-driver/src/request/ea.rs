@@ -178,7 +178,7 @@ impl CreateEa {
         }
         let input = target.buffered_input(length)?;
         Ok(Self {
-            entries: parse_full_ea_list(input)?,
+            entries: FullEaList::new(input)?.decode()?,
         })
     }
 
@@ -633,7 +633,7 @@ fn parse_set_ea_entries(
     target
         .requestor_input(length)?
         .copy_to(snapshot.as_mut_slice())?;
-    parse_full_ea_list(snapshot.as_slice())
+    FullEaList::new(snapshot.as_slice())?.decode()
 }
 
 /// Parses FILE_GET_EA_INFORMATION selection from the query stack.
@@ -669,6 +669,66 @@ fn requested_eas(
         },
         PreparedEaSelection::Names(bytes) => {
             parse_get_ea_list(bytes.as_slice()).map(WindowsEaSelection::Names)
+        }
+    }
+}
+
+/// Immutable full-EA buffer admitted by the I/O Manager format validator.
+struct FullEaList<'a> {
+    /// Only this stable snapshot may be decoded after native validation.
+    bytes: &'a [u8],
+}
+impl<'a> FullEaList<'a> {
+    /// # Errors
+    /// Preserves the native invalid-entry offset before any xattr mutation.
+    fn new(bytes: &'a [u8]) -> DriverResult<Self> {
+        crate::kernel::input_validation::full_ea(bytes)?;
+        Ok(Self { bytes })
+    }
+    /// Interprets names, flags and values within the admitted Windows record sequence.
+    /// # Errors
+    /// Returns unsupported EA semantics, allocation failure or a violated native buffer bound.
+    fn decode(self) -> DriverResult<DriverVec<WindowsEaRecord>> {
+        let fields = LittleEndianInput::new(self.bytes);
+        let mut offset = 0_usize;
+        let mut entries = DriverVec::new();
+        loop {
+            let record = self
+                .bytes
+                .get(offset..)
+                .ok_or(DriverError::EaListInconsistent)?;
+            let header = LittleEndianInput::new(record);
+            let next = usize::try_from(header.read_u32(wire_offset(0))?)
+                .map_err(|_| DriverError::InvalidBufferSize)?;
+            let flags = header.read_u8(wire_offset(4))?;
+            let name_len = usize::from(header.read_u8(wire_offset(5))?);
+            let value_len = usize::from(header.read_u16(wire_offset(6))?);
+            let name_end = FILE_FULL_EA_NAME_OFFSET
+                .checked_add(name_len)
+                .ok_or(DriverError::EaListInconsistent)?;
+            let value_start = name_end
+                .checked_add(1)
+                .ok_or(DriverError::EaListInconsistent)?;
+            let value_end = value_start
+                .checked_add(value_len)
+                .ok_or(DriverError::EaListInconsistent)?;
+            let name = record
+                .get(FILE_FULL_EA_NAME_OFFSET..name_end)
+                .ok_or(DriverError::EaListInconsistent)?;
+            let value = record
+                .get(value_start..value_end)
+                .ok_or(DriverError::EaListInconsistent)?;
+            entries
+                .try_push_owned(WindowsEaRecord::from_wire(flags, name, value)?)
+                .map_err(|error| error.into_parts().0)?;
+            if next == 0 {
+                return Ok(entries);
+            }
+            offset = offset
+                .checked_add(next)
+                .ok_or(DriverError::EaListInconsistent)?;
+            // This bound protects safe decoding; Windows owns structural admission.
+            fields.range(wire_range(offset, FILE_FULL_EA_NAME_OFFSET)?)?;
         }
     }
 }
@@ -916,6 +976,15 @@ fn align_to_four(value: usize) -> DriverResult<usize> {
 
 #[cfg(test)]
 mod tests {
+    /// Decodes independently prepared records without claiming kernel format admission.
+    /// # Errors
+    /// Returns semantic or allocation failure.
+    fn decode_full_ea_fixture(
+        input: &[u8],
+    ) -> super::DriverResult<super::DriverVec<WindowsEaRecord>> {
+        FullEaList { bytes: input }.decode()
+    }
+
     /// # Panics
     ///
     /// Panics if EA accounting includes wire offsets or query record alignment.
@@ -955,9 +1024,9 @@ mod tests {
     };
 
     use super::{
-        CreateEa, EA_RECORD_ALIGNMENT, EaEnumerationOrigin, WindowsEaName, WindowsEaRecord,
-        WindowsEaValue, fitting_full_ea_prefix, pack_full_ea_entries, parse_full_ea_list,
-        parse_get_ea_list, validate_enumeration_start, wire_offset, xattr_name_from_ea_name,
+        CreateEa, EaEnumerationOrigin, FullEaList, WindowsEaName, WindowsEaRecord, WindowsEaValue,
+        fitting_full_ea_prefix, pack_full_ea_entries, parse_get_ea_list,
+        validate_enumeration_start, wire_offset, xattr_name_from_ea_name,
     };
 
     /// Builds a create dispatch target carrying one EA system buffer.
@@ -1073,7 +1142,7 @@ mod tests {
         let fields = LittleEndianInput::new(output.as_slice());
         assert_eq!(fields.read_u32(wire_offset(0)), Ok(20));
         assert_eq!(fields.read_u16(wire_offset(6)), Ok(3));
-        let parsed = parse_full_ea_list(output.get(..36).unwrap_or(&[]));
+        let parsed = decode_full_ea_fixture(output.get(..36).unwrap_or(&[]));
         assert!(parsed.is_ok());
         if let Ok(parsed) = parsed {
             assert_eq!(parsed.as_slice(), entries.as_slice());
@@ -1149,55 +1218,6 @@ mod tests {
                 fitting_full_ea_prefix(entries.as_slice(), capacity),
                 Ok(emitted)
             );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn create_ea_decodes_buffered_full_ea_list() {
-        let alpha = WindowsEaName::new(b"alpha");
-        let one = WindowsEaValue::new(b"one");
-        assert!(alpha.is_ok());
-        assert!(one.is_ok());
-        let (Ok(alpha), Ok(one)) = (alpha, one) else {
-            return;
-        };
-        let expected = [WindowsEaRecord::new(alpha, one)];
-        let mut input = vec![0; 24];
-        let written = pack_full_ea_entries(expected.as_slice(), input.as_mut_slice());
-        assert!(written.is_ok());
-        let Ok(written) = written else {
-            return;
-        };
-        let ea_length = wdk_sys::ULONG::try_from(written).unwrap_or(wdk_sys::ULONG::MAX);
-
-        let mut file_object = wdk_sys::FILE_OBJECT::default();
-        let mut security_context = wdk_sys::IO_SECURITY_CONTEXT::default();
-        let mut stack = wdk_sys::IO_STACK_LOCATION::default();
-        let mut irp = wdk_sys::IRP::default();
-        let mut device = wdk_sys::DEVICE_OBJECT::default();
-        let target = create_target_with_ea(
-            input.as_mut_ptr().cast::<c_void>(),
-            ea_length,
-            &mut file_object,
-            &mut security_context,
-            &mut stack,
-            &mut irp,
-            &mut device,
-        );
-        assert!(target.is_ok());
-        let Ok(mut target) = target else {
-            return;
-        };
-        let parsed = target.with_active(|active| {
-            let create = active.current_stack()?.create()?;
-            CreateEa::decode(active, create.parameters().ea_length())
-        });
-        assert!(parsed.is_ok());
-        if let Ok(parsed) = parsed {
-            assert_eq!(parsed.entries.as_slice(), expected.as_slice());
         }
     }
 
@@ -1309,58 +1329,6 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn inconsistent_full_ea_list_is_rejected() {
-        let mut input = vec![0; 16];
-        {
-            let mut output = LittleEndianOutput::new(input.as_mut_slice());
-            assert_eq!(output.write_u8(wire_offset(5), 3), Ok(()));
-            assert_eq!(output.write_bytes(wire_offset(8), b"abc"), Ok(()));
-            assert_eq!(output.write_u8(wire_offset(11), b'x'), Ok(()));
-        }
-
-        assert_eq!(
-            parse_full_ea_list(input.as_slice()),
-            Err(DriverError::EaListInconsistent)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when a generated non-DWORD-aligned EA record offset is accepted.
-    #[test]
-    fn generated_full_ea_offsets_require_dword_alignment() {
-        let entries = sample_ea_records();
-        let mut baseline = vec![0; 96];
-        let written = pack_full_ea_entries(entries.as_slice(), baseline.as_mut_slice());
-        assert!(written.is_ok());
-        let Ok(written) = written else {
-            return;
-        };
-        let baseline = baseline.get(..written);
-        assert!(baseline.is_some());
-        let Some(baseline) = baseline else {
-            return;
-        };
-
-        for next in 1_u32..32 {
-            if usize::try_from(next).is_ok_and(|offset| offset.is_multiple_of(EA_RECORD_ALIGNMENT))
-            {
-                continue;
-            }
-            let mut input = baseline.to_vec();
-            let mut output = LittleEndianOutput::new(input.as_mut_slice());
-            assert_eq!(output.write_u32(wire_offset(0), next), Ok(()));
-            assert_eq!(
-                parse_full_ea_list(input.as_slice()),
-                Err(DriverError::EaListInconsistent)
-            );
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
     fn nonzero_ea_flags_are_rejected() {
         let mut input = vec![0; 16];
         {
@@ -1372,7 +1340,7 @@ mod tests {
         }
 
         assert_eq!(
-            parse_full_ea_list(input.as_slice()),
+            decode_full_ea_fixture(input.as_slice()),
             Err(DriverError::NotSupported)
         );
     }

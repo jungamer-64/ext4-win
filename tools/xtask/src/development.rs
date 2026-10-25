@@ -197,6 +197,11 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
 fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
         (
+            "input-validation",
+            "input_validation.tests.c",
+            "native EA and reparse validation delegation and failure propagation",
+        ),
+        (
             "configuration-persistence",
             "configuration_persistence.tests.c",
             "native configuration persistence failure contract",
