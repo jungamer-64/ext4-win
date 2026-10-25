@@ -8,10 +8,28 @@ use crate::volume::fast_commit::ResolvedDeltaImages;
 /// A changed inode owns its original tree until final data accounting is known for the whole log.
 #[derive(Debug)]
 enum ReplayInode {
-    /// Existing storage or a regular-file allocation already has a complete mapping interpretation.
-    Live { raw: LiveInodeRecord, tree: Option<MutableExtentTree> },
+    /// Existing storage or a file allocation already has a complete mapping interpretation.
+    Live {
+        /// Metadata and mapping identity remain private until final graph validation.
+        raw: LiveInodeRecord,
+        /// Resident symlinks/inline files own no extent-tree allocation.
+        tree: Option<MutableExtentTree>,
+    },
     /// Directory body initialization is mandatory before this inode can enter the staged live set.
-    NewDirectory { raw: LiveInodeRecord, parent: InodeId },
+    NewDirectory {
+        /// Fresh metadata has no directory blocks or externally visible namespace authority.
+        raw: LiveInodeRecord,
+        /// The logged birth parent supplies the mandatory dot-dot postcondition.
+        parent: InodeId,
+    },
+}
+impl ReplayInode {
+    /// Identity is independent of whether the storage initialization obligation has completed.
+    fn id(&self) -> InodeId {
+        match self {
+            Self::Live { raw, .. } | Self::NewDirectory { raw, .. } => raw.id(),
+        }
+    }
 }
 
 /// Applies complete, ordered mapping assignments while deriving bitmap changes from final ownership.
@@ -31,6 +49,7 @@ pub(in crate::volume) fn resolve_delta_postconditions(
             return Err(Error::UnsupportedJournal);
         }
     }
+    validate_creation_ancestry(program)?;
     let allocation = AllocationExclusionSource::recovery(volume.superblock, program)?;
     let mut mutation = MetadataMutation::begin(volume, allocation);
     let mut inodes: Vec<ReplayInode> = Vec::new();
@@ -48,17 +67,19 @@ pub(in crate::volume) fn resolve_delta_postconditions(
         }
     }
     for inode in &mut inodes {
-        let Some(tree) = &mut inode.tree else {
+        let ReplayInode::Live {
+            raw,
+            tree: Some(tree),
+        } = inode
+        else {
             continue;
         };
         for record in program.records() {
             let (range, replacement) = match record {
-                ParsedDelta::AddRange { inode: id, extent } if *id == inode.raw.id() => {
+                ParsedDelta::AddRange { inode: id, extent } if *id == raw.id() => {
                     (LogicalRange::from_extent(*extent)?, Some(*extent))
                 }
-                ParsedDelta::RemoveRange { inode: id, range } if *id == inode.raw.id() => {
-                    (*range, None)
-                }
+                ParsedDelta::RemoveRange { inode: id, range } if *id == raw.id() => (*range, None),
                 _ => continue,
             };
             for extent in tree.extents() {
@@ -84,8 +105,15 @@ pub(in crate::volume) fn resolve_delta_postconditions(
         mutation.reconcile_replay_cluster(cluster)?;
     }
     for inode in inodes {
-        let mut raw = inode.raw;
-        if let Some(tree) = inode.tree {
+        let (mut raw, tree) = match inode {
+            ReplayInode::Live { raw, tree } => (raw, tree),
+            ReplayInode::NewDirectory { mut raw, parent } => {
+                let mut tree = MutableExtentTree::from_extents(Vec::new())?;
+                mutation.initialize_delta_directory(&mut raw, &mut tree, parent)?;
+                (raw, Some(tree))
+            }
+        };
+        if let Some(tree) = tree {
             if raw.parse()?.kind() == InodeKind::Directory {
                 let blocks = tree
                     .extents()
@@ -121,6 +149,7 @@ pub(in crate::volume) fn resolve_delta_postconditions(
             mutation.replay_directory_binding(*parent, *inode, name, *change)?;
         }
     }
+    mutation.recount_replayed_directory_links(program)?;
     let (_references, superblock) = mutation.committed_cluster_state()?;
     let images = mutation.recovery_images()?;
     Ok(ResolvedDeltaImages { superblock, images })
@@ -135,7 +164,7 @@ fn prepare_inode(
     program: &DeltaProgram,
     id: InodeId,
 ) -> Result<()> {
-    if inodes.iter().any(|inode| inode.raw.id() == id) {
+    if inodes.iter().any(|inode| inode.id() == id) {
         return Ok(());
     }
     let encoded = program
@@ -146,24 +175,80 @@ fn prepare_inode(
             ParsedDelta::Inode { inode, encoded } if *inode == id => Some(encoded.as_slice()),
             _ => None,
         });
-    let created = program.records().iter().any(|record| matches!(record, ParsedDelta::Namespace { change: NamespaceChange::Create, inode, .. } if *inode == id));
-    let raw = if created {
-        mutation.recover_file_inode(id, encoded.ok_or(Error::UnsupportedJournal)?)?
+    if let Some(parent) = program.records().iter().find_map(|record| match record {
+        ParsedDelta::Namespace {
+            change: NamespaceChange::Create,
+            parent,
+            inode,
+            ..
+        } if *inode == id => Some(*parent),
+        _ => None,
+    }) {
+        inodes.try_push(mutation.recover_created_inode(
+            id,
+            parent,
+            encoded.ok_or(Error::UnsupportedJournal)?,
+        )?)?;
     } else {
         let mut raw = mutation.volume.read_live_inode_record(id)?;
         if let Some(encoded) = encoded {
             raw = raw.restore_delta_metadata(encoded)?;
         }
-        raw
-    };
-    let inode = raw.parse()?;
-    let tree = if matches!(inode.storage(), InodeStorage::Extents(_)) {
-        Some(mutation.mutable_extent_tree(&inode)?)
-    } else {
-        None
-    };
-    if tree.is_none() && program.records().iter().any(|record| matches!(record, ParsedDelta::AddRange { inode, .. } | ParsedDelta::RemoveRange { inode, .. } if *inode == id)) { return Err(Error::UnsupportedJournal); }
-    inodes.try_push(ReplayInode { raw, tree })?;
+        let inode = raw.parse()?;
+        let tree = if matches!(inode.storage(), InodeStorage::Extents(_)) {
+            Some(mutation.mutable_extent_tree(&inode)?)
+        } else {
+            None
+        };
+        inodes.try_push(ReplayInode::Live { raw, tree })?;
+    }
+    let planned = inodes.last().ok_or(Error::InvalidInode)?;
+    let range = program.records().iter().any(|record| matches!(record, ParsedDelta::AddRange { inode, .. } | ParsedDelta::RemoveRange { inode, .. } if *inode == id));
+    if range
+        && !matches!(planned, ReplayInode::Live { raw, tree: Some(_) } if raw.parse()?.kind() != InodeKind::Directory)
+    {
+        return Err(Error::UnsupportedJournal);
+    }
+    Ok(())
+}
+
+/// Birth edges cannot introduce a cycle even before newly allocated directory bodies exist.
+/// # Errors
+/// Rejects cyclic creation parentage or pre-effect allocation failure.
+fn validate_creation_ancestry(program: &DeltaProgram) -> Result<()> {
+    for record in program.records() {
+        let ParsedDelta::Namespace {
+            change: NamespaceChange::Create,
+            parent,
+            inode,
+            ..
+        } = record
+        else {
+            continue;
+        };
+        let mut seen = Vec::new();
+        seen.try_push(*inode)?;
+        let mut cursor = *parent;
+        loop {
+            if seen.contains(&cursor) {
+                return Err(Error::InvalidDirectoryEntry);
+            }
+            seen.try_push(cursor)?;
+            let next = program.records().iter().find_map(|record| match record {
+                ParsedDelta::Namespace {
+                    change: NamespaceChange::Create,
+                    parent,
+                    inode,
+                    ..
+                } if *inode == cursor => Some(*parent),
+                _ => None,
+            });
+            let Some(parent) = next else {
+                break;
+            };
+            cursor = parent;
+        }
+    }
     Ok(())
 }
 
@@ -236,10 +321,15 @@ fn replace_range(
 }
 
 impl MetadataMutation<'_, '_> {
-    /// A recorded new file claims its exact ordinary inode slot; replay cannot replace another generation.
+    /// A recorded object claims its exact ordinary inode slot without replacing another generation.
     /// # Errors
     /// Returns reserved identities, conflicting generations, unsupported metadata or bitmap/I/O failure.
-    fn recover_file_inode(&mut self, id: InodeId, encoded: &[u8]) -> Result<LiveInodeRecord> {
+    fn recover_created_inode(
+        &mut self,
+        id: InodeId,
+        parent: InodeId,
+        encoded: &[u8],
+    ) -> Result<ReplayInode> {
         self.volume.superblock.require_namespace_inode(id)?;
         if id == InodeId::ROOT {
             return Err(Error::CannotRemoveRoot);
@@ -258,19 +348,41 @@ impl MetadataMutation<'_, '_> {
             .ok_or(Error::InvalidInode)?;
         if inode_bitmap_bit_state(&bitmap.bytes, position)? == BitmapBitState::Used {
             let raw = self.volume.read_live_inode_record(id)?;
-            if raw.parse()?.kind() != InodeKind::File
-                || le_u32(raw.raw().bytes(), disk_offset(INODE_GENERATION_OFFSET))?
-                    != le_u32(encoded, disk_offset(INODE_GENERATION_OFFSET))?
+            if le_u32(raw.raw().bytes(), disk_offset(INODE_GENERATION_OFFSET))?
+                != le_u32(encoded, disk_offset(INODE_GENERATION_OFFSET))?
             {
                 return Err(Error::UnsupportedJournal);
             }
-            return raw.restore_delta_metadata(encoded);
+            let raw = raw.restore_delta_metadata(encoded)?;
+            let tree = if matches!(raw.parse()?.storage(), InodeStorage::Extents(_)) {
+                Some(self.mutable_extent_tree(&raw.parse()?)?)
+            } else {
+                None
+            };
+            if raw.parse()?.kind() == InodeKind::Directory
+                && tree.as_ref().is_some_and(|tree| tree.extents().is_empty())
+            {
+                return Ok(ReplayInode::NewDirectory { raw, parent });
+            }
+            return Ok(ReplayInode::Live { raw, tree });
         }
         set_inode_bitmap_bit(&mut bitmap.bytes, position, BitmapBitState::Used)?;
         self.record_group_free_inodes_delta(group, -1)?;
         let block_size = self.volume.superblock.block_size();
-        self.empty_allocated_inode_record(id)?
-            .initialize_delta_file(encoded, block_size)
+        let raw = self
+            .empty_allocated_inode_record(id)?
+            .initialize_delta_inode(encoded, block_size)?;
+        if raw.parse()?.kind() == InodeKind::Directory {
+            self.record_group_used_dirs_delta(group, 1)?;
+            Ok(ReplayInode::NewDirectory { raw, parent })
+        } else {
+            let tree = if matches!(raw.parse()?.storage(), InodeStorage::Extents(_)) {
+                Some(self.mutable_extent_tree(&raw.parse()?)?)
+            } else {
+                None
+            };
+            Ok(ReplayInode::Live { raw, tree })
+        }
     }
 
     /// Reference changes visit mapped allocation units only; sparse logical holes consume no work.

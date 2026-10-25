@@ -1918,7 +1918,7 @@ impl MetadataMutation<'_, '_> {
         self.stage_extent_tree(raw_parent, tree)
     }
 
-    /// Replays existing file/symlink bindings using staged plaintext leaves and final inode counts.
+    /// Replays plaintext bindings using staged leaves and final inode counts.
     /// # Errors
     /// Rejects encrypted/inline parents, directory targets, required growth or malformed routes.
     pub(super) fn replay_directory_binding(
@@ -1935,7 +1935,7 @@ impl MetadataMutation<'_, '_> {
         if parent.kind() != InodeKind::Directory
             || parent.protection().is_encrypted()
             || parent.flags().has_inline_data()
-            || child.kind() == InodeKind::Directory
+            || (child.kind() == InodeKind::Directory && change == NamespaceChange::Link)
         {
             return Err(Error::UnsupportedJournal);
         }
@@ -2027,6 +2027,158 @@ impl MetadataMutation<'_, '_> {
         } else {
             self.finish_logged_binding(parent.id(), binding)
         }
+    }
+
+    /// Establishes mandatory directory entries before a fresh inode can enter namespace staging.
+    /// # Errors
+    /// Returns allocation, coordinate or directory checksum/serialization failure.
+    pub(super) fn initialize_delta_directory(
+        &mut self,
+        raw: &mut LiveInodeRecord,
+        tree: &mut MutableExtentTree,
+        parent: InodeId,
+    ) -> Result<()> {
+        let logical = LogicalBlock::from_u32(0);
+        let physical = self.allocate_extent_block(tree, logical)?;
+        tree.insert_or_extend_initialized(logical, physical)?;
+        let inode = raw.parse()?;
+        let mut block = DirectoryBlock::empty(
+            usize::try_from(self.volume.superblock.block_size().bytes())
+                .map_err(|_| Error::ArithmeticOverflow)?,
+            self.volume.directory_checksum(&inode),
+            DirectoryEntryEncoding::for_inode(&inode),
+        )?;
+        block.initialize_dot_entries(raw.id(), parent)?;
+        self.stage_directory_block(physical, block.into_bytes())
+    }
+
+    /// Directory link counts are structural postconditions, independent of replay attempt counts.
+    /// # Errors
+    /// Returns invalid children, malformed routes, source reads or count-field overflow.
+    pub(super) fn recount_replayed_directory_links(
+        &mut self,
+        program: &crate::disk_format::journal::fast_commit::DeltaProgram,
+    ) -> Result<()> {
+        for offset in 0..self.inode_updates.len() {
+            let is_directory = match self.inode_updates.get(offset).ok_or(Error::InvalidInode)? {
+                StagedInodeRecord::Live(raw) => raw.parse()?.kind() == InodeKind::Directory,
+                _ => false,
+            };
+            if !is_directory {
+                continue;
+            }
+            let index = StagedInodeIndex::new(offset);
+            let mut raw = self.staged_live_inode(index)?;
+            let inode = raw.parse()?;
+            let recorded = program.records().iter().any(|record| matches!(record, crate::disk_format::journal::fast_commit::ParsedDelta::Inode { inode: id, .. } if *id == inode.id()));
+            let normalize_uncounted = inode.links_count().known_count().is_none()
+                && !inode.flags().has_indexed_directory();
+            if recorded && !normalize_uncounted {
+                continue;
+            }
+            let mut structural_change = normalize_uncounted;
+            for record in program.records() {
+                if let crate::disk_format::journal::fast_commit::ParsedDelta::Namespace {
+                    parent,
+                    inode: child,
+                    ..
+                } = record
+                    && *parent == inode.id()
+                    && self.raw_inode_for_policy(*child)?.parse()?.kind() == InodeKind::Directory
+                {
+                    structural_change = true;
+                    break;
+                }
+            }
+            if !structural_change {
+                continue;
+            }
+            let mut links = Ext4LinkCount::TWO;
+            if let InodeStorage::InlineData(data) = inode.storage() {
+                self.count_directory_children(
+                    data.directory_entries(inode.id())?,
+                    &inode,
+                    &mut links,
+                )?;
+            } else {
+                let tree = self.mutable_extent_tree(&inode)?;
+                match inode.directory_storage_kind()? {
+                    DirectoryStorageKind::Linear => {
+                        let count = round_up_div(
+                            inode.size().bytes(),
+                            u64::from(self.volume.superblock.block_size().bytes()),
+                        )?;
+                        for logical in 0..count {
+                            let (_physical, block) = self.read_mutation_directory_block(
+                                &inode,
+                                &tree,
+                                LogicalBlock::try_from(logical)?,
+                            )?;
+                            self.count_directory_children(block.entries()?, &inode, &mut links)?;
+                        }
+                    }
+                    DirectoryStorageKind::HTree => {
+                        let mut context =
+                            self.mutation_htree_context(&inode, &tree, HtreePathTarget::First)?;
+                        loop {
+                            let (_physical, block) = self.read_mutation_directory_block(
+                                &inode,
+                                &tree,
+                                LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
+                            )?;
+                            let entries = block.entries()?;
+                            context.path.hash_range()?.validate_leaf(
+                                &entries,
+                                context.root.hash_profile(),
+                                self.volume.superblock.name_semantics(&inode)?,
+                            )?;
+                            self.count_directory_children(entries, &inode, &mut links)?;
+                            if !self.advance_mutation_htree_path(
+                                &inode,
+                                &tree,
+                                &mut context.path,
+                                context.root.indirect_levels(),
+                            )? {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            raw.replace_directory_links(links)?;
+            self.replace_live_inode(index, raw)?;
+        }
+        Ok(())
+    }
+
+    /// Counts identities using validated inode kinds, including directories without dirent type hints.
+    /// # Errors
+    /// Returns invalid namespace identities, source I/O, allocation or directory-count overflow.
+    fn count_directory_children(
+        &mut self,
+        entries: Vec<RawDirectoryEntry>,
+        parent: &Inode,
+        links: &mut Ext4LinkCount,
+    ) -> Result<()> {
+        for entry in entries {
+            if matches!(entry.name().bytes(), b"." | b"..") {
+                continue;
+            }
+            self.volume
+                .superblock
+                .require_namespace_inode(entry.inode())?;
+            let inode = self.raw_inode_for_policy(entry.inode())?.parse()?;
+            if inode.kind() == InodeKind::Directory {
+                *links = links.directory_incremented(
+                    self.volume
+                        .superblock
+                        .inode_data_encoding()
+                        .directory_links(),
+                    parent.flags().has_indexed_directory(),
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// A searched, absent name can require layout growth while preserving recorded inode timestamps.

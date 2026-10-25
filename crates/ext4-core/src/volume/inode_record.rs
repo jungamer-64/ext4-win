@@ -220,11 +220,11 @@ impl AllocatedInodeRecord {
         put_le_u32(&mut self.raw.bytes, disk_offset(36), 1)?;
         self.raw.into_attribute()
     }
-    /// Establishes a new ordinary extent-file identity from its authenticated metadata prefix.
+    /// Establishes a new namespace identity from its authenticated metadata prefix.
     /// Root and allocation fields are reconstructed; absent attribute bodies are never invented.
     /// # Errors
-    /// Rejects malformed prefix/layout, non-file storage, external attributes or protected payloads.
-    pub(super) fn initialize_delta_file(
+    /// Rejects malformed prefix/layout, unsupported storage, external attributes or protected payloads.
+    pub(super) fn initialize_delta_inode(
         mut self,
         encoded: &[u8],
         block_size: BlockSize,
@@ -249,18 +249,31 @@ impl AllocatedInodeRecord {
                 .ok_or(Error::InvalidInode)?,
             encoded,
         )?;
-        let tree = MutableExtentTree::from_extents(Vec::new())?;
-        let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
-        self.raw.set_extent_root_bytes(serialized.inode_root())?;
+        let kind = InodeMode::from_disk(self.raw.mode()?)?.kind();
+        if kind != InodeKind::Symlink || self.raw.flags()?.has_extent_tree() {
+            let tree = MutableExtentTree::from_extents(Vec::new())?;
+            let serialized = tree.serialize(block_size, ExtentTreeContext::none())?;
+            self.raw.set_extent_root_bytes(serialized.inode_root())?;
+        }
+        if kind == InodeKind::Directory {
+            self.raw
+                .set_flags(self.raw.flags()?.without_indexed_directory())?;
+            self.raw.set_encoded_size(
+                self.raw
+                    .encoding
+                    .encode_directory_size(DirectorySize::from_bytes(0))?,
+            )?;
+        }
         self.raw.set_encoded_allocation_size(
             self.raw
                 .encoding
                 .encode_allocation_size(FileAllocationSize::from_bytes(0))?,
         )?;
         let inode = self.raw.parse()?;
-        if inode.kind() != InodeKind::File
-            || !matches!(inode.storage(), InodeStorage::Extents(_))
-            || inode.protection().is_encrypted()
+        if !matches!(
+            inode.storage(),
+            InodeStorage::Extents(_) | InodeStorage::FastSymlink(_)
+        ) || inode.protection().is_encrypted()
             || inode.protection().is_verity()
             || self.raw.xattr_block()?.is_some()
         {
@@ -740,6 +753,16 @@ impl LiveInodeRecord {
     /// Returns an error when the writable inline xattr region cannot be located.
     pub(super) fn clear_inline_xattr_region(&mut self) -> Result<()> {
         self.raw.clear_inline_xattr_region()
+    }
+
+    /// Installs a structural directory count without replaying a second link/unlink operation.
+    /// # Errors
+    /// Rejects a non-directory record or an unrepresentable count field.
+    pub(super) fn replace_directory_links(&mut self, links: Ext4LinkCount) -> Result<()> {
+        if self.parse()?.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        self.raw.set_links_count(links)
     }
 
     /// Increments link count.

@@ -695,3 +695,196 @@ fn namespace_replay_derives_growth_before_using_recorded_parent_layout() -> Resu
     assert_eq!(&bytes, b"a");
     Ok(())
 }
+
+/// Constructs namespace identities that do not exist until the replayed allocation succeeds.
+fn birth_binding(parent: u32, inode: u32, name: &[u8]) -> Vec<u8> {
+    let mut value = parent.to_le_bytes().to_vec();
+    value.extend_from_slice(&inode.to_le_bytes());
+    value.extend_from_slice(name);
+    value
+}
+
+/// Independent mode/size vectors for namespace object births.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BirthKind {
+    /// Mode type 0x8000 with one externally supplied payload block.
+    File,
+    /// Mode type 0x4000 with a body reconstructed from namespace records.
+    Directory,
+    /// Mode type 0xa000 with a short target stored in the inode prefix.
+    Symlink,
+}
+
+/// Explicit raw inode operands retain only the independent format-vector fields they declare.
+/// # Errors
+/// Returns malformed template coordinates or field bounds.
+fn birth_inode(fixture: &Fixture, inode: u32, kind: BirthKind, links: u16) -> Result<Vec<u8>> {
+    let mut value = inode_operand(&fixture.disk, NodeId::File(fixture.a))?;
+    put(&mut value, 0, &inode.to_le_bytes())?;
+    let (mode, flags, size) = match kind {
+        BirthKind::File => (0x8000_u16 | 0o640, 0x80000_u32, 8_u32),
+        BirthKind::Directory => (0x4000_u16 | 0o755, 0x80000_u32, 4096_u32),
+        BirthKind::Symlink => (0xa000_u16 | 0o777, 0_u32, 11_u32),
+    };
+    put(&mut value, 4, &mode.to_le_bytes())?;
+    put(&mut value, 8, &size.to_le_bytes())?;
+    put(&mut value, 30, &links.to_le_bytes())?;
+    put(&mut value, 36, &flags.to_le_bytes())?;
+    put(&mut value, 104, &(0x1234_0000_u32 | inode).to_le_bytes())?;
+    put(&mut value, 112, &0_u32.to_le_bytes())?;
+    value.get_mut(44..104).ok_or(Error::DeviceRange)?.fill(0);
+    if kind == BirthKind::Symlink {
+        put(&mut value, 44, b"target/path")?;
+    }
+    Ok(value)
+}
+
+/// # Errors
+/// Propagates independently constructed directory/file/symlink records and production recovery.
+/// # Panics
+/// Fails if dot entries, structural counts, nested namespace or repeated allocation differ.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe initialized directory bodies and stable recovered allocation"
+)]
+fn nested_directory_creation_initializes_parentage_and_fast_symlinks_once() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let root = fixture_inode_offset(&fixture.disk, NodeId::Directory(DirectoryNodeId::ROOT))?;
+    let root_links_offset = root.checked_add(26).ok_or(Error::DeviceRange)?;
+    let root_links = u16::from_le_bytes(
+        fixture
+            .disk
+            .filesystem
+            .get(root_links_offset..root_links_offset.checked_add(2).ok_or(Error::DeviceRange)?)
+            .ok_or(Error::DeviceRange)?
+            .try_into()
+            .map_err(|_| Error::DeviceRange)?,
+    );
+    let free_inodes = fixture_u32(&fixture.disk.filesystem, 1040)?;
+    let free_blocks = fixture_u32(&fixture.disk.filesystem, 1036)?;
+    put(&mut fixture.disk.filesystem, 1000 * 4096, b"replayed")?;
+    let a = birth_binding(2, 64, b"delta-tree");
+    let b = birth_binding(64, 65, b"nested");
+    let c = birth_binding(65, 66, b"payload");
+    let d = birth_binding(65, 67, b"link");
+    let i64 = birth_inode(&fixture, 64, BirthKind::Directory, 3)?;
+    let i65 = birth_inode(&fixture, 65, BirthKind::Directory, 2)?;
+    let i66 = birth_inode(&fixture, 66, BirthKind::File, 1)?;
+    let i67 = birth_inode(&fixture, 67, BirthKind::Symlink, 1)?;
+    let mut add = [0; 16];
+    put(&mut add, 0, &66_u32.to_le_bytes())?;
+    put(&mut add, 8, &1_u16.to_le_bytes())?;
+    put(&mut add, 12, &1000_u32.to_le_bytes())?;
+    let records = [
+        (3, a.as_slice()),
+        (3, b.as_slice()),
+        (3, c.as_slice()),
+        (3, d.as_slice()),
+        (1, add.as_slice()),
+        (6, i64.as_slice()),
+        (6, i65.as_slice()),
+        (6, i66.as_slice()),
+        (6, i67.as_slice()),
+    ];
+    for _ in 0..2 {
+        install_delta(&mut fixture, &records)?;
+        fixture.remount()?;
+        let ChildLookup::Found(top) = fixture.read(|pass| {
+            pass.lookup_child(DirectoryNodeId::ROOT, &Ext4Name::new(b"delta-tree")?)
+        })?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::Directory(top) = *top.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        let ChildLookup::Found(nested) =
+            fixture.read(|pass| pass.lookup_child(top, &Ext4Name::new(b"nested")?))?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::Directory(nested) = *nested.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(top, &Ext4Name::new(b"..")?))?, ChildLookup::Found(parent) if *parent.node() == NodeId::Directory(DirectoryNodeId::ROOT))
+        );
+        assert!(
+            matches!(fixture.read(|pass| pass.lookup_child(nested, &Ext4Name::new(b"..")?))?, ChildLookup::Found(parent) if *parent.node() == NodeId::Directory(top))
+        );
+        let ChildLookup::Found(payload) =
+            fixture.read(|pass| pass.lookup_child(nested, &Ext4Name::new(b"payload")?))?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::File(file) = *payload.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        let mut bytes = [0; 8];
+        fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
+        assert_eq!(&bytes, b"replayed");
+        let ChildLookup::Found(link) =
+            fixture.read(|pass| pass.lookup_child(nested, &Ext4Name::new(b"link")?))?
+        else {
+            return Err(Error::DirectoryEntryNotFound);
+        };
+        let NodeId::Symlink(link) = *link.node() else {
+            return Err(Error::WrongInodeKind);
+        };
+        assert_eq!(
+            fixture.read(|pass| pass.read_symlink(link))?,
+            b"target/path"
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1040)?,
+            free_inodes.checked_sub(4).ok_or(Error::InvalidSuperblock)?
+        );
+        assert_eq!(
+            fixture_u32(&fixture.disk.filesystem, 1036)?,
+            free_blocks.checked_sub(3).ok_or(Error::InvalidSuperblock)?
+        );
+        let actual_root_links = u16::from_le_bytes(
+            fixture
+                .disk
+                .filesystem
+                .get(
+                    root_links_offset
+                        ..root_links_offset.checked_add(2).ok_or(Error::DeviceRange)?,
+                )
+                .ok_or(Error::DeviceRange)?
+                .try_into()
+                .map_err(|_| Error::DeviceRange)?,
+        );
+        assert_eq!(
+            actual_root_links,
+            root_links.checked_add(1).ok_or(Error::InvalidInode)?
+        );
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates independent cyclic operands or production recovery admission errors.
+/// # Panics
+/// Fails if a directory birth cycle reaches any persistent write or flush.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions verify acyclic creation parentage before effects"
+)]
+fn cyclic_directory_births_are_rejected_before_allocation_publication() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let a = birth_binding(65, 64, b"a");
+    let b = birth_binding(64, 65, b"b");
+    let i64 = birth_inode(&fixture, 64, BirthKind::Directory, 3)?;
+    let i65 = birth_inode(&fixture, 65, BirthKind::Directory, 3)?;
+    install_delta(&mut fixture, &[(3, &a), (3, &b), (6, &i64), (6, &i65)])?;
+    fixture.disk.storage_effects = 0;
+    assert!(matches!(
+        fixture.disk.mount(MountAccess::ReadWrite),
+        Err(Error::InvalidDirectoryEntry)
+    ));
+    assert_eq!(fixture.disk.storage_effects, 0);
+    Ok(())
+}
