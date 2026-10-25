@@ -4,7 +4,7 @@
 //! recovery; a successful save never changes the media authority of an existing session.
 #![no_std]
 #![forbid(unsafe_code)]
-use ext4_core::{FilesystemUuid, MountAccess, RecoveryMemoryLimit};
+use ext4_core::{FilesystemUuid, MountAccess, ReadOnlyRecovery, RecoveryMemoryLimit};
 
 /// Directory comparison query on a retained directory handle, using buffered I/O.
 pub const QUERY_DIRECTORY_CASEFOLD_FSCTL: u32 = 0x0009_2414;
@@ -247,18 +247,25 @@ impl PolicySnapshot {
     /// Encodes the entire persistent value without allocation or native-layout dependence.
     pub fn encode(self) -> [u8; POLICY_RECORD_BYTES] {
         let mut bytes = [0; POLICY_RECORD_BYTES];
-        let access: u32 = match self.policy.access {
-            AccessMode::ReadWrite => 0,
-            AccessMode::ReadOnly => 1,
+        let (access, recovery, budget): (u32, u32, u64) = match self.policy {
+            MountAccess::ReadWrite => (0, 0, 0),
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Replay,
+            } => (1, 0, 0),
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::NoLoad,
+            } => (1, 1, 0),
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Memory { limit },
+            } => (1, 2, u64::try_from(limit.bytes()).unwrap_or(u64::MAX)),
         };
-        let budget = u64::try_from(self.policy.recovery_memory.bytes()).unwrap_or(u64::MAX);
         let fields = b"E4MP\x01\0\0\0"
             .iter()
             .copied()
             .chain(self.uuid.bytes())
             .chain(self.generation.to_le_bytes())
             .chain(access.to_le_bytes())
-            .chain([0; 4])
+            .chain(recovery.to_le_bytes())
             .chain(budget.to_le_bytes());
         for (target, value) in bytes.iter_mut().zip(fields) {
             *target = value;
@@ -277,25 +284,33 @@ impl PolicySnapshot {
         {
             return Err(Error::MalformedEncoding);
         }
-        if field::<4>(bytes, 36)? != [0; 4] {
-            return Err(Error::MalformedEncoding);
-        }
-        let access = match u32::from_le_bytes(field(bytes, 32)?) {
-            0 => AccessMode::ReadWrite,
-            1 => AccessMode::ReadOnly,
+        let budget = u64::from_le_bytes(field(bytes, 40)?);
+        // A zero recovery tag selects ordinary replay regardless of a dormant stored budget.
+        let policy = match (
+            u32::from_le_bytes(field(bytes, 32)?),
+            u32::from_le_bytes(field(bytes, 36)?),
+        ) {
+            (0, 0) => MountAccess::ReadWrite,
+            (1, 0) => MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Replay,
+            },
+            (1, 1) if budget == 0 => MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::NoLoad,
+            },
+            (1, 2) => MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Memory {
+                    limit: RecoveryMemoryLimit::new(
+                        usize::try_from(budget).map_err(|_| Error::RecoveryBudget)?,
+                    )
+                    .map_err(|_| Error::RecoveryBudget)?,
+                },
+            },
             _ => return Err(Error::MalformedEncoding),
         };
-        let budget = usize::try_from(u64::from_le_bytes(field(bytes, 40)?))
-            .map_err(|_| Error::RecoveryBudget)?;
-        let recovery_memory =
-            RecoveryMemoryLimit::new(budget).map_err(|_| Error::RecoveryBudget)?;
         Ok(Self {
             uuid: FilesystemUuid::from_bytes(field(bytes, 8)?),
             generation: u64::from_le_bytes(field(bytes, 24)?),
-            policy: MountPolicy {
-                access,
-                recovery_memory,
-            },
+            policy,
         })
     }
 }
@@ -373,7 +388,7 @@ impl PolicyReplacement {
     /// Prepares a whole replacement before any persistent effect.
     /// # Errors
     /// Rejects generation exhaustion.
-    pub fn new(previous: u64, uuid: FilesystemUuid, policy: MountPolicy) -> Result<Self, Error> {
+    pub fn new(previous: u64, uuid: FilesystemUuid, policy: MountAccess) -> Result<Self, Error> {
         Ok(Self {
             next: PolicySnapshot {
                 uuid,
@@ -419,6 +434,45 @@ fn field<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], Error> 
 
 #[cfg(test)]
 mod tests {
+    /// # Panics
+    /// Fails if stored budgets select memory implicitly or a recovery mode is lost on roundtrip.
+    #[test]
+    fn recovery_selection_is_explicit_and_persistent() {
+        use ext4_core::{MountAccess, ReadOnlyRecovery, RecoveryMemoryLimit};
+        let mut snapshot =
+            super::PolicySnapshot::defaults(ext4_core::FilesystemUuid::from_bytes([7; 16]));
+        for recovery in [
+            ReadOnlyRecovery::Replay,
+            ReadOnlyRecovery::NoLoad,
+            ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
+        ] {
+            snapshot.policy = MountAccess::ReadOnly { recovery };
+            assert_eq!(
+                super::PolicySnapshot::decode(&snapshot.encode()),
+                Ok(snapshot)
+            );
+        }
+        let mut stored = snapshot.encode();
+        if let Some(tag) = stored.get_mut(36..40) {
+            tag.fill(0);
+        }
+        snapshot.policy = MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Replay,
+        };
+        assert_eq!(super::PolicySnapshot::decode(&stored), Ok(snapshot));
+        if let Some(tag) = stored.get_mut(36) {
+            *tag = 2;
+        }
+        if let Some(budget) = stored.get_mut(40..48) {
+            budget.fill(0);
+        }
+        assert_eq!(
+            super::PolicySnapshot::decode(&stored),
+            Err(super::Error::RecoveryBudget)
+        );
+    }
     use super::*;
     /// # Panics
     /// Fails if equal bit numbers cross mask domains, unknown declarations disappear, or invalid
@@ -537,7 +591,7 @@ mod tests {
             bytes.get(24..48),
             Some(
                 [
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
                 ]
                 .as_slice()
             )

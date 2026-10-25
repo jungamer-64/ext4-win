@@ -1,8 +1,44 @@
 //! Administrator CLI for UUID-scoped identity and future-mount policy configuration.
 use std::process::ExitCode;
 
+/// Resolves parsed updates against one observed policy before acquiring persistence authority.
+/// # Errors
+/// Rejects recovery options on RW and memory budgets outside the memory recovery mode.
+fn replace_policy_fields(
+    observed: ext4_core::MountAccess,
+    access: Option<ext4_control::AccessMode>,
+    recovery: Option<ext4_core::ReadOnlyRecovery>,
+    memory: Option<ext4_core::RecoveryMemoryLimit>,
+) -> Result<ext4_core::MountAccess, String> {
+    use ext4_core::{MountAccess, ReadOnlyRecovery};
+    let selected = match access {
+        Some(ext4_control::AccessMode::ReadWrite) => MountAccess::ReadWrite,
+        Some(ext4_control::AccessMode::ReadOnly) => MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Replay,
+        },
+        None => observed,
+    };
+    match selected {
+        MountAccess::ReadWrite if recovery.is_some() || memory.is_some() => {
+            Err("recovery options require read-only access".to_owned())
+        }
+        MountAccess::ReadWrite => Ok(selected),
+        MountAccess::ReadOnly { recovery: current } => {
+            let recovery = recovery.unwrap_or(current);
+            let recovery = match (recovery, memory) {
+                (ReadOnlyRecovery::Memory { limit }, bytes) => ReadOnlyRecovery::Memory {
+                    limit: bytes.unwrap_or(limit),
+                },
+                (_, Some(_)) => return Err("--recovery-memory requires memory recovery".to_owned()),
+                (mode, None) => mode,
+            };
+            Ok(MountAccess::ReadOnly { recovery })
+        }
+    }
+}
+
 /// User-visible grammar; replacements contain the entire desired table.
-const USAGE: &str = "ext4ctl volumes\next4ctl features <volume-path>\next4ctl trim <volume-path|ext4-uuid>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery-memory <bytes>]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
+const USAGE: &str = "ext4ctl volumes\next4ctl features <volume-path>\next4ctl trim <volume-path|ext4-uuid>\next4ctl whoami\next4ctl identity show <volume-path|ext4-uuid>\next4ctl identity replace <volume-path|ext4-uuid> [--user <account|SID> <UID>]... [--group <account|SID> <GID>]...\next4ctl identity clear <volume-path|ext4-uuid>\next4ctl policy show <volume-path|ext4-uuid>\next4ctl policy set <volume-path|ext4-uuid> [--access read-write|read-only] [--recovery replay|noload|memory] [--recovery-memory <bytes>]\next4ctl casefold show <directory>\next4ctl casefold set <directory> on|off";
 /// Fully parsed action before any replacement can be submitted.
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
@@ -33,6 +69,8 @@ enum Command {
         target: String,
         /// Explicit media-mode replacement.
         access: Option<ext4_control::AccessMode>,
+        /// Explicit recovery mode; a memory budget alone does not select it.
+        recovery: Option<ext4_core::ReadOnlyRecovery>,
         /// Explicit logical recovery-memory budget.
         recovery_memory: Option<ext4_core::RecoveryMemoryLimit>,
     },
@@ -79,6 +117,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
                 "show" => Command::PolicyShow(target),
                 "set" => {
                     let mut access = None;
+                    let mut recovery = None;
                     let mut recovery_memory = None;
                     while let Some(option) = args.next() {
                         let value = args
@@ -91,6 +130,16 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
                                     "read-only" => ext4_control::AccessMode::ReadOnly,
                                     _ => return Err(format!("invalid access mode: {value}")),
                                 })
+                            }
+                            "--recovery" if recovery.is_none() => {
+                                recovery = Some(match value.as_str() {
+                                    "replay" => ext4_core::ReadOnlyRecovery::Replay,
+                                    "noload" => ext4_core::ReadOnlyRecovery::NoLoad,
+                                    "memory" => ext4_core::ReadOnlyRecovery::Memory {
+                                        limit: ext4_core::RecoveryMemoryLimit::DEFAULT,
+                                    },
+                                    _ => return Err(format!("invalid recovery mode: {value}")),
+                                });
                             }
                             "--recovery-memory" if recovery_memory.is_none() => {
                                 let bytes = value
@@ -106,12 +155,13 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Command, String> {
                             }
                         }
                     }
-                    if access.is_none() && recovery_memory.is_none() {
+                    if access.is_none() && recovery.is_none() && recovery_memory.is_none() {
                         return Err("policy set requires at least one option".to_owned());
                     }
                     Command::PolicySet {
                         target,
                         access,
+                        recovery,
                         recovery_memory,
                     }
                 }
@@ -301,15 +351,34 @@ fn show(state: &ext4_security::MappingState) {
 /// Reports durable selection without implying that an existing session was changed.
 #[cfg(windows)]
 fn show_policy(state: &ext4_control::PolicyState) {
+    use ext4_core::{MountAccess, ReadOnlyRecovery};
+    let (access, recovery) = match state.selected.policy {
+        MountAccess::ReadWrite => ("read-write", "none"),
+        MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Replay,
+        } => ("read-only", "replay"),
+        MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::NoLoad,
+        } => ("read-only", "noload"),
+        MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Memory { .. },
+        } => ("read-only", "memory"),
+    };
     println!(
-        "UUID {}\nsaved generation {}\noutcome {:?}\nstatus {:#010x}\naccess {:?}\nrecovery memory {} bytes\napplies to subsequent mounts",
+        "UUID {}\nsaved generation {}\noutcome {:?}\nstatus {:#010x}\naccess {}\nrecovery {}\napplies to subsequent mounts",
         uuid_text(state.selected.uuid),
         state.selected.generation,
         state.outcome,
         state.status,
-        state.selected.policy.access,
-        state.selected.policy.recovery_memory.bytes()
+        access,
+        recovery
     );
+    if let MountAccess::ReadOnly {
+        recovery: ReadOnlyRecovery::Memory { limit },
+    } = state.selected.policy
+    {
+        println!("recovery memory {} bytes", limit.bytes());
+    }
 }
 /// Retains an authoritative policy reply even when native handle release failed.
 /// # Errors
@@ -385,6 +454,7 @@ fn execute(command: Command) -> Result<(), String> {
         Command::PolicySet {
             target,
             access,
+            recovery,
             recovery_memory,
         } => {
             let uuid = target_uuid(&target)?;
@@ -395,13 +465,8 @@ fn execute(command: Command) -> Result<(), String> {
                     "policy persistence requires reconciliation before replacement".to_owned(),
                 );
             }
-            let mut policy = observed.selected.policy;
-            if let Some(access) = access {
-                policy.access = access;
-            }
-            if let Some(recovery_memory) = recovery_memory {
-                policy.recovery_memory = recovery_memory;
-            }
+            let policy =
+                replace_policy_fields(observed.selected.policy, access, recovery, recovery_memory)?;
             let replacement =
                 ext4_control::PolicyReplacement::new(observed.selected.generation, uuid, policy)
                     .map_err(|error| format!("invalid policy replacement: {error:?}"))?;
@@ -500,6 +565,61 @@ fn main() -> ExitCode {
 }
 #[cfg(test)]
 mod tests {
+    /// # Panics
+    /// Fails if access-only RO retains private recovery or budget-only input enables it.
+    #[test]
+    fn recovery_options_select_one_complete_policy() {
+        use ext4_core::{MountAccess, ReadOnlyRecovery, RecoveryMemoryLimit};
+        let memory = MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
+        };
+        assert_eq!(
+            replace_policy_fields(memory, Some(ext4_control::AccessMode::ReadOnly), None, None),
+            Ok(MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Replay
+            })
+        );
+        assert!(
+            replace_policy_fields(
+                MountAccess::ReadWrite,
+                None,
+                Some(ReadOnlyRecovery::NoLoad),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            replace_policy_fields(
+                MountAccess::ReadOnly {
+                    recovery: ReadOnlyRecovery::Replay
+                },
+                None,
+                None,
+                Some(RecoveryMemoryLimit::DEFAULT)
+            )
+            .is_err()
+        );
+        for mode in ["replay", "noload", "memory"] {
+            assert!(
+                parse(
+                    [
+                        "policy",
+                        "set",
+                        "X:",
+                        "--access",
+                        "read-only",
+                        "--recovery",
+                        mode
+                    ]
+                    .into_iter()
+                    .map(str::to_owned)
+                )
+                .is_ok()
+            );
+        }
+    }
     use super::*;
     /// # Panics
     /// Fails if an observation command accepts a feature toggle or omits the mounted target.
@@ -541,6 +661,7 @@ mod tests {
             Ok(Command::PolicySet {
                 target: "X:".to_owned(),
                 access: Some(ext4_control::AccessMode::ReadOnly),
+                recovery: None,
                 recovery_memory: None,
             })
         );

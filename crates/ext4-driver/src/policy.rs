@@ -374,7 +374,7 @@ impl PolicyWork {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ext4_control::{AccessMode, MountPolicy};
+    use ext4_core::{MountAccess, ReadOnlyRecovery};
 
     /// # Errors
     /// Propagates physical resource or policy codec failure.
@@ -394,9 +394,8 @@ mod tests {
         let readonly = PolicySnapshot {
             uuid,
             generation: 1,
-            policy: MountPolicy {
-                access: AccessMode::ReadOnly,
-                ..MountPolicy::DEFAULT
+            policy: MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Replay,
             },
         };
         binding.get().0.with(|state| {
@@ -406,7 +405,7 @@ mod tests {
                 selected: readonly,
             }
         });
-        assert_eq!(selected.policy.access, AccessMode::ReadWrite);
+        assert_eq!(selected.policy, MountAccess::ReadWrite);
         assert_eq!(catalog.directory.select(uuid)?, readonly);
         binding
             .get()
@@ -416,7 +415,7 @@ mod tests {
             catalog.directory.select(uuid),
             Err(DriverError::DeviceBusy)
         ));
-        let replacement = PolicyReplacement::new(1, uuid, MountPolicy::DEFAULT)?;
+        let replacement = PolicyReplacement::new(1, uuid, MountAccess::ReadWrite)?;
         let PreparedPolicyAction::Reply(bytes) =
             catalog.prepare(PolicyCommand::Replace(replacement), POLICY_REPLY_BYTES)?
         else {
@@ -455,9 +454,8 @@ mod tests {
         let replacement = PolicyReplacement::new(
             0,
             uuid,
-            MountPolicy {
-                access: AccessMode::ReadOnly,
-                ..MountPolicy::DEFAULT
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Replay,
             },
         )?;
         assert!(matches!(
@@ -479,8 +477,8 @@ mod tests {
         let bytes = work.failed(DriverError::InsufficientResources);
         assert_eq!(PolicyState::decode(&bytes)?.selected.generation, 0);
         assert_eq!(
-            catalog.directory.select(uuid)?.policy.access,
-            AccessMode::ReadWrite
+            catalog.directory.select(uuid)?.policy,
+            MountAccess::ReadWrite
         );
         let PreparedPolicyAction::Work(work) =
             catalog.prepare(PolicyCommand::Replace(replacement), POLICY_REPLY_BYTES)?
