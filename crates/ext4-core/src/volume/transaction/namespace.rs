@@ -1269,8 +1269,6 @@ impl MutationResolvePass<'_, '_, '_> {
             }
         }
     }
-
-
 }
 
 /// A logged binding supplies a postcondition; link-count arithmetic is not part of leaf editing.
@@ -1991,6 +1989,92 @@ impl MetadataMutation<'_, '_> {
         self.stage_directory_block(physical, block.into_bytes())
     }
 
+    /// Visits the current staged directory view, stopping at the first completed observation.
+    /// Hash routes are authenticated before the visitor observes a leaf; encoded names stay opaque.
+    /// # Errors
+    /// Returns malformed layout/routes, allocation, suspended reads or the visitor's failure.
+    pub(super) fn visit_directory_entries(
+        &mut self,
+        inode: &Inode,
+        mut visit: impl FnMut(&mut Self, Vec<RawDirectoryEntry>) -> Result<core::ops::ControlFlow<()>>,
+    ) -> Result<core::ops::ControlFlow<()>> {
+        use core::ops::ControlFlow;
+        if inode.kind() != InodeKind::Directory {
+            return Err(Error::WrongInodeKind);
+        }
+        if let InodeStorage::InlineData(data) = inode.storage() {
+            return visit(self, data.directory_entries(inode.id())?);
+        }
+        let tree = self.mutable_extent_tree(inode)?;
+        match inode.directory_storage_kind()? {
+            DirectoryStorageKind::Linear => {
+                let blocks = round_up_div(
+                    inode.size().bytes(),
+                    u64::from(self.volume.superblock.block_size().bytes()),
+                )?;
+                for logical in 0..blocks {
+                    let (_, block) = self.read_mutation_directory_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(logical)?,
+                    )?;
+                    if visit(self, block.entries()?)?.is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
+            }
+            DirectoryStorageKind::HTree => {
+                let mut context =
+                    self.mutation_htree_context(inode, &tree, HtreePathTarget::First)?;
+                loop {
+                    let (_, block) = self.read_mutation_directory_block(
+                        inode,
+                        &tree,
+                        LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
+                    )?;
+                    let entries = block.entries()?;
+                    context.path.hash_range()?.validate_leaf(
+                        &entries,
+                        context.root.hash_profile(),
+                        self.volume.superblock.name_semantics(inode)?,
+                    )?;
+                    if visit(self, entries)?.is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    if !self.advance_mutation_htree_path(
+                        inode,
+                        &tree,
+                        &mut context.path,
+                        context.root.indirect_levels(),
+                    )? {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Empty-directory admission observes the same staged leaves as namespace recovery.
+    /// # Errors
+    /// Returns malformed directory storage, routes or source reads.
+    pub(super) fn directory_is_empty(&mut self, inode: &Inode) -> Result<bool> {
+        Ok(self
+            .visit_directory_entries(inode, |_, entries| {
+                Ok(
+                    if entries
+                        .iter()
+                        .any(|entry| !matches!(entry.name().bytes(), b"." | b".."))
+                    {
+                        core::ops::ControlFlow::Break(())
+                    } else {
+                        core::ops::ControlFlow::Continue(())
+                    },
+                )
+            })?
+            .is_continue())
+    }
+
     /// Directory link counts are structural postconditions, independent of replay attempt counts.
     /// # Errors
     /// Returns invalid children, malformed routes, source reads or count-field overflow.
@@ -2033,57 +2117,10 @@ impl MetadataMutation<'_, '_> {
                 continue;
             }
             let mut links = Ext4LinkCount::TWO;
-            if let InodeStorage::InlineData(data) = inode.storage() {
-                self.count_directory_children(
-                    data.directory_entries(inode.id())?,
-                    &inode,
-                    &mut links,
-                )?;
-            } else {
-                let tree = self.mutable_extent_tree(&inode)?;
-                match inode.directory_storage_kind()? {
-                    DirectoryStorageKind::Linear => {
-                        let count = round_up_div(
-                            inode.size().bytes(),
-                            u64::from(self.volume.superblock.block_size().bytes()),
-                        )?;
-                        for logical in 0..count {
-                            let (_physical, block) = self.read_mutation_directory_block(
-                                &inode,
-                                &tree,
-                                LogicalBlock::try_from(logical)?,
-                            )?;
-                            self.count_directory_children(block.entries()?, &inode, &mut links)?;
-                        }
-                    }
-                    DirectoryStorageKind::HTree => {
-                        let mut context =
-                            self.mutation_htree_context(&inode, &tree, HtreePathTarget::First)?;
-                        loop {
-                            let (_physical, block) = self.read_mutation_directory_block(
-                                &inode,
-                                &tree,
-                                LogicalBlock::try_from(u64::from(context.path.leaf()?))?,
-                            )?;
-                            let entries = block.entries()?;
-                            context.path.hash_range()?.validate_leaf(
-                                &entries,
-                                context.root.hash_profile(),
-                                self.volume.superblock.name_semantics(&inode)?,
-                            )?;
-                            self.count_directory_children(entries, &inode, &mut links)?;
-                            if !self.advance_mutation_htree_path(
-                                &inode,
-                                &tree,
-                                &mut context.path,
-                                context.root.indirect_levels(),
-                            )? {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
+            let _complete = self.visit_directory_entries(&inode, |mutation, entries| {
+                mutation.count_directory_children(entries, &inode, &mut links)?;
+                Ok(core::ops::ControlFlow::Continue(()))
+            })?;
             raw.replace_directory_links(links)?;
             self.replace_live_inode(index, raw)?;
         }
