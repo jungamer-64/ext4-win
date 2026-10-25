@@ -1826,8 +1826,8 @@ impl MountedVolumeAccess<'_> {
 
     /// Reports whether no mutation or checkpoint owns journal space.
     #[cfg(not(test))]
-    pub(crate) fn journal_is_clean(&self) -> bool {
-        self.runtime.journal_is_clean()
+    pub(crate) fn publication_is_idle(&self) -> bool {
+        self.runtime.publication_is_idle()
     }
 
     /// Publishes the durable epoch and its prevalidated stream metadata in one reactor turn.

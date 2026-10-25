@@ -960,7 +960,7 @@ mod tests {
         let initial = crate::CommittedEpoch::initial(
             superblock,
             crate::FscryptKeySet::empty(),
-            ClusterReferenceIndex::new(),
+            Some(ClusterReferenceIndex::new()),
             crate::MountAccess::ReadWrite,
             crate::volume::mount::MountIdentity::new()?,
         );
@@ -1023,7 +1023,7 @@ mod tests {
             initial.sequence().next()?,
             superblock,
             crate::FscryptKeySet::empty(),
-            ClusterReferenceIndex::new(),
+            Some(ClusterReferenceIndex::new()),
             alloc::vec![changed],
         );
         let writes = [
@@ -1124,7 +1124,7 @@ mod tests {
             durable.sequence().next()?,
             superblock,
             crate::FscryptKeySet::empty(),
-            ClusterReferenceIndex::new(),
+            Some(ClusterReferenceIndex::new()),
             Vec::new(),
         );
         cache.publish(&checkpoint);
@@ -1873,7 +1873,7 @@ mod tests {
             let epoch = CommittedEpoch::initial(
                 superblock,
                 FscryptKeySet::empty(),
-                ClusterReferenceIndex::new(),
+                Some(ClusterReferenceIndex::new()),
                 crate::MountAccess::ReadWrite,
                 crate::volume::mount::MountIdentity::new()?,
             );

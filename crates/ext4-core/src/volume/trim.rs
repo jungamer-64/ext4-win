@@ -320,7 +320,7 @@ impl TrimSelection {
         {
             return Err(Error::StaleReadContext);
         }
-        if !coordinator.journal_is_clean() || coordinator.trims.active.is_some() {
+        if !coordinator.publication_is_idle() || coordinator.trims.active.is_some() {
             return Ok(TrimAdmission::Waiting(self));
         }
         if !epoch.overlay.is_empty() {
@@ -614,7 +614,13 @@ fn select(
     while cluster < group_end {
         let free = |cluster: u64| -> Result<bool> {
             let address = ClusterAddress::new(cluster);
-            if epoch.clusters.count(address) != 0 {
+            if epoch
+                .clusters
+                .as_ref()
+                .ok_or(Error::ReadOnlyFilesystem)?
+                .count(address)
+                != 0
+            {
                 return Ok(false);
             }
             let bit = u32::try_from(

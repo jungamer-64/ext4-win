@@ -36,7 +36,12 @@ use super::scheduler::SlotId;
 #[derive(Debug)]
 pub(crate) enum PassiveWork {
     /// Mount-owned exclusive open may reenter the filesystem through native volume recognition.
-    OpenExternalJournal(crate::kernel::external_journal::SelectedExternalJournal),
+    OpenExternalJournal {
+        /// Unique selected native device identity.
+        selected: crate::kernel::external_journal::SelectedExternalJournal,
+        /// Narrow native handle authority for this recovery mode.
+        access: ext4_core::DeviceWriteAccess,
+    },
     /// Retained UUID update or reconciliation, owned through worker completion.
     Identity(alloc::boxed::Box<crate::identity::IdentityWork>),
     /// Retained mount-policy save or reconciliation.
@@ -209,7 +214,7 @@ impl PassiveWork {
         authorize: impl FnOnce() -> DriverResult<()>,
     ) -> DriverResult<()> {
         match self {
-            Self::OpenExternalJournal(_)
+            Self::OpenExternalJournal { .. }
             | Self::Identity(_)
             | Self::Policy(_)
             | Self::Uninitialize { .. }
@@ -292,9 +297,13 @@ impl PassiveWork {
     /// Executes the sole native call selected before the actor suspended.
     pub(super) fn execute(self, retrying: bool) -> PassiveWorkCompletion {
         match self {
-            Self::OpenExternalJournal(selected) => PassiveWorkCompletion::OpenExternalJournal(
-                crate::kernel::external_journal::ExclusiveExternalJournal::open(selected),
-            ),
+            Self::OpenExternalJournal { selected, access } => {
+                PassiveWorkCompletion::OpenExternalJournal(
+                    crate::kernel::external_journal::ExclusiveExternalJournal::open(
+                        selected, access,
+                    ),
+                )
+            }
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).execute()),
             Self::Policy(work) => PassiveWorkCompletion::Policy((*work).execute()),
             Self::SectorSize {
@@ -386,7 +395,9 @@ impl PassiveWork {
     /// Preserves the selected operation kind when worker preparation fails before queueing.
     pub(super) fn failed(self, error: DriverError) -> PassiveWorkCompletion {
         match self {
-            Self::OpenExternalJournal(_) => PassiveWorkCompletion::OpenExternalJournal(Err(error)),
+            Self::OpenExternalJournal { .. } => {
+                PassiveWorkCompletion::OpenExternalJournal(Err(error))
+            }
             Self::Identity(work) => PassiveWorkCompletion::Identity((*work).failed(error)),
             Self::Policy(work) => PassiveWorkCompletion::Policy((*work).failed(error)),
             Self::SectorSize { .. } => PassiveWorkCompletion::SectorSize(Err(error)),

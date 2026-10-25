@@ -129,6 +129,8 @@ mod recognition_tests {
 }
 /// Clean filesystem bit stored in `s_state`.
 const EXT4_VALID_FS: u16 = 0x0001;
+/// Recorded filesystem error suppresses orphan cleanup on ordinary RO mounts.
+const EXT4_ERROR_FS: u16 = 0x0002;
 /// Fixed inode number assigned to online-resize metadata by ext4.
 const EXT4_RESIZE_INODE_ID: u32 = 7;
 /// Byte offset of `s_volume_name` inside the superblock.
@@ -1367,54 +1369,26 @@ impl FeatureSet {
         if compat & COMPAT_HAS_JOURNAL == 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if compat & COMPAT_FAST_COMMIT != 0 {
-            return Err(Error::UnsupportedWriteFeature);
-        }
-        if compat
-            & !(COMPAT_HAS_JOURNAL
-                | COMPAT_EXT_ATTR
-                | COMPAT_RESIZE_INODE
-                | COMPAT_DIR_INDEX
-                | COMPAT_ORPHAN_FILE)
-            != 0
+        Self::mutable(compat, incompat, read_only_compat)
+    }
+
+    /// Validates metadata updates independently of journal availability.
+    /// # Errors
+    /// Rejects features whose mutable metadata is not implemented.
+    fn mutable(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
+        Self::read_only(compat, incompat, read_only_compat).map_err(|error| match error {
+            Error::UnsupportedReadOnlyFeature => Error::UnsupportedWriteFeature,
+            error => error,
+        })?;
+        if compat & COMPAT_FAST_COMMIT != 0
+            || compat
+                & !(COMPAT_HAS_JOURNAL
+                    | COMPAT_EXT_ATTR
+                    | COMPAT_RESIZE_INODE
+                    | COMPAT_DIR_INDEX
+                    | COMPAT_ORPHAN_FILE)
+                != 0
         {
-            return Err(Error::UnsupportedWriteFeature);
-        }
-        if incompat & (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS)
-            != (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS)
-        {
-            return Err(Error::UnsupportedWriteFeature);
-        }
-        if incompat & INCOMPAT_JOURNAL_DEV != 0 {
-            return Err(Error::UnsupportedWriteFeature);
-        }
-        if incompat
-            & !(INCOMPAT_FILETYPE
-                | INCOMPAT_RECOVER
-                | INCOMPAT_EXTENTS
-                | INCOMPAT_64BIT
-                | INCOMPAT_FLEX_BG
-                | INCOMPAT_CSUM_SEED
-                | INCOMPAT_ENCRYPT
-                | INCOMPAT_META_BG
-                | INCOMPAT_MMP
-                | INCOMPAT_EA_INODE
-                | INCOMPAT_LARGEDIR
-                | INCOMPAT_INLINE_DATA
-                | INCOMPAT_CASEFOLD)
-            != 0
-        {
-            return Err(Error::UnsupportedWriteFeature);
-        }
-        if incompat & INCOMPAT_META_BG != 0 {
-            return Err(Error::UnsupportedWriteFeature);
-        }
-        if incompat & (INCOMPAT_INLINE_DATA | INCOMPAT_EA_INODE) != 0
-            && compat & COMPAT_EXT_ATTR == 0
-        {
-            return Err(Error::UnsupportedWriteFeature);
-        }
-        if incompat & INCOMPAT_CSUM_SEED != 0 && read_only_compat & RO_COMPAT_METADATA_CSUM == 0 {
             return Err(Error::UnsupportedWriteFeature);
         }
         if read_only_compat
@@ -1437,6 +1411,50 @@ impl FeatureSet {
         }
         if read_only_compat & (RO_COMPAT_READONLY | RO_COMPAT_QUOTA | RO_COMPAT_PROJECT) != 0 {
             return Err(Error::UnsupportedWriteFeature);
+        }
+        Ok(Self::from_raw(compat, incompat, read_only_compat))
+    }
+
+    /// Establishes read-format invariants without granting mutation authority.
+    /// # Errors
+    /// Rejects unsupported incompatible features and contradictory declarations.
+    fn read_only(compat: u32, incompat: u32, read_only_compat: u32) -> Result<Self> {
+        if incompat & (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS)
+            != (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS)
+        {
+            return Err(Error::UnsupportedReadOnlyFeature);
+        }
+        if incompat & INCOMPAT_JOURNAL_DEV != 0 {
+            return Err(Error::UnsupportedReadOnlyFeature);
+        }
+        if incompat
+            & !(INCOMPAT_FILETYPE
+                | INCOMPAT_RECOVER
+                | INCOMPAT_EXTENTS
+                | INCOMPAT_64BIT
+                | INCOMPAT_FLEX_BG
+                | INCOMPAT_CSUM_SEED
+                | INCOMPAT_ENCRYPT
+                | INCOMPAT_META_BG
+                | INCOMPAT_MMP
+                | INCOMPAT_EA_INODE
+                | INCOMPAT_LARGEDIR
+                | INCOMPAT_INLINE_DATA
+                | INCOMPAT_CASEFOLD)
+            != 0
+        {
+            return Err(Error::UnsupportedReadOnlyFeature);
+        }
+        if incompat & INCOMPAT_META_BG != 0 {
+            return Err(Error::UnsupportedReadOnlyFeature);
+        }
+        if incompat & (INCOMPAT_INLINE_DATA | INCOMPAT_EA_INODE) != 0
+            && compat & COMPAT_EXT_ATTR == 0
+        {
+            return Err(Error::UnsupportedReadOnlyFeature);
+        }
+        if incompat & INCOMPAT_CSUM_SEED != 0 && read_only_compat & RO_COMPAT_METADATA_CSUM == 0 {
+            return Err(Error::UnsupportedReadOnlyFeature);
         }
         if read_only_compat & RO_COMPAT_ORPHAN_PRESENT != 0 && compat & COMPAT_ORPHAN_FILE == 0 {
             return Err(Error::InvalidOrphanTracking);
@@ -1621,6 +1639,8 @@ impl FeatureSet {
 /// Superblock whose structural fields and mount policy are validated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Superblock {
+    /// On-disk health flags; observation does not imply cleanup permission.
+    state: u16,
     /// Validated filesystem block size.
     block_size: BlockSize,
     /// Total inode count.
@@ -1680,6 +1700,42 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Reads only the magic and policy-selection identity. This does not admit any filesystem.
+    /// # Errors
+    /// Returns read suspension, truncated input or invalid magic.
+    pub(crate) fn probe_uuid(device: &mut OperationDevice<'_>) -> Result<FilesystemUuid> {
+        let mut raw = [0_u8; SUPERBLOCK_SIZE];
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        if le_u16(&raw, disk_offset(56))? != EXT4_SUPER_MAGIC {
+            return Err(Error::InvalidMagic);
+        }
+        let mut uuid = [0; 16];
+        memory::copy_exact(
+            &mut uuid,
+            raw.get(104..120).ok_or(Error::TruncatedStructure)?,
+        )?;
+        Ok(FilesystemUuid::from_bytes(uuid))
+    }
+
+    /// Selects strict read-only validation or journal-authenticated writable/private recovery.
+    /// # Errors
+    /// Returns read suspension, checksum, feature or geometry failures.
+    pub(crate) fn read_for_mount(
+        device: &mut OperationDevice<'_>,
+        access: crate::MountAccess,
+    ) -> Result<PrimarySuperblockRead> {
+        match access {
+            crate::MountAccess::ReadOnly {
+                recovery: crate::ReadOnlyRecovery::Replay | crate::ReadOnlyRecovery::NoLoad,
+            } => {
+                let mut raw = [0_u8; SUPERBLOCK_SIZE];
+                device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+                Self::parse_read_only(&raw).map(PrimarySuperblockRead::Valid)
+            }
+            _ => Self::read_write_from(device),
+        }
+    }
+
     /// Reads and validates the primary ext4 superblock for read-write mode.
     ///
     /// # Errors
@@ -1694,6 +1750,7 @@ impl Superblock {
             Err(Error::ChecksumMismatch) => Self::parse_with_policy(
                 &raw,
                 FeatureSet::read_write,
+                crate::MediaAccess::ReadWrite,
                 SuperblockChecksumValidation::DeferredToJournalReplay,
             )
             .map(ChecksumInvalidSuperblock)
@@ -1710,8 +1767,66 @@ impl Superblock {
         Self::parse_with_policy(
             raw,
             FeatureSet::read_write,
+            crate::MediaAccess::ReadWrite,
             SuperblockChecksumValidation::Required,
         )
+    }
+
+    /// Validates a read-only view without requiring a journal or writable-compatible features.
+    /// # Errors
+    /// Rejects invalid checksums, geometry and unsupported read formats.
+    pub fn parse_read_only(raw: &[u8]) -> Result<Self> {
+        Self::parse_with_policy(
+            raw,
+            FeatureSet::read_only,
+            crate::MediaAccess::ReadOnly,
+            SuperblockChecksumValidation::Required,
+        )
+    }
+
+    /// Parses an admitted metadata update, including no-journal orphan cleanup.
+    /// # Errors
+    /// Rejects unsupported updates and malformed or unauthenticated bytes.
+    pub(crate) fn parse_mutable(raw: &[u8]) -> Result<Self> {
+        Self::parse_with_policy(
+            raw,
+            FeatureSet::mutable,
+            crate::MediaAccess::ReadOnly,
+            SuperblockChecksumValidation::Required,
+        )
+    }
+
+    /// Orphan cleanup requires implemented writable features and no recorded filesystem error.
+    pub(crate) fn permits_orphan_cleanup(self) -> bool {
+        self.state & EXT4_ERROR_FS == 0
+            && FeatureSet::mutable(
+                self.features.declared.compatible.bits(),
+                self.features.declared.incompatible.bits(),
+                self.features.declared.read_only_compatible.bits(),
+            )
+            .is_ok()
+    }
+
+    /// Clears recovery markers after ordinary RO recovery without recording a writable mount.
+    /// # Errors
+    /// Returns source-read suspension, checksum or field-encoding failure before publication.
+    pub(crate) fn prepare_read_only_completion(
+        device: &mut OperationDevice<'_>,
+        unix_seconds: u64,
+    ) -> Result<Option<[u8; SUPERBLOCK_SIZE]>> {
+        let mut raw = [0; SUPERBLOCK_SIZE];
+        device.read_exact_at(ByteOffset::new(SUPERBLOCK_OFFSET), &mut raw)?;
+        Self::parse_read_only(&raw)?;
+        let incompat = le_u32(&raw, disk_offset(96))?;
+        let ro = le_u32(&raw, disk_offset(100))?;
+        if incompat & INCOMPAT_RECOVER == 0 && ro & RO_COMPAT_ORPHAN_PRESENT == 0 {
+            return Ok(None);
+        }
+        put_le_u32(&mut raw, disk_offset(96), incompat & !INCOMPAT_RECOVER)?;
+        put_le_u32(&mut raw, disk_offset(100), ro & !RO_COMPAT_ORPHAN_PRESENT)?;
+        Self::update_write_time(&mut raw, unix_seconds)?;
+        Self::refresh_checksum(&mut raw)?;
+        Ok(Some(raw))
     }
 
     /// Parses a raw superblock with the supplied feature validation policy.
@@ -1722,6 +1837,7 @@ impl Superblock {
     fn parse_with_policy(
         raw: &[u8],
         validate_features: fn(u32, u32, u32) -> Result<FeatureSet>,
+        access: crate::MediaAccess,
         checksum_validation: SuperblockChecksumValidation,
     ) -> Result<Self> {
         if raw.len() < SUPERBLOCK_SIZE {
@@ -1734,7 +1850,8 @@ impl Superblock {
         if le_u32(raw, disk_offset(76))? != 1 {
             return Err(Error::UnsupportedWriteFeature);
         }
-        if le_u16(raw, disk_offset(58))? & EXT4_VALID_FS == 0 {
+        let state = le_u16(raw, disk_offset(58))?;
+        if access == crate::MediaAccess::ReadWrite && state & EXT4_VALID_FS == 0 {
             return Err(Error::DirtyVolume);
         }
 
@@ -1896,6 +2013,7 @@ impl Superblock {
             block_size,
             inode_count,
             block_count,
+            state,
             cluster_size: geometry.cluster_size,
             blocks_per_cluster: geometry.blocks_per_cluster,
             cluster_count: geometry.cluster_count,

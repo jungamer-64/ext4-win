@@ -517,7 +517,9 @@ pub(crate) enum OperationTransition {
         suspended: Box<dyn CompletionOperation>,
     },
     /// Build and submit one mount-time lower device-length query.
-    QueryDeviceLength {
+    QueryDevice {
+        /// The physical fact being observed.
+        query: crate::kernel::storage::DeviceQuery,
         /// Driver-owned device whose image pins the completion callback.
         completion_owner: KernelDevice,
         /// Lower storage device being mounted.
@@ -3161,7 +3163,8 @@ impl CompletionReactor {
                             TimerDelay::ObservationSeconds(seconds),
                         );
                 }
-                OperationTransition::QueryDeviceLength {
+                OperationTransition::QueryDevice {
+                    query,
                     completion_owner,
                     target,
                     suspended,
@@ -3169,7 +3172,7 @@ impl CompletionReactor {
                     let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
                         return;
                     };
-                    self.submit_device_length(index, completion_owner, target, suspended);
+                    self.submit_device_query(index, query, completion_owner, target, suspended);
                 }
                 OperationTransition::SubmitTrim {
                     devices,
@@ -3819,9 +3822,10 @@ impl CompletionReactor {
 
     /// Builds, registers, and submits the private mount-time length query.
     #[cfg(not(test))]
-    fn submit_device_length(
+    fn submit_device_query(
         &self,
         index: usize,
+        query: crate::kernel::storage::DeviceQuery,
         completion_owner: KernelDevice,
         target: KernelDevice,
         suspended: SuspendedOperation,
@@ -3829,18 +3833,41 @@ impl CompletionReactor {
         let rundown = match self.completion_rundown.acquire() {
             Ok(Some(rundown)) => rundown,
             Ok(None) => {
-                self.set_ready_length_failure(index, suspended, DriverError::InvalidDeviceRequest);
+                self.set_ready_control_completion(
+                    index,
+                    match query {
+                        crate::kernel::storage::DeviceQuery::Length => {
+                            DeviceControlCommand::Length { suspended }
+                        }
+                        crate::kernel::storage::DeviceQuery::WriteAccess => {
+                            DeviceControlCommand::WriteAccess { suspended }
+                        }
+                    }
+                    .unsubmitted(DriverError::InvalidDeviceRequest),
+                );
                 return;
             }
             Err(error) => {
-                self.set_ready_length_failure(index, suspended, error);
+                self.set_ready_control_completion(
+                    index,
+                    match query {
+                        crate::kernel::storage::DeviceQuery::Length => {
+                            DeviceControlCommand::Length { suspended }
+                        }
+                        crate::kernel::storage::DeviceQuery::WriteAccess => {
+                            DeviceControlCommand::WriteAccess { suspended }
+                        }
+                    }
+                    .unsubmitted(error),
+                );
                 return;
             }
         };
         let destination = DeviceControlCompletionRoute {
             reactor: NonNull::from(self),
         };
-        let lower = match DeviceControlCommand::length(
+        let lower = match DeviceControlCommand::query(
+            query,
             completion_owner,
             target,
             suspended,
@@ -4073,6 +4100,14 @@ impl CompletionReactor {
         completed: DeviceControlCompletion<SuspendedOperation>,
     ) {
         match completed {
+            DeviceControlCompletion::WriteAccess { suspended, result } => self
+                .set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::Core(OperationEvent::DeviceWriteAccessCompleted(
+                        result.map_err(driver_error_to_core),
+                    )),
+                ),
             DeviceControlCompletion::Length { suspended, result } => match result {
                 Ok(length) => self.set_ready_operation_event(
                     index,
@@ -4917,7 +4952,7 @@ impl CompletionReactor {
                 let has_commit_work = self.with_scheduler(|scheduler| scheduler.has_commit_work());
                 let readiness = self.with_mounted_access(|access| {
                     access.authorize_durability()?;
-                    Ok(!has_commit_work && access.journal_is_clean())
+                    Ok(!has_commit_work && access.publication_is_idle())
                 });
                 CompletionEvent::durability_wait(1, readiness)
             }
@@ -5739,7 +5774,8 @@ mod tests {
                 suspended,
             } => drop(suspended),
             OperationTransition::ForwardQueryRemove(forwarding) => forwarding.queue(),
-            OperationTransition::QueryDeviceLength {
+            OperationTransition::QueryDevice {
+                query: _query,
                 completion_owner: _completion_owner,
                 target: _target,
                 suspended,

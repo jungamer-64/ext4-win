@@ -760,7 +760,11 @@ fn verify_directory_links(linux: LinuxEnvironment, root: &Path, image: &Path) ->
 /// Returns mount, resolution, reservation or effect-boundary failures.
 fn overwrite_until_boundary(image: &Path, cut: Option<EffectCut>) -> TaskResult<EffectBoundaryRun> {
     let mut storage = CrashStorageAdapter::open_internal(image)?;
-    let completed = mount_internal_core(&mut storage)?;
+    let completed = mount_internal_core(
+        &mut storage,
+        ext4_core::MountAccess::ReadWrite,
+        ext4_core::DeviceWriteAccess::Writable,
+    )?;
     let (profile, epoch, mut coordinator, _mmp) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let name = ext4_core::Ext4Name::new(b"payload").map_err(core_task_error)?;

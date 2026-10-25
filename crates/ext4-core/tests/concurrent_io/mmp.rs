@@ -1,6 +1,37 @@
 //! Independent on-disk MMP vectors exercised through complete filesystem mount and close.
 use super::*;
 
+/// # Errors
+/// Returns independent MMP fixture preparation or standard RO recovery errors.
+/// # Panics
+/// Fails if standard RO treats an active MMP owner as admission failure or updates its record.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare the independent physical MMP record"
+)]
+fn standard_ro_does_not_claim_or_observe_mmp() -> Result<()> {
+    for recovery in [
+        ext4_core::ReadOnlyRecovery::Replay,
+        ext4_core::ReadOnlyRecovery::NoLoad,
+    ] {
+        let mut disk = ownership_disk(0xe24d_4d50)?;
+        let record = disk
+            .filesystem
+            .get(OWNERSHIP_OFFSET..OWNERSHIP_OFFSET + 4096)
+            .ok_or(Error::DeviceRange)?
+            .to_vec();
+        let mounted = disk.mount(MountAccess::ReadOnly { recovery })?;
+        assert!(mounted.into_parts().3.is_none());
+        assert_eq!(
+            disk.filesystem
+                .get(OWNERSHIP_OFFSET..OWNERSHIP_OFFSET + 4096),
+            Some(record.as_slice())
+        );
+    }
+    Ok(())
+}
+
 /// Independent block reserved in the fixture's otherwise free block bitmap.
 const OWNERSHIP_BLOCK: usize = 1000;
 /// Physical fixture byte coordinate.
@@ -303,7 +334,9 @@ fn readonly_and_rejected_owners_leave_both_devices_unchanged() -> Result<()> {
         for access in [
             MountAccess::ReadWrite,
             MountAccess::ReadOnly {
-                recovery_memory: RecoveryMemoryLimit::DEFAULT,
+                recovery: ext4_core::ReadOnlyRecovery::Memory {
+                    limit: RecoveryMemoryLimit::DEFAULT,
+                },
             },
         ] {
             if reason.is_none() && access == MountAccess::ReadWrite {

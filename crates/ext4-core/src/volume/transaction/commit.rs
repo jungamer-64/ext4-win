@@ -388,7 +388,12 @@ impl ReservedMutation {
         }
         let version_publication =
             coordinator.prepare_version_publication(&self.resolved.observed)?;
-        let JournalCoordinatorState::Ready { journal, epoch, .. } = &coordinator.journal else {
+        let PublicationState::Ready {
+            journal: Some(journal),
+            epoch,
+            ..
+        } = &coordinator.journal
+        else {
             return Err(Error::JournalCorrupt);
         };
         if coordinator.mount != current_epoch.mount
@@ -399,6 +404,8 @@ impl ReservedMutation {
 
         let durable_clusters = current_epoch
             .clusters
+            .as_ref()
+            .ok_or(Error::ReadOnlyFilesystem)?
             .with_deltas(&self.resolved.cluster_deltas)?;
         let checkpoint_clusters = durable_clusters.try_clone()?;
         let durable_keys = current_epoch.fscrypt_keys.try_clone()?;
@@ -455,7 +462,7 @@ impl ReservedMutation {
             durable_sequence,
             superblock,
             durable_keys,
-            durable_clusters,
+            Some(durable_clusters),
             overlay,
         );
         let checkpointed_epoch = CommittedEpoch::prepared(
@@ -463,7 +470,7 @@ impl ReservedMutation {
             checkpoint_sequence,
             superblock,
             checkpoint_keys,
-            checkpoint_clusters,
+            Some(checkpoint_clusters),
             Vec::new(),
         );
         let checkpoint = CheckpointOperation {
@@ -563,13 +570,13 @@ impl DurableMutation {
             return Err((error, self));
         }
         let valid = coordinator.mount == self.durable_epoch.mount
-            && matches!(coordinator.journal, JournalCoordinatorState::Ready { .. })
+            && matches!(coordinator.journal, PublicationState::Ready { .. })
             && coordinator.published_epoch().1.next() == Ok(self.durable_epoch.sequence());
         if !valid {
             return Err((Error::ClusterReferenceConflict, self));
         }
         let _durable_journal = self.durable_journal;
-        coordinator.journal = JournalCoordinatorState::CheckpointPending {
+        coordinator.journal = PublicationState::CheckpointPending {
             admission: CheckpointAdmission::Available,
             epoch: (
                 self.durable_epoch.identity().uuid(),
@@ -607,7 +614,7 @@ impl CheckpointOperation {
             || coordinator.published_epoch().1.next() != Ok(self.checkpointed_epoch.sequence())
             || !matches!(
                 coordinator.journal,
-                JournalCoordinatorState::CheckpointPending {
+                PublicationState::CheckpointPending {
                     admission: CheckpointAdmission::Granted,
                     ..
                 }
@@ -652,7 +659,7 @@ impl CheckpointPublication {
         if coordinator.mount != self.checkpointed_epoch.mount
             || !matches!(
                 coordinator.journal,
-                JournalCoordinatorState::CheckpointPending {
+                PublicationState::CheckpointPending {
                     admission: CheckpointAdmission::Granted,
                     ..
                 }
@@ -661,9 +668,9 @@ impl CheckpointPublication {
         {
             return Err((Error::ClusterReferenceConflict, self));
         }
-        coordinator.journal = JournalCoordinatorState::Ready {
+        coordinator.journal = PublicationState::Ready {
             admission: CommitAdmission::Available,
-            journal: self.clean_journal,
+            journal: Some(self.clean_journal),
             epoch: (
                 self.checkpointed_epoch.identity().uuid(),
                 self.checkpointed_epoch.sequence(),

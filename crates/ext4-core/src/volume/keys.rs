@@ -135,7 +135,7 @@ impl ReservedKeyChange {
         }
         let expected_epoch = (current.identity().uuid(), current.sequence());
         match &coordinator.journal {
-            JournalCoordinatorState::Ready { epoch, .. } if *epoch == expected_epoch => {}
+            PublicationState::Ready { epoch, .. } if *epoch == expected_epoch => {}
             _ => return Err(Error::StaleReadContext),
         }
         let versions = coordinator.prepare_version_publication(&self.resolved.observed)?;
@@ -144,7 +144,11 @@ impl ReservedKeyChange {
             current.sequence().next()?,
             current.superblock,
             self.resolved.keys,
-            current.clusters.try_clone()?,
+            current
+                .clusters
+                .as_ref()
+                .map(ClusterReferenceIndex::try_clone)
+                .transpose()?,
             Vec::new(),
         );
         Ok(PreparedKeyChange {
@@ -207,7 +211,7 @@ impl PreparedKeyChange {
         if coordinator.mount != self.epoch.mount {
             return Err((Error::ClusterReferenceConflict, self));
         }
-        let JournalCoordinatorState::Ready {
+        let PublicationState::Ready {
             epoch, admission, ..
         } = &mut coordinator.journal
         else {

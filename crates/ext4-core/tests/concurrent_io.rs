@@ -67,7 +67,9 @@ fn mutation_staging_requires_current_writable_session_admission() -> Result<()> 
     let (_profile, read_only, read_only_coordinator, _lease) = fixture
         .disk
         .mount(MountAccess::ReadOnly {
-            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
         })?
         .into_parts();
     let mut read_only_cache = MetadataCache::default();
@@ -684,7 +686,9 @@ fn inline_growth_and_read_only_mount_preserve_storage_contracts() -> Result<()> 
     let (profile, epoch, coordinator, _mmp) = fixture
         .disk
         .mount(MountAccess::ReadOnly {
-            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
         })?
         .into_parts();
     fixture.profile = profile;
@@ -1028,7 +1032,9 @@ fn read_only_recovery_preserves_media_and_mount_local_keys() -> Result<()> {
     fixture.disk.storage_effects = 0;
     assert!(matches!(
         fixture.disk.mount(MountAccess::ReadOnly {
-            recovery_memory: RecoveryMemoryLimit::new(1)?
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::new(1)?
+            },
         }),
         Err(Error::RecoveryMemoryLimitExceeded)
     ));
@@ -1036,7 +1042,9 @@ fn read_only_recovery_preserves_media_and_mount_local_keys() -> Result<()> {
     assert_eq!(fixture.disk.filesystem, filesystem);
     assert_eq!(fixture.disk.journal, journal);
     let access = MountAccess::ReadOnly {
-        recovery_memory: RecoveryMemoryLimit::DEFAULT,
+        recovery: ext4_core::ReadOnlyRecovery::Memory {
+            limit: RecoveryMemoryLimit::DEFAULT,
+        },
     };
     let (profile, epoch, coordinator, _mmp) = fixture.disk.mount(access)?.into_parts();
     fixture.profile = profile;
@@ -1067,6 +1075,347 @@ fn read_only_recovery_preserves_media_and_mount_local_keys() -> Result<()> {
     assert_eq!(fixture.disk.filesystem, filesystem);
     assert_eq!(fixture.disk.journal, journal);
     Ok(())
+}
+
+/// # Errors
+/// Returns fixture construction, ordinary RO recovery or committed read failures.
+/// # Panics
+/// Fails if NoLoad opens the journal, RO keeps recovery markers, or RO grants mutations.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe media bytes and authority across real mount transitions"
+)]
+fn standard_read_only_modes_follow_journal_selection() -> Result<()> {
+    use ext4_core::{DeviceWriteAccess, ReadOnlyRecovery};
+    let mut fixture = Fixture::new()?;
+    let filesystem = fixture.disk.filesystem.clone();
+    let journal = fixture.disk.journal.clone();
+    fixture.disk.storage_effects = 0;
+    let no_load = MountAccess::ReadOnly {
+        recovery: ReadOnlyRecovery::NoLoad,
+    };
+    let mounted = fixture.disk.mount_observing(no_load, |_disk, boundary, _time| {
+        if matches!(boundary, MountBoundary::Lower(request) if request.target() == StorageTarget::ExternalJournal)
+            || matches!(boundary, MountBoundary::JournalValidated) { return Err(Error::UnsupportedJournal); }
+        Ok(())
+    })?;
+    assert_eq!(mounted.into_parts().0.journal_target(), None);
+    assert_eq!(fixture.disk.filesystem, filesystem);
+    assert_eq!(fixture.disk.journal, journal);
+    assert_eq!(fixture.disk.storage_effects, 0);
+    let replay = MountAccess::ReadOnly {
+        recovery: ReadOnlyRecovery::Replay,
+    };
+    assert!(matches!(
+        fixture.disk.mount_devices(
+            replay,
+            DeviceWriteAccess::ReadOnly,
+            DeviceWriteAccess::Writable,
+            0,
+            |_, _, _| Ok(())
+        ),
+        Err(Error::ReadOnlyFilesystem)
+    ));
+    assert_eq!(fixture.disk.storage_effects, 0);
+    let (profile, epoch, coordinator, _) = fixture.disk.mount(replay)?.into_parts();
+    assert_eq!(profile.access(), ext4_core::MediaAccess::ReadOnly);
+    assert_eq!(fixture_u32(&fixture.disk.filesystem, 1120)? & 4, 0);
+    assert_eq!(
+        fixture.disk.filesystem.get(1076..1078),
+        filesystem.get(1076..1078)
+    );
+    let mut cache = MetadataCache::default();
+    assert!(matches!(
+        coordinator.mutation_context(cache.access(&epoch)),
+        Err(Error::ReadOnlyFilesystem)
+    ));
+    let close = Box::try_new(CleanCloseOperation::new(&profile))
+        .map_err(|_| Error::OutOfMemory)?
+        .start(&coordinator, Ext4Timestamp::from_seconds(900));
+    assert!(matches!(close, CleanCloseTransition::Complete(Ok(_))));
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture preparation errors before strict checksum admission is observed.
+/// # Panics
+/// Fails if either standard RO mode accepts a checksum-invalid primary or writes before rejection.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions validate rejection before physical effects"
+)]
+fn standard_read_only_requires_authenticated_primary() -> Result<()> {
+    for recovery in [
+        ext4_core::ReadOnlyRecovery::Replay,
+        ext4_core::ReadOnlyRecovery::NoLoad,
+    ] {
+        let mut disk = Disk::fixture();
+        *disk.filesystem.get_mut(2044).ok_or(Error::DeviceRange)? ^= 1;
+        let original = disk.filesystem.clone();
+        assert!(matches!(
+            disk.mount(MountAccess::ReadOnly { recovery }),
+            Err(Error::ChecksumMismatch)
+        ));
+        assert_eq!(disk.filesystem, original);
+        assert_eq!(disk.storage_effects, 0);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns independent image editing or no-journal RO admission failure.
+/// # Panics
+/// Fails if read-only access requires a journal or mutation-only global inode validation.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions check journal-free physical images without granting update authority"
+)]
+fn read_only_home_view_needs_no_journal_or_global_inode_scan() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let mut disk = fixture.disk;
+    let unrelated = fixture_inode_offset(&disk, NodeId::File(fixture.b))?;
+    *disk
+        .filesystem
+        .get_mut(unrelated + 0x7c)
+        .ok_or(Error::DeviceRange)? ^= 1;
+    for (offset, mask) in [(1116, !4_u32), (1120, !4_u32), (1124, !0x10000_u32)] {
+        let value = fixture_u32(&disk.filesystem, offset)? & mask;
+        for (target, byte) in disk
+            .filesystem
+            .get_mut(offset..offset + 4)
+            .ok_or(Error::DeviceRange)?
+            .iter_mut()
+            .zip(value.to_le_bytes())
+        {
+            *target = byte;
+        }
+    }
+    let crc = fixture_crc32c(
+        u32::MAX,
+        disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+    );
+    for (target, byte) in disk
+        .filesystem
+        .get_mut(2044..2048)
+        .ok_or(Error::DeviceRange)?
+        .iter_mut()
+        .zip(crc.to_le_bytes())
+    {
+        *target = byte;
+    }
+    let image = disk.filesystem.clone();
+    disk.storage_effects = 0;
+    for recovery in [
+        ext4_core::ReadOnlyRecovery::Replay,
+        ext4_core::ReadOnlyRecovery::NoLoad,
+    ] {
+        let mounted = disk.mount_devices(
+            MountAccess::ReadOnly { recovery },
+            ext4_core::DeviceWriteAccess::ReadOnly,
+            ext4_core::DeviceWriteAccess::ReadOnly,
+            0,
+            |_, _, _| Ok(()),
+        )?;
+        assert_eq!(mounted.into_parts().0.journal_target(), None);
+        assert_eq!(disk.filesystem, image);
+        assert_eq!(disk.storage_effects, 0);
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns independent linked-orphan fixture encoding or RO recovery failure.
+/// # Panics
+/// Fails if noload suppresses admitted orphan cleanup or writes its suppressed journal.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare independent orphan fields and physical effect boundaries"
+)]
+fn ro_orphan_cleanup_uses_selected_persistence_and_physical_access() -> Result<()> {
+    use ext4_core::{DeviceWriteAccess, ReadOnlyRecovery};
+    for recovery in [
+        ReadOnlyRecovery::Replay,
+        ReadOnlyRecovery::NoLoad,
+        ReadOnlyRecovery::Memory {
+            limit: RecoveryMemoryLimit::DEFAULT,
+        },
+    ] {
+        for physical in [DeviceWriteAccess::Writable, DeviceWriteAccess::ReadOnly] {
+            let fixture = Fixture::new()?;
+            let node = NodeId::File(fixture.b);
+            let mut disk = fixture.disk;
+            let inode = fixture_inode_offset(&disk, node)?;
+            for offset in [4, 108, 20] {
+                disk.filesystem
+                    .get_mut(inode + offset..inode + offset + 4)
+                    .ok_or(Error::DeviceRange)?
+                    .fill(0);
+            }
+            let flags = fixture_u32(&disk.filesystem, inode + 32)?;
+            disk.encode_inode(node, flags, None)?;
+            for (target, byte) in disk
+                .filesystem
+                .get_mut(1256..1260)
+                .ok_or(Error::DeviceRange)?
+                .iter_mut()
+                .zip(node.file_index().to_le_bytes())
+            {
+                *target = byte;
+            }
+            let crc = fixture_crc32c(
+                u32::MAX,
+                disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+            );
+            for (target, byte) in disk
+                .filesystem
+                .get_mut(2044..2048)
+                .ok_or(Error::DeviceRange)?
+                .iter_mut()
+                .zip(crc.to_le_bytes())
+            {
+                *target = byte;
+            }
+            let original = disk.filesystem.clone();
+            let journal = disk.journal.clone();
+            disk.storage_effects = 0;
+            let result = disk.mount_devices(
+                MountAccess::ReadOnly { recovery },
+                physical,
+                DeviceWriteAccess::Writable,
+                0,
+                |_, _, _| Ok(()),
+            );
+            if recovery == ReadOnlyRecovery::Replay && physical == DeviceWriteAccess::ReadOnly {
+                assert!(matches!(result, Err(Error::ReadOnlyFilesystem)));
+                assert_eq!(disk.storage_effects, 0);
+                continue;
+            }
+            let _mounted = result?;
+            if physical == DeviceWriteAccess::Writable
+                && !matches!(recovery, ReadOnlyRecovery::Memory { .. })
+            {
+                assert_eq!(fixture_u32(&disk.filesystem, 1256)?, 0);
+                assert_eq!(fixture_u32(&disk.filesystem, inode + 28)?, 0);
+                assert!(disk.storage_effects > 0);
+            } else {
+                assert_eq!(disk.filesystem, original);
+                assert_eq!(disk.storage_effects, 0);
+            }
+            if recovery == ReadOnlyRecovery::NoLoad {
+                assert_eq!(disk.journal, journal);
+                assert_ne!(fixture_u32(&disk.filesystem, 1120)? & 4, 0);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture/probe preparation failure before the injected lower failure.
+/// # Panics
+/// Fails if a rejected recovery write is reported as unchanged media or retried.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions check the authoritative physical effect outcome"
+)]
+fn read_only_recovery_failure_retains_uncertain_effect() -> Result<()> {
+    use ext4_core::{
+        DeviceWriteAccess, MountMediaOutcome, MountProbeOperation, MountProbeTransition,
+        ReadOnlyRecovery,
+    };
+    let mut disk = Fixture::new()?.disk;
+    let length = DeviceLength::from_bytes(
+        u64::try_from(disk.filesystem.len()).map_err(|_| Error::DeviceRange)?,
+    );
+    let mut probe = Box::try_new(MountProbeOperation::new(length))
+        .map_err(|_| Error::OutOfMemory)?
+        .advance(OperationEvent::Admitted);
+    let prepared = loop {
+        probe = match probe {
+            MountProbeTransition::SubmitLower { request, suspended } => {
+                suspended.advance(OperationEvent::StorageCompleted(disk.complete(request)?))
+            }
+            MountProbeTransition::Complete(result) => break result?,
+        };
+    };
+    let now = ext4_core::MmpTime::new(0, 0);
+    let mut step = Box::try_new(prepared.start(
+        FscryptKeySet::empty(),
+        MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Replay,
+        },
+        DeviceWriteAccess::Writable,
+        ext4_core::MmpOwner::new([3; 16])?,
+        now,
+    )?)
+    .map_err(|_| Error::OutOfMemory)?
+    .advance(OperationEvent::Admitted, now);
+    let mut failed_effects = 0;
+    loop {
+        step = match step {
+            MountTransition::SubmitLower { request, suspended } => {
+                let completion = if matches!(request, StorageRequest::Read { .. }) {
+                    disk.complete(request)?
+                } else {
+                    failed_effects += 1;
+                    StorageCompletion::failure(
+                        CompletedStorageTransfer::from_request(request),
+                        Error::DeviceIo,
+                    )
+                };
+                suspended.advance(OperationEvent::StorageCompleted(completion), now)
+            }
+            MountTransition::DiscoverExternalJournal {
+                requirement,
+                suspended,
+            } => {
+                let length = DeviceLength::from_bytes(
+                    u64::try_from(disk.journal.len()).map_err(|_| Error::DeviceRange)?,
+                );
+                let mut probe = Box::try_new(ext4_core::ExternalJournalProbeOperation::new(
+                    requirement,
+                    length,
+                ))
+                .map_err(|_| Error::OutOfMemory)?
+                .advance(OperationEvent::Admitted);
+                let token = loop {
+                    probe = match probe {
+                        ext4_core::ExternalJournalProbeTransition::SubmitLower {
+                            request,
+                            suspended,
+                        } => suspended
+                            .advance(OperationEvent::StorageCompleted(disk.complete(request)?)),
+                        ext4_core::ExternalJournalProbeTransition::Complete(result) => {
+                            match result? {
+                                ext4_core::ExternalJournalProbeOutcome::Match(token) => {
+                                    break token;
+                                }
+                                ext4_core::ExternalJournalProbeOutcome::Mismatch => {
+                                    return Err(Error::UnsupportedJournal);
+                                }
+                            }
+                        }
+                    };
+                };
+                suspended.attach_external_journal(token, DeviceWriteAccess::Writable, now)
+            }
+            MountTransition::Complete(result) => {
+                let Err(failure) = result else {
+                    return Err(Error::DeviceIo);
+                };
+                assert_eq!(failure.reason, Error::DeviceIo);
+                assert_eq!(failure.media, MountMediaOutcome::OutcomeUnknown);
+                assert_eq!(failed_effects, 1);
+                return Ok(());
+            }
+            _ => return Err(Error::DeviceIo),
+        };
+    }
 }
 
 /// # Errors
@@ -1383,7 +1732,7 @@ fn revoked_session_rejects_completed_checkpoint_publication() -> Result<()> {
         .err()
         .ok_or(Error::DeviceIo)?;
     assert_eq!(error, Error::MmpOwnershipLost);
-    assert!(!fixture.coordinator.journal_is_clean());
+    assert!(!fixture.coordinator.publication_is_idle());
     assert!(matches!(
         fixture.coordinator.acquire_commit(ticket),
         Err(Error::MmpOwnershipLost)
@@ -2462,6 +2811,26 @@ impl Disk {
         &mut self,
         access: MountAccess,
         unix_seconds: u64,
+        observe: impl FnMut(&mut Self, MountBoundary<'_>, &mut u64) -> Result<()>,
+    ) -> Result<CompletedMount> {
+        self.mount_devices(
+            access,
+            ext4_core::DeviceWriteAccess::Writable,
+            ext4_core::DeviceWriteAccess::Writable,
+            unix_seconds,
+            observe,
+        )
+    }
+
+    /// Supplies independently observed primary and journal write availability to the mount.
+    /// # Errors
+    /// Preserves the mount reason; production retains its separate media outcome.
+    fn mount_devices(
+        &mut self,
+        access: MountAccess,
+        primary_access: ext4_core::DeviceWriteAccess,
+        journal_access: ext4_core::DeviceWriteAccess,
+        unix_seconds: u64,
         mut observe: impl FnMut(&mut Self, MountBoundary<'_>, &mut u64) -> Result<()>,
     ) -> Result<CompletedMount> {
         let length = u64::try_from(self.filesystem.len()).map_err(|_| Error::DeviceRange)?;
@@ -2483,6 +2852,7 @@ impl Disk {
         let mut step = Box::try_new(prepared.start(
             FscryptKeySet::empty(),
             access,
+            primary_access,
             ext4_core::MmpOwner::new([0x65; 16])?,
             now,
         )?)
@@ -2505,7 +2875,11 @@ impl Disk {
                         ext4_core::MmpTime::new(millis, unix_seconds),
                     )
                 }
-                MountTransition::Complete(result) => return result.map(|mounted| *mounted),
+                MountTransition::Complete(result) => {
+                    return result
+                        .map(|mounted| *mounted)
+                        .map_err(|failure| failure.reason);
+                }
                 MountTransition::DiscoverExternalJournal {
                     requirement,
                     suspended,
@@ -2536,6 +2910,7 @@ impl Disk {
                     observe(self, MountBoundary::JournalValidated, &mut millis)?;
                     suspended.attach_external_journal(
                         journal,
+                        journal_access,
                         ext4_core::MmpTime::new(millis, unix_seconds),
                     )
                 }
@@ -5520,7 +5895,7 @@ fn journal_acquisition_revocation_and_preparation_are_exclusive() -> Result<()> 
     prepared
         .abort(&mut fixture.coordinator, &mut fixture.cache)
         .map_err(|(error, _prepared)| error)?;
-    assert!(fixture.coordinator.journal_is_clean());
+    assert!(fixture.coordinator.publication_is_idle());
     let foreign = Fixture::new()?;
     let reserved = resolve(&mut fixture)?;
     let grant = fixture
@@ -5536,7 +5911,7 @@ fn journal_acquisition_revocation_and_preparation_are_exclusive() -> Result<()> 
         ),
         Err(Error::ClusterReferenceConflict)
     ));
-    assert!(fixture.coordinator.journal_is_clean());
+    assert!(fixture.coordinator.publication_is_idle());
     fixture.mutate(|pass| pass.set_volume_label(Ext4VolumeLabel::new(b"after-abort")?))?;
     assert_eq!(
         fixture.epoch.identity().label(),

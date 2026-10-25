@@ -9,9 +9,23 @@ const DSM_RANGES_OFFSET: usize = 32;
 /// One signed starting byte offset and one unsigned byte length.
 const DSM_RANGE_BYTES: usize = 16;
 
+/// Independent read-only device observations needed before filesystem admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceQuery {
+    /// Byte length with one positive signed output field.
+    Length,
+    /// Write protection represented by native completion status, with no payload.
+    WriteAccess,
+}
+
 /// Distinct native input/output contracts retained inside one stable completion envelope.
 #[derive(Debug)]
 pub(crate) enum DeviceControlCommand<O> {
+    /// Write-protection observation grants no write authority by itself.
+    WriteAccess {
+        /// Unique mount continuation.
+        suspended: O,
+    },
     /// Device length is an output-only control used before filesystem admission.
     Length {
         /// Unique operation resumed by the decoded length or terminal failure.
@@ -29,6 +43,13 @@ pub(crate) enum DeviceControlCommand<O> {
 /// Native completion preserves each control's own observable outcome and unique continuation.
 #[derive(Debug)]
 pub(crate) enum DeviceControlCompletion<O> {
+    /// Physical availability, including a protected device as a successful observation.
+    WriteAccess {
+        /// Sole mount continuation.
+        suspended: O,
+        /// Native observation failure is distinct from write protection.
+        result: DriverResult<ext4_core::DeviceWriteAccess>,
+    },
     /// Decoded output-only geometry observation.
     Length {
         /// Unique mount/discovery continuation.
@@ -52,7 +73,9 @@ impl<O> DeviceControlCommand<O> {
     #[cfg(not(test))]
     pub(crate) const fn suspended(&self) -> &O {
         match self {
-            Self::Length { suspended } | Self::Trim { suspended, .. } => suspended,
+            Self::Length { suspended }
+            | Self::WriteAccess { suspended }
+            | Self::Trim { suspended, .. } => suspended,
         }
     }
 
@@ -60,7 +83,8 @@ impl<O> DeviceControlCommand<O> {
     /// # Errors
     /// Returns the unchanged command on allocation, native request or rundown preparation failure.
     #[cfg(not(test))]
-    pub(crate) fn length<R>(
+    pub(crate) fn query<R>(
+        query: DeviceQuery,
         completion_owner: KernelDevice,
         target: KernelDevice,
         suspended: O,
@@ -71,18 +95,28 @@ impl<O> DeviceControlCommand<O> {
         O: Send + 'static,
         R: LowerCompletionRoute<Self>,
     {
-        let command = Self::Length { suspended };
-        let transfer =
-            match AlignedTransferBuffer::try_zeroed(size_of::<i64>(), core::mem::align_of::<i64>())
-            {
-                Ok(transfer) => transfer,
-                Err(error) => return Err(LowerBuildError::from_unsubmitted(error, command)),
-            };
+        let (command, operation, bytes) = match query {
+            DeviceQuery::Length => (
+                Self::Length { suspended },
+                LowerOperation::QueryLength,
+                size_of::<i64>(),
+            ),
+            DeviceQuery::WriteAccess => (
+                Self::WriteAccess { suspended },
+                LowerOperation::QueryWriteAccess,
+                0,
+            ),
+        };
+        let transfer = match AlignedTransferBuffer::try_zeroed(bytes, core::mem::align_of::<i64>())
+        {
+            Ok(transfer) => transfer,
+            Err(error) => return Err(LowerBuildError::from_unsubmitted(error, command)),
+        };
         PreparedLowerIrp::try_new(
             completion_owner,
             LowerIrpTransfer::new(
                 target,
-                LowerOperation::QueryLength,
+                operation,
                 LowerTransferMethod::Buffered,
                 ByteOffset::new(0),
                 transfer,
@@ -138,6 +172,10 @@ impl<O> DeviceControlCommand<O> {
     /// Reclaims a command known not to have reached any lower device.
     pub(crate) fn unsubmitted(self, error: DriverError) -> DeviceControlCompletion<O> {
         match self {
+            Self::WriteAccess { suspended } => DeviceControlCompletion::WriteAccess {
+                suspended,
+                result: Err(error),
+            },
             Self::Length { suspended } => DeviceControlCompletion::Length {
                 suspended,
                 result: Err(error),
@@ -270,6 +308,18 @@ impl<O> CompletedLowerIrp<DeviceControlCommand<O>> {
             information,
         } = self;
         match command {
+            DeviceControlCommand::WriteAccess { suspended } => {
+                let result = if information != 0 {
+                    Err(DriverError::InvalidParameter)
+                } else if status == wdk_sys::STATUS_MEDIA_WRITE_PROTECTED {
+                    Ok(ext4_core::DeviceWriteAccess::ReadOnly)
+                } else if status >= wdk_sys::STATUS_SUCCESS {
+                    Ok(ext4_core::DeviceWriteAccess::Writable)
+                } else {
+                    Err(DriverError::from(Error::DeviceIo))
+                };
+                DeviceControlCompletion::WriteAccess { suspended, result }
+            }
             DeviceControlCommand::Length { suspended } => {
                 let result = (|| {
                     if status < wdk_sys::STATUS_SUCCESS || information != size_of::<i64>() {

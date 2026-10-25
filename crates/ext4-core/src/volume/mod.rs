@@ -1,7 +1,9 @@
 //! Mounted ext4 volume state and journaled write transactions.
 
 mod access;
-pub use access::{MediaAccess, MountAccess, ReadOnlyRecovery, RecoveryMemoryLimit};
+pub use access::{
+    DeviceWriteAccess, MediaAccess, MountAccess, ReadOnlyRecovery, RecoveryMemoryLimit,
+};
 mod block_group;
 mod directory;
 mod directory_read;
@@ -41,9 +43,10 @@ pub use mount::{
     CleanCloseDurability, CleanCloseOperation, CleanCloseTransition, CommittedEpoch,
     CommittedReadContext, CompletedMount, EpochSequence, ExternalJournalProbeOperation,
     ExternalJournalProbeOutcome, ExternalJournalProbeTransition, ExternalJournalRequirement,
-    MountOperation, MountProbeOperation, MountProbeTransition, MountTransition, MountedProfile,
-    MutationCoordinatorState, MutationResolveContext, MutationResource, ObservedResourceVersionSet,
-    ProbedMount, ResourceVersion, ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
+    MountFailure, MountMediaOutcome, MountOperation, MountProbeOperation, MountProbeTransition,
+    MountTransition, MountedProfile, MutationCoordinatorState, MutationResolveContext,
+    MutationResource, ObservedResourceVersionSet, ProbedMount, ResourceVersion,
+    ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
     ChildLookup, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,

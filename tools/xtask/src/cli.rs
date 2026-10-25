@@ -5,7 +5,10 @@ use crate::{
         check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload,
         verify_hosted_driver_load,
     },
-    interop::{verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop},
+    interop::{
+        verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop,
+        verify_ro_interop,
+    },
     live::{
         benchmark_multi_file, check_live_driver_host, cleanup_live_vhdx_session, verify_live_vhdx,
     },
@@ -31,6 +34,8 @@ enum Task {
     JournalInterop,
     /// Exercises bounded HTree reads and local updates against fresh ext4 images.
     HtreeInterop,
+    /// Compares read-only recovery with native Linux kernel mounts.
+    RoInterop,
     /// Reproduces tracked external-journal fixtures under the pinned Linux toolchain.
     JournalFixtureProvenance,
     /// Builds and verifies one signed, identity-bound Windows driver bundle.
@@ -66,6 +71,8 @@ impl Task {
             Some(Self::FuzzReplay)
         } else if argument == "verify-journal-interop" {
             Some(Self::JournalInterop)
+        } else if argument == "verify-ro-interop" {
+            Some(Self::RoInterop)
         } else if argument == "verify-htree-interop" {
             Some(Self::HtreeInterop)
         } else if argument == "verify-journal-fixture-provenance" {
@@ -143,6 +150,7 @@ fn execute() -> TaskResult<()> {
         | Task::FuzzReplay
         | Task::JournalInterop
         | Task::HtreeInterop
+        | Task::RoInterop
         | Task::JournalFixtureProvenance
         | Task::ProductionDriver
         | Task::CheckHostedDriverHost
@@ -160,6 +168,7 @@ fn execute() -> TaskResult<()> {
                 Task::FuzzReplay => verify_fuzz_replay(&repository_root),
                 Task::JournalInterop => verify_journal_interop(&repository_root),
                 Task::HtreeInterop => verify_htree_interop(&repository_root),
+                Task::RoInterop => verify_ro_interop(&repository_root),
                 Task::JournalFixtureProvenance => {
                     verify_journal_fixture_provenance(&repository_root)
                 }
@@ -182,7 +191,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 

@@ -94,6 +94,7 @@ impl Device {
         let mut step = Box::try_new(prepared.start(
             FscryptKeySet::empty(),
             MountAccess::ReadWrite,
+            ext4_core::DeviceWriteAccess::Writable,
             MmpOwner::new([0x56; 16])?,
             self.now(),
         )?)
@@ -138,9 +139,17 @@ impl Device {
                             },
                         };
                     };
-                    suspended.attach_external_journal(validated, self.now())
+                    suspended.attach_external_journal(
+                        validated,
+                        ext4_core::DeviceWriteAccess::Writable,
+                        self.now(),
+                    )
                 }
-                MountTransition::Complete(result) => return result.map(|mounted| *mounted),
+                MountTransition::Complete(result) => {
+                    return result
+                        .map(|mounted| *mounted)
+                        .map_err(|failure| failure.reason);
+                }
             };
         }
     }

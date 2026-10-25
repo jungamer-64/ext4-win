@@ -55,6 +55,15 @@ pub enum ReadOnlyRecovery {
     },
 }
 
+/// Physical device write availability observed by the host, independent of mount policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeviceWriteAccess {
+    /// The device accepts writes; lower failures can still revoke that availability.
+    Writable,
+    /// The device is physically or administratively write protected.
+    ReadOnly,
+}
+
 impl MountAccess {
     /// Attenuates recovery admission to the media operations granted after mounting.
     #[must_use]

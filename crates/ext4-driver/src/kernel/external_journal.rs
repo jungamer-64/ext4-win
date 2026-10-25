@@ -188,7 +188,10 @@ impl ExclusiveExternalJournal {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) fn open(selected: SelectedExternalJournal) -> DriverResult<Self> {
+    pub(crate) fn open(
+        selected: SelectedExternalJournal,
+        access: ext4_core::DeviceWriteAccess,
+    ) -> DriverResult<Self> {
         let mut name = unicode_string(selected.path.as_slice())
             .map_err(|_| DriverError::ExternalJournalDiscoveryFailed)?;
         let mut attributes = wdk_sys::OBJECT_ATTRIBUTES {
@@ -202,8 +205,12 @@ impl ExclusiveExternalJournal {
         };
         let mut io_status = wdk_sys::IO_STATUS_BLOCK::default();
         let mut handle = core::ptr::null_mut();
-        let desired_access =
-            wdk_sys::FILE_GENERIC_READ | wdk_sys::FILE_GENERIC_WRITE | wdk_sys::SYNCHRONIZE;
+        let desired_access = wdk_sys::FILE_GENERIC_READ
+            | wdk_sys::SYNCHRONIZE
+            | match access {
+                ext4_core::DeviceWriteAccess::Writable => wdk_sys::FILE_GENERIC_WRITE,
+                ext4_core::DeviceWriteAccess::ReadOnly => 0,
+            };
         let status = unsafe {
             // SAFETY: All native structures point to live stack storage for the duration of the
             // synchronous open. Share access zero establishes the mount-long exclusion contract.
@@ -289,13 +296,16 @@ impl ExclusiveExternalJournal {
     /// # Errors
     ///
     /// Always reports that the exclusive reopen failed.
-    pub(crate) fn open(selected: SelectedExternalJournal) -> DriverResult<Self> {
+    pub(crate) fn open(
+        selected: SelectedExternalJournal,
+        access: ext4_core::DeviceWriteAccess,
+    ) -> DriverResult<Self> {
         let SelectedExternalJournal {
             path,
             base_identity,
         } = selected;
         drop(path);
-        let _identity = base_identity;
+        let _identity = (base_identity, access);
         Err(DriverError::ExternalJournalExclusiveOpenFailed)
     }
 

@@ -13,6 +13,10 @@ mod orphan;
 /// Independent inode-field and data-journaling interoperability vectors.
 mod inode;
 
+/// Kernel RO mount observations compared with current-source core execution.
+mod readonly;
+pub(crate) use readonly::verify_ro_interop;
+
 /// One generated internal-journal interoperability profile.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct JournalInteropCase {
@@ -4123,7 +4127,11 @@ fn run_internal_htree_mutation_until_boundary(
 ) -> TaskResult<EffectBoundaryRun> {
     let names = htree_fault_names()?;
     let mut storage = CrashStorageAdapter::open_internal(filesystem)?;
-    let completed = mount_internal_core(&mut storage)?;
+    let completed = mount_internal_core(
+        &mut storage,
+        ext4_core::MountAccess::ReadWrite,
+        ext4_core::DeviceWriteAccess::Writable,
+    )?;
     let (profile, epoch, mut coordinator, _mmp) = (*completed).into_parts();
     let ticket = coordinator.admit_mutation().map_err(core_task_error)?;
     let (prepared, ()) = prepare_core_mutation(

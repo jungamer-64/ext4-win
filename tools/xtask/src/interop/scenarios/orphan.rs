@@ -2,6 +2,76 @@
 
 use super::*;
 
+/// Independent tracker encoding used by the kernel RO differential cases.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum RoOrphanTracker {
+    /// Legacy superblock head and inode deletion-time link.
+    Chain,
+    /// Authenticated special-file slot.
+    File,
+}
+
+/// Observes the independently seeded orphan-file block without consulting production recovery.
+/// # Errors
+/// Returns debugfs block-location, range or raw-image I/O failure.
+pub(super) fn ro_orphan_entries(linux: LinuxEnvironment, image: &Path) -> TaskResult<Vec<u32>> {
+    let mut fixture = OrphanImage::open(image)?;
+    let special = le32(&fixture.primary, 0x280)?;
+    if special == 0 {
+        return Ok(Vec::new());
+    }
+    let block = debugfs_request_output(linux, image, &format!("bmap <{special}> 0"))?
+        .lines()
+        .find_map(|line| line.trim().parse::<u64>().ok())
+        .ok_or_else(|| io::Error::other("missing orphan observation block"))?;
+    let bytes = read_image_block(&mut fixture.file, block, fixture.block_size)?;
+    let entries = bytes
+        .get(
+            ..bytes
+                .len()
+                .checked_sub(8)
+                .ok_or_else(|| io::Error::other("missing orphan tail"))?,
+        )
+        .ok_or_else(|| io::Error::other("missing orphan entries"))?;
+    let (entries, remainder) = entries.as_chunks::<4>();
+    if !remainder.is_empty() {
+        return Err(io::Error::other("partial orphan slot").into());
+    }
+    entries
+        .iter()
+        .map(|field| le32(field, 0))
+        .filter(|value| !matches!(value, Ok(0)))
+        .collect()
+}
+
+/// Seeds one unlinked allocated inode without depending on production cleanup serialization.
+/// # Errors
+/// Returns debugfs, inode identity or independent checksum encoding failures.
+pub(super) fn seed_ro_orphan(
+    linux: LinuxEnvironment,
+    image: &Path,
+    payload: &Path,
+    tracker: RoOrphanTracker,
+) -> TaskResult<()> {
+    let image_path = linux.tool_path(image)?;
+    let victim = create_file(linux, &image_path, &linux.tool_path(payload)?, "/victim")?;
+    mutate(linux, &image_path, "sif /victim links_count 0")?;
+    mutate(linux, &image_path, "unlink /victim")?;
+    let mut fixture = OrphanImage::open(image)?;
+    match tracker {
+        RoOrphanTracker::Chain => put32(&mut fixture.primary, 0xe8, victim)?,
+        RoOrphanTracker::File => {
+            let special = le32(&fixture.primary, 0x280)?;
+            let block = debugfs_request_output(linux, image, &format!("bmap <{special}> 0"))?
+                .lines()
+                .find_map(|line| line.trim().parse::<u64>().ok())
+                .ok_or_else(|| io::Error::other("missing orphan file block"))?;
+            fixture.slots(block, &[victim])?;
+        }
+    }
+    fixture.activate()
+}
+
 /// On-disk geometry used only by the independent fixture encoder, never by production recovery.
 struct OrphanImage {
     /// Host-owned disposable raw image.

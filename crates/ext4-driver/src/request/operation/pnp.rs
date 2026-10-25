@@ -144,6 +144,23 @@ impl QueryRemoveOperation {
             suspended: self,
         }
     }
+
+    /// Publishes drained query-removal admission before forwarding its exact lower request.
+    fn forward(
+        owned: OwnedIrp,
+        preparation: QueryRemovalPreparation,
+        access: &MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let storage = access.storage_access();
+        let lower = access.storage_route().filesystem_control_device();
+        if let Err(error) = access
+            .authorize_query_removal()
+            .and_then(|()| preparation.publish())
+        {
+            return OperationTransition::Complete(owned.prepare_result(Err(error)));
+        }
+        OperationTransition::ForwardQueryRemove(owned.prepare_query_remove_forward(lower, storage))
+    }
 }
 
 impl MountedVolumeOperation for QueryRemoveOperation {
@@ -182,12 +199,15 @@ impl MountedVolumeOperation for QueryRemoveOperation {
                         if let Err(error) = access.authorize_query_removal() {
                             return OperationTransition::Complete(owned.prepare_result(Err(error)));
                         }
-                        self.flush(
-                            owned,
-                            preparation,
-                            access.mounted_profile().journal_target(),
-                            access,
-                        )
+                        if access.mounted_profile().access() == ext4_core::MediaAccess::ReadOnly {
+                            return Self::forward(owned, preparation, access);
+                        }
+                        let Some(target) = access.mounted_profile().journal_target() else {
+                            return OperationTransition::Complete(
+                                owned.prepare_result(Err(DriverError::InternalInvariantViolation)),
+                            );
+                        };
+                        self.flush(owned, preparation, target, access)
                     }
                 }
             }
@@ -229,17 +249,7 @@ impl MountedVolumeOperation for QueryRemoveOperation {
                         access,
                     );
                 }
-                let storage = access.storage_access();
-                let lower = access.storage_route().filesystem_control_device();
-                if let Err(error) = access
-                    .authorize_query_removal()
-                    .and_then(|()| preparation.publish())
-                {
-                    return OperationTransition::Complete(owned.prepare_result(Err(error)));
-                }
-                OperationTransition::ForwardQueryRemove(
-                    owned.prepare_query_remove_forward(lower, storage),
-                )
+                Self::forward(owned, preparation, access)
             }
             (
                 QueryState::Ready(owned)

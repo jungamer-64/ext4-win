@@ -92,6 +92,14 @@ jobs:
             "RUSTUP_HOME=$(rustup show home)" \
             ./target/debug/xtask verify-htree-interop
 
+      - name: Verify read-only mount interoperability
+        run: |
+          sudo env \
+            "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=$(rustup show home)" \
+            ./target/debug/xtask verify-ro-interop
+
 
   production-driver:
     name: live ext4 read-write (WDK 28000)

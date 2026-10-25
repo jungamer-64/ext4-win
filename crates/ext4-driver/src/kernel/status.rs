@@ -24,6 +24,8 @@ pub(crate) type DriverResult<T> = Result<T, DriverError>;
 /// Driver failure after IRP decoding and ext4-core execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DriverError {
+    /// Recovery failed with physical effects retained until the native completion boundary.
+    MountFailure(ext4_core::MountFailure),
     /// IRP is not valid for this device or stack state.
     InvalidDeviceRequest,
     /// Caller supplied parameters outside the accepted FSD boundary.
@@ -225,6 +227,7 @@ impl DriverError {
             Self::ExternalJournalDiscoveryFailed => STATUS_IO_DEVICE_ERROR,
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),
+            Self::MountFailure(failure) => core_error_status(failure.reason),
         }
     }
 }
@@ -232,6 +235,12 @@ impl DriverError {
 impl From<Error> for DriverError {
     fn from(value: Error) -> Self {
         Self::Core(value)
+    }
+}
+
+impl From<ext4_core::MountFailure> for DriverError {
+    fn from(value: ext4_core::MountFailure) -> Self {
+        Self::MountFailure(value)
     }
 }
 

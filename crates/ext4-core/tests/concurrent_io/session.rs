@@ -145,7 +145,9 @@ fn writable_mount_and_close_persist_session_clocks() -> Result<()> {
             Err(Error::DeviceIo)
         ));
         let _recovered = failed.disk.mount(MountAccess::ReadOnly {
-            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
         })?;
     }
     Ok(())
@@ -169,7 +171,9 @@ fn read_only_mount_and_close_preserve_all_session_fields() -> Result<()> {
         .disk
         .mount_at(
             MountAccess::ReadOnly {
-                recovery_memory: RecoveryMemoryLimit::DEFAULT,
+                recovery: ext4_core::ReadOnlyRecovery::Memory {
+                    limit: RecoveryMemoryLimit::DEFAULT,
+                },
             },
             0x12_3456_789a,
             |_, _, _| Ok(()),

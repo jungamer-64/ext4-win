@@ -3,6 +3,46 @@ use super::*;
 use alloc::{boxed::Box, vec::Vec};
 use ext4_core::{CompletedStorageTransfer, MutationCoordinatorState, PendingTrim};
 
+/// # Errors
+/// Returns buffer admission failure before any native request.
+/// # Panics
+/// Fails if protection is confused with an unsuccessful physical availability query.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions check native completion semantics while allocation is fallible"
+)]
+fn write_availability_preserves_status_and_continuation() -> DriverResult<()> {
+    for (status, expected) in [
+        (
+            wdk_sys::STATUS_SUCCESS,
+            Ok(ext4_core::DeviceWriteAccess::Writable),
+        ),
+        (
+            wdk_sys::STATUS_MEDIA_WRITE_PROTECTED,
+            Ok(ext4_core::DeviceWriteAccess::ReadOnly),
+        ),
+        (
+            wdk_sys::STATUS_IO_DEVICE_ERROR,
+            Err(DriverError::from(Error::DeviceIo)),
+        ),
+    ] {
+        let completed = CompletedLowerIrp {
+            suspended: DeviceControlCommand::WriteAccess { suspended: 73 },
+            transfer: AlignedTransferBuffer::try_zeroed(0, 8)?,
+            status,
+            information: 0,
+        }
+        .finish_control();
+        let DeviceControlCompletion::WriteAccess { suspended, result } = completed else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        assert_eq!(suspended, 73);
+        assert_eq!(result, expected);
+    }
+    Ok(())
+}
+
 /// Completes a portable core transfer against the independently generated journal fixture.
 /// # Errors
 /// Returns a malformed range, mismatched buffer or conversion failure.
@@ -73,6 +113,7 @@ fn admitted_request() -> DriverResult<(TrimRequest, PendingTrim, MutationCoordin
     let mut step = Box::try_new(prepared.start(
         ext4_core::FscryptKeySet::empty(),
         ext4_core::MountAccess::ReadWrite,
+        ext4_core::DeviceWriteAccess::Writable,
         ext4_core::MmpOwner::new([0x35; 16])?,
         now,
     )?)
@@ -123,7 +164,11 @@ fn admitted_request() -> DriverResult<(TrimRequest, PendingTrim, MutationCoordin
                         }
                     };
                 };
-                suspended.attach_external_journal(validated, now)
+                suspended.attach_external_journal(
+                    validated,
+                    ext4_core::DeviceWriteAccess::Writable,
+                    now,
+                )
             }
             ext4_core::MountTransition::Complete(result) => break result?,
             ext4_core::MountTransition::WaitForTimer { .. } => {

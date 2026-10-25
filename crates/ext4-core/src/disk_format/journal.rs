@@ -113,6 +113,10 @@ pub(crate) struct JournalBlock {
 }
 
 impl JournalBlock {
+    /// Transfers the complete image into one owned home-block write.
+    pub(crate) fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
     /// Creates a complete filesystem block image for a journal transaction.
     pub(crate) fn new(block: BlockAddress, bytes: Vec<u8>) -> Self {
         Self { block, bytes }
@@ -921,6 +925,23 @@ impl JournalSequence {
 }
 
 impl JournalRecoveryOperation {
+    /// Ordinary read-only mounting follows the filesystem recovery marker. A clean filesystem
+    /// can discard an old log but cannot replay it as new recovery authority.
+    /// # Errors
+    /// Returns journal-buffer admission or allocation failure before any effect.
+    pub(crate) fn read_only_mount(
+        journal: Journal<LoadedJournal>,
+        state: RecoveryState,
+    ) -> Result<Self> {
+        Self::new_with_primary_repair(
+            journal,
+            match state {
+                RecoveryState::Clean => RecoveryPolicy::Discard,
+                RecoveryState::NeedsRecovery => RecoveryPolicy::Replay,
+            },
+            PrimaryRepairValidation::NotRequired,
+        )
+    }
     /// Starts bounded recovery from a fully validated loaded journal.
     /// # Errors
     ///

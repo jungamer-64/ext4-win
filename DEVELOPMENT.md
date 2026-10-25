@@ -19,6 +19,7 @@ compile the driver or require WDK.
 | `cargo xtask verify-driver` | Windows with MSVC, WDK, and Clang configured | Checks, tests, lints, and documents the kernel-driver crate and its native boundaries. |
 | `cargo xtask verify-fuzz-replay` | Host with the repository-pinned cargo-fuzz installed | Discovers every declared fuzz target and replays its tracked corpus once under the bounded fuzz harness. |
 | `cargo xtask verify-journal-interop` | Native Linux or Windows with WSL; e2fsprogs | Exercises ext4 mutation and recovery against independently generated `debugfs` and `e2fsck` evidence. |
+| `cargo xtask verify-ro-interop` | Native Linux or Windows with WSL; e2fsprogs and Linux root loop-mount authority | Compares RO acceptance, recovery state, orphan cleanup and file observations with native Linux mounts of disposable image copies. |
 | `cargo xtask verify-htree-interop` | Native Linux or Windows with WSL; e2fsprogs and root loop-mount authority | Exercises bounded HTree lookup, paging, and local mutation against independently generated ext4 images. |
 | `cargo xtask verify-journal-fixture-provenance` | Native Linux or Windows with WSL; root loop-device authority and the manifest-pinned e2fsprogs release | Regenerates the tracked external-journal fixtures and requires byte-for-byte and digest equality. |
 | `cargo xtask verify-production-driver` | Windows with MSVC, WDK, `cargo-wdk`, WSL/e2fsprogs, and WSL root loop-mount authority | Runs the development and interoperability gates, builds and signs one identity-bound package, and verifies release reachability. |
@@ -156,14 +157,28 @@ authority; saving policy does not remount a volume or switch it between read-onl
 
 ```console
 cargo run -p ext4ctl -- policy show <volume-path-or-ext4-uuid>
-cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-only --recovery-memory 67108864
+cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-only
+cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-only --recovery noload
+cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-only --recovery memory --recovery-memory 67108864
 cargo run -p ext4ctl -- policy set <volume-path-or-ext4-uuid> --access read-write
 ```
 
-Unspecified fields retain their observed values. Recovery memory is a nonzero logical byte budget;
-budget exhaustion is distinct from physical allocation failure. Read-only sessions replay journal
-and orphan recovery into private memory and issue no lower media write or flush, including at close.
-Filesystem key changes remain mount-local operations and do not grant media-write authority.
+`--access read-only` selects ordinary journal replay; `--recovery replay` selects it explicitly.
+Required recovery writes reach media before read-only publication. Write-protected media cannot
+admit required journal recovery. Standard RO requires a valid primary checksum and does not claim
+or inspect MMP ownership. `noload` skips journal loading, including external-journal discovery;
+it does not suppress independently admitted orphan cleanup. Orphan cleanup requires writable media,
+implemented update semantics and no recorded filesystem error. It uses home writes without a journal
+when `noload` is selected, and cannot make suppressed journal recovery complete.
+
+`memory` explicitly selects private recovery and bounded primary-checksum rescue through authenticated
+journal replay. It issues no lower media write or flush, including at close. Recovery memory is a
+nonzero logical byte budget; exhaustion is distinct from physical allocation failure. A budget alone
+does not select this mode. Unspecified access retains its observed value; an access-only RO update
+selects replay. Budgets can be changed only while selecting or retaining memory recovery.
+Saving RW with recovery options is rejected. Filesystem key changes remain mount-local operations
+and do not grant media-write authority. Failed recovery retains whether media was unchanged,
+partially updated or has an uncertain effect; it is not automatically retried or switched to another mode.
 
 The service's `Parameters\MountPolicies\<UUID>\Table` binary value stores one complete policy.
 The shared [control codec](crates/ext4-control/src/lib.rs) owns wire layout and defaults. Replacement
@@ -197,7 +212,7 @@ The observation contains the filesystem UUID, complete compatible, incompatible 
 read-only-compatible masks, and media access admitted before recovery. Named entries describe
 on-disk declarations. They do not claim current mutation permission or change any filesystem
 feature. An independent ownership or reliability failure can prevent writes after writable mount
-admission. Read-only recovery reports the committed virtual metadata view.
+admission. Memory recovery reports its committed private metadata view; noload observes home metadata.
 
 ## Free-space discard
 

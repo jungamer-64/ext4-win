@@ -41,7 +41,7 @@ pub fn assert_deterministic_mount(filesystem: &[u8], external_journal: Option<&[
     for access in [
         ext4_core::MountAccess::ReadWrite,
         ext4_core::MountAccess::ReadOnly {
-            recovery_memory: ext4_core::RecoveryMemoryLimit::DEFAULT,
+            recovery: ext4_core::ReadOnlyRecovery::Memory { limit: ext4_core::RecoveryMemoryLimit::DEFAULT },
         },
     ] {
         let first = run_mount(filesystem, external_journal, access);
@@ -204,7 +204,7 @@ fn run_mount(
     let Ok(owner) = ext4_core::MmpOwner::new([0x35; 16]) else {
         return MountOutcome::Rejected;
     };
-    let Ok(operation) = prepared.start(FscryptKeySet::empty(), access, owner, now) else {
+    let Ok(operation) = prepared.start(FscryptKeySet::empty(), access, ext4_core::DeviceWriteAccess::Writable, owner, now) else {
         return MountOutcome::Rejected;
     };
     let Ok(operation) = Box::try_new(operation) else {
@@ -244,7 +244,7 @@ fn run_mount(
                         }
                     };
                 transition = suspended
-                    .attach_external_journal(validated, ext4_core::MmpTime::new(millis, 0));
+                    .attach_external_journal(validated, ext4_core::DeviceWriteAccess::Writable, ext4_core::MmpTime::new(millis, 0));
             }
             MountTransition::WaitForTimer { seconds, suspended } => {
                 millis = millis.saturating_add(u64::from(seconds).saturating_mul(1000));

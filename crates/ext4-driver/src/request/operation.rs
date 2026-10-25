@@ -130,6 +130,24 @@ impl AdmitOperationError {
 /// Explicit ownership phase of one mount request.
 #[derive(Debug)]
 enum MountRequestState {
+    /// Independent physical write observation after primary geometry, before UUID policy selection.
+    QueryPrimaryWriteAccess {
+        /// Top-level completion authority.
+        owned: OwnedIrp,
+        /// Stable native identities.
+        admission: MountAdmission,
+        /// Primary storage retained through the query.
+        devices: MountedStorage,
+    },
+    /// Exclusive journal access is observed before its bytes can authorize recovery.
+    QueryExternalWriteAccess {
+        /// Geometry already observed from this exclusively opened device.
+        length: ext4_core::DeviceLength,
+        /// Unique mount/discovery ownership.
+        context: ExclusiveExternalProbeContext,
+        /// Exact journal identity being revalidated.
+        requirement: ExternalJournalRequirement,
+    },
     /// The mount IRP retains its VPB while a private length query is constructed.
     QueryLength {
         /// Unique top-level completion authority.
@@ -139,6 +157,8 @@ enum MountRequestState {
     },
     /// Primary reads precede UUID-scoped policy selection and any recovery effect.
     Probing {
+        /// Physical primary availability, independent of the selected mount policy.
+        device_access: ext4_core::DeviceWriteAccess,
         /// Unique mount completion owner.
         owned: OwnedIrp,
         /// Stable kernel identities.
@@ -234,6 +254,8 @@ struct ExternalMountContext {
 /// Ownership retained while the unique share-zero journal is revalidated by core.
 #[derive(Debug)]
 struct ExclusiveExternalProbeContext {
+    /// Actual write availability of the exclusively opened journal.
+    device_access: ext4_core::DeviceWriteAccess,
     /// Unique top-level mount completion authority.
     owned: OwnedIrp,
     /// Stable filesystem device and VPB identities.
@@ -292,6 +314,7 @@ impl MountRequestOperation {
         owned: OwnedIrp,
         admission: MountAdmission,
         devices: MountedStorage,
+        device_access: ext4_core::DeviceWriteAccess,
         transition: MountProbeTransition,
         catalog: &mut crate::administration::MountDirectory<'_>,
     ) -> OperationTransition {
@@ -299,6 +322,7 @@ impl MountRequestOperation {
             MountProbeTransition::SubmitLower { request, suspended } => {
                 let route = devices.route();
                 self.state = MountRequestState::Probing {
+                    device_access,
                     owned,
                     admission,
                     devices,
@@ -316,12 +340,6 @@ impl MountRequestOperation {
                     Ok(policy) => policy,
                     Err(error) => return Self::complete(owned, Err(error)),
                 };
-                if policy.policy.mount_access().media_access() == ext4_core::MediaAccess::ReadWrite
-                    && let Some(block_size) = prepared.ownership_block_size()
-                    && let Err(error) = devices.route().require_ownership_blocks(block_size)
-                {
-                    return Self::complete(owned, Err(error));
-                }
                 let now = match crate::kernel::time::mmp_time() {
                     Ok(now) => now,
                     Err(error) => return Self::complete(owned, Err(error)),
@@ -331,7 +349,8 @@ impl MountRequestOperation {
                     crate::kernel::cng::random_bytes(&mut entropy)?;
                     Ok(prepared.start(
                         FscryptKeySet::empty(),
-                        policy.policy.mount_access(),
+                        policy.policy,
+                        device_access,
                         ext4_core::MmpOwner::new(entropy)?,
                         now,
                     )?)
@@ -339,6 +358,11 @@ impl MountRequestOperation {
                     Ok(mount) => mount,
                     Err(error) => return Self::complete(owned, Err(error)),
                 };
+                if let Some(width) = mount.ownership_block_size()
+                    && let Err(error) = devices.route().require_ownership_blocks(width)
+                {
+                    return Self::complete(owned, Err(error));
+                }
                 let transition = mount.advance(OperationEvent::Admitted, now);
                 self.drive_mount(owned, admission, devices, transition, catalog)
             }
@@ -419,9 +443,10 @@ impl MountRequestOperation {
                 owned,
                 Self::publish_mount(admission, devices, completed, self.trace, catalog),
             ),
-            MountTransition::Complete(Err(Error::InvalidMagic | Error::InvalidSuperblock)) => {
-                Self::complete(owned, Err(DriverError::UnrecognizedVolume))
-            }
+            MountTransition::Complete(Err(ext4_core::MountFailure {
+                reason: Error::InvalidMagic | Error::InvalidSuperblock,
+                media: ext4_core::MountMediaOutcome::Unchanged,
+            })) => Self::complete(owned, Err(DriverError::UnrecognizedVolume)),
             MountTransition::Complete(Err(error)) => {
                 Self::complete(owned, Err(DriverError::from(error)))
             }
@@ -439,7 +464,8 @@ impl MountRequestOperation {
             };
             let completion_owner = context.admission.file_system_device();
             self.state = MountRequestState::DiscoveringCandidateLength { context };
-            OperationTransition::QueryDeviceLength {
+            OperationTransition::QueryDevice {
+                query: crate::kernel::storage::DeviceQuery::Length,
                 completion_owner,
                 target,
                 suspended: self,
@@ -458,6 +484,7 @@ impl MountRequestOperation {
                 Ok(selected) => selected,
                 Err(error) => return Self::complete(owned, Err(error)),
             };
+            let access = mount.external_write_access();
             self.state = MountRequestState::OpeningExternalJournal {
                 owned,
                 admission,
@@ -466,7 +493,7 @@ impl MountRequestOperation {
                 requirement,
             };
             OperationTransition::SubmitPassiveWork {
-                work: crate::irp::PassiveWork::OpenExternalJournal(selected),
+                work: crate::irp::PassiveWork::OpenExternalJournal { selected, access },
                 suspended: self,
             }
         }
@@ -550,7 +577,10 @@ impl MountRequestOperation {
                     Ok(now) => now,
                     Err(error) => return Self::complete(context.owned, Err(error)),
                 };
-                let transition = context.mount.attach_external_journal(validated, now);
+                let transition =
+                    context
+                        .mount
+                        .attach_external_journal(validated, context.device_access, now);
                 self.drive_mount(
                     context.owned,
                     context.admission,
@@ -655,7 +685,8 @@ impl ControlDeviceOperation for MountRequestOperation {
             MountRequestState::QueryLength { owned, admission } => match event {
                 OperationEvent::Admitted => {
                     self.state = MountRequestState::QueryLength { owned, admission };
-                    OperationTransition::QueryDeviceLength {
+                    OperationTransition::QueryDevice {
+                        query: crate::kernel::storage::DeviceQuery::Length,
                         completion_owner: admission.file_system_device(),
                         target: admission.target_device(),
                         suspended: self,
@@ -669,14 +700,17 @@ impl ControlDeviceOperation for MountRequestOperation {
                         };
                     let devices =
                         MountedStorage::primary(admission.file_system_device(), filesystem);
-                    let probe = match memory::boxed_try_with(move || {
-                        Ok(MountProbeOperation::new(length))
-                    }) {
-                        Ok(probe) => probe,
-                        Err(error) => return Self::complete(owned, Err(error)),
+                    self.state = MountRequestState::QueryPrimaryWriteAccess {
+                        owned,
+                        admission,
+                        devices,
                     };
-                    let transition = probe.advance(OperationEvent::Admitted);
-                    self.drive_probe(owned, admission, devices, transition, catalog)
+                    OperationTransition::QueryDevice {
+                        query: crate::kernel::storage::DeviceQuery::WriteAccess,
+                        completion_owner: admission.file_system_device(),
+                        target: admission.target_device(),
+                        suspended: self,
+                    }
                 }
                 OperationEvent::DeviceLengthCompleted(Err(error)) => {
                     Self::complete(owned, Err(DriverError::from(error)))
@@ -684,7 +718,8 @@ impl ControlDeviceOperation for MountRequestOperation {
                 OperationEvent::CancelRequested => {
                     Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
                 }
-                OperationEvent::TimerElapsed
+                OperationEvent::DeviceWriteAccessCompleted(_)
+                | OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -693,14 +728,76 @@ impl ControlDeviceOperation for MountRequestOperation {
                     Self::complete(owned, Err(DriverError::InternalInvariantViolation))
                 }
             },
+            MountRequestState::QueryPrimaryWriteAccess {
+                owned,
+                admission,
+                devices,
+            } => match event {
+                OperationEvent::DeviceWriteAccessCompleted(Ok(device_access)) => {
+                    let length = devices.route().filesystem_device_length();
+                    let probe =
+                        match memory::boxed_try_with(|| Ok(MountProbeOperation::new(length))) {
+                            Ok(probe) => probe,
+                            Err(error) => return Self::complete(owned, Err(error)),
+                        };
+                    let transition = probe.advance(OperationEvent::Admitted);
+                    self.drive_probe(
+                        owned,
+                        admission,
+                        devices,
+                        device_access,
+                        transition,
+                        catalog,
+                    )
+                }
+                OperationEvent::DeviceWriteAccessCompleted(Err(error)) => {
+                    Self::complete(owned, Err(error.into()))
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(owned, Err(Error::OperationCancelled.into()))
+                }
+                _ => Self::complete(owned, Err(DriverError::InternalInvariantViolation)),
+            },
+            MountRequestState::QueryExternalWriteAccess {
+                mut context,
+                requirement,
+                length,
+            } => match event {
+                OperationEvent::DeviceWriteAccessCompleted(Ok(device_access)) => {
+                    context.device_access = device_access;
+                    let probe = match memory::boxed_try_with(|| {
+                        Ok(ExternalJournalProbeOperation::new(requirement, length))
+                    }) {
+                        Ok(probe) => probe,
+                        Err(error) => return Self::complete(context.owned, Err(error)),
+                    };
+                    let transition = probe.advance(OperationEvent::Admitted);
+                    self.drive_exclusive_external_probe(context, transition, catalog)
+                }
+                OperationEvent::DeviceWriteAccessCompleted(Err(error)) => {
+                    Self::complete(context.owned, Err(error.into()))
+                }
+                OperationEvent::CancelRequested => {
+                    Self::complete(context.owned, Err(Error::OperationCancelled.into()))
+                }
+                _ => Self::complete(context.owned, Err(DriverError::InternalInvariantViolation)),
+            },
             MountRequestState::Probing {
                 owned,
                 admission,
                 devices,
+                device_access,
                 probe,
             } => {
                 let transition = probe.advance(event);
-                self.drive_probe(owned, admission, devices, transition, catalog)
+                self.drive_probe(
+                    owned,
+                    admission,
+                    devices,
+                    device_access,
+                    transition,
+                    catalog,
+                )
             }
             MountRequestState::Mounting {
                 owned,
@@ -778,25 +875,26 @@ impl ControlDeviceOperation for MountRequestOperation {
                         Ok(external) => external,
                         Err(error) => return Self::complete(owned, Err(error)),
                     };
-                    let probe = match memory::boxed_try_with(|| {
-                        Ok(ExternalJournalProbeOperation::new(requirement, length))
-                    }) {
-                        Ok(probe) => probe,
-                        Err(error) => return Self::complete(owned, Err(error)),
-                    };
-                    let transition = probe.advance(OperationEvent::Admitted);
-                    self.drive_exclusive_external_probe(
-                        ExclusiveExternalProbeContext {
+                    let target = external_device;
+                    self.state = MountRequestState::QueryExternalWriteAccess {
+                        context: ExclusiveExternalProbeContext {
                             owned,
                             admission,
                             devices,
                             mount,
                             external,
                             lease,
+                            device_access: ext4_core::DeviceWriteAccess::ReadOnly,
                         },
-                        transition,
-                        catalog,
-                    )
+                        requirement,
+                        length,
+                    };
+                    OperationTransition::QueryDevice {
+                        query: crate::kernel::storage::DeviceQuery::WriteAccess,
+                        completion_owner: admission.file_system_device(),
+                        target,
+                        suspended: self,
+                    }
                 }
                 OperationEvent::DeviceLengthCompleted(Err(error)) => {
                     Self::complete(owned, Err(DriverError::from(error)))
@@ -855,7 +953,8 @@ impl CompletionOperation for MountRequestOperation {
                 requirement,
                 external,
             };
-            OperationTransition::QueryDeviceLength {
+            OperationTransition::QueryDevice {
+                query: crate::kernel::storage::DeviceQuery::Length,
                 completion_owner,
                 target,
                 suspended: self,
@@ -1213,6 +1312,7 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     }
                     OperationEvent::TimerElapsed
                     | OperationEvent::StorageCompleted(_)
+                    | OperationEvent::DeviceWriteAccessCompleted(_)
                     | OperationEvent::DeviceLengthCompleted(_)
                     | OperationEvent::IntentGranted(_)
                     | OperationEvent::CommitGranted(_)
@@ -1243,6 +1343,7 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     }
                     OperationEvent::TimerElapsed
                     | OperationEvent::StorageCompleted(_)
+                    | OperationEvent::DeviceWriteAccessCompleted(_)
                     | OperationEvent::DeviceLengthCompleted(_)
                     | OperationEvent::IntentGranted(_)
                     | OperationEvent::CommitGranted(_)
@@ -1604,6 +1705,7 @@ impl MountedVolumeOperation for RawVolumeOperation {
                 }
                 OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -1893,6 +1995,7 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
             OperationEvent::CancelRequested => Err(DriverError::from(Error::OperationCancelled)),
             OperationEvent::TimerElapsed
             | OperationEvent::StorageCompleted(_)
+            | OperationEvent::DeviceWriteAccessCompleted(_)
             | OperationEvent::DeviceLengthCompleted(_)
             | OperationEvent::IntentGranted(_)
             | OperationEvent::CommitGranted(_)
@@ -1972,6 +2075,7 @@ impl MountedVolumeOperation for NotificationOperation {
             ),
             OperationEvent::TimerElapsed
             | OperationEvent::StorageCompleted(_)
+            | OperationEvent::DeviceWriteAccessCompleted(_)
             | OperationEvent::DeviceLengthCompleted(_)
             | OperationEvent::IntentGranted(_)
             | OperationEvent::CommitGranted(_)
@@ -2159,6 +2263,7 @@ impl MountedVolumeOperation for ByteRangeLockOperation {
                 | ByteRangeLockOperationState::OplockReady { owned, .. },
                 OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -2315,6 +2420,7 @@ impl MountedVolumeOperation for OplockControlOperation {
                 OplockControlOperationState::Ready { owned, .. },
                 OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -2676,6 +2782,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 }
                 OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -2696,6 +2803,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 OperationEvent::Admitted
                 | OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -2748,6 +2856,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                 OperationEvent::Admitted
                 | OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -3115,6 +3224,7 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 }
                 OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -3139,6 +3249,7 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 }
                 OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -3162,6 +3273,7 @@ impl MountedVolumeOperation for FlushRequestOperation {
                 OperationEvent::Admitted
                 | OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::IntentGranted(_)
                 | OperationEvent::CommitGranted(_)
@@ -6151,6 +6263,7 @@ impl MutationRequestOperation {
                 }
                 OperationEvent::TimerElapsed
                 | OperationEvent::StorageCompleted(_)
+                | OperationEvent::DeviceWriteAccessCompleted(_)
                 | OperationEvent::DeviceLengthCompleted(_)
                 | OperationEvent::CancelRequested
                 | OperationEvent::IntentGranted(_)

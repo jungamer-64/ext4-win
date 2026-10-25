@@ -546,6 +546,37 @@ pub enum StorageRequestSequenceStep<Next> {
 }
 
 impl<Next> StorageRequestSequence<Next> {
+    /// Persists preallocated home images without claiming journal atomicity. A failed transfer
+    /// leaves recovery incomplete; the mount owner must not retry or publish the continuation.
+    /// # Errors
+    /// Returns allocation or coordinate failure before the first media effect.
+    pub(in crate::volume) fn home_updates(
+        images: Vec<JournalBlock>,
+        block_size: BlockSize,
+        next: Next,
+    ) -> Result<Self> {
+        let mut requests = Vec::new();
+        requests
+            .try_reserve_exact(
+                images
+                    .len()
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .map_err(|_| Error::OutOfMemory)?;
+        for image in images {
+            requests.try_push(crate::StorageRequest::Write {
+                target: crate::StorageTarget::Filesystem,
+                offset: block_size.offset_of(image.block())?,
+                buffer: image.into_bytes(),
+            })?;
+        }
+        requests.try_push(crate::StorageRequest::Flush {
+            target: crate::StorageTarget::Filesystem,
+        })?;
+        Ok(Self::new(requests, next))
+    }
+
     /// Builds a consuming sequence from fully preallocated requests.
     fn new(requests: Vec<crate::StorageRequest>, next: Next) -> Self {
         Self {

@@ -46,6 +46,25 @@ pub(super) struct ValidatedOrphanInventory {
 }
 
 impl ValidatedOrphanInventory {
+    /// No cleanup authority is admitted for this mount.
+    pub(super) const fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            head: None,
+        }
+    }
+    /// Validates the orphan-file format without acquiring cleanup authority over its inode entries.
+    /// # Errors
+    /// Returns file checksum, geometry, storage or allocation failures.
+    pub(super) fn observe_file(volume: &mut EpochReadView<'_, '_>) -> Result<bool> {
+        let mut empty = true;
+        visit_orphan_file(volume, |_volume, _entry| {
+            empty = false;
+            Ok(())
+        })?;
+        Ok(empty)
+    }
+
     /// Whether mount requires any orphan-cleanup transactions.
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -59,121 +78,7 @@ impl ValidatedOrphanInventory {
             entries: Vec::new(),
             head: volume.superblock.last_orphan(),
         };
-        if let Some(file) = volume.superblock.orphan_file() {
-            validate_recovery_identity(volume.superblock, file.inode, None)?;
-            let raw = read_allocated_inode(volume, file.inode)?;
-            let inode = raw.parse()?;
-            let block_size = volume.superblock.block_size();
-            let block_bytes = u64::from(block_size.bytes());
-            let file_size = inode.size().bytes();
-            if inode.kind() != InodeKind::File
-                || inode.links_count() != Ext4LinkCount::ONE
-                || file_size == 0
-                || file_size
-                    .checked_rem(block_bytes)
-                    .ok_or(Error::ArithmeticOverflow)?
-                    != 0
-            {
-                return Err(Error::InvalidOrphanTracking);
-            }
-            let blocks = inode
-                .size()
-                .bytes()
-                .checked_div(block_bytes)
-                .ok_or(Error::ArithmeticOverflow)?;
-            if blocks > MAX_ORPHAN_BLOCKS {
-                return Err(Error::OrphanRecoveryLimitExceeded);
-            }
-            let context =
-                OrphanBlockContext::new(volume.superblock, file.inode, inode.generation());
-            let tree_context = volume.extent_tree_context(&inode);
-            let mut logical = 0_u64;
-            let mut allocation_items = 0_u64;
-            let mut physical_blocks = Vec::new();
-            crate::disk_format::extent::visit_allocations(
-                inode.extent_root()?,
-                block_size,
-                &mut volume.device,
-                tree_context,
-                |allocation| {
-                    allocation_items = allocation_items
-                        .checked_add(1)
-                        .ok_or(Error::ArithmeticOverflow)?;
-                    if allocation_items
-                        > MAX_ORPHAN_BLOCKS
-                            .checked_mul(2)
-                            .ok_or(Error::ArithmeticOverflow)?
-                    {
-                        return Err(Error::OrphanRecoveryLimitExceeded);
-                    }
-                    if let crate::disk_format::extent::ExtentAllocation::Data(extent) = allocation {
-                        if u64::from(extent.logical_start().as_u32()) != logical
-                            || extent.initialization()
-                                != crate::disk_format::extent::ExtentInitialization::Initialized
-                        {
-                            return Err(Error::InvalidOrphanTracking);
-                        }
-                        logical = logical
-                            .checked_add(extent.len().as_u64())
-                            .ok_or(Error::ArithmeticOverflow)?;
-                        if logical > blocks {
-                            return Err(Error::InvalidOrphanTracking);
-                        }
-                        for offset in 0..extent.len().as_u64() {
-                            physical_blocks.try_push(BlockAddress::new(
-                                extent
-                                    .physical_start()
-                                    .get()
-                                    .checked_add(offset)
-                                    .ok_or(Error::ArithmeticOverflow)?,
-                            ))?;
-                        }
-                    }
-                    Ok(())
-                },
-            )?;
-            if logical != blocks
-                || u64::try_from(physical_blocks.len()).map_err(|_| Error::ArithmeticOverflow)?
-                    != blocks
-            {
-                return Err(Error::InvalidOrphanTracking);
-            }
-            for block in physical_blocks {
-                let mut bytes = memory::repeated_vec(
-                    0,
-                    usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
-                )?;
-                volume
-                    .device
-                    .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
-                let (entries, remainder) = context.entries(&bytes, block)?.as_chunks::<4>();
-                if !remainder.is_empty() {
-                    return Err(Error::InvalidOrphanTracking);
-                }
-                for (slot, entry) in entries.iter().enumerate() {
-                    let value = le_u32(entry, disk_offset(0))?;
-                    if value == 0 {
-                        continue;
-                    }
-                    if !file.present {
-                        return Err(Error::InvalidOrphanTracking);
-                    }
-                    let inode =
-                        InodeId::try_from(value).map_err(|_| Error::InvalidOrphanTracking)?;
-                    inventory.insert(
-                        volume,
-                        TrackedOrphan {
-                            inode,
-                            source: OrphanSource::File {
-                                block,
-                                slot,
-                                context,
-                            },
-                        },
-                    )?;
-                }
-            }
-        }
+        visit_orphan_file(volume, |volume, entry| inventory.insert(volume, entry))?;
         let mut current = inventory.head;
         while let Some(inode) = current {
             validate_recovery_identity(
@@ -538,4 +443,127 @@ impl InodeAllocation {
                 .ok_or(Error::ArithmeticOverflow)?,
         ))
     }
+}
+
+/// Traverses authenticated orphan-file blocks without interpreting tracked inode allocation.
+/// # Errors
+/// Returns malformed file layout, checksum, allocation or lower-read failure.
+fn visit_orphan_file(
+    volume: &mut EpochReadView<'_, '_>,
+    mut visit: impl FnMut(&mut EpochReadView<'_, '_>, TrackedOrphan) -> Result<()>,
+) -> Result<()> {
+    if let Some(file) = volume.superblock.orphan_file() {
+        validate_recovery_identity(volume.superblock, file.inode, None)?;
+        let raw = read_allocated_inode(volume, file.inode)?;
+        let inode = raw.parse()?;
+        let block_size = volume.superblock.block_size();
+        let block_bytes = u64::from(block_size.bytes());
+        let file_size = inode.size().bytes();
+        if inode.kind() != InodeKind::File
+            || inode.links_count() != Ext4LinkCount::ONE
+            || file_size == 0
+            || file_size
+                .checked_rem(block_bytes)
+                .ok_or(Error::ArithmeticOverflow)?
+                != 0
+        {
+            return Err(Error::InvalidOrphanTracking);
+        }
+        let blocks = inode
+            .size()
+            .bytes()
+            .checked_div(block_bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if blocks > MAX_ORPHAN_BLOCKS {
+            return Err(Error::OrphanRecoveryLimitExceeded);
+        }
+        let context = OrphanBlockContext::new(volume.superblock, file.inode, inode.generation());
+        let tree_context = volume.extent_tree_context(&inode);
+        let mut logical = 0_u64;
+        let mut allocation_items = 0_u64;
+        let mut physical_blocks = Vec::new();
+        crate::disk_format::extent::visit_allocations(
+            inode.extent_root()?,
+            block_size,
+            &mut volume.device,
+            tree_context,
+            |allocation| {
+                allocation_items = allocation_items
+                    .checked_add(1)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if allocation_items
+                    > MAX_ORPHAN_BLOCKS
+                        .checked_mul(2)
+                        .ok_or(Error::ArithmeticOverflow)?
+                {
+                    return Err(Error::OrphanRecoveryLimitExceeded);
+                }
+                if let crate::disk_format::extent::ExtentAllocation::Data(extent) = allocation {
+                    if u64::from(extent.logical_start().as_u32()) != logical
+                        || extent.initialization()
+                            != crate::disk_format::extent::ExtentInitialization::Initialized
+                    {
+                        return Err(Error::InvalidOrphanTracking);
+                    }
+                    logical = logical
+                        .checked_add(extent.len().as_u64())
+                        .ok_or(Error::ArithmeticOverflow)?;
+                    if logical > blocks {
+                        return Err(Error::InvalidOrphanTracking);
+                    }
+                    for offset in 0..extent.len().as_u64() {
+                        physical_blocks.try_push(BlockAddress::new(
+                            extent
+                                .physical_start()
+                                .get()
+                                .checked_add(offset)
+                                .ok_or(Error::ArithmeticOverflow)?,
+                        ))?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if logical != blocks
+            || u64::try_from(physical_blocks.len()).map_err(|_| Error::ArithmeticOverflow)?
+                != blocks
+        {
+            return Err(Error::InvalidOrphanTracking);
+        }
+        for block in physical_blocks {
+            let mut bytes = memory::repeated_vec(
+                0,
+                usize::try_from(block_size.bytes()).map_err(|_| Error::ArithmeticOverflow)?,
+            )?;
+            volume
+                .device
+                .read_exact_at(block_size.offset_of(block)?, &mut bytes)?;
+            let (entries, remainder) = context.entries(&bytes, block)?.as_chunks::<4>();
+            if !remainder.is_empty() {
+                return Err(Error::InvalidOrphanTracking);
+            }
+            for (slot, entry) in entries.iter().enumerate() {
+                let value = le_u32(entry, disk_offset(0))?;
+                if value == 0 {
+                    continue;
+                }
+                if !file.present {
+                    return Err(Error::InvalidOrphanTracking);
+                }
+                let inode = InodeId::try_from(value).map_err(|_| Error::InvalidOrphanTracking)?;
+                visit(
+                    volume,
+                    TrackedOrphan {
+                        inode,
+                        source: OrphanSource::File {
+                            block,
+                            slot,
+                            context,
+                        },
+                    },
+                )?;
+            }
+        }
+    }
+    Ok(())
 }

@@ -404,6 +404,7 @@ impl EpochReadOperation {
             }
             super::OperationEvent::TimerElapsed
             | super::OperationEvent::DeviceLengthCompleted(_)
+            | super::OperationEvent::DeviceWriteAccessCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)
@@ -504,6 +505,7 @@ impl MutationResolveOperation {
             super::OperationEvent::CancelRequested => return Err(Error::OperationCancelled),
             super::OperationEvent::TimerElapsed
             | super::OperationEvent::DeviceLengthCompleted(_)
+            | super::OperationEvent::DeviceWriteAccessCompleted(_)
             | super::OperationEvent::IntentGranted(_)
             | super::OperationEvent::CommitGranted(_)
             | super::OperationEvent::VisibilityGranted(_)

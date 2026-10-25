@@ -12,24 +12,24 @@ pub(in crate::volume) const ORPHAN_METADATA_BUDGET: usize = 32;
 /// Maximum data-block references released in one batch, additionally split at group boundaries.
 const RELEASE_BLOCK_BUDGET: u64 = 1024;
 
-/// State revealed only after commit, home checkpoint, and clean-journal flush complete.
+/// State revealed only after the admitted batch persistence protocol completes.
 #[derive(Debug)]
 pub(in crate::volume) struct OrphanBatchCompletion {
-    /// Next clean journal cursor; no scheduler can observe it before mount publication.
-    pub(in crate::volume) journal: Journal<CleanJournal>,
+    /// Journal cursor for a journaled batch; direct home updates have no journal cursor.
+    pub(in crate::volume) journal: Option<Journal<CleanJournal>>,
     /// Allocation counts corresponding to checkpointed home metadata.
     pub(in crate::volume) clusters: ClusterReferenceIndex,
     /// Primary metadata including a possibly advanced fallback head.
     pub(in crate::volume) superblock: Superblock,
 }
 
-/// Prepares all failure-prone work before a bounded batch issues its first journal write.
+/// Prepares all failure-prone work before a bounded batch issues its first media effect.
 /// # Errors
 /// Returns validation, allocation, capacity, or suspended-I/O errors without writing anything.
 pub(in crate::volume) fn prepare_orphan_batch(
     volume: EpochReadView<'_, '_>,
     target: &OrphanRecoveryTarget,
-    journal: &Journal<CleanJournal>,
+    journal: Option<&Journal<CleanJournal>>,
 ) -> Result<(
     StorageRequestSequence<OrphanBatchCompletion>,
     OrphanProgress,
@@ -166,25 +166,35 @@ pub(in crate::volume) fn prepare_orphan_batch(
                 }
                 put_le_u32(raw, disk_offset(0xe8), next.map_or(0, InodeId::as_u32))?;
                 Superblock::refresh_checksum(raw)?;
-                next_superblock = Superblock::parse_read_write(raw)?;
+                next_superblock = Superblock::parse_mutable(raw)?;
             }
         }
     }
     if metadata.len() > ORPHAN_METADATA_BUDGET {
         return Err(Error::TransactionTooLarge);
     }
-    let prepared = journal.prepare_commit(
-        block_size,
-        crate::disk_format::journal::JournalCommitImage::full(metadata),
-    )?;
-    Ok((
+    let sequence = if let Some(journal) = journal {
+        let prepared = journal.prepare_commit(
+            block_size,
+            crate::disk_format::journal::JournalCommitImage::full(metadata),
+        )?;
         StorageRequestSequence::checkpoint(prepared, &[], |journal| OrphanBatchCompletion {
-            journal,
+            journal: Some(journal),
             clusters,
             superblock: next_superblock,
-        })?,
-        progress,
-    ))
+        })?
+    } else {
+        StorageRequestSequence::home_updates(
+            metadata,
+            block_size,
+            OrphanBatchCompletion {
+                journal: None,
+                clusters,
+                superblock: next_superblock,
+            },
+        )?
+    };
+    Ok((sequence, progress))
 }
 
 /// Coalesces a tracker edit with any already staged inode/group/superblock image.

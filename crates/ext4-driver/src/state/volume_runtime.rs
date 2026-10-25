@@ -370,9 +370,9 @@ impl VolumeRuntime {
 
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
     #[cfg(not(test))]
-    pub(crate) fn journal_is_clean(&self) -> bool {
+    pub(crate) fn publication_is_idle(&self) -> bool {
         self.active_mutations.get().load(Ordering::Acquire) == 0
-            && self.coordinator.journal_is_clean()
+            && self.coordinator.publication_is_idle()
             && !self.coordinator.has_pending_trim()
     }
 
@@ -385,7 +385,7 @@ impl VolumeRuntime {
         if self.profile.access() == ext4_core::MediaAccess::ReadOnly {
             return Err(ext4_core::Error::ReadOnlyFilesystem.into());
         }
-        Ok(self.coordinator.journal_is_clean() && !self.coordinator.has_pending_trim())
+        Ok(self.coordinator.publication_is_idle() && !self.coordinator.has_pending_trim())
     }
     /// Acquires only the ranges selected by the exact current checkpointed epoch.
     /// # Errors

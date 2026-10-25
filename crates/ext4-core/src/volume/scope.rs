@@ -70,9 +70,9 @@ pub(super) use super::inode_record::{
     LiveInodeRecord, RawInodeRecord, RecoverableOrphanInode, StagedInodeIndex, StagedInodeRecord,
 };
 pub(super) use super::mount::{
-    CheckpointAdmission, CommitAdmission, CommittedEpoch, EpochReadView, JournalCoordinatorState,
-    MountIdentity, MountedProfile, MutationCoordinatorState, MutationResource,
-    ObservedResourceVersionSet, ReadObservations, ResourceVersion, ResourceVersionPublication,
+    CheckpointAdmission, CommitAdmission, CommittedEpoch, EpochReadView, MountIdentity,
+    MountedProfile, MutationCoordinatorState, MutationResource, ObservedResourceVersionSet,
+    PublicationState, ReadObservations, ResourceVersion, ResourceVersionPublication,
 };
 pub(super) use super::node::{
     ChildLookup, DirectoryEntry, DirectoryNode, DirectoryNodeId, FileNode, FileNodeId,

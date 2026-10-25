@@ -188,7 +188,9 @@ fn read_only_mapping_replay_has_zero_backing_effects() -> Result<()> {
     let (profile, epoch, coordinator, _lease) = fixture
         .disk
         .mount(MountAccess::ReadOnly {
-            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
         })?
         .into_parts();
     fixture.cache = MetadataCache::try_new(&epoch)?;
@@ -209,6 +211,51 @@ fn read_only_mapping_replay_has_zero_backing_effects() -> Result<()> {
     assert_eq!(fixture.disk.storage_effects, 0);
     assert_eq!(fixture.disk.filesystem, filesystem);
     assert_eq!(fixture.disk.journal, journal);
+    Ok(())
+}
+
+/// # Errors
+/// Returns independent delta construction, standard RO mount or committed payload read errors.
+/// # Panics
+/// Fails if standard replay loses a durable mapping or noload interprets journal deltas.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare raw allocation and payload observations for both standard RO modes"
+)]
+fn standard_ro_replays_mapping_and_noload_preserves_home_view() -> Result<()> {
+    for recovery in [
+        ext4_core::ReadOnlyRecovery::Replay,
+        ext4_core::ReadOnlyRecovery::NoLoad,
+    ] {
+        let mut fixture = Fixture::new()?;
+        put(&mut fixture.disk.filesystem, 1000 * 4096, b"replayed")?;
+        inject_range(&mut fixture, 1000)?;
+        let physical = fixture.disk.filesystem.clone();
+        fixture.disk.storage_effects = 0;
+        let (profile, epoch, coordinator, _) = fixture
+            .disk
+            .mount(MountAccess::ReadOnly { recovery })?
+            .into_parts();
+        fixture.cache = MetadataCache::try_new(&epoch)?;
+        fixture.profile = profile;
+        fixture.epoch = epoch;
+        fixture.coordinator = coordinator;
+        let mut bytes = [0; 8];
+        let file = fixture.a;
+        let read = fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
+        if recovery == ext4_core::ReadOnlyRecovery::Replay {
+            assert_eq!(read, ReadBytes::from_usize(8));
+            assert_eq!(&bytes, b"replayed");
+            assert!(allocated(&fixture.disk, 1000)?);
+            assert!(fixture.disk.storage_effects > 0);
+        } else {
+            assert_eq!(read, ReadBytes::from_usize(1));
+            assert_eq!(bytes.first(), Some(&b'a'));
+            assert_eq!(fixture.disk.filesystem, physical);
+            assert_eq!(fixture.disk.storage_effects, 0);
+        }
+    }
     Ok(())
 }
 
@@ -1336,7 +1383,9 @@ fn read_only_terminal_replay_has_zero_backing_effects() -> Result<()> {
     let (profile, epoch, coordinator, _) = fixture
         .disk
         .mount(MountAccess::ReadOnly {
-            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
         })?
         .into_parts();
     fixture.profile = profile;
@@ -1458,7 +1507,9 @@ fn inline_records_restore_full_payload_and_preserve_attribute_bindings() -> Resu
     for access in [
         MountAccess::ReadWrite,
         MountAccess::ReadOnly {
-            recovery_memory: RecoveryMemoryLimit::DEFAULT,
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
         },
     ] {
         let mut fixture = inline_fixture()?;

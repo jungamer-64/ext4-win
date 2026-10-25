@@ -146,6 +146,8 @@ pub enum OperationEvent {
     StorageCompleted(StorageCompletion),
     /// Mount-time lower device-length query completed through its private IRP envelope.
     DeviceLengthCompleted(crate::Result<crate::DeviceLength>),
+    /// Physical write availability queried independently of filesystem mount policy.
+    DeviceWriteAccessCompleted(crate::Result<crate::DeviceWriteAccess>),
     /// Top-level cancellation observed by the active-operation lane.
     CancelRequested,
     /// The complete mutation resource set was acquired atomically.
