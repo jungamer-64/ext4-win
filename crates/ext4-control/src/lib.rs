@@ -222,32 +222,8 @@ pub enum Error {
 pub enum AccessMode {
     /// Journaled writes after successful admission.
     ReadWrite,
-    /// Private recovery with no lower write or flush.
+    /// Filesystem mutations are denied after mount recovery.
     ReadOnly,
-}
-/// Allocation-free validated policy value.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MountPolicy {
-    /// Fixed media authority for the next session.
-    pub access: AccessMode,
-    /// Logical private-recovery budget independent of physical allocation failure.
-    pub recovery_memory: RecoveryMemoryLimit,
-}
-impl MountPolicy {
-    /// Writable defaults with bounded recovery.
-    pub const DEFAULT: Self = Self {
-        access: AccessMode::ReadWrite,
-        recovery_memory: RecoveryMemoryLimit::DEFAULT,
-    };
-    /// Fixes core media authority at the mount selection boundary.
-    pub const fn mount_access(self) -> MountAccess {
-        match self.access {
-            AccessMode::ReadWrite => MountAccess::ReadWrite,
-            AccessMode::ReadOnly => MountAccess::ReadOnly {
-                recovery_memory: self.recovery_memory,
-            },
-        }
-    }
 }
 /// Authoritative policy and durable-selection generation for one ext4 UUID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,7 +233,7 @@ pub struct PolicySnapshot {
     /// Zero denotes unsaved defaults; persisted records have positive generations.
     pub generation: u64,
     /// Policy copied into each admitted session.
-    pub policy: MountPolicy,
+    pub policy: MountAccess,
 }
 impl PolicySnapshot {
     /// Unsaved defaults for one filesystem identity.
@@ -265,7 +241,7 @@ impl PolicySnapshot {
         Self {
             uuid,
             generation: 0,
-            policy: MountPolicy::DEFAULT,
+            policy: MountAccess::ReadWrite,
         }
     }
     /// Encodes the entire persistent value without allocation or native-layout dependence.

@@ -33,11 +33,25 @@ impl RecoveryMemoryLimit {
 pub enum MountAccess {
     /// Journaled changes may be persisted to exclusively held backing storage.
     ReadWrite,
-    /// Recovery is private to memory; no media write or flush is authorized.
-    /// Backing storage must remain unchanged by other writers until unmount.
+    /// Filesystem mutations are denied after the selected recovery protocol completes.
     ReadOnly {
-        /// Finite admission for recovery images and their indexing storage.
-        recovery_memory: RecoveryMemoryLimit,
+        /// Recovery destination and journal-loading policy, independent of mounted authority.
+        recovery: ReadOnlyRecovery,
+    },
+}
+
+/// Recovery selected explicitly for one read-only session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadOnlyRecovery {
+    /// Load the journal and persist recovery before publishing read-only access.
+    Replay,
+    /// Do not load the journal; orphan cleanup remains a separate media operation.
+    NoLoad,
+    /// Recover privately without issuing media writes or flushes.
+    /// Backing storage must remain unchanged by other writers until unmount.
+    Memory {
+        /// Finite resident admission, separate from physical allocation success.
+        limit: RecoveryMemoryLimit,
     },
 }
 

@@ -66,7 +66,7 @@ pub use volume::{
     NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot, NodeMetadataUpdate,
     ObservedResourceVersionSet, OperationEvent, OrderedDataDurability, PendingTrim,
     PreparedKeyChange, PreparedTrim, ProbedMount, PublishedMutation, ReadTransition,
-    RecoveryMemoryLimit, ReservedKeyChange, ReservedMutation, ResolvedKeyChange, ResolvedMutation,
+    ReadOnlyRecovery, RecoveryMemoryLimit, ReservedKeyChange, ReservedMutation, ResolvedKeyChange, ResolvedMutation,
     ResourceVersion, ScannedDirectoryEntry, StorageRequestSequence, StorageRequestSequenceStep,
     SymlinkNode, SymlinkNodeId, TRIM_BATCH_BYTES, TRIM_BATCH_RANGES, TransactionDirectory,
     TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink, TrimAdmission,
