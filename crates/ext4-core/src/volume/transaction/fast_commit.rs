@@ -7,11 +7,11 @@ use crate::volume::fast_commit::ResolvedDeltaImages;
 
 /// A changed inode owns its original tree until final data accounting is known for the whole log.
 #[derive(Debug)]
-struct ReplayInode {
-    /// Final metadata is private and cannot be observed before the full replacement commit.
-    raw: LiveInodeRecord,
-    /// Extent storage always derives its allocation charge independently of recorded i_blocks.
-    tree: Option<MutableExtentTree>,
+enum ReplayInode {
+    /// Existing storage or a regular-file allocation already has a complete mapping interpretation.
+    Live { raw: LiveInodeRecord, tree: Option<MutableExtentTree> },
+    /// Directory body initialization is mandatory before this inode can enter the staged live set.
+    NewDirectory { raw: LiveInodeRecord, parent: InodeId },
 }
 
 /// Applies complete, ordered mapping assignments while deriving bitmap changes from final ownership.
