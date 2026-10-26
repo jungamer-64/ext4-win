@@ -2099,18 +2099,6 @@ impl KernelIrp {
                 unsafe {
                     // SAFETY: This filesystem owns the live IRP through native completion. The
                     // thread-local marker is restored below before returning to any caller.
-    /// Attributes completed logical direct bytes to the retained original requestor.
-    #[cfg_attr(not(test), expect(unsafe_code, reason = "the completion owner retains the original IRP and associated requestor"))]
-    fn account_request_io(self, read: u64, written: u64, flush: u32) {
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: Completion has not released this original IRP or its requestor lifetime.
-            ffi::ext4win_account_request_io(self.irp.as_ptr(), read, written, flush);
-        }
-        #[cfg(test)]
-        let _charge = (self, read, written, flush);
-    }
-
                     ffi::IoSetTopLevelIrp(self.as_mut_ptr());
                 }
             }
