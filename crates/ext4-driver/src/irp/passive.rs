@@ -110,6 +110,8 @@ pub(crate) enum PassiveWork {
     Purge {
         /// Stream retained through the coherency boundary.
         stream: StreamCacheLease,
+        /// Original operation's Filter Manager conflict protocol.
+        policy: crate::kernel::section::PurgeFailurePolicy,
     },
     /// Flush cached data and release every unreferenced section before volume lock.
     DrainForVolumeLock {
@@ -120,11 +122,15 @@ pub(crate) enum PassiveWork {
     PrepareSizeChange {
         /// Exact retained stream and new-size semantics.
         stream: StreamSizeChangeLease,
+        /// Original operation's permitted conflict/requeue protocol.
+        policy: crate::kernel::section::PurgeFailurePolicy,
     },
     /// Establish one image/data-section gate for a cleanup namespace deletion.
     PrepareDeletion {
         /// Exact cleaned-up stream retained independently from its handle.
         stream: StreamDeletionLease,
+        /// Explicit set-information may requeue; cleanup must wait for scan release itself.
+        policy: crate::kernel::section::PurgeFailurePolicy,
     },
     /// Establish one image-section gate for an existing regular-file write-open.
     PrepareWriteOpen {
@@ -287,8 +293,8 @@ impl PassiveWork {
     }
 
     /// Builds one stream coherency flush/purge.
-    pub(crate) const fn purge(stream: StreamCacheLease) -> Self {
-        Self::Purge { stream }
+    pub(crate) const fn purge(stream: StreamCacheLease, policy: crate::kernel::section::PurgeFailurePolicy) -> Self {
+        Self::Purge { stream, policy }
     }
 
     /// Builds one volume-lock cache and section drain.
@@ -297,13 +303,13 @@ impl PassiveWork {
     }
 
     /// Builds one resolved stream-size cache/section precommit gate.
-    pub(crate) const fn prepare_size_change(stream: StreamSizeChangeLease) -> Self {
-        Self::PrepareSizeChange { stream }
+    pub(crate) const fn prepare_size_change(stream: StreamSizeChangeLease, policy: crate::kernel::section::PurgeFailurePolicy) -> Self {
+        Self::PrepareSizeChange { stream, policy }
     }
 
     /// Builds one cleanup stream-deletion section gate.
-    pub(crate) const fn prepare_deletion(stream: StreamDeletionLease) -> Self {
-        Self::PrepareDeletion { stream }
+    pub(crate) const fn prepare_deletion(stream: StreamDeletionLease, policy: crate::kernel::section::PurgeFailurePolicy) -> Self {
+        Self::PrepareDeletion { stream, policy }
     }
 
     /// Builds one existing write-open image-section gate.
@@ -393,15 +399,15 @@ impl PassiveWork {
             Self::CloseWriteback { stream } => {
                 PassiveWorkCompletion::CloseWriteback(stream.close_writeback())
             }
-            Self::Purge { stream } => PassiveWorkCompletion::Purge(stream.purge()),
+            Self::Purge { stream, policy } => PassiveWorkCompletion::Purge(stream.purge(policy)),
             Self::DrainForVolumeLock { stream } => {
                 PassiveWorkCompletion::DrainForVolumeLock(stream.execute())
             }
-            Self::PrepareSizeChange { stream } => {
-                PassiveWorkCompletion::PrepareSizeChange(stream.execute())
+            Self::PrepareSizeChange { stream, policy } => {
+                PassiveWorkCompletion::PrepareSizeChange(stream.execute(policy))
             }
-            Self::PrepareDeletion { stream } => {
-                PassiveWorkCompletion::PrepareDeletion(stream.execute())
+            Self::PrepareDeletion { stream, policy } => {
+                PassiveWorkCompletion::PrepareDeletion(stream.execute(policy))
             }
             Self::PrepareWriteOpen { stream } => {
                 PassiveWorkCompletion::PrepareWriteOpen(stream.execute())

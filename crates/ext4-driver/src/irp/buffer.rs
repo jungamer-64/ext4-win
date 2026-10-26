@@ -12,6 +12,14 @@ pub(crate) struct CurrentIrpStackLocation<'owner> {
 }
 
 impl<'owner> CurrentIrpStackLocation<'owner> {
+    /// Reads the major-function discriminator retained by the current active IRP owner.
+    #[expect(unsafe_code, reason = "the lifetime-bound stack view retains this initialized discriminator")]
+    pub(super) fn raw_major_function(self) -> wdk_sys::UCHAR {
+        unsafe {
+            // SAFETY: The active completion owner retains this stack location for the view's lifetime.
+            self.stack.as_ref().MajorFunction
+        }
+    }
     /// Decodes the device-scoped Plug and Play minor without requiring a FILE_OBJECT.
     pub(crate) fn pnp_minor(self) -> PnpMinor {
         PnpMinor::decode(self.raw_minor_function())

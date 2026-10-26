@@ -274,6 +274,8 @@ pub(crate) enum FsControlCode {
     GetReparsePoint,
     /// Windows `FSCTL_SET_REPARSE_POINT`.
     SetReparsePoint,
+    /// Kernel Filter Manager data-scan section lifetime.
+    SetPurgeFailureMode,
     /// Windows `FSCTL_DELETE_REPARSE_POINT`.
     DeleteReparsePoint,
     /// ext4win private fscrypt add-key control.
@@ -334,6 +336,7 @@ impl FsControlCode {
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
             FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
+            FSCTL_SET_PURGE_FAILURE_MODE => Ok(Self::SetPurgeFailureMode),
             FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY => Ok(Self::AddEncryptionKey),
             FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY => Ok(Self::RemoveEncryptionKey),
             FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS => Ok(Self::GetEncryptionKeyStatus),
@@ -402,6 +405,7 @@ impl FsControlCode {
             | Self::GetReparsePoint
             | Self::SetReparsePoint
             | Self::DeleteReparsePoint
+            | Self::SetPurgeFailureMode
             | Self::AddEncryptionKey
             | Self::RemoveEncryptionKey
             | Self::GetEncryptionKeyStatus
@@ -487,6 +491,8 @@ const FSCTL_SET_ZERO_ON_DEALLOCATION: wdk_sys::ULONG = buffered_file_system_cont
 const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
 /// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_SET_REPARSE_POINT: wdk_sys::ULONG = 589_988;
+/// `FSCTL_SET_PURGE_FAILURE_MODE`.
+const FSCTL_SET_PURGE_FAILURE_MODE: wdk_sys::ULONG = buffered_file_system_control(156);
 /// `FSCTL_DELETE_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 43, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_DELETE_REPARSE_POINT: wdk_sys::ULONG = 589_996;
 

@@ -2,7 +2,7 @@
 
 #[cfg(not(test))]
 use super::section::SectionResource;
-use super::section::{SealedSectionMutation, SectionMutationOperation, SectionSynchronization};
+use super::section::{PurgeFailurePolicy, ScanSectionChange, SealedSectionMutation, SectionMutationOperation, SectionSynchronization};
 use super::storage_admission::{ClosePhase, MediaState, StorageAdmission};
 #[cfg(not(test))]
 use alloc::boxed::Box;
@@ -595,6 +595,28 @@ impl core::fmt::Debug for StreamContext {
     reason = "the audited wrapper is the sole Rust boundary for the opaque native advanced FCB header"
 )]
 impl StreamContext {
+    /// Balances a Filter Manager data-scan section independently of ordinary I/O admission.
+    /// # Errors
+    /// Returns unmatched-disable or finite section-count exhaustion before changing state.
+    pub(crate) fn change_scan_section(&self, change: ScanSectionChange) -> DriverResult<()> {
+        self.sections.get().change_scan(change)
+    }
+
+    /// Successful return authorizes another attempt only after a mapped-section conflict and
+    /// scan release. I/O errors, stale plans and uncertain writeback are never retried here.
+    /// # Errors
+    /// Returns the original failure or the Filter Manager retry status for an eligible request.
+    fn await_scan_conflict(&self, error: DriverError, policy: PurgeFailurePolicy) -> DriverResult<()> {
+        let mapped = error == DriverError::CannotDelete || matches!(error,
+            DriverError::CacheManagerFailure(status) if status == wdk_sys::STATUS_USER_MAPPED_FILE
+                || status == wdk_sys::STATUS_CACHE_PAGE_LOCKED || status == wdk_sys::STATUS_PURGE_FAILED);
+        if !mapped || !self.sections.get().scans_active() { return Err(error); }
+        match policy {
+            PurgeFailurePolicy::FilterRetry => Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_PURGE_FAILED)),
+            PurgeFailurePolicy::DestructiveCreate => Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_USER_MAPPED_FILE)),
+            PurgeFailurePolicy::WaitForScans => { self.sections.get().wait_for_scans(); Ok(()) }
+        }
+    }
     /// Observes the archive bit from the sole coherent committed metadata projection.
     #[cfg_attr(
         not(test),
@@ -1545,13 +1567,37 @@ impl StreamContext {
         {
             Ok(())
         }
+        loop {
+            match self.close_cache_attempt() {
+                Ok(()) => return Ok(()),
+                Err(error) => self.await_scan_conflict(error, PurgeFailurePolicy::WaitForScans)?,
+            }
+        }
+    }
+
+    /// Releases every native resource before a mapped-section conflict may wait for scan release.
+    /// # Errors
+    /// Returns the exact native writeback or purge status.
+    fn close_cache_attempt(&self) -> DriverResult<()> {
     }
 
     /// Flushes and purges cached data before a coherent direct mutation or size change.
     /// # Errors
     ///
     /// Returns the exact Cache Manager coherency status.
-    pub(crate) fn coherency_flush_and_purge(&self) -> DriverResult<()> {
+    pub(crate) fn coherency_flush_and_purge(&self, policy: PurgeFailurePolicy) -> DriverResult<()> {
+        loop {
+            match self.coherency_attempt() {
+                Ok(()) => return Ok(()),
+                Err(error) => self.await_scan_conflict(error, policy)?,
+            }
+        }
+    }
+
+    /// Performs one coherency attempt, releasing every native resource before returning.
+    /// # Errors
+    /// Returns the exact Cc/MM failure or the internal plan-revalidation status.
+    fn coherency_attempt(&self) -> DriverResult<()> {
         #[cfg(not(test))]
         {
             let status = unsafe {
@@ -1583,6 +1629,18 @@ impl StreamContext {
         {
             Ok(())
         }
+        loop {
+            match self.drain_cache_attempt() {
+                Ok(()) => return Ok(()),
+                Err(error) => self.await_scan_conflict(error, PurgeFailurePolicy::WaitForScans)?,
+            }
+        }
+    }
+
+    /// Drains one retained native section set without retaining resources after failure.
+    /// # Errors
+    /// Returns the exact native flush or mapping conflict.
+    fn drain_cache_attempt(&self) -> DriverResult<()> {
     }
 
     /// Acquires one operation-specific, uniquely owned section gate through committed publication.
@@ -1603,7 +1661,23 @@ impl StreamContext {
                 // SAFETY: The current thread's scalar IRQL is observed before any blocking preparation.
                 wdk_sys::ntddk::KeGetCurrentIrql()
             } != 0
+        policy: PurgeFailurePolicy,
             {
+        if self.is_paging_file() {
+            return Err(DriverError::NotSupported);
+        }
+        loop {
+            match self.prepare_section_attempt(operation) {
+                Ok(prepared) => return Ok(prepared),
+                Err(error) => self.await_scan_conflict(error, policy)?,
+            }
+        }
+    }
+
+    /// Claims one section preparation and releases it on any failed attempt, before scan waiting.
+    /// # Errors
+    /// Returns execution-context, resource admission, storage, mapped-view or Cc/MM failures.
+    fn prepare_section_attempt(&self, operation: SectionMutationOperation) -> DriverResult<SealedSectionMutation> {
                 return Err(DriverError::CacheManagerFailure(
                     wdk_sys::STATUS_INVALID_DEVICE_STATE,
                 ));
@@ -2217,6 +2291,26 @@ mod tests {
         reason = "fixture errors propagate while assertions check exclusion lifetime"
     )]
     fn key_removal_exclusion_lasts_until_lease_release() -> DriverResult<()> {
+    /// # Errors
+    /// Returns allocation or scan-lifetime failure.
+    /// # Panics
+    /// Fails if scan retry status escapes its Windows request class or masks an I/O failure.
+    #[test]
+    #[expect(clippy::panic_in_result_fn, reason = "fallible stream setup precedes status assertions")]
+    fn scan_conflicts_follow_the_windows_request_policy() -> DriverResult<()> {
+        use super::{PurgeFailurePolicy, ScanSectionChange};
+        let stream = StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let conflict = DriverError::CacheManagerFailure(wdk_sys::STATUS_USER_MAPPED_FILE);
+        assert_eq!(stream.await_scan_conflict(conflict, PurgeFailurePolicy::FilterRetry), Err(conflict));
+        stream.change_scan_section(ScanSectionChange::Enable)?;
+        assert_eq!(stream.await_scan_conflict(conflict, PurgeFailurePolicy::FilterRetry),
+            Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_PURGE_FAILED)));
+        assert_eq!(stream.await_scan_conflict(DriverError::CannotDelete, PurgeFailurePolicy::DestructiveCreate), Err(conflict));
+        let io_failure = DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_DEVICE_ERROR);
+        assert_eq!(stream.await_scan_conflict(io_failure, PurgeFailurePolicy::WaitForScans), Err(io_failure));
+        stream.change_scan_section(ScanSectionChange::Disable)?;
+        Ok(())
+    }
         let owner = crate::kernel::io_reliability::IoReliabilityOwner::try_new()?;
         let volume = StreamContext::try_new_volume(
             StreamSizes::EMPTY,

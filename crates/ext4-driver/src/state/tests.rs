@@ -276,7 +276,7 @@ fn reparse_mutation_accepts_either_retained_write_right() {
             *write_data = data == RegularFileWriteAccess::Positional;
         }
         assert_eq!(handle.require_reparse_write_access(), expected);
-        handle.kind = super::OpenedHandleKind::File { write_access: data };
+        handle.kind = super::OpenedHandleKind::File { write_access: data, valid_data_length: crate::irp::ValidDataLengthAccess::Denied };
         assert_eq!(handle.require_reparse_write_access(), expected);
     }
 }
@@ -1671,7 +1671,7 @@ fn regular_file_handle_retains_write_authority() {
                 DataTransferMode::Cached,
                 super::NormalizedNameAccess::Granted,
             ),
-            kind: super::OpenedHandleKind::File { write_access },
+            kind: super::OpenedHandleKind::File { write_access, valid_data_length: crate::irp::ValidDataLengthAccess::Denied },
         };
         assert_eq!(handle.regular_file_write_access(), Some(write_access));
     }

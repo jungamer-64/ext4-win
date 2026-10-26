@@ -8,7 +8,7 @@
 
 use super::status::{DriverError, DriverResult};
 use crate::memory::{DriverShared, DriverSharedLease};
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 #[cfg(not(test))]
 use core::{cell::UnsafeCell, marker::PhantomData, ptr::NonNull};
 
@@ -23,8 +23,32 @@ enum SectionPhase {
     Sealed,
 }
 
+/// Filter Manager brackets each data-scan section independently from stream mutation admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ScanSectionChange {
+    /// Admit another outstanding data-scan section.
+    Enable,
+    /// Release one balanced section observation.
+    Disable,
+}
+
+/// Only the Windows-specified request classes may return purge conflicts to Filter Manager.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PurgeFailurePolicy {
+    /// Unbuffered writes and explicit set-information requests use STATUS_PURGE_FAILED.
+    FilterRetry,
+    /// Destructive create uses STATUS_USER_MAPPED_FILE.
+    DestructiveCreate,
+    /// Other operations must wait outside all actor/native resources and retry after scans drain.
+    WaitForScans,
+}
+
 /// Sole state authority retained by the stream and its unique mutation permit.
 pub(super) struct SectionSynchronization {
+    /// Sole outstanding scan-section authority; event state is only its locked projection.
+    scans: AtomicU32,
+    /// Signaled exactly while no Filter Manager scan section remains.
+    scans_released: AdmissionNotification,
     /// Acquire/release observation consumed by native cache callbacks.
     phase: AtomicU8,
     /// Serializes state publication with resetting and signaling the notification.
@@ -53,6 +77,8 @@ impl SectionSynchronization {
     /// Returns nonpaged allocation failure before any native callback can observe the state.
     pub(super) fn try_new() -> DriverResult<DriverShared<Self>> {
         let owner = DriverShared::try_new(Self {
+            scans: AtomicU32::new(0),
+            scans_released: AdmissionNotification::new(),
             phase: AtomicU8::new(0),
             #[cfg(not(test))]
             lock: UnsafeCell::new(0),
@@ -63,7 +89,37 @@ impl SectionSynchronization {
         })?;
         owner.get().ordinary.initialize();
         owner.get().paging.initialize();
+        owner.get().scans_released.initialize();
         Ok(owner)
+    }
+
+    /// Changes the paired reference count without acquiring MainResource, a handle lane or any
+    /// mutation authority. Disable must progress while an operation waits for its scan section.
+    /// # Errors
+    /// Rejects unmatched release or reference-budget exhaustion before changing either fact.
+    pub(super) fn change_scan(&self, change: ScanSectionChange) -> DriverResult<()> {
+        const MAX_SCAN_SECTIONS: u32 = 0x7fff_ffff;
+        self.transition(|| {
+            let current = self.scans.load(Ordering::Relaxed);
+            let next = match change {
+                ScanSectionChange::Enable if current == MAX_SCAN_SECTIONS => return Err(DriverError::TooManyOpenReferences),
+                ScanSectionChange::Enable => current.checked_add(1).ok_or(DriverError::InternalInvariantViolation)?,
+                ScanSectionChange::Disable => current.checked_sub(1).ok_or(DriverError::InvalidParameter)?,
+            };
+            self.scans_released.publish(next == 0);
+            self.scans.store(next, Ordering::Release);
+            Ok(())
+        })
+    }
+
+    /// Observes scan lifetime without granting mutation authority.
+    pub(super) fn scans_active(&self) -> bool {
+        self.scans.load(Ordering::Acquire) != 0
+    }
+
+    /// Waits only on the scan reference projection; callers must release all stream/actor locks.
+    pub(super) fn wait_for_scans(&self) {
+        self.scans_released.wait();
     }
 
     /// Observes admission without acquiring mutation authority.
@@ -696,6 +752,38 @@ unsafe extern "system" fn ext4win_section_acquire_paging(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns allocation, channel or worker failure while joining every waiter.
+    /// # Panics
+    /// Fails if a partial release wakes a scan waiter or an unmatched release changes state.
+    #[test]
+    #[expect(clippy::panic_in_result_fn, reason = "fallible fixture setup precedes scan lifetime assertions")]
+    fn balanced_scan_sections_release_only_the_last_waiter() -> DriverResult<()> {
+        let owner = SectionSynchronization::try_new()?;
+        owner.get().change_scan(ScanSectionChange::Enable)?;
+        owner.get().change_scan(ScanSectionChange::Enable)?;
+        let waiter = owner.try_acquire()?;
+        std::thread::scope(|scope| {
+            let (done, result) = std::sync::mpsc::channel();
+            let worker = scope.spawn(move || {
+                waiter.get().wait_for_scans();
+                done.send(())
+            });
+            owner.get().change_scan(ScanSectionChange::Disable)?;
+            let still_active = owner.get().scans_active();
+            let blocked = result.try_recv();
+            owner.get().change_scan(ScanSectionChange::Disable)?;
+            worker.join().map_err(|_| DriverError::InternalInvariantViolation)?
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            assert!(still_active);
+            assert_eq!(blocked, Err(std::sync::mpsc::TryRecvError::Empty));
+            assert_eq!(result.recv(), Ok(()));
+            assert_eq!(owner.get().change_scan(ScanSectionChange::Disable), Err(DriverError::InvalidParameter));
+            assert!(!owner.get().scans_active());
+            Ok(())
+        })
+    }
 
     /// # Errors
     /// Returns allocation, channel or worker failures while retaining every waiter until joined.

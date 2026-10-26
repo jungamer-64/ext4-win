@@ -42,6 +42,29 @@ pub(crate) struct ActiveIrp<'owner> {
 }
 
 impl ActiveIrp<'_> {
+    /// Classifies Filter Manager's requeue contract from the original operation and buffering
+    /// request, independently of whether ext4 policy later chooses a direct data path.
+    /// # Errors
+    /// Returns a malformed stack or missing write FILE_OBJECT before native preparation.
+    pub(crate) fn purge_failure_policy(&self) -> DriverResult<crate::kernel::section::PurgeFailurePolicy> {
+        use crate::kernel::section::PurgeFailurePolicy;
+        let current = self.current_stack()?;
+        Ok(match u32::from(current.raw_major_function()) {
+            wdk_sys::IRP_MJ_CREATE => PurgeFailurePolicy::DestructiveCreate,
+            wdk_sys::IRP_MJ_SET_INFORMATION => PurgeFailurePolicy::FilterRetry,
+            wdk_sys::IRP_MJ_WRITE if self.data_cache_policy() == DataCachePolicy::NonCached
+                || current.file_object()?.flags() & wdk_sys::FO_NO_INTERMEDIATE_BUFFERING != 0 => PurgeFailurePolicy::FilterRetry,
+            _ => PurgeFailurePolicy::WaitForScans,
+        })
+    }
+    /// Admits kernel-only callback controls before they can mutate native stream state.
+    /// # Errors
+    /// Returns access-denied for user mode or an invalid requestor-mode value.
+    pub(crate) fn require_kernel_requestor(&self) -> DriverResult<()> {
+        let kernel = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        if self.requestor_mode() == kernel { Ok(()) } else { Err(DriverError::AccessDenied) }
+    }
     /// Copies the requestor mode retained unchanged through dispatch and capture.
     #[expect(
         unsafe_code,

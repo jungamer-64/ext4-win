@@ -47,6 +47,12 @@ impl fmt::Debug for FileControlBlock {
 }
 
 impl FileControlBlock {
+    /// Updates a native scan-section observation without taking the ledger or stream resources.
+    /// # Errors
+    /// Returns an unmatched release or section-reference budget exhaustion.
+    pub(crate) fn change_scan_section(&self, change: crate::kernel::section::ScanSectionChange) -> DriverResult<()> {
+        self.stream_context.change_scan_section(change)
+    }
     /// Acquires the selected namespace identity while a create claim retains this FCB.
     /// # Errors
     /// Returns allocation or reference exhaustion before the handle becomes visible.

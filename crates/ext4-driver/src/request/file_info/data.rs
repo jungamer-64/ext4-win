@@ -148,6 +148,7 @@ pub(crate) fn prepare_read_cache_plan(
         if matches!(mode, DataTransferMode::Direct(_)) {
             return Ok(ReadCachePlan::PurgeBeforeDirect(PassiveWork::purge(
                 file_cache.into_stream(),
+                active.purge_failure_policy()?,
             )));
         }
         if !stack.length().is_empty()
@@ -263,6 +264,7 @@ pub(crate) fn prepare_write_cache_plan(
         {
             return Ok(WriteCachePlan::PurgeBeforeDirect(PassiveWork::purge(
                 file_cache.into_stream(),
+                active.purge_failure_policy()?,
             )));
         }
         let offset =

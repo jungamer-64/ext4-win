@@ -27,6 +27,21 @@ use crate::state::{KernelDevice, KernelFileObject, WriteCommitment};
 /// IRP_MN_MOUNT_VOLUME as a stack-location minor function byte.
 const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 
+/// # Errors
+/// Returns malformed fixture setup failure.
+/// # Panics
+/// Fails if a user-mode request can reach scan state before kernel-origin authorization.
+#[test]
+#[expect(clippy::panic_in_result_fn, reason = "fixture failures propagate while authorization is asserted")]
+fn scan_lifetime_rejects_user_origin_before_file_object_access() -> Result<(), DriverError> {
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut irp = wdk_sys::IRP::default();
+    irp.RequestorMode = 1;
+    let mut received = received_irp_fixture(&mut device, &mut irp)?;
+    assert_eq!(received.with_active(crate::request::file_info::set_purge_failure_mode), Err(DriverError::AccessDenied));
+    Ok(())
+}
+
 /// Binds one live stack-local device fixture to the raw WDK boundary.
 #[expect(
     unsafe_code,

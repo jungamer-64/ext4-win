@@ -665,12 +665,12 @@ impl StreamSizeChangeLease {
     /// # Errors
     ///
     /// Returns the exact cache failure, mapped-view truncation conflict, or executable-image sharing conflict.
-    pub(crate) fn execute(self) -> DriverResult<PreparedStreamSizeChange> {
+    pub(crate) fn execute(self, policy: crate::kernel::section::PurgeFailurePolicy) -> DriverResult<PreparedStreamSizeChange> {
         let section = self
             .stream
             .stream()
             .stream_context
-            .prepare_section_mutation(self.kind.operation(self.target_sizes))?;
+            .prepare_section_mutation(self.kind.operation(self.target_sizes), policy)?;
         Ok(PreparedStreamSizeChange {
             _section: section,
             stream: self.stream,
@@ -799,12 +799,12 @@ impl StreamDeletionLease {
     ///
     /// Returns cannot-delete while an image or mapped data section remains, or the exact native
     /// flush failure. A coherent shared cache map remains under delayed-close ownership.
-    pub(crate) fn execute(self) -> DriverResult<PreparedStreamDeletion> {
+    pub(crate) fn execute(self, policy: crate::kernel::section::PurgeFailurePolicy) -> DriverResult<PreparedStreamDeletion> {
         let section = self
             .stream
             .stream()
             .stream_context
-            .prepare_section_mutation(crate::kernel::section::SectionMutationOperation::Delete)?;
+            .prepare_section_mutation(crate::kernel::section::SectionMutationOperation::Delete, policy)?;
         Ok(PreparedStreamDeletion {
             _section: section,
             stream: self.stream,
@@ -857,6 +857,7 @@ impl StreamWriteOpenLease {
             .stream_context
             .prepare_section_mutation(
                 crate::kernel::section::SectionMutationOperation::WriteOpen,
+                crate::kernel::section::PurgeFailurePolicy::DestructiveCreate,
             )?;
         Ok(PreparedStreamWriteOpen {
             _section: section,
@@ -978,6 +979,7 @@ impl StreamVerityLease {
             .stream_context
             .prepare_section_mutation(
                 crate::kernel::section::SectionMutationOperation::EnableVerity,
+                crate::kernel::section::PurgeFailurePolicy::WaitForScans,
             )?;
         Ok(PreparedStreamVerity {
             _section: section,
@@ -1106,8 +1108,8 @@ impl StreamCacheLease {
     /// # Errors
     ///
     /// Returns the exact Cache Manager coherency status.
-    pub(crate) fn purge(&self) -> DriverResult<()> {
-        self.stream().stream_context.coherency_flush_and_purge()
+    pub(crate) fn purge(&self, policy: crate::kernel::section::PurgeFailurePolicy) -> DriverResult<()> {
+        self.stream().stream_context.coherency_flush_and_purge(policy)
     }
 
     /// Flushes cached data and releases every unreferenced data or image section before lock.
@@ -3378,6 +3380,12 @@ fn record_reused_file_control_block_open(
     share_check: FileControlBlockShareCheck,
 ) -> DriverResult<NonZeroU32> {
     let mut state = ledger_file_control_block_open_state(table, fcb);
+    if unsafe {
+        // SAFETY: The ledger lookup above established this pinned FCB's current table membership.
+        fcb.as_ref().is_paging_file()
+    } {
+        return Err(DriverError::ShareAccessConflict);
+    }
     let state = unsafe {
         // SAFETY: The caller holds the ledger resource exclusively and the helper validated this
         // state pointer against the owning table.

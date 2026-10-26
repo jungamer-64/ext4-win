@@ -475,6 +475,23 @@ fn dispatch_received(
 }
 
 /// Immediate request semantics selected from both the device kind and IRP major function.
+    if device_kind == DriverDeviceKind::MountedVolume && major == DispatchMajor::FileSystemControl {
+        let result = received.with_active(|active| {
+            let current = active.current_stack()?;
+            if current.file_system_control_minor() != crate::irp::FileSystemControlMinorFunction::UserFsRequest {
+                return Ok(None);
+            }
+            if current.file_system_control()?.fs_control_code() != crate::irp::FsControlCode::SetPurgeFailureMode {
+                return Ok(None);
+            }
+            super::file_info::set_purge_failure_mode(active).map(Some)
+        });
+        match result {
+            Ok(Some(completion)) => return received.complete(completion),
+            Ok(None) => {},
+            Err(error) => return received.complete_result(Err(error)),
+        }
+    }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ImmediateDispatch {
     /// Device-scoped storage removal and original-IRP lower delegation.
@@ -848,6 +865,7 @@ pub(crate) fn admit_owned(
                         Admission::Mutation(MutationRequestKind::DeleteReparsePoint)
                     }
                     crate::irp::FsControlCode::EnableVerity => {
+                    crate::irp::FsControlCode::SetPurgeFailureMode => Admission::Unsupported,
                         Admission::Mutation(MutationRequestKind::EnableVerity)
                     }
                     crate::irp::FsControlCode::AddEncryptionKey

@@ -2,6 +2,26 @@
 
 use super::*;
 
+/// Kernel-only scan lifetime control runs without queue admission or a handle lane. A balancing
+/// disable must progress even if every ordinary actor slot is waiting for that same scan.
+/// # Errors
+/// Returns origin, input, file-kind or section-count admission errors before changing state.
+pub(crate) fn set_purge_failure_mode(active: &mut ActiveIrp<'_>) -> DriverResult<IrpCompletion> {
+    active.require_kernel_requestor()?;
+    let current = active.current_stack()?;
+    let control = current.file_system_control()?;
+    if !control.output_buffer_length().is_empty() { return Err(DriverError::InvalidParameter); }
+    let input = active.buffered_input(control.input_buffer_length().prefix(4)?)?;
+    let change = match LittleEndianInput::new(input).read_u32(WireOffset::new(0))? {
+        wdk_sys::SET_PURGE_FAILURE_MODE_ENABLED => crate::kernel::section::ScanSectionChange::Enable,
+        wdk_sys::SET_PURGE_FAILURE_MODE_DISABLED => crate::kernel::section::ScanSectionChange::Disable,
+        _ => return Err(DriverError::InvalidParameter),
+    };
+    let opened = OpenedRegularFile::decode(current.file_object()?)?;
+    opened.file_control_block().change_scan_section(change)?;
+    Ok(IrpCompletion::EMPTY)
+}
+
 /// Executes file information queries.
 /// # Errors
 ///

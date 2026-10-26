@@ -47,6 +47,7 @@ use crate::state::{
 fn record_cache_coherency_failure(error: DriverError, access: &mut MountedVolumeAccess<'_>) {
     if let DriverError::CacheManagerFailure(status) = error
         && status != wdk_sys::STATUS_USER_MAPPED_FILE
+        && status != wdk_sys::STATUS_PURGE_FAILED
         && status != STATUS_FILE_LOCK_CONFLICT
         && status != STATUS_RETRY
     {
@@ -4205,6 +4206,8 @@ struct MutationRequestOperation {
     /// Committed request retained until its required home checkpoint succeeds or fails.
     checkpoint_acknowledgment: Option<CheckpointAcknowledgment>,
     /// Validated mounted lower devices.
+    /// Native purge failure behavior follows the original Windows operation class.
+    purge_policy: crate::kernel::section::PurgeFailurePolicy,
     devices: MountedStorageRoute,
     /// Write-only operational event capability retained with paging writeback continuations.
     trace: OperationalTrace,
@@ -4430,6 +4433,10 @@ impl MutationRequestOperation {
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         let trace = access.operational_trace();
+        let purge_policy = match owned.request().with_active(|active| active.purge_failure_policy()) {
+            Ok(policy) => policy,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
         let paging = request.is_paging();
         let now = match crate::kernel::time::current_ext4_timestamp() {
             Ok(now) => now,
@@ -4480,6 +4487,7 @@ impl MutationRequestOperation {
                     ticket,
                     _activity: activity,
                     now,
+                    purge_policy,
                     request,
                     crypto,
                     oplock_mutation,
@@ -5273,7 +5281,7 @@ impl MutationRequestOperation {
                         size_changes,
                     };
                     return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                        work: crate::irp::PassiveWork::prepare_deletion(stream),
+                        work: crate::irp::PassiveWork::prepare_deletion(stream, self.purge_policy),
                         suspended: self,
                     });
                 }
@@ -5922,7 +5930,7 @@ impl MutationRequestOperation {
                                         deletion,
                                     };
                                     MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                                        work: crate::irp::PassiveWork::prepare_size_change(stream),
+                                        work: crate::irp::PassiveWork::prepare_size_change(stream, self.purge_policy),
                                         suspended: self,
                                     })
                                 } else {
@@ -6298,7 +6306,7 @@ impl MutationRequestOperation {
                             size_changes,
                         };
                         return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                            work: crate::irp::PassiveWork::prepare_deletion(stream),
+                            work: crate::irp::PassiveWork::prepare_deletion(stream, self.purge_policy),
                             suspended: self,
                         });
                     }
@@ -6351,7 +6359,7 @@ impl MutationRequestOperation {
                             deletion,
                         };
                         return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                            work: crate::irp::PassiveWork::prepare_size_change(stream),
+                            work: crate::irp::PassiveWork::prepare_size_change(stream, self.purge_policy),
                             suspended: self,
                         });
                     }
