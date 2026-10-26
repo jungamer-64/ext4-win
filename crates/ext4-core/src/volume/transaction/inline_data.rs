@@ -9,6 +9,7 @@ impl MetadataMutation<'_, '_> {
     pub(super) fn initialize_inline_file(&mut self, raw: &mut LiveInodeRecord) -> Result<()> {
         if !self.volume.superblock.supports_inline_data()
             || raw.parse()?.protection().is_encrypted()
+            || raw.parse()?.flags().zero_on_deallocation()
         {
             return Ok(());
         }

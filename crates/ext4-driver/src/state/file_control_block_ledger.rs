@@ -893,6 +893,80 @@ pub(crate) struct StreamVerityLease {
     node: ext4_core::FileNodeId,
 }
 
+/// Ledger-owned movement admission; the enclosing stream lease retains this exact FCB.
+#[derive(Debug)]
+struct ClusterMoveLease {
+    /// Sole protection/movement state owner.
+    owner: NonNull<FileControlBlockLedger>,
+    /// Stable stream whose relocation admission must be consumed on release.
+    fcb: NonNull<FileControlBlock>,
+}
+
+#[expect(unsafe_code, reason = "the enclosing deferred stream retention keeps the ledger and exact FCB alive")]
+impl Drop for ClusterMoveLease {
+    fn drop(&mut self) {
+        let owner = unsafe {
+            // SAFETY: The enclosing stream lease drops after this admission permit.
+            self.owner.as_ref()
+        };
+        let _guard = owner.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource serializes its registry and FCB state.
+            &*owner.table.get()
+        };
+        let mut state = ledger_file_control_block_open_state(table, self.fcb);
+        unsafe {
+            // SAFETY: Exact FCB retention and the ledger resource grant this state mutation.
+            state.as_mut()
+        }.cluster_mobility.finish_move();
+    }
+}
+
+/// Retained physical-movement admission before blocking cache and section preparation.
+#[derive(Debug)]
+pub(crate) struct StreamRelocationLease {
+    /// Must drop before the stream retention lease.
+    admission: ClusterMoveLease,
+    /// Retains the stream independently from the target FILE_OBJECT's cleanup.
+    stream: StreamCacheLease,
+    /// Logical payload identity whose physical map may change.
+    node: ext4_core::FileNodeId,
+}
+
+impl StreamRelocationLease {
+    /// Drains cache and paging before sealing every data-changing native route.
+    /// # Errors
+    /// Returns mapped-file, scan, storage or exact cache failure before relocation staging.
+    pub(crate) fn execute(self) -> DriverResult<PreparedStreamRelocation> {
+        let section = self.stream.stream().stream_context.prepare_section_mutation(
+            crate::kernel::section::SectionMutationOperation::Relocate,
+            crate::kernel::section::PurgeFailurePolicy::WaitForScans,
+        )?;
+        Ok(PreparedStreamRelocation { _section: section,
+            _admission: self.admission, stream: self.stream, node: self.node })
+    }
+}
+
+/// Frozen stream and movement admission retained until physical-map publication.
+#[derive(Debug)]
+pub(crate) struct PreparedStreamRelocation {
+    /// Release native exclusion before ledger movement admission and stream retention.
+    _section: crate::kernel::section::SealedSectionMutation,
+    /// Consumes movement admission before the retained stream can disappear.
+    _admission: ClusterMoveLease,
+    /// Exact retained FCB.
+    stream: StreamCacheLease,
+    /// Logical identity preserved by relocation.
+    node: ext4_core::FileNodeId,
+}
+
+impl PreparedStreamRelocation {
+    /// Revalidates the captured file against the retained frozen stream.
+    pub(crate) fn authorizes(&self, file: ext4_core::FileNodeId) -> bool {
+        self.node == file && self.stream.stream().node == NodeId::File(file)
+    }
+}
+
 impl StreamVerityLease {
     /// Flushes and purges old data, excludes mappings and returns frozen-data authority.
     /// # Errors
@@ -2410,6 +2484,51 @@ impl FileControlBlockLedger {
     ) -> DriverResult<StreamVerityLease> {
         Ok(StreamVerityLease {
             stream: self.retain_regular_stream(fcb, NodeId::File(file))?,
+            node: file,
+        })
+    }
+
+    /// Protects one active FILE_OBJECT until its cleanup consumes the share obligation.
+    /// # Errors
+    /// Returns an active relocation conflict or allocation failure without changing protection.
+    #[expect(unsafe_code, reason = "the retained FILE_OBJECT and ledger resource bind this exact FCB state")]
+    pub(super) fn protect_file_clusters(&self, fcb: NonNull<FileControlBlock>, file: KernelFileObject) -> DriverResult<()> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource excludes concurrent registry and open-state mutation.
+            &*self.table.get()
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The validated pointer remains retained by the requesting FILE_OBJECT.
+            state.as_mut()
+        }.cluster_mobility.protect(file)
+    }
+
+    /// Atomically excludes protection and retains the exact regular stream for relocation.
+    /// # Errors
+    /// Returns stale identity, protection conflict or deferred-reference exhaustion.
+    #[expect(unsafe_code, reason = "ledger exclusion owns identity validation and both admission/lifetime transitions")]
+    pub(super) fn prepare_stream_relocation(&self, fcb: NonNull<FileControlBlock>, file: ext4_core::FileNodeId) -> DriverResult<StreamRelocationLease> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource serializes exact registry lookup and FCB mutation.
+            &*self.table.get()
+        };
+        if find_file_control_block_in_table(table, NodeId::File(file)) != Some(fcb) {
+            return Err(DriverError::FileClosed);
+        }
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        let state = unsafe {
+            // SAFETY: Registry validation established this retained state under its sole owner lock.
+            state.as_mut()
+        };
+        let lifetime = state.lifetime.with_additional_deferred_lease()?;
+        state.cluster_mobility.begin_move()?;
+        state.lifetime = lifetime;
+        Ok(StreamRelocationLease {
+            admission: ClusterMoveLease { owner: NonNull::from(self), fcb },
+            stream: StreamCacheLease { retained: DeferredStreamLease { owner: NonNull::from(self), fcb } },
             node: file,
         })
     }

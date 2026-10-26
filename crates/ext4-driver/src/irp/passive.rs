@@ -136,6 +136,11 @@ pub(crate) enum PassiveWork {
         /// Exact stream allocation retained independently from its requesting handle.
         stream: crate::state::StreamVerityLease,
     },
+    /// Flush/purge and exclude mappings while a physical allocation map is replaced.
+    PrepareRelocation {
+        /// Exact stream and ledger-owned movement admission.
+        stream: crate::state::StreamRelocationLease,
+    },
     /// Release byte-range locks and notify FsRtl of cleanup outside the actor.
     CleanupOplock {
         /// Exact retained stream and create-time deletion semantics.
@@ -209,6 +214,8 @@ pub(crate) enum PassiveWorkCompletion {
     PrepareWriteOpen(DriverResult<PreparedStreamWriteOpen>),
     /// Frozen data and cache invalidation result, retained through protection publication.
     PrepareVerity(DriverResult<crate::state::PreparedStreamVerity>),
+    /// Frozen physical-map mutation authority retained through committed publication.
+    PrepareRelocation(DriverResult<crate::state::PreparedStreamRelocation>),
     /// Synchronous handle-oplock release status; driver completion ownership remains retained.
     CleanupOplock(DriverResult<()>),
     /// Private cache-map uninitialization status.
@@ -247,7 +254,8 @@ impl PassiveWork {
             | Self::PrepareSizeChange { .. }
             | Self::PrepareDeletion { .. }
             | Self::PrepareWriteOpen { .. }
-            | Self::PrepareVerity { .. } => authorize(),
+            | Self::PrepareVerity { .. }
+            | Self::PrepareRelocation { .. } => authorize(),
         }
     }
 
@@ -401,6 +409,7 @@ impl PassiveWork {
             Self::PrepareVerity { stream } => {
                 PassiveWorkCompletion::PrepareVerity(stream.execute())
             }
+            Self::PrepareRelocation { stream } => PassiveWorkCompletion::PrepareRelocation(stream.execute()),
             Self::CleanupOplock { check, irp } => {
                 PassiveWorkCompletion::CleanupOplock(check.execute(irp))
             }
@@ -451,6 +460,7 @@ impl PassiveWork {
             Self::PrepareDeletion { .. } => PassiveWorkCompletion::PrepareDeletion(Err(error)),
             Self::PrepareWriteOpen { .. } => PassiveWorkCompletion::PrepareWriteOpen(Err(error)),
             Self::PrepareVerity { .. } => PassiveWorkCompletion::PrepareVerity(Err(error)),
+            Self::PrepareRelocation { .. } => PassiveWorkCompletion::PrepareRelocation(Err(error)),
             Self::CleanupOplock { .. } => PassiveWorkCompletion::CleanupOplock(Err(error)),
             Self::Uninitialize { owned, .. } => PassiveWorkCompletion::Uninitialize {
                 owned,

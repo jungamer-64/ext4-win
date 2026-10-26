@@ -244,6 +244,12 @@ pub(crate) enum FsControlCode {
     GetVolumeBitmap,
     /// Physical sector offset of allocation-cluster zero.
     GetRetrievalPointerBase,
+    /// Exact physical relocation authorized through a direct volume handle.
+    MoveFile,
+    /// Per-FILE_OBJECT cluster-movement protection.
+    MarkHandle,
+    /// Persistent zeroing of retired file allocation.
+    SetZeroOnDeallocation,
     /// Windows `FSCTL_GET_REPARSE_POINT`.
     GetReparsePoint,
     /// Windows `FSCTL_SET_REPARSE_POINT`.
@@ -300,6 +306,9 @@ impl FsControlCode {
             FSCTL_GET_RETRIEVAL_POINTERS => Ok(Self::GetRetrievalPointers),
             FSCTL_GET_VOLUME_BITMAP => Ok(Self::GetVolumeBitmap),
             FSCTL_GET_RETRIEVAL_POINTER_BASE => Ok(Self::GetRetrievalPointerBase),
+            FSCTL_MOVE_FILE => Ok(Self::MoveFile),
+            FSCTL_MARK_HANDLE => Ok(Self::MarkHandle),
+            FSCTL_SET_ZERO_ON_DEALLOCATION => Ok(Self::SetZeroOnDeallocation),
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
             FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
@@ -363,6 +372,9 @@ impl FsControlCode {
             | Self::GetRetrievalPointers
             | Self::GetVolumeBitmap
             | Self::GetRetrievalPointerBase
+            | Self::MoveFile
+            | Self::MarkHandle
+            | Self::SetZeroOnDeallocation
             | Self::GetReparsePoint
             | Self::SetReparsePoint
             | Self::DeleteReparsePoint
@@ -437,6 +449,12 @@ const FSCTL_GET_RETRIEVAL_POINTERS: wdk_sys::ULONG = neither_file_system_control
 const FSCTL_GET_VOLUME_BITMAP: wdk_sys::ULONG = neither_file_system_control(27);
 /// `FSCTL_GET_RETRIEVAL_POINTER_BASE`.
 const FSCTL_GET_RETRIEVAL_POINTER_BASE: wdk_sys::ULONG = buffered_file_system_control(141);
+/// Standard buffered cluster-management controls.
+const FSCTL_MOVE_FILE: wdk_sys::ULONG = buffered_file_system_control(29);
+/// Standard buffered handle marking control.
+const FSCTL_MARK_HANDLE: wdk_sys::ULONG = buffered_file_system_control(63);
+/// Standard buffered physical zero-retirement control.
+const FSCTL_SET_ZERO_ON_DEALLOCATION: wdk_sys::ULONG = buffered_file_system_control(101);
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
 /// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.

@@ -23,6 +23,9 @@ use super::{
     QueryEaStack, ReadStack, WriteStack,
 };
 
+mod cluster_control;
+pub(crate) use cluster_control::PreparedClusterControl;
+
 /// Maximum owned snapshot of an I/O Manager-captured self-relative descriptor.
 #[cfg(not(test))]
 const SET_SECURITY_DESCRIPTOR_MAXIMUM: wdk_sys::ULONG = 128 * 1024;
@@ -1054,6 +1057,8 @@ pub(crate) enum PreparedRequest {
     DirectoryControl(PreparedDirectoryControl),
     /// File-system control with a sealed minor-function classification.
     FileSystemControl(FileSystemControlMinorFunction),
+    /// Embedded handle reference and immutable cluster-control scalars captured before deferral.
+    ClusterControl(PreparedClusterControl),
     /// Requestor privilege checked before queue handoff; ordinary FSCTL cannot grant it.
     KeyControl(PreparedKeyControl),
     /// Volume-management privilege captured on the original thread for one free-space discard.
@@ -1242,6 +1247,14 @@ impl PreparedRequest {
                         let control = stack
                             .file_system_control()
                             .map_err(IrpCompletion::from_error)?;
+                        if matches!(control.fs_control_code(), super::FsControlCode::MoveFile | super::FsControlCode::MarkHandle) {
+                            if control.fs_control_code() == super::FsControlCode::MoveFile {
+                                authorize_volume_management(target)?;
+                            }
+                            let captured = PreparedClusterControl::capture(target, control.fs_control_code())
+                                .map_err(IrpCompletion::from_error)?;
+                            return Ok((Self::ClusterControl(captured), generic_key()));
+                        }
                         if control.fs_control_code() == super::FsControlCode::SetReparsePoint {
                             authorize_symbolic_link(target)?;
                         }
@@ -1919,6 +1932,7 @@ mod tests {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file = wdk_sys::FILE_OBJECT::default();
         for (code, expected) in [
+            (0x0009_0074, wdk_sys::STATUS_ACCESS_DENIED),
             (0x0009_a400, wdk_sys::STATUS_ACCESS_DENIED),
             (0x0009_a404, wdk_sys::STATUS_ACCESS_DENIED),
             (0x0009_00a4, wdk_sys::STATUS_PRIVILEGE_NOT_HELD),

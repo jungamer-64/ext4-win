@@ -57,6 +57,8 @@ pub(crate) use directory_search::{DirectoryPattern, DirectorySearch};
 mod file_control_block;
 mod file_control_block_ledger;
 mod file_object_shares;
+mod cluster_mobility;
+use cluster_mobility::ClusterMobility;
 mod handle_times;
 use handle_times::HandleTimestampState;
 pub(crate) use handle_times::{AutomaticTimeUpdate, HandleTimestampPolicy};

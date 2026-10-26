@@ -1328,6 +1328,20 @@ impl MountedVolumeAccess<'_> {
             .prepare_stream_verity(fcb, file)
     }
 
+    /// Grants exclusive physical-map mutation over the exact retained stream.
+    /// # Errors
+    /// Returns protected/stale stream or reference admission failure.
+    pub(crate) fn prepare_stream_relocation(&self, fcb: NonNull<FileControlBlock>, file: ext4_core::FileNodeId) -> DriverResult<StreamRelocationLease> {
+        self.volume.file_control_blocks.prepare_stream_relocation(fcb, file)
+    }
+
+    /// Installs FILE_OBJECT-owned protection while no relocation is active.
+    /// # Errors
+    /// Returns movement conflict or allocation failure before acquiring protection.
+    pub(crate) fn protect_file_clusters(&self, fcb: NonNull<FileControlBlock>, file: KernelFileObject) -> DriverResult<()> {
+        self.volume.file_control_blocks.protect_file_clusters(fcb, file)
+    }
+
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
     /// # Errors
     ///

@@ -1657,7 +1657,7 @@ impl StreamContext {
                             return Err(DriverError::ShareAccessConflict);
                         }
                     }
-                    SectionMutationOperation::EnableVerity => {
+                    SectionMutationOperation::EnableVerity | SectionMutationOperation::Relocate => {
                         let status = unsafe {
                             // SAFETY: MainResource excludes mappings/transfers; preparation permits paging reentry.
                             ext4win_stream_prepare_verity_data(self.header.as_ptr())
@@ -1684,6 +1684,7 @@ impl StreamContext {
                     }
                     SectionMutationOperation::Delete
                     | SectionMutationOperation::WriteOpen
+                    | SectionMutationOperation::Relocate
                     | SectionMutationOperation::EnableVerity => {}
                 }
                 preparation.seal()

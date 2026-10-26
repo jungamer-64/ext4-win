@@ -346,6 +346,18 @@ unsafe extern "system" {
         value: *mut i64,
     ) -> wdk_sys::NTSTATUS;
 
+    /// Snapshots buffered cluster controls and references an embedded handle in requestor context.
+    pub(crate) fn ext4win_capture_cluster_control(
+        irp: wdk_sys::PIRP,
+        file: *mut wdk_sys::PFILE_OBJECT,
+        vcn: *mut u64,
+        lcn: *mut u64,
+        count: *mut u32,
+        source_info: *mut u32,
+        flags: *mut u32,
+        granted: *mut u32,
+    ) -> wdk_sys::NTSTATUS;
+
     /// Locks a bounded writable requestor prefix as an opaque owning native target.
     pub(crate) fn ext4win_capture_requestor_output(
         output_out: *mut wdk_sys::PVOID,

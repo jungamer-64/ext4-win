@@ -217,6 +217,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native captured-input bounds, descriptor validity, and SEH ownership contract",
         ),
         (
+            "cluster-control-capture",
+            "cluster_control_capture.tests.c",
+            "native cluster-control WOW64 ABI and requestor handle-reference ownership contract",
+        ),
+        (
             "executive-resource",
             "executive_resource.tests.c",
             "native executive resource APC contract",

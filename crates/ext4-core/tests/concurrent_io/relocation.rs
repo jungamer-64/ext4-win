@@ -162,3 +162,38 @@ fn zero_deallocation_persists_policy_and_erases_retired_home_storage() -> Result
     assert!(fixture.disk.filesystem.get(home..home + 4096).ok_or(Error::DeviceRange)?.iter().all(|byte| *byte == 0));
     Ok(())
 }
+
+/// # Errors
+/// Returns inline fixture, namespace, conversion, truncation or physical read failures.
+/// # Panics
+/// Fails if zero retirement can retain resident payload or lose contents during extent conversion.
+#[test]
+#[expect(clippy::panic_in_result_fn, reason = "assertions observe payload preservation, allocation and physical retirement")]
+fn zero_policy_converts_inline_file_before_accepting_retirement() -> Result<()> {
+    let mut fixture = inline_fixture()?;
+    let file = fixture.mutate(|pass| {
+        let root = pass.directory(DirectoryNodeId::ROOT)?;
+        let file = pass.create_file(root, &Ext4Name::new(b"zero-inline")?,
+            NewFileMetadata::new(namespace_owner(), Ext4Permissions::new(0o600)?))?;
+        pass.write_file_range(file, FileOffset::ZERO, b"resident-secret")?;
+        Ok(file.id())
+    })?;
+    assert_eq!(fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))?, 0);
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.set_zero_on_deallocation(file)
+    })?;
+    assert!(fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))? > 0);
+    let mut bytes = [0; 15];
+    fixture.read(|pass| pass.read_file(file, FileOffset::ZERO, &mut bytes))?;
+    assert_eq!(&bytes, b"resident-secret");
+    let mut byte = [0];
+    let (_read, request) = fixture.suspend_payload(file, &mut byte)?;
+    let home = usize::try_from(request.offset().ok_or(Error::DeviceRange)?.get()).map_err(|_| Error::ArithmeticOverflow)?;
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.truncate_file(file, FileSize::from_bytes(0))
+    })?;
+    assert!(fixture.disk.filesystem.get(home..home + 4096).ok_or(Error::DeviceRange)?.iter().all(|byte| *byte == 0));
+    Ok(())
+}

@@ -49,6 +49,8 @@ const EXT4_INDEX_FL: u32 = 0x0000_1000;
 const EXT4_IMMUTABLE_FL: u32 = 0x0000_0010;
 /// Inode flag rejecting non-append mutation.
 const EXT4_APPEND_FL: u32 = 0x0000_0020;
+/// Retired allocation clusters must be overwritten with zeroes.
+const EXT4_SECRM_FL: u32 = 0x0000_0001;
 /// Inode flag rejected because encrypted payload interpretation is unsupported.
 const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
 /// Inode-body payload storage flag.
@@ -1233,6 +1235,15 @@ pub(crate) enum FileDataPersistence {
 pub struct InodeFlags(u32);
 
 impl InodeFlags {
+    /// Whether releasing the final owner of an allocation requires physical zero completion.
+    pub(crate) const fn zero_on_deallocation(self) -> bool {
+        self.0 & EXT4_SECRM_FL != 0
+    }
+
+    /// Makes zero-on-deallocation a persistent inode policy.
+    pub(crate) const fn with_zero_on_deallocation(self) -> Self {
+        Self(self.0 | EXT4_SECRM_FL)
+    }
     /// Selects the parent's policy applicable to the child's inode kind.
     pub(crate) const fn inherited_by(self, kind: InodeKind) -> Self {
         let mask = match kind {

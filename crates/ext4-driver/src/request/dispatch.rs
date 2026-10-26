@@ -778,6 +778,10 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
             Admission::FsControl(*minor)
         }
+        ActorRequest::Captured(PreparedRequest::ClusterControl(control)) => match control {
+            crate::irp::PreparedClusterControl::Move { .. } => Admission::Mutation(MutationRequestKind::MoveFile),
+            crate::irp::PreparedClusterControl::Mark { .. } => Admission::Immediate(ImmediateRequestKind::MarkHandle),
+        },
         ActorRequest::Captured(PreparedRequest::Trim) => Admission::Trim,
         ActorRequest::Captured(PreparedRequest::RetrievalPointerBase) => {
             Admission::Immediate(ImmediateRequestKind::GetRetrievalPointerBase)
@@ -829,6 +833,8 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::GetRetrievalPointers => Admission::Unsupported,
                     crate::irp::FsControlCode::GetVolumeBitmap => Admission::Unsupported,
                     crate::irp::FsControlCode::GetRetrievalPointerBase => Admission::Unsupported,
+                    crate::irp::FsControlCode::MoveFile | crate::irp::FsControlCode::MarkHandle => Admission::Unsupported,
+                    crate::irp::FsControlCode::SetZeroOnDeallocation => Admission::Mutation(MutationRequestKind::SetZeroOnDeallocation),
                     crate::irp::FsControlCode::GetReparsePoint => {
                         Admission::Read(ReadRequestKind::GetReparsePoint)
                     }

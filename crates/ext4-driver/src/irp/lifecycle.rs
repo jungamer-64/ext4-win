@@ -6,7 +6,7 @@ mod capture;
 pub(crate) use capture::{
     AllocationStart, CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory, PreparedQueryEa, PreparedRead,
-    PreparedRequest, PreparedWrite,
+    PreparedRequest, PreparedWrite, PreparedClusterControl,
 };
 use capture::{QueueContext, QueueContextOwnership};
 
@@ -1181,6 +1181,19 @@ impl<'a> PendingIrpLease<'a> {
     /// Returns access denied unless the original requestor granted this queued key operation.
     pub(crate) fn prepared_key_control(&self) -> DriverResult<super::PreparedKeyControl> {
         self.owner.context.key_control()
+    }
+
+    /// Borrows the pre-deferral handle reference and sealed cluster-control input.
+    /// # Errors
+    /// Returns an invariant violation for another request class.
+    pub(crate) fn cluster_control(&self) -> DriverResult<&PreparedClusterControl> {
+        match &self.owner.context {
+            QueueContextOwnership::Captured(context) => match context.prepared() {
+                PreparedRequest::ClusterControl(control) => Ok(control),
+                _ => Err(DriverError::InternalInvariantViolation),
+            },
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
     }
 
     /// Retains original-thread authorization while resolving an extended rename target.

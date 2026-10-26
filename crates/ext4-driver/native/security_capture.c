@@ -12,6 +12,8 @@
 #include "io_manager_input.h"
 #include "input_validation.h"
 
+#include "cluster_control_capture.h"
+
 typedef struct _EXT4WIN_REQUESTOR_OUTPUT {
     PMDL Mdl;
     PVOID SystemAddress;

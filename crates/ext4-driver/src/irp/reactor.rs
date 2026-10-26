@@ -5877,6 +5877,9 @@ mod tests {
                     crate::irp::PassiveWorkCompletion::PrepareVerity(result) => {
                         let _result = result;
                     }
+                    crate::irp::PassiveWorkCompletion::PrepareRelocation(result) => {
+                        let _result = result;
+                    }
                 }
                 drop(suspended);
             }

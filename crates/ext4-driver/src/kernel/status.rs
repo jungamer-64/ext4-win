@@ -38,6 +38,9 @@ pub(crate) enum DriverError {
     AmbiguousName,
     /// Driver attempted to build a collection larger than `Vec` can represent.
     InvalidBufferSize,
+    /// Object Manager or ABI capture rejected an embedded cluster-control handle.
+    #[cfg_attr(test, expect(dead_code, reason = "native cluster-control capture preserves Object Manager NTSTATUS failures"))]
+    ClusterControlCaptureFailed(NTSTATUS),
     /// A local invariant inside driver-only helper code was violated.
     InternalInvariantViolation,
     /// Kernel memory could not be mapped for the current IRP.
@@ -172,6 +175,7 @@ impl DriverError {
             }
             Self::AmbiguousName => STATUS_OBJECT_NAME_COLLISION,
             Self::InvalidBufferSize => STATUS_INVALID_BUFFER_SIZE,
+            Self::ClusterControlCaptureFailed(status) => status,
             Self::InternalInvariantViolation => STATUS_INTERNAL_ERROR,
             Self::InsufficientResources => STATUS_INSUFFICIENT_RESOURCES,
             Self::AccessDenied => STATUS_ACCESS_DENIED,

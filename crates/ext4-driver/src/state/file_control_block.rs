@@ -504,6 +504,8 @@ impl DurablePublicationOutcome {
 
 /// Mutable FCB lifecycle state owned exclusively by `FileControlBlockLedger`.
 pub(super) struct FileControlBlockOpenState {
+    /// Handle-owned protection is mutually exclusive with a retained physical relocation.
+    pub(super) cluster_mobility: ClusterMobility,
     /// Active FILE_OBJECT opens and their separate native sharing constraints.
     pub(super) shares: FileObjectShares,
     /// Explicit stream lifetime across handle and cache/mapping residency domains.
@@ -516,6 +518,7 @@ impl FileControlBlockOpenState {
     /// Creates empty share accounting for the first FILE_OBJECT reference.
     pub(super) const fn new() -> Self {
         Self {
+            cluster_mobility: ClusterMobility::Movable,
             shares: FileObjectShares::new(),
             lifetime: StreamLifetimeState::OpenHandles {
                 handles: NonZeroU32::MIN,
@@ -553,6 +556,7 @@ impl FileControlBlockOpenState {
 
     /// Consumes one FILE_OBJECT's unique active-open cleanup obligation.
     pub(super) fn remove_share_access(&mut self, file_object: KernelFileObject) {
+        self.cluster_mobility.cleanup(file_object);
         self.shares.cleanup(file_object);
     }
 

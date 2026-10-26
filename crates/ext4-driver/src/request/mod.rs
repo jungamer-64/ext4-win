@@ -16,5 +16,6 @@ pub(crate) mod security;
 pub(crate) mod volume_info;
 
 mod retrieval;
+mod cluster_control;
 
 mod administration_control;

@@ -374,6 +374,8 @@ pub(crate) enum SectionMutationOperation {
     WriteOpen,
     /// Dirty data must reach disk and all data mappings must drain before Merkle construction.
     EnableVerity,
+    /// Raw block copies require the same frozen logical data while its physical map changes.
+    Relocate,
 }
 
 /// Paging and ordinary acquisition remain excluded until this unique permit is dropped.

@@ -1882,9 +1882,11 @@ unsafe impl Send for RawVolumeOperation {}
 /// Synchronous request kinds that require no lower-storage state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
-    /// Privileged allocation-origin query, with requestor authority sealed before queueing.
+    /// FILE_OBJECT-owned movement protection with captured optional volume reference.
+    MarkHandle,
     /// Counted Windows pathname validation without namespace mutation.
     IsPathnameValid,
+    /// Privileged allocation-origin query, with requestor authority sealed before queueing.
     GetRetrievalPointerBase,
     /// Cc notification of already initialized data, including after handle cleanup.
     AdvanceValidDataLength,
@@ -1950,6 +1952,7 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
         };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
+                ImmediateRequestKind::MarkHandle => crate::request::cluster_control::mark_handle(owned.request(), access),
                 ImmediateRequestKind::GetRetrievalPointerBase => (|| {
                     let origin = access.volume_geometry().allocation_start()?.get();
                     let sector =
@@ -3458,6 +3461,10 @@ unsafe impl Send for FlushRequestOperation {}
 /// Mutation request semantics selected entirely from captured queue metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationRequestKind {
+    /// Exact physical-cluster movement with an original-context target object reference.
+    MoveFile,
+    /// Persistent physical retirement policy.
+    SetZeroOnDeallocation,
     /// Create/open, including missing-child creation.
     Create,
     /// Regular-file data write.
@@ -3489,6 +3496,10 @@ pub(crate) enum MutationRequestKind {
 /// Mutation request after any paging stream lifetime authority has been captured.
 #[derive(Debug)]
 enum PreparedMutationRequest {
+    /// Data remains frozen while the physical map is copied and atomically replaced.
+    Relocation(crate::request::cluster_control::RelocationRequest),
+    /// The retained writable file grants persistent zero retirement.
+    ZeroOnDeallocation,
     /// Logical create pins mapping and effective creator principals before any replay.
     Create {
         /// Immutable mapping observed by traverse, existing open and prepared child security.
@@ -3547,6 +3558,8 @@ impl PreparedMutationRequest {
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Self> {
         match kind {
+            MutationRequestKind::MoveFile => crate::request::cluster_control::RelocationRequest::prepare(owned.request(), access).map(Self::Relocation),
+            MutationRequestKind::SetZeroOnDeallocation => Ok(Self::ZeroOnDeallocation),
             MutationRequestKind::EnableVerity => {
                 crate::request::fsctl::prepare_verity(&mut owned.request(), access)
                     .map(|stream| Self::Verity(VerityPreparation::Required(stream)))
@@ -3602,6 +3615,8 @@ impl PreparedMutationRequest {
     /// Returns the captured request class without exposing the stream lease.
     const fn kind(&self) -> MutationRequestKind {
         match self {
+            Self::Relocation(_) => MutationRequestKind::MoveFile,
+            Self::ZeroOnDeallocation => MutationRequestKind::SetZeroOnDeallocation,
             Self::DataWrite(_) => MutationRequestKind::Write,
             Self::Verity(_) => MutationRequestKind::EnableVerity,
             Self::Create { .. } => MutationRequestKind::Create,
@@ -4076,6 +4091,11 @@ enum MutationOperationState {
         /// Completion authority retained while the passive worker owns the stream preparation.
         owned: OwnedIrp,
     },
+    /// Cache and paging drain before any physical-map source reads.
+    PreparingRelocation {
+        /// Sole terminal request authority while a passive worker owns stream preparation.
+        owned: OwnedIrp,
+    },
     /// Read-only resolution against one immutable epoch.
     Resolving {
         /// Unique top-level completion authority.
@@ -4167,6 +4187,10 @@ enum MutationOperationState {
 /// One journaled request whose operation allocation is reused through checkpoint completion.
 #[derive(Debug)]
 struct MutationRequestOperation {
+    /// Exact resolved effects determine whether acknowledgment must await physical home writes.
+    completion_durability: ext4_core::MutationCompletionDurability,
+    /// Committed request retained until its required home checkpoint succeeds or fails.
+    checkpoint_acknowledgment: Option<CheckpointAcknowledgment>,
     /// Validated mounted lower devices.
     devices: MountedStorageRoute,
     /// Write-only operational event capability retained with paging writeback continuations.
@@ -4203,6 +4227,17 @@ struct MutationRequestOperation {
     state: MutationOperationState,
 }
 
+/// Upper acknowledgment whose mutation is visible but whose physical retirement is unfinished.
+#[derive(Debug)]
+struct CheckpointAcknowledgment {
+    /// Sole terminal authority remains live through the home-storage barrier.
+    owned: OwnedIrp,
+    /// Already published semantic result.
+    completion: TopLevelCompletion,
+    /// A stream publication failure remains reportable after physical checkpointing.
+    publication_failure: Option<DriverError>,
+}
+
 /// Restart-local driver state consulted by exactly one concrete request surface.
 struct DriverResolveState<'a> {
     /// Cleanup deletion plan retained across lower-read suspension.
@@ -4223,6 +4258,8 @@ struct DriverResolveState<'a> {
 
 /// Result of one driver request surface invoked inside an ephemeral core resolve pass.
 enum DriverResolveDisposition {
+    /// Raw source reads require cache/paging exclusion established outside the actor.
+    PrepareRelocation,
     /// Merkle construction must wait for stream-wide data and section exclusion.
     PrepareVerity,
     /// Request completed without staging a filesystem mutation.
@@ -4313,6 +4350,8 @@ impl MutationRequestOperation {
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Option<PreparedMutationOplock>> {
         let requires_check = match request {
+            PreparedMutationRequest::Relocation(_) => false,
+            PreparedMutationRequest::ZeroOnDeallocation => false,
             PreparedMutationRequest::DataWrite(authority) => {
                 !authority.is_paging()
                     && !owned
@@ -4420,6 +4459,8 @@ impl MutationRequestOperation {
                     ),
                 };
                 Self {
+                    completion_durability: ext4_core::MutationCompletionDurability::JournalCommit,
+                    checkpoint_acknowledgment: None,
                     devices,
                     trace,
                     ticket,
@@ -4486,6 +4527,22 @@ impl MutationRequestOperation {
         match completion {
             TopLevelCompletion::Normal(completion) => owned.prepare_completion(completion),
             TopLevelCompletion::Create(completion) => owned.prepare_create_result(Ok(completion)),
+        }
+    }
+
+    /// Retains committed failure information while selecting the upper completion boundary.
+    fn prepare_committed_acknowledgment(
+        &self,
+        owned: OwnedIrp,
+        completion: TopLevelCompletion,
+        failure: Option<DriverError>,
+    ) -> crate::irp::PreparedIrpCompletion {
+        match (completion, failure) {
+            (completion, None) => self.prepare_success(owned, completion),
+            (TopLevelCompletion::Normal(completion), Some(error)) => {
+                owned.prepare_completion(completion.committed_failure(error))
+            }
+            (TopLevelCompletion::Create(_), Some(error)) => owned.prepare_create_result(Err(error)),
         }
     }
 
@@ -4597,6 +4654,17 @@ impl MutationRequestOperation {
             _ => None,
         };
         let result: DriverResult<DriverResolveDisposition> = match request {
+            PreparedMutationRequest::Relocation(relocation) if relocation.requires_preparation() => {
+                Ok(DriverResolveDisposition::PrepareRelocation)
+            }
+            PreparedMutationRequest::Relocation(relocation) => {
+                let completion = relocation.resolve(mutation)?;
+                Ok(DriverResolveDisposition::Mutation(PendingDriverPublication::Normal(completion)))
+            }
+            PreparedMutationRequest::ZeroOnDeallocation => {
+                let completion = crate::request::cluster_control::set_zero_on_deallocation(owned.request(), operations, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(PendingDriverPublication::Normal(completion)))
+            }
             PreparedMutationRequest::Create { mapping, creator } => {
                 match crate::request::create::execute(
                     owned.request(),
@@ -5211,6 +5279,20 @@ impl MutationRequestOperation {
                         suspended: self,
                     });
                 }
+                Ok(DriverResolveDisposition::PrepareRelocation) => {
+                    drop(pass);
+                    let PreparedMutationRequest::Relocation(relocation) = &mut self.request else {
+                        return MutationStep::Transition(self.complete_error(owned, DriverError::InternalInvariantViolation));
+                    };
+                    let stream = match relocation.begin_preparation() {
+                        Ok(stream) => stream,
+                        Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
+                    };
+                    self.state = MutationOperationState::PreparingRelocation { owned };
+                    return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
+                        work: crate::irp::PassiveWork::PrepareRelocation { stream }, suspended: self,
+                    });
+                }
                 Ok(DriverResolveDisposition::PrepareWriteOpen { fcb, node }) => {
                     drop(pass);
                     if size_changes.is_some()
@@ -5356,6 +5438,7 @@ impl MutationRequestOperation {
                 })
             }
             MutationResolveTransition::Complete(Ok(resolved)) => {
+                self.completion_durability = resolved.completion_durability();
                 let Some(publication) = publication else {
                     return MutationStep::Transition(
                         self.complete_error(owned, DriverError::InternalInvariantViolation),
@@ -5635,7 +5718,7 @@ impl MutationRequestOperation {
 
     /// Ends a failed detached checkpoint while retaining the already published overlay.
     fn fail_checkpoint(
-        &self,
+        mut self: Box<Self>,
         publication: EpochPublicationSlot,
         failure: StorageFailureClass,
         access: &mut MountedVolumeAccess<'_>,
@@ -5649,6 +5732,13 @@ impl MutationRequestOperation {
             StorageFailureClass::DurabilityUnknown { .. } => {
                 access.record_durability_unknown();
             }
+        }
+        if let Some(acknowledgment) = self.checkpoint_acknowledgment.take() {
+            return OperationTransition::Complete(self.prepare_committed_acknowledgment(
+                acknowledgment.owned,
+                acknowledgment.completion,
+                Some(Error::DeviceIo.into()),
+            ));
         }
         OperationTransition::Retired
     }
@@ -5846,6 +5936,23 @@ impl MutationRequestOperation {
                         return match result {
                             Ok(deletion) => {
                                 self.restart_resolution(owned, size_changes, Some(deletion), access)
+                            }
+                            Err(error) => {
+                                record_cache_coherency_failure(error, access);
+                                MutationStep::Transition(self.complete_error(owned, error))
+                            }
+                        };
+                    }
+                    (MutationOperationState::PreparingRelocation { owned }, crate::irp::PassiveWorkCompletion::PrepareRelocation(result)) => {
+                        return match result {
+                            Ok(prepared) => {
+                                let PreparedMutationRequest::Relocation(relocation) = &mut self.request else {
+                                    return MutationStep::Transition(self.complete_error(owned, DriverError::InternalInvariantViolation));
+                                };
+                                if let Err(error) = relocation.seal(prepared) {
+                                    return MutationStep::Transition(self.complete_error(owned, error));
+                                }
+                                self.restart_resolution(owned, None, None, access)
                             }
                             Err(error) => {
                                 record_cache_coherency_failure(error, access);
@@ -6090,6 +6197,7 @@ impl MutationRequestOperation {
             MutationOperationState::PreparingSizeChange { owned, .. }
             | MutationOperationState::PreparingDeletion { owned, .. }
             | MutationOperationState::PreparingWriteOpen { owned }
+            | MutationOperationState::PreparingRelocation { owned }
             | MutationOperationState::PreparingVerity { owned } => match event {
                 OperationEvent::CancelRequested => MutationStep::Transition(
                     self.complete_error(owned, DriverError::from(Error::OperationCancelled)),
@@ -6494,6 +6602,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
                 | MutationOperationState::PreparingSizeChange { .. }
                 | MutationOperationState::PreparingDeletion { .. }
                 | MutationOperationState::PreparingWriteOpen { .. }
+                | MutationOperationState::PreparingRelocation { .. }
                 | MutationOperationState::PreparingVerity { .. }
                 | MutationOperationState::CacheWriting { .. }
                 | MutationOperationState::CachePurging { .. }
@@ -6530,6 +6639,7 @@ impl PreparedPublication for MutationRequestOperation {
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
+            | MutationOperationState::PreparingRelocation { .. }
             | MutationOperationState::PreparingVerity { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
@@ -6600,8 +6710,8 @@ impl PreparedPublication for MutationRequestOperation {
                 drop(self.oplock_mutation.take());
                 while self.cleanup_parent_oplock.pop().is_some() {}
                 drop(self.namespace_oplocks.take());
-                let completion = match stream_projection {
-                    StreamProjectionOutcome::Complete => self.prepare_success(owned, completion),
+                let publication_failure = match stream_projection {
+                    StreamProjectionOutcome::Complete => None,
                     StreamProjectionOutcome::Incomplete(failure) => {
                         let (error, published_streams, unexamined_updates) = failure.into_parts();
                         access.record_publication_failure(
@@ -6609,14 +6719,7 @@ impl PreparedPublication for MutationRequestOperation {
                             published_streams,
                             unexamined_updates,
                         );
-                        match completion {
-                            TopLevelCompletion::Normal(completion) => {
-                                owned.prepare_completion(completion.committed_failure(error))
-                            }
-                            TopLevelCompletion::Create(_completion) => {
-                                owned.prepare_create_result(Err(error))
-                            }
-                        }
+                        Some(error)
                     }
                 };
                 if let PreparedMutationRequest::Verity(preparation) = &mut self.request {
@@ -6625,8 +6728,21 @@ impl PreparedPublication for MutationRequestOperation {
                         VerityPreparation::Published,
                     ));
                 }
+                if let PreparedMutationRequest::Relocation(relocation) = &mut self.request {
+                    relocation.publish();
+                }
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
-                Some(completion)
+                match self.completion_durability {
+                    ext4_core::MutationCompletionDurability::JournalCommit => Some(
+                        self.prepare_committed_acknowledgment(owned, completion, publication_failure),
+                    ),
+                    ext4_core::MutationCompletionDurability::HomeCheckpoint => {
+                        self.checkpoint_acknowledgment = Some(CheckpointAcknowledgment {
+                            owned, completion, publication_failure,
+                        });
+                        None
+                    }
+                }
             }
             MutationOperationState::PublishingCheckpoint {
                 durability,
@@ -6635,10 +6751,19 @@ impl PreparedPublication for MutationRequestOperation {
             } => {
                 if access.publish_checkpoint(durability, publication).is_err() {
                     access.record_durability_unknown();
+                    if let Some(acknowledgment) = self.checkpoint_acknowledgment.take() {
+                        return PublicationOutcome::Rejected(OperationTransition::Complete(
+                            self.prepare_committed_acknowledgment(acknowledgment.owned,
+                                acknowledgment.completion, Some(Error::DeviceIo.into())),
+                        ));
+                    }
                     return PublicationOutcome::Rejected(OperationTransition::Retired);
                 }
                 self.state = MutationOperationState::Terminal;
-                None
+                self.checkpoint_acknowledgment.take().map(|acknowledgment| {
+                    self.prepare_committed_acknowledgment(acknowledgment.owned,
+                        acknowledgment.completion, acknowledgment.publication_failure)
+                })
             }
             MutationOperationState::AbortingCreate { .. }
             | MutationOperationState::RestartingAfterAbort { .. }
@@ -6651,6 +6776,7 @@ impl PreparedPublication for MutationRequestOperation {
             | MutationOperationState::PreparingSizeChange { .. }
             | MutationOperationState::PreparingDeletion { .. }
             | MutationOperationState::PreparingWriteOpen { .. }
+            | MutationOperationState::PreparingRelocation { .. }
             | MutationOperationState::PreparingVerity { .. }
             | MutationOperationState::Resolving { .. }
             | MutationOperationState::AwaitingIntent { .. }
