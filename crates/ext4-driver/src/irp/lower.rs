@@ -1253,6 +1253,10 @@ impl RegisteredLowerRequest {
 #[cfg(not(test))]
 /// Builds the private IRP and optional MDL while the ownership-bearing envelope source remains
 /// untouched.
+        unsafe {
+            // SAFETY: This registered private IRP has not reached lower storage; its next stack is live.
+            ffi::ext4win_account_lower_io(self.irp.as_ptr());
+        }
 /// # Errors
 ///
 /// Returns an error when the transfer contract is inconsistent, target geometry is invalid, an

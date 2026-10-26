@@ -81,6 +81,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={TUNNEL_CACHE_SOURCE}");
     println!("cargo:rerun-if-changed=native/tunnel_cache.h");
     println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_CONTRACT}");
+    println!("cargo:rerun-if-changed=native/file_object_flags.h");
+    println!("cargo:rerun-if-changed=native/disk_accounting.h");
+    println!("cargo:rerun-if-changed={LIFECYCLE_CONTROL_CONTRACT}");
     println!("cargo:rerun-if-env-changed={ARTIFACT_ID_ENVIRONMENT}");
 
     let artifact_id = production_artifact_id()?;

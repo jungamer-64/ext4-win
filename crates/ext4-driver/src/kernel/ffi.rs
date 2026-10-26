@@ -7,6 +7,16 @@ pub(crate) use wdk_sys::ntddk::RtlCopyVolatileMemory;
     reason = "the native boundary owns concurrent access to the OS FILE_OBJECT flag word"
 )]
 unsafe extern "system" {
+    /// Accounts issued physical bytes before private IRP ownership moves to the lower stack.
+    /// # Safety
+    /// The live private IRP must contain its initialized next stack location.
+    #[cfg(not(test))]
+    pub(crate) fn ext4win_account_lower_io(irp: wdk_sys::PIRP);
+    /// Charges completed direct data to the original requestor while its IRP remains owned.
+    /// # Safety
+    /// The original IRP and its associated requestor thread must remain live through this call.
+    #[cfg(not(test))]
+    pub(crate) fn ext4win_account_request_io(irp: wdk_sys::PIRP, read: u64, written: u64, flush: u32);
     /// Observes only flag bits; retaining the file does not grant access to its other fields.
     /// # Safety
     /// `file` must remain a live FILE_OBJECT throughout this native atomic load.

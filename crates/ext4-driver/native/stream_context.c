@@ -897,6 +897,9 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS NTAPI
+                if (PsIsDiskCountersEnabled()) {
+                    CcSetAdditionalCacheAttributesEx(file_object, CC_ENABLE_DISK_IO_ACCOUNTING);
+                }
 ext4win_stream_cache_close_writeback(_In_ PVOID stream_header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);

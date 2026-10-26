@@ -601,6 +601,8 @@ impl Drop for CapturedAuxiliaryInput {
 /// Request identity captured before the IRP enters the cancel-safe queue.
 #[derive(Debug)]
 pub(super) struct QueueContext {
+    /// The data operation selected the core/lower path rather than a Cc cache transfer.
+    direct_data: bool,
     /// Complete typed request classification plus any requestor-context capture.
     prepared: PreparedRequest,
     /// Progress responsibility captured before the IRP enters the queue.
@@ -622,6 +624,44 @@ pub(super) enum QueueContextOwnership {
 }
 
 impl QueueContextOwnership {
+    /// Records the selected data path; retries keep the same accounting responsibility.
+    /// # Errors
+    /// Rejects non-data requests before changing their capture.
+    pub(super) fn select_direct_data(&mut self) -> DriverResult<()> {
+        let Self::Captured(context) = self else { return Err(DriverError::InternalInvariantViolation); };
+        if !matches!(context.prepared, PreparedRequest::Read(_) | PreparedRequest::Write(_)) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        context.direct_data = true;
+        Ok(())
+    }
+
+    /// Cache retry selection hands logical data charging back to Cc before accepting bytes.
+    /// # Errors
+    /// Rejects lifecycle requests without a captured data transfer.
+    pub(super) fn select_cached_data(&mut self) -> DriverResult<()> {
+        let Self::Captured(context) = self else { return Err(DriverError::InternalInvariantViolation); };
+        if !matches!(context.prepared, PreparedRequest::Read(_) | PreparedRequest::Write(_)) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        context.direct_data = false;
+        Ok(())
+    }
+
+    /// Charges only direct data and explicit successful flushes; Cc owns cache-hit accounting.
+    pub(super) fn account_completion(&self, irp: super::KernelIrp, completion: IrpCompletion) {
+        let Self::Captured(context) = self else { return; };
+        let bytes = completion.information().as_ulong_ptr();
+        let (read, written, flush) = match &context.prepared {
+            PreparedRequest::Read(_) if context.direct_data => (bytes, 0, 0),
+            PreparedRequest::Write(_) if context.direct_data => (0, bytes, 0),
+            PreparedRequest::FlushBuffers if completion.status() >= wdk_sys::STATUS_SUCCESS => (0, 0, 1),
+            _ => return,
+        };
+        if read != 0 || written != 0 || flush != 0 {
+            irp.account_request_io(read, written, flush);
+        }
+    }
     /// Derives the independent progress lane from the immutable captured request.
     pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
         match self {
@@ -830,6 +870,7 @@ impl QueueContext {
                 prepared,
                 execution,
                 cancellation_key,
+                direct_data: false,
             })
         })
         .map(QueueContextOwnership::Captured)
@@ -847,6 +888,7 @@ impl QueueContext {
                 execution: super::scheduler::ExecutionClass::Ordinary,
                 prepared: PreparedRequest::Create,
                 cancellation_key: QueueCancellationKey::Device,
+                direct_data: false,
             })
         })
     }
@@ -2893,6 +2935,7 @@ mod tests {
 
         let ordinary = QueueContext {
             execution: super::super::scheduler::ExecutionClass::Ordinary,
+            direct_data: false,
             prepared: PreparedRequest::QueryInformation,
             cancellation_key: QueueCancellationKey::Device,
         };
@@ -2900,6 +2943,7 @@ mod tests {
     }
 
     /// # Panics
+            direct_data: false,
     ///
     /// Panics when DriverContext[0] publication is not taken and cleared exactly once.
     #[test]

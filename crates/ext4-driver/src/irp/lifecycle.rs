@@ -1134,6 +1134,12 @@ impl<'a> PendingIrpLease<'a> {
         Ok(CacheMdlTransfer {
             owner: self,
             file_object,
+    /// Transfers logical data accounting from Cc to the selected direct data operation.
+    /// # Errors
+    /// Rejects a captured request that does not carry read/write data.
+    pub(crate) fn select_direct_data(&mut self) -> DriverResult<()> {
+        self.owner.context.select_direct_data()
+    }
             request,
         })
     }
@@ -1165,6 +1171,7 @@ impl<'a> PendingIrpLease<'a> {
     /// Rejects another request kind, an excess prefix or an absent FILE_OBJECT before native access.
     pub(crate) fn cache_write_transfer(
         mut self,
+        self.owner.context.select_cached_data()?;
         length: usize,
     ) -> DriverResult<CacheWriteTransfer<'a>> {
         let length = self.prepared_write()?.stack().length().prefix(length)?;
@@ -1187,6 +1194,7 @@ impl<'a> PendingIrpLease<'a> {
         &mut self,
         operation: impl for<'view> FnOnce(&'view mut ActiveIrp<'view>) -> R,
     ) -> R {
+        self.owner.context.select_cached_data()?;
         let mut active = self.owner.target.active();
         operation(&mut active)
     }
@@ -1479,6 +1487,7 @@ impl OwnedIrp {
             Ok(completion) => completion,
             Err(error) => IrpCompletion::from_error(error),
         })
+        context.account_completion(target.irp, completion);
     }
 
     /// Prepares a create result, consuming its mutually exclusive completion ownership.
@@ -2070,6 +2079,18 @@ impl KernelIrp {
                 unsafe {
                     // SAFETY: This filesystem owns the live IRP through native completion. The
                     // thread-local marker is restored below before returning to any caller.
+    /// Attributes completed logical direct bytes to the retained original requestor.
+    #[cfg_attr(not(test), expect(unsafe_code, reason = "the completion owner retains the original IRP and associated requestor"))]
+    fn account_request_io(self, read: u64, written: u64, flush: u32) {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Completion has not released this original IRP or its requestor lifetime.
+            ffi::ext4win_account_request_io(self.irp.as_ptr(), read, written, flush);
+        }
+        #[cfg(test)]
+        let _charge = (self, read, written, flush);
+    }
+
                     ffi::IoSetTopLevelIrp(self.as_mut_ptr());
                 }
             }

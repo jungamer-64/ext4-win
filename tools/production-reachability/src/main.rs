@@ -130,6 +130,10 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     (
         "native volume lifecycle notification",
         "FsRtlNotifyVolumeEvent",
+    ("physical disk I/O accounting", "FsRtlUpdateDiskCounters"),
+    ("process disk I/O accounting", "PsUpdateDiskCounters"),
+    ("disk counter enablement", "PsIsDiskCountersEnabled"),
+    ("cache disk accounting coordination", "CcSetAdditionalCacheAttributesEx"),
     ),
     (
         "native reparse admission",
@@ -2449,6 +2453,10 @@ mod tests {
              RtlAddAce\n\
              RtlCreateSecurityDescriptor\n\
              RtlAbsoluteToSelfRelativeSD\n\
+             FsRtlUpdateDiskCounters\n\
+             PsUpdateDiskCounters\n\
+             PsIsDiskCountersEnabled\n\
+             CcSetAdditionalCacheAttributesEx\n\
              EtwRegister\n\
              FsRtlInitializeTunnelCache\n\
              FsRtlAddToTunnelCache\n\
