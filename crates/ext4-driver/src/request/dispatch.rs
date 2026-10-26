@@ -437,6 +437,13 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
         Ok(device_kind) => device_kind,
         Err(error) => return received.complete_result(Err(error)),
     };
+    let received = if device_kind == DriverDeviceKind::MountedVolume
+        && matches!(major, DispatchMajor::Read | DispatchMajor::Write | DispatchMajor::FileSystemControl) {
+        match received.dispatch_paging_file() {
+            Ok(status) => return status,
+            Err(received) => received,
+        }
+    } else { received };
     if device_kind == DriverDeviceKind::MountedVolume
         && matches!(major, DispatchMajor::Read | DispatchMajor::Write)
     {
@@ -757,6 +764,9 @@ pub(crate) fn admit_owned(
                 Ok(match active.current_stack()?.set_file()?.operation() {
                     crate::irp::SetFileOperation::AdvanceValidDataLength => {
                         Admission::Immediate(ImmediateRequestKind::AdvanceValidDataLength)
+                    }
+                    crate::irp::SetFileOperation::ValidDataLength => {
+                        Admission::Immediate(ImmediateRequestKind::ValidDataLength)
                     }
                     _ => Admission::Mutation(MutationRequestKind::SetInformation),
                 })

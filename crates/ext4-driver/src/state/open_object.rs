@@ -1031,6 +1031,8 @@ pub(super) enum OpenedHandleKind {
     File {
         /// Data-write authority fixed when this handle was created.
         write_access: RegularFileWriteAccess,
+        /// Explicit VDL authority captured from the initial-open subject.
+        valid_data_length: ValidDataLengthAccess,
     },
     /// Directory handle retaining its search expression and published continuation.
     Directory {
@@ -1091,6 +1093,7 @@ impl OpenedHandle {
         let kind = match node {
             NodeId::File(_) => OpenedHandleKind::File {
                 write_access: access.regular_file_write_access(),
+                valid_data_length: access.valid_data_length_access(),
             },
             NodeId::Directory(_) => OpenedHandleKind::Directory {
                 search: memory::boxed_try_with(|| Ok(DirectorySearch::new()))?,
@@ -1192,7 +1195,7 @@ impl OpenedHandle {
     /// Returns write authority for a regular-file handle variant.
     pub(super) fn regular_file_write_access(&self) -> Option<RegularFileWriteAccess> {
         match &self.kind {
-            OpenedHandleKind::File { write_access } => Some(*write_access),
+            OpenedHandleKind::File { write_access, .. } => Some(*write_access),
             OpenedHandleKind::Directory { .. } | OpenedHandleKind::Symlink => None,
         }
     }
@@ -1202,7 +1205,7 @@ impl OpenedHandle {
     /// Returns access denied if neither right was granted.
     pub(super) fn require_reparse_write_access(&self) -> DriverResult<()> {
         let write_data = match self.kind() {
-            OpenedHandleKind::File { write_access } => {
+            OpenedHandleKind::File { write_access, .. } => {
                 *write_access == RegularFileWriteAccess::Positional
             }
             OpenedHandleKind::Directory { write_data, .. } => *write_data,
@@ -2125,6 +2128,16 @@ impl<'owner> OpenedRegularFile<'owner> {
             .handle()
             .regular_file_write_access()
             .unwrap_or_else(|| KernelWideInconsistency::file_object_context_corruption().bugcheck())
+    }
+
+    /// Returns SeManageVolumePrivilege retained from this exact handle's initial open.
+    pub(crate) fn valid_data_length_access(&self) -> ValidDataLengthAccess {
+        match self.opened.handle().kind() {
+            OpenedHandleKind::File { valid_data_length, .. } => *valid_data_length,
+            OpenedHandleKind::Directory { .. } | OpenedHandleKind::Symlink => {
+                KernelWideInconsistency::file_object_context_corruption().bugcheck()
+            }
+        }
     }
 
     /// Returns the synchronous per-handle file position.

@@ -1893,6 +1893,8 @@ pub(crate) enum ImmediateRequestKind {
     GetRetrievalPointerBase,
     /// Cc notification of already initialized data, including after handle cleanup.
     AdvanceValidDataLength,
+    /// Explicit VDL assignment using initial-open privilege authority.
+    ValidDataLength,
     /// Mounted ext4 UUID independent of a Windows volume path.
     QueryVolumeIdentity,
     /// Declared format bits and immutable session media policy from one committed view.
@@ -1991,6 +1993,9 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
                 })(),
                 ImmediateRequestKind::AdvanceValidDataLength => {
                     crate::request::file_info::advance_valid_data_length(owned.request())
+                }
+                ImmediateRequestKind::ValidDataLength => {
+                    crate::request::file_info::set_valid_data_length(owned.request())
                 }
                 ImmediateRequestKind::QueryVolumeIdentity => {
                     owned.request().with_active(|active| {

@@ -705,6 +705,25 @@ pub(crate) struct ReceivedIrp {
 }
 
 impl ReceivedIrp {
+    /// Transfers an admitted paging-file IRP directly to its fixed lower mapping.
+    /// QUERY_RETRIEVAL_POINTERS completes here using its kernel pointer-return contract.
+    /// An ordinary stream retains the unchanged receive owner for normal dispatch.
+    /// # Errors
+    /// Returns the unchanged receive owner when this request does not select the paging boundary.
+    #[cfg_attr(not(test), expect(unsafe_code, reason = "the native boundary borrows the original dispatch IRP and consumes completion ownership only when it returns handled"))]
+    pub(crate) fn dispatch_paging_file(self) -> Result<NTSTATUS, Self> {
+        #[cfg(not(test))]
+        {
+            let mut status = wdk_sys::STATUS_INVALID_DEVICE_REQUEST;
+            let handled = unsafe {
+                // SAFETY: This unqueued receive owner retains the IRP and its FILE_OBJECT; native
+                // code either declines unchanged or transfers/completes it exactly once.
+                ext4win_stream_paging_file_dispatch(self.target.irp.as_ptr(), &mut status)
+            };
+            if handled != 0 { return Ok(status); }
+        }
+        Err(self)
+    }
     /// Transfers a consuming MDL notification to its stream's preallocated passive worker.
     /// Cancellation cannot skip chain release. Allocation was completed before page acquisition.
     #[cfg_attr(
@@ -898,6 +917,7 @@ impl ReceivedIrp {
     reason = "native consuming boundaries preserve the distinct dispatch and pending stack protocols"
 )]
 unsafe extern "system" {
+    fn ext4win_stream_paging_file_dispatch(irp: PIRP, status: *mut NTSTATUS) -> u8;
     fn ext4win_stream_mdl_queue(file: *mut wdk_sys::FILE_OBJECT) -> *mut c_void;
     fn ext4win_forward_original_irp(
         device: wdk_sys::PDEVICE_OBJECT,

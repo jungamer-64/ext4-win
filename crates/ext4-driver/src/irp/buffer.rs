@@ -521,6 +521,7 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         let operation = match set.FileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => SetFileOperation::Basic,
             wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => SetFileOperation::Position,
+            wdk_sys::_FILE_INFORMATION_CLASS::FileValidDataLengthInformation => SetFileOperation::ValidDataLength,
             wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => {
                 let advance_only = unsafe {
                     // SAFETY: End-of-file operations initialize the AdvanceOnly union arm.

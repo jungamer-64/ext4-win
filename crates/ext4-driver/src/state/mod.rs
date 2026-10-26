@@ -37,7 +37,7 @@ use crate::irp::{
     ActiveFileObject, ByteRangeLockKey, CompletionReactor, CreateDeletion, DataIoKind,
     DeleteAccess, DispatchMajor, DispatchTarget, ExistingOperationAccess,
     FileAttributesWriteAccess, GrantedAccess, OplockCreatePolicy, ReceivedIrp,
-    RegularFileWriteAccess, RequestorProcess, ShareAccess,
+    RegularFileWriteAccess, RequestorProcess, ShareAccess, ValidDataLengthAccess,
 };
 use crate::kernel::cng::CngOperation;
 use crate::kernel::fatal::KernelWideInconsistency;

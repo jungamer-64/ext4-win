@@ -1565,7 +1565,6 @@ fn create_stack_preserves_access_share_options_and_ea_length() {
 #[test]
 fn create_stack_rejects_unimplemented_special_flag_protocols() {
     for flag in [
-        wdk_sys::SL_OPEN_PAGING_FILE,
         wdk_sys::SL_STOP_ON_SYMLINK,
         wdk_sys::SL_IGNORE_READONLY_ATTRIBUTE,
     ] {
@@ -1597,6 +1596,33 @@ fn create_stack_rejects_unimplemented_special_flag_protocols() {
                 );
             }
         }
+    }
+}
+
+/// # Panics
+/// Fails if paging-file admission loses its exclusive open or fixed-allocation protocol.
+#[test]
+fn paging_file_create_retains_its_distinct_exclusive_protocol() {
+    let decode = |disposition, share| super::CreateParameters::decode(
+        wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA,
+        (disposition << super::CREATE_DISPOSITION_SHIFT) | wdk_sys::FILE_NON_DIRECTORY_FILE,
+        share,
+        super::IrpBufferLength(0),
+        u8::try_from(wdk_sys::SL_OPEN_PAGING_FILE).unwrap_or_default(),
+    );
+    let open = decode(super::FILE_OPEN_IF_DISPOSITION, 0);
+    assert!(open.is_ok());
+    if let Ok(open) = open {
+        assert_eq!(open.file_mode(), super::CreateFileMode::PagingFile);
+        assert_eq!(open.validate_supported_flags(), Ok(()));
+    }
+    for (disposition, share) in [
+        (super::FILE_OVERWRITE_DISPOSITION, 0),
+        (super::FILE_OPEN_DISPOSITION, u16::try_from(wdk_sys::FILE_SHARE_READ).unwrap_or_default()),
+    ] {
+        let open = decode(disposition, share);
+        assert!(open.is_ok());
+        if let Ok(open) = open { assert_eq!(open.validate_supported_flags(), Err(DriverError::NotSupported)); }
     }
 }
 
@@ -2597,7 +2623,7 @@ fn granted_access_projects_regular_file_write_authority() {
         ),
     ] {
         assert_eq!(
-            super::GrantedAccess::from_authorized(raw).regular_file_write_access(),
+            super::GrantedAccess::from_authorized(raw, super::ValidDataLengthAccess::Denied).regular_file_write_access(),
             expected
         );
     }
@@ -2686,11 +2712,11 @@ fn generic_mapping_preserves_maximum_for_security_evaluation() {
 #[test]
 fn granted_access_projects_delete_authority() {
     assert_eq!(
-        super::GrantedAccess::from_authorized(0).delete_access(),
+        super::GrantedAccess::from_authorized(0, super::ValidDataLengthAccess::Denied).delete_access(),
         super::DeleteAccess::Denied
     );
     assert_eq!(
-        super::GrantedAccess::from_authorized(wdk_sys::DELETE).delete_access(),
+        super::GrantedAccess::from_authorized(wdk_sys::DELETE, super::ValidDataLengthAccess::Denied).delete_access(),
         super::DeleteAccess::Granted
     );
     assert_eq!(
@@ -2706,11 +2732,11 @@ fn granted_access_projects_delete_authority() {
 #[test]
 fn granted_access_projects_file_attributes_write_authority() {
     assert_eq!(
-        super::GrantedAccess::from_authorized(0).file_attributes_write_access(),
+        super::GrantedAccess::from_authorized(0, super::ValidDataLengthAccess::Denied).file_attributes_write_access(),
         super::FileAttributesWriteAccess::Denied
     );
     assert_eq!(
-        super::GrantedAccess::from_authorized(wdk_sys::FILE_WRITE_ATTRIBUTES)
+        super::GrantedAccess::from_authorized(wdk_sys::FILE_WRITE_ATTRIBUTES, super::ValidDataLengthAccess::Denied)
             .file_attributes_write_access(),
         super::FileAttributesWriteAccess::Granted
     );
@@ -2942,6 +2968,11 @@ fn set_file_stack_retains_eof_protocol_and_namespace_parent() {
             wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation,
             1,
             SetFileOperation::AdvanceValidDataLength,
+        ),
+        (
+            wdk_sys::_FILE_INFORMATION_CLASS::FileValidDataLengthInformation,
+            0,
+            SetFileOperation::ValidDataLength,
         ),
         (
             wdk_sys::_FILE_INFORMATION_CLASS::FileLinkInformation,
@@ -3470,7 +3501,7 @@ fn reserve_filter_oplock_requires_exact_access_and_sharing() {
 fn normalized_names_retain_create_time_traversal_authority() {
     use crate::state::{NormalizedNameAccess, OpenedLocation};
 
-    let metadata_only = super::GrantedAccess::from_authorized(wdk_sys::FILE_READ_ATTRIBUTES);
+    let metadata_only = super::GrantedAccess::from_authorized(wdk_sys::FILE_READ_ATTRIBUTES, super::ValidDataLengthAccess::Denied);
     assert_eq!(
         NormalizedNameAccess::for_open(&OpenedLocation::Root, metadata_only).require(),
         Ok(())
@@ -3479,7 +3510,7 @@ fn normalized_names_retain_create_time_traversal_authority() {
         NormalizedNameAccess::for_open(&OpenedLocation::FileReference, metadata_only).require(),
         Err(DriverError::AccessDenied)
     );
-    let traverse = super::GrantedAccess::from_authorized(wdk_sys::FILE_TRAVERSE);
+    let traverse = super::GrantedAccess::from_authorized(wdk_sys::FILE_TRAVERSE, super::ValidDataLengthAccess::Denied);
     assert_eq!(
         NormalizedNameAccess::for_open(&OpenedLocation::FileReference, traverse).require(),
         Ok(())

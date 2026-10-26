@@ -83,6 +83,9 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "ext4win_stream_set_namespace_query_fallback",
     ),
     ("native stream destruction", "ext4win_stream_destroy"),
+    ("paging-file fixed-map publication", "ext4win_stream_install_paging_file"),
+    ("paging-file allocation ownership", "ext4win_stream_is_paging_file"),
+    ("allocation-free paging-file dispatch", "ext4win_stream_paging_file_dispatch"),
     (
         "cache-map initialization",
         "ext4win_stream_cache_initialize",
@@ -2424,6 +2427,9 @@ mod tests {
              ext4win_stream_publish_metadata\n\
              ext4win_stream_set_namespace_query_fallback\n\
              ext4win_stream_destroy\n\
+             ext4win_stream_install_paging_file\n\
+             ext4win_stream_is_paging_file\n\
+             ext4win_stream_paging_file_dispatch\n\
              ext4win_stream_cache_initialize\n\
              ext4win_cc_copy_read\n\
              ext4win_cc_copy_write\n\

@@ -165,6 +165,9 @@ impl FileControlBlock {
         self.stream_context.sizes()
     }
 
+    /// Reports the FCB's immutable paging-file allocation policy.
+    pub(crate) fn is_paging_file(&self) -> bool { self.stream_context.is_paging_file() }
+
     /// Observes the committed archive attribute before selecting a data-only cache write.
     pub(crate) fn archive_is_set(&self) -> bool {
         self.stream_context.archive_is_set()

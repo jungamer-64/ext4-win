@@ -161,6 +161,14 @@ impl EpochReadPass<'_, '_, '_> {
         self.view.read_cluster_bitmap(start, output)
     }
 
+    /// Observes a fully initialized, plain, contiguous regular-file payload in this epoch.
+    /// This observation grants no allocation exclusion or direct-I/O authority.
+    /// # Errors
+    /// Rejects empty, resident, sparse, unwritten, fragmented, protected or data-journaled files.
+    pub fn contiguous_file_storage(&mut self, file: FileNodeId) -> Result<super::node::ContiguousFileStorage> {
+        self.view.contiguous_file_storage(file)
+    }
+
     /// Observes the payload allocation beginning at one block-aligned file coordinate.
     /// No result means resident data or the end of the visible allocation span. This grants no
     /// raw-I/O or mutation authority; the result belongs to the pass's immutable epoch.

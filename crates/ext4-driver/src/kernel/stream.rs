@@ -750,6 +750,18 @@ impl StreamContext {
         }
     }
 
+    /// Reports whether the FCB owns an immutable native paging-file mapping.
+    #[cfg_attr(not(test), expect(unsafe_code, reason = "the retained stream header owns the native one-time paging state"))]
+    pub(crate) fn is_paging_file(&self) -> bool {
+        #[cfg(not(test))]
+        { unsafe {
+            // SAFETY: The stream owner retains the native header through this atomic observation.
+            ext4win_stream_is_paging_file(self.header.as_ptr()) != 0
+        } }
+        #[cfg(test)]
+        { false }
+    }
+
     /// Atomically binds one pinned FCB and its embedded byte-range lock package.
     ///
     /// # Safety
@@ -2103,6 +2115,8 @@ fn cache_status(status: NTSTATUS) -> DriverResult<()> {
     reason = "these declarations expose the audited native advanced-FCB-header ownership boundary"
 )]
 unsafe extern "system" {
+    fn ext4win_stream_is_paging_file(header: *mut c_void) -> u8;
+    fn ext4win_stream_install_paging_file(header: *mut c_void, lower: wdk_sys::PDEVICE_OBJECT, physical: i64, length: i64, sector_size: u32) -> NTSTATUS;
     fn ext4win_stream_prepare_verity_data(stream_header: *mut c_void) -> NTSTATUS;
     fn ext4win_stream_data_writable(stream_header: *mut c_void) -> u8;
     fn ext4win_prepare_mdl_completion(

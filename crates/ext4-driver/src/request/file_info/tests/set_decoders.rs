@@ -1,4 +1,18 @@
 use super::*;
+
+/// Explicit VDL assignment cannot reduce initialization or expose bytes beyond EOF.
+/// # Panics
+/// Fails if an assignment changes the initialized bound or bypasses initial-open privilege.
+#[test]
+fn explicit_valid_data_length_preserves_initialized_ext4_bound() {
+    use crate::irp::ValidDataLengthAccess::{Denied, Granted};
+    let eof = FileSize::from_bytes(8192);
+    assert_eq!(super::explicit_valid_data_length(Granted, eof, eof), Ok(IrpCompletion::EMPTY));
+    for end in [0, 1, 8191, 8193] {
+        assert_eq!(super::explicit_valid_data_length(Granted, FileSize::from_bytes(end), eof), Err(DriverError::InvalidParameter));
+    }
+    assert_eq!(super::explicit_valid_data_length(Denied, eof, eof), Err(DriverError::SecurityCheckFailed(wdk_sys::STATUS_PRIVILEGE_NOT_HELD)));
+}
 use crate::request::file_info::test_support::*;
 use alloc::vec;
 

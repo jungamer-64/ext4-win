@@ -20,6 +20,46 @@ mod session;
 mod trim;
 
 /// # Errors
+/// Propagates fixture setup, independent inode decoding, and committed allocation observation failures.
+/// # Panics
+/// Fails if direct-map admission exposes unwritten or sparse bytes, or changes physical coordinates.
+#[test]
+#[expect(clippy::panic_in_result_fn, reason = "assertions compare the direct map with independent inode extent fields and zero-read contracts")]
+fn contiguous_storage_requires_initialized_payload_and_matches_inode_vector() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    let bytes = u64::from(fixture.epoch.geometry().block_size().bytes());
+    let initialized = alloc::vec![b'a'; usize::try_from(bytes).map_err(|_| Error::ArithmeticOverflow)?];
+    fixture.mutate(|pass| {
+        let target = pass.file(file)?;
+        pass.write_file_range(target, FileOffset::ZERO, &initialized)
+    })?;
+    let inode = fixture_inode_offset(&fixture.disk, NodeId::File(file))?;
+    let physical_low = u64::from(fixture_u32(&fixture.disk.filesystem, inode + 60)?);
+    let high: [u8; 2] = fixture.disk.filesystem.get(inode + 58..inode + 60)
+        .ok_or(Error::DeviceRange)?.try_into().map_err(|_| Error::DeviceRange)?;
+    let physical_block = physical_low | (u64::from(u16::from_le_bytes(high)) << 32);
+    let expected_physical = physical_block.checked_mul(bytes).ok_or(Error::ArithmeticOverflow)?;
+    let storage = fixture.read(|pass| pass.contiguous_file_storage(file))?;
+    assert_eq!(storage.physical().get(), expected_physical);
+    assert_eq!(storage.length().bytes(), u64::from(fixture_u32(&fixture.disk.filesystem, inode + 4)?));
+    let previous = storage.length().bytes();
+    fixture.mutate(|pass| {
+        let target = pass.file(file)?;
+        pass.reserve_file_allocation(target, FileAllocationSize::from_bytes(previous + bytes))?;
+        pass.extend_file(target, FileSize::from_bytes(previous + bytes))
+    })?;
+    assert_eq!(fixture.read(|pass| pass.contiguous_file_storage(file)), Err(Error::UnsupportedInodeMutation));
+    fixture.mutate(|pass| {
+        let target = pass.file(file)?;
+        pass.truncate_file(target, FileSize::from_bytes(0))?;
+        pass.extend_file(target, FileSize::from_bytes(bytes))
+    })?;
+    assert_eq!(fixture.read(|pass| pass.contiguous_file_storage(file)), Err(Error::UnsupportedInodeMutation));
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, independent descriptor decoding or committed read failures.
 /// # Panics
 /// Panics if the Windows-facing allocation observation differs from the on-disk bitmap.

@@ -636,6 +636,27 @@ pub enum ChildLookup {
     NotFound,
 }
 
+/// A fully initialized, unprotected regular file occupying one physical byte interval.
+///
+/// This is an epoch-local observation, not permission to bypass the filesystem. A direct-I/O
+/// owner must exclude changes to allocation, size, protection, and data persistence for its lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContiguousFileStorage {
+    /// Physical byte address corresponding to file offset zero.
+    pub(super) physical: crate::ByteOffset,
+    /// Complete initialized logical file length.
+    pub(super) length: crate::FileSize,
+}
+
+impl ContiguousFileStorage {
+    /// Returns the physical byte address corresponding to file offset zero.
+    #[must_use]
+    pub const fn physical(self) -> crate::ByteOffset { self.physical }
+    /// Returns the complete initialized logical file length.
+    #[must_use]
+    pub const fn length(self) -> crate::FileSize { self.length }
+}
+
 /// One block-aligned payload allocation run observed in an immutable epoch.
 /// Inode-table, xattr, extent-index and fs-verity metadata are excluded. Unwritten payload
 /// has a physical location even though ordinary reads return zeros.

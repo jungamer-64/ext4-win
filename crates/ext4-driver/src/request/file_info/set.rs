@@ -266,6 +266,18 @@ pub(super) fn set_file_information(
         let file_object = current.file_object()?;
         let stack = current.set_file()?;
         let mut opened_file = OpenedObject::decode(file_object)?;
+        if opened_file.file_control_block().is_paging_file() {
+            let requested = match stack.operation() {
+                SetFileOperation::Resize => read_end_of_file_input(active, stack.length())?,
+                SetFileOperation::Allocation => read_allocation_size_input(active, stack.length())?,
+                _ => return Err(DriverError::NotSupported),
+            };
+            let requested = file_size_from_large_integer(requested)?;
+            let eof = u64::try_from(opened_file.file_control_block().stream_sizes()?.file_size())
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            if requested.bytes() != eof { return Err(DriverError::NotSupported); }
+            return Ok(SetFilePlan::Complete);
+        }
         let plan = match stack.operation() {
             SetFileOperation::Basic => {
                 if opened_file.file_attributes_write_access() != FileAttributesWriteAccess::Granted
@@ -293,7 +305,7 @@ pub(super) fn set_file_information(
                     size: file_size_from_large_integer(end_of_file)?,
                 }
             }
-            SetFileOperation::AdvanceValidDataLength => {
+            SetFileOperation::AdvanceValidDataLength | SetFileOperation::ValidDataLength => {
                 return Err(DriverError::InvalidDeviceRequest);
             }
             SetFileOperation::Allocation => {
@@ -2091,6 +2103,50 @@ pub(crate) fn advance_valid_data_length(
 /// Rejects an announcement that would claim initialization beyond the logical file.
 fn valid_data_notification(announced: FileSize, eof: FileSize) -> DriverResult<IrpCompletion> {
     if announced > eof {
+        return Err(DriverError::InvalidParameter);
+    }
+    Ok(IrpCompletion::EMPTY)
+}
+
+/// Acknowledges explicit VDL assignment for an already initialized ext4 stream.
+///
+/// Holes and unwritten extents read as zero, so ext4's initialized logical bound is EOF.
+/// Only a positive assignment equal to that bound is admissible: a smaller value would
+/// reduce VDL, and a larger value would exceed EOF. This operation never converts unwritten
+/// extents into readable stale media data or changes allocation.
+/// # Errors
+/// Rejects absent initial-open privilege, malformed input, or a bound different from EOF.
+pub(crate) fn set_valid_data_length(mut request: PendingIrpLease<'_>) -> DriverResult<IrpCompletion> {
+    request.with_active(|active| {
+        let current = active.current_stack()?;
+        let stack = current.set_file()?;
+        if stack.operation() != SetFileOperation::ValidDataLength {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        let opened = OpenedRegularFile::decode(current.file_object()?)?;
+        let announced = file_size_from_large_integer(read_end_of_file_input(active, stack.length())?)?;
+        let eof = u64::try_from(opened.file_control_block().stream_sizes()?.file_size())
+            .map_err(|_| DriverError::InternalInvariantViolation)?;
+        explicit_valid_data_length(
+            opened.valid_data_length_access(),
+            announced,
+            FileSize::from_bytes(eof),
+        )
+    })
+}
+
+/// Applies the initial-open authority and initialized-bound contract without media effects.
+/// # Errors
+/// Returns privilege-not-held for an unprivileged initial open and invalid parameter for a reduction.
+fn explicit_valid_data_length(
+    access: crate::irp::ValidDataLengthAccess,
+    announced: FileSize,
+    eof: FileSize,
+) -> DriverResult<IrpCompletion> {
+    if access != crate::irp::ValidDataLengthAccess::Granted {
+        return Err(DriverError::SecurityCheckFailed(wdk_sys::STATUS_PRIVILEGE_NOT_HELD));
+    }
+    if announced.bytes() == 0 || announced != eof {
         return Err(DriverError::InvalidParameter);
     }
     Ok(IrpCompletion::EMPTY)

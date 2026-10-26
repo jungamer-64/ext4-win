@@ -39,6 +39,8 @@ pub(crate) struct CreateParameters {
     target_selection: CreateTargetSelection,
     /// Create flags whose semantics this filesystem does not implement.
     unsupported_flags: UnsupportedCreateFlags,
+    /// Ordinary stream or fixed-allocation Memory Manager paging-file protocol.
+    file_mode: CreateFileMode,
     /// Whether excluding readers additionally requires native write permission.
     require_writable_exclusive: bool,
     /// Native privilege protocol selected for the open.
@@ -85,6 +87,7 @@ impl CreateParameters {
             },
             target_selection: CreateTargetSelection::from_stack_flags(stack_flags),
             unsupported_flags: UnsupportedCreateFlags::from_stack_flags(stack_flags),
+            file_mode: if stack_flag(stack_flags, wdk_sys::SL_OPEN_PAGING_FILE) { CreateFileMode::PagingFile } else { CreateFileMode::Ordinary },
             require_writable_exclusive: options & wdk_sys::FILE_DISALLOW_EXCLUSIVE != 0
                 && share_access.as_ulong() & wdk_sys::FILE_SHARE_READ == 0,
             intent: CreateIntent::from_options(options),
@@ -189,13 +192,37 @@ impl CreateParameters {
         self.target_selection
     }
 
+    /// Returns the required stream lifetime and data-I/O protocol.
+    pub(crate) const fn file_mode(self) -> CreateFileMode { self.file_mode }
+
     /// Rejects valid create flags whose required filesystem protocol is not implemented.
     /// # Errors
     ///
     /// Returns not-supported instead of silently treating a special create as an ordinary open.
-    pub(crate) const fn validate_supported_flags(self) -> DriverResult<()> {
-        self.unsupported_flags.validate()
+    pub(crate) fn validate_supported_flags(self) -> DriverResult<()> {
+        self.unsupported_flags.validate()?;
+        if matches!(self.file_mode, CreateFileMode::PagingFile)
+            && (!matches!(self.disposition, CreateDisposition::Open | CreateDisposition::OpenIf)
+                || self.share_access.as_ulong() != 0
+                || !matches!(self.deletion, CreateDeletion::Retain)
+                || !matches!(self.target_selection, CreateTargetSelection::NamedObject)
+                || matches!(self.target_requirement, CreateTargetRequirement::Directory)
+                || !matches!(self.oplock_policy, OplockCreatePolicy::Ordinary)) {
+            return Err(DriverError::NotSupported);
+        }
+        Ok(())
     }
+}
+
+/// Allocation and I/O lifetime selected at the native create boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateFileMode {
+    /// Ordinary handles, mapped sections, and Cache Manager writeback.
+    Ordinary,
+    /// Existing kernel paging file with an immutable initialized contiguous physical mapping.
+    /// Empty, sparse, unwritten, fragmented or size-changing setups require a different admission
+    /// protocol and fail without falling back to ordinary file I/O.
+    PagingFile,
 }
 
 /// Access-check policy carried by `IO_STACK_LOCATION::Flags`.
@@ -241,8 +268,6 @@ impl CreateTargetSelection {
 /// Special create modes that require protocols this filesystem does not expose.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct UnsupportedCreateFlags {
-    /// The Memory Manager requested paging-file semantics.
-    paging_file: bool,
     /// Name resolution requested the stop-on-symlink contract.
     stop_on_symlink: bool,
     /// Replacement requested read-only-attribute bypass semantics.
@@ -253,7 +278,6 @@ impl UnsupportedCreateFlags {
     /// Captures every currently unsupported create stack flag.
     fn from_stack_flags(flags: wdk_sys::UCHAR) -> Self {
         Self {
-            paging_file: stack_flag(flags, wdk_sys::SL_OPEN_PAGING_FILE),
             stop_on_symlink: stack_flag(flags, wdk_sys::SL_STOP_ON_SYMLINK),
             ignore_readonly_attribute: stack_flag(flags, wdk_sys::SL_IGNORE_READONLY_ATTRIBUTE),
         }
@@ -265,7 +289,7 @@ impl UnsupportedCreateFlags {
     /// Returns not-supported when the caller requires a special create protocol not implemented
     /// by this filesystem.
     const fn validate(self) -> DriverResult<()> {
-        if self.paging_file || self.stop_on_symlink || self.ignore_readonly_attribute {
+        if self.stop_on_symlink || self.ignore_readonly_attribute {
             Err(DriverError::NotSupported)
         } else {
             Ok(())
@@ -285,6 +309,17 @@ pub(crate) struct DesiredAccess {
 pub(crate) struct GrantedAccess {
     /// Concrete, generic-mapped WDK access mask.
     raw: wdk_sys::ACCESS_MASK,
+    /// Volume-management privilege and positional write access captured at initial open.
+    valid_data_length: ValidDataLengthAccess,
+}
+
+/// Initial-open authority required by explicit valid-data-length assignment.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ValidDataLengthAccess {
+    /// The captured subject lacked the privilege or FILE_WRITE_DATA.
+    Denied,
+    /// The captured subject held enabled SeManageVolumePrivilege and FILE_WRITE_DATA.
+    Granted,
 }
 
 /// Owner-bound view of the Security Reference Monitor state for one active create.
@@ -392,13 +427,21 @@ impl DesiredAccess {
 
 impl GrantedAccess {
     /// Constructs concrete rights after the access-check boundary authorizes them.
-    pub(super) const fn from_authorized(raw: wdk_sys::ACCESS_MASK) -> Self {
-        Self { raw }
+    pub(super) const fn from_authorized(
+        raw: wdk_sys::ACCESS_MASK,
+        valid_data_length: ValidDataLengthAccess,
+    ) -> Self {
+        Self { raw, valid_data_length }
     }
 
     /// Returns the WDK mask used for share-access accounting.
     pub(crate) const fn as_raw(self) -> wdk_sys::ACCESS_MASK {
         self.raw
+    }
+
+    /// Returns the initial-open privilege captured for explicit VDL assignment.
+    pub(crate) const fn valid_data_length_access(self) -> ValidDataLengthAccess {
+        self.valid_data_length
     }
 
     /// Adds rights needed only while preflighting an existing-object operation.
@@ -546,6 +589,7 @@ impl CreateAccessState<'_> {
             state.RemainingDesiredAccess = 0;
             return Ok(GrantedAccess::from_authorized(
                 state.PreviouslyGrantedAccess,
+                self.valid_data_length_access(state.PreviouslyGrantedAccess),
             ));
         }
 
@@ -577,7 +621,47 @@ impl CreateAccessState<'_> {
         state.RemainingDesiredAccess = desired & !(granted | wdk_sys::MAXIMUM_ALLOWED);
         Ok(GrantedAccess::from_authorized(
             state.PreviouslyGrantedAccess,
+            self.valid_data_length_access(state.PreviouslyGrantedAccess),
         ))
+    }
+
+    /// Captures the original subject's privilege rather than a later actor thread's token.
+    #[cfg_attr(not(test), expect(unsafe_code, reason = "the create IRP owns its captured subject throughout the locked privilege check"))]
+    fn valid_data_length_access(&self, granted: wdk_sys::ACCESS_MASK) -> ValidDataLengthAccess {
+        if granted & wdk_sys::FILE_WRITE_DATA == 0 {
+            return ValidDataLengthAccess::Denied;
+        }
+        #[cfg(not(test))]
+        {
+            let subject = unsafe {
+                // SAFETY: The pending create owns ACCESS_STATE through this synchronous call.
+                core::ptr::addr_of_mut!((*self.access_state.as_ptr()).SubjectSecurityContext)
+            };
+            let mut required = wdk_sys::PRIVILEGE_SET {
+                PrivilegeCount: 1,
+                Control: wdk_sys::PRIVILEGE_SET_ALL_NECESSARY,
+                Privilege: [wdk_sys::LUID_AND_ATTRIBUTES {
+                    Luid: wdk_sys::LUID { LowPart: wdk_sys::SE_MANAGE_VOLUME_PRIVILEGE, HighPart: 0 },
+                    Attributes: 0,
+                }],
+            };
+            unsafe {
+                // SAFETY: The retained create owns this captured subject until the balanced unlock.
+                ffi::SeLockSubjectContext(subject);
+            }
+            let enabled = unsafe {
+                // SAFETY: The same subject is locked, and required is exclusive fixed local storage.
+                ffi::SePrivilegeCheck(&mut required, subject, self.access_mode) != 0
+            };
+            unsafe {
+                // SAFETY: All privilege observation has ended; this balances the preceding lock.
+                ffi::SeUnlockSubjectContext(subject);
+            }
+            if enabled {
+                return ValidDataLengthAccess::Granted;
+            }
+        }
+        ValidDataLengthAccess::Denied
     }
 
     /// Checks operation-only rights without turning them into returned handle authority.

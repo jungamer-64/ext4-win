@@ -210,6 +210,9 @@ impl<'a> PreparedCreateRequest<'a> {
             let stack = current.create()?;
             let parameters = stack.parameters();
             parameters.validate_supported_flags()?;
+            if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
+                active.require_kernel_requestor()?;
+            }
             let mut file_object = UninitializedFileObject::decode(file_object)?;
             let device = active.device();
             MountedVolumeDevice::bind_create_vpb(device, &mut file_object)?;
@@ -687,6 +690,8 @@ enum TargetDirectoryLeaf {
 /// Per-handle policy decoded from one create/open request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CreateHandlePolicy {
+    /// Stream lifetime required by this create, independently of per-handle buffering.
+    file_mode: crate::irp::CreateFileMode,
     /// Access explicitly requested for the returned handle.
     granted_access: GrantedAccess,
     /// Virtual access used only to preflight an existing-object operation.
@@ -717,13 +722,14 @@ impl CreateHandlePolicy {
     ) -> DriverResult<Self> {
         let file_object_flags = CreateFileObjectFlags::from_parameters(parameters);
         Ok(Self {
+            file_mode: parameters.file_mode(),
             granted_access,
             existing_operation_access: granted_access
                 .including_for_operation(parameters.existing_operation_required_access()),
             share_access: parameters.share_access(),
-            data_transfer_mode: match parameters.transfer_buffering() {
-                CreateTransferBuffering::IntermediateAllowed => DataTransferMode::Cached,
-                CreateTransferBuffering::NoIntermediate => {
+            data_transfer_mode: match (parameters.file_mode(), parameters.transfer_buffering()) {
+                (crate::irp::CreateFileMode::Ordinary, CreateTransferBuffering::IntermediateAllowed) => DataTransferMode::Cached,
+                (_, CreateTransferBuffering::NoIntermediate) | (crate::irp::CreateFileMode::PagingFile, _) => {
                     DataTransferMode::Direct(NoIntermediateTransfer::from_device(device)?)
                 }
             },
@@ -804,7 +810,7 @@ impl CreateFileObjectFlags {
         if matches!(
             parameters.transfer_buffering(),
             CreateTransferBuffering::NoIntermediate
-        ) {
+        ) || matches!(parameters.file_mode(), crate::irp::CreateFileMode::PagingFile) {
             raw |= wdk_sys::FO_NO_INTERMEDIATE_BUFFERING;
         }
         match parameters.synchronization_mode() {
@@ -1331,6 +1337,13 @@ impl PendingExistingCreateOpen {
             fcb: admission.file_control_block(),
             file_object,
         };
+        if policy.file_mode == crate::irp::CreateFileMode::PagingFile
+            && (admission.residency() != ExistingStreamResidency::FirstOpen
+                || admission.open_count().get() != 1
+                || node_mode != OpenedNodeMode::Direct
+                || policy.regular_file_write_access() != RegularFileWriteAccess::Positional) {
+            return Err(DriverError::ShareAccessConflict);
+        }
         let handle = claim.prepare_handle(node, node_mode, location, policy)?;
         let write_open = match node {
             // Reset admission belongs to the final size plan: it checks image and data sections
@@ -1641,6 +1654,7 @@ fn revalidate_existing_open(
 /// Stages a reset while the operation keeps sole rollback and oplock-backout ownership.
 /// # Errors
 /// Returns gate, read-only, EA, allocation, or ext4 mutation failures before handle publication.
+#[expect(unsafe_code, reason = "the pending first-open claim uniquely retains the pinned FCB until infallible FILE_OBJECT publication")]
 fn finish_existing_create(
     pending: &mut Option<PendingExistingCreateOpen>,
     gate: Option<&PreparedStreamWriteOpen>,
@@ -1651,6 +1665,18 @@ fn finish_existing_create(
         .as_ref()
         .ok_or(DriverError::InternalInvariantViolation)?;
     open.validate_gate(gate)?;
+    if open.policy.file_mode == crate::irp::CreateFileMode::PagingFile {
+        let NodeId::File(file) = open.node else { return Err(DriverError::NotSupported); };
+        let storage = mutation.contiguous_file_storage(file)?;
+        if !storage.length().bytes().is_multiple_of(4096) {
+            return Err(DriverError::NotSupported);
+        }
+        let stream = unsafe {
+            // SAFETY: The rollback-owning first-open claim retains its pinned FCB until attachment.
+            open.claim.file_control_block().as_ref()
+        };
+        stream.install_paging_file(storage, operations.storage_route())?;
+    }
     if let ExistingCreateIntent::Reset {
         reset,
         metadata,
@@ -1727,6 +1753,13 @@ fn open_existing_node(
 ) -> DriverResult<CreateResolution> {
     let node = target.node;
     let parameters = request.parameters();
+    if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
+        let NodeId::File(file) = node else { return Err(DriverError::NotSupported); };
+        let allocation = request.owner.metadata.allocation;
+        if allocation < 0 || u64::try_from(allocation).map_err(|_| DriverError::InvalidParameter)? > mutation.load_file(file)?.size().bytes() {
+            return Err(DriverError::NotSupported);
+        }
+    }
     validate_existing_node_options(node, parameters.target_requirement())?;
     let intent = match disposition {
         CreateDisposition::Create => return Err(DriverError::ObjectNameCollision),
@@ -1922,6 +1955,9 @@ fn create_missing_node(
     name: &Ext4Name,
 ) -> DriverResult<PendingCreatePublication> {
     let parameters = request.parameters();
+    if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
+        return Err(DriverError::NotSupported);
+    }
     let policy = CreateHandlePolicy::from_authorized(
         parameters,
         request.granted_access(),
@@ -1947,11 +1983,22 @@ fn create_missing_node(
         return Err(DriverError::InternalInvariantViolation);
     };
     let target = child_creation_target(parameters.target_requirement(), security);
+    let parent_metadata = mutation.load_node_metadata(NodeId::Directory(parent))?;
+    let tunneled = if matches!(parameters.name_case(), NameCase::Insensitive) && !parent_metadata.is_encrypted() {
+        operations.name_tunnel().find(crate::kernel::name_tunnel::directory_key(parent_metadata), &WindowsName::from_ext4(name)?)?
+    } else { None };
+    let alias = crate::short_name::prepare(mutation, parent, name, tunneled.as_ref().and_then(|cached| cached.alias))?;
     let mut creation = operations.begin_child_creation(mutation, parent, name, target)?;
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
     request.owner.metadata.apply(node, mutation)?;
+    crate::short_name::store(mutation, parent, name, node, alias)?;
+    if let Some(tunneled) = tunneled {
+        let times = mutation.staged_node_metadata(node)?.times();
+        let selected = mutation.node(node)?;
+        mutation.set_times(selected, ext4_core::Ext4Times::new(times.accessed(), times.modified(), times.changed(), Some(tunneled.created)))?;
+    }
     let staged_stream = StagedNodeStreamMetadata::try_from_staged_snapshot(
         crate::metadata::staged_node_metadata(mutation, node)?,
         operations.volume_geometry().cluster_size(),
@@ -1983,22 +2030,11 @@ fn child_creation_target(
         }
         CreateTargetRequirement::Directory => ChildCreationTarget::Directory(
             ext4_core::NewDirectoryMetadata::new(security.owner(), security.permissions()),
-    let parent_metadata = mutation.load_node_metadata(NodeId::Directory(parent))?;
-    let tunneled = if matches!(parameters.name_case(), NameCase::Insensitive) && !parent_metadata.is_encrypted() {
-        operations.name_tunnel().find(crate::kernel::name_tunnel::directory_key(parent_metadata), &WindowsName::from_ext4(name)?)?
-    } else { None };
-    let alias = crate::short_name::prepare(mutation, parent, name, tunneled.as_ref().and_then(|cached| cached.alias))?;
         ),
     }
 }
 
 /// Validates file-vs-directory options for an existing node.
-    crate::short_name::store(mutation, parent, name, node, alias)?;
-    if let Some(tunneled) = tunneled {
-        let times = mutation.staged_node_metadata(node)?.times();
-        let selected = mutation.node(node)?;
-        mutation.set_times(selected, ext4_core::Ext4Times::new(times.accessed(), times.modified(), times.changed(), Some(tunneled.created)))?;
-    }
 /// # Errors
 ///
 /// Returns an error when directory-only or non-directory-only create options contradict `node`.

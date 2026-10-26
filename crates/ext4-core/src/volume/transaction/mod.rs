@@ -897,6 +897,14 @@ impl MutationResolvePass<'_, '_, '_> {
         result
     }
 
+    /// Observes committed initialized contiguous payload without staging a mutation.
+    /// The caller must retain allocation exclusion before using this observation for direct I/O.
+    /// # Errors
+    /// Rejects non-contiguous/uninitialized/protected files and preserves storage failures.
+    pub fn contiguous_file_storage(&mut self, file: FileNodeId) -> Result<super::node::ContiguousFileStorage> {
+        self.mutation.volume.contiguous_file_storage(file)
+    }
+
     /// Observes this pass's latest staged inode metadata.
     ///
     /// This is distinct from `CommittedReadPass`: callers use it to prepare post-commit state,

@@ -49,7 +49,7 @@ pub use mount::{
     ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
-    ChildLookup, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,
+    ChildLookup, ContiguousFileStorage, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,
     FileNode, FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeDataPolicy, NodeId,
     NodeMetadataSnapshot, NodeMetadataUpdate, SymlinkNode, SymlinkNodeId,
 };

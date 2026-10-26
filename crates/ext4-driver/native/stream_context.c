@@ -16,6 +16,7 @@
 #include "irp_forward.h"
 #include "directory_notification.h"
 #include "fsrtl_completion.h"
+#include "paging_file.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
@@ -98,6 +99,7 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     BOOLEAN PagingResourceInitialized;
     BOOLEAN HeaderInitialized;
     BOOLEAN OplockInitialized;
+    EXT4WIN_PAGING_FILE PagingFile;
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_CONTEXT, Header) == 0);
@@ -171,6 +173,60 @@ ext4win_stream_storage_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
     return (volume != NULL) && (ext4win_storage_media_state(volume->RustState) == 0);
+}
+
+BOOLEAN NTAPI
+ext4win_stream_is_paging_file(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    return stream != NULL && InterlockedCompareExchange(&stream->PagingFile.Active, 1, 1) == 1;
+}
+
+/* The Rust first-open claim proves exclusive ownership before this one-time publication. */
+NTSTATUS NTAPI
+ext4win_stream_install_paging_file(PVOID header, PDEVICE_OBJECT lower,
+    LONGLONG physical, LONGLONG length, ULONG sector_size)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    if (stream == NULL || stream->Kind != 1 || lower == NULL || physical < 0 || length <= 0 ||
+        stream->VolumeStream == NULL || !ext4win_stream_storage_available(stream) ||
+        ext4win_storage_close_phase(stream->VolumeStream->RustState) != 0 ||
+        ext4win_storage_io_policy(stream->VolumeStream->RustState) != 0 ||
+        physical > MAXLONGLONG - length || sector_size == 0 ||
+        ((ULONGLONG)physical % sector_size) != 0 || ((ULONGLONG)length % sector_size) != 0 ||
+        stream->Header.FileSize.QuadPart != length ||
+        stream->SectionObjects.DataSectionObject != NULL ||
+        stream->SectionObjects.ImageSectionObject != NULL ||
+        stream->SectionObjects.SharedCacheMap != NULL ||
+        InterlockedCompareExchange(&stream->PagingFile.Active, -1, 0) != 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+    stream->PagingFile.Lower = lower;
+    stream->PagingFile.PhysicalStart = physical;
+    stream->PagingFile.Length = length;
+    stream->PagingFile.SectorSize = sector_size;
+    stream->Header.Flags2 &= (UCHAR)~FSRTL_FLAG2_SUPPORTS_FILTER_CONTEXTS;
+    stream->Header.Flags2 |= FSRTL_FLAG2_IS_PAGING_FILE;
+    stream->Header.IsFastIoPossible = FastIoIsNotPossible;
+    InterlockedExchange(&stream->PagingFile.Active, 1);
+    return STATUS_SUCCESS;
+}
+
+BOOLEAN NTAPI
+ext4win_stream_paging_file_dispatch(PIRP irp, NTSTATUS *status_out)
+{
+    PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
+    PEXT4WIN_STREAM_CONTEXT stream = stack->FileObject == NULL ? NULL :
+        ext4win_stream_from_header(stack->FileObject->FsContext);
+    BOOLEAN available;
+    if (stream != NULL && stream->Kind != 1) { stream = NULL; }
+    available = stream != NULL && stream->VolumeStream != NULL &&
+        ext4win_stream_storage_available(stream) &&
+        ext4win_storage_close_phase(stream->VolumeStream->RustState) < 2 &&
+        ext4win_storage_io_policy(stream->VolumeStream->RustState) <
+            (stack->MajorFunction == IRP_MJ_WRITE ? 1 : 2);
+    return ext4win_paging_dispatch(stream == NULL ? NULL : &stream->PagingFile, irp,
+        available, status_out);
 }
 
 /* Cache/Fast I/O authority is independent from lower storage presence. */
@@ -343,7 +399,7 @@ ext4win_stream_section_callback_stream(
 static VOID
 ext4win_stream_refresh_fast_io_projection(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
-    if ((stream == NULL) || (stream->ByteRangeLocks == NULL) ||
+    if ((stream == NULL) || (stream->PagingFile.Active == 1) || (stream->ByteRangeLocks == NULL) ||
         !FsRtlOplockIsFastIoPossible(&stream->Header.Oplock)) {
         if (stream != NULL) {
             stream->Header.IsFastIoPossible = FastIoIsNotPossible;
@@ -822,6 +878,7 @@ ext4win_stream_cache_initialize(
     if (!ext4win_stream_matches_file_object(stream, file_object)) {
         return STATUS_INVALID_PARAMETER;
     }
+    if (stream->PagingFile.Active == 1) { return STATUS_INVALID_DEVICE_REQUEST; }
     if (!ext4win_stream_ordinary_io_available(stream)) { return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED; }
 
     status = STATUS_SUCCESS;

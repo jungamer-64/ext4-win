@@ -51,7 +51,7 @@ pub use volume::{
     CheckpointLease, CheckpointOperation, CheckpointPublication, ChildLookup, CleanCloseDurability,
     CleanCloseOperation, CleanCloseTransition, CleanJournalDurability, CleanJournalRecordPhase,
     CommitDurability, CommitLease, CommitReadyMutation, CommitRecordPhase, CommittedEpoch,
-    CommittedReadContext, CommittedReadPass, CompletedMount, DataAllocationRun, DeviceWriteAccess,
+    CommittedReadContext, CommittedReadPass, CompletedMount, ContiguousFileStorage, DataAllocationRun, DeviceWriteAccess,
     DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId, DirectoryReadOperation,
     DirectoryReadTransition, DirectoryReader, DirectoryScanCursor, DurableMutation,
     EpochReadOperation, EpochReadPass, EpochSequence, ExternalJournalProbeOperation,
