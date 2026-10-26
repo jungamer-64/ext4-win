@@ -341,7 +341,7 @@ unsafe extern "system" {
     ) -> wdk_sys::NTSTATUS;
 
     /// Copies the fixed signed VCN from the current FSCTL's Type3 buffer under SEH.
-    pub(crate) fn ext4win_capture_starting_vcn(
+    pub(crate) fn ext4win_capture_allocation_start(
         irp: wdk_sys::PIRP,
         value: *mut i64,
     ) -> wdk_sys::NTSTATUS;

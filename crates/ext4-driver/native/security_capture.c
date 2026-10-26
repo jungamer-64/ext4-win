@@ -178,13 +178,14 @@ ext4win_release_requestor_output(_Frees_ptr_opt_ PVOID output)
 /* Fixed Type3 input is snapshotted in requestor context before actor admission. */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS NTAPI
-ext4win_capture_starting_vcn(_In_ PIRP irp, _Out_ PLONGLONG value)
+ext4win_capture_allocation_start(_In_ PIRP irp, _Out_ PLONGLONG value)
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
     NTSTATUS status = STATUS_SUCCESS;
     PVOID source;
     if ((value == NULL) || (stack->MajorFunction != IRP_MJ_FILE_SYSTEM_CONTROL) ||
-        (stack->Parameters.FileSystemControl.FsControlCode != FSCTL_GET_RETRIEVAL_POINTERS) ||
+        ((stack->Parameters.FileSystemControl.FsControlCode != FSCTL_GET_RETRIEVAL_POINTERS) &&
+         (stack->Parameters.FileSystemControl.FsControlCode != FSCTL_GET_VOLUME_BITMAP)) ||
         (stack->Parameters.FileSystemControl.InputBufferLength < sizeof(*value)) ||
         !ext4win_is_requestor_mode_valid(irp->RequestorMode)) { return STATUS_INVALID_PARAMETER; }
     source = stack->Parameters.FileSystemControl.Type3InputBuffer;
