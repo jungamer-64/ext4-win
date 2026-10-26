@@ -13,7 +13,10 @@ mod fscrypt;
 mod inline_data;
 mod namespace;
 mod orphan;
+mod relocation;
 mod staging;
+mod zero_deallocation;
+pub use zero_deallocation::MutationCompletionDurability;
 mod xattr;
 
 pub(super) use orphan::{ORPHAN_METADATA_BUDGET, OrphanBatchCompletion, prepare_orphan_batch};
@@ -350,6 +353,10 @@ struct MetadataMutation<'storage, 'epoch> {
     file_writes: Vec<StagedFileWrite>,
     /// Staged cluster-reference changes to apply after journal commit.
     cluster_deltas: Vec<ClusterReferenceDelta>,
+    /// Inode-owned ranges whose final retirement requires journaled zero images.
+    zero_retirement_ranges: Vec<InodeAllocationClusterRange>,
+    /// Completion cannot acknowledge physical zeroes before their home checkpoint.
+    completion_durability: MutationCompletionDurability,
     /// Superblock free-cluster delta accumulated by this transaction.
     free_clusters_delta: FreeClusterDelta,
     /// Superblock free-inode delta accumulated by this transaction.
@@ -371,6 +378,8 @@ impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
 /// Fully resolved mutation with resource versions and provisional allocation choices.
 #[derive(Debug)]
 pub struct ResolvedMutation {
+    /// Observable durability required before the mutation can be acknowledged.
+    completion_durability: MutationCompletionDurability,
     /// Resource set and versions observed by this resolve pass.
     observed: ObservedResourceVersionSet,
     /// Read dependency, revalidated at reservation and commit without serializing disjoint files.
@@ -1277,6 +1286,8 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
             group_deltas: Vec::new(),
             file_writes: Vec::new(),
             cluster_deltas: Vec::new(),
+            zero_retirement_ranges: Vec::new(),
+            completion_durability: MutationCompletionDurability::JournalCommit,
             free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             volume_label_update: None,
@@ -1503,6 +1514,7 @@ impl MetadataMutation<'_, '_> {
             return Ok(StagedInodeIndex::new(index));
         }
         let raw_inode = self.volume.read_live_inode_record(inode_id)?;
+        self.register_zero_on_deallocation(&raw_inode.parse()?)?;
         self.inode_updates.try_push(raw_inode.into())?;
         Ok(StagedInodeIndex::new(
             self.inode_updates

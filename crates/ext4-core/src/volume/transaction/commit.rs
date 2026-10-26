@@ -332,6 +332,7 @@ impl MetadataMutation<'_, '_> {
             }
         }
         Ok(ResolvedMutation {
+            completion_durability: self.completion_durability,
             observed,
             key_version,
             node_metadata_updates,

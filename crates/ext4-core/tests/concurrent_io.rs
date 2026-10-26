@@ -12,6 +12,8 @@ use sha2::Digest as _;
 mod fast_commit;
 #[path = "concurrent_io/mmp.rs"]
 mod mmp;
+#[path = "concurrent_io/relocation.rs"]
+mod relocation;
 #[path = "concurrent_io/session.rs"]
 mod session;
 #[path = "concurrent_io/trim.rs"]

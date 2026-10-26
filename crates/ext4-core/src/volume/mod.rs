@@ -60,7 +60,7 @@ pub use operation::{
 pub use transaction::{
     CheckpointOperation, CheckpointPublication, CleanJournalDurability, CleanJournalRecordPhase,
     CommitDurability, CommitReadyMutation, CommitRecordPhase, DurableMutation, HomeBlockDurability,
-    JournalPayloadDurability, MutationResolvePass, NamespaceDestination, OrderedDataDurability,
+    JournalPayloadDurability, MutationCompletionDurability, MutationResolvePass, NamespaceDestination, OrderedDataDurability,
     PublishedMutation, ReservedMutation, ResolvedMutation, StorageRequestSequence,
     StorageRequestSequenceStep, TransactionDirectory, TransactionFile, TransactionHardLinkSource,
     TransactionNode, TransactionSymlink,

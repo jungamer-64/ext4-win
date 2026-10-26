@@ -141,6 +141,7 @@ impl MetadataMutation<'_, '_> {
     /// # Errors
     /// Rejects unsupported storage and inconsistent allocation references.
     pub(super) fn release_inode_data(&mut self, inode: &Inode) -> Result<()> {
+        self.register_zero_on_deallocation(inode)?;
         match inode.storage() {
             InodeStorage::FastSymlink(_) | InodeStorage::InlineData(_) => Ok(()),
             InodeStorage::UnsupportedBlockMap => Err(Error::UnsupportedBlockMap),
@@ -162,6 +163,9 @@ impl MetadataMutation<'_, '_> {
     pub(super) fn reclaim_inode(&mut self, raw: &RawInodeRecord<Vec<u8>>) -> Result<()> {
         self.release_inline_attribute_values(raw)?;
         if let Some(block) = raw.xattr_block()? {
+            if raw.flags()?.zero_on_deallocation() {
+                self.protect_zero_retirement(block)?;
+            }
             self.release_xattr_block_ref(block)?;
         }
         self.free_inode(raw.id())?;
@@ -198,50 +202,71 @@ impl MetadataMutation<'_, '_> {
                         .and_then(|start| start.checked_add(u64::from(bit)))
                         .ok_or(Error::ArithmeticOverflow)?,
                 );
-                let first_block = self.volume.superblock.first_block_of_cluster(cluster)?;
-                if first_block.get() >= self.volume.superblock.block_count().as_u64() {
-                    break;
+                if let Some(block) = self.claim_cluster(cluster, position, bitmap_index)? {
+                    return Ok(block);
                 }
-                if self.volume.superblock.blocks_in_cluster(cluster)?
-                    != self.volume.superblock.blocks_per_cluster().as_u32()
-                {
-                    continue;
-                }
-                let occupied = {
-                    let bitmap = self
-                        .block_bitmap_updates
-                        .get(bitmap_index)
-                        .ok_or(Error::InvalidSuperblock)?;
-                    cluster_bitmap_bit_state(bitmap.bytes.as_slice(), position)?
-                };
-                if occupied == BitmapBitState::Used || self.allocation.contains(cluster) {
-                    continue;
-                }
-                // Home writes precede the metadata commit. A committed owner must remain intact
-                // until that commit retires its references, even if the final bitmap is free.
-                if self.volume.committed_clusters()?.count(cluster) != 0 {
-                    continue;
-                }
-                if self.staged_cluster_reference_count(cluster)? != 0 {
-                    return Err(Error::ClusterReferenceConflict);
-                }
-                let bitmap = self
-                    .block_bitmap_updates
-                    .get_mut(bitmap_index)
-                    .ok_or(Error::InvalidSuperblock)?;
-                set_cluster_bitmap_bit(
-                    bitmap.bytes.as_mut_slice(),
-                    position,
-                    BitmapBitState::Used,
-                )?;
-                self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(-1))?;
-                self.free_clusters_delta = self.free_clusters_delta.checked_add(-1)?;
-                self.record_cluster_reference_delta(cluster, 1)?;
-                self.stage_cluster_zeroes(cluster)?;
-                return Ok(first_block);
             }
         }
         Err(Error::NoSpace)
+    }
+
+    /// Claims one requested cluster through the same bitmap and reference authority as ordinary
+    /// allocation. A bitmap observation never reserves its destination for a later relocation.
+    /// # Errors
+    /// Returns range, allocation exclusion, occupied destination or accounting failures.
+    pub(super) fn allocate_cluster_at(&mut self, cluster: ClusterAddress) -> Result<BlockAddress> {
+        let position = ClusterBitmapPosition::from_cluster(&self.volume.superblock, cluster)?;
+        let descriptor = BlockGroupDescriptor::read_from(
+            &mut self.volume.device,
+            &self.volume.superblock,
+            position.group(),
+        )?;
+        let bitmap = self.ensure_block_bitmap_update(position.group(), &descriptor)?;
+        self.claim_cluster(cluster, position, bitmap)?
+            .ok_or(Error::NoSpace)
+    }
+
+    /// Claims a full unowned cluster, or reports a destination unavailable without changing it.
+    /// # Errors
+    /// Returns malformed geometry, inconsistent staged ownership or accounting/allocation failure.
+    fn claim_cluster(
+        &mut self,
+        cluster: ClusterAddress,
+        position: ClusterBitmapPosition,
+        bitmap_index: usize,
+    ) -> Result<Option<BlockAddress>> {
+        let first_block = self.volume.superblock.first_block_of_cluster(cluster)?;
+        if self.volume.superblock.blocks_in_cluster(cluster)?
+            != self.volume.superblock.blocks_per_cluster().as_u32()
+        {
+            return Ok(None);
+        }
+        let bitmap = self
+            .block_bitmap_updates
+            .get(bitmap_index)
+            .ok_or(Error::InvalidSuperblock)?;
+        if cluster_bitmap_bit_state(bitmap.bytes.as_slice(), position)? == BitmapBitState::Used
+            || self.allocation.contains(cluster)
+        {
+            return Ok(None);
+        }
+        // Ordered home writes cannot reuse an owner retired by this uncommitted transaction.
+        if self.volume.committed_clusters()?.count(cluster) != 0 {
+            return Ok(None);
+        }
+        if self.staged_cluster_reference_count(cluster)? != 0 {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        let bitmap = self
+            .block_bitmap_updates
+            .get_mut(bitmap_index)
+            .ok_or(Error::InvalidSuperblock)?;
+        set_cluster_bitmap_bit(bitmap.bytes.as_mut_slice(), position, BitmapBitState::Used)?;
+        self.record_group_free_clusters_delta(position.group(), FreeClusterDelta::from_i64(-1))?;
+        self.free_clusters_delta = self.free_clusters_delta.checked_add(-1)?;
+        self.record_cluster_reference_delta(cluster, 1)?;
+        self.stage_cluster_zeroes(cluster)?;
+        Ok(Some(first_block))
     }
 
     /// Stages zeroes for every block covered by a newly allocated cluster.
@@ -360,6 +385,7 @@ impl MetadataMutation<'_, '_> {
             set_cluster_bitmap_bit(bitmap.bytes.as_mut_slice(), position, BitmapBitState::Free)?;
             self.record_group_free_clusters_delta(group, FreeClusterDelta::from_i64(1))?;
             self.free_clusters_delta = self.free_clusters_delta.checked_add(1)?;
+            self.zero_retired_cluster(cluster)?;
             Ok(())
         } else {
             Err(Error::ClusterReferenceConflict)

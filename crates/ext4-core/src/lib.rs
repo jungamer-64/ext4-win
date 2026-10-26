@@ -62,7 +62,7 @@ pub use volume::{
     MmpRenewal, MmpRenewingLease, MmpTime, MmpTransition, MountAccess, MountFailure,
     MountMediaOutcome, MountOperation, MountProbeOperation, MountProbeTransition, MountTransition,
     MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveContext,
-    MutationResolveOperation, MutationResolvePass, MutationResolveReady, MutationResolveTransition,
+    MutationCompletionDurability, MutationResolveOperation, MutationResolvePass, MutationResolveReady, MutationResolveTransition,
     MutationResource, NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot,
     NodeMetadataUpdate, ObservedResourceVersionSet, OperationEvent, OrderedDataDurability,
     PendingTrim, PreparedKeyChange, PreparedTrim, ProbedMount, PublishedMutation, ReadOnlyRecovery,

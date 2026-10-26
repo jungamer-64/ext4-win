@@ -49,6 +49,9 @@ pub(in crate::volume) fn prepare_orphan_batch(
         return Err(Error::InvalidOrphanTracking);
     }
     let mut inode = RecoverableOrphanInode::parse(raw)?;
+    // Secure retirement contributes complete journaled data images in addition to metadata.
+    // One data-reference retirement bounds each batch before journal-credit admission below.
+    let release_budget = if inode.raw().flags()?.zero_on_deallocation() { 1 } else { RELEASE_BLOCK_BUDGET };
     let data = inode.data()?;
     let cutoff = match &inode {
         RecoverableOrphanInode::Unlinked(_) => 0,
@@ -82,7 +85,7 @@ pub(in crate::volume) fn prepare_orphan_batch(
                 superblock.cluster_of_block(BlockAddress::new(last))?,
             )?
             .group();
-            for offset in 0..core::cmp::min(available, RELEASE_BLOCK_BUDGET) {
+            for offset in 0..core::cmp::min(available, release_budget) {
                 let block =
                     BlockAddress::new(last.checked_sub(offset).ok_or(Error::ArithmeticOverflow)?);
                 if ClusterBitmapPosition::from_cluster(
@@ -107,6 +110,9 @@ pub(in crate::volume) fn prepare_orphan_batch(
                 released.try_push(block)?;
             }
             for block in &released {
+                if inode.raw().flags()?.zero_on_deallocation() {
+                    mutation.protect_zero_retirement(*block)?;
+                }
                 mutation.release_cluster_reference(*block)?;
             }
             inode
@@ -138,7 +144,7 @@ pub(in crate::volume) fn prepare_orphan_batch(
         OrphanProgress::Remaining(allocation)
     };
     let (clusters, mut next_superblock) = mutation.committed_cluster_state()?;
-    let mut metadata = mutation.metadata_images(None)?.into_blocks();
+    let mut metadata = mutation.recovery_images()?.into_blocks();
     if matches!(progress, OrphanProgress::Complete) {
         match target.tracking.source {
             OrphanSource::File {
