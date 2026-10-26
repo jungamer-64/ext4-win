@@ -335,9 +335,15 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     MountedVolumeDevice::unregister_shutdown_notification(self.device);
                     MountedVolumeDevice::complete_dismount(self.device);
                 }
-                OperationTransition::Complete(
-                    owned.prepare_result(result.map(|()| IrpCompletion::EMPTY)),
-                )
+                let dismounted = result.is_ok() && self.terminal == CleanCloseTerminal::Dismount;
+                let mut completion = owned.prepare_result(result.map(|()| IrpCompletion::EMPTY));
+                if dismounted && let Some(owner) = self.owner {
+                    completion = completion.with_volume_event(
+                        owner,
+                        crate::kernel::volume_event::VolumeEvent::Dismount,
+                    );
+                }
+                OperationTransition::Complete(completion)
             }
             (
                 CloseState::Draining {

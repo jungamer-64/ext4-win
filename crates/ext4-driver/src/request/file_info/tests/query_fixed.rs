@@ -22,7 +22,12 @@ fn unnamed_stream_information_has_exact_windows_record_and_preserves_short_outpu
     );
     let mut expected = [0; 38];
     expected[4] = 14;
-    expected[24..].copy_from_slice(&[58, 0, 58, 0, 36, 0, 68, 0, 65, 0, 84, 0, 65, 0]);
+    for (byte, value) in expected[24..]
+        .iter_mut()
+        .zip([58, 0, 58, 0, 36, 0, 68, 0, 65, 0, 84, 0, 65, 0])
+    {
+        *byte = value;
+    }
     assert_eq!(&output[..38], &expected);
     assert_eq!(&output[38..], &[0xA5; 2]);
     assert_eq!(

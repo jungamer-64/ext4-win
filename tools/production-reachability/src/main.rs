@@ -128,6 +128,10 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("operational ETW unregister", "ext4win_trace_unregister"),
     ("native full-EA admission", "IoCheckEaBufferValidity"),
     (
+        "native volume lifecycle notification",
+        "FsRtlNotifyVolumeEvent",
+    ),
+    (
         "native reparse admission",
         "FsRtlValidateReparsePointBuffer",
     ),
@@ -2434,6 +2438,7 @@ mod tests {
              ext4win_trace_write\n\
              ext4win_trace_unregister\n\
              IoCheckEaBufferValidity\n\
+             FsRtlNotifyVolumeEvent\n\
              FsRtlValidateReparsePointBuffer\n\
              RtlCreateAcl\n\
              RtlAddAce\n\

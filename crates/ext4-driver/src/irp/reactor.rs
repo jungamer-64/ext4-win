@@ -5857,7 +5857,8 @@ mod tests {
                     | crate::irp::PassiveWorkCompletion::CleanupOplock(result) => {
                         let _result = result;
                     }
-                    crate::irp::PassiveWorkCompletion::Uninitialize { owned, result } => {
+                    crate::irp::PassiveWorkCompletion::NotifyVolume { owned, result }
+                    | crate::irp::PassiveWorkCompletion::Uninitialize { owned, result } => {
                         let _owned = owned;
                         let _result = result;
                     }

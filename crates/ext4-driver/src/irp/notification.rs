@@ -10,6 +10,7 @@ use super::{
     lifecycle::KernelIrp,
     lower::{CompletionRundown, CompletionRundownLease},
 };
+use crate::kernel::volume_event::VolumeNotification;
 use crate::{
     kernel::{
         fatal::KernelWideInconsistency,
@@ -116,6 +117,8 @@ enum NotificationCallback {
 
 /// Mutually exclusive terminal ownership selected before the actor releases its slot.
 enum NotificationJob {
+    /// A committed volume transition must notify outside the actor before IRP completion.
+    Volume(KernelIrp, wdk_sys::NTSTATUS, VolumeNotification),
     /// Notify upper drivers of a prepared status.
     Complete(KernelIrp, wdk_sys::NTSTATUS),
     /// Submit the original query-remove IRP; lower drivers then own completion.
@@ -290,6 +293,10 @@ pub(super) struct NotificationPermit {
 unsafe impl Send for NotificationPermit {}
 
 impl NotificationPermit {
+    /// Uses the request's reserved PASSIVE_LEVEL worker for an advisory committed-volume event.
+    fn queue_volume(self, irp: KernelIrp, status: wdk_sys::NTSTATUS, event: VolumeNotification) {
+        self.queue_job(NotificationJob::Volume(irp, status, event));
+    }
     /// Queues terminal notification after actor borrows, cancellation and handle lanes are gone.
     pub(super) fn queue(self, irp: KernelIrp, status: wdk_sys::NTSTATUS) {
         self.queue_job(NotificationJob::Complete(irp, status));
@@ -418,6 +425,10 @@ unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_s
     };
     // No slot access follows release; reentrant completion may reuse the same work item.
     match job {
+        NotificationJob::Volume(irp, status, event) => {
+            event.deliver();
+            let _status = irp.finish_completion(status);
+        }
         NotificationJob::Complete(irp, status) => {
             let _status = irp.finish_completion(status);
         }
@@ -440,6 +451,25 @@ pub(super) enum IrpNotification {
     Deferred(NonNull<super::reactor::CompletionReactor>),
 }
 impl IrpNotification {
+    /// Volume transitions always own a reserved ordinary worker; dispatch rejections cannot
+    /// publish transitions and paging requests never carry volume events.
+    pub(super) fn queue_volume(
+        self,
+        irp: KernelIrp,
+        status: wdk_sys::NTSTATUS,
+        event: Option<VolumeNotification>,
+    ) {
+        let Some(event) = event else {
+            self.queue(irp, status);
+            return;
+        };
+        match self {
+            Self::Worker(permit) => permit.queue_volume(irp, status, event),
+            Self::Dispatch | Self::Deferred(_) => {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            }
+        }
+    }
     /// Dispatch routes complete immediately; actor routes consume their prepared worker.
     #[expect(
         unsafe_code,

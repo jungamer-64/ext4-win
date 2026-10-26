@@ -232,6 +232,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native PnP volume interface publication and ownership contract",
         ),
         (
+            "volume-event",
+            "volume_event.tests.c",
+            "native mount event failure and temporary stream ownership contract",
+        ),
+        (
             "fast-io-transfer",
             "fast_io_transfer.tests.c",
             "native Fast I/O transfer admission contract",

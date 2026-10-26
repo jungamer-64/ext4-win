@@ -439,10 +439,16 @@ impl MountRequestOperation {
                 };
                 self.query_next_external_candidate(context)
             }
-            MountTransition::Complete(Ok(completed)) => Self::complete(
-                owned,
-                Self::publish_mount(admission, devices, completed, self.trace, catalog),
-            ),
+            MountTransition::Complete(Ok(completed)) => {
+                match Self::publish_mount(admission, devices, completed, self.trace, catalog) {
+                    Ok(device) => OperationTransition::Complete(
+                        owned
+                            .prepare_completion(IrpCompletion::EMPTY)
+                            .with_mount_event(device),
+                    ),
+                    Err(error) => Self::complete(owned, Err(error)),
+                }
+            }
             MountTransition::Complete(Err(ext4_core::MountFailure {
                 reason: Error::InvalidMagic | Error::InvalidSuperblock,
                 media: ext4_core::MountMediaOutcome::Unchanged,
@@ -616,7 +622,7 @@ impl MountRequestOperation {
         completed: Box<ext4_core::CompletedMount>,
         trace: OperationalTrace,
         catalog: &mut crate::administration::MountDirectory<'_>,
-    ) -> DriverResult<IrpCompletion> {
+    ) -> DriverResult<crate::state::KernelDevice> {
         let _output_buffer_length = admission.output_buffer_length().as_usize();
         let Some(driver_object) = admission.file_system_device().driver_object() else {
             return Err(DriverError::InvalidParameter);
@@ -661,7 +667,7 @@ impl MountRequestOperation {
             admission.vpb(),
             admission.target_device(),
         ) {
-            Ok(()) => Ok(IrpCompletion::EMPTY),
+            Ok(()) => Ok(device),
             Err(error) => {
                 unsafe {
                     // SAFETY: Initialization rejected the unpublished device and retained no VCB
@@ -2470,6 +2476,8 @@ pub(crate) enum VolumeControlRequestKind {
 enum VolumeControlOperationState {
     /// IRP target and lifecycle transition have not yet been decoded.
     Ready(OwnedIrp),
+    /// The native worker owns the IRP while announcing exclusive-lock intent.
+    Announcing(crate::request::file_system_control::DirectVolumeTarget),
     /// Every shared stream cache is being coherently flushed and purged before volume lock.
     CacheDraining {
         /// Unique top-level completion authority.
@@ -2540,8 +2548,32 @@ impl VolumeControlOperation {
     }
 
     /// Completes and consumes the lifecycle IRP.
-    fn complete(owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
-        OperationTransition::Complete(owned.prepare_result(result))
+    fn complete(mut owned: OwnedIrp, result: DriverResult<IrpCompletion>) -> OperationTransition {
+        let failed_lock = if result.is_err() {
+            // A malformed rejected request has no event target; its original failure remains
+            // authoritative and advisory observation has no independent recovery owner.
+            owned
+                .request()
+                .with_active(|active| -> DriverResult<_> {
+                    let stack = active.current_stack()?;
+                    if stack.file_system_control()?.fs_control_code()
+                        == crate::irp::FsControlCode::LockVolume
+                    {
+                        Ok(Some(stack.file_object()?.address()))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            None
+        };
+        let mut completion = owned.prepare_result(result);
+        if let Some(file) = failed_lock {
+            completion = completion
+                .with_volume_event(file, crate::kernel::volume_event::VolumeEvent::LockFailed);
+        }
+        OperationTransition::Complete(completion)
     }
 
     /// Publishes the prevalidated lock or dismount transition after successful lower flush.
@@ -2642,6 +2674,29 @@ impl MountedVolumeOperation for VolumeControlOperation {
         event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        if let CompletionEvent::PassiveCompleted(
+            crate::irp::PassiveWorkCompletion::NotifyVolume { owned, result },
+        ) = event
+        {
+            let VolumeControlOperationState::Announcing(target) =
+                core::mem::replace(&mut self.state, VolumeControlOperationState::Terminal)
+            else {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
+                )
+                .bugcheck();
+            };
+            if let Err(error) = result {
+                return Self::complete(owned, Err(error));
+            }
+            let prepared = match access.prepare_lock_volume(target.owner()) {
+                Ok(prepared) => prepared,
+                Err(error) => return Self::complete(owned, Err(error)),
+            };
+            let (transition, drain) = prepared.into_parts();
+            let devices = access.storage_route();
+            return self
+                .continue_lock_cache_drain(owned, target, transition, devices, drain, access);
+        }
         let event = match event {
             CompletionEvent::Core(event) => event,
             CompletionEvent::BarrierReleased(permit) => {
@@ -2750,7 +2805,18 @@ impl MountedVolumeOperation for VolumeControlOperation {
                             if result.is_ok() {
                                 MountedVolumeDevice::publish_volume_lock(target.device(), false);
                             }
-                            Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
+                            if result.is_ok() {
+                                OperationTransition::Complete(
+                                    owned
+                                        .prepare_completion(IrpCompletion::EMPTY)
+                                        .with_volume_event(
+                                            target.owner(),
+                                            crate::kernel::volume_event::VolumeEvent::Unlock,
+                                        ),
+                                )
+                            } else {
+                                Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
+                            }
                         }
                         VolumeControlRequestKind::IsMounted => {
                             let result = access.ensure_mounted();
@@ -2765,15 +2831,15 @@ impl MountedVolumeOperation for VolumeControlOperation {
                             Self::complete(owned, result.map(|()| IrpCompletion::EMPTY))
                         }
                         VolumeControlRequestKind::Lock => {
-                            let prepared = match access.prepare_lock_volume(target.owner()) {
-                                Ok(prepared) => prepared,
-                                Err(error) => return Self::complete(owned, Err(error)),
-                            };
-                            let (transition, drain) = prepared.into_parts();
-                            let devices = access.storage_route();
-                            self.continue_lock_cache_drain(
-                                owned, target, transition, devices, drain, access,
-                            )
+                            self.state = VolumeControlOperationState::Announcing(target);
+                            OperationTransition::SubmitPassiveWork {
+                                work: crate::irp::PassiveWork::NotifyVolume {
+                                    owned,
+                                    file: target.owner(),
+                                    event: crate::kernel::volume_event::VolumeEvent::Lock,
+                                },
+                                suspended: self,
+                            }
                         }
                     }
                 }
@@ -2868,6 +2934,10 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     access,
                 ),
             },
+            VolumeControlOperationState::Announcing(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             VolumeControlOperationState::Terminal => OperationTransition::Retired,
         }
     }
@@ -2883,6 +2953,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
         let _target = match &self.state {
             VolumeControlOperationState::Flushing { target, .. } => *target,
             VolumeControlOperationState::Ready(_)
+            | VolumeControlOperationState::Announcing(_)
             | VolumeControlOperationState::CacheDraining { .. }
             | VolumeControlOperationState::Waiting { .. }
             | VolumeControlOperationState::Terminal => return,

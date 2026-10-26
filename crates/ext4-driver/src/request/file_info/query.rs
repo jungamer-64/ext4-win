@@ -273,8 +273,10 @@ fn pack_stream_information(
         return Ok(IrpCompletion::EMPTY);
     }
     const NAME: [u16; 7] = [58, 58, 36, 68, 65, 84, 65];
-    let name_offset = core::mem::offset_of!(wdk_sys::FILE_STREAM_INFORMATION, StreamName);
-    let length = name_offset + NAME.len() * size_of::<u16>();
+    const NAME_OFFSET: usize = core::mem::offset_of!(wdk_sys::FILE_STREAM_INFORMATION, StreamName);
+    const LENGTH: usize = NAME_OFFSET + NAME.len() * size_of::<u16>();
+    let name_offset = NAME_OFFSET;
+    let length = LENGTH;
     let bytes = output
         .get_mut(..length)
         .ok_or(DriverError::BufferTooSmall)?;

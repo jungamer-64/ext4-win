@@ -22,3 +22,4 @@ mod storage_admission;
 pub(crate) mod stream;
 pub(crate) mod time;
 pub(crate) mod volume_discovery;
+pub(crate) mod volume_event;

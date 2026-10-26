@@ -4,6 +4,7 @@
 
 #include "discovery_io.h"
 #include "volume_publication.h"
+#include "volume_event.h"
 
 _IRQL_requires_(PASSIVE_LEVEL)
 NTSTATUS NTAPI

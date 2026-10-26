@@ -70,6 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/operational_trace.h");
     println!("cargo:rerun-if-changed={VOLUME_DISCOVERY_SOURCE}");
     println!("cargo:rerun-if-changed=native/volume_publication.h");
+    println!("cargo:rerun-if-changed=native/volume_event.h");
     println!("cargo:rerun-if-changed=native/discovery_io.h");
     println!("cargo:rerun-if-changed={NAME_EXPRESSION_SOURCE}");
     println!("cargo:rerun-if-changed={FILE_OBJECT_FLAGS_SOURCE}");

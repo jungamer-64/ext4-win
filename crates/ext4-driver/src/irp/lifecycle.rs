@@ -1424,6 +1424,7 @@ impl OwnedIrp {
         drop(context);
         target.irp.write_status_block(completion);
         PreparedIrpCompletion {
+            volume_event: None,
             #[cfg(not(test))]
             notification,
             irp: target.irp,
@@ -1481,6 +1482,7 @@ impl OwnedIrp {
         };
         target.irp.write_status_and_information(status, information);
         PreparedIrpCompletion {
+            volume_event: None,
             #[cfg(not(test))]
             notification,
             irp: target.irp,
@@ -1521,6 +1523,7 @@ impl OwnedIrp {
             let completion = IrpCompletion::from_error(error);
             target.irp.write_status_block(completion);
             return Err(PreparedIrpCompletion {
+                volume_event: None,
                 #[cfg(not(test))]
                 notification,
                 irp: target.irp,
@@ -1631,6 +1634,8 @@ unsafe impl Send for OwnedIrp {}
 #[derive(Debug)]
 #[must_use]
 pub(crate) struct PreparedIrpCompletion {
+    /// Advisory volume event delivered by the terminal worker before it releases the IRP.
+    volume_event: Option<crate::kernel::volume_event::VolumeNotification>,
     /// Pre-admitted worker slot retained through upper completion callbacks.
     #[cfg(not(test))]
     notification: super::notification::IrpNotification,
@@ -1702,6 +1707,25 @@ impl PnpSubmission {
 }
 
 impl PreparedIrpCompletion {
+    /// Holds the published mounted device through its advisory mount notification.
+    pub(crate) fn with_mount_event(mut self, device: KernelDevice) -> Self {
+        self.volume_event = Some(crate::kernel::volume_event::VolumeNotification::mounted(
+            device,
+        ));
+        self
+    }
+    /// Attaches notification for a completed volume transition. The original IRP retains this
+    /// exact FILE_OBJECT until the terminal worker consumes both notification and completion.
+    pub(crate) fn with_volume_event(
+        mut self,
+        file: KernelFileObject,
+        event: crate::kernel::volume_event::VolumeEvent,
+    ) -> Self {
+        self.volume_event = Some(crate::kernel::volume_event::VolumeNotification::new(
+            file, event,
+        ));
+        self
+    }
     /// Transfers terminal notification to the preallocated PASSIVE_LEVEL worker.
     ///
     /// The reactor has already released actor borrows and the top-level handle lane. Upper
@@ -1710,9 +1734,15 @@ impl PreparedIrpCompletion {
     /// prepared request result; notification and callback rundown can finish asynchronously.
     pub(super) fn notify(self) -> NTSTATUS {
         #[cfg(not(test))]
-        self.notification.queue(self.irp, self.status);
+        self.notification
+            .queue_volume(self.irp, self.status, self.volume_event);
         #[cfg(test)]
-        let _status = self.irp.finish_completion(self.status);
+        {
+            if let Some(event) = self.volume_event {
+                event.deliver();
+            }
+            let _status = self.irp.finish_completion(self.status);
+        }
         self.status
     }
 }

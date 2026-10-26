@@ -35,6 +35,15 @@ use super::scheduler::SlotId;
 /// One captured native call whose resource lease owns every identity through worker completion.
 #[derive(Debug)]
 pub(crate) enum PassiveWork {
+    /// A lock announcement can reenter the filesystem; its worker retains the original IRP.
+    NotifyVolume {
+        /// Original request returned to the actor after delivery.
+        owned: super::OwnedIrp,
+        /// Exact captured direct-volume identity.
+        file: crate::state::KernelFileObject,
+        /// Lifecycle observation.
+        event: crate::kernel::volume_event::VolumeEvent,
+    },
     /// Mount-owned exclusive open may reenter the filesystem through native volume recognition.
     OpenExternalJournal {
         /// Unique selected native device identity.
@@ -146,6 +155,13 @@ pub(crate) enum PassiveWork {
 /// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// Original request returned after its advisory announcement.
+    NotifyVolume {
+        /// Original request retained through cancellation or delivery.
+        owned: super::OwnedIrp,
+        /// Worker admission can fail before an event is announced.
+        result: DriverResult<()>,
+    },
     /// Exclusive journal handle, retained until the mount consumes or releases it.
     OpenExternalJournal(DriverResult<crate::kernel::external_journal::ExclusiveExternalJournal>),
     /// No transfer was admitted; the executor retains this request for bounded admission retry.
@@ -214,6 +230,7 @@ impl PassiveWork {
         authorize: impl FnOnce() -> DriverResult<()>,
     ) -> DriverResult<()> {
         match self {
+            Self::NotifyVolume { .. } => Ok(()),
             Self::OpenExternalJournal { .. }
             | Self::Identity(_)
             | Self::Policy(_)
@@ -297,6 +314,13 @@ impl PassiveWork {
     /// Executes the sole native call selected before the actor suspended.
     pub(super) fn execute(self, retrying: bool) -> PassiveWorkCompletion {
         match self {
+            Self::NotifyVolume { owned, file, event } => {
+                crate::kernel::volume_event::VolumeNotification::new(file, event).deliver();
+                PassiveWorkCompletion::NotifyVolume {
+                    owned,
+                    result: Ok(()),
+                }
+            }
             Self::OpenExternalJournal { selected, access } => {
                 PassiveWorkCompletion::OpenExternalJournal(
                     crate::kernel::external_journal::ExclusiveExternalJournal::open(
@@ -395,6 +419,10 @@ impl PassiveWork {
     /// Preserves the selected operation kind when worker preparation fails before queueing.
     pub(super) fn failed(self, error: DriverError) -> PassiveWorkCompletion {
         match self {
+            Self::NotifyVolume { owned, .. } => PassiveWorkCompletion::NotifyVolume {
+                owned,
+                result: Err(error),
+            },
             Self::OpenExternalJournal { .. } => {
                 PassiveWorkCompletion::OpenExternalJournal(Err(error))
             }
@@ -437,6 +465,7 @@ impl PassiveWork {
     pub(super) fn cancel_before_execution(self) -> super::reactor::CompletionEvent {
         match self {
             work @ (Self::Read { .. }
+            | Self::NotifyVolume { .. }
             | Self::Write { .. }
             | Self::Mdl { .. }
             | Self::Uninitialize { .. }) => super::reactor::CompletionEvent::PassiveCompleted(
@@ -746,4 +775,73 @@ unsafe extern "C" fn passive_work_item(device: wdk_sys::PDEVICE_OBJECT, context:
         CompletionReactor::enqueue_passive_completion(reactor, address);
     }
     // The actor may reclaim or reuse storage immediately; no envelope access is permitted here.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Errors
+    /// Returns invalid fixture identities before any worker owns the request.
+    /// # Panics
+    /// Panics if advisory delivery or worker-admission failure loses terminal IRP ownership.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "scoped fixtures retain the device, file and IRP until terminal notification"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture setup is fallible; assertions check completion ownership and status"
+    )]
+    fn volume_event_worker_returns_the_request_on_delivery_and_admission_failure()
+    -> DriverResult<()> {
+        let mut raw_device = wdk_sys::DEVICE_OBJECT::default();
+        let mut raw_file = wdk_sys::FILE_OBJECT::default();
+        // SAFETY: Both scoped native fixtures outlive every worker/completion below.
+        let device = unsafe { crate::state::KernelDevice::from_raw(&mut raw_device) }
+            .ok_or(DriverError::InvalidParameter)?;
+        // SAFETY: The scoped file fixture remains live through delivery.
+        let file = unsafe { crate::state::KernelFileObject::from_raw(&mut raw_file) }
+            .ok_or(DriverError::InvalidParameter)?;
+        for denied in [false, true] {
+            let mut irp = wdk_sys::IRP::default();
+            // SAFETY: The fixture retains exclusive IRP storage through final notification.
+            let owned = unsafe { super::super::OwnedIrp::from_test_raw(device, &mut irp) }
+                .ok_or(DriverError::InvalidParameter)?;
+            let work = PassiveWork::NotifyVolume {
+                owned,
+                file,
+                event: crate::kernel::volume_event::VolumeEvent::Lock,
+            };
+            let completion = if denied {
+                work.failed(DriverError::AccessDenied)
+            } else {
+                work.execute(false)
+            };
+            let PassiveWorkCompletion::NotifyVolume { owned, result } = completion else {
+                return Err(DriverError::InternalInvariantViolation);
+            };
+            assert_eq!(
+                result,
+                if denied {
+                    Err(DriverError::AccessDenied)
+                } else {
+                    Ok(())
+                }
+            );
+            let status = owned
+                .prepare_result(result.map(|()| super::super::IrpCompletion::EMPTY))
+                .notify();
+            assert_eq!(
+                status,
+                if denied {
+                    wdk_sys::STATUS_ACCESS_DENIED
+                } else {
+                    wdk_sys::STATUS_SUCCESS
+                }
+            );
+        }
+        Ok(())
+    }
 }
