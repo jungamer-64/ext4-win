@@ -1883,6 +1883,8 @@ unsafe impl Send for RawVolumeOperation {}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
     /// Privileged allocation-origin query, with requestor authority sealed before queueing.
+    /// Counted Windows pathname validation without namespace mutation.
+    IsPathnameValid,
     GetRetrievalPointerBase,
     /// Cc notification of already initialized data, including after handle cleanup.
     AdvanceValidDataLength,
@@ -1955,6 +1957,11 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
                     let base = origin
                         .checked_div(sector)
                         .filter(|_| origin.is_multiple_of(sector))
+                ImmediateRequestKind::IsPathnameValid => {
+                    let mut request = owned.request();
+                    crate::request::file_system_control::authorize_path_handle(&mut request, access)
+                        .and_then(|()| crate::request::fsctl::is_pathname_valid(request))
+                }
                         .ok_or(DriverError::NotSupported)?;
                     let base = i64::try_from(base).map_err(|_| DriverError::InvalidParameter)?;
                     owned.request().with_active(|active| {

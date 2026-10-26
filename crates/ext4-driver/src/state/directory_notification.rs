@@ -59,6 +59,8 @@ impl DirectoryChangeAction {
 /// Committed namespace mutation prepared before its ext4 transaction is published.
 #[derive(Debug)]
 pub(crate) struct DirectoryChange {
+    /// Removing-link data admitted before staging and cached only after durable publication.
+    pub(super) tunnel: Option<Box<crate::kernel::name_tunnel::TunnelRemoval>>,
     /// Full synthetic target name used only by the FsRtl notifier package.
     pub(super) target: DirectoryNotificationTarget,
     /// FILE_NOTIFY_CHANGE_FILE_NAME or FILE_NOTIFY_CHANGE_DIR_NAME.
@@ -68,6 +70,21 @@ pub(crate) struct DirectoryChange {
 }
 
 impl DirectoryChange {
+    /// Captures cache data before mutation; publication remains tied to this durable event.
+    /// # Errors
+    /// Returns namespace metadata, encoding or allocation failures before staging writes.
+    pub(crate) fn with_tunnel(mut self, read: &mut impl ext4_core::CommittedReadPass, parent: DirectoryNodeId, name: &Ext4Name, node: NodeId) -> DriverResult<Self> {
+        let removal = if let NodeId::Directory(directory) = node {
+            if self.action == DirectoryChangeAction::Removed {
+                Some(crate::kernel::name_tunnel::TunnelRemoval::directory(read, directory)?)
+            } else { None }
+        } else { crate::kernel::name_tunnel::TunnelRemoval::prepare(read, parent, name, node)? };
+        self.tunnel = match removal {
+            Some(removal) => Some(memory::boxed_try_with(|| Ok(removal))?),
+            None => None,
+        };
+        Ok(self)
+    }
     /// Builds a namespace change event for one parent/name/node tuple.
     /// # Errors
     ///
@@ -85,6 +102,7 @@ impl DirectoryChange {
         };
         Ok(Self {
             target: DirectoryNotificationTarget::new(parent, name)?,
+            tunnel: None,
             completion_filter,
             action,
         })
@@ -107,6 +125,7 @@ impl DirectoryChange {
             | wdk_sys::FILE_NOTIFY_CHANGE_EA;
         Ok(Self {
             target: DirectoryNotificationTarget::new(parent, name)?,
+            tunnel: None,
             completion_filter: FILTER,
             action: DirectoryChangeAction::Modified,
         })

@@ -895,6 +895,9 @@ pub(crate) fn admit_owned(
         Admission::Administration | Admission::Mount(_) | Admission::QueryRemove => {
             HandleRequestClass::Device
         }
+                    crate::irp::FsControlCode::IsPathnameValid => {
+                        Admission::Immediate(ImmediateRequestKind::IsPathnameValid)
+                    }
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
             HandleRequestClass::Paging
         }

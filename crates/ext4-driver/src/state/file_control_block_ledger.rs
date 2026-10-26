@@ -3122,7 +3122,8 @@ impl VolumeControlBlock {
     }
 
     /// Reports one committed namespace name change to pending directory watchers.
-    pub(crate) fn report_directory_change(&self, change: DirectoryChange) {
+    pub(crate) fn report_directory_change(&self, mut change: DirectoryChange) {
+        if let Some(removal) = change.tunnel.take() { self.name_tunnel.removed(*removal); }
         self.directory_change_notifier.report(change);
     }
 

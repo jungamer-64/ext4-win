@@ -30,7 +30,7 @@ pub use disk_format::acl::{AclGroup, AclPermissions, AclUser, Ext4Access, PosixA
 pub use disk_format::inode::{
     Ext4Gid, Ext4LinkCount, Ext4Owner, Ext4Permissions, Ext4Security, Ext4Times, Ext4Timestamp,
     Ext4Uid, FileAllocationSize, FileOffset, FileSize, InodeId, NewDirectoryMetadata,
-    NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget,
+    NewFileMetadata, NewSymlinkMetadata, ReadBytes, SymlinkTarget, InodeGeneration,
 };
 pub use disk_format::name::{DirectoryCasefold, Ext4Name};
 pub use disk_format::superblock::{

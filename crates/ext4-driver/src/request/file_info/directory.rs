@@ -282,6 +282,8 @@ struct DirectoryMetadata {
     file: FileMetadata,
     /// Windows EA byte charge, without copying EA values into the wire record.
     ea_size: u32,
+    /// Alias observed from the same current directory relation.
+    short_name: Option<crate::short_name::ShortName>,
 }
 
 /// Packs one variable-length directory information record.
@@ -300,6 +302,7 @@ fn pack_directory_record(
     let DirectoryMetadata {
         file: metadata,
         ea_size,
+        short_name,
     } = metadata;
     clear_record(buffer, start, layout.unpadded_size)?;
     LittleEndianOutput::new(buffer)
@@ -351,8 +354,12 @@ fn pack_directory_record(
         };
         LittleEndianOutput::new(buffer).write_u32(record_field_offset(start, offset)?, value)?;
     }
-    if let Some(offset) = class.short_name_length_offset() {
-        LittleEndianOutput::new(buffer).write_u8(record_field_offset(start, offset)?, 0)?;
+    if let Some(offset) = class.short_name_length_offset()
+        && let Some(short_name) = short_name {
+            let short_name = short_name.windows_name()?;
+            LittleEndianOutput::new(buffer).write_u8(record_field_offset(start, offset)?,
+                u8::try_from(utf16_byte_len(short_name.utf16())?).map_err(|_| DriverError::InvalidParameter)?)?;
+            write_utf16(buffer, field_offset(start, offset.checked_add(2).ok_or(DriverError::InvalidParameter)?)?, short_name.utf16())?;
     }
     if let Some(offset) = class.reparse_tag_offset() {
         LittleEndianOutput::new(buffer).write_u32(
@@ -534,6 +541,8 @@ fn pack_name_record(
 /// Packing progress belongs to the admitted request, including across metadata I/O.
 #[derive(Debug)]
 pub(crate) struct DirectoryQuery {
+    /// Exact directory retained by the enumeration handle.
+    directory: DirectoryNodeId,
     /// Retains the handle-selected expression independently of later IRP captures.
     pattern: crate::memory::DriverSharedLease<DirectoryPattern>,
     /// Requested Windows wire layout.
@@ -556,9 +565,11 @@ pub(crate) struct DirectoryQuery {
     previous: Option<usize>,
 }
 
-/// A matching record whose output space has been reserved before metadata is read.
+/// A matching record whose alias and output capacity belong to one committed entry observation.
 #[derive(Debug)]
 pub(crate) struct DirectoryRecord {
+    /// Alias from the same committed entry observation, if it remains visible.
+    short_name: Option<crate::short_name::ShortName>,
     /// Validated identity and opaque continuation for this reserved record.
     entry: ext4_core::ScannedDirectoryEntry,
     /// Windows-visible name retained while metadata is loaded.
@@ -567,12 +578,6 @@ pub(crate) struct DirectoryRecord {
     layout: DirectoryRecordLayout,
     /// Partial first record reports overflow and does not consume the entry.
     extent: DirectoryRecordExtent,
-}
-impl DirectoryRecord {
-    /// Identity already validated by the directory engine, used only for additional metadata.
-    pub(crate) fn node(&self) -> NodeId {
-        *self.entry.entry().node()
-    }
 }
 
 /// Filtering either consumes a skipped name, reserves one record, or leaves it for the next call.
@@ -584,7 +589,7 @@ impl DirectoryRecord {
 pub(crate) enum DirectorySelection {
     /// The name does not match or cannot be represented on Windows.
     Skip,
-    /// Output space exists; metadata may now be requested.
+    /// Matching and output capacity are admitted for serialization.
     Record(DirectoryRecord),
     /// No further complete record fits; the entry remains unpublished.
     Full,
@@ -643,6 +648,7 @@ impl DirectoryQuery {
         })?;
         Ok((
             Self {
+                directory,
                 pattern,
                 class: stack.information_class(),
                 length: stack.length(),
@@ -663,22 +669,27 @@ impl DirectoryQuery {
         self.cursor
     }
     /// Names-only wire records require no timestamps, attributes, or reparse metadata.
-    pub(crate) const fn needs_metadata(&self) -> bool {
-        !matches!(self.class, DirectoryInformationClass::Names)
+    pub(crate) fn needs_metadata(&self) -> bool {
+        !matches!(self.class, DirectoryInformationClass::Names) || !matches!(self.pattern.get(), DirectoryPattern::All)
     }
 
-    /// Name filtering and capacity decisions precede any metadata request.
+    /// Directory identity for entry-bound alias projection in the same read epoch.
+    pub(crate) const fn directory(&self) -> DirectoryNodeId { self.directory }
+
+    /// Applies long-name and alias matching before admitting a wire record's capacity.
     /// # Errors
     /// Returns record-size overflow or an output buffer smaller than the fixed header.
     pub(crate) fn select(
         &mut self,
         entry: ext4_core::ScannedDirectoryEntry,
+        short_name: Option<crate::short_name::ShortName>,
     ) -> DriverResult<DirectorySelection> {
         let Ok(name) = WindowsName::from_ext4(entry.entry().name()) else {
             self.cursor = *entry.next_cursor();
             return Ok(DirectorySelection::Skip);
         };
-        if !self.pattern.get().matches(&name)? {
+        let alias_matches = match short_name { Some(alias) => self.pattern.get().matches_alias(&alias.windows_name()?)?, None => false };
+        if !self.pattern.get().matches(&name)? && !alias_matches {
             self.cursor = *entry.next_cursor();
             return Ok(DirectorySelection::Skip);
         }
@@ -693,6 +704,7 @@ impl DirectoryQuery {
             return Ok(DirectorySelection::Full);
         };
         Ok(DirectorySelection::Record(DirectoryRecord {
+            short_name,
             entry,
             name,
             layout,
@@ -715,12 +727,14 @@ impl DirectoryQuery {
         metadata: WindowsNodeMetadata,
         ea_size: u32,
     ) -> DriverResult<bool> {
+        let short_name = record.short_name;
         self.append(
             record,
-            Some(DirectoryMetadata {
+            if matches!(self.class, DirectoryInformationClass::Names) { None } else { Some(DirectoryMetadata {
                 file: metadata.into(),
                 ea_size,
-            }),
+                short_name,
+            }) },
         )
     }
 

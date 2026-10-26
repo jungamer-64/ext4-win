@@ -1983,11 +1983,22 @@ fn child_creation_target(
         }
         CreateTargetRequirement::Directory => ChildCreationTarget::Directory(
             ext4_core::NewDirectoryMetadata::new(security.owner(), security.permissions()),
+    let parent_metadata = mutation.load_node_metadata(NodeId::Directory(parent))?;
+    let tunneled = if matches!(parameters.name_case(), NameCase::Insensitive) && !parent_metadata.is_encrypted() {
+        operations.name_tunnel().find(crate::kernel::name_tunnel::directory_key(parent_metadata), &WindowsName::from_ext4(name)?)?
+    } else { None };
+    let alias = crate::short_name::prepare(mutation, parent, name, tunneled.as_ref().and_then(|cached| cached.alias))?;
         ),
     }
 }
 
 /// Validates file-vs-directory options for an existing node.
+    crate::short_name::store(mutation, parent, name, node, alias)?;
+    if let Some(tunneled) = tunneled {
+        let times = mutation.staged_node_metadata(node)?.times();
+        let selected = mutation.node(node)?;
+        mutation.set_times(selected, ext4_core::Ext4Times::new(times.accessed(), times.modified(), times.changed(), Some(tunneled.created)))?;
+    }
 /// # Errors
 ///
 /// Returns an error when directory-only or non-directory-only create options contradict `node`.

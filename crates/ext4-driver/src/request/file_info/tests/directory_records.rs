@@ -3,6 +3,34 @@ use crate::request::file_info::test_support::*;
 use alloc::vec;
 
 /// # Panics
+/// Fails if DOS aliases disappear from the documented short-name fields of any Both layout.
+#[test]
+fn both_directory_classes_serialize_the_bound_alias() {
+    let result = (|| -> DriverResult<()> {
+        let Some(file) = test_metadata(super::FileMetadataKind::File) else { return Err(DriverError::InternalInvariantViolation); };
+        let name = WindowsName::from_ext4(&ext4_core::Ext4Name::new(b"long file name.txt")?)?;
+        let alias = crate::short_name::ShortName::from_utf16(&[76, 79, 78, 71, 70, 73, 126, 49, 46, 84, 88, 84])?;
+        for class in [DirectoryInformationClass::Both, DirectoryInformationClass::IdBoth,
+            DirectoryInformationClass::IdExtdBoth, DirectoryInformationClass::Id64ExtdBoth] {
+            let layout = DirectoryRecordLayout::new(class, &name)?;
+            let mut output = vec![0xA5; layout.padded_size];
+            pack_directory_record(&mut output, 0, class, 1, &name,
+                DirectoryMetadata { file, ea_size: 0, short_name: Some(alias) }, layout)?;
+            let offset = class.short_name_length_offset().ok_or(DriverError::InvalidParameter)?;
+            assert_eq!(output.get(offset), Some(&24));
+            let start = offset.checked_add(2).ok_or(DriverError::InvalidParameter)?;
+            let end = start.checked_add(24).ok_or(DriverError::InvalidParameter)?;
+            let stored = output.get(start..end).ok_or(DriverError::InvalidParameter)?;
+            for (pair, expected) in stored.as_chunks::<2>().0.iter().zip(b"LONGFI~1.TXT") {
+                assert_eq!(*pair, [*expected, 0]);
+            }
+        }
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
+}
+
+/// # Panics
 /// Fails if directory metadata truncates a 64-bit EOF or reports logical size as physical charge.
 #[test]
 fn directory_metadata_preserves_large_eof_and_allocation_charge() {
@@ -23,7 +51,7 @@ fn directory_metadata_preserves_large_eof_and_allocation_charge() {
             class,
             1,
             &name,
-            DirectoryMetadata { file, ea_size: 0 },
+            DirectoryMetadata { file, ea_size: 0, short_name: None },
             layout,
         )?;
         assert_eq!(
@@ -62,7 +90,7 @@ fn directory_metadata_returns_regular_file_ea_charge() {
                 class,
                 1,
                 &name,
-                DirectoryMetadata { file, ea_size: 29 },
+                DirectoryMetadata { file, ea_size: 29, short_name: None },
                 layout,
             )?;
             assert_eq!(le_u32(&buffer, DIRECTORY_EA_SIZE_OFFSET), Some(29));
@@ -185,7 +213,8 @@ fn identity_directory_records_preserve_exact_windows_layouts() {
                 &name,
                 super::DirectoryMetadata {
                     file: metadata,
-                    ea_size: 44
+                    ea_size: 44,
+                    short_name: None,
                 },
                 layout,
             )

@@ -617,6 +617,8 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         &root,
         windows_host::NamespaceAccess::RestorePrivilege,
     )?;
+    println!("live filesystem I/O: verify short-name opens, collisions, hard links and tunneling");
+    windows_host::verify_short_name_lifecycle(&root, windows_host::NamespaceAccess::RestorePrivilege)?;
     println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
     let descriptor = windows_host::file_security(&alpha)?;

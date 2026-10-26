@@ -252,6 +252,8 @@ pub(crate) enum FsControlCode {
     DeleteReparsePoint,
     /// ext4win private fscrypt add-key control.
     AddEncryptionKey,
+    /// Validates a counted Windows path against the mounted namespace codec.
+    IsPathnameValid,
     /// ext4win private fscrypt remove-key control.
     RemoveEncryptionKey,
     /// ext4win private fscrypt key-status control.
@@ -322,6 +324,7 @@ impl FsControlCode {
                 | Self::OplockBreakAckNoLevel2
                 | Self::RequestFilterOplock
                 | Self::RequestOplock
+            FSCTL_IS_PATHNAME_VALID => Ok(Self::IsPathnameValid),
         )
     }
 
@@ -390,6 +393,7 @@ fn structured_oplock_action(input: &[u8]) -> OplockControlAction {
     };
     let flags = u32::from_le_bytes(*flags);
     if flags & REQUEST_OPLOCK_INPUT_FLAG_ACK != 0 && flags & REQUEST_OPLOCK_INPUT_FLAG_REQUEST == 0
+            | Self::IsPathnameValid
     {
         OplockControlAction::BreakContinuation
     } else {
@@ -464,6 +468,8 @@ const EXT4WIN_ENABLE_VERITY_FUNCTION: wdk_sys::ULONG = 0x903;
 /// Builds a buffered, unrestricted Windows filesystem control code.
 const fn buffered_file_system_control(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
     (FILE_DEVICE_FILE_SYSTEM << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_BUFFERED
+/// `FSCTL_IS_PATHNAME_VALID`, whose input is `PATHNAME_BUFFER`.
+const FSCTL_IS_PATHNAME_VALID: wdk_sys::ULONG = buffered_file_system_control(11);
 }
 
 /// Builds an unrestricted Windows filesystem control code with no transfer buffer.
@@ -634,6 +640,8 @@ pub(crate) enum DirectoryInformationClass {
     IdExtdBoth,
     /// Windows `FileId64ExtdDirectoryInformation`.
     Id64Extd,
+    /// Windows `FileAlternateNameInformation`, for the selected directory link.
+    AlternateName,
     /// Windows `FileId64ExtdBothDirectoryInformation`.
     Id64ExtdBoth,
 }
@@ -656,6 +664,7 @@ impl DirectoryInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileIdExtdBothDirectoryInformation => {
                 Ok(Self::IdExtdBoth)
             }
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAlternateNameInformation => Ok(Self::AlternateName),
             wdk_sys::_FILE_INFORMATION_CLASS::FileId64ExtdDirectoryInformation => {
                 Ok(Self::Id64Extd)
             }

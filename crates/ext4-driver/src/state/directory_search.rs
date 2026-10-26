@@ -116,6 +116,17 @@ impl DirectoryPattern {
             Self::Expression(expression) => expression.matches(name),
         }
     }
+
+    /// POSIX exact searches retain their long-name namespace; Windows searches also match aliases.
+    /// # Errors
+    /// Returns native expression failure before enumeration progress is published.
+    pub(crate) fn matches_alias(&self, name: &WindowsName) -> DriverResult<bool> {
+        match self {
+            Self::All => Ok(true),
+            Self::Expression(expression) if expression.matching == NameCase::Insensitive => expression.matches(name),
+            Self::Expression(_) => Ok(false),
+        }
+    }
 }
 
 /// Owned expression normalized once for the Windows comparison table selected at open.

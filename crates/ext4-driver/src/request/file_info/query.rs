@@ -27,6 +27,8 @@ enum QueryFilePlan {
         node: NodeId,
         /// Exact selected hard link, when create supplied one.
         location: OpenedLocation,
+        /// Selects the stored per-link alias rather than a volume-relative long name.
+        alternate: bool,
     },
     /// FILE_OBJECT state was packed into driver-owned storage.
     Complete {
@@ -121,7 +123,7 @@ pub(super) fn query_file_information(
                     completion,
                 });
             }
-            QueryFileInformationClass::Name | QueryFileInformationClass::NormalizedName => {
+            QueryFileInformationClass::Name | QueryFileInformationClass::NormalizedName | QueryFileInformationClass::AlternateName => {
                 if information_class == QueryFileInformationClass::NormalizedName {
                     opened_file.require_normalized_name_access()?;
                 }
@@ -132,6 +134,7 @@ pub(super) fn query_file_information(
                     length,
                     node: opened_file.node(),
                     location: opened_file.location().try_to_owned_location()?,
+                    alternate: information_class == QueryFileInformationClass::AlternateName,
                 });
             }
             QueryFileInformationClass::HardLink => {
@@ -182,7 +185,22 @@ pub(super) fn query_file_information(
             length,
             node,
             location,
+            alternate,
         } => {
+            if alternate {
+                let OpenedLocation::DirectoryEntry { parent, name } = location else {
+                    return Err(DriverError::ObjectNameNotFound);
+                };
+                let live = read.lookup_child(parent, &name)?;
+                if !matches!(live, ext4_core::ChildLookup::Found(child) if *child.node() == node) {
+                    return Err(DriverError::ObjectNameNotFound);
+                }
+                let alias = crate::short_name::visible_alias(read, parent, &name, node)?
+                    .ok_or(DriverError::ObjectNameNotFound)?.windows_name()?;
+                return request.with_active(|active| {
+                    pack_name_information(active.buffered_output(length)?, alias.utf16())?.completion()
+                });
+            }
             let name = volume_relative_name(read, node, &location)?;
             return request.with_active(|active| {
                 let buffer = active.buffered_output(length)?;
@@ -252,6 +270,7 @@ pub(super) fn query_file_information(
             | QueryFileInformationClass::Ea
             | QueryFileInformationClass::Name
             | QueryFileInformationClass::NormalizedName
+            | QueryFileInformationClass::AlternateName
             | QueryFileInformationClass::HardLink => Err(DriverError::InternalInvariantViolation),
         }
     })

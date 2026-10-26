@@ -1,6 +1,6 @@
 //! QueryDirectory owns validated walk dependencies and unpublished output across completions.
 use super::*;
-use crate::request::file_info::{DirectoryQuery, DirectoryRecord, DirectorySelection};
+use crate::request::file_info::{DirectoryQuery, DirectorySelection};
 use ext4_core::{DirectoryReadOperation, DirectoryReadTransition};
 
 /// The next event belongs exclusively to traversal or to one reserved record's metadata.
@@ -17,7 +17,7 @@ enum DirectoryPhase {
         /// Decoded traversal resumes only after the reserved record is packed.
         walk: DirectoryReadOperation,
         /// Matching name with capacity reserved in the request output.
-        record: DirectoryRecord,
+        record: ext4_core::ScannedDirectoryEntry,
         /// Only this record's unfinished metadata reads are retained.
         read: EpochReadOperation,
     },
@@ -136,25 +136,19 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                         DirectoryReadTransition::Entry {
                             entry,
                             continuation,
-                        } => match self.query.select(entry) {
+                        } if self.query.needs_metadata() => {
+                            let read = match continuation.entry_read(access.mounted_profile(), *entry.entry().node()) {
+                                Ok(read) => read,
+                                Err(error) => return self.fail(error.into()),
+                            };
+                            self.phase = DirectoryPhase::Metadata { walk: continuation, record: entry, read };
+                        }
+                        DirectoryReadTransition::Entry { entry, continuation } => match self.query.select(entry, None) {
                             Ok(DirectorySelection::Skip) => {
                                 self.phase = DirectoryPhase::Walking(continuation)
                             }
                             Ok(DirectorySelection::Full) => return self.finish(None),
                             Ok(DirectorySelection::Record(record)) => {
-                                if self.query.needs_metadata() {
-                                    let read = match continuation
-                                        .entry_read(access.mounted_profile(), record.node())
-                                    {
-                                        Ok(read) => read,
-                                        Err(error) => return self.fail(error.into()),
-                                    };
-                                    self.phase = DirectoryPhase::Metadata {
-                                        walk: continuation,
-                                        record,
-                                        read,
-                                    };
-                                } else {
                                     match self.query.append_name(record) {
                                         Ok(true) => return self.finish(None),
                                         Ok(false) => {
@@ -162,7 +156,6 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                                         }
                                         Err(error) => return self.fail(error),
                                     }
-                                }
                             }
                             Err(error) => return self.fail(error),
                         },
@@ -183,11 +176,13 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                         Ok::<_, DriverError>(read.run(event, context, &mut self.crypto, |pass| {
                             let metadata = ext4_core::CommittedReadPass::load_node_metadata(
                                 pass,
-                                record.node(),
+                                *record.entry().node(),
                             )?;
                             let xattrs =
-                                ext4_core::CommittedReadPass::read_xattrs(pass, record.node())?;
-                            Ok((metadata, xattrs))
+                                ext4_core::CommittedReadPass::read_xattrs(pass, *record.entry().node())?;
+                            let alias = crate::short_name::visible_alias(pass, self.query.directory(), record.entry().name(), *record.entry().node());
+                            if let Err(DriverError::Core(error)) = alias { return Err(error); }
+                            Ok((metadata, xattrs, alias))
                         }))
                     });
                     let transition = match transition {
@@ -207,7 +202,14 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                                 suspended: self,
                             };
                         }
-                        ReadTransition::Complete(Ok((metadata, xattrs))) => {
+                        ReadTransition::Complete(Ok((metadata, xattrs, alias))) => {
+                            let alias = match alias { Ok(alias) => alias, Err(error) => return self.fail(error) };
+                            let record = match self.query.select(record, alias) {
+                                Ok(DirectorySelection::Skip) => { self.phase = DirectoryPhase::Walking(walk); event = OperationEvent::Admitted; continue; }
+                                Ok(DirectorySelection::Full) => return self.finish(None),
+                                Ok(DirectorySelection::Record(record)) => record,
+                                Err(error) => return self.fail(error),
+                            };
                             let metadata = match crate::metadata::WindowsNodeMetadata::from_ext4(
                                 metadata, &xattrs,
                             ) {

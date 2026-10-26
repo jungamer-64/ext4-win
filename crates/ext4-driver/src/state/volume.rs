@@ -7,6 +7,8 @@ use super::*;
 /// Native owner pointers borrow this allocation through shared references. Epoch and lifecycle
 /// mutation belongs to the separate reactor-owned fields of [`MountedVolumeBinding`].
 pub(crate) struct VolumeControlBlock {
+    /// FsRtl's advisory per-volume filename tunneling owner.
+    pub(super) name_tunnel: crate::kernel::name_tunnel::NameTunnel,
     /// Write-only operational event capability inherited from the driver registration owner.
     pub(super) trace: OperationalTrace,
     /// Volume-wide opaque FsRtl notification state. This field drops before filesystem state so
@@ -566,6 +568,7 @@ impl MountedVolumeBinding {
         })?;
         let mut volume = memory::boxed_try_with(|| {
             Ok(VolumeControlBlock {
+                name_tunnel: crate::kernel::name_tunnel::NameTunnel::try_new()?,
                 trace,
                 directory_change_notifier: DirectoryChangeNotifier::uninitialized(),
                 file_control_blocks: FileControlBlockLedger::try_new()?,
@@ -624,6 +627,10 @@ pub(crate) struct MountedVolumeAccess<'volume> {
 }
 
 impl MountedVolumeAccess<'_> {
+    /// Borrows advisory tunneling without granting ext4 namespace mutation authority.
+    pub(crate) fn name_tunnel(&self) -> &crate::kernel::name_tunnel::NameTunnel {
+        &self.volume.name_tunnel
+    }
     /// Pins the UUID identity table only for metadata/security operation admission.
     /// # Errors
     /// Returns finite reference-budget exhaustion.

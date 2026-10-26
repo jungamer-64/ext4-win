@@ -134,6 +134,11 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     (
         "native reparse admission",
         "FsRtlValidateReparsePointBuffer",
+    ("native tunnel initialization", "FsRtlInitializeTunnelCache"),
+    ("native tunnel admission", "FsRtlAddToTunnelCache"),
+    ("native tunnel lookup", "FsRtlFindInTunnelCache"),
+    ("native tunnel release", "FsRtlDeleteTunnelCache"),
+    ("native directory tunnel retirement", "FsRtlDeleteKeyFromTunnelCache"),
     ),
     ("native ACL initialization", "RtlCreateAcl"),
     ("native ACE placement", "RtlAddAce"),
@@ -2445,6 +2450,11 @@ mod tests {
              RtlCreateSecurityDescriptor\n\
              RtlAbsoluteToSelfRelativeSD\n\
              EtwRegister\n\
+             FsRtlInitializeTunnelCache\n\
+             FsRtlAddToTunnelCache\n\
+             FsRtlFindInTunnelCache\n\
+             FsRtlDeleteTunnelCache\n\
+             FsRtlDeleteKeyFromTunnelCache\n\
              EtwEventEnabled\n\
              EtwWrite\n\
              EtwUnregister\n\

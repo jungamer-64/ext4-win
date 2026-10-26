@@ -81,6 +81,7 @@ mod set_path_tests;
 
 /// Result of one restartable set-information resolve pass.
 #[derive(Debug)]
+#[expect(clippy::large_enum_variant, reason = "the bounded publication carries prepared notifications inline and cannot add allocation after durable commit")]
 pub(crate) enum SetFileResolution {
     /// No ext4 mutation was staged; all requested control-plane work is complete.
     Complete(IrpCompletion),
@@ -1215,6 +1216,7 @@ impl PreparedHardLinkMutation {
                 target_parent,
                 &self.target_name,
                 NamespaceDestination::Vacant,
+        let alias = crate::short_name::prepare(mutation, self.target_parent, &self.target_name, None)?;
             )?,
             PreparedNamespaceDestination::Replace { existing_name } => mutation.create_hard_link(
                 source,
@@ -1235,6 +1237,7 @@ impl PreparedHardLinkMutation {
 fn prepare_hard_link_destination(
     operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
+        crate::short_name::store(mutation, self.target_parent, &self.target_name, self.source_node, alias)?;
     source_node: NodeId,
     target_parent: DirectoryNodeId,
     target_name: &Ext4Name,
@@ -1288,7 +1291,8 @@ fn prepare_hard_link_destination(
     let existing_name = target.name().try_to_owned_name()?;
     let changes = if target.name() == target_name {
         HardLinkDirectoryChanges {
-            first: DirectoryChange::hard_link_replaced(target_parent, target_name)?,
+            first: DirectoryChange::hard_link_replaced(target_parent, target_name)?
+                .with_tunnel(read, target_parent, target.name(), target_node)?,
             second: None,
         }
     } else {
@@ -1298,7 +1302,7 @@ fn prepare_hard_link_destination(
                 target.name(),
                 target_node,
                 DirectoryChangeAction::Removed,
-            )?,
+            )?.with_tunnel(read, target_parent, target.name(), target_node)?,
             second: Some(DirectoryChange::new(
                 target_parent,
                 target_name,
@@ -1473,6 +1477,7 @@ enum PreparedRename {
     },
 }
 
+#[expect(clippy::large_enum_variant, reason = "prepared notification ownership moves directly to publication without fallible allocation after commit")]
 /// Fully resolved rename staged only after its exact parent oplock plan is authorized.
 #[expect(
     clippy::large_enum_variant,
@@ -1513,6 +1518,8 @@ impl PreparedRenameMutation {
         request: RenameMutation,
         operations: &mut MountedVolumeAccess<'_>,
         read: &mut impl CommittedReadPass,
+        /// Advisory destination metadata retained until the same mutation can apply it.
+        tunneled: Option<crate::kernel::name_tunnel::TunneledName>,
         owned: &PendingIrpLease<'_>,
         mapping: &ext4_security::IdentityMap,
     ) -> DriverResult<Self> {
@@ -1555,7 +1562,7 @@ impl PreparedRenameMutation {
                                 child.name(),
                                 source_node,
                                 DirectoryChangeAction::Removed,
-                            )?)
+                            )?.with_tunnel(read, target_parent, child.name(), source_node)?)
                         } else {
                             None
                         },
@@ -1600,7 +1607,7 @@ impl PreparedRenameMutation {
                         child.name(),
                         *child.node(),
                         DirectoryChangeAction::Removed,
-                    )?),
+                    )?.with_tunnel(read, target_parent, child.name(), *child.node())?),
                 )
             }
         };
@@ -1615,7 +1622,7 @@ impl PreparedRenameMutation {
                 } else {
                     DirectoryChangeAction::RenamedOldName
                 },
-            )?,
+            )?.with_tunnel(read, source_parent, &source_name, source_node)?,
             new_source_name: match &destination {
                 RenameNamespaceAction::Coalesce { existing_name }
                     if existing_name == &target_name =>
@@ -1654,6 +1661,10 @@ impl PreparedRenameMutation {
                 parent: target_parent,
                 name: target_name,
             },
+        let parent_metadata = read.load_node_metadata(NodeId::Directory(target_parent))?;
+        let tunneled = if matches!(source_node, NodeId::File(_)) && !parent_metadata.is_encrypted() {
+            operations.name_tunnel().find(crate::kernel::name_tunnel::directory_key(parent_metadata), &WindowsName::from_ext4(&target_name)?)?
+        } else { None };
             notifications,
         })
     }
@@ -1667,6 +1678,7 @@ impl PreparedRenameMutation {
     }
 
     /// Stages the authorized rename and returns its allocation-free publication state.
+            tunneled,
     /// # Errors
     ///
     /// Returns an error when the epoch state changed or the ext4 transaction cannot stage writes.
@@ -1692,12 +1704,15 @@ impl PreparedRenameMutation {
             RenameNamespaceAction::Move(destination) => {
                 mutation.rename_child(
                     source_parent,
+            tunneled,
                     &source_name,
                     target_parent,
                     &target_name,
                     match &destination {
                         PreparedNamespaceDestination::Vacant => NamespaceDestination::Vacant,
                         PreparedNamespaceDestination::Replace { existing_name } => {
+        let alias = crate::short_name::prepare(mutation, target_parent, &target_name, tunneled.as_ref().and_then(|cached| cached.alias))?;
+        crate::short_name::forget(mutation, source_parent, &source_name, source_node)?;
                             NamespaceDestination::Replace { existing_name }
                         }
                     },
@@ -1740,6 +1755,12 @@ impl PreparedRenameMutation {
 pub(crate) struct RenameDirectoryNameChanges {
     /// Existing target entry removed by a replace-capable rename.
     replaced_target: Option<DirectoryChange>,
+        crate::short_name::store(mutation, target_parent_id, &target_name, source_node, alias)?;
+        if let Some(tunneled) = tunneled {
+            let times = mutation.staged_node_metadata(source_node)?.times();
+            let selected = mutation.node(source_node)?;
+            mutation.set_times(selected, Ext4Times::new(times.accessed(), times.modified(), times.changed(), Some(tunneled.created)))?;
+        }
     /// Source entry under its former name.
     old_source_name: DirectoryChange,
     /// Source entry under its new name.

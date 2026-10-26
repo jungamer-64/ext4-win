@@ -112,6 +112,10 @@ impl NodeId {
 pub struct NodeMetadataSnapshot {
     /// Identity and kind validated from the same inode as every remaining field.
     node: NodeId,
+    /// Allocation incarnation, independent from the reusable inode number.
+    generation: crate::disk_format::inode::InodeGeneration,
+    /// Whether inode-owned names or contents are protected by fscrypt.
+    encrypted: bool,
     /// Logical payload length, including holes and unwritten ranges.
     size: FileSize,
     /// Allocation charge including inode-owned metadata blocks.
@@ -166,6 +170,8 @@ impl NodeMetadataSnapshot {
         };
         Self {
             node,
+            generation: inode.generation(),
+            encrypted: inode.protection().is_encrypted(),
             size: inode.size(),
             allocation_size: inode.allocation_size(),
             security: inode.security(),
@@ -183,6 +189,18 @@ impl NodeMetadataSnapshot {
     #[must_use]
     pub const fn node(self) -> NodeId {
         self.node
+    }
+
+    /// Identifies the observed allocation incarnation of this inode number.
+    #[must_use]
+    pub const fn generation(self) -> crate::disk_format::inode::InodeGeneration {
+        self.generation
+    }
+
+    /// Reports whether publishing plaintext filename metadata would bypass fscrypt.
+    #[must_use]
+    pub const fn is_encrypted(self) -> bool {
+        self.encrypted
     }
 
     /// Payload eligibility from the same inode/epoch as the remaining metadata.

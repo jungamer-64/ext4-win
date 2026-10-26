@@ -3,6 +3,40 @@
 use super::*;
 
 impl MutationResolvePass<'_, '_, '_> {
+    /// Checks layout capacity without allocating blocks, value inodes or staging writes.
+    ///
+    /// A positive result admits representation only; allocation and I/O can still fail when
+    /// the caller subsequently stores the attribute in this mutation.
+    /// # Errors
+    /// Returns malformed existing attributes, inode policy or allocation failures.
+    pub fn xattr_fits(
+        &mut self,
+        node: NodeId,
+        name: XattrName,
+        value: XattrValue,
+    ) -> Result<bool> {
+        self.edit(|pass| {
+            if matches!(pass.mutation.volume.superblock.xattr_mutation(), XattrMutationSupport::Disabled) {
+                return Ok(false);
+            }
+            let raw = pass.mutation.raw_inode_for_policy(node.inode())?;
+            let mut set = pass.mutation.xattr_set_for_raw_inode(&raw)?;
+            set.public_mut().insert(name, value)?;
+            let width = usize::try_from(pass.mutation.volume.superblock.block_size().bytes())
+                .map_err(|_| Error::ArithmeticOverflow)?;
+            match xattr_storage::XattrStoragePlan::for_inode(
+                &set,
+                raw.inline_xattr_region()?.len(),
+                width,
+                pass.mutation.volume.superblock.attribute_value_storage(),
+            ) {
+                Ok(_) => Ok(true),
+                Err(Error::NoSpace) => Ok(false),
+                Err(error) => Err(error),
+            }
+        })
+    }
+
     /// Sets or replaces one ext4 extended attribute.
     /// Access ACL values synchronize inode rwx; a header-only ACL removes either reserved ACL slot.
     ///

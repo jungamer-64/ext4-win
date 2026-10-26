@@ -2311,6 +2311,8 @@ pub use identity::*;
 
 mod directory;
 pub use directory::{DirectoryCasefoldError, query_directory_casefold, set_directory_casefold};
+mod short_names;
+pub use short_names::verify_short_name_lifecycle;
 
 mod trim;
 pub use trim::{TrimError, TrimSubmission, trim_volume};

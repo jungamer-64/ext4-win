@@ -22,6 +22,7 @@ mod lifecycle_control {
 mod memory;
 mod metadata;
 mod namespace;
+mod short_name;
 mod request;
 mod security_descriptor;
 mod state;

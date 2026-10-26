@@ -247,6 +247,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native FsRtl file-lock completion delegation contract",
         ),
         (
+            "tunnel-cache",
+            "tunnel_cache.tests.c",
+            "native tunnel lifetime, counted-name, opaque creation-time and miss contracts",
+        ),
+        (
             "irp-forward",
             "irp_forward.tests.c",
             "native immediate and pending IRP stack delegation contract",

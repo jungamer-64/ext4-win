@@ -35,6 +35,18 @@ pub(crate) fn lookup_child(
             found = Some(scanned.into_child());
         }
     }
+    if let Some(found) = found {
+        return Ok(ChildLookup::Found(found));
+    }
+    let mut reader = DirectoryReader::new(parent, DirectoryScanCursor::start());
+    while let Some(scanned) = read.next_directory_entry(&mut reader)? {
+        if let Some(alias) = crate::short_name::read_alias(read, parent, scanned.entry().name(), *scanned.entry().node())?
+            && lookup.matches(&alias.windows_name()?)
+        {
+            if found.is_some() { return Err(DriverError::AmbiguousName); }
+            found = Some(scanned.into_child());
+        }
+    }
     Ok(found.map_or(ChildLookup::NotFound, ChildLookup::Found))
 }
 
