@@ -159,6 +159,7 @@ impl MetadataMutation<'_, '_> {
         if !self.free_clusters_delta.is_zero()
             || self.free_inodes_delta != 0
             || self.volume_label_update.is_some()
+            || self.mark_filesystem_error
         {
             writes.try_push(RangeWrite {
                 offset: ByteOffset::new(SUPERBLOCK_OFFSET),
@@ -245,6 +246,9 @@ impl MetadataMutation<'_, '_> {
         if let Some(label) = self.volume_label_update {
             label.write_to(&mut bytes)?;
         }
+        if self.mark_filesystem_error {
+            Superblock::mark_filesystem_error_in_raw(&mut bytes)?;
+        }
         if let Some(now) = write_time {
             Superblock::update_write_time(&mut bytes, u64::try_from(now.seconds()).unwrap_or(0))?;
         }
@@ -316,6 +320,7 @@ impl MetadataMutation<'_, '_> {
         if !self.free_clusters_delta.is_zero()
             || self.free_inodes_delta != 0
             || self.volume_label_update.is_some()
+            || self.mark_filesystem_error
         {
             observed.include(
                 MutationResource::VOLUME_METADATA,
@@ -332,6 +337,7 @@ impl MetadataMutation<'_, '_> {
             }
         }
         Ok(ResolvedMutation {
+            mark_filesystem_error: self.mark_filesystem_error,
             completion_durability: self.completion_durability,
             observed,
             key_version,
@@ -416,6 +422,9 @@ impl ReservedMutation {
         superblock.apply_free_inode_delta(self.resolved.free_inodes_delta)?;
         if let Some(label) = self.resolved.volume_label_update {
             superblock.apply_volume_label(label);
+        }
+        if self.resolved.mark_filesystem_error {
+            superblock.mark_filesystem_error();
         }
 
         let mut ordered_data_writes = Vec::new();

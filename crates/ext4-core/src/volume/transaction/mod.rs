@@ -363,6 +363,8 @@ struct MetadataMutation<'storage, 'epoch> {
     free_inodes_delta: i64,
     /// Superblock volume label replacement staged by this transaction.
     volume_label_update: Option<Ext4VolumeLabel>,
+    /// Explicit persistent filesystem error to include in this transaction's superblock image.
+    mark_filesystem_error: bool,
     /// Ancestors whose committed parent relation authorizes a directory move.
     namespace_ancestors: Vec<InodeId>,
 }
@@ -378,6 +380,8 @@ impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
 /// Fully resolved mutation with resource versions and provisional allocation choices.
 #[derive(Debug)]
 pub struct ResolvedMutation {
+    /// Durable health-state change projected only after this mutation commits.
+    mark_filesystem_error: bool,
     /// Observable durability required before the mutation can be acknowledged.
     completion_durability: MutationCompletionDurability,
     /// Resource set and versions observed by this resolve pass.
@@ -1066,6 +1070,17 @@ impl MutationResolvePass<'_, '_, '_> {
         })
     }
 
+    /// Records a persistent filesystem-check requirement in the journaled superblock.
+    /// Session finalization preserves this explicit error state; an offline checker owns repair.
+    /// # Errors
+    /// Returns an already rejected or unavailable writable mutation pass.
+    pub fn mark_volume_dirty(&mut self) -> Result<()> {
+        self.edit(|pass| {
+            pass.mutation.mark_filesystem_error = true;
+            Ok(())
+        })
+    }
+
     /// Verifies directory-entry creation policy using the latest staged inode.
     /// # Errors
     ///
@@ -1291,6 +1306,7 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
             free_clusters_delta: FreeClusterDelta::ZERO,
             free_inodes_delta: 0,
             volume_label_update: None,
+            mark_filesystem_error: false,
             namespace_ancestors: Vec::new(),
         }
     }
@@ -1319,6 +1335,9 @@ impl MetadataMutation<'_, '_> {
         superblock.apply_free_inode_delta(self.free_inodes_delta)?;
         if let Some(label) = self.volume_label_update {
             superblock.apply_volume_label(label);
+        }
+        if self.mark_filesystem_error {
+            superblock.mark_filesystem_error();
         }
         Ok((clusters, superblock))
     }

@@ -782,6 +782,7 @@ pub(crate) fn admit_owned(
             crate::irp::PreparedClusterControl::Move { .. } => Admission::Mutation(MutationRequestKind::MoveFile),
             crate::irp::PreparedClusterControl::Mark { .. } => Admission::Immediate(ImmediateRequestKind::MarkHandle),
         },
+        ActorRequest::Captured(PreparedRequest::MarkVolumeDirty) => Admission::Mutation(MutationRequestKind::MarkVolumeDirty),
         ActorRequest::Captured(PreparedRequest::Trim) => Admission::Trim,
         ActorRequest::Captured(PreparedRequest::RetrievalPointerBase) => {
             Admission::Immediate(ImmediateRequestKind::GetRetrievalPointerBase)
@@ -834,6 +835,8 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::GetVolumeBitmap => Admission::Unsupported,
                     crate::irp::FsControlCode::GetRetrievalPointerBase => Admission::Unsupported,
                     crate::irp::FsControlCode::MoveFile | crate::irp::FsControlCode::MarkHandle => Admission::Unsupported,
+                    crate::irp::FsControlCode::IsVolumeDirty => Admission::Immediate(ImmediateRequestKind::IsVolumeDirty),
+                    crate::irp::FsControlCode::MarkVolumeDirty => Admission::Unsupported,
                     crate::irp::FsControlCode::SetZeroOnDeallocation => Admission::Mutation(MutationRequestKind::SetZeroOnDeallocation),
                     crate::irp::FsControlCode::GetReparsePoint => {
                         Admission::Read(ReadRequestKind::GetReparsePoint)

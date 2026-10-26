@@ -1937,6 +1937,11 @@ impl MountedVolumeAccess<'_> {
         self.runtime.current_epoch().geometry()
     }
 
+    /// Persistent check requirement from the exact currently published superblock authority.
+    pub(crate) fn volume_requires_check(&self) -> bool {
+        self.runtime.current_epoch().requires_check()
+    }
+
     /// Returns the committed epoch that owns non-suspending metadata observations.
     pub(crate) fn current_epoch_sequence(&self) -> ext4_core::EpochSequence {
         self.runtime.current_epoch().sequence()

@@ -1882,6 +1882,8 @@ unsafe impl Send for RawVolumeOperation {}
 /// Synchronous request kinds that require no lower-storage state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
+    /// Persistent filesystem-check health from the current committed superblock.
+    IsVolumeDirty,
     /// FILE_OBJECT-owned movement protection with captured optional volume reference.
     MarkHandle,
     /// Counted Windows pathname validation without namespace mutation.
@@ -1953,6 +1955,7 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
         let result = match event {
             OperationEvent::Admitted => match self.kind {
                 ImmediateRequestKind::MarkHandle => crate::request::cluster_control::mark_handle(owned.request(), access),
+                ImmediateRequestKind::IsVolumeDirty => crate::request::volume_health::query(owned.request(), access),
                 ImmediateRequestKind::GetRetrievalPointerBase => (|| {
                     let origin = access.volume_geometry().allocation_start()?.get();
                     let sector =
@@ -3461,6 +3464,8 @@ unsafe impl Send for FlushRequestOperation {}
 /// Mutation request semantics selected entirely from captured queue metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationRequestKind {
+    /// Original-thread privileged persistent filesystem-check request.
+    MarkVolumeDirty,
     /// Exact physical-cluster movement with an original-context target object reference.
     MoveFile,
     /// Persistent physical retirement policy.
@@ -3496,6 +3501,8 @@ pub(crate) enum MutationRequestKind {
 /// Mutation request after any paging stream lifetime authority has been captured.
 #[derive(Debug)]
 enum PreparedMutationRequest {
+    /// SeManageVolumePrivilege is sealed in the corresponding captured queue metadata.
+    MarkVolumeDirty,
     /// Data remains frozen while the physical map is copied and atomically replaced.
     Relocation(crate::request::cluster_control::RelocationRequest),
     /// The retained writable file grants persistent zero retirement.
@@ -3559,6 +3566,11 @@ impl PreparedMutationRequest {
     ) -> DriverResult<Self> {
         match kind {
             MutationRequestKind::MoveFile => crate::request::cluster_control::RelocationRequest::prepare(owned.request(), access).map(Self::Relocation),
+            MutationRequestKind::MarkVolumeDirty => {
+                if matches!(owned.actor_request(), crate::irp::ActorRequest::Captured(crate::irp::PreparedRequest::MarkVolumeDirty)) {
+                    Ok(Self::MarkVolumeDirty)
+                } else { Err(DriverError::AccessDenied) }
+            }
             MutationRequestKind::SetZeroOnDeallocation => Ok(Self::ZeroOnDeallocation),
             MutationRequestKind::EnableVerity => {
                 crate::request::fsctl::prepare_verity(&mut owned.request(), access)
@@ -3616,6 +3628,7 @@ impl PreparedMutationRequest {
     const fn kind(&self) -> MutationRequestKind {
         match self {
             Self::Relocation(_) => MutationRequestKind::MoveFile,
+            Self::MarkVolumeDirty => MutationRequestKind::MarkVolumeDirty,
             Self::ZeroOnDeallocation => MutationRequestKind::SetZeroOnDeallocation,
             Self::DataWrite(_) => MutationRequestKind::Write,
             Self::Verity(_) => MutationRequestKind::EnableVerity,
@@ -4351,6 +4364,7 @@ impl MutationRequestOperation {
     ) -> DriverResult<Option<PreparedMutationOplock>> {
         let requires_check = match request {
             PreparedMutationRequest::Relocation(_) => false,
+            PreparedMutationRequest::MarkVolumeDirty => false,
             PreparedMutationRequest::ZeroOnDeallocation => false,
             PreparedMutationRequest::DataWrite(authority) => {
                 !authority.is_paging()
@@ -4654,6 +4668,10 @@ impl MutationRequestOperation {
             _ => None,
         };
         let result: DriverResult<DriverResolveDisposition> = match request {
+            PreparedMutationRequest::MarkVolumeDirty => {
+                let completion = crate::request::volume_health::mark(owned.request(), operations, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(PendingDriverPublication::Normal(completion)))
+            }
             PreparedMutationRequest::Relocation(relocation) if relocation.requires_preparation() => {
                 Ok(DriverResolveDisposition::PrepareRelocation)
             }

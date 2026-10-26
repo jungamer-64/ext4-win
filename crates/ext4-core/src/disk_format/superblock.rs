@@ -1700,6 +1700,25 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    /// Reports persistent health requiring an offline filesystem check, independently of the
+    /// journal recovery marker maintained during every writable session.
+    #[must_use]
+    pub const fn requires_check(self) -> bool {
+        self.state & (EXT4_VALID_FS | EXT4_ERROR_FS) != EXT4_VALID_FS
+    }
+
+    /// Records an explicit check requirement without changing unrelated session state.
+    pub(crate) fn mark_filesystem_error(&mut self) {
+        self.state |= EXT4_ERROR_FS;
+    }
+
+    /// Adds the persistent error-state bit to an already authenticated superblock image.
+    /// # Errors
+    /// Returns a truncated state field; the caller refreshes the complete metadata checksum.
+    pub(crate) fn mark_filesystem_error_in_raw(raw: &mut [u8]) -> Result<()> {
+        let state = le_u16(raw, disk_offset(58))?;
+        put_le_u16(raw, disk_offset(58), state | EXT4_ERROR_FS)
+    }
     /// Reads only the magic and policy-selection identity. This does not admit any filesystem.
     /// # Errors
     /// Returns read suspension, truncated input or invalid magic.
@@ -2664,6 +2683,24 @@ fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::disk::endian::put_le_u16;
+
+    /// # Errors
+    /// Returns independent fixture serialization or superblock parsing failure.
+    /// # Panics
+    /// Fails if recovery-session state replaces the persistent ext4 health-word authority.
+    #[test]
+    #[expect(clippy::panic_in_result_fn, reason = "assertions compare independent ext4 s_state vectors with parsed health")]
+    fn health_state_vectors_are_independent_of_journal_recovery() -> Result<()> {
+        for recovery in [false, true] {
+            for (state, requires_check) in [(0, true), (1, false), (2, true), (3, true)] {
+                let mut raw = primary(false, recovery, false)?;
+                put_le_u16(&mut raw, disk_offset(58), state)?;
+                Superblock::refresh_checksum(&mut raw)?;
+                assert_eq!(Superblock::parse_read_only(&raw)?.requires_check(), requires_check);
+            }
+        }
+        Ok(())
+    }
 
     /// Independently assembled minimal primary geometry with a required CRC32C checksum.
     /// # Errors

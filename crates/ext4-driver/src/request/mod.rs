@@ -17,5 +17,6 @@ pub(crate) mod volume_info;
 
 mod retrieval;
 mod cluster_control;
+mod volume_health;
 
 mod administration_control;

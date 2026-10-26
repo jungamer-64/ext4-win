@@ -117,6 +117,22 @@ mod mdl_tests {
     use super::*;
 
     /// # Panics
+    /// Fails if independent WDK control-code values select another operation or transfer method.
+    #[test]
+    fn standard_cluster_and_health_codes_match_the_windows_abi() {
+        for (code, expected) in [
+            (0x0009_0030, FsControlCode::MarkVolumeDirty),
+            (0x0009_0074, FsControlCode::MoveFile),
+            (0x0009_0078, FsControlCode::IsVolumeDirty),
+            (0x0009_00fc, FsControlCode::MarkHandle),
+            (0x0009_0194, FsControlCode::SetZeroOnDeallocation),
+        ] {
+            assert_eq!(FsControlCode::from_raw(code), Ok(expected));
+        }
+        assert_eq!(FsControlCode::from_raw(0x0009_007b), Err(DriverError::NotSupported));
+    }
+
+    /// # Panics
     ///
     /// Panics if DPC changes the protocol or completion is decoded as page acquisition.
     #[test]
@@ -248,6 +264,10 @@ pub(crate) enum FsControlCode {
     MoveFile,
     /// Per-FILE_OBJECT cluster-movement protection.
     MarkHandle,
+    /// Query persistent filesystem-check health through a direct volume handle.
+    IsVolumeDirty,
+    /// Privileged persistent filesystem-check request.
+    MarkVolumeDirty,
     /// Persistent zeroing of retired file allocation.
     SetZeroOnDeallocation,
     /// Windows `FSCTL_GET_REPARSE_POINT`.
@@ -308,6 +328,8 @@ impl FsControlCode {
             FSCTL_GET_RETRIEVAL_POINTER_BASE => Ok(Self::GetRetrievalPointerBase),
             FSCTL_MOVE_FILE => Ok(Self::MoveFile),
             FSCTL_MARK_HANDLE => Ok(Self::MarkHandle),
+            FSCTL_IS_VOLUME_DIRTY => Ok(Self::IsVolumeDirty),
+            FSCTL_MARK_VOLUME_DIRTY => Ok(Self::MarkVolumeDirty),
             FSCTL_SET_ZERO_ON_DEALLOCATION => Ok(Self::SetZeroOnDeallocation),
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
@@ -374,6 +396,8 @@ impl FsControlCode {
             | Self::GetRetrievalPointerBase
             | Self::MoveFile
             | Self::MarkHandle
+            | Self::IsVolumeDirty
+            | Self::MarkVolumeDirty
             | Self::SetZeroOnDeallocation
             | Self::GetReparsePoint
             | Self::SetReparsePoint
@@ -453,6 +477,10 @@ const FSCTL_GET_RETRIEVAL_POINTER_BASE: wdk_sys::ULONG = buffered_file_system_co
 const FSCTL_MOVE_FILE: wdk_sys::ULONG = buffered_file_system_control(29);
 /// Standard buffered handle marking control.
 const FSCTL_MARK_HANDLE: wdk_sys::ULONG = buffered_file_system_control(63);
+/// `FSCTL_IS_VOLUME_DIRTY`.
+const FSCTL_IS_VOLUME_DIRTY: wdk_sys::ULONG = buffered_file_system_control(30);
+/// `FSCTL_MARK_VOLUME_DIRTY`.
+const FSCTL_MARK_VOLUME_DIRTY: wdk_sys::ULONG = buffered_file_system_control(12);
 /// Standard buffered physical zero-retirement control.
 const FSCTL_SET_ZERO_ON_DEALLOCATION: wdk_sys::ULONG = buffered_file_system_control(101);
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.

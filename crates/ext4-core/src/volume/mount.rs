@@ -514,6 +514,11 @@ pub struct CommittedEpoch {
 }
 
 impl CommittedEpoch {
+    /// Persistent filesystem health from this exact committed metadata view.
+    #[must_use]
+    pub const fn requires_check(&self) -> bool {
+        self.superblock.requires_check()
+    }
     /// Declared format of this committed view, including recovered metadata on read-only mounts.
     #[must_use]
     pub const fn features(&self) -> crate::FilesystemFeatures {

@@ -1059,6 +1059,8 @@ pub(crate) enum PreparedRequest {
     FileSystemControl(FileSystemControlMinorFunction),
     /// Embedded handle reference and immutable cluster-control scalars captured before deferral.
     ClusterControl(PreparedClusterControl),
+    /// SeManageVolumePrivilege admitted on the original thread for one persistent dirty marker.
+    MarkVolumeDirty,
     /// Requestor privilege checked before queue handoff; ordinary FSCTL cannot grant it.
     KeyControl(PreparedKeyControl),
     /// Volume-management privilege captured on the original thread for one free-space discard.
@@ -1247,6 +1249,10 @@ impl PreparedRequest {
                         let control = stack
                             .file_system_control()
                             .map_err(IrpCompletion::from_error)?;
+                        if control.fs_control_code() == super::FsControlCode::MarkVolumeDirty {
+                            authorize_volume_management(target)?;
+                            return Ok((Self::MarkVolumeDirty, generic_key()));
+                        }
                         if matches!(control.fs_control_code(), super::FsControlCode::MoveFile | super::FsControlCode::MarkHandle) {
                             if control.fs_control_code() == super::FsControlCode::MoveFile {
                                 authorize_volume_management(target)?;
@@ -1932,6 +1938,7 @@ mod tests {
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut file = wdk_sys::FILE_OBJECT::default();
         for (code, expected) in [
+            (0x0009_0030, wdk_sys::STATUS_ACCESS_DENIED),
             (0x0009_0074, wdk_sys::STATUS_ACCESS_DENIED),
             (0x0009_a400, wdk_sys::STATUS_ACCESS_DENIED),
             (0x0009_a404, wdk_sys::STATUS_ACCESS_DENIED),
