@@ -96,6 +96,9 @@ impl MutationResolvePass<'_, '_, '_> {
             }
             tree.replace_extents(replacement)?;
             pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            // Physical allocation queries can be followed by raw LCN reads. Journaled payload
+            // images must therefore reach their new home addresses before MOVE acknowledges.
+            pass.mutation.completion_durability = MutationCompletionDurability::HomeCheckpoint;
             pass.mutation.replace_live_inode(inode_index, raw_inode)
         })
     }

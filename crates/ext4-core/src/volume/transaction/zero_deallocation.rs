@@ -7,7 +7,7 @@ use super::*;
 pub enum MutationCompletionDurability {
     /// The durable journal record and committed metadata overlay suffice.
     JournalCommit,
-    /// Retired clusters must reach zeroed home storage and its durability barrier.
+    /// Committed physical payload images must reach home storage and its durability barrier.
     HomeCheckpoint,
 }
 

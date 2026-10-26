@@ -32,6 +32,28 @@ fn destination_run(fixture: &mut Fixture, count: u64) -> Result<ClusterAddress> 
 }
 
 /// # Errors
+/// Returns fixture, inode flag encoding, mount or physical relocation resolution failure.
+/// # Panics
+/// Fails if journaled relocation can acknowledge before its destination payload reaches home.
+#[test]
+#[expect(clippy::panic_in_result_fn, reason = "assertions observe the completion contract derived from exact staged relocation effects")]
+fn relocation_requires_home_checkpoint_for_physical_destination_readers() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let file = fixture.a;
+    fixture.disk.encode_inode(NodeId::File(file), 0x0008_4000, None)?;
+    fixture.remount()?;
+    let target = destination(&mut fixture)?;
+    let ticket = fixture.coordinator.admit_mutation()?;
+    let (resolved, ()) = fixture.disk.resolve(&fixture.profile, &fixture.epoch, &fixture.coordinator,
+        ticket, &mut PlainCrypto, |pass| {
+            let file = pass.file(file)?;
+            pass.move_file_clusters(file, FileOffset::ZERO, target, ClusterCount::new(1)?)
+        })?;
+    assert_eq!(resolved.completion_durability(), MutationCompletionDurability::HomeCheckpoint);
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, sparse extension, movement, bitmap or payload read failure.
 /// # Panics
 /// Fails if moving virtual clusters allocates a sparse hole or changes zero-read contents.
