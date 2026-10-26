@@ -4,6 +4,102 @@ use core::num::NonZeroU64;
 
 use super::scope::*;
 
+impl EpochReadView<'_, '_> {
+    /// Allocation is read under block-group resource dependencies, so a suspended bitmap cannot
+    /// be interpreted with a later allocation publication. Descriptor-selected metadata locations
+    /// remain fixed for this mount; BLOCK_UNINIT uses their semantic bitmap, never raw disk bits.
+    /// # Errors
+    /// Returns geometry, bitmap integrity, allocation or lower-storage failures.
+    pub(super) fn read_cluster_bitmap(
+        &mut self,
+        start: ClusterAddress,
+        output: &mut [u8],
+    ) -> Result<crate::ClusterCount> {
+        let remaining = self
+            .superblock
+            .cluster_count()
+            .as_u64()
+            .checked_sub(start.get())
+            .filter(|value| *value != 0)
+            .ok_or(Error::DeviceRange)?;
+        let capacity = u64::try_from(output.len())
+            .map_err(|_| Error::ArithmeticOverflow)?
+            .checked_mul(8)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let count = crate::ClusterCount::new(capacity.min(remaining))?;
+        output.fill(0);
+        let mut cursor = 0_u64;
+        let mut layouts = None;
+        while cursor < count.as_u64() {
+            let address = ClusterAddress::new(
+                start
+                    .get()
+                    .checked_add(cursor)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
+            let group = self.superblock.cluster_group_of(address)?;
+            self.observe_resource(MutationResource::block_group(group))?;
+            let descriptor =
+                BlockGroupDescriptor::read_from(&mut self.device, &self.superblock, group)?;
+            let bitmap = match descriptor.block_bitmap_initialization() {
+                AllocationBitmapInitialization::Initialized => descriptor.read_bitmap(
+                    &mut self.device,
+                    &self.superblock,
+                    AllocationBitmapKind::Block,
+                )?,
+                AllocationBitmapInitialization::Uninitialized => {
+                    if layouts.is_none() {
+                        layouts = Some(super::block_group::read_group_metadata_layouts(
+                            &mut self.device,
+                            &self.superblock,
+                        )?);
+                    }
+                    super::block_group::materialize_uninitialized_block_bitmap(
+                        &self.superblock,
+                        group,
+                        layouts.as_deref().ok_or(Error::InvalidSuperblock)?,
+                    )?
+                }
+            };
+            let first = self.superblock.cluster_bit_in_group(address, group)?;
+            let available = self
+                .superblock
+                .clusters_in_group(group)?
+                .checked_sub(first)
+                .ok_or(Error::InvalidClusterGeometry)?;
+            let take = u64::from(available).min(
+                count
+                    .as_u64()
+                    .checked_sub(cursor)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
+            if take == 0 {
+                return Err(Error::InvalidClusterGeometry);
+            }
+            for bit in 0..take {
+                let source = first
+                    .checked_add(u32::try_from(bit).map_err(|_| Error::ArithmeticOverflow)?)
+                    .ok_or(Error::ArithmeticOverflow)?;
+                if cluster_bitmap_bit_state(&bitmap, ClusterBitmapPosition::new(group, source))?
+                    == BitmapBitState::Used
+                {
+                    let target = cursor.checked_add(bit).ok_or(Error::ArithmeticOverflow)?;
+                    let index =
+                        usize::try_from(target / 8).map_err(|_| Error::ArithmeticOverflow)?;
+                    let value = output.get_mut(index).ok_or(Error::DeviceRange)?;
+                    *value |= 1_u8
+                        .checked_shl(
+                            u32::try_from(target % 8).map_err(|_| Error::ArithmeticOverflow)?,
+                        )
+                        .ok_or(Error::ArithmeticOverflow)?;
+                }
+            }
+            cursor = cursor.checked_add(take).ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(count)
+    }
+}
+
 /// Maximum bytes passed to one backing-device data read.
 const MAX_READ_WINDOW_BYTES: usize = 65_536;
 

@@ -4,7 +4,7 @@ use super::*;
 
 mod capture;
 pub(crate) use capture::{
-    CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
+    AllocationStart, CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory, PreparedQueryEa, PreparedRead,
     PreparedRequest, PreparedWrite,
 };
@@ -1227,11 +1227,13 @@ impl<'a> PendingIrpLease<'a> {
         self.owner.context.query_security_parts()
     }
 
-    /// Borrows the copied VCN and locked output for a retrieval query.
+    /// Borrows the captured allocation coordinate and locked output pages.
     /// # Errors
-    /// Returns an invariant error when this pending request is not a retrieval query.
-    pub(crate) fn retrieval_parts(self) -> DriverResult<(u64, &'a mut CapturedRequestorOutput)> {
-        self.owner.context.retrieval_parts()
+    /// Returns an invariant error when this pending request is not an allocation query.
+    pub(crate) fn allocation_parts(
+        self,
+    ) -> DriverResult<(AllocationStart, &'a mut CapturedRequestorOutput)> {
+        self.owner.context.allocation_parts()
     }
 
     /// Borrows the owned set-security descriptor for the lifetime of this pending request.

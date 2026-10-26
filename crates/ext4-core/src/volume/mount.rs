@@ -364,6 +364,8 @@ impl VolumeIdentity {
 /// Allocation geometry projected from one committed epoch.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VolumeGeometry {
+    /// Allocation-cluster coordinate zero in physical filesystem block space.
+    first_data_block: BlockAddress,
     /// Filesystem block size.
     block_size: BlockSize,
     /// Allocation cluster size.
@@ -375,6 +377,12 @@ pub struct VolumeGeometry {
 }
 
 impl VolumeGeometry {
+    /// Physical byte origin for allocation-cluster coordinates.
+    /// # Errors
+    /// Returns coordinate overflow before exposing an invalid physical address.
+    pub fn allocation_start(self) -> Result<crate::ByteOffset> {
+        self.block_size.offset_of(self.first_data_block)
+    }
     /// Filesystem block size.
     #[must_use]
     pub const fn block_size(self) -> BlockSize {
@@ -582,6 +590,7 @@ impl CommittedEpoch {
     #[must_use]
     pub const fn geometry(&self) -> VolumeGeometry {
         VolumeGeometry {
+            first_data_block: self.superblock.first_data_block(),
             block_size: self.superblock.block_size(),
             cluster_size: self.superblock.cluster_size(),
             cluster_count: self.superblock.cluster_count(),

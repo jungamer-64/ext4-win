@@ -769,13 +769,19 @@ pub(crate) fn admit_owned(
             PreparedDirectoryControl::NotifyChangeDirectory,
         )) => Admission::Notification,
         ActorRequest::Captured(PreparedRequest::LockControl) => Admission::ByteRangeLock,
-        ActorRequest::Captured(PreparedRequest::RetrievalPointers { .. }) => {
-            Admission::Read(ReadRequestKind::GetRetrievalPointers)
+        ActorRequest::Captured(PreparedRequest::AllocationQuery { start, .. }) => {
+            Admission::Read(match start {
+                crate::irp::AllocationStart::FileVcn(_) => ReadRequestKind::GetRetrievalPointers,
+                crate::irp::AllocationStart::VolumeCluster(_) => ReadRequestKind::GetVolumeBitmap,
+            })
         }
         ActorRequest::Captured(PreparedRequest::FileSystemControl(minor)) => {
             Admission::FsControl(*minor)
         }
         ActorRequest::Captured(PreparedRequest::Trim) => Admission::Trim,
+        ActorRequest::Captured(PreparedRequest::RetrievalPointerBase) => {
+            Admission::Immediate(ImmediateRequestKind::GetRetrievalPointerBase)
+        }
         ActorRequest::Captured(PreparedRequest::KeyControl(control)) => {
             Admission::Mutation(match control {
                 crate::irp::PreparedKeyControl::Add => MutationRequestKind::AddEncryptionKey,
@@ -821,6 +827,8 @@ pub(crate) fn admit_owned(
                     | crate::irp::FsControlCode::RequestFilterOplock
                     | crate::irp::FsControlCode::RequestOplock => Admission::OplockControl,
                     crate::irp::FsControlCode::GetRetrievalPointers => Admission::Unsupported,
+                    crate::irp::FsControlCode::GetVolumeBitmap => Admission::Unsupported,
+                    crate::irp::FsControlCode::GetRetrievalPointerBase => Admission::Unsupported,
                     crate::irp::FsControlCode::GetReparsePoint => {
                         Admission::Read(ReadRequestKind::GetReparsePoint)
                     }

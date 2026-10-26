@@ -240,6 +240,10 @@ pub(crate) enum FsControlCode {
     AllowExtendedDasdIo,
     /// Windows `FSCTL_GET_RETRIEVAL_POINTERS`.
     GetRetrievalPointers,
+    /// Windows allocation bitmap, in volume allocation-cluster coordinates.
+    GetVolumeBitmap,
+    /// Physical sector offset of allocation-cluster zero.
+    GetRetrievalPointerBase,
     /// Windows `FSCTL_GET_REPARSE_POINT`.
     GetReparsePoint,
     /// Windows `FSCTL_SET_REPARSE_POINT`.
@@ -292,6 +296,8 @@ impl FsControlCode {
             FSCTL_IS_VOLUME_MOUNTED => Ok(Self::IsVolumeMounted),
             FSCTL_ALLOW_EXTENDED_DASD_IO => Ok(Self::AllowExtendedDasdIo),
             FSCTL_GET_RETRIEVAL_POINTERS => Ok(Self::GetRetrievalPointers),
+            FSCTL_GET_VOLUME_BITMAP => Ok(Self::GetVolumeBitmap),
+            FSCTL_GET_RETRIEVAL_POINTER_BASE => Ok(Self::GetRetrievalPointerBase),
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
             FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
@@ -352,6 +358,8 @@ impl FsControlCode {
             | Self::IsVolumeMounted
             | Self::AllowExtendedDasdIo
             | Self::GetRetrievalPointers
+            | Self::GetVolumeBitmap
+            | Self::GetRetrievalPointerBase
             | Self::GetReparsePoint
             | Self::SetReparsePoint
             | Self::DeleteReparsePoint
@@ -421,6 +429,10 @@ const FSCTL_IS_VOLUME_MOUNTED: wdk_sys::ULONG = buffered_file_system_control(10)
 const FSCTL_ALLOW_EXTENDED_DASD_IO: wdk_sys::ULONG = neither_file_system_control(32);
 /// `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 28, METHOD_NEITHER, FILE_ANY_ACCESS)`.
 const FSCTL_GET_RETRIEVAL_POINTERS: wdk_sys::ULONG = neither_file_system_control(28);
+/// `FSCTL_GET_VOLUME_BITMAP`.
+const FSCTL_GET_VOLUME_BITMAP: wdk_sys::ULONG = neither_file_system_control(27);
+/// `FSCTL_GET_RETRIEVAL_POINTER_BASE`.
+const FSCTL_GET_RETRIEVAL_POINTER_BASE: wdk_sys::ULONG = buffered_file_system_control(141);
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
 /// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.

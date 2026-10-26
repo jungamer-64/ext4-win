@@ -1014,6 +1014,8 @@ pub(crate) enum ReadRequestKind {
     QuerySecurity,
     /// Committed payload allocation query.
     GetRetrievalPointers,
+    /// Committed volume allocation bitmap.
+    GetVolumeBitmap,
     /// Reparse-point FSCTL query.
     GetReparsePoint,
     /// Committed directory comparison-state query.
@@ -1235,6 +1237,18 @@ impl ReadRequestOperation {
                 let mut request = owned.request();
                 crate::request::file_system_control::authorize_path_handle(&mut request, access)?;
                 crate::request::retrieval::query(request, read, access.volume_geometry())
+            }
+            PreparedReadRequest::Other(ReadRequestKind::GetVolumeBitmap) => {
+                let mut request = owned.request();
+                request.with_active(|active| {
+                    let opened =
+                        crate::state::OpenedVolume::decode(active.current_stack()?.file_object()?)?;
+                    if !access.owns_volume(opened.volume()) {
+                        return Err(DriverError::InvalidDeviceRequest);
+                    }
+                    access.authorize_handle(opened.file_object())
+                })?;
+                crate::request::retrieval::volume_bitmap(request, read, access.volume_geometry())
             }
             PreparedReadRequest::Other(ReadRequestKind::QueryDirectoryCasefold) => {
                 let mut request = owned.request();
@@ -1868,6 +1882,8 @@ unsafe impl Send for RawVolumeOperation {}
 /// Synchronous request kinds that require no lower-storage state machine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ImmediateRequestKind {
+    /// Privileged allocation-origin query, with requestor authority sealed before queueing.
+    GetRetrievalPointerBase,
     /// Cc notification of already initialized data, including after handle cleanup.
     AdvanceValidDataLength,
     /// Mounted ext4 UUID independent of a Windows volume path.
@@ -1932,6 +1948,33 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
         };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
+                ImmediateRequestKind::GetRetrievalPointerBase => (|| {
+                    let origin = access.volume_geometry().allocation_start()?.get();
+                    let sector =
+                        u64::from(access.storage_route().filesystem_sector_size().as_u32());
+                    let base = origin
+                        .checked_div(sector)
+                        .filter(|_| origin.is_multiple_of(sector))
+                        .ok_or(DriverError::NotSupported)?;
+                    let base = i64::try_from(base).map_err(|_| DriverError::InvalidParameter)?;
+                    owned.request().with_active(|active| {
+                        let current = active.current_stack()?;
+                        let opened = crate::state::OpenedVolume::decode(current.file_object()?)?;
+                        if !access.owns_volume(opened.volume()) {
+                            return Err(DriverError::InvalidDeviceRequest);
+                        }
+                        access.authorize_handle(opened.file_object())?;
+                        let control = current.file_system_control()?;
+                        if !control.input_buffer_length().is_empty() {
+                            return Err(DriverError::InvalidParameter);
+                        }
+                        let output =
+                            active.buffered_output(control.output_buffer_length().prefix(8)?)?;
+                        crate::wire::LittleEndianOutput::new(output)
+                            .write_i64(crate::wire::WireOffset::new(0), base)?;
+                        IrpCompletion::from_usize(8)
+                    })
+                })(),
                 ImmediateRequestKind::AdvanceValidDataLength => {
                     crate::request::file_info::advance_valid_data_length(owned.request())
                 }

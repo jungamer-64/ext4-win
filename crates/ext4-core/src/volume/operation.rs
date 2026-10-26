@@ -148,6 +148,19 @@ impl core::fmt::Debug for EpochReadPass<'_, '_, '_> {
 }
 
 impl EpochReadPass<'_, '_, '_> {
+    /// Reads allocation bits from one committed view, including filesystem metadata. Bit zero
+    /// names `start`, relative to [`super::VolumeGeometry::allocation_start`]. Padding is zero. Only a
+    /// successful result makes the scratch output usable; suspension/failure may overwrite it.
+    /// # Errors
+    /// Returns invalid range, bitmap/descriptor checksum, allocation or lower-storage failures.
+    pub fn read_cluster_bitmap(
+        &mut self,
+        start: crate::ClusterAddress,
+        output: &mut [u8],
+    ) -> Result<crate::ClusterCount> {
+        self.view.read_cluster_bitmap(start, output)
+    }
+
     /// Observes the payload allocation beginning at one block-aligned file coordinate.
     /// No result means resident data or the end of the visible allocation span. This grants no
     /// raw-I/O or mutation authority; the result belongs to the pass's immutable epoch.

@@ -26,6 +26,8 @@ struct VolumeCluster(i64);
 /// Mounted allocation geometry used by all byte/cluster conversions in this boundary.
 #[derive(Clone, Copy, Debug)]
 struct ClusterGeometry {
+    /// Physical byte origin of volume allocation-cluster zero.
+    origin: u64,
     /// Byte length of an ext4 allocation unit, including BIGALLOC.
     bytes: u64,
     /// Exclusive volume-space allocation-unit bound.
@@ -34,11 +36,14 @@ struct ClusterGeometry {
 
 impl ClusterGeometry {
     /// Converts mounted ext4 geometry without changing its physical allocation unit.
-    fn from_volume(geometry: VolumeGeometry) -> Self {
-        Self {
+    /// # Errors
+    /// Returns an unrepresentable physical allocation origin.
+    fn from_volume(geometry: VolumeGeometry) -> DriverResult<Self> {
+        Ok(Self {
+            origin: geometry.allocation_start()?.get(),
             bytes: u64::from(geometry.cluster_size().bytes()),
             count: geometry.cluster_count().as_u64(),
-        }
+        })
     }
 
     /// Converts a file-space unit index to its aligned byte address.
@@ -81,6 +86,7 @@ impl ClusterGeometry {
         let base = physical
             .get()
             .checked_sub(within)
+            .and_then(|value| value.checked_sub(self.origin))
             .ok_or(ext4_core::Error::InvalidExtentTree)?;
         if !base.is_multiple_of(self.bytes) {
             return Err(ext4_core::Error::InvalidExtentTree.into());
@@ -336,10 +342,13 @@ pub(crate) fn query(
     let node: NodeId = request.with_active(|active| {
         Ok::<_, DriverError>(OpenedObject::decode(active.current_stack()?.file_object()?)?.node())
     })?;
-    let (starting_vcn, target) = request.retrieval_parts()?;
+    let (start, target) = request.allocation_parts()?;
+    let crate::irp::AllocationStart::FileVcn(starting_vcn) = start else {
+        return Err(DriverError::InvalidDeviceRequest);
+    };
     let page = RetrievalPage::collect(
         VirtualCluster(starting_vcn),
-        ClusterGeometry::from_volume(geometry),
+        ClusterGeometry::from_volume(geometry)?,
         target.capacity(),
         |offset| {
             let run = read.node_data_allocation(node, offset)?;
@@ -354,9 +363,149 @@ pub(crate) fn query(
     Ok(completion)
 }
 
+/// Bounded allocation observation: the header reports all remaining bits even on overflow.
+/// This grants no allocation reservation; callers must revalidate before attempting a move.
+struct BitmapLayout {
+    /// The ABI rounds requested LCNs down to an eight-cluster boundary.
+    start: ext4_core::ClusterAddress,
+    /// Total valid bits after that boundary, independent of returned capacity.
+    remaining: u64,
+    /// Header and the bounded initialized bitmap prefix.
+    length: usize,
+}
+
+impl BitmapLayout {
+    /// Establishes the complete bounded output shape before reading allocation metadata.
+    /// # Errors
+    /// Returns invalid starting LCN, short output or unrepresentable geometry.
+    fn new(
+        start: ext4_core::ClusterAddress,
+        total: ext4_core::ClusterCount,
+        capacity: usize,
+    ) -> DriverResult<Self> {
+        if start.get() >= total.as_u64() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let start = ext4_core::ClusterAddress::new(start.get() & !7);
+        let remaining = total
+            .as_u64()
+            .checked_sub(start.get())
+            .ok_or(DriverError::InvalidParameter)?;
+        i64::try_from(start.get()).map_err(|_| DriverError::InvalidParameter)?;
+        i64::try_from(remaining).map_err(|_| DriverError::InvalidParameter)?;
+        let available = capacity
+            .checked_sub(16)
+            .filter(|bytes| *bytes != 0)
+            .ok_or(DriverError::BufferTooSmall)?;
+        let required =
+            usize::try_from(remaining.div_ceil(8)).map_err(|_| DriverError::InvalidBufferSize)?;
+        let length = 16_usize
+            .checked_add(available.min(required))
+            .ok_or(DriverError::InvalidBufferSize)?;
+        Ok(Self {
+            start,
+            remaining,
+            length,
+        })
+    }
+
+    /// Encodes the standard Windows header after bitmap reads complete.
+    /// # Errors
+    /// Returns a short output before writing header bytes.
+    fn write_header(&self, bytes: &mut [u8]) -> DriverResult<()> {
+        let header = bytes.get_mut(..16).ok_or(DriverError::BufferTooSmall)?;
+        let mut writer = LittleEndianOutput::new(header);
+        writer.write_u64(WireOffset::new(0), self.start.get())?;
+        writer.write_u64(WireOffset::new(8), self.remaining)
+    }
+}
+
+/// Publishes only a complete committed-epoch observation into the captured METHOD_NEITHER output.
+/// # Errors
+/// Returns invalid volume/range, capture, allocation, bitmap integrity or backing-storage failures.
+pub(crate) fn volume_bitmap(
+    request: PendingIrpLease<'_>,
+    read: &mut EpochReadPass<'_, '_, '_>,
+    geometry: VolumeGeometry,
+) -> DriverResult<IrpCompletion> {
+    let (start, target) = request.allocation_parts()?;
+    let crate::irp::AllocationStart::VolumeCluster(start) = start else {
+        return Err(DriverError::InvalidDeviceRequest);
+    };
+    let layout = BitmapLayout::new(start, geometry.cluster_count(), target.capacity())?;
+    let mut bytes = DriverVec::try_repeated_copy(0_u8, layout.length)?;
+    let covered = read.read_cluster_bitmap(
+        layout.start,
+        bytes
+            .as_mut_slice()
+            .get_mut(16..)
+            .ok_or(DriverError::InternalInvariantViolation)?,
+    )?;
+    layout.write_header(bytes.as_mut_slice())?;
+    let completion = if covered.as_u64() == layout.remaining {
+        IrpCompletion::from_usize(layout.length)?
+    } else {
+        IrpCompletion::buffer_overflow(layout.length)?
+    };
+    target.copy_from_owned(bytes.as_slice())?;
+    Ok(completion)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns fixture geometry or Windows-header encoding errors.
+    /// # Panics
+    /// Panics if LCN rounding, full remaining length, physical origin or short-buffer behavior changes.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture setup is fallible; assertions check independent Windows allocation vectors"
+    )]
+    fn bitmap_header_and_retrieval_coordinates_share_the_allocation_origin() -> DriverResult<()> {
+        let layout = BitmapLayout::new(
+            ext4_core::ClusterAddress::new(13),
+            ext4_core::ClusterCount::new(103)?,
+            18,
+        )?;
+        assert_eq!(
+            (layout.start.get(), layout.remaining, layout.length),
+            (8, 95, 18)
+        );
+        let mut header = [0xA5; 18];
+        layout.write_header(&mut header)?;
+        assert_eq!(
+            header,
+            [8, 0, 0, 0, 0, 0, 0, 0, 95, 0, 0, 0, 0, 0, 0, 0, 0xA5, 0xA5]
+        );
+        for capacity in 0..17 {
+            assert!(matches!(
+                BitmapLayout::new(
+                    ext4_core::ClusterAddress::new(0),
+                    ext4_core::ClusterCount::new(103)?,
+                    capacity
+                ),
+                Err(DriverError::BufferTooSmall)
+            ));
+        }
+        let geometry = ClusterGeometry {
+            origin: 1024,
+            bytes: 1024,
+            count: 100,
+        };
+        assert_eq!(
+            geometry.physical_cluster(ByteOffset::new(2048), FileOffset::ZERO, FileOffset::ZERO)?,
+            VolumeCluster(1)
+        );
+        assert!(
+            geometry
+                .physical_cluster(ByteOffset::new(0), FileOffset::ZERO, FileOffset::ZERO)
+                .is_err()
+        );
+        Ok(())
+    }
 
     /// Independent logical/physical byte intervals used to observe a requested interior block.
     /// # Errors
@@ -399,6 +548,7 @@ mod tests {
     )]
     fn sparse_pages_preserve_wire_prefix_and_resume_after_overflow() -> DriverResult<()> {
         let geometry = ClusterGeometry {
+            origin: 0,
             bytes: 4096,
             count: 1000,
         };
@@ -454,6 +604,7 @@ mod tests {
     fn bigalloc_fragments_and_partial_final_cluster_report_physical_allocation() -> DriverResult<()>
     {
         let geometry = ClusterGeometry {
+            origin: 0,
             bytes: 16384,
             count: 1000,
         };
@@ -490,6 +641,7 @@ mod tests {
     )]
     fn boundary_and_observation_failures_remain_distinct() -> DriverResult<()> {
         let geometry = ClusterGeometry {
+            origin: 0,
             bytes: 4096,
             count: 1000,
         };
@@ -539,6 +691,7 @@ mod tests {
             RetrievalPage::collect(
                 VirtualCluster(0),
                 ClusterGeometry {
+                    origin: 0,
                     bytes: 8192,
                     count: 1000
                 },

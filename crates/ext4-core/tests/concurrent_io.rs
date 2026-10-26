@@ -18,6 +18,56 @@ mod session;
 mod trim;
 
 /// # Errors
+/// Returns fixture, independent descriptor decoding or committed read failures.
+/// # Panics
+/// Panics if the Windows-facing allocation observation differs from the on-disk bitmap.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fallible fixture setup propagates errors while assertions compare independent bitmap bytes"
+)]
+fn committed_allocation_bitmap_matches_independent_descriptor_bytes() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let source = &fixture.disk.filesystem;
+    let field = |offset: usize| -> Result<u32> {
+        let bytes: [u8; 4] = source
+            .get(offset..offset.checked_add(4).ok_or(Error::ArithmeticOverflow)?)
+            .ok_or(Error::DeviceRange)?
+            .try_into()
+            .map_err(|_| Error::DeviceRange)?;
+        Ok(u32::from_le_bytes(bytes))
+    };
+    let block_bytes = 1024_usize
+        .checked_shl(field(1048)?)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let descriptor = usize::try_from(field(1044)?)
+        .map_err(|_| Error::ArithmeticOverflow)?
+        .checked_add(1)
+        .and_then(|block| block.checked_mul(block_bytes))
+        .ok_or(Error::ArithmeticOverflow)?;
+    let bitmap = usize::try_from(field(descriptor)?)
+        .map_err(|_| Error::ArithmeticOverflow)?
+        .checked_mul(block_bytes)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let expected: [u8; 16] = source
+        .get(bitmap..bitmap.checked_add(16).ok_or(Error::ArithmeticOverflow)?)
+        .ok_or(Error::DeviceRange)?
+        .try_into()
+        .map_err(|_| Error::DeviceRange)?;
+    let mut actual = [0xA5; 16];
+    let count =
+        fixture.read(|pass| pass.read_cluster_bitmap(ClusterAddress::new(0), &mut actual))?;
+    assert_eq!(count.as_u64(), 128);
+    assert_eq!(actual, expected);
+    let total = fixture.epoch.geometry().cluster_count().as_u64();
+    assert_eq!(
+        fixture.read(|pass| pass.read_cluster_bitmap(ClusterAddress::new(total), &mut actual)),
+        Err(Error::DeviceRange)
+    );
+    Ok(())
+}
+
+/// # Errors
 /// Propagates fixture mount or truncated independent superblock-vector failure.
 /// # Panics
 /// Fails if a committed feature observation loses a declared mask or changes its on-disk domain.

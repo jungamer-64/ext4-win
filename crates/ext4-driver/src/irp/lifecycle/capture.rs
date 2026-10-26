@@ -27,8 +27,17 @@ use super::{
 #[cfg(not(test))]
 const SET_SECURITY_DESCRIPTOR_MAXIMUM: wdk_sys::ULONG = 128 * 1024;
 
-/// Maximum writable prefix pinned by one retrieval request; excess results use NextVcn continuation.
-const RETRIEVAL_OUTPUT_MAXIMUM: usize = 128 * 1024;
+/// Maximum pinned allocation-query output; partial results retain their resume coordinates.
+const ALLOCATION_OUTPUT_MAXIMUM: usize = 128 * 1024;
+
+/// Captured allocation indices retain their file-space or volume-space origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AllocationStart {
+    /// File-space virtual cluster coordinate.
+    FileVcn(u64),
+    /// Volume allocation coordinate relative to the mounted allocation origin.
+    VolumeCluster(ext4_core::ClusterAddress),
+}
 
 /// Owned directory pattern captured before queue insertion.
 #[derive(Debug)]
@@ -708,12 +717,14 @@ impl QueueContextOwnership {
         }
     }
 
-    /// Borrows the sealed retrieval payload through the completion owner's unique lease.
+    /// Borrows the origin-qualified allocation payload through its completion owner's unique lease.
     /// # Errors
     /// Returns an invariant error for a different prepared request.
-    pub(super) fn retrieval_parts(&mut self) -> DriverResult<(u64, &mut CapturedRequestorOutput)> {
+    pub(super) fn allocation_parts(
+        &mut self,
+    ) -> DriverResult<(AllocationStart, &mut CapturedRequestorOutput)> {
         match self {
-            Self::Captured(context) => context.retrieval_parts(),
+            Self::Captured(context) => context.allocation_parts(),
             Self::Cleanup | Self::Close => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -928,15 +939,14 @@ impl QueueContext {
         }
     }
 
-    /// Borrows the copied starting VCN and native output owner.
+    /// Borrows the captured allocation coordinate and native output owner.
     /// # Errors
     /// Returns an invariant error for a different prepared request.
-    pub(super) fn retrieval_parts(&mut self) -> DriverResult<(u64, &mut CapturedRequestorOutput)> {
+    pub(super) fn allocation_parts(
+        &mut self,
+    ) -> DriverResult<(AllocationStart, &mut CapturedRequestorOutput)> {
         match &mut self.prepared {
-            PreparedRequest::RetrievalPointers {
-                starting_vcn,
-                output,
-            } => Ok((*starting_vcn, output)),
+            PreparedRequest::AllocationQuery { start, output } => Ok((*start, output)),
             _ => Err(DriverError::InternalInvariantViolation),
         }
     }
@@ -1048,10 +1058,12 @@ pub(crate) enum PreparedRequest {
     KeyControl(PreparedKeyControl),
     /// Volume-management privilege captured on the original thread for one free-space discard.
     Trim,
-    /// Retrieval request with a copied VCN and uniquely owned locked output pages.
-    RetrievalPointers {
-        /// Nonnegative file-space allocation-unit index decoded in requestor context.
-        starting_vcn: u64,
+    /// Manage-volume privilege admitted in requestor context for a physical-origin query.
+    RetrievalPointerBase,
+    /// Allocation query with an origin-qualified index and uniquely owned locked output pages.
+    AllocationQuery {
+        /// Origin-qualified starting coordinate sealed in requestor context.
+        start: AllocationStart,
         /// Bounded native output capacity retained until publication or cancellation.
         output: CapturedRequestorOutput,
     },
@@ -1233,12 +1245,22 @@ impl PreparedRequest {
                         if control.fs_control_code() == super::FsControlCode::SetReparsePoint {
                             authorize_symbolic_link(target)?;
                         }
-                        if control.fs_control_code() == super::FsControlCode::GetRetrievalPointers {
-                            return capture_retrieval_pointers(target, control, generic_key());
+                        if matches!(
+                            control.fs_control_code(),
+                            super::FsControlCode::GetRetrievalPointers
+                                | super::FsControlCode::GetVolumeBitmap
+                        ) {
+                            return capture_allocation_query(target, control, generic_key());
                         }
                         if control.fs_control_code() == super::FsControlCode::TrimVolume {
                             authorize_volume_management(target)?;
                             return Ok((Self::Trim, generic_key()));
+                        }
+                        if control.fs_control_code()
+                            == super::FsControlCode::GetRetrievalPointerBase
+                        {
+                            authorize_volume_management(target)?;
+                            return Ok((Self::RetrievalPointerBase, generic_key()));
                         }
                         let key_control = match control.fs_control_code() {
                             super::FsControlCode::AddEncryptionKey => Some(PreparedKeyControl::Add),
@@ -1444,7 +1466,7 @@ impl QueueFileObjectAddress {
         reason = "the native boundary copies Type3 input under SEH before the request can leave its process"
     )
 )]
-fn capture_retrieval_pointers(
+fn capture_allocation_query(
     target: &ActiveIrp<'_>,
     stack: super::FileSystemControlStack,
     key: QueueCancellationKey,
@@ -1452,7 +1474,17 @@ fn capture_retrieval_pointers(
     if stack.input_buffer_length().as_usize() < 8 {
         return Err(IrpCompletion::from_error(DriverError::InvalidParameter));
     }
-    if stack.output_buffer_length().as_usize() < 32 {
+    let minimum = match stack.fs_control_code() {
+        super::FsControlCode::GetRetrievalPointers => 32,
+        super::FsControlCode::GetVolumeBitmap => {
+            if stack.input_buffer_length().as_usize() != 8 {
+                return Err(IrpCompletion::from_error(DriverError::InvalidParameter));
+            }
+            17
+        }
+        _ => return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest)),
+    };
+    if stack.output_buffer_length().as_usize() < minimum {
         return Err(IrpCompletion::from_error(DriverError::BufferTooSmall));
     }
     #[cfg(not(test))]
@@ -1461,7 +1493,10 @@ fn capture_retrieval_pointers(
         let status = unsafe {
             // SAFETY: Dispatch owns this live FSCTL IRP in requestor context. Native capture
             // probes and copies only the fixed STARTING_VCN prefix, never forming a Rust view.
-            ffi::ext4win_capture_starting_vcn(target.irp.as_ptr(), core::ptr::addr_of_mut!(value))
+            ffi::ext4win_capture_allocation_start(
+                target.irp.as_ptr(),
+                core::ptr::addr_of_mut!(value),
+            )
         };
         ensure_native_success(status)?;
         u64::try_from(value)
@@ -1472,11 +1507,19 @@ fn capture_retrieval_pointers(
     let capacity = stack
         .output_buffer_length()
         .as_usize()
-        .min(RETRIEVAL_OUTPUT_MAXIMUM);
+        .min(ALLOCATION_OUTPUT_MAXIMUM);
     let output = CapturedRequestorOutput::capture(target, capacity)?;
     Ok((
-        PreparedRequest::RetrievalPointers {
-            starting_vcn,
+        PreparedRequest::AllocationQuery {
+            start: match stack.fs_control_code() {
+                super::FsControlCode::GetRetrievalPointers => {
+                    AllocationStart::FileVcn(starting_vcn)
+                }
+                super::FsControlCode::GetVolumeBitmap => {
+                    AllocationStart::VolumeCluster(ext4_core::ClusterAddress::new(starting_vcn))
+                }
+                _ => return Err(IrpCompletion::from_error(DriverError::InvalidDeviceRequest)),
+            },
             output,
         },
         key,

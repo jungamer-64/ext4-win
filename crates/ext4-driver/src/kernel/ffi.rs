@@ -340,7 +340,7 @@ unsafe extern "system" {
         group_length: *mut u32,
     ) -> wdk_sys::NTSTATUS;
 
-    /// Copies the fixed signed VCN from the current FSCTL's Type3 buffer under SEH.
+    /// Snapshots the fixed signed VCN or LCN from a supported allocation FSCTL under SEH.
     pub(crate) fn ext4win_capture_allocation_start(
         irp: wdk_sys::PIRP,
         value: *mut i64,
