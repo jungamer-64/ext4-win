@@ -5,11 +5,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::block_group::AllocationIndexBuild;
-use super::orphan::{OrphanRecoveryQueue, ValidatedOrphanInventory};
+use super::orphan::{ORPHAN_METADATA_BUDGET, OrphanRecoveryQueue, ValidatedOrphanInventory};
 use super::scope::*;
 use super::transaction::{
-    ORPHAN_METADATA_BUDGET, OrphanBatchCompletion, StorageRequestSequence,
-    StorageRequestSequenceStep, prepare_orphan_batch,
+    OrphanBatchCompletion, StorageRequestSequence, StorageRequestSequenceStep, prepare_orphan_batch,
 };
 use crate::disk::storage::{OperationDevice, StorageReadOverlay, StorageTarget, StorageTranscript};
 use crate::disk_format::journal::{

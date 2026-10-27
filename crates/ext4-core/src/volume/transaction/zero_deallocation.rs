@@ -1,6 +1,7 @@
 //! Persistent inode retirement policy and its physical completion boundary.
 
 use super::*;
+use crate::volume::orphan::require_zero_retirement_profile;
 
 /// Persistence boundary required before reporting a mutation's successful completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,10 +24,14 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Enables persistent physical zeroing when file allocation loses its last owner.
     /// Inline payload is converted to extent storage in the same commit. Zeroing uses journaled
     /// images, so it cannot destroy the old file before its retirement is durably committed.
+    /// Allocation geometry must fit complete zero images and extent pruning within the bounded
+    /// orphan recovery journal credits.
     /// # Errors
-    /// Returns inode-policy, allocation, inline-conversion, storage or serialization failures.
+    /// Returns unsupported cluster geometry, inode-policy, allocation, inline-conversion,
+    /// storage or serialization failures.
     pub fn set_zero_on_deallocation(&mut self, file: TransactionFile) -> Result<()> {
         self.edit(|pass| {
+            require_zero_retirement_profile(pass.mutation.volume.superblock)?;
             let index = pass.mutation.ensure_inode_update(file.inode())?;
             let mut raw = pass.mutation.staged_live_inode(index)?;
             let _metadata = raw.parse()?.metadata_mutation()?;

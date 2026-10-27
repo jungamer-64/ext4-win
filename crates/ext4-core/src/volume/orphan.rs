@@ -8,6 +8,35 @@ use crate::disk_format::superblock::JournalMode;
 /// Supported orphan-file size, measured in filesystem blocks independently of allocator capacity.
 const MAX_ORPHAN_BLOCKS: u64 = 512;
 
+/// Conservative payload credits for group allocation metadata, extent pruning, inode tables,
+/// the primary superblock and terminal orphan/xattr/inode-bitmap updates.
+pub(super) const ORPHAN_METADATA_BUDGET: usize = 32;
+
+/// Admits complete secure-retirement batches under the same fixed journal credits as recovery.
+/// One data reference plus the maximum pruned extent path can retire this many clusters. Each
+/// needs its full zero payload, bitmap and descriptor; four further images cover the surviving
+/// extent node, inode table, superblock and orphan tracker. Terminal xattr-block/inode reclamation
+/// runs in a separate batch.
+/// # Errors
+/// Returns an unsupported policy before staging when the recovery batch cannot fit.
+pub(super) fn require_zero_retirement_profile(superblock: Superblock) -> Result<()> {
+    let retired_clusters = usize::from(crate::disk_format::extent::MAX_EXTENT_DEPTH)
+        .checked_add(1)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let images_per_cluster = usize::try_from(superblock.blocks_per_cluster().as_u32())
+        .map_err(|_| Error::ArithmeticOverflow)?
+        .checked_add(2)
+        .ok_or(Error::ArithmeticOverflow)?;
+    let required = retired_clusters
+        .checked_mul(images_per_cluster)
+        .and_then(|images| images.checked_add(4))
+        .ok_or(Error::ArithmeticOverflow)?;
+    if required > ORPHAN_METADATA_BUDGET {
+        return Err(Error::UnsupportedInodeMutation);
+    }
+    Ok(())
+}
+
 /// Persistent location that must remain until the corresponding inode has finished recovery.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum OrphanSource {
@@ -120,6 +149,9 @@ impl ValidatedOrphanInventory {
             volume.superblock.orphan_file().map(|file| file.inode),
         )?;
         let raw = read_allocated_inode(volume, entry.inode)?;
+        if raw.flags()?.zero_on_deallocation() {
+            require_zero_retirement_profile(volume.superblock)?;
+        }
         let recovery = RecoverableOrphanInode::parse(raw)?;
         let allocation = InodeAllocation::load(volume, &recovery)?;
         self.entries.try_insert(

@@ -451,6 +451,9 @@ fn begin_inode_scan(
         return Ok(InodeAllocationScan::Next);
     }
     raw.verify_checksum(superblock)?;
+    if raw.flags()?.zero_on_deallocation() {
+        crate::volume::orphan::require_zero_retirement_profile(*superblock)?;
+    }
     if superblock.is_resize_inode(raw.id) {
         let root = raw.resize_inode_block_map()?.double_indirect();
         ranges.try_push(AllocationRange::new(root, 1, BlockOwnership::Exclusive)?)?;
@@ -1553,6 +1556,55 @@ mod tests {
         assert_eq!(index.count(ClusterAddress::new(1)), 3);
         assert_eq!(index.count(ClusterAddress::new(2)), 2);
         assert_eq!(index.count(ClusterAddress::new(3)), 0);
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns independent geometry, inode-field encoding or allocation failures.
+    /// # Panics
+    /// Fails if mounted allocation authority admits an unrecoverable secure-retirement profile.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare profile admission against independently encoded geometry and inode flags"
+    )]
+    fn secure_retirement_requires_recovery_credits_before_allocation_publication() -> Result<()> {
+        for (cluster_log, flags, links, accepted) in [
+            (0, 0x0008_0001, 1, true),
+            (1, 0x0008_0001, 1, true),
+            (6, 0x0008_0000, 1, true),
+            (2, 0x0008_0001, 1, false),
+            (6, 0x0008_0001, 1, false),
+            (6, 0x0008_0001, 0, false),
+        ] {
+            let (superblock, _) = allocation_fixture(cluster_log, 4097, 128)?;
+            let mut bytes = [0_u8; 256];
+            put_le_u16(&mut bytes, disk_offset(0), 0x81a4)?;
+            put_le_u16(&mut bytes, disk_offset(26), links)?;
+            put_le_u32(&mut bytes, disk_offset(32), flags)?;
+            for (offset, value) in [(40, 0xf30a), (44, 4)] {
+                put_le_u16(&mut bytes, disk_offset(offset), value)?;
+            }
+            let raw = RawInodeRecord {
+                id: InodeId::try_from(12)?,
+                offset: ByteOffset::new(0),
+                bytes: bytes.as_slice(),
+                encoding: superblock.inode_data_encoding(),
+            };
+            let result = begin_inode_scan(
+                raw,
+                &superblock,
+                &ValidatedOrphanInventory::empty(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            if accepted {
+                assert!(matches!(result, Ok(InodeAllocationScan::Extents(_))));
+            } else {
+                assert!(matches!(result, Err(Error::UnsupportedInodeMutation)));
+            }
+        }
         Ok(())
     }
 

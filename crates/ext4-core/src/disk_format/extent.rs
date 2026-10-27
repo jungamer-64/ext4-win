@@ -53,7 +53,7 @@ const INODE_ROOT_ENTRY_CAPACITY: usize = 4;
 /// Checksum tail bytes reserved at the end of external extent blocks.
 const EXTENT_TAIL_SIZE: usize = 4;
 /// ext4 extent trees are bounded; deeper trees are rejected before recursion.
-const MAX_EXTENT_DEPTH: u16 = 5;
+pub(crate) const MAX_EXTENT_DEPTH: u16 = 5;
 /// Exclusive end of the 32-bit logical block domain.
 const LOGICAL_BLOCK_EXCLUSIVE_END: u64 = 1_u64 << 32;
 

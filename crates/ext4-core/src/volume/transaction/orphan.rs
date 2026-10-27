@@ -3,12 +3,10 @@
 use super::*;
 use crate::disk_format::extent::ExtentTail;
 use crate::volume::orphan::{
-    OrphanProgress, OrphanRecoveryTarget, OrphanSource, extent_context, read_allocated_inode,
+    ORPHAN_METADATA_BUDGET, OrphanProgress, OrphanRecoveryTarget, OrphanSource, extent_context,
+    read_allocated_inode,
 };
 
-/// Conservative payload credits: one data bitmap group, up to five pruned metadata groups,
-/// descriptors, inode table, primary superblock, and terminal orphan/xattr/inode-bitmap updates.
-pub(in crate::volume) const ORPHAN_METADATA_BUDGET: usize = 32;
 /// Maximum data-block references released in one batch, additionally split at group boundaries.
 const RELEASE_BLOCK_BUDGET: u64 = 1024;
 

@@ -20,7 +20,7 @@ mod zero_deallocation;
 pub use zero_deallocation::MutationCompletionDurability;
 mod xattr;
 
-pub(super) use orphan::{ORPHAN_METADATA_BUDGET, OrphanBatchCompletion, prepare_orphan_batch};
+pub(super) use orphan::{OrphanBatchCompletion, prepare_orphan_batch};
 
 use commit::{
     directory_entry_kind, map_extents, reject_reserved_directory_name, verity_metadata_image,
