@@ -130,10 +130,12 @@ impl RequestedCreationMetadata {
         self,
         node: NodeId,
         mutation: &mut DriverMutationPass<'_, '_, '_>,
+        mode: crate::irp::CreateFileMode,
     ) -> DriverResult<()> {
         let allocation =
             u64::try_from(self.allocation).map_err(|_| DriverError::InvalidParameter)?;
-        if let NodeId::File(file) = node {
+        if let NodeId::File(file) = node
+            && mode == crate::irp::CreateFileMode::Ordinary {
             let file = mutation.file(file)?;
             mutation.reserve_file_allocation(
                 file,
@@ -1277,6 +1279,10 @@ impl ExistingCreateIntent {
 /// Fully allocated existing-node open retained while an image-section check runs outside the actor.
 #[derive(Debug)]
 pub(crate) struct PendingExistingCreateOpen {
+    /// Initial allocation bound selected before any reset commits.
+    paging_target: Option<ext4_core::FileSize>,
+    /// Native setup and FCB retention move to the operation after initial publication.
+    paging: Option<super::paging_file::PagingInitialization>,
     /// Rollback-owning FCB reference and provisional share claim.
     claim: PendingFileControlBlockClaim,
     /// Exact inode resolved before the native call.
@@ -1300,6 +1306,8 @@ pub(crate) struct PendingExistingCreateOpen {
 }
 
 impl PendingExistingCreateOpen {
+    /// Transfers unique setup ownership after the initial inode transaction commits.
+    pub(crate) fn take_paging(&mut self) -> Option<super::paging_file::PagingInitialization> { self.paging.take() }
     /// Allocates and admits every resource needed before any MM call can occur.
     /// # Errors
     ///
@@ -1311,6 +1319,7 @@ impl PendingExistingCreateOpen {
         policy: CreateHandlePolicy,
         pending_deletion: Option<PendingFileDeletion>,
         intent: ExistingCreateIntent,
+        paging_target: Option<ext4_core::FileSize>,
     ) -> DriverResult<Self> {
         let ExistingNodeTarget {
             volume,
@@ -1329,26 +1338,44 @@ impl PendingExistingCreateOpen {
             stream_metadata,
             file_object,
             policy.granted_access(),
-            policy.existing_operation_access(),
             policy.share_access(),
-            policy.oplock_policy(),
+            crate::state::ExistingNodeOpenPolicy {
+                operation_access: policy.existing_operation_access(),
+                oplock_policy: policy.oplock_policy(),
+                file_mode: policy.file_mode,
+            },
         )?;
         let claim = PendingFileControlBlockClaim {
             fcb: admission.file_control_block(),
             file_object,
         };
-        if policy.file_mode == crate::irp::CreateFileMode::PagingFile
-            && (admission.residency() != ExistingStreamResidency::FirstOpen
-                || admission.open_count().get() != 1
-                || node_mode != OpenedNodeMode::Direct
-                || policy.regular_file_write_access() != RegularFileWriteAccess::Positional) {
-            return Err(DriverError::ShareAccessConflict);
+        let mut paging_target = paging_target;
+        if policy.file_mode == crate::irp::CreateFileMode::PagingFile {
+            if node_mode != OpenedNodeMode::Direct
+                || policy.regular_file_write_access() != RegularFileWriteAccess::Positional {
+                return Err(DriverError::ShareAccessConflict);
+            }
+            let acknowledged = claim.paging_file_length();
+            if acknowledged != 0 {
+                if !matches!(intent, ExistingCreateIntent::Open(_)) {
+                    return Err(DriverError::ShareAccessConflict);
+                }
+                if paging_target.is_some_and(|target| target.bytes() <= acknowledged) {
+                    paging_target = None;
+                }
+            } else if admission.residency() != ExistingStreamResidency::FirstOpen
+                || admission.open_count().get() != 1 {
+                return Err(DriverError::ShareAccessConflict);
+            }
         }
         let handle = claim.prepare_handle(node, node_mode, location, policy)?;
         let write_open = match node {
             // Reset admission belongs to the final size plan: it checks image and data sections
             // under one permit, including when the existing EOF is already zero.
             NodeId::File(_) if matches!(intent, ExistingCreateIntent::Reset { .. }) => {
+                ExistingWriteOpenRequirement::NotRequired
+            }
+            NodeId::File(_) if policy.file_mode == crate::irp::CreateFileMode::PagingFile => {
                 ExistingWriteOpenRequirement::NotRequired
             }
             NodeId::File(_) => ExistingWriteOpenRequirement::for_regular_file(
@@ -1363,6 +1390,8 @@ impl PendingExistingCreateOpen {
             admission.open_count(),
         );
         Ok(Self {
+            paging_target,
+            paging: None,
             claim,
             node,
             node_mode,
@@ -1654,7 +1683,6 @@ fn revalidate_existing_open(
 /// Stages a reset while the operation keeps sole rollback and oplock-backout ownership.
 /// # Errors
 /// Returns gate, read-only, EA, allocation, or ext4 mutation failures before handle publication.
-#[expect(unsafe_code, reason = "the pending first-open claim uniquely retains the pinned FCB until infallible FILE_OBJECT publication")]
 fn finish_existing_create(
     pending: &mut Option<PendingExistingCreateOpen>,
     gate: Option<&PreparedStreamWriteOpen>,
@@ -1662,20 +1690,18 @@ fn finish_existing_create(
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<CreateResolution> {
     let open = pending
-        .as_ref()
+        .as_mut()
         .ok_or(DriverError::InternalInvariantViolation)?;
     open.validate_gate(gate)?;
-    if open.policy.file_mode == crate::irp::CreateFileMode::PagingFile {
-        let NodeId::File(file) = open.node else { return Err(DriverError::NotSupported); };
-        let storage = mutation.contiguous_file_storage(file)?;
-        if !storage.length().bytes().is_multiple_of(4096) {
-            return Err(DriverError::NotSupported);
-        }
-        let stream = unsafe {
-            // SAFETY: The rollback-owning first-open claim retains its pinned FCB until attachment.
-            open.claim.file_control_block().as_ref()
-        };
-        stream.install_paging_file(storage, operations.storage_route())?;
+    if open.paging_target.is_some() && open.paging.is_none() {
+        let current = if matches!(open.intent, ExistingCreateIntent::Reset { .. }) {
+            ext4_core::FileSize::from_bytes(0)
+        } else { mutation.staged_node_metadata(open.node)?.size() };
+        let extension = open.claim.paging_file_length() != 0;
+        let lease = operations.acquire_paging_file_setup(open.claim.file_control_block(), open.claim.file_object(), extension)?;
+        open.paging = Some(super::paging_file::PagingInitialization::new(lease,
+            open.paging_target.ok_or(DriverError::InternalInvariantViolation)?, current,
+            operations.volume_geometry().block_size())?);
     }
     if let ExistingCreateIntent::Reset {
         reset,
@@ -1698,7 +1724,7 @@ fn finish_existing_create(
         let file = mutation.file(id)?;
         mutation.truncate_file(file, ext4_core::FileSize::from_bytes(0))?;
         ea.replace_existing(open.node, mutation)?;
-        metadata.apply(open.node, mutation)?;
+        metadata.apply(open.node, mutation, open.policy.file_mode)?;
         if *reset == ExistingFileReset::Supersede {
             let node = mutation.node(open.node)?;
             let times = crate::metadata::staged_node_metadata(mutation, open.node)?.times();
@@ -1712,6 +1738,12 @@ fn finish_existing_create(
                 ),
             )?;
         }
+        return Ok(CreateResolution::ExistingMutation);
+    }
+    if open.paging.is_some() {
+        let times = mutation.staged_node_metadata(open.node)?.times();
+        let node = mutation.node(open.node)?;
+        mutation.set_times(node, times)?;
         return Ok(CreateResolution::ExistingMutation);
     }
     let open = pending
@@ -1730,7 +1762,8 @@ pub(crate) fn publish_existing_mutation(
         crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
             .bugcheck();
     };
-    if !matches!(open.intent, ExistingCreateIntent::Reset { .. }) {
+    if !matches!(open.intent, ExistingCreateIntent::Reset { .. })
+        && open.policy.file_mode != crate::irp::CreateFileMode::PagingFile {
         crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
             .bugcheck();
     }
@@ -1753,13 +1786,6 @@ fn open_existing_node(
 ) -> DriverResult<CreateResolution> {
     let node = target.node;
     let parameters = request.parameters();
-    if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
-        let NodeId::File(file) = node else { return Err(DriverError::NotSupported); };
-        let allocation = request.owner.metadata.allocation;
-        if allocation < 0 || u64::try_from(allocation).map_err(|_| DriverError::InvalidParameter)? > mutation.load_file(file)?.size().bytes() {
-            return Err(DriverError::NotSupported);
-        }
-    }
     validate_existing_node_options(node, parameters.target_requirement())?;
     let intent = match disposition {
         CreateDisposition::Create => return Err(DriverError::ObjectNameCollision),
@@ -1798,8 +1824,16 @@ fn open_existing_node(
         )?,
         operations.current_epoch_sequence(),
     );
-    let pending =
-        PendingExistingCreateOpen::prepare(request, target, stream, policy, deletion, intent)?;
+    let paging_target = if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
+        let NodeId::File(file) = node else { return Err(DriverError::NotSupported); };
+        let current = if matches!(intent, ExistingCreateIntent::Reset { .. }) { ext4_core::FileSize::from_bytes(0) }
+            else { mutation.load_file(file)?.size() };
+        let requested = u64::try_from(request.owner.metadata.allocation).map_err(|_| DriverError::InvalidParameter)?;
+        let target = ext4_core::FileSize::from_bytes(requested.max(current.bytes()));
+        super::paging_file::validate_bound(target, current, u64::from(operations.volume_geometry().block_size().bytes()).max(4096))?;
+        Some(target)
+    } else { None };
+    let pending = PendingExistingCreateOpen::prepare(request, target, stream, policy, deletion, intent, paging_target)?;
     select_existing_open_gate(pending, pending_existing, operations, mutation)
 }
 
@@ -1913,6 +1947,7 @@ fn open_target_directory(
         policy,
         None,
         ExistingCreateIntent::Open(action),
+        None,
     )
 }
 
@@ -1955,9 +1990,12 @@ fn create_missing_node(
     name: &Ext4Name,
 ) -> DriverResult<PendingCreatePublication> {
     let parameters = request.parameters();
-    if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
-        return Err(DriverError::NotSupported);
-    }
+    let paging_target = if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
+        let target = ext4_core::FileSize::from_bytes(u64::try_from(request.owner.metadata.allocation).map_err(|_| DriverError::InvalidParameter)?);
+        super::paging_file::validate_bound(target, ext4_core::FileSize::from_bytes(0),
+            u64::from(operations.volume_geometry().block_size().bytes()).max(4096))?;
+        Some(target)
+    } else { None };
     let policy = CreateHandlePolicy::from_authorized(
         parameters,
         request.granted_access(),
@@ -1992,7 +2030,7 @@ fn create_missing_node(
     let node = creation.node();
     let notification = DirectoryChange::new(parent, name, node, DirectoryChangeAction::Added)?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
-    request.owner.metadata.apply(node, mutation)?;
+    request.owner.metadata.apply(node, mutation, parameters.file_mode())?;
     crate::short_name::store(mutation, parent, name, node, alias)?;
     if let Some(tunneled) = tunneled {
         let times = mutation.staged_node_metadata(node)?.times();
@@ -2006,6 +2044,7 @@ fn create_missing_node(
     let file_object =
         request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
     Ok(PendingCreatePublication {
+        paging_target,
         creation,
         staged_stream,
         file_object,
@@ -2365,6 +2404,8 @@ fn path_components(units: &[u16]) -> DriverResult<DriverVec<CreatePathComponent>
 /// Driver publication seed built during a restartable mutation resolve pass.
 #[derive(Debug)]
 pub(crate) struct PendingCreatePublication {
+    /// A paging create initializes this bound after the namespace transaction checkpoints.
+    paging_target: Option<ext4_core::FileSize>,
     /// Staged child identity and stable VCB/FCB-ledger capability.
     creation: PendingChildCreation,
     /// Exact staged stream dimensions after all create-time metadata and EA changes.
@@ -2390,8 +2431,9 @@ impl PendingCreatePublication {
     ///
     /// Returns an error when FCB allocation, first-open admission, reference accounting, or share
     /// recording fails.
-    pub(crate) fn prepare(self) -> DriverResult<PreparedCreatePublication> {
+    pub(crate) fn prepare(self, operations: &MountedVolumeAccess<'_>) -> DriverResult<PreparedCreatePublication> {
         let Self {
+            paging_target,
             creation,
             staged_stream,
             file_object,
@@ -2410,7 +2452,12 @@ impl PendingCreatePublication {
         let claim = PendingFileControlBlockClaim { fcb, file_object };
         let handle =
             claim.prepare_handle(creation.node(), OpenedNodeMode::Direct, location, policy)?;
+        let paging = if let Some(target) = paging_target {
+            let lease = operations.acquire_paging_file_setup(fcb, file_object, false)?;
+            Some(super::paging_file::PagingInitialization::new(lease, target, ext4_core::FileSize::from_bytes(0), operations.volume_geometry().block_size())?)
+        } else { None };
         Ok(PreparedCreatePublication {
+            paging,
             claim,
             oplock: NewCreateOplockState::from_policy(
                 policy.oplock_policy(),
@@ -2419,7 +2466,7 @@ impl PendingCreatePublication {
             handle,
             flags: policy.file_object_flags(),
             pending_deletion,
-            notification,
+            notification: Some(notification),
         })
     }
 }
@@ -2427,6 +2474,8 @@ impl PendingCreatePublication {
 /// Fully prepared post-commit create publication.
 #[derive(Debug)]
 pub(crate) struct PreparedCreatePublication {
+    /// Setup owns allocation until the fully initialized map can attach its FILE_OBJECT.
+    paging: Option<super::paging_file::PagingInitialization>,
     /// Rollback-owning FCB/share claim consumed only by durable attachment.
     claim: PendingFileControlBlockClaim,
     /// Atomic create reservation state retained through commit durability.
@@ -2438,10 +2487,17 @@ pub(crate) struct PreparedCreatePublication {
     /// Optional preallocated delete-on-close target.
     pending_deletion: Option<PendingFileDeletion>,
     /// Preallocated directory notification payload.
-    notification: DirectoryChange,
+    notification: Option<DirectoryChange>,
 }
 
 impl PreparedCreatePublication {
+    /// Moves setup authority while retaining the unpublished FILE_OBJECT claim here.
+    pub(crate) fn take_paging(&mut self) -> Option<super::paging_file::PagingInitialization> { self.paging.take() }
+
+    /// Announces a committed namespace entry even when later initialization may fail.
+    pub(crate) fn publish_namespace(&mut self, operations: &mut MountedVolumeAccess<'_>) {
+        if let Some(notification) = self.notification.take() { operations.report_directory_change(notification); }
+    }
     /// Returns the exact first-open stream that must establish an atomic create oplock.
     pub(crate) fn oplock_reservation_target(
         &self,
@@ -2470,6 +2526,7 @@ impl PreparedCreatePublication {
     pub(crate) fn publish(mut self, operations: &mut MountedVolumeAccess<'_>) -> CreateCompletion {
         self.oplock.publish();
         let Self {
+            paging: _,
             claim,
             oplock: _,
             handle,
@@ -2482,7 +2539,7 @@ impl PreparedCreatePublication {
         if let Some(pending) = pending_deletion {
             operations.set_file_delete_pending(fcb, pending);
         }
-        operations.report_directory_change(notification);
+        if let Some(notification) = notification { operations.report_directory_change(notification); }
         CreateCompletion::Handle(CreateAction::Created)
     }
 }
@@ -2497,6 +2554,15 @@ struct PendingFileControlBlockClaim {
 }
 
 impl PendingFileControlBlockClaim {
+    /// Observes the native acknowledged prefix while this provisional claim retains its FCB.
+    #[expect(unsafe_code, reason = "the unpublished share/reference claim pins its FCB through observation")]
+    fn paging_file_length(&self) -> u64 {
+        unsafe {
+            // SAFETY: This claim owns the FCB reference until consume or Drop.
+            self.fcb.as_ref().paging_file_length()
+        }
+    }
+
     /// Prepares a handle against this retained stream's selected-link authority.
     /// # Errors
     /// Returns shared-location or CCB allocation failure while this claim still owns rollback.

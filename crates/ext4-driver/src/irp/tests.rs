@@ -1600,30 +1600,31 @@ fn create_stack_rejects_unimplemented_special_flag_protocols() {
 }
 
 /// # Panics
-/// Fails if paging-file admission loses its exclusive open or fixed-allocation protocol.
+/// Fails if paging-file setup rejects the Memory Manager's creation and sharing contract.
 #[test]
-fn paging_file_create_retains_its_distinct_exclusive_protocol() {
-    let decode = |disposition, share| super::CreateParameters::decode(
+fn paging_file_create_accepts_initialization_and_shared_control_opens() {
+    let decode = |disposition, share, options| super::CreateParameters::decode(
         wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA,
-        (disposition << super::CREATE_DISPOSITION_SHIFT) | wdk_sys::FILE_NON_DIRECTORY_FILE,
+        (disposition << super::CREATE_DISPOSITION_SHIFT) | options,
         share,
         super::IrpBufferLength(0),
         u8::try_from(wdk_sys::SL_OPEN_PAGING_FILE).unwrap_or_default(),
     );
-    let open = decode(super::FILE_OPEN_IF_DISPOSITION, 0);
-    assert!(open.is_ok());
-    if let Ok(open) = open {
+    for (disposition, share, options) in [
+        (super::FILE_OPEN_IF_DISPOSITION, 0, wdk_sys::FILE_NON_DIRECTORY_FILE),
+        (super::FILE_SUPERSEDE_DISPOSITION, u16::try_from(wdk_sys::FILE_SHARE_WRITE).unwrap_or_default(),
+            wdk_sys::FILE_NON_DIRECTORY_FILE | wdk_sys::FILE_DELETE_ON_CLOSE),
+        (super::FILE_OPEN_DISPOSITION, u16::try_from(wdk_sys::FILE_SHARE_WRITE).unwrap_or_default(), wdk_sys::FILE_NON_DIRECTORY_FILE),
+    ] {
+        let open = decode(disposition, share, options);
+        assert!(open.is_ok());
+        if let Ok(open) = open {
         assert_eq!(open.file_mode(), super::CreateFileMode::PagingFile);
         assert_eq!(open.validate_supported_flags(), Ok(()));
+        }
     }
-    for (disposition, share) in [
-        (super::FILE_OVERWRITE_DISPOSITION, 0),
-        (super::FILE_OPEN_DISPOSITION, u16::try_from(wdk_sys::FILE_SHARE_READ).unwrap_or_default()),
-    ] {
-        let open = decode(disposition, share);
-        assert!(open.is_ok());
-        if let Ok(open) = open { assert_eq!(open.validate_supported_flags(), Err(DriverError::NotSupported)); }
-    }
+    let directory = decode(super::FILE_OPEN_DISPOSITION, 0, wdk_sys::FILE_DIRECTORY_FILE);
+    assert!(matches!(directory, Ok(open) if open.validate_supported_flags() == Err(DriverError::NotSupported)));
 }
 
 /// # Panics

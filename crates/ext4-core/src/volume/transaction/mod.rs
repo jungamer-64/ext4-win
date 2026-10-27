@@ -8,6 +8,7 @@ mod fast_commit;
 use allocation::AllocationExclusionSource;
 pub(super) use fast_commit::resolve_delta_postconditions;
 mod commit;
+mod contiguous;
 mod file_data;
 mod fscrypt;
 mod inline_data;
@@ -897,12 +898,28 @@ impl MutationResolvePass<'_, '_, '_> {
         result
     }
 
-    /// Observes committed initialized contiguous payload without staging a mutation.
-    /// The caller must retain allocation exclusion before using this observation for direct I/O.
+    /// Observes initialized contiguous payload from this pass's latest staged inode and extents.
+    /// The result is provisional until commit; it grants no direct-I/O or allocation authority.
     /// # Errors
     /// Rejects non-contiguous/uninitialized/protected files and preserves storage failures.
     pub fn contiguous_file_storage(&mut self, file: FileNodeId) -> Result<super::node::ContiguousFileStorage> {
-        self.mutation.volume.contiguous_file_storage(file)
+        self.edit(|pass| {
+            let raw = pass.mutation.raw_inode_for_policy(file.inode())?;
+            let inode = raw.parse()?;
+            if inode.kind() != InodeKind::File { return Err(Error::WrongInodeKind); }
+            if pass.mutation.xattr_set_for_raw_inode(&raw)?.public().entries().any(|(name, _)|
+                name.namespace() == crate::XattrNamespace::Security && name.local() == b"capability") {
+                return Err(Error::UnsupportedInodeMutation);
+            }
+            let context = pass.mutation.volume.extent_tree_context(&inode);
+            let size = pass.mutation.volume.superblock.block_size();
+            let mut source = TransactionExtentSource {
+                device: &mut pass.mutation.volume.device,
+                staged: &pass.mutation.extent_updates,
+                block_size: size,
+            };
+            super::read::initialized_contiguous_storage(&inode, size, context, &mut source)
+        })
     }
 
     /// Observes this pass's latest staged inode metadata.

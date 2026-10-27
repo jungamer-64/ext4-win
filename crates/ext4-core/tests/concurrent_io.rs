@@ -10,6 +10,8 @@ use sha2::Digest as _;
 
 #[path = "concurrent_io/fast_commit.rs"]
 mod fast_commit;
+#[path = "concurrent_io/contiguous.rs"]
+mod contiguous;
 #[path = "concurrent_io/mmp.rs"]
 mod mmp;
 #[path = "concurrent_io/relocation.rs"]

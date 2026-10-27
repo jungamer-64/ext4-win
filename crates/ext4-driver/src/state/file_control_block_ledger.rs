@@ -509,6 +509,35 @@ pub(crate) struct StreamCacheLease {
     retained: DeferredStreamLease,
 }
 
+/// Setup admission retains its exact FCB even before a create attaches its FILE_OBJECT.
+#[derive(Debug)]
+pub(crate) struct PagingFileSetupLease {
+    /// Drops native reservation before releasing the deferred stream owner below.
+    native: crate::kernel::stream::PagingFileReservation,
+    /// Explicit nonpaged FCB lifetime through activation, abort, or checkpoint failure.
+    stream: StreamCacheLease,
+}
+
+impl PagingFileSetupLease {
+    /// Returns the fixed old prefix whose direct paging I/O remains admitted during extension.
+    pub(crate) const fn claim(&self) -> crate::kernel::stream::PagingFileClaim { self.native.claim() }
+
+    /// Identifies the retained regular-file inode for initialization transactions.
+    pub(crate) fn file(&self) -> DriverResult<ext4_core::FileNodeId> {
+        match self.stream.stream().node {
+            NodeId::File(file) => Ok(file),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Consumes setup after home durability has established the complete initialized prefix.
+    /// # Errors
+    /// Returns invalid geometry or revoked native admission without widening the old map.
+    pub(crate) fn activate(self, storage: ext4_core::ContiguousFileStorage, route: crate::kernel::storage::MountedStorageRoute) -> DriverResult<()> {
+        self.native.activate(storage, route)
+    }
+}
+
 /// One FILE_OBJECT cache identity retained while a PASSIVE_LEVEL worker calls Cc/MM.
 #[derive(Debug)]
 pub(crate) struct FileObjectCacheLease {
@@ -1399,14 +1428,20 @@ impl Drop for FileControlBlockLedgerLock {
 #[derive(Clone, Copy, Debug)]
 pub(super) enum FileControlBlockShareCheck {
     /// Existing-node operations must first respect the access shared by prior handles.
-    ExistingNode {
-        /// Virtual access required by the existing-node disposition.
-        operation_access: ExistingOperationAccess,
-        /// Oplock behavior that must be admitted atomically with the new share claim.
-        oplock_policy: OplockCreatePolicy,
-    },
+    ExistingNode(ExistingNodeOpenPolicy),
     /// A transaction-local new node has no pre-existing operation access to validate.
     NewNode,
+}
+
+/// Authorized existing-node disposition and Windows stream protocol admitted with one share claim.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExistingNodeOpenPolicy {
+    /// Virtual access required by the existing-node disposition.
+    pub(crate) operation_access: ExistingOperationAccess,
+    /// Oplock behavior admitted atomically with the returned open.
+    pub(crate) oplock_policy: OplockCreatePolicy,
+    /// Kernel paging opens may share an acknowledged fixed allocation.
+    pub(crate) file_mode: crate::irp::CreateFileMode,
 }
 
 /// One normalized existing-stream claim admitted atomically by the FCB ledger.
@@ -1423,11 +1458,9 @@ struct ExistingFileControlBlockOpen {
     /// Access already granted by the create security boundary.
     desired_access: GrantedAccess,
     /// Existing-node operation access that participates in share validation.
-    operation_access: ExistingOperationAccess,
+    policy: ExistingNodeOpenPolicy,
     /// Requested Windows sharing.
     share_access: ShareAccess,
-    /// Requested create-time oplock behavior.
-    oplock_policy: OplockCreatePolicy,
 }
 
 /// Common construction and share-admission facts for one ledger open.
@@ -1589,10 +1622,7 @@ impl FileControlBlockLedger {
             file_object: request.file_object,
             desired_access: request.desired_access,
             share_access: request.share_access,
-            share_check: FileControlBlockShareCheck::ExistingNode {
-                operation_access: request.operation_access,
-                oplock_policy: request.oplock_policy,
-            },
+            share_check: FileControlBlockShareCheck::ExistingNode(request.policy),
         })
     }
 
@@ -2572,6 +2602,27 @@ impl FileControlBlockLedger {
         })
     }
 
+    /// Reserves one setup while retaining the exact regular stream across actor suspensions.
+    /// # Errors
+    /// Rejects competing setup, non-first initial claims, native residency or lease exhaustion.
+    #[expect(unsafe_code, reason = "the returned owner drops native setup before the deferred FCB retention")]
+    pub(super) fn acquire_paging_file_setup(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file_object: KernelFileObject,
+        extension: bool,
+    ) -> DriverResult<PagingFileSetupLease> {
+        // SAFETY: The actor's original FILE_OBJECT or unpublished create claim retains this FCB.
+        let node = unsafe { fcb.as_ref().node };
+        let stream = self.retain_regular_stream(fcb, node)?;
+        if !extension && self.stream_open_count(fcb) != 1 { return Err(DriverError::ShareAccessConflict); }
+        let native = unsafe {
+            // SAFETY: `stream` owns deferred retention until after native reservation Drop.
+            stream.stream().stream_context.reserve_paging_file(file_object, extension)?
+        };
+        Ok(PagingFileSetupLease { native, stream })
+    }
+
     /// Retires freed allocations before any fallible native projection, preserving their exact
     /// pointer lifetimes. Live streams are retained through short leases while the ledger
     /// resource is released for each native Cc/MM call.
@@ -3261,9 +3312,8 @@ impl VolumeControlBlock {
         stream: CommittedNodeStreamMetadata,
         file_object: KernelFileObject,
         desired_access: GrantedAccess,
-        existing_operation_access: ExistingOperationAccess,
         share_access: ShareAccess,
-        oplock_policy: OplockCreatePolicy,
+        policy: ExistingNodeOpenPolicy,
     ) -> DriverResult<ExistingFileControlBlockAdmission> {
         let owner = unsafe {
             // SAFETY: Actor admission retains this immutable mounted stream owner. Ledger
@@ -3278,9 +3328,8 @@ impl VolumeControlBlock {
                 stream,
                 file_object,
                 desired_access,
-                operation_access: existing_operation_access,
+                policy,
                 share_access,
-                oplock_policy,
             })
     }
 }
@@ -3383,7 +3432,12 @@ fn record_reused_file_control_block_open(
     if unsafe {
         // SAFETY: The ledger lookup above established this pinned FCB's current table membership.
         fcb.as_ref().is_paging_file()
-    } {
+    } && (!matches!(share_check, FileControlBlockShareCheck::ExistingNode(policy)
+            if policy.file_mode == crate::irp::CreateFileMode::PagingFile)
+        || unsafe {
+            // SAFETY: The same retained table member provides a locked native map observation.
+            fcb.as_ref().paging_file_length() == 0
+        }) {
         return Err(DriverError::ShareAccessConflict);
     }
     let state = unsafe {

@@ -226,6 +226,83 @@ impl MetadataMutation<'_, '_> {
             .ok_or(Error::NoSpace)
     }
 
+    /// Selects a full free run without granting allocation ownership. Later exact claims recheck
+    /// the same bitmap, committed references and independent allocation exclusions.
+    /// # Errors
+    /// Returns finite-space exhaustion, malformed geometry or metadata/reference failures.
+    pub(super) fn find_free_cluster_run(&mut self, count: crate::ClusterCount) -> Result<ClusterAddress> {
+        let mut run = 0_u64;
+        let mut first = ClusterAddress::new(0);
+        for group in 0..self.volume.superblock.block_group_count()?.as_u32() {
+            let group = BlockGroupId::from_u32(group);
+            let descriptor = BlockGroupDescriptor::read_from(&mut self.volume.device, &self.volume.superblock, group)?;
+            // Candidate exploration owns no bitmap update or allocation authority. Only the
+            // subsequently claimed chunk contributes group writes to mutation admission.
+            let bitmap = if let Some(staged) = self.block_bitmap_updates.iter()
+                .find(|image| image.block == descriptor.block_bitmap()) {
+                memory::copied_slice(&staged.bytes)?
+            } else {
+                match descriptor.block_bitmap_initialization() {
+                    AllocationBitmapInitialization::Initialized => descriptor.read_bitmap(
+                        &mut self.volume.device, &self.volume.superblock, AllocationBitmapKind::Block)?,
+                    AllocationBitmapInitialization::Uninitialized => {
+                        let layouts = read_group_metadata_layouts(&mut self.volume.device, &self.volume.superblock)?;
+                        materialize_uninitialized_block_bitmap(&self.volume.superblock, group, &layouts)?
+                    }
+                }
+            };
+            for bit in 0..self.volume.superblock.clusters_in_group(group)? {
+                let cluster = ClusterAddress::new(u64::from(group.as_u32())
+                    .checked_mul(u64::from(self.volume.superblock.clusters_per_group().as_u32()))
+                    .and_then(|base| base.checked_add(u64::from(bit))).ok_or(Error::ArithmeticOverflow)?);
+                if self.cluster_available(cluster, ClusterBitmapPosition::new(group, bit), &bitmap)? {
+                    if run == 0 { first = cluster; }
+                    run = run.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
+                    if run == count.as_u64() { return Ok(first); }
+                } else { run = 0; }
+            }
+        }
+        Err(Error::NoSpace)
+    }
+
+    /// Allocates a logical block at an exact physical coordinate, sharing only its own already
+    /// mapped logical cluster. Exact placement never silently falls back to another free cluster.
+    /// # Errors
+    /// Returns occupied destination, inconsistent cluster origin or allocation failures.
+    pub(super) fn allocate_extent_block_at(&mut self, tree: &MutableExtentTree,
+        logical: LogicalBlock, physical: BlockAddress) -> Result<()> {
+        let superblock = self.volume.superblock;
+        let cluster = superblock.cluster_of_block(physical)?;
+        let width = u64::from(superblock.blocks_per_cluster().as_u32());
+        let within = logical.as_u64().checked_rem(width).ok_or(Error::InvalidClusterGeometry)?;
+        if self.physical_block_in_cluster(cluster, within)? != physical { return Err(Error::InvalidClusterGeometry); }
+        let start = logical.as_u64().checked_sub(within).ok_or(Error::ArithmeticOverflow)?;
+        for offset in 0..width {
+            let probe = start.checked_add(offset).ok_or(Error::ArithmeticOverflow)?;
+            if probe > u64::from(u32::MAX) { break; }
+            if let Some(mapped) = tree.allocated_block(LogicalBlock::try_from(probe)?)? {
+                if superblock.cluster_of_block(mapped)? != cluster { return Err(Error::ClusterReferenceConflict); }
+                return self.record_cluster_reference_delta(cluster, 1);
+            }
+        }
+        self.allocate_cluster_at(cluster).map(|_| ())
+    }
+
+    /// A free observation is provisional; only `claim_cluster` publishes staged ownership.
+    /// # Errors
+    /// Returns malformed geometry or inconsistent committed/staged reference accounting.
+    fn cluster_available(&self, cluster: ClusterAddress, position: ClusterBitmapPosition, bitmap: &[u8]) -> Result<bool> {
+        if self.volume.superblock.blocks_in_cluster(cluster)? != self.volume.superblock.blocks_per_cluster().as_u32() {
+            return Ok(false);
+        }
+        if cluster_bitmap_bit_state(bitmap, position)? == BitmapBitState::Used
+            || self.allocation.contains(cluster) || self.volume.committed_clusters()?.count(cluster) != 0 {
+            return Ok(false);
+        }
+        if self.staged_cluster_reference_count(cluster)? != 0 { return Err(Error::ClusterReferenceConflict); }
+        Ok(true)
+    }
+
     /// Claims a full unowned cluster, or reports a destination unavailable without changing it.
     /// # Errors
     /// Returns malformed geometry, inconsistent staged ownership or accounting/allocation failure.
@@ -236,26 +313,10 @@ impl MetadataMutation<'_, '_> {
         bitmap_index: usize,
     ) -> Result<Option<BlockAddress>> {
         let first_block = self.volume.superblock.first_block_of_cluster(cluster)?;
-        if self.volume.superblock.blocks_in_cluster(cluster)?
-            != self.volume.superblock.blocks_per_cluster().as_u32()
-        {
-            return Ok(None);
-        }
-        let bitmap = self
-            .block_bitmap_updates
-            .get(bitmap_index)
-            .ok_or(Error::InvalidSuperblock)?;
-        if cluster_bitmap_bit_state(bitmap.bytes.as_slice(), position)? == BitmapBitState::Used
-            || self.allocation.contains(cluster)
-        {
-            return Ok(None);
-        }
         // Ordered home writes cannot reuse an owner retired by this uncommitted transaction.
-        if self.volume.committed_clusters()?.count(cluster) != 0 {
+        let bitmap = self.block_bitmap_updates.get(bitmap_index).ok_or(Error::InvalidSuperblock)?;
+        if !self.cluster_available(cluster, position, &bitmap.bytes)? {
             return Ok(None);
-        }
-        if self.staged_cluster_reference_count(cluster)? != 0 {
-            return Err(Error::ClusterReferenceConflict);
         }
         let bitmap = self
             .block_bitmap_updates

@@ -168,6 +168,9 @@ impl FileControlBlock {
     /// Reports the FCB's immutable paging-file allocation policy.
     pub(crate) fn is_paging_file(&self) -> bool { self.stream_context.is_paging_file() }
 
+    /// Returns the fixed prefix acknowledged to Memory Manager; preparation exposes zero.
+    pub(crate) fn paging_file_length(&self) -> u64 { self.stream_context.paging_file_length() }
+
     /// Observes the committed archive attribute before selecting a data-only cache write.
     pub(crate) fn archive_is_set(&self) -> bool {
         self.stream_context.archive_is_set()
@@ -547,18 +550,15 @@ impl FileControlBlockOpenState {
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<NonZeroU32> {
-        if let FileControlBlockShareCheck::ExistingNode {
-            operation_access,
-            oplock_policy,
-        } = share_check
+        if let FileControlBlockShareCheck::ExistingNode(policy) = share_check
         {
-            if matches!(oplock_policy, OplockCreatePolicy::ReserveFilter)
+            if matches!(policy.oplock_policy, OplockCreatePolicy::ReserveFilter)
                 && self.shares.active_handle_count() != 0
             {
                 return Err(DriverError::OplockNotGranted);
             }
             self.shares
-                .check_operation(file_object, operation_access, share_access)?;
+                .check_operation(file_object, policy.operation_access, share_access)?;
         }
         self.shares.open(file_object, desired_access, share_access)
     }

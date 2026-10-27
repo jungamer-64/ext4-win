@@ -627,6 +627,17 @@ pub(crate) struct MountedVolumeAccess<'volume> {
 }
 
 impl MountedVolumeAccess<'_> {
+    /// Acquires unique paging initialization authority without borrowing the VCB across I/O.
+    /// # Errors
+    /// Returns stale stream identity, competing setup, native residency or lease exhaustion.
+    pub(crate) fn acquire_paging_file_setup(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file: KernelFileObject,
+        extension: bool,
+    ) -> DriverResult<PagingFileSetupLease> {
+        self.volume.file_control_blocks.acquire_paging_file_setup(fcb, file, extension)
+    }
     /// Borrows advisory tunneling without granting ext4 namespace mutation authority.
     pub(crate) fn name_tunnel(&self) -> &crate::kernel::name_tunnel::NameTunnel {
         &self.volume.name_tunnel

@@ -5,6 +5,7 @@ pub(crate) type DriverMutationPass<'storage, 'epoch, 'crypto> =
     ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>;
 
 pub(crate) mod create;
+pub(crate) mod paging_file;
 pub(crate) mod dispatch;
 pub(crate) mod ea;
 pub(crate) mod file_info;

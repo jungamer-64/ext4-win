@@ -180,37 +180,79 @@ BOOLEAN NTAPI
 ext4win_stream_is_paging_file(PVOID header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
-    return stream != NULL && InterlockedCompareExchange(&stream->PagingFile.Active, 1, 1) == 1;
+    return stream != NULL && InterlockedCompareExchange(&stream->PagingFile.Active, 0, 0) != EXT4WIN_PAGING_VACANT;
 }
 
-/* The Rust first-open claim proves exclusive ownership before this one-time publication. */
 NTSTATUS NTAPI
-ext4win_stream_install_paging_file(PVOID header, PDEVICE_OBJECT lower,
-    LONGLONG physical, LONGLONG length, ULONG sector_size)
+ext4win_stream_reserve_paging_file(PVOID header, PFILE_OBJECT file, BOOLEAN extension,
+    LONGLONG *physical, LONGLONG *length)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
-    if (stream == NULL || stream->Kind != 1 || lower == NULL || physical < 0 || length <= 0 ||
+    if (stream == NULL || stream->Kind != 1 || file == NULL ||
         stream->VolumeStream == NULL || !ext4win_stream_storage_available(stream) ||
         ext4win_storage_close_phase(stream->VolumeStream->RustState) != 0 ||
         ext4win_storage_io_policy(stream->VolumeStream->RustState) != 0 ||
-        physical > MAXLONGLONG - length || sector_size == 0 ||
-        ((ULONGLONG)physical % sector_size) != 0 || ((ULONGLONG)length % sector_size) != 0 ||
-        stream->Header.FileSize.QuadPart != length ||
-        stream->SectionObjects.DataSectionObject != NULL ||
-        stream->SectionObjects.ImageSectionObject != NULL ||
-        stream->SectionObjects.SharedCacheMap != NULL ||
-        InterlockedCompareExchange(&stream->PagingFile.Active, -1, 0) != 0) {
+        (!extension && (stream->SectionObjects.DataSectionObject != NULL ||
+            stream->SectionObjects.ImageSectionObject != NULL ||
+            stream->SectionObjects.SharedCacheMap != NULL))) {
         return STATUS_INVALID_PARAMETER;
     }
-    stream->PagingFile.Lower = lower;
-    stream->PagingFile.PhysicalStart = physical;
-    stream->PagingFile.Length = length;
-    stream->PagingFile.SectorSize = sector_size;
-    stream->Header.Flags2 &= (UCHAR)~FSRTL_FLAG2_SUPPORTS_FILTER_CONTEXTS;
-    stream->Header.Flags2 |= FSRTL_FLAG2_IS_PAGING_FILE;
-    stream->Header.IsFastIoPossible = FastIoIsNotPossible;
-    InterlockedExchange(&stream->PagingFile.Active, 1);
-    return STATUS_SUCCESS;
+    return ext4win_paging_reserve(&stream->PagingFile, file, extension, physical, length);
+}
+
+VOID NTAPI
+ext4win_stream_abort_paging_file(PVOID header, BOOLEAN extension)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    if (stream != NULL) { ext4win_paging_abort(&stream->PagingFile, extension); }
+}
+
+NTSTATUS NTAPI
+ext4win_stream_activate_paging_file(PVOID header, BOOLEAN extension, PDEVICE_OBJECT lower,
+    LONGLONG physical, LONGLONG length, ULONG sector_size)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    NTSTATUS status;
+    if (stream == NULL || lower == NULL || physical < 0 || length <= 0 ||
+        physical > MAXLONGLONG - length || sector_size == 0 ||
+        ((ULONGLONG)physical % sector_size) != 0 || ((ULONGLONG)length % sector_size) != 0 ||
+        stream->Header.FileSize.QuadPart != length) { return STATUS_INVALID_PARAMETER; }
+    status = ext4win_paging_activate(&stream->PagingFile, extension, lower, physical, length, sector_size);
+    if (NT_SUCCESS(status) && !extension) {
+        stream->Header.Flags2 &= (UCHAR)~FSRTL_FLAG2_SUPPORTS_FILTER_CONTEXTS;
+        stream->Header.Flags2 |= FSRTL_FLAG2_IS_PAGING_FILE;
+        stream->Header.IsFastIoPossible = FastIoIsNotPossible;
+    }
+    return status;
+}
+
+BOOLEAN NTAPI
+ext4win_stream_paging_mutation_allowed(PVOID header, BOOLEAN deletion, LONGLONG target)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    KIRQL irql;
+    BOOLEAN allowed;
+    if (stream == NULL) { return FALSE; }
+    KeAcquireSpinLock(&stream->PagingFile.Lock, &irql);
+    allowed = deletion ? stream->PagingFile.Active == EXT4WIN_PAGING_RETIRED :
+        (stream->PagingFile.Active == EXT4WIN_PAGING_PREPARING ||
+         (stream->PagingFile.Active == EXT4WIN_PAGING_EXTENDING && target >= stream->PagingFile.Length));
+    KeReleaseSpinLock(&stream->PagingFile.Lock, irql);
+    return allowed;
+}
+
+LONGLONG NTAPI
+ext4win_stream_paging_length(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    KIRQL irql;
+    LONGLONG length;
+    if (stream == NULL) { return 0; }
+    KeAcquireSpinLock(&stream->PagingFile.Lock, &irql);
+    length = stream->PagingFile.Active == EXT4WIN_PAGING_ACTIVE ||
+        stream->PagingFile.Active == EXT4WIN_PAGING_EXTENDING ? stream->PagingFile.Length : 0;
+    KeReleaseSpinLock(&stream->PagingFile.Lock, irql);
+    return length;
 }
 
 BOOLEAN NTAPI
@@ -401,7 +443,7 @@ ext4win_stream_section_callback_stream(
 static VOID
 ext4win_stream_refresh_fast_io_projection(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
-    if ((stream == NULL) || (stream->PagingFile.Active == 1) || (stream->ByteRangeLocks == NULL) ||
+    if ((stream == NULL) || (stream->PagingFile.Active != EXT4WIN_PAGING_VACANT) || (stream->ByteRangeLocks == NULL) ||
         !FsRtlOplockIsFastIoPossible(&stream->Header.Oplock)) {
         if (stream != NULL) {
             stream->Header.IsFastIoPossible = FastIoIsNotPossible;
@@ -473,6 +515,7 @@ ext4win_stream_create(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(stream, sizeof(*stream));
+    ext4win_paging_initialize(&stream->PagingFile);
     stream->TraceRegistrationHandle = trace_registration_handle;
     stream->RustState = rust_state;
     stream->SectionState = section_state;
@@ -880,7 +923,7 @@ ext4win_stream_cache_initialize(
     if (!ext4win_stream_matches_file_object(stream, file_object)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (stream->PagingFile.Active == 1) { return STATUS_INVALID_DEVICE_REQUEST; }
+    if (stream->PagingFile.Active != EXT4WIN_PAGING_VACANT) { return STATUS_INVALID_DEVICE_REQUEST; }
     if (!ext4win_stream_ordinary_io_available(stream)) { return ext4win_storage_verify_required(stream->VolumeStream->RustState) ? STATUS_VERIFY_REQUIRED : (ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED); }
 
     status = STATUS_SUCCESS;
@@ -1103,6 +1146,7 @@ ext4win_stream_cache_uninitialize(
     if (!ext4win_stream_matches_file_object(stream, file_object)) {
         return STATUS_INVALID_PARAMETER;
     }
+    ext4win_paging_retire(&stream->PagingFile, file_object);
     status = STATUS_SUCCESS;
     __try {
         (VOID)CcUninitializeCacheMap(file_object, NULL, NULL);

@@ -202,10 +202,7 @@ impl CreateParameters {
     pub(crate) fn validate_supported_flags(self) -> DriverResult<()> {
         self.unsupported_flags.validate()?;
         if matches!(self.file_mode, CreateFileMode::PagingFile)
-            && (!matches!(self.disposition, CreateDisposition::Open | CreateDisposition::OpenIf)
-                || self.share_access.as_ulong() != 0
-                || !matches!(self.deletion, CreateDeletion::Retain)
-                || !matches!(self.target_selection, CreateTargetSelection::NamedObject)
+            && (!matches!(self.target_selection, CreateTargetSelection::NamedObject)
                 || matches!(self.target_requirement, CreateTargetRequirement::Directory)
                 || !matches!(self.oplock_policy, OplockCreatePolicy::Ordinary)) {
             return Err(DriverError::NotSupported);
@@ -219,9 +216,7 @@ impl CreateParameters {
 pub(crate) enum CreateFileMode {
     /// Ordinary handles, mapped sections, and Cache Manager writeback.
     Ordinary,
-    /// Existing kernel paging file with an immutable initialized contiguous physical mapping.
-    /// Empty, sparse, unwritten, fragmented or size-changing setups require a different admission
-    /// protocol and fail without falling back to ordinary file I/O.
+    /// Kernel paging setup owns initialization and a physically fixed prefix across extension.
     PagingFile,
 }
 

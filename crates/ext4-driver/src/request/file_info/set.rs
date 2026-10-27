@@ -3,6 +3,30 @@
 use super::*;
 use crate::kernel::name_expression::NameCase;
 
+/// Captures paging EOF extension before ordinary set-information mutation admission.
+/// # Errors
+/// Rejects user-origin setup, missing positional-write authority or an invalid whole-block bound.
+pub(crate) fn prepare_paging_extension(mut request: PendingIrpLease<'_>, operations: &MountedVolumeAccess<'_>) -> DriverResult<Option<crate::request::paging_file::PagingInitialization>> {
+    let selected = request.with_active(|active| {
+        let current = active.current_stack()?;
+        let stack = current.set_file()?;
+        let opened_object = OpenedObject::decode(current.file_object()?)?;
+        if !opened_object.file_control_block().is_paging_file() || stack.operation() != SetFileOperation::Resize { return Ok(None); }
+        let opened = OpenedRegularFile::decode(current.file_object()?)?;
+        active.require_kernel_requestor()?;
+        if opened.write_access() != RegularFileWriteAccess::Positional { return Err(DriverError::AccessDenied); }
+        let target = file_size_from_large_integer(read_end_of_file_input(active, stack.length())?)?;
+        let acknowledged = opened.file_control_block().paging_file_length();
+        if target.bytes() < acknowledged { return Err(DriverError::InvalidParameter); }
+        if target.bytes() == acknowledged { return Ok(None); }
+        let current = FileSize::from_bytes(u64::try_from(opened.file_control_block().stream_sizes()?.file_size()).map_err(|_| DriverError::InternalInvariantViolation)?);
+        Ok(Some((NonNull::from(opened.file_control_block()), opened.file_object(), target, current)))
+    })?;
+    let Some((fcb, file, target, current)) = selected else { return Ok(None); };
+    let lease = operations.acquire_paging_file_setup(fcb, file, true)?;
+    crate::request::paging_file::PagingInitialization::new(lease, target, current, operations.volume_geometry().block_size()).map(Some)
+}
+
 /// Applies one supported set-file-information class.
 enum SetFilePlan {
     /// The request completed entirely while decoding its synchronous control-plane mutation.
@@ -267,16 +291,21 @@ pub(super) fn set_file_information(
         let stack = current.set_file()?;
         let mut opened_file = OpenedObject::decode(file_object)?;
         if opened_file.file_control_block().is_paging_file() {
-            let requested = match stack.operation() {
-                SetFileOperation::Resize => read_end_of_file_input(active, stack.length())?,
-                SetFileOperation::Allocation => read_allocation_size_input(active, stack.length())?,
+            match stack.operation() {
+                SetFileOperation::Resize | SetFileOperation::Allocation => {
+                    let requested = if stack.operation() == SetFileOperation::Resize {
+                        read_end_of_file_input(active, stack.length())?
+                    } else { read_allocation_size_input(active, stack.length())? };
+                    let requested = file_size_from_large_integer(requested)?;
+                    if requested.bytes() != opened_file.file_control_block().paging_file_length() {
+                        return Err(DriverError::NotSupported);
+                    }
+                    return Ok(SetFilePlan::Complete);
+                }
+                SetFileOperation::Basic | SetFileOperation::Position
+                | SetFileOperation::Disposition | SetFileOperation::DispositionEx => {}
                 _ => return Err(DriverError::NotSupported),
-            };
-            let requested = file_size_from_large_integer(requested)?;
-            let eof = u64::try_from(opened_file.file_control_block().stream_sizes()?.file_size())
-                .map_err(|_| DriverError::InternalInvariantViolation)?;
-            if requested.bytes() != eof { return Err(DriverError::NotSupported); }
-            return Ok(SetFilePlan::Complete);
+            }
         }
         let plan = match stack.operation() {
             SetFileOperation::Basic => {
@@ -920,6 +949,7 @@ fn disposition_plan(
             Ok(SetFilePlan::Complete)
         }
         FileDispositionAction::Delete(readonly) => {
+            if opened.file_control_block().is_paging_file() { return Err(DriverError::NotSupported); }
             let readonly = readonly.bind(opened.file_attributes_write_access());
             let (pending, publication) = match request.target {
                 FileDispositionTarget::Mutable => (
@@ -1216,6 +1246,7 @@ impl PreparedHardLinkMutation {
         self,
         mutation: &mut DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<(Option<PreparedLinkRename>, HardLinkDirectoryChanges)> {
+        let alias = crate::short_name::prepare(mutation, self.target_parent, &self.target_name, None)?;
         let source = mutation.hard_link_source(self.source)?;
         let target_parent = mutation.directory(self.target_parent)?;
         if let Some(overlay) = self.archive_overlay {
@@ -1228,7 +1259,6 @@ impl PreparedHardLinkMutation {
                 target_parent,
                 &self.target_name,
                 NamespaceDestination::Vacant,
-        let alias = crate::short_name::prepare(mutation, self.target_parent, &self.target_name, None)?;
             )?,
             PreparedNamespaceDestination::Replace { existing_name } => mutation.create_hard_link(
                 source,
@@ -1237,6 +1267,7 @@ impl PreparedHardLinkMutation {
                 NamespaceDestination::Replace { existing_name },
             )?,
         }
+        crate::short_name::store(mutation, self.target_parent, &self.target_name, self.source_node, alias)?;
         Ok((self.location, self.changes))
     }
 }
@@ -1249,7 +1280,6 @@ impl PreparedHardLinkMutation {
 fn prepare_hard_link_destination(
     operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
-        crate::short_name::store(mutation, self.target_parent, &self.target_name, self.source_node, alias)?;
     source_node: NodeId,
     target_parent: DirectoryNodeId,
     target_name: &Ext4Name,
@@ -1477,6 +1507,7 @@ enum RenameLinkPublication {
 }
 
 /// Result of a committed rename with mutually exclusive no-op and changed states.
+#[expect(clippy::large_enum_variant, reason = "prepared notification ownership moves directly to publication without fallible allocation after commit")]
 enum PreparedRename {
     /// The transaction preserved the existing handle location and emitted no notifications.
     Unchanged,
@@ -1489,7 +1520,6 @@ enum PreparedRename {
     },
 }
 
-#[expect(clippy::large_enum_variant, reason = "prepared notification ownership moves directly to publication without fallible allocation after commit")]
 /// Fully resolved rename staged only after its exact parent oplock plan is authorized.
 #[expect(
     clippy::large_enum_variant,
@@ -1518,6 +1548,8 @@ enum PreparedRenameMutation {
         location: OpenedLocation,
         /// Fully allocated post-commit notification sequence.
         notifications: RenameDirectoryNameChanges,
+        /// Advisory destination metadata retained until the same mutation can apply it.
+        tunneled: Option<crate::kernel::name_tunnel::TunneledName>,
     },
 }
 
@@ -1530,8 +1562,6 @@ impl PreparedRenameMutation {
         request: RenameMutation,
         operations: &mut MountedVolumeAccess<'_>,
         read: &mut impl CommittedReadPass,
-        /// Advisory destination metadata retained until the same mutation can apply it.
-        tunneled: Option<crate::kernel::name_tunnel::TunneledName>,
         owned: &PendingIrpLease<'_>,
         mapping: &ext4_security::IdentityMap,
     ) -> DriverResult<Self> {
@@ -1661,6 +1691,10 @@ impl PreparedRenameMutation {
             NamespaceParentOplockEffect::Change
         };
         let oplocks = NamespaceOplockPlan::rename(source_parent, target_parent, target_effect);
+        let parent_metadata = read.load_node_metadata(NodeId::Directory(target_parent))?;
+        let tunneled = if matches!(source_node, NodeId::File(_)) && !parent_metadata.is_encrypted() {
+            operations.name_tunnel().find(crate::kernel::name_tunnel::directory_key(parent_metadata), &WindowsName::from_ext4(&target_name)?)?
+        } else { None };
         Ok(Self::Changed {
             source_parent,
             source_name,
@@ -1673,11 +1707,8 @@ impl PreparedRenameMutation {
                 parent: target_parent,
                 name: target_name,
             },
-        let parent_metadata = read.load_node_metadata(NodeId::Directory(target_parent))?;
-        let tunneled = if matches!(source_node, NodeId::File(_)) && !parent_metadata.is_encrypted() {
-            operations.name_tunnel().find(crate::kernel::name_tunnel::directory_key(parent_metadata), &WindowsName::from_ext4(&target_name)?)?
-        } else { None };
             notifications,
+            tunneled,
         })
     }
 
@@ -1690,7 +1721,6 @@ impl PreparedRenameMutation {
     }
 
     /// Stages the authorized rename and returns its allocation-free publication state.
-            tunneled,
     /// # Errors
     ///
     /// Returns an error when the epoch state changed or the ext4 transaction cannot stage writes.
@@ -1704,27 +1734,27 @@ impl PreparedRenameMutation {
             destination,
             location,
             notifications,
+            tunneled,
             ..
         } = self
         else {
             return Ok(PreparedRename::Unchanged);
         };
         let target_parent_id = target_parent;
+        let alias = crate::short_name::prepare(mutation, target_parent, &target_name, tunneled.as_ref().and_then(|cached| cached.alias))?;
+        crate::short_name::forget(mutation, source_parent, &source_name, source_node)?;
         let source_parent = mutation.directory(source_parent)?;
         let target_parent = mutation.directory(target_parent)?;
         let location = match destination {
             RenameNamespaceAction::Move(destination) => {
                 mutation.rename_child(
                     source_parent,
-            tunneled,
                     &source_name,
                     target_parent,
                     &target_name,
                     match &destination {
                         PreparedNamespaceDestination::Vacant => NamespaceDestination::Vacant,
                         PreparedNamespaceDestination::Replace { existing_name } => {
-        let alias = crate::short_name::prepare(mutation, target_parent, &target_name, tunneled.as_ref().and_then(|cached| cached.alias))?;
-        crate::short_name::forget(mutation, source_parent, &source_name, source_node)?;
                             NamespaceDestination::Replace { existing_name }
                         }
                     },
@@ -1755,6 +1785,12 @@ impl PreparedRenameMutation {
                 }
             }
         };
+        crate::short_name::store(mutation, target_parent_id, &target_name, source_node, alias)?;
+        if let Some(tunneled) = tunneled {
+            let times = mutation.staged_node_metadata(source_node)?.times();
+            let selected = mutation.node(source_node)?;
+            mutation.set_times(selected, Ext4Times::new(times.accessed(), times.modified(), times.changed(), Some(tunneled.created)))?;
+        }
         Ok(PreparedRename::Changed {
             location,
             notifications,
@@ -1767,12 +1803,6 @@ impl PreparedRenameMutation {
 pub(crate) struct RenameDirectoryNameChanges {
     /// Existing target entry removed by a replace-capable rename.
     replaced_target: Option<DirectoryChange>,
-        crate::short_name::store(mutation, target_parent_id, &target_name, source_node, alias)?;
-        if let Some(tunneled) = tunneled {
-            let times = mutation.staged_node_metadata(source_node)?.times();
-            let selected = mutation.node(source_node)?;
-            mutation.set_times(selected, Ext4Times::new(times.accessed(), times.modified(), times.changed(), Some(tunneled.created)))?;
-        }
     /// Source entry under its former name.
     old_source_name: DirectoryChange,
     /// Source entry under its new name.
