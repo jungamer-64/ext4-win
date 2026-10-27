@@ -885,8 +885,8 @@ impl FileDispositionTarget {
     const fn validate(self, create_deletion: CreateDeletion) -> DriverResult<()> {
         match (self, create_deletion) {
             (Self::CreateDeleteOnClose, CreateDeletion::Retain) => Err(DriverError::NotSupported),
-            (Self::Mutable, CreateDeletion::Retain | CreateDeletion::DeleteOnClose)
-            | (Self::CreateDeleteOnClose, CreateDeletion::DeleteOnClose) => Ok(()),
+            (Self::Mutable, _)
+            | (Self::CreateDeleteOnClose, CreateDeletion::DeleteOnClose | CreateDeletion::KernelPagingDeleteOnClose) => Ok(()),
         }
     }
 }

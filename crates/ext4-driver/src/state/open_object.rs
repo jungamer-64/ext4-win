@@ -764,8 +764,8 @@ pub(crate) enum OpenedNodeMode {
 
 /// Per-handle namespace deletion authority and create-time lifecycle.
 ///
-/// Delete-on-close is a distinct variant because that lifecycle necessarily includes `DELETE`
-/// authority; an unauthorized delete-on-close handle is unrepresentable after create decoding.
+/// Ordinary delete-on-close requires `DELETE`; kernel paging cleanup is a separate lifecycle
+/// authority and does not grant later ordinary disposition or rename rights.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HandleDeletion {
     /// No create-time deletion was requested; later disposition uses the retained authorities.
@@ -780,13 +780,20 @@ pub(crate) enum HandleDeletion {
         /// Authority to override a read-only attribute during extended disposition.
         file_attributes_write_access: FileAttributesWriteAccess,
     },
+    /// Kernel paging setup retains cleanup deletion without synthesizing handle rights.
+    KernelPagingDeleteOnClose {
+        /// Ordinary disposition still requires the original handle's granted `DELETE`.
+        delete_access: DeleteAccess,
+        /// Explicit attribute authority retained from the requested access mask.
+        file_attributes_write_access: FileAttributesWriteAccess,
+    },
 }
 
 impl HandleDeletion {
     /// Binds decoded create deletion to the handle's retained delete authority.
     /// # Errors
     ///
-    /// Returns access denied when delete-on-close is paired with missing `DELETE` authority.
+    /// Returns access denied when ordinary delete-on-close lacks `DELETE` authority.
     pub(crate) fn from_create(
         deletion: CreateDeletion,
         delete_access: DeleteAccess,
@@ -803,6 +810,9 @@ impl HandleDeletion {
                     file_attributes_write_access,
                 })
             }
+            CreateDeletion::KernelPagingDeleteOnClose => Ok(Self::KernelPagingDeleteOnClose {
+                delete_access, file_attributes_write_access,
+            }),
         }
     }
 
@@ -812,7 +822,7 @@ impl HandleDeletion {
     /// Returns access denied when a retained handle was not opened with `DELETE`.
     fn require_delete_access(self) -> DriverResult<()> {
         match self {
-            Self::Retain { delete_access, .. } => delete_access.require(),
+            Self::Retain { delete_access, .. } | Self::KernelPagingDeleteOnClose { delete_access, .. } => delete_access.require(),
             Self::DeleteOnClose { .. } => Ok(()),
         }
     }
@@ -822,6 +832,7 @@ impl HandleDeletion {
         match self {
             Self::Retain { .. } => CreateDeletion::Retain,
             Self::DeleteOnClose { .. } => CreateDeletion::DeleteOnClose,
+            Self::KernelPagingDeleteOnClose { .. } => CreateDeletion::KernelPagingDeleteOnClose,
         }
     }
 
@@ -834,6 +845,8 @@ impl HandleDeletion {
             }
             | Self::DeleteOnClose {
                 file_attributes_write_access,
+            } | Self::KernelPagingDeleteOnClose {
+                file_attributes_write_access, ..
             } => file_attributes_write_access,
         }
     }
@@ -1046,6 +1059,14 @@ pub(super) enum OpenedHandleKind {
 }
 
 impl OpenedHandle {
+    /// Binds the preallocated paging deletion to this exact handle's cleanup. Other paging
+    /// control handles may reopen the live link before its owner closes.
+    pub(crate) fn arm_paging_file_cleanup_deletion(&self, pending: PendingFileDeletion) {
+        if self.create_deletion() != CreateDeletion::KernelPagingDeleteOnClose {
+            KernelWideInconsistency::file_object_lifecycle_corruption().bugcheck();
+        }
+        self.state.location.arm_paging_cleanup(pending);
+    }
     /// Creates per-handle state for an opened node.
     /// # Errors
     ///
@@ -1128,7 +1149,7 @@ impl OpenedHandle {
     }
 
     /// Returns the namespace deletion lifecycle selected at create/open.
-    const fn create_deletion(&self) -> CreateDeletion {
+    pub(crate) const fn create_deletion(&self) -> CreateDeletion {
         self.state.create_deletion()
     }
 
@@ -2418,5 +2439,24 @@ pub(crate) fn queue_device_request(
     }) {
         Ok(status) => status,
         Err(received) => received.complete_result(Err(DriverError::InvalidDeviceRequest)),
+    }
+}
+
+#[cfg(test)]
+mod paging_deletion_tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails if kernel paging cleanup synthesizes ordinary handle deletion authority.
+    #[test]
+    fn kernel_paging_cleanup_retains_the_original_disposition_authority() {
+        for (access, expected) in [(DeleteAccess::Denied, Err(DriverError::AccessDenied)), (DeleteAccess::Granted, Ok(()))] {
+            let deletion = HandleDeletion::from_create(CreateDeletion::KernelPagingDeleteOnClose, access, FileAttributesWriteAccess::Denied);
+            assert!(deletion.is_ok());
+            if let Ok(deletion) = deletion {
+                assert_eq!(deletion.create_deletion(), CreateDeletion::KernelPagingDeleteOnClose);
+                assert_eq!(deletion.require_delete_access(), expected);
+            }
+        }
     }
 }

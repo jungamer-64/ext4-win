@@ -238,6 +238,14 @@ impl LinkTable {
             })
             .unwrap_or_else(corruption)
     }
+    /// Moves a preallocated removal into link-wide admission only when its owner publishes it.
+    fn set_pending(&mut self, pending: PendingFileDeletion) {
+        let index = self.target(pending.target_ref());
+        let link = self.link_mut(index);
+        if matches!(&link.deletion, LinkDeletion::Pending(existing) if existing.cause() == super::FileDeletionCause::DeleteOnClose) { return; }
+        if !matches!(link.deletion, LinkDeletion::Live | LinkDeletion::Pending(_)) { corruption::<()>(); }
+        link.deletion = LinkDeletion::Pending(pending);
+    }
     /// Finalization must match the exact claimed allocation, rather than a reusable name.
     fn removing(&self, target: NonNull<FileDeleteTarget>) -> usize {
         self.slots
@@ -283,6 +291,7 @@ impl OpenedLocations {
                 reference: SlotReference::Retained(index),
             },
             active: Cell::new(true),
+            paging_cleanup: RefCell::new(None),
         })
     }
     /// # Errors
@@ -321,17 +330,7 @@ impl OpenedLocations {
     }
     /// Mandatory on-close deletion cannot be displaced by a mutable disposition.
     pub(super) fn set_pending(&self, pending: PendingFileDeletion) {
-        let mut table = borrow_mut(self.table.as_ref().unwrap_or_else(corruption).get());
-        let index = table.target(pending.target_ref());
-        let link = table.link_mut(index);
-        if matches!(&link.deletion, LinkDeletion::Pending(existing) if existing.cause() == super::FileDeletionCause::DeleteOnClose)
-        {
-            return;
-        }
-        if !matches!(link.deletion, LinkDeletion::Live | LinkDeletion::Pending(_)) {
-            corruption::<()>();
-        }
-        link.deletion = LinkDeletion::Pending(pending);
+        borrow_mut(self.table.as_ref().unwrap_or_else(corruption).get()).set_pending(pending);
     }
     /// Any finalizing inode handle can claim a deferred link, but each target has one cleanup owner.
     pub(super) fn claim_deletion(&self) -> FileCleanupDisposition {
@@ -472,8 +471,17 @@ pub(crate) struct OpenedLocationLease {
     identity: LinkLease,
     /// Cleanup consumes this obligation; Drop handles cancelled-create rollback.
     active: Cell<bool>,
+    /// Only the kernel paging owner retains this mandatory cleanup target. The live link remains
+    /// reopenable until that owner's cleanup; another control handle cannot consume this value.
+    paging_cleanup: RefCell<Option<PendingFileDeletion>>,
 }
 impl OpenedLocationLease {
+    /// Binds a preallocated target to this retained link and its unique handle-cleanup obligation.
+    pub(super) fn arm_paging_cleanup(&self, pending: PendingFileDeletion) {
+        if pending.cause() != super::FileDeletionCause::DeleteOnClose || !self.active.get()
+            || borrow(self.identity.table.get()).target(pending.target_ref()) != self.identity.index()
+            || borrow_mut(&self.paging_cleanup).replace(pending).is_some() { corruption::<()>(); }
+    }
     /// The returned guard must retire before any namespace publication or suspension.
     pub(crate) fn location(&self) -> Ref<'_, OpenedLocation> {
         Ref::map(borrow(self.identity.table.get()), |table| {
@@ -492,7 +500,9 @@ impl OpenedLocationLease {
         if !self.active.replace(false) {
             corruption::<()>();
         }
-        borrow_mut(self.identity.table.get()).deactivate(self.identity.index());
+        let mut table = borrow_mut(self.identity.table.get());
+        if let Some(pending) = borrow_mut(&self.paging_cleanup).take() { table.set_pending(pending); }
+        table.deactivate(self.identity.index());
     }
     /// Normal disposition cancellation cannot revoke mandatory delete-on-close.
     pub(super) fn clear_pending(&self) {
@@ -575,7 +585,7 @@ fn borrow(table: &RefCell<LinkTable>) -> Ref<'_, LinkTable> {
     table.try_borrow().unwrap_or_else(|_| corruption())
 }
 /// Every mutation finishes within one actor step before publication or deferred execution.
-fn borrow_mut(table: &RefCell<LinkTable>) -> RefMut<'_, LinkTable> {
+fn borrow_mut<T>(table: &RefCell<T>) -> RefMut<'_, T> {
     table.try_borrow_mut().unwrap_or_else(|_| corruption())
 }
 
@@ -692,6 +702,34 @@ mod tests {
         );
         links.finish_deletion(target, LinkDeletionOutcome::Aborted);
         assert!(links.acquire(location(b"a")?).is_ok());
+        Ok(())
+    }
+
+    /// # Errors
+    /// Propagates link or preallocated deletion-target failures.
+    /// # Panics
+    /// Fails if a shared control handle consumes the paging owner's deletion or prevents a later
+    /// control reopen before owner cleanup, or if cleanup can unlink a still-active control link.
+    #[test]
+    #[expect(clippy::panic_in_result_fn, reason = "assertions observe paging-owner cleanup through ordinary live-link admission and final-link deletion")]
+    fn paging_owner_deletion_waits_for_its_cleanup_and_remaining_control_handles() -> DriverResult<()> {
+        let mut links = OpenedLocations::new();
+        let owner = links.acquire(location(b"paging")?)?;
+        let deletion = PendingFileDeletion::try_from_delete_on_close(&owner.location())?;
+        let target = deletion.target();
+        owner.arm_paging_cleanup(deletion);
+        let control = links.acquire(location(b"paging")?)?;
+        assert_eq!(links.ensure_openable(Some(&location(b"paging")?)), Ok(()));
+        assert!(!owner.delete_pending());
+        control.cleanup();
+        assert_eq!(links.claim_deletion(), FileCleanupDisposition::Retained);
+        let remaining = links.acquire(location(b"paging")?)?;
+        owner.cleanup();
+        assert_eq!(links.ensure_openable(Some(&location(b"paging")?)), Err(DriverError::DeletePending));
+        assert_eq!(links.claim_deletion(), FileCleanupDisposition::Retained);
+        remaining.cleanup();
+        assert_eq!(links.claim_deletion(), FileCleanupDisposition::Delete(target));
+        links.finish_deletion(target, LinkDeletionOutcome::Removed);
         Ok(())
     }
 

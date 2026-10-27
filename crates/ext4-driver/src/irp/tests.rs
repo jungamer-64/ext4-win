@@ -1609,40 +1609,50 @@ fn create_stack_rejects_unimplemented_special_flag_protocols() {
 /// Fails if paging-file setup rejects the Memory Manager's creation and sharing contract.
 #[test]
 fn paging_file_create_accepts_initialization_and_shared_control_opens() {
-    let decode = |disposition, share, options| {
+    let decode = |access, disposition, share, options| {
         super::CreateParameters::decode(
-            wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA,
+            access,
             (disposition << super::CREATE_DISPOSITION_SHIFT) | options,
             share,
             super::IrpBufferLength(0),
             u8::try_from(wdk_sys::SL_OPEN_PAGING_FILE).unwrap_or_default(),
         )
     };
-    for (disposition, share, options) in [
+    for (access, disposition, share, options, deletion) in [
         (
+            wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA,
             super::FILE_OPEN_IF_DISPOSITION,
             0,
             wdk_sys::FILE_NON_DIRECTORY_FILE,
+            super::CreateDeletion::Retain,
         ),
         (
+            wdk_sys::SYNCHRONIZE | wdk_sys::WRITE_DAC | wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA,
             super::FILE_SUPERSEDE_DISPOSITION,
             u16::try_from(wdk_sys::FILE_SHARE_WRITE).unwrap_or_default(),
-            wdk_sys::FILE_NON_DIRECTORY_FILE | wdk_sys::FILE_DELETE_ON_CLOSE,
+            wdk_sys::FILE_DELETE_ON_CLOSE | wdk_sys::FILE_NO_COMPRESSION | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
+            super::CreateDeletion::KernelPagingDeleteOnClose,
         ),
         (
+            wdk_sys::SYNCHRONIZE | wdk_sys::FILE_WRITE_DATA,
             super::FILE_OPEN_DISPOSITION,
-            u16::try_from(wdk_sys::FILE_SHARE_WRITE).unwrap_or_default(),
-            wdk_sys::FILE_NON_DIRECTORY_FILE,
+            u16::try_from(wdk_sys::FILE_SHARE_WRITE | wdk_sys::FILE_SHARE_READ).unwrap_or_default(),
+            wdk_sys::FILE_NO_COMPRESSION | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
+            super::CreateDeletion::Retain,
         ),
     ] {
-        let open = decode(disposition, share, options);
+        let open = decode(access, disposition, share, options);
         assert!(open.is_ok());
         if let Ok(open) = open {
             assert_eq!(open.file_mode(), super::CreateFileMode::PagingFile);
             assert_eq!(open.validate_supported_flags(), Ok(()));
+            assert_eq!(open.deletion(), deletion);
+            assert_eq!(open.desired_access().as_raw() & wdk_sys::DELETE, 0);
+            assert_eq!(open.existing_operation_required_access(), 0);
         }
     }
     let directory = decode(
+        wdk_sys::FILE_WRITE_DATA,
         super::FILE_OPEN_DISPOSITION,
         0,
         wdk_sys::FILE_DIRECTORY_FILE,

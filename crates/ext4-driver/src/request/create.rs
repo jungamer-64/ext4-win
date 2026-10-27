@@ -1542,6 +1542,12 @@ impl PendingExistingCreateOpen {
                     .bugcheck()
             }
         };
+        let deletion = self.pending_deletion.take().and_then(|deletion| {
+            if self.policy.deletion() == CreateDeletion::KernelPagingDeleteOnClose {
+                self.handle.arm_paging_file_cleanup_deletion(deletion);
+                None
+            } else { Some(deletion) }
+        });
         let (fcb, file_object) = self.claim.consume();
         publish_node_stream_raw(
             file_object,
@@ -1549,7 +1555,7 @@ impl PendingExistingCreateOpen {
             self.handle,
             self.policy.file_object_flags(),
         );
-        if let Some(deletion) = self.pending_deletion {
+        if let Some(deletion) = deletion {
             operations.set_file_delete_pending(fcb, deletion);
         }
         completion
@@ -1924,7 +1930,7 @@ fn open_volume(
         request.granted_access(),
         request.device(),
     )?;
-    if policy.deletion() == CreateDeletion::DeleteOnClose {
+    if policy.deletion().deletes_on_close() {
         return Err(DriverError::CannotDelete);
     }
     let handle = memory::boxed_try_with(|| {
@@ -1962,7 +1968,7 @@ fn open_target_directory(
         return Err(DriverError::InvalidParameter);
     }
     let parameters = request.parameters();
-    if parameters.deletion() == CreateDeletion::DeleteOnClose {
+    if parameters.deletion().deletes_on_close() {
         return Err(DriverError::CannotDelete);
     }
     validate_existing_node_options(
@@ -2064,7 +2070,7 @@ fn create_missing_node(
     let location = OpenedLocation::try_directory_entry(parent, name)?;
     let pending_deletion = match policy.deletion() {
         CreateDeletion::Retain => None,
-        CreateDeletion::DeleteOnClose => {
+        CreateDeletion::DeleteOnClose | CreateDeletion::KernelPagingDeleteOnClose => {
             Some(PendingFileDeletion::try_from_delete_on_close(&location)?)
         }
     };
@@ -2622,6 +2628,12 @@ impl PreparedCreatePublication {
             pending_deletion,
             notification,
         } = self;
+        let pending_deletion = pending_deletion.and_then(|pending| {
+            if handle.create_deletion() == CreateDeletion::KernelPagingDeleteOnClose {
+                handle.arm_paging_file_cleanup_deletion(pending);
+                None
+            } else { Some(pending) }
+        });
         let (fcb, file_object) = claim.consume();
         publish_node_stream_raw(file_object, fcb, handle, flags);
         if let Some(pending) = pending_deletion {

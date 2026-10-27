@@ -61,9 +61,12 @@ impl CreateParameters {
         stack_flags: wdk_sys::UCHAR,
     ) -> Result<Self, DriverError> {
         let desired_access = DesiredAccess::from_raw(desired_access);
+        let file_mode = if stack_flag(stack_flags, wdk_sys::SL_OPEN_PAGING_FILE) {
+            CreateFileMode::PagingFile
+        } else { CreateFileMode::Ordinary };
         let share_access = ShareAccess::from_raw(share_access)?;
         let disposition = CreateDisposition::from_options(options)?;
-        let create_options = CreateOptions::decode(options, desired_access)?;
+        let create_options = CreateOptions::decode(options, desired_access, file_mode)?;
         let target_requirement = create_options.target_requirement();
         disposition.validate_target_requirement(target_requirement)?;
         Ok(Self {
@@ -87,11 +90,7 @@ impl CreateParameters {
             },
             target_selection: CreateTargetSelection::from_stack_flags(stack_flags),
             unsupported_flags: UnsupportedCreateFlags::from_stack_flags(stack_flags),
-            file_mode: if stack_flag(stack_flags, wdk_sys::SL_OPEN_PAGING_FILE) {
-                CreateFileMode::PagingFile
-            } else {
-                CreateFileMode::Ordinary
-            },
+            file_mode,
             require_writable_exclusive: options & wdk_sys::FILE_DISALLOW_EXCLUSIVE != 0
                 && share_access.as_ulong() & wdk_sys::FILE_SHARE_READ == 0,
             intent: CreateIntent::from_options(options),
@@ -115,6 +114,9 @@ impl CreateParameters {
 
     /// Returns virtual access whose sharing must permit this existing-object operation.
     pub(crate) const fn existing_operation_required_access(self) -> wdk_sys::ACCESS_MASK {
+        // Kernel paging setup owns its reset and cleanup; those operations do not add ordinary
+        // handle DELETE or metadata rights to the Memory Manager's requested share contract.
+        if matches!(self.file_mode, CreateFileMode::PagingFile) { return 0; }
         match self.disposition {
             CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
                 wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES
@@ -1287,15 +1289,19 @@ pub(crate) enum CreateDeletion {
     Retain,
     /// Successful create/open must publish delete-pending for this exact link.
     DeleteOnClose,
+    /// Kernel paging setup owns cleanup deletion independently of ordinary handle `DELETE`.
+    KernelPagingDeleteOnClose,
 }
 
 impl CreateDeletion {
     /// Decodes `FILE_DELETE_ON_CLOSE` and its required handle authority.
     /// # Errors
     ///
-    /// Returns access denied when delete-on-close is requested without `DELETE`.
-    fn from_options(options: wdk_sys::ULONG, desired_access: DesiredAccess) -> DriverResult<Self> {
+    /// Ordinary delete-on-close requires `DELETE`. Paging intent is consumed only after the
+    /// create boundary has independently required a kernel requestor.
+    fn from_options(options: wdk_sys::ULONG, desired_access: DesiredAccess, mode: CreateFileMode) -> DriverResult<Self> {
         if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
+            if matches!(mode, CreateFileMode::PagingFile) { return Ok(Self::KernelPagingDeleteOnClose); }
             if !desired_access.requests(wdk_sys::DELETE) {
                 return Err(DriverError::AccessDenied);
             }
@@ -1304,6 +1310,9 @@ impl CreateDeletion {
             Ok(Self::Retain)
         }
     }
+
+    /// Whether cleanup must remove the selected link, regardless of how that authority arose.
+    pub(crate) const fn deletes_on_close(self) -> bool { !matches!(self, Self::Retain) }
 }
 
 impl CreateNameInterpretation {
@@ -1358,7 +1367,7 @@ impl CreateOptions {
     /// # Errors
     ///
     /// Returns an error when create options include bits outside the accepted ext4win boundary.
-    fn decode(options: wdk_sys::ULONG, desired_access: DesiredAccess) -> DriverResult<Self> {
+    fn decode(options: wdk_sys::ULONG, desired_access: DesiredAccess, mode: CreateFileMode) -> DriverResult<Self> {
         let raw_options = options & CREATE_OPTIONS_MASK;
         if raw_options & !ACCEPTED_CREATE_OPTIONS != 0 {
             return Err(DriverError::NotSupported);
@@ -1373,7 +1382,7 @@ impl CreateOptions {
             CreateSynchronizationMode::from_options(options, desired_access)?;
         let reparse_point_mode = CreateReparsePointMode::from_options(options);
         let name_interpretation = CreateNameInterpretation::from_options(options);
-        let deletion = CreateDeletion::from_options(options, desired_access)?;
+        let deletion = CreateDeletion::from_options(options, desired_access, mode)?;
         let write_commitment = if create_option_selected(options, wdk_sys::FILE_WRITE_THROUGH)
             || matches!(transfer_buffering, CreateTransferBuffering::NoIntermediate)
         {
