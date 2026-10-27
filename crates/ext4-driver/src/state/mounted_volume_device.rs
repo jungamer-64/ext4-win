@@ -1374,6 +1374,8 @@ mod tests {
         fixture.real.Flags = wdk_sys::DO_VERIFY_VOLUME | 0x4000;
         let publication = fixture.publish()?;
         assert_eq!(fixture.real.Flags, 0x4000);
+        // The I/O Manager marks the VPB mounted after successful mount-IRP completion.
+        fixture.original(|vpb| vpb.Flags |= vpb_flag(wdk_sys::VPB_MOUNTED))?;
         let device = fixture.device()?;
         fixture.real.Flags |= wdk_sys::DO_VERIFY_VOLUME;
         let (association, query) = MountedVolumeDevice::prepare_storage_verification(device)?;

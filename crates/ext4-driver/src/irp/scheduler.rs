@@ -1893,6 +1893,9 @@ mod tests {
         );
         assert!(scheduler.grant_commit(mutation, 7));
         assert!(!scheduler.set_phase(mutation, Phase::Passive));
+        // A lower write reaches verification only after the shell consumed its pre-effect
+        // cancellation boundary. The issued commit must finish or report its physical failure.
+        assert!(!scheduler.consume_cancel_before_effect(mutation.index(), false));
         assert!(scheduler.set_phase(mutation, Phase::Verifying));
         assert!(!scheduler.checkpoint_authority_is_clear(mutation));
         assert_eq!(
