@@ -149,7 +149,9 @@ fn verify_casefold_names(linux: LinuxEnvironment, root: &Path) -> TaskResult<()>
 /// # Errors
 /// Returns formatting, checksum, value, namespace or independent allocation-oracle failure.
 fn verify_attribute_values(linux: LinuxEnvironment, root: &Path) -> TaskResult<()> {
-    for (compact, inode_size) in [(false, 128_u16), (false, 256), (true, 256)] {
+    for (compact, inode_size, owner_sectors) in
+        [(false, 128_u16, 24_u16), (false, 256, 16), (true, 256, 8)]
+    {
         let case = root.join(format!(
             "attribute-values-inline{compact}-inode{inode_size}"
         ));
@@ -205,9 +207,6 @@ fn verify_attribute_values(linux: LinuxEnvironment, root: &Path) -> TaskResult<(
         // debugfs does not charge the owner for value-inode storage. Initialize the
         // fixture's complete sector count: payload, optional entry block, and value.
         // The independent read-only fsck below validates it before core operations.
-        let payload_sectors = if compact { 0 } else { 8 };
-        let entry_sectors = if inode_size == 128 { 8 } else { 0 };
-        let owner_sectors = payload_sectors + entry_sectors + 8;
         request(
             linux,
             &image,
