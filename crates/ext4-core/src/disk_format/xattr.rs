@@ -6,7 +6,7 @@ use core::cmp::Ordering;
 use crate::disk::block::BlockAddress;
 use crate::disk::checksum::ext4_crc32c;
 use crate::disk::endian::{DiskOffset, le_u16, le_u32, put_le_u16, put_le_u32};
-use crate::disk_format::inode::InodeId;
+use crate::disk_format::inode::{FileAllocationSize, InodeId};
 use crate::disk_format::superblock::{MetadataChecksum, Superblock};
 use crate::error::{Error, Result};
 use crate::memory::{self, FallibleVec};
@@ -618,6 +618,28 @@ pub(crate) struct ParsedXattrs<'a> {
     entries: Vec<ParsedAttribute<'a>>,
 }
 impl ParsedXattrs<'_> {
+    /// Owner allocation charged for each value reference, even when its storage is shared.
+    /// Value lengths round independently to complete mounted allocation clusters; the value
+    /// inode's extent metadata belongs to that inode and does not increase this owner charge.
+    /// # Errors
+    /// Returns arithmetic overflow while rounding or summing validated value lengths.
+    pub(crate) fn attribute_value_allocation(
+        &self,
+        superblock: Superblock,
+    ) -> Result<FileAllocationSize> {
+        let cluster_bytes = u64::from(superblock.cluster_size().bytes());
+        let mut bytes = 0_u64;
+        for reference in self.attribute_references() {
+            let size = u64::try_from(reference.size).map_err(|_| Error::ArithmeticOverflow)?;
+            let charge = size
+                .div_ceil(cluster_bytes)
+                .checked_mul(cluster_bytes)
+                .ok_or(Error::ArithmeticOverflow)?;
+            bytes = bytes.checked_add(charge).ok_or(Error::ArithmeticOverflow)?;
+        }
+        Ok(FileAllocationSize::from_bytes(bytes))
+    }
+
     /// External references are physical entries, independent of shared-block owner count.
     pub(crate) fn attribute_references(
         &self,

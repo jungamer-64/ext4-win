@@ -594,17 +594,20 @@ fn attribute_value_inodes_replace_delete_and_preserve_inline_payload() -> Result
         let mut fixture = fixture_with_incompatible_features(features)?;
         let file = fixture.a;
         let before = fixture.epoch.geometry().free_cluster_count();
+        let original_allocation =
+            fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))?;
+        let initial_value = alloc::vec![0x71; 16_385];
         fixture.mutate(|pass| {
             let node = pass.node(NodeId::File(file))?;
             pass.set_xattr(
                 node,
                 XattrName::new(XattrNamespace::User, b"large")?,
-                XattrValue::new(&[0x71; 16_384])?,
+                XattrValue::new(&initial_value)?,
             )?;
             assert!(
                 pass.staged_xattrs(NodeId::File(file))?
                     .entries()
-                    .any(|(_, value)| value.bytes() == [0x71; 16_384])
+                    .any(|(_, value)| value.bytes() == initial_value)
             );
             Ok(())
         })?;
@@ -617,7 +620,11 @@ fn attribute_value_inodes_replace_delete_and_preserve_inline_payload() -> Result
                 )
             })?
             .ok_or(Error::InvalidXattr)?;
-        assert_eq!(value.bytes(), &[0x71; 16_384]);
+        assert_eq!(value.bytes(), initial_value);
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))?,
+            original_allocation + 20_480
+        );
         let offset = fixture_inode_offset(&fixture.disk, NodeId::File(file))?;
         let value_inode = fixture_u32(
             &fixture.disk.filesystem,
@@ -656,6 +663,10 @@ fn attribute_value_inodes_replace_delete_and_preserve_inline_payload() -> Result
             })?
             .ok_or(Error::InvalidXattr)?;
         assert_eq!(value.bytes(), &[0x42; 8192]);
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))?,
+            original_allocation + 8192
+        );
         fixture.mutate(|pass| {
             let node = pass.node(NodeId::File(file))?;
             pass.remove_xattr(node, &XattrName::new(XattrNamespace::User, b"large")?)?;
@@ -663,7 +674,56 @@ fn attribute_value_inodes_replace_delete_and_preserve_inline_payload() -> Result
         })?;
         fixture.remount()?;
         assert_eq!(fixture.epoch.geometry().free_cluster_count(), before);
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))?,
+            original_allocation
+        );
     }
+    Ok(())
+}
+
+/// # Errors
+/// Propagates value/data staging, orphan cleanup, removal and remount failures.
+/// # Panics
+/// Fails if truncation loses the surviving attribute charge or removal retains it.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare persistent allocation with independently rounded value lengths"
+)]
+fn attribute_value_charge_survives_orphan_truncation() -> Result<()> {
+    let mut fixture = fixture_with_incompatible_features(0x400)?;
+    let file = fixture.a;
+    let name = XattrName::new(XattrNamespace::User, b"large")?;
+    fixture.mutate(|pass| {
+        let target = pass.file(file)?;
+        pass.write_file_range(target, FileOffset::ZERO, &[0x33; 8192])?;
+        let node = pass.node(NodeId::File(file))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"large")?,
+            XattrValue::new(&[0x71; 4097])?,
+        )
+    })?;
+    fixture.mutate(|pass| {
+        let target = pass.file(file)?;
+        pass.truncate_file(target, FileSize::from_bytes(0))
+    })?;
+    fixture.remount()?;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))?,
+        8192
+    );
+    fixture.mutate(|pass| {
+        let node = pass.node(NodeId::File(file))?;
+        pass.remove_xattr(node, &name)?;
+        Ok(())
+    })?;
+    fixture.remount()?;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_file(file)?.allocation_size().bytes()))?,
+        0
+    );
     Ok(())
 }
 
@@ -710,6 +770,21 @@ fn attribute_value_shared_references_and_corruption() -> Result<()> {
         .get_mut(b_offset + 160..b_offset + 256)
         .ok_or(Error::DeviceRange)?
         .copy_from_slice(&body);
+    for offset in [28, 118] {
+        let width = if offset == 28 { 4 } else { 2 };
+        let charge = fixture
+            .disk
+            .filesystem
+            .get(a_offset + offset..a_offset + offset + width)
+            .ok_or(Error::DeviceRange)?
+            .to_vec();
+        fixture
+            .disk
+            .filesystem
+            .get_mut(b_offset + offset..b_offset + offset + width)
+            .ok_or(Error::DeviceRange)?
+            .copy_from_slice(&charge);
+    }
     let b_flags = fixture_u32(&fixture.disk.filesystem, b_offset + 32)?;
     fixture.disk.encode_inode(NodeId::File(b), b_flags, None)?;
     let value_flags = fixture_u32(&fixture.disk.filesystem, value_offset + 32)?;
@@ -730,6 +805,12 @@ fn attribute_value_shared_references_and_corruption() -> Result<()> {
         .disk
         .encode_inode_number(value_number, value_flags, None)?;
     fixture.remount()?;
+    for owner in [a, b] {
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(owner)?.allocation_size().bytes()))?,
+            4096 + 65_536
+        );
+    }
     fixture.mutate(|pass| {
         let node = pass.node(NodeId::File(a))?;
         pass.remove_xattr(node, &XattrName::new(XattrNamespace::User, b"large")?)?;
@@ -5719,6 +5800,12 @@ fn attribute_value_entries_in_shared_blocks_have_one_reference() -> Result<()> {
     fixture.remount()?;
     let a = fixture.a;
     let b = fixture.b;
+    for owner in [a, b] {
+        assert_eq!(
+            fixture.read(|pass| Ok(pass.load_file(owner)?.allocation_size().bytes()))?,
+            4096 + 4096 + 5 * 8192
+        );
+    }
     fixture.mutate(|pass| {
         let node = pass.node(NodeId::File(a))?;
         pass.set_xattr(
@@ -5728,6 +5815,10 @@ fn attribute_value_entries_in_shared_blocks_have_one_reference() -> Result<()> {
         )
     })?;
     fixture.remount()?;
+    assert_eq!(
+        fixture.read(|pass| Ok(pass.load_file(a)?.allocation_size().bytes()))?,
+        4096 + 4096 + 4 * 8192
+    );
     fixture.mutate(|pass| {
         let root = pass.directory(DirectoryNodeId::ROOT)?;
         pass.unlink_file(root, &Ext4Name::new(b"concurrent-a")?)

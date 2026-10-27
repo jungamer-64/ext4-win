@@ -1935,7 +1935,7 @@ fn debugfs_require_file(
     links: u16,
     label: &str,
 ) -> TaskResult<()> {
-    let stat = debugfs_request_output(linux, image, &format!("stat {path}"))?;
+    let stat = debugfs_request_output(linux, image, &format!("stat \"{path}\""))?;
     let size_field = format!("Size: {}", expected.len());
     let links_field = format!("Links: {links}");
     if !stat.contains("Inode:") || !stat.contains(&size_field) || !stat.contains(&links_field) {
@@ -1947,7 +1947,11 @@ fn debugfs_require_file(
     let dump_path = linux.tool_path(&dump)?;
     let image_path = linux.tool_path(image)?;
     let mut command = linux.command("debugfs");
-    command.args(["-R", &format!("dump -p {path} {dump_path}"), &image_path]);
+    command.args([
+        "-R",
+        &format!("dump -p \"{path}\" \"{dump_path}\""),
+        &image_path,
+    ]);
     run_checked(command, &format!("debugfs dump for {label}"))?;
     let observed = fs::read(&dump)?;
     fs::remove_file(&dump)?;
@@ -2060,7 +2064,7 @@ fn debugfs_require_xattr(
     let output = case_root.join(format!("{label}-xattr.bin"));
     let output_path = linux.tool_path(&output)?;
     let image_path = linux.tool_path(image)?;
-    let request = format!("ea_get -f {output_path} {path} user.ext4win.interop");
+    let request = format!("ea_get -f \"{output_path}\" \"{path}\" user.ext4win.interop");
     let mut command = linux.command("debugfs");
     command.args(["-R", &request, &image_path]);
     run_checked(command, &format!("debugfs xattr extraction for {label}"))?;

@@ -79,6 +79,10 @@ pub(super) trait ExtentInodeRecord {
     /// # Errors
     /// Rejects truncated pointer fields.
     fn xattr_block(&self) -> Result<Option<BlockAddress>>;
+    /// Borrows resident attribute entries contributing external-value allocation charges.
+    /// # Errors
+    /// Rejects malformed inode record bounds.
+    fn inline_xattr_region(&self) -> Result<&[u8]>;
     /// Publishes a complete serialized root into this private inode image.
     /// # Errors
     /// Rejects truncated storage.
@@ -856,6 +860,9 @@ impl ExtentInodeRecord for LiveInodeRecord {
     fn xattr_block(&self) -> Result<Option<BlockAddress>> {
         self.raw.xattr_block()
     }
+    fn inline_xattr_region(&self) -> Result<&[u8]> {
+        self.raw.inline_xattr_region()
+    }
     fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
         self.raw.set_extent_root_bytes(root)
     }
@@ -869,6 +876,9 @@ impl ExtentInodeRecord for AttributeInodeRecord {
     }
     fn xattr_block(&self) -> Result<Option<BlockAddress>> {
         self.raw.xattr_block()
+    }
+    fn inline_xattr_region(&self) -> Result<&[u8]> {
+        self.raw.inline_xattr_region()
     }
     fn set_extent_root_bytes(&mut self, root: &[u8; 60]) -> Result<()> {
         self.raw.set_extent_root_bytes(root)

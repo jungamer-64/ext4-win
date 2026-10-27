@@ -1489,7 +1489,7 @@ impl MetadataMutation<'_, '_> {
     /// Returns an error when inode-owned blocks cannot be mapped to allocation clusters or the
     /// resulting charge cannot be represented by the mounted inode encoding.
     fn set_inode_allocation_size(
-        &self,
+        &mut self,
         raw_inode: &mut impl ExtentInodeRecord,
         tree: Option<&MutableExtentTree>,
     ) -> Result<()> {
@@ -1502,17 +1502,26 @@ impl MetadataMutation<'_, '_> {
         raw_inode.set_encoded_allocation_size(encoded)
     }
 
-    /// Counts all allocation clusters owned by one inode.
+    /// Counts inode-owned clusters and each external attribute value's owner charge.
     /// # Errors
     ///
-    /// Returns an error when extent block arithmetic overflows or an inode-owned block cannot be
-    /// mapped to mounted cluster geometry.
+    /// Returns malformed or unreadable attributes, arithmetic overflow or an inode-owned block
+    /// that cannot be mapped to mounted cluster geometry.
     fn inode_allocation_size(
-        &self,
+        &mut self,
         raw_inode: &impl ExtentInodeRecord,
         tree: Option<&MutableExtentTree>,
     ) -> Result<FileAllocationSize> {
         let superblock = self.volume.superblock;
+        let value_inodes =
+            superblock.attribute_value_storage() == xattr_storage::AttributeValueStorage::Inodes;
+        let mut attribute_bytes = if value_inodes {
+            xattr_storage::parse_inline_xattrs(raw_inode.inline_xattr_region()?)?
+                .attribute_value_allocation(superblock)?
+                .bytes()
+        } else {
+            0
+        };
         let mut ranges = Vec::new();
         if let Some(tree) = tree {
             for extent in tree.extents().iter().copied() {
@@ -1526,6 +1535,14 @@ impl MetadataMutation<'_, '_> {
         }
         if let Some(block) = raw_inode.xattr_block()? {
             ranges.try_push(InodeAllocationClusterRange::from_block(superblock, block)?)?;
+            if value_inodes {
+                let bytes = self.xattr_block_bytes(block)?;
+                let external =
+                    xattr_storage::parse_external_xattr_block(&bytes, block, &superblock)?;
+                attribute_bytes = attribute_bytes
+                    .checked_add(external.attribute_value_allocation(superblock)?.bytes())
+                    .ok_or(Error::ArithmeticOverflow)?;
+            }
         }
         memory::heap_sort_by(&mut ranges, |left, right| left.start.cmp(&right.start))?;
 
@@ -1546,6 +1563,7 @@ impl MetadataMutation<'_, '_> {
         }
         let bytes = blocks
             .checked_mul(u64::from(superblock.block_size().bytes()))
+            .and_then(|bytes| bytes.checked_add(attribute_bytes))
             .ok_or(Error::ArithmeticOverflow)?;
         Ok(FileAllocationSize::from_bytes(bytes))
     }

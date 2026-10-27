@@ -185,7 +185,7 @@ impl MetadataMutation<'_, '_> {
     ///
     /// Returns an error when `block` cannot be read from the mounted device or block-size arithmetic
     /// cannot be represented.
-    fn xattr_block_bytes(&mut self, block: BlockAddress) -> Result<Vec<u8>> {
+    pub(super) fn xattr_block_bytes(&mut self, block: BlockAddress) -> Result<Vec<u8>> {
         if let Some(staged) = self
             .xattr_updates
             .iter()

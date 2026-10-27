@@ -304,6 +304,8 @@ pub(super) enum OrphanProgress {
 pub(super) struct InodeAllocation {
     /// Sorted cluster reference multiplicities derived from this inode alone.
     clusters: Vec<InodeClusterCharge>,
+    /// Entry-derived value charge retained until terminal attribute reclamation.
+    attribute_values: FileAllocationSize,
 }
 
 /// One charged cluster, independent of other inodes' references to shared metadata.
@@ -333,6 +335,10 @@ impl InodeAllocation {
         let mut references = 0_u64;
         let mut allocation = Self {
             clusters: Vec::new(),
+            attribute_values: xattr_storage::parse_inline_xattrs(
+                inode.raw().inline_xattr_region()?,
+            )?
+            .attribute_value_allocation(superblock)?,
         };
         if let InodeStorage::Extents(root) = data.storage() {
             visit_allocations(
@@ -388,7 +394,14 @@ impl InodeAllocation {
             volume
                 .device
                 .read_exact_at(superblock.block_size().offset_of(block)?, &mut bytes)?;
-            let _xattrs = xattr_storage::parse_external_xattr_block(&bytes, block, &superblock)?;
+            let xattrs = xattr_storage::parse_external_xattr_block(&bytes, block, &superblock)?;
+            allocation.attribute_values = FileAllocationSize::from_bytes(
+                allocation
+                    .attribute_values
+                    .bytes()
+                    .checked_add(xattrs.attribute_value_allocation(superblock)?.bytes())
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
             allocation.add(superblock, block)?;
         }
         if allocation.size(superblock)? != data.allocation_size() {
@@ -437,6 +450,7 @@ impl InodeAllocation {
     ) -> Result<Self> {
         let mut next = Self {
             clusters: memory::copied_slice(&self.clusters)?,
+            attribute_values: self.attribute_values,
         };
         for block in blocks {
             let cluster = superblock.cluster_of_block(*block)?;
@@ -472,6 +486,7 @@ impl InodeAllocation {
         Ok(FileAllocationSize::from_bytes(
             blocks
                 .checked_mul(u64::from(superblock.block_size().bytes()))
+                .and_then(|bytes| bytes.checked_add(self.attribute_values.bytes()))
                 .ok_or(Error::ArithmeticOverflow)?,
         ))
     }

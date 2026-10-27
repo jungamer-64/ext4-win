@@ -189,7 +189,9 @@ fn verify_attribute_values(linux: LinuxEnvironment, root: &Path) -> TaskResult<(
             &image,
             &format!("write \"{}\" /payload", linux.tool_path(&payload)?),
         )?;
-        let value = vec![0x61; 65_536];
+        // The pinned debugfs reads at most one filesystem block from ea_set -f.
+        // A full block forces value-inode storage with either inode layout.
+        let value = vec![0x61; 4096];
         let value_path = case.join("value.bin");
         fs::write(&value_path, &value)?;
         request(
@@ -200,7 +202,26 @@ fn verify_attribute_values(linux: LinuxEnvironment, root: &Path) -> TaskResult<(
                 linux.tool_path(&value_path)?
             ),
         )?;
+        // debugfs does not charge the owner for value-inode storage. Initialize the
+        // fixture's complete sector count: payload, optional entry block, and value.
+        // The independent read-only fsck below validates it before core operations.
+        let payload_sectors = if compact { 0 } else { 8 };
+        let entry_sectors = if inode_size == 128 { 8 } else { 0 };
+        let owner_sectors = payload_sectors + entry_sectors + 8;
+        request(
+            linux,
+            &image,
+            &format!("set_inode_field /payload blocks {owner_sectors}"),
+        )?;
         verify_internal_e2fsck_clean(linux, &image, "independent attribute value baseline")?;
+        debugfs_require_xattr(
+            linux,
+            &case,
+            &image,
+            "/payload",
+            &value,
+            "independent value",
+        )?;
         let name = ext4_core::Ext4Name::new(b"payload").map_err(core_task_error)?;
         drive_internal_core_read(&image, |pass| {
             let ext4_core::ChildLookup::Found(child) =
