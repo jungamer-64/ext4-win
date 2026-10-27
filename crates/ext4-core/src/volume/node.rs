@@ -644,8 +644,10 @@ pub enum ChildLookup {
 pub struct ContiguousFileStorage {
     /// Physical byte address corresponding to file offset zero.
     pub(super) physical: crate::ByteOffset,
-    /// Complete initialized logical file length.
-    pub(super) length: crate::FileSize,
+    /// Fully initialized physical prefix, including retained allocation beyond EOF.
+    pub(super) initialized_length: crate::FileSize,
+    /// Visible logical EOF, bounded by the independently validated initialized prefix.
+    pub(super) logical_size: crate::FileSize,
 }
 
 impl ContiguousFileStorage {
@@ -654,10 +656,16 @@ impl ContiguousFileStorage {
     pub const fn physical(self) -> crate::ByteOffset {
         self.physical
     }
-    /// Returns the complete initialized logical file length.
+    /// Returns the initialized physical prefix independently of the visible logical EOF.
     #[must_use]
-    pub const fn length(self) -> crate::FileSize {
-        self.length
+    pub const fn initialized_length(self) -> crate::FileSize {
+        self.initialized_length
+    }
+
+    /// Returns the logical EOF recorded by the same inode observation.
+    #[must_use]
+    pub const fn logical_size(self) -> crate::FileSize {
+        self.logical_size
     }
 }
 
