@@ -123,7 +123,9 @@ impl DirectoryPattern {
     pub(crate) fn matches_alias(&self, name: &WindowsName) -> DriverResult<bool> {
         match self {
             Self::All => Ok(true),
-            Self::Expression(expression) if expression.matching == NameCase::Insensitive => expression.matches(name),
+            Self::Expression(expression) if expression.matching == NameCase::Insensitive => {
+                expression.matches(name)
+            }
             Self::Expression(_) => Ok(false),
         }
     }

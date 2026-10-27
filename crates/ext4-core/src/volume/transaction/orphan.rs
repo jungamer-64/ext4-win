@@ -51,7 +51,11 @@ pub(in crate::volume) fn prepare_orphan_batch(
     let mut inode = RecoverableOrphanInode::parse(raw)?;
     // Secure retirement contributes complete journaled data images in addition to metadata.
     // One data-reference retirement bounds each batch before journal-credit admission below.
-    let release_budget = if inode.raw().flags()?.zero_on_deallocation() { 1 } else { RELEASE_BLOCK_BUDGET };
+    let release_budget = if inode.raw().flags()?.zero_on_deallocation() {
+        1
+    } else {
+        RELEASE_BLOCK_BUDGET
+    };
     let data = inode.data()?;
     let cutoff = match &inode {
         RecoverableOrphanInode::Unlinked(_) => 0,

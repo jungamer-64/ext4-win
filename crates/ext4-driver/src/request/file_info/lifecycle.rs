@@ -321,7 +321,8 @@ pub(crate) fn stage_cleanup_deletion(
             target.name(),
             plan.node,
             DirectoryChangeAction::Removed,
-        )?.with_tunnel(mutation, target.parent(), target.name(), plan.node)?;
+        )?
+        .with_tunnel(mutation, target.parent(), target.name(), plan.node)?;
         crate::short_name::forget(mutation, target.parent(), target.name(), plan.node)?;
         let parent = mutation.directory(target.parent())?;
         match plan.node {

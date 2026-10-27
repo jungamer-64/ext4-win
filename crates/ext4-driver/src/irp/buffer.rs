@@ -13,7 +13,10 @@ pub(crate) struct CurrentIrpStackLocation<'owner> {
 
 impl<'owner> CurrentIrpStackLocation<'owner> {
     /// Reads the major-function discriminator retained by the current active IRP owner.
-    #[expect(unsafe_code, reason = "the lifetime-bound stack view retains this initialized discriminator")]
+    #[expect(
+        unsafe_code,
+        reason = "the lifetime-bound stack view retains this initialized discriminator"
+    )]
     pub(super) fn raw_major_function(self) -> wdk_sys::UCHAR {
         unsafe {
             // SAFETY: The active completion owner retains this stack location for the view's lifetime.
@@ -139,7 +142,9 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     pub(crate) fn file_system_control_minor(self) -> FileSystemControlMinorFunction {
         match u32::from(self.raw_minor_function()) {
             MOUNT_VOLUME_MINOR_FUNCTION => FileSystemControlMinorFunction::MountVolume,
-            value if value == wdk_sys::IRP_MN_VERIFY_VOLUME => FileSystemControlMinorFunction::VerifyVolume,
+            value if value == wdk_sys::IRP_MN_VERIFY_VOLUME => {
+                FileSystemControlMinorFunction::VerifyVolume
+            }
             value if value == wdk_sys::IRP_MN_USER_FS_REQUEST => {
                 FileSystemControlMinorFunction::UserFsRequest
             }
@@ -263,16 +268,21 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
     /// Captures only the initialized kernel verify union, without retaining a stack borrow.
     /// # Errors
     /// Rejects a missing VPB or mounted target device.
-    #[expect(unsafe_code, reason = "kernel-origin verify admission selects this initialized union and retains the supplied objects through IRP completion")]
+    #[expect(
+        unsafe_code,
+        reason = "kernel-origin verify admission selects this initialized union and retains the supplied objects through IRP completion"
+    )]
     pub(crate) fn verify_volume(self) -> DriverResult<VerifyVolumeTarget> {
         // SAFETY: The active IRP owns the current initialized stack for this lexical view.
         let stack = unsafe { self.stack.as_ref() };
         // SAFETY: Capture calls this only for the IRP_MN_VERIFY_VOLUME kernel union arm.
         let verify = unsafe { stack.Parameters.VerifyVolume };
         // SAFETY: The I/O Manager retains this VPB through the pending verify IRP.
-        let vpb = unsafe { KernelVpb::from_raw(verify.Vpb) }.ok_or(DriverError::InvalidParameter)?;
+        let vpb =
+            unsafe { KernelVpb::from_raw(verify.Vpb) }.ok_or(DriverError::InvalidParameter)?;
         // SAFETY: The same IRP retains its mounted filesystem target device.
-        let device = unsafe { KernelDevice::from_raw(verify.DeviceObject) }.ok_or(DriverError::InvalidParameter)?;
+        let device = unsafe { KernelDevice::from_raw(verify.DeviceObject) }
+            .ok_or(DriverError::InvalidParameter)?;
         Ok(VerifyVolumeTarget { device, vpb })
     }
 
@@ -538,7 +548,9 @@ impl<'owner> CurrentIrpStackLocation<'owner> {
         let operation = match set.FileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation => SetFileOperation::Basic,
             wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation => SetFileOperation::Position,
-            wdk_sys::_FILE_INFORMATION_CLASS::FileValidDataLengthInformation => SetFileOperation::ValidDataLength,
+            wdk_sys::_FILE_INFORMATION_CLASS::FileValidDataLengthInformation => {
+                SetFileOperation::ValidDataLength
+            }
             wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation => {
                 let advance_only = unsafe {
                     // SAFETY: End-of-file operations initialize the AdvanceOnly union arm.

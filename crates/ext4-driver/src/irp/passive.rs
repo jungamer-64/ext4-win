@@ -298,7 +298,10 @@ impl PassiveWork {
     }
 
     /// Builds one stream coherency flush/purge.
-    pub(crate) const fn purge(stream: StreamCacheLease, policy: crate::kernel::section::PurgeFailurePolicy) -> Self {
+    pub(crate) const fn purge(
+        stream: StreamCacheLease,
+        policy: crate::kernel::section::PurgeFailurePolicy,
+    ) -> Self {
         Self::Purge { stream, policy }
     }
 
@@ -308,12 +311,18 @@ impl PassiveWork {
     }
 
     /// Builds one resolved stream-size cache/section precommit gate.
-    pub(crate) const fn prepare_size_change(stream: StreamSizeChangeLease, policy: crate::kernel::section::PurgeFailurePolicy) -> Self {
+    pub(crate) const fn prepare_size_change(
+        stream: StreamSizeChangeLease,
+        policy: crate::kernel::section::PurgeFailurePolicy,
+    ) -> Self {
         Self::PrepareSizeChange { stream, policy }
     }
 
     /// Builds one cleanup stream-deletion section gate.
-    pub(crate) const fn prepare_deletion(stream: StreamDeletionLease, policy: crate::kernel::section::PurgeFailurePolicy) -> Self {
+    pub(crate) const fn prepare_deletion(
+        stream: StreamDeletionLease,
+        policy: crate::kernel::section::PurgeFailurePolicy,
+    ) -> Self {
         Self::PrepareDeletion { stream, policy }
     }
 
@@ -421,7 +430,9 @@ impl PassiveWork {
             Self::PrepareVerity { stream } => {
                 PassiveWorkCompletion::PrepareVerity(stream.execute())
             }
-            Self::PrepareRelocation { stream } => PassiveWorkCompletion::PrepareRelocation(stream.execute()),
+            Self::PrepareRelocation { stream } => {
+                PassiveWorkCompletion::PrepareRelocation(stream.execute())
+            }
             Self::CleanupOplock { check, irp } => {
                 PassiveWorkCompletion::CleanupOplock(check.execute(irp))
             }

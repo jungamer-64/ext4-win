@@ -87,7 +87,11 @@ impl CreateParameters {
             },
             target_selection: CreateTargetSelection::from_stack_flags(stack_flags),
             unsupported_flags: UnsupportedCreateFlags::from_stack_flags(stack_flags),
-            file_mode: if stack_flag(stack_flags, wdk_sys::SL_OPEN_PAGING_FILE) { CreateFileMode::PagingFile } else { CreateFileMode::Ordinary },
+            file_mode: if stack_flag(stack_flags, wdk_sys::SL_OPEN_PAGING_FILE) {
+                CreateFileMode::PagingFile
+            } else {
+                CreateFileMode::Ordinary
+            },
             require_writable_exclusive: options & wdk_sys::FILE_DISALLOW_EXCLUSIVE != 0
                 && share_access.as_ulong() & wdk_sys::FILE_SHARE_READ == 0,
             intent: CreateIntent::from_options(options),
@@ -193,7 +197,9 @@ impl CreateParameters {
     }
 
     /// Returns the required stream lifetime and data-I/O protocol.
-    pub(crate) const fn file_mode(self) -> CreateFileMode { self.file_mode }
+    pub(crate) const fn file_mode(self) -> CreateFileMode {
+        self.file_mode
+    }
 
     /// Rejects valid create flags whose required filesystem protocol is not implemented.
     /// # Errors
@@ -204,7 +210,8 @@ impl CreateParameters {
         if matches!(self.file_mode, CreateFileMode::PagingFile)
             && (!matches!(self.target_selection, CreateTargetSelection::NamedObject)
                 || matches!(self.target_requirement, CreateTargetRequirement::Directory)
-                || !matches!(self.oplock_policy, OplockCreatePolicy::Ordinary)) {
+                || !matches!(self.oplock_policy, OplockCreatePolicy::Ordinary))
+        {
             return Err(DriverError::NotSupported);
         }
         Ok(())
@@ -426,7 +433,10 @@ impl GrantedAccess {
         raw: wdk_sys::ACCESS_MASK,
         valid_data_length: ValidDataLengthAccess,
     ) -> Self {
-        Self { raw, valid_data_length }
+        Self {
+            raw,
+            valid_data_length,
+        }
     }
 
     /// Returns the WDK mask used for share-access accounting.
@@ -621,7 +631,13 @@ impl CreateAccessState<'_> {
     }
 
     /// Captures the original subject's privilege rather than a later actor thread's token.
-    #[cfg_attr(not(test), expect(unsafe_code, reason = "the create IRP owns its captured subject throughout the locked privilege check"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the create IRP owns its captured subject throughout the locked privilege check"
+        )
+    )]
     fn valid_data_length_access(&self, granted: wdk_sys::ACCESS_MASK) -> ValidDataLengthAccess {
         if granted & wdk_sys::FILE_WRITE_DATA == 0 {
             return ValidDataLengthAccess::Denied;
@@ -636,7 +652,10 @@ impl CreateAccessState<'_> {
                 PrivilegeCount: 1,
                 Control: wdk_sys::PRIVILEGE_SET_ALL_NECESSARY,
                 Privilege: [wdk_sys::LUID_AND_ATTRIBUTES {
-                    Luid: wdk_sys::LUID { LowPart: wdk_sys::SE_MANAGE_VOLUME_PRIVILEGE, HighPart: 0 },
+                    Luid: wdk_sys::LUID {
+                        LowPart: wdk_sys::SE_MANAGE_VOLUME_PRIVILEGE,
+                        HighPart: 0,
+                    },
                     Attributes: 0,
                 }],
             };

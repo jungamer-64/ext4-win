@@ -636,7 +636,9 @@ impl MountedVolumeAccess<'_> {
         file: KernelFileObject,
         extension: bool,
     ) -> DriverResult<PagingFileSetupLease> {
-        self.volume.file_control_blocks.acquire_paging_file_setup(fcb, file, extension)
+        self.volume
+            .file_control_blocks
+            .acquire_paging_file_setup(fcb, file, extension)
     }
     /// Borrows advisory tunneling without granting ext4 namespace mutation authority.
     pub(crate) fn name_tunnel(&self) -> &crate::kernel::name_tunnel::NameTunnel {
@@ -732,11 +734,16 @@ impl MountedVolumeAccess<'_> {
     /// # Errors
     /// Removal, revoked ownership or a failed runtime prevents reissuing even a zero-progress I/O.
     #[cfg(not(test))]
-    pub(crate) fn authorize_storage_resumption(&self, request: &ext4_core::StorageRequest) -> DriverResult<()> {
+    pub(crate) fn authorize_storage_resumption(
+        &self,
+        request: &ext4_core::StorageRequest,
+    ) -> DriverResult<()> {
         self.authorize_storage()?;
         match request {
             ext4_core::StorageRequest::Read { .. } => self.runtime.authorize_media_read(),
-            ext4_core::StorageRequest::Write { .. } | ext4_core::StorageRequest::Flush { .. } => self.runtime.authorize_durability(),
+            ext4_core::StorageRequest::Write { .. } | ext4_core::StorageRequest::Flush { .. } => {
+                self.runtime.authorize_durability()
+            }
         }
     }
 
@@ -1354,15 +1361,27 @@ impl MountedVolumeAccess<'_> {
     /// Grants exclusive physical-map mutation over the exact retained stream.
     /// # Errors
     /// Returns protected/stale stream or reference admission failure.
-    pub(crate) fn prepare_stream_relocation(&self, fcb: NonNull<FileControlBlock>, file: ext4_core::FileNodeId) -> DriverResult<StreamRelocationLease> {
-        self.volume.file_control_blocks.prepare_stream_relocation(fcb, file)
+    pub(crate) fn prepare_stream_relocation(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file: ext4_core::FileNodeId,
+    ) -> DriverResult<StreamRelocationLease> {
+        self.volume
+            .file_control_blocks
+            .prepare_stream_relocation(fcb, file)
     }
 
     /// Installs FILE_OBJECT-owned protection while no relocation is active.
     /// # Errors
     /// Returns movement conflict or allocation failure before acquiring protection.
-    pub(crate) fn protect_file_clusters(&self, fcb: NonNull<FileControlBlock>, file: KernelFileObject) -> DriverResult<()> {
-        self.volume.file_control_blocks.protect_file_clusters(fcb, file)
+    pub(crate) fn protect_file_clusters(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file: KernelFileObject,
+    ) -> DriverResult<()> {
+        self.volume
+            .file_control_blocks
+            .protect_file_clusters(fcb, file)
     }
 
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.

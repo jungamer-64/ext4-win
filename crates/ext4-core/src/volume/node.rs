@@ -651,10 +651,14 @@ pub struct ContiguousFileStorage {
 impl ContiguousFileStorage {
     /// Returns the physical byte address corresponding to file offset zero.
     #[must_use]
-    pub const fn physical(self) -> crate::ByteOffset { self.physical }
+    pub const fn physical(self) -> crate::ByteOffset {
+        self.physical
+    }
     /// Returns the complete initialized logical file length.
     #[must_use]
-    pub const fn length(self) -> crate::FileSize { self.length }
+    pub const fn length(self) -> crate::FileSize {
+        self.length
+    }
 }
 
 /// One block-aligned payload allocation run observed in an immutable epoch.

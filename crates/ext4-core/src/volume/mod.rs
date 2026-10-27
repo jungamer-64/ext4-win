@@ -13,12 +13,14 @@ mod inode_record;
 mod keys;
 pub use keys::{PreparedKeyChange, ReservedKeyChange, ResolvedKeyChange};
 mod fast_commit;
+mod media_verification;
 mod metadata_cache;
 mod metadata_image;
 mod mmp;
 mod mount;
-mod media_verification;
-pub use media_verification::{MediaVerificationOperation, MediaVerificationTransition, MediaVerificationOutcome};
+pub use media_verification::{
+    MediaVerificationOperation, MediaVerificationOutcome, MediaVerificationTransition,
+};
 pub(crate) use metadata_cache::CacheReadStamp;
 pub use metadata_cache::{MetadataCache, MetadataCacheAccess};
 pub use mmp::{
@@ -51,9 +53,9 @@ pub use mount::{
     ValidatedExternalJournal, VolumeGeometry, VolumeIdentity,
 };
 pub use node::{
-    ChildLookup, ContiguousFileStorage, DataAllocationRun, DirectoryChild, DirectoryEntry, DirectoryNode, DirectoryNodeId,
-    FileNode, FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks, NodeDataPolicy, NodeId,
-    NodeMetadataSnapshot, NodeMetadataUpdate, SymlinkNode, SymlinkNodeId,
+    ChildLookup, ContiguousFileStorage, DataAllocationRun, DirectoryChild, DirectoryEntry,
+    DirectoryNode, DirectoryNodeId, FileNode, FileNodeId, HardLinkEntry, HardLinkNodeId, HardLinks,
+    NodeDataPolicy, NodeId, NodeMetadataSnapshot, NodeMetadataUpdate, SymlinkNode, SymlinkNodeId,
 };
 pub use operation::{
     CommittedReadPass, EpochReadOperation, EpochReadPass, MutationResolveOperation,
@@ -62,8 +64,8 @@ pub use operation::{
 pub use transaction::{
     CheckpointOperation, CheckpointPublication, CleanJournalDurability, CleanJournalRecordPhase,
     CommitDurability, CommitReadyMutation, CommitRecordPhase, DurableMutation, HomeBlockDurability,
-    JournalPayloadDurability, MutationCompletionDurability, MutationResolvePass, NamespaceDestination, OrderedDataDurability,
-    PublishedMutation, ReservedMutation, ResolvedMutation, StorageRequestSequence,
-    StorageRequestSequenceStep, TransactionDirectory, TransactionFile, TransactionHardLinkSource,
-    TransactionNode, TransactionSymlink,
+    JournalPayloadDurability, MutationCompletionDurability, MutationResolvePass,
+    NamespaceDestination, OrderedDataDurability, PublishedMutation, ReservedMutation,
+    ResolvedMutation, StorageRequestSequence, StorageRequestSequenceStep, TransactionDirectory,
+    TransactionFile, TransactionHardLinkSource, TransactionNode, TransactionSymlink,
 };

@@ -632,13 +632,24 @@ impl<O> PreparedStorageCommand<O> {
     /// Builds new-mount I/O while retaining the core's read/write/recovery effect classification.
     /// # Errors
     /// Returns the retained operation and request on geometry or transfer preparation failure.
-    pub(crate) fn mount_io(devices: MountedStorageRoute, request: StorageRequest, suspended: O) -> Result<Self, StorageCommandBuildError<O>> {
+    pub(crate) fn mount_io(
+        devices: MountedStorageRoute,
+        request: StorageRequest,
+        suspended: O,
+    ) -> Result<Self, StorageCommandBuildError<O>> {
         let mut prepared = Self::try_new(devices, request, suspended)?;
         prepared.operation = match &mut prepared.command {
-            StorageCommand::Read { purpose, .. } => { *purpose = ReadPurpose::MountRecovery; LowerOperation::VerifyRead }
+            StorageCommand::Read { purpose, .. } => {
+                *purpose = ReadPurpose::MountRecovery;
+                LowerOperation::VerifyRead
+            }
             StorageCommand::Write { purpose, phase, .. } => {
                 *purpose = WritePurpose::MountRecovery;
-                if *phase == WriteTransferPhase::ReadBeforeWrite { LowerOperation::VerifyRead } else { LowerOperation::MountWrite }
+                if *phase == WriteTransferPhase::ReadBeforeWrite {
+                    LowerOperation::VerifyRead
+                } else {
+                    LowerOperation::MountWrite
+                }
             }
             StorageCommand::Flush { .. } => LowerOperation::Flush,
         };
@@ -654,14 +665,22 @@ impl<O> PreparedStorageCommand<O> {
         suspended: O,
     ) -> Result<Self, StorageCommandBuildError<O>> {
         if !matches!(request, StorageRequest::Read { .. }) {
-            return Err(StorageCommandBuildError { error: DriverError::InvalidDeviceRequest, suspended, request });
+            return Err(StorageCommandBuildError {
+                error: DriverError::InvalidDeviceRequest,
+                suspended,
+                request,
+            });
         }
         let mut prepared = Self::try_new(devices, request, suspended)?;
         if let StorageCommand::Read { purpose, .. } = &mut prepared.command {
             *purpose = ReadPurpose::VerifyMedia;
         } else {
             let (suspended, request) = prepared.command.into_parts();
-            return Err(StorageCommandBuildError { error: DriverError::InternalInvariantViolation, suspended, request });
+            return Err(StorageCommandBuildError {
+                error: DriverError::InternalInvariantViolation,
+                suspended,
+                request,
+            });
         }
         prepared.operation = LowerOperation::VerifyRead;
         Ok(prepared)
@@ -996,8 +1015,11 @@ pub struct FailedStorageCommand<O> {
 impl<O> FailedStorageCommand<O> {
     /// Preserves the lower device's guaranteed zero-progress verification gate.
     pub(crate) fn domain_error(&self) -> Error {
-        if self.status == wdk_sys::STATUS_VERIFY_REQUIRED && self.information == 0 { Error::MediaVerificationRequired }
-        else { Error::DeviceIo }
+        if self.status == wdk_sys::STATUS_VERIFY_REQUIRED && self.information == 0 {
+            Error::MediaVerificationRequired
+        } else {
+            Error::DeviceIo
+        }
     }
     /// Observes the caller's effect policy before retry selection consumes the failed request.
     #[cfg(not(test))]
@@ -1010,7 +1032,8 @@ impl<O> FailedStorageCommand<O> {
         let effect_free_write_failure = matches!(
             self.status,
             STATUS_DEVICE_BUSY | STATUS_RETRY | STATUS_DEVICE_NOT_READY
-        ) && self.information == 0 || self.domain_error() == Error::MediaVerificationRequired;
+        ) && self.information == 0
+            || self.domain_error() == Error::MediaVerificationRequired;
         let read_unreliable = self.command.is_read_phase()
             && matches!(
                 self.status,
@@ -1034,7 +1057,15 @@ impl<O> FailedStorageCommand<O> {
 
     /// Selects and owns the next fixed retry timer, or preserves terminal failure ownership.
     pub fn into_retry(mut self, policy: StorageRetryPolicy) -> StorageRetryDecision<O> {
-        if policy == StorageRetryPolicy::Never || matches!(self.command, StorageCommand::Read { purpose: ReadPurpose::VerifyMedia, .. }) {
+        if policy == StorageRetryPolicy::Never
+            || matches!(
+                self.command,
+                StorageCommand::Read {
+                    purpose: ReadPurpose::VerifyMedia,
+                    ..
+                }
+            )
+        {
             return StorageRetryDecision::Terminal(self);
         }
         if self.domain_error() == Error::MediaVerificationRequired
@@ -1106,26 +1137,48 @@ pub struct VerifyingStorageCommand<O> {
 impl<O> VerifyingStorageCommand<O> {
     /// Borrows the immutable original request only for current session-health admission.
     pub(crate) fn request(&self) -> &StorageRequest {
-        match &self.command { StorageCommand::Read { request, .. } | StorageCommand::Write { request, .. } | StorageCommand::Flush { request, .. } => request }
+        match &self.command {
+            StorageCommand::Read { request, .. }
+            | StorageCommand::Write { request, .. }
+            | StorageCommand::Flush { request, .. } => request,
+        }
     }
     /// Returns the original owner when verification fails or cancellation wins before effect.
-    pub(crate) fn into_parts(self) -> (O, StorageRequest) { self.command.into_parts() }
+    pub(crate) fn into_parts(self) -> (O, StorageRequest) {
+        self.command.into_parts()
+    }
 
     /// Same-media acknowledgment consumes this gate and prepares a fresh private IRP.
     /// # Errors
     /// Returns an invalid attempt state with the original request and operation still owned.
-    pub(crate) fn verified(mut self) -> Result<PreparedStorageCommand<O>, StorageCommandBuildError<O>> {
+    pub(crate) fn verified(
+        mut self,
+    ) -> Result<PreparedStorageCommand<O>, StorageCommandBuildError<O>> {
         if let Err(error) = self.command.advance_attempt() {
             let (suspended, request) = self.command.into_parts();
-            return Err(StorageCommandBuildError { error, suspended, request });
+            return Err(StorageCommandBuildError {
+                error,
+                suspended,
+                request,
+            });
         }
-        if self.command.is_read_phase() { self.transfer.as_mut_slice().fill(0); }
+        if self.command.is_read_phase() {
+            self.transfer.as_mut_slice().fill(0);
+        }
         let operation = match &self.command {
-            StorageCommand::Read { .. } | StorageCommand::Write { phase: WriteTransferPhase::ReadBeforeWrite, .. } => LowerOperation::Read,
+            StorageCommand::Read { .. }
+            | StorageCommand::Write {
+                phase: WriteTransferPhase::ReadBeforeWrite,
+                ..
+            } => LowerOperation::Read,
             StorageCommand::Write { .. } => LowerOperation::Write,
             StorageCommand::Flush { .. } => LowerOperation::Flush,
         };
-        Ok(PreparedStorageCommand { command: self.command, transfer: self.transfer, operation })
+        Ok(PreparedStorageCommand {
+            command: self.command,
+            transfer: self.transfer,
+            operation,
+        })
     }
 }
 
@@ -1170,10 +1223,16 @@ impl<O> RetryingStorageCommand<O> {
                 ReadPurpose::MountRecovery => LowerOperation::VerifyRead,
             },
             StorageCommand::Write { phase, purpose, .. } => match phase {
-                WriteTransferPhase::ReadBeforeWrite if *purpose == WritePurpose::MountRecovery => LowerOperation::VerifyRead,
+                WriteTransferPhase::ReadBeforeWrite if *purpose == WritePurpose::MountRecovery => {
+                    LowerOperation::VerifyRead
+                }
                 WriteTransferPhase::ReadBeforeWrite => LowerOperation::Read,
                 WriteTransferPhase::DirectWrite | WriteTransferPhase::WriteAfterRead => {
-                    if *purpose == WritePurpose::MountRecovery { LowerOperation::MountWrite } else { LowerOperation::Write }
+                    if *purpose == WritePurpose::MountRecovery {
+                        LowerOperation::MountWrite
+                    } else {
+                        LowerOperation::Write
+                    }
                 }
             },
             StorageCommand::Flush { .. } => LowerOperation::Flush,
@@ -1284,7 +1343,11 @@ impl<O> CompletedLowerIrp<StorageCommand<O>> {
                         attempt: 1,
                     },
                     transfer,
-                    operation: if purpose == WritePurpose::MountRecovery { LowerOperation::MountWrite } else { LowerOperation::Write },
+                    operation: if purpose == WritePurpose::MountRecovery {
+                        LowerOperation::MountWrite
+                    } else {
+                        LowerOperation::Write
+                    },
                 }))
             }
             StorageCommand::Write {
@@ -1530,18 +1593,34 @@ mod tests {
     /// Fails if raw verification retries, gains mutation authority or misclassifies read failure.
     #[test]
     fn verification_reads_never_retry_or_acquire_write_failure_semantics() {
-        let Some(fixture) = storage_fixture() else { return; };
-        for (status, expected) in [(STATUS_IO_TIMEOUT, StorageFailureClass::Terminal), (STATUS_DEVICE_BUSY, StorageFailureClass::Terminal), (STATUS_CRC_ERROR, StorageFailureClass::ReadUnreliable)] {
-            let request = StorageRequest::Read { target: StorageTarget::Filesystem, offset: ByteOffset::new(1024), buffer: vec![0; 1024] };
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        for (status, expected) in [
+            (STATUS_IO_TIMEOUT, StorageFailureClass::Terminal),
+            (STATUS_DEVICE_BUSY, StorageFailureClass::Terminal),
+            (STATUS_CRC_ERROR, StorageFailureClass::ReadUnreliable),
+        ] {
+            let request = StorageRequest::Read {
+                target: StorageTarget::Filesystem,
+                offset: ByteOffset::new(1024),
+                buffer: vec![0; 1024],
+            };
             let prepared = PreparedStorageCommand::verify_read(fixture.devices, request, 9_u64);
             assert!(prepared.is_ok());
-            let Ok(prepared) = prepared else { return; };
+            let Ok(prepared) = prepared else {
+                return;
+            };
             assert!(!prepared.is_effect_bearing());
             assert_eq!(prepared.operation, LowerOperation::VerifyRead);
-            let Some(failed) = failed_command(prepared, status, 0) else { return; };
+            let Some(failed) = failed_command(prepared, status, 0) else {
+                return;
+            };
             let decision = failed.into_retry(StorageRetryPolicy::Classified);
             assert!(matches!(decision, StorageRetryDecision::Terminal(_)));
-            let StorageRetryDecision::Terminal(terminal) = decision else { return; };
+            let StorageRetryDecision::Terminal(terminal) = decision else {
+                return;
+            };
             assert_eq!(terminal.into_failure().2, expected);
         }
     }
@@ -1550,45 +1629,87 @@ mod tests {
     /// Fails if a media gate retries uncertain progress, changes its write image or loses its bound.
     #[test]
     fn zero_progress_media_gate_requires_verification_and_preserves_the_exact_phase() {
-        let Some(fixture) = storage_fixture() else { return; };
-        let request = StorageRequest::Write { target: StorageTarget::Filesystem, offset: ByteOffset::new(0), buffer: vec![0x5a; 512] };
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        let request = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0x5a; 512],
+        };
         let prepared = PreparedStorageCommand::try_new(fixture.devices, request, 41_u64);
         assert!(prepared.is_ok());
-        let Ok(mut prepared) = prepared else { return; };
+        let Ok(mut prepared) = prepared else {
+            return;
+        };
         for attempt in 1..super::MAX_STORAGE_ATTEMPTS {
-            let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 0) else { panic!("expected failed write gate"); };
+            let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 0) else {
+                panic!("expected failed write gate");
+            };
             assert_eq!(failed.domain_error(), Error::MediaVerificationRequired);
             let decision = failed.into_retry(StorageRetryPolicy::Classified);
             assert!(matches!(decision, StorageRetryDecision::Verify(_)));
-            let StorageRetryDecision::Verify(gate) = decision else { return; };
+            let StorageRetryDecision::Verify(gate) = decision else {
+                return;
+            };
             assert!(matches!(gate.request(), StorageRequest::Write { .. }));
             let resumed = gate.verified();
             assert!(resumed.is_ok());
-            let Ok(next) = resumed else { return; };
+            let Ok(next) = resumed else {
+                return;
+            };
             assert_eq!(next.operation, LowerOperation::Write);
             assert_eq!(next.command.attempt(), attempt + 1);
             assert!(next.transfer.as_slice().iter().all(|byte| *byte == 0x5a));
             prepared = next;
         }
-        let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 0) else { panic!("expected exhausted gate"); };
+        let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 0) else {
+            panic!("expected exhausted gate");
+        };
         let decision = failed.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(decision, StorageRetryDecision::Terminal(_)));
-        let StorageRetryDecision::Terminal(failed) = decision else { return; };
+        let StorageRetryDecision::Terminal(failed) = decision else {
+            return;
+        };
         assert_eq!(failed.into_failure().2, StorageFailureClass::Terminal);
 
-        let request = StorageRequest::Write { target: StorageTarget::Filesystem, offset: ByteOffset::new(0), buffer: vec![0x7f; 512] };
-        let Ok(prepared) = PreparedStorageCommand::try_new(fixture.devices, request, 42_u64) else { panic!("invalid fixture"); };
-        let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 1) else { panic!("expected partial write failure"); };
+        let request = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0x7f; 512],
+        };
+        let Ok(prepared) = PreparedStorageCommand::try_new(fixture.devices, request, 42_u64) else {
+            panic!("invalid fixture");
+        };
+        let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 1) else {
+            panic!("expected partial write failure");
+        };
         assert_eq!(failed.domain_error(), Error::DeviceIo);
         let decision = failed.into_retry(StorageRetryPolicy::Classified);
         assert!(matches!(decision, StorageRetryDecision::Terminal(_)));
-        let StorageRetryDecision::Terminal(failed) = decision else { return; };
-        assert_eq!(failed.into_failure().2, StorageFailureClass::DurabilityUnknown { completed: 1 });
+        let StorageRetryDecision::Terminal(failed) = decision else {
+            return;
+        };
+        assert_eq!(
+            failed.into_failure().2,
+            StorageFailureClass::DurabilityUnknown { completed: 1 }
+        );
 
-        let request = StorageRequest::Read { target: StorageTarget::Filesystem, offset: ByteOffset::new(0), buffer: vec![0; 512] };
-        let Ok(prepared) = PreparedStorageCommand::try_new(fixture.devices, request, 43_u64) else { panic!("invalid read fixture"); };
-        let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 0) else { panic!("expected read gate"); };
-        let StorageRetryDecision::Verify(gate) = failed.into_retry(StorageRetryPolicy::Classified) else { panic!("missing verification gate"); };
+        let request = StorageRequest::Read {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(0),
+            buffer: vec![0; 512],
+        };
+        let Ok(prepared) = PreparedStorageCommand::try_new(fixture.devices, request, 43_u64) else {
+            panic!("invalid read fixture");
+        };
+        let Some(failed) = failed_command(prepared, wdk_sys::STATUS_VERIFY_REQUIRED, 0) else {
+            panic!("expected read gate");
+        };
+        let StorageRetryDecision::Verify(gate) = failed.into_retry(StorageRetryPolicy::Classified)
+        else {
+            panic!("missing verification gate");
+        };
         let (owner, request) = gate.into_parts();
         assert_eq!(owner, 43);
         assert!(matches!(request, StorageRequest::Read { .. }));
@@ -1598,24 +1719,59 @@ mod tests {
     /// Fails if new-mount override is lost between the read and write halves of sector recovery.
     #[test]
     fn mount_recovery_override_follows_the_exact_read_modify_write_phase() {
-        let Some(fixture) = storage_fixture() else { return; };
-        let request = StorageRequest::Read { target: StorageTarget::Filesystem, offset: ByteOffset::new(1024), buffer: vec![0; 1024] };
+        let Some(fixture) = storage_fixture() else {
+            return;
+        };
+        let request = StorageRequest::Read {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(1024),
+            buffer: vec![0; 1024],
+        };
         let prepared = PreparedStorageCommand::mount_io(fixture.devices, request, 44_u64);
         assert!(prepared.is_ok());
-        let Ok(prepared) = prepared else { return; };
+        let Ok(prepared) = prepared else {
+            return;
+        };
         assert_eq!(prepared.operation, LowerOperation::VerifyRead);
-        assert!(matches!(prepared.command, super::StorageCommand::Read { purpose: super::ReadPurpose::MountRecovery, .. }));
-        let request = StorageRequest::Write { target: StorageTarget::Filesystem, offset: ByteOffset::new(1), buffer: vec![0x33; 7] };
-        let Ok(prepared) = PreparedStorageCommand::mount_io(fixture.devices, request, 45_u64) else { panic!("invalid recovery fixture"); };
+        assert!(matches!(
+            prepared.command,
+            super::StorageCommand::Read {
+                purpose: super::ReadPurpose::MountRecovery,
+                ..
+            }
+        ));
+        let request = StorageRequest::Write {
+            target: StorageTarget::Filesystem,
+            offset: ByteOffset::new(1),
+            buffer: vec![0x33; 7],
+        };
+        let Ok(prepared) = PreparedStorageCommand::mount_io(fixture.devices, request, 45_u64)
+        else {
+            panic!("invalid recovery fixture");
+        };
         assert_eq!(prepared.operation, LowerOperation::VerifyRead);
-        let PreparedStorageCommand { command, mut transfer, operation: _ } = prepared;
+        let PreparedStorageCommand {
+            command,
+            mut transfer,
+            operation: _,
+        } = prepared;
         transfer.as_mut_slice().fill(0x55);
-        let completed = CompletedLowerIrp { suspended: command, transfer, status: wdk_sys::STATUS_SUCCESS, information: 512 };
-        let Ok(StorageCommandStep::SubmitNext(next)) = completed.advance() else { panic!("missing recovery write phase"); };
+        let completed = CompletedLowerIrp {
+            suspended: command,
+            transfer,
+            status: wdk_sys::STATUS_SUCCESS,
+            information: 512,
+        };
+        let Ok(StorageCommandStep::SubmitNext(next)) = completed.advance() else {
+            panic!("missing recovery write phase");
+        };
         assert_eq!(next.operation, LowerOperation::MountWrite);
         assert!(next.is_effect_bearing());
         assert_eq!(next.transfer.as_slice().first(), Some(&0x55));
-        assert_eq!(next.transfer.as_slice().get(1..8), Some([0x33; 7].as_slice()));
+        assert_eq!(
+            next.transfer.as_slice().get(1..8),
+            Some([0x33; 7].as_slice())
+        );
         assert_eq!(next.transfer.as_slice().get(8), Some(&0x55));
     }
 

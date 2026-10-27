@@ -551,7 +551,8 @@ impl LiveInodeRecord {
     /// # Errors
     /// Returns a truncated inode flags field.
     pub(super) fn mark_zero_on_deallocation(&mut self) -> Result<()> {
-        self.raw.set_flags(self.raw.flags()?.with_zero_on_deallocation())
+        self.raw
+            .set_flags(self.raw.flags()?.with_zero_on_deallocation())
     }
 
     /// Marks this inode as fscrypt protected.

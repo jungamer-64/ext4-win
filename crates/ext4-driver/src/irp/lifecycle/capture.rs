@@ -644,9 +644,14 @@ impl QueueContextOwnership {
     /// # Errors
     /// Returns verify-required after the sole attempt, or invalid-device-request for finalization.
     pub(super) fn claim_media_verification(&mut self) -> DriverResult<()> {
-        let Self::Captured(context) = self else { return Err(DriverError::InvalidDeviceRequest); };
+        let Self::Captured(context) = self else {
+            return Err(DriverError::InvalidDeviceRequest);
+        };
         match context.verification {
-            VerificationBudget::Available => { context.verification = VerificationBudget::Spent; Ok(()) },
+            VerificationBudget::Available => {
+                context.verification = VerificationBudget::Spent;
+                Ok(())
+            }
             VerificationBudget::Spent => Err(DriverError::VerifyRequired),
         }
     }
@@ -1289,13 +1294,19 @@ impl PreparedRequest {
                 let minor = stack.file_system_control_minor();
                 let key = match minor {
                     FileSystemControlMinorFunction::MountVolume => {
-                        if target.requestor_mode() != 0 { return Err(IrpCompletion::from_error(DriverError::AccessDenied)); }
+                        if target.requestor_mode() != 0 {
+                            return Err(IrpCompletion::from_error(DriverError::AccessDenied));
+                        }
                         QueueCancellationKey::Device
                     }
                     FileSystemControlMinorFunction::VerifyVolume => {
-                        if target.requestor_mode() != 0 { return Err(IrpCompletion::from_error(DriverError::AccessDenied)); }
+                        if target.requestor_mode() != 0 {
+                            return Err(IrpCompletion::from_error(DriverError::AccessDenied));
+                        }
                         let verify = stack.verify_volume().map_err(IrpCompletion::from_error)?;
-                        if verify.device != target.device() { return Err(IrpCompletion::from_error(DriverError::InvalidParameter)); }
+                        if verify.device != target.device() {
+                            return Err(IrpCompletion::from_error(DriverError::InvalidParameter));
+                        }
                         return Ok((Self::VerifyVolume(verify), QueueCancellationKey::Device));
                     }
                     FileSystemControlMinorFunction::UserFsRequest => {
@@ -1306,12 +1317,16 @@ impl PreparedRequest {
                             authorize_volume_management(target)?;
                             return Ok((Self::MarkVolumeDirty, generic_key()));
                         }
-                        if matches!(control.fs_control_code(), super::FsControlCode::MoveFile | super::FsControlCode::MarkHandle) {
+                        if matches!(
+                            control.fs_control_code(),
+                            super::FsControlCode::MoveFile | super::FsControlCode::MarkHandle
+                        ) {
                             if control.fs_control_code() == super::FsControlCode::MoveFile {
                                 authorize_volume_management(target)?;
                             }
-                            let captured = PreparedClusterControl::capture(target, control.fs_control_code())
-                                .map_err(IrpCompletion::from_error)?;
+                            let captured =
+                                PreparedClusterControl::capture(target, control.fs_control_code())
+                                    .map_err(IrpCompletion::from_error)?;
                             return Ok((Self::ClusterControl(captured), generic_key()));
                         }
                         if control.fs_control_code() == super::FsControlCode::SetReparsePoint {
@@ -1888,29 +1903,54 @@ mod tests {
     /// # Panics
     /// Fails if requestor-supplied tuples enter raw verification or verification loses release capacity.
     #[test]
-    #[expect(unsafe_code, reason = "scoped native device, VPB, IRP and stack allocations survive consuming capture and rejection")]
-    #[expect(clippy::panic_in_result_fn, reason = "fallible fixture capture surrounds kernel-origin and finite-budget assertions")]
+    #[expect(
+        unsafe_code,
+        reason = "scoped native device, VPB, IRP and stack allocations survive consuming capture and rejection"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture capture surrounds kernel-origin and finite-budget assertions"
+    )]
     fn media_verification_capture_requires_kernel_origin_and_the_dispatch_device()
     -> crate::kernel::status::DriverResult<()> {
         use crate::kernel::status::DriverError;
         let mut device = wdk_sys::DEVICE_OBJECT::default();
         let mut foreign = wdk_sys::DEVICE_OBJECT::default();
         let mut vpb = wdk_sys::VPB::default();
-        for (mode, other, expected) in [(0_i8, false, wdk_sys::STATUS_SUCCESS), (1, false, wdk_sys::STATUS_ACCESS_DENIED), (0, true, wdk_sys::STATUS_INVALID_PARAMETER)] {
-            let mut irp = wdk_sys::IRP { RequestorMode: mode, ..Default::default() };
+        for (mode, other, expected) in [
+            (0_i8, false, wdk_sys::STATUS_SUCCESS),
+            (1, false, wdk_sys::STATUS_ACCESS_DENIED),
+            (0, true, wdk_sys::STATUS_INVALID_PARAMETER),
+        ] {
+            let mut irp = wdk_sys::IRP {
+                RequestorMode: mode,
+                ..Default::default()
+            };
             let mut stack = wdk_sys::IO_STACK_LOCATION {
-                MajorFunction: 0x0d, MinorFunction: 2, ..Default::default()
+                MajorFunction: 0x0d,
+                MinorFunction: 2,
+                ..Default::default()
             };
             stack.Parameters.VerifyVolume.Vpb = &raw mut vpb;
-            stack.Parameters.VerifyVolume.DeviceObject = if other { &raw mut foreign } else { &raw mut device };
+            stack.Parameters.VerifyVolume.DeviceObject = if other {
+                &raw mut foreign
+            } else {
+                &raw mut device
+            };
             // SAFETY: The original local allocations outlive capture and consuming rejection.
-            let received = unsafe { build_target(&raw mut device, &raw mut irp, &raw mut stack) }.ok_or(DriverError::InvalidParameter)?;
+            let received = unsafe { build_target(&raw mut device, &raw mut irp, &raw mut stack) }
+                .ok_or(DriverError::InvalidParameter)?;
             let captured = PendingIrp::capture(received, DispatchMajor::FileSystemControl);
             match captured {
                 Ok(captured) => {
                     assert_eq!(expected, wdk_sys::STATUS_SUCCESS);
-                    assert_eq!(captured.execution_class(), super::super::scheduler::ExecutionClass::Release);
-                    assert!(matches!(&captured.context, QueueContextOwnership::Captured(context) if matches!(context.prepared, PreparedRequest::VerifyVolume(_))));
+                    assert_eq!(
+                        captured.execution_class(),
+                        super::super::scheduler::ExecutionClass::Release
+                    );
+                    assert!(
+                        matches!(&captured.context, QueueContextOwnership::Captured(context) if matches!(context.prepared, PreparedRequest::VerifyVolume(_)))
+                    );
                     let _status = captured.reject(DriverError::InsufficientResources);
                 }
                 Err(status) => assert_eq!(status, expected),
@@ -1918,7 +1958,10 @@ mod tests {
         }
         let mut context = QueueContextOwnership::Captured(QueueContext::for_test_create()?);
         assert_eq!(context.claim_media_verification(), Ok(()));
-        assert_eq!(context.claim_media_verification(), Err(DriverError::VerifyRequired));
+        assert_eq!(
+            context.claim_media_verification(),
+            Err(DriverError::VerifyRequired)
+        );
         Ok(())
     }
 

@@ -17,35 +17,56 @@ pub(super) fn initialized_contiguous_storage(
     inode.file_payload_mutation()?;
     if inode.protection() != crate::disk_format::inode::InodeProtection::Plain
         || inode.data_persistence() == crate::disk_format::inode::FileDataPersistence::Journaled
-        || inode.security().permissions() != inode.security().permissions().without_file_privileges()
-    { return Err(Error::UnsupportedInodeMutation); }
+        || inode.security().permissions()
+            != inode.security().permissions().without_file_privileges()
+    {
+        return Err(Error::UnsupportedInodeMutation);
+    }
     let crate::disk_format::inode::InodeStorage::Extents(root) = inode.storage() else {
         return Err(Error::UnsupportedInodeMutation);
     };
     let bytes = u64::from(size.bytes());
     let length = inode.size();
-    if length.bytes() == 0 { return Err(Error::InvalidWriteRange); }
-    let blocks = length.bytes().checked_add(bytes - 1).ok_or(Error::ArithmeticOverflow)?
-        .checked_div(bytes).ok_or(Error::ArithmeticOverflow)?;
+    if length.bytes() == 0 {
+        return Err(Error::InvalidWriteRange);
+    }
+    let blocks = length
+        .bytes()
+        .checked_add(bytes - 1)
+        .ok_or(Error::ArithmeticOverflow)?
+        .checked_div(bytes)
+        .ok_or(Error::ArithmeticOverflow)?;
     let mut mapping = ExtentMappingCursor::new(root, size, context)?;
     let mut cursor = 0_u64;
     let mut origin = None;
     while cursor < blocks {
-        let run = mapping.map_run(LogicalBlock::try_from(cursor)?,
-            NonZeroU64::new(blocks.checked_sub(cursor).ok_or(Error::ArithmeticOverflow)?)
-                .ok_or(Error::InvalidExtentTree)?, source)?;
+        let run = mapping.map_run(
+            LogicalBlock::try_from(cursor)?,
+            NonZeroU64::new(
+                blocks
+                    .checked_sub(cursor)
+                    .ok_or(Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Error::InvalidExtentTree)?,
+            source,
+        )?;
         let ExtentBlockRun::Initialized { physical_start, .. } = run else {
             return Err(Error::UnsupportedInodeMutation);
         };
         let physical = size.offset_of(physical_start)?.get();
         let base = *origin.get_or_insert(physical);
-        if base.checked_add(cursor.checked_mul(bytes).ok_or(Error::ArithmeticOverflow)?) != Some(physical) {
+        if base.checked_add(cursor.checked_mul(bytes).ok_or(Error::ArithmeticOverflow)?)
+            != Some(physical)
+        {
             return Err(Error::UnsupportedInodeMutation);
         }
-        cursor = cursor.checked_add(run.blocks().get()).ok_or(Error::ArithmeticOverflow)?;
+        cursor = cursor
+            .checked_add(run.blocks().get())
+            .ok_or(Error::ArithmeticOverflow)?;
     }
     Ok(super::node::ContiguousFileStorage {
-        physical: ByteOffset::new(origin.ok_or(Error::InvalidExtentTree)?), length,
+        physical: ByteOffset::new(origin.ok_or(Error::InvalidExtentTree)?),
+        length,
     })
 }
 
@@ -455,15 +476,28 @@ impl EpochReadView<'_, '_> {
     /// Validates an initialized, contiguous regular-file payload for an external fixed-map owner.
     /// # Errors
     /// Rejects empty, resident, sparse, unwritten, fragmented, protected, or data-journaled files.
-    pub(super) fn contiguous_file_storage(&mut self, id: FileNodeId) -> Result<super::node::ContiguousFileStorage> {
+    pub(super) fn contiguous_file_storage(
+        &mut self,
+        id: FileNodeId,
+    ) -> Result<super::node::ContiguousFileStorage> {
         let file = self.load_file(id)?;
         let inode = file.inode();
-        if self.read_inode_xattrs(inode.id())?.entries().any(|(name, _)|
-            name.namespace() == crate::XattrNamespace::Security && name.local() == b"capability") {
+        if self
+            .read_inode_xattrs(inode.id())?
+            .entries()
+            .any(|(name, _)| {
+                name.namespace() == crate::XattrNamespace::Security && name.local() == b"capability"
+            })
+        {
             return Err(Error::UnsupportedInodeMutation);
         }
         let context = self.extent_tree_context(inode);
-        initialized_contiguous_storage(inode, self.superblock.block_size(), context, &mut self.device)
+        initialized_contiguous_storage(
+            inode,
+            self.superblock.block_size(),
+            context,
+            &mut self.device,
+        )
     }
 
     /// Observes one payload allocation run without reading file contents or building a full tree.

@@ -83,11 +83,26 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "ext4win_stream_set_namespace_query_fallback",
     ),
     ("native stream destruction", "ext4win_stream_destroy"),
-    ("paging-file setup reservation", "ext4win_stream_reserve_paging_file"),
-    ("paging-file setup rollback", "ext4win_stream_abort_paging_file"),
-    ("paging-file fixed-map activation", "ext4win_stream_activate_paging_file"),
-    ("paging-file allocation ownership", "ext4win_stream_is_paging_file"),
-    ("allocation-free paging-file dispatch", "ext4win_stream_paging_file_dispatch"),
+    (
+        "paging-file setup reservation",
+        "ext4win_stream_reserve_paging_file",
+    ),
+    (
+        "paging-file setup rollback",
+        "ext4win_stream_abort_paging_file",
+    ),
+    (
+        "paging-file fixed-map activation",
+        "ext4win_stream_activate_paging_file",
+    ),
+    (
+        "paging-file allocation ownership",
+        "ext4win_stream_is_paging_file",
+    ),
+    (
+        "allocation-free paging-file dispatch",
+        "ext4win_stream_paging_file_dispatch",
+    ),
     (
         "cache-map initialization",
         "ext4win_stream_cache_initialize",
@@ -135,10 +150,16 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("physical disk I/O accounting", "FsRtlUpdateDiskCounters"),
     ("process disk I/O accounting", "PsUpdateDiskCounters"),
     ("requestor process capture", "ext4win_capture_disk_process"),
-    ("lifecycle process capture", "ext4win_capture_lifecycle_disk_process"),
+    (
+        "lifecycle process capture",
+        "ext4win_capture_lifecycle_disk_process",
+    ),
     ("physical process disk charge", "ext4win_account_process_io"),
     ("disk counter enablement", "PsIsDiskCountersEnabled"),
-    ("cache disk accounting coordination", "CcSetAdditionalCacheAttributesEx"),
+    (
+        "cache disk accounting coordination",
+        "CcSetAdditionalCacheAttributesEx",
+    ),
     (
         "native volume lifecycle notification",
         "FsRtlNotifyVolumeEvent",
@@ -148,7 +169,10 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("native tunnel admission", "FsRtlAddToTunnelCache"),
     ("native tunnel lookup", "FsRtlFindInTunnelCache"),
     ("native tunnel release", "FsRtlDeleteTunnelCache"),
-    ("native directory tunnel retirement", "FsRtlDeleteKeyFromTunnelCache"),
+    (
+        "native directory tunnel retirement",
+        "FsRtlDeleteKeyFromTunnelCache",
+    ),
     (
         "native reparse admission",
         "FsRtlValidateReparsePointBuffer",

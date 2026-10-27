@@ -6,9 +6,9 @@ mod capture;
 #[cfg(not(test))]
 pub(crate) use capture::DiskAccounting;
 pub(crate) use capture::{
-    AllocationStart, CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
-    PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory, PreparedQueryEa, PreparedRead,
-    PreparedRequest, PreparedWrite, PreparedClusterControl,
+    AllocationStart, CapturedRequestorOutput, PreparedClusterControl, PreparedDirectoryControl,
+    PreparedDirectoryPattern, PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory,
+    PreparedQueryEa, PreparedRead, PreparedRequest, PreparedWrite,
 };
 use capture::{QueueContext, QueueContextOwnership};
 
@@ -48,14 +48,21 @@ impl ActiveIrp<'_> {
     /// request, independently of whether ext4 policy later chooses a direct data path.
     /// # Errors
     /// Returns a malformed stack or missing write FILE_OBJECT before native preparation.
-    pub(crate) fn purge_failure_policy(&self) -> DriverResult<crate::kernel::section::PurgeFailurePolicy> {
+    pub(crate) fn purge_failure_policy(
+        &self,
+    ) -> DriverResult<crate::kernel::section::PurgeFailurePolicy> {
         use crate::kernel::section::PurgeFailurePolicy;
         let current = self.current_stack()?;
         Ok(match u32::from(current.raw_major_function()) {
             wdk_sys::IRP_MJ_CREATE => PurgeFailurePolicy::DestructiveCreate,
             wdk_sys::IRP_MJ_SET_INFORMATION => PurgeFailurePolicy::FilterRetry,
-            wdk_sys::IRP_MJ_WRITE if self.data_cache_policy() == DataCachePolicy::NonCached
-                || current.file_object()?.flags() & wdk_sys::FO_NO_INTERMEDIATE_BUFFERING != 0 => PurgeFailurePolicy::FilterRetry,
+            wdk_sys::IRP_MJ_WRITE
+                if self.data_cache_policy() == DataCachePolicy::NonCached
+                    || current.file_object()?.flags() & wdk_sys::FO_NO_INTERMEDIATE_BUFFERING
+                        != 0 =>
+            {
+                PurgeFailurePolicy::FilterRetry
+            }
             _ => PurgeFailurePolicy::WaitForScans,
         })
     }
@@ -65,7 +72,11 @@ impl ActiveIrp<'_> {
     pub(crate) fn require_kernel_requestor(&self) -> DriverResult<()> {
         let kernel = wdk_sys::KPROCESSOR_MODE::try_from(wdk_sys::_MODE::KernelMode)
             .map_err(|_| DriverError::InternalInvariantViolation)?;
-        if self.requestor_mode() == kernel { Ok(()) } else { Err(DriverError::AccessDenied) }
+        if self.requestor_mode() == kernel {
+            Ok(())
+        } else {
+            Err(DriverError::AccessDenied)
+        }
     }
     /// Copies the requestor mode retained unchanged through dispatch and capture.
     #[expect(
@@ -712,7 +723,13 @@ impl ReceivedIrp {
     /// An ordinary stream retains the unchanged receive owner for normal dispatch.
     /// # Errors
     /// Returns the unchanged receive owner when this request does not select the paging boundary.
-    #[cfg_attr(not(test), expect(unsafe_code, reason = "the native boundary borrows the original dispatch IRP and consumes completion ownership only when it returns handled"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the native boundary borrows the original dispatch IRP and consumes completion ownership only when it returns handled"
+        )
+    )]
     pub(crate) fn dispatch_paging_file(self) -> Result<NTSTATUS, Self> {
         #[cfg(not(test))]
         {
@@ -722,7 +739,9 @@ impl ReceivedIrp {
                 // code either declines unchanged or transfers/completes it exactly once.
                 ext4win_stream_paging_file_dispatch(self.target.irp.as_ptr(), &mut status)
             };
-            if handled != 0 { return Ok(status); }
+            if handled != 0 {
+                return Ok(status);
+            }
         }
         Err(self)
     }
@@ -1333,7 +1352,10 @@ impl OwnedIrp {
     }
     /// Reserved release/finalization requests must keep making progress during native verification.
     pub(crate) fn allows_media_verification(&self) -> bool {
-        matches!(self.context.execution_class(), super::scheduler::ExecutionClass::Ordinary | super::scheduler::ExecutionClass::Paging)
+        matches!(
+            self.context.execution_class(),
+            super::scheduler::ExecutionClass::Ordinary | super::scheduler::ExecutionClass::Paging
+        )
     }
     /// Removal consumes the pending reservation of the immutable captured progress class.
     pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {

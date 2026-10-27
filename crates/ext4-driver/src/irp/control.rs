@@ -129,7 +129,10 @@ mod mdl_tests {
         ] {
             assert_eq!(FsControlCode::from_raw(code), Ok(expected));
         }
-        assert_eq!(FsControlCode::from_raw(0x0009_007b), Err(DriverError::NotSupported));
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_007b),
+            Err(DriverError::NotSupported)
+        );
     }
 
     /// # Panics
@@ -666,7 +669,9 @@ impl QueryFileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileEaInformation => Ok(Self::Ea),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => Ok(Self::NetworkOpen),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNameInformation => Ok(Self::Name),
-            wdk_sys::_FILE_INFORMATION_CLASS::FileAlternateNameInformation => Ok(Self::AlternateName),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAlternateNameInformation => {
+                Ok(Self::AlternateName)
+            }
             wdk_sys::_FILE_INFORMATION_CLASS::FileNormalizedNameInformation => {
                 Ok(Self::NormalizedName)
             }

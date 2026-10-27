@@ -49,9 +49,11 @@ impl MetadataMutation<'_, '_> {
         if let InodeStorage::Extents(_) = inode.storage() {
             let tree = self.mutable_extent_tree(inode)?;
             for extent in tree.extents().iter().copied() {
-                self.zero_retirement_ranges.try_push(InodeAllocationClusterRange::from_extent(
-                    self.volume.superblock, extent,
-                )?)?;
+                self.zero_retirement_ranges
+                    .try_push(InodeAllocationClusterRange::from_extent(
+                        self.volume.superblock,
+                        extent,
+                    )?)?;
             }
             for block in tree.metadata_blocks().iter().copied() {
                 self.protect_zero_retirement(block)?;
@@ -67,9 +69,11 @@ impl MetadataMutation<'_, '_> {
     /// # Errors
     /// Returns invalid cluster coordinates or allocation failure.
     pub(super) fn protect_zero_retirement(&mut self, block: BlockAddress) -> Result<()> {
-        self.zero_retirement_ranges.try_push(InodeAllocationClusterRange::from_block(
-            self.volume.superblock, block,
-        )?)
+        self.zero_retirement_ranges
+            .try_push(InodeAllocationClusterRange::from_block(
+                self.volume.superblock,
+                block,
+            )?)
     }
 
     /// Journals zero images after the last old owner is retired, never as precommit home writes.
@@ -77,21 +81,32 @@ impl MetadataMutation<'_, '_> {
     /// # Errors
     /// Returns invalid cluster geometry, image allocation or journal-staging failures.
     pub(super) fn zero_retired_cluster(&mut self, cluster: ClusterAddress) -> Result<()> {
-        if !self.zero_retirement_ranges.iter().any(|range| {
-            range.start <= cluster && cluster.get() < range.end_exclusive
-        }) {
+        if !self
+            .zero_retirement_ranges
+            .iter()
+            .any(|range| range.start <= cluster && cluster.get() < range.end_exclusive)
+        {
             return Ok(());
         }
         let superblock = self.volume.superblock;
         let first = superblock.first_block_of_cluster(cluster)?;
-        let width = usize::try_from(superblock.block_size().bytes()).map_err(|_| Error::ArithmeticOverflow)?;
+        let width = usize::try_from(superblock.block_size().bytes())
+            .map_err(|_| Error::ArithmeticOverflow)?;
         for within in 0..superblock.blocks_in_cluster(cluster)? {
-            let block = BlockAddress::new(first.get().checked_add(u64::from(within)).ok_or(Error::ArithmeticOverflow)?);
+            let block = BlockAddress::new(
+                first
+                    .get()
+                    .checked_add(u64::from(within))
+                    .ok_or(Error::ArithmeticOverflow)?,
+            );
             self.release_block_images(block);
-            self.stage_file_write(FileDataPersistence::Journaled, RangeWrite {
-                offset: superblock.block_size().offset_of(block)?,
-                bytes: memory::repeated_vec(0_u8, width)?,
-            })?;
+            self.stage_file_write(
+                FileDataPersistence::Journaled,
+                RangeWrite {
+                    offset: superblock.block_size().offset_of(block)?,
+                    bytes: memory::repeated_vec(0_u8, width)?,
+                },
+            )?;
         }
         self.completion_durability = MutationCompletionDurability::HomeCheckpoint;
         Ok(())

@@ -355,11 +355,22 @@ fn pack_directory_record(
         LittleEndianOutput::new(buffer).write_u32(record_field_offset(start, offset)?, value)?;
     }
     if let Some(offset) = class.short_name_length_offset()
-        && let Some(short_name) = short_name {
-            let short_name = short_name.windows_name()?;
-            LittleEndianOutput::new(buffer).write_u8(record_field_offset(start, offset)?,
-                u8::try_from(utf16_byte_len(short_name.utf16())?).map_err(|_| DriverError::InvalidParameter)?)?;
-            write_utf16(buffer, field_offset(start, offset.checked_add(2).ok_or(DriverError::InvalidParameter)?)?, short_name.utf16())?;
+        && let Some(short_name) = short_name
+    {
+        let short_name = short_name.windows_name()?;
+        LittleEndianOutput::new(buffer).write_u8(
+            record_field_offset(start, offset)?,
+            u8::try_from(utf16_byte_len(short_name.utf16())?)
+                .map_err(|_| DriverError::InvalidParameter)?,
+        )?;
+        write_utf16(
+            buffer,
+            field_offset(
+                start,
+                offset.checked_add(2).ok_or(DriverError::InvalidParameter)?,
+            )?,
+            short_name.utf16(),
+        )?;
     }
     if let Some(offset) = class.reparse_tag_offset() {
         LittleEndianOutput::new(buffer).write_u32(
@@ -670,11 +681,14 @@ impl DirectoryQuery {
     }
     /// Names-only wire records require no timestamps, attributes, or reparse metadata.
     pub(crate) fn needs_metadata(&self) -> bool {
-        !matches!(self.class, DirectoryInformationClass::Names) || !matches!(self.pattern.get(), DirectoryPattern::All)
+        !matches!(self.class, DirectoryInformationClass::Names)
+            || !matches!(self.pattern.get(), DirectoryPattern::All)
     }
 
     /// Directory identity for entry-bound alias projection in the same read epoch.
-    pub(crate) const fn directory(&self) -> DirectoryNodeId { self.directory }
+    pub(crate) const fn directory(&self) -> DirectoryNodeId {
+        self.directory
+    }
 
     /// Applies long-name and alias matching before admitting a wire record's capacity.
     /// # Errors
@@ -688,7 +702,10 @@ impl DirectoryQuery {
             self.cursor = *entry.next_cursor();
             return Ok(DirectorySelection::Skip);
         };
-        let alias_matches = match short_name { Some(alias) => self.pattern.get().matches_alias(&alias.windows_name()?)?, None => false };
+        let alias_matches = match short_name {
+            Some(alias) => self.pattern.get().matches_alias(&alias.windows_name()?)?,
+            None => false,
+        };
         if !self.pattern.get().matches(&name)? && !alias_matches {
             self.cursor = *entry.next_cursor();
             return Ok(DirectorySelection::Skip);
@@ -730,11 +747,15 @@ impl DirectoryQuery {
         let short_name = record.short_name;
         self.append(
             record,
-            if matches!(self.class, DirectoryInformationClass::Names) { None } else { Some(DirectoryMetadata {
-                file: metadata.into(),
-                ea_size,
-                short_name,
-            }) },
+            if matches!(self.class, DirectoryInformationClass::Names) {
+                None
+            } else {
+                Some(DirectoryMetadata {
+                    file: metadata.into(),
+                    ea_size,
+                    short_name,
+                })
+            },
         )
     }
 

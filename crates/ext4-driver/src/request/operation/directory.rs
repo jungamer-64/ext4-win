@@ -137,25 +137,32 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                             entry,
                             continuation,
                         } if self.query.needs_metadata() => {
-                            let read = match continuation.entry_read(access.mounted_profile(), *entry.entry().node()) {
+                            let read = match continuation
+                                .entry_read(access.mounted_profile(), *entry.entry().node())
+                            {
                                 Ok(read) => read,
                                 Err(error) => return self.fail(error.into()),
                             };
-                            self.phase = DirectoryPhase::Metadata { walk: continuation, record: entry, read };
+                            self.phase = DirectoryPhase::Metadata {
+                                walk: continuation,
+                                record: entry,
+                                read,
+                            };
                         }
-                        DirectoryReadTransition::Entry { entry, continuation } => match self.query.select(entry, None) {
+                        DirectoryReadTransition::Entry {
+                            entry,
+                            continuation,
+                        } => match self.query.select(entry, None) {
                             Ok(DirectorySelection::Skip) => {
                                 self.phase = DirectoryPhase::Walking(continuation)
                             }
                             Ok(DirectorySelection::Full) => return self.finish(None),
                             Ok(DirectorySelection::Record(record)) => {
-                                    match self.query.append_name(record) {
-                                        Ok(true) => return self.finish(None),
-                                        Ok(false) => {
-                                            self.phase = DirectoryPhase::Walking(continuation)
-                                        }
-                                        Err(error) => return self.fail(error),
-                                    }
+                                match self.query.append_name(record) {
+                                    Ok(true) => return self.finish(None),
+                                    Ok(false) => self.phase = DirectoryPhase::Walking(continuation),
+                                    Err(error) => return self.fail(error),
+                                }
                             }
                             Err(error) => return self.fail(error),
                         },
@@ -178,10 +185,19 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                                 pass,
                                 *record.entry().node(),
                             )?;
-                            let xattrs =
-                                ext4_core::CommittedReadPass::read_xattrs(pass, *record.entry().node())?;
-                            let alias = crate::short_name::visible_alias(pass, self.query.directory(), record.entry().name(), *record.entry().node());
-                            if let Err(DriverError::Core(error)) = alias { return Err(error); }
+                            let xattrs = ext4_core::CommittedReadPass::read_xattrs(
+                                pass,
+                                *record.entry().node(),
+                            )?;
+                            let alias = crate::short_name::visible_alias(
+                                pass,
+                                self.query.directory(),
+                                record.entry().name(),
+                                *record.entry().node(),
+                            );
+                            if let Err(DriverError::Core(error)) = alias {
+                                return Err(error);
+                            }
                             Ok((metadata, xattrs, alias))
                         }))
                     });
@@ -203,9 +219,16 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                             };
                         }
                         ReadTransition::Complete(Ok((metadata, xattrs, alias))) => {
-                            let alias = match alias { Ok(alias) => alias, Err(error) => return self.fail(error) };
+                            let alias = match alias {
+                                Ok(alias) => alias,
+                                Err(error) => return self.fail(error),
+                            };
                             let record = match self.query.select(record, alias) {
-                                Ok(DirectorySelection::Skip) => { self.phase = DirectoryPhase::Walking(walk); event = OperationEvent::Admitted; continue; }
+                                Ok(DirectorySelection::Skip) => {
+                                    self.phase = DirectoryPhase::Walking(walk);
+                                    event = OperationEvent::Admitted;
+                                    continue;
+                                }
                                 Ok(DirectorySelection::Full) => return self.finish(None),
                                 Ok(DirectorySelection::Record(record)) => record,
                                 Err(error) => return self.fail(error),

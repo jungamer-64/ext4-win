@@ -1704,20 +1704,31 @@ impl Superblock {
     /// health, labels and journal/orphan session markers may legitimately differ on media.
     pub(crate) fn same_media_identity(self, other: Self) -> bool {
         self.uuid == other.uuid
-            && self.block_size == other.block_size && self.inode_count == other.inode_count
-            && self.block_count == other.block_count && self.cluster_size == other.cluster_size
-            && self.first_data_block == other.first_data_block && self.blocks_per_group == other.blocks_per_group
-            && self.reserved_gdt_blocks == other.reserved_gdt_blocks && self.clusters_per_group == other.clusters_per_group
-            && self.inodes_per_group == other.inodes_per_group && self.inode_size == other.inode_size
-            && self.first_inode == other.first_inode && self.descriptor_size == other.descriptor_size
-            && self.journal_mode == other.journal_mode && self.orphan_file.map(|file| file.inode) == other.orphan_file.map(|file| file.inode)
-            && self.checksum_seed == other.checksum_seed && self.directory_hash_seed == other.directory_hash_seed
+            && self.block_size == other.block_size
+            && self.inode_count == other.inode_count
+            && self.block_count == other.block_count
+            && self.cluster_size == other.cluster_size
+            && self.first_data_block == other.first_data_block
+            && self.blocks_per_group == other.blocks_per_group
+            && self.reserved_gdt_blocks == other.reserved_gdt_blocks
+            && self.clusters_per_group == other.clusters_per_group
+            && self.inodes_per_group == other.inodes_per_group
+            && self.inode_size == other.inode_size
+            && self.first_inode == other.first_inode
+            && self.descriptor_size == other.descriptor_size
+            && self.journal_mode == other.journal_mode
+            && self.orphan_file.map(|file| file.inode) == other.orphan_file.map(|file| file.inode)
+            && self.checksum_seed == other.checksum_seed
+            && self.directory_hash_seed == other.directory_hash_seed
             && self.directory_hash_signedness == other.directory_hash_signedness
             && self.default_directory_hash_version == other.default_directory_hash_version
-            && self.casefold == other.casefold && self.mmp == other.mmp
+            && self.casefold == other.casefold
+            && self.mmp == other.mmp
             && self.features.declared.compatible == other.features.declared.compatible
-            && self.features.declared.incompatible.bits() & !INCOMPAT_RECOVER == other.features.declared.incompatible.bits() & !INCOMPAT_RECOVER
-            && self.features.declared.read_only_compatible.bits() & !RO_COMPAT_ORPHAN_PRESENT == other.features.declared.read_only_compatible.bits() & !RO_COMPAT_ORPHAN_PRESENT
+            && self.features.declared.incompatible.bits() & !INCOMPAT_RECOVER
+                == other.features.declared.incompatible.bits() & !INCOMPAT_RECOVER
+            && self.features.declared.read_only_compatible.bits() & !RO_COMPAT_ORPHAN_PRESENT
+                == other.features.declared.read_only_compatible.bits() & !RO_COMPAT_ORPHAN_PRESENT
     }
 
     /// Reports persistent health requiring an offline filesystem check, independently of the
@@ -2709,14 +2720,20 @@ mod tests {
     /// # Panics
     /// Fails if recovery-session state replaces the persistent ext4 health-word authority.
     #[test]
-    #[expect(clippy::panic_in_result_fn, reason = "assertions compare independent ext4 s_state vectors with parsed health")]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independent ext4 s_state vectors with parsed health"
+    )]
     fn health_state_vectors_are_independent_of_journal_recovery() -> Result<()> {
         for recovery in [false, true] {
             for (state, requires_check) in [(0, true), (1, false), (2, true), (3, true)] {
                 let mut raw = primary(false, recovery, false)?;
                 put_le_u16(&mut raw, disk_offset(58), state)?;
                 Superblock::refresh_checksum(&mut raw)?;
-                assert_eq!(Superblock::parse_read_only(&raw)?.requires_check(), requires_check);
+                assert_eq!(
+                    Superblock::parse_read_only(&raw)?.requires_check(),
+                    requires_check
+                );
             }
         }
         Ok(())

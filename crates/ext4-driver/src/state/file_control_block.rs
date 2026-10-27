@@ -50,7 +50,10 @@ impl FileControlBlock {
     /// Updates a native scan-section observation without taking the ledger or stream resources.
     /// # Errors
     /// Returns an unmatched release or section-reference budget exhaustion.
-    pub(crate) fn change_scan_section(&self, change: crate::kernel::section::ScanSectionChange) -> DriverResult<()> {
+    pub(crate) fn change_scan_section(
+        &self,
+        change: crate::kernel::section::ScanSectionChange,
+    ) -> DriverResult<()> {
         self.stream_context.change_scan_section(change)
     }
     /// Acquires the selected namespace identity while a create claim retains this FCB.
@@ -166,10 +169,14 @@ impl FileControlBlock {
     }
 
     /// Reports the FCB's immutable paging-file allocation policy.
-    pub(crate) fn is_paging_file(&self) -> bool { self.stream_context.is_paging_file() }
+    pub(crate) fn is_paging_file(&self) -> bool {
+        self.stream_context.is_paging_file()
+    }
 
     /// Returns the fixed prefix acknowledged to Memory Manager; preparation exposes zero.
-    pub(crate) fn paging_file_length(&self) -> u64 { self.stream_context.paging_file_length() }
+    pub(crate) fn paging_file_length(&self) -> u64 {
+        self.stream_context.paging_file_length()
+    }
 
     /// Observes the committed archive attribute before selecting a data-only cache write.
     pub(crate) fn archive_is_set(&self) -> bool {
@@ -550,8 +557,7 @@ impl FileControlBlockOpenState {
         share_access: ShareAccess,
         share_check: FileControlBlockShareCheck,
     ) -> DriverResult<NonZeroU32> {
-        if let FileControlBlockShareCheck::ExistingNode(policy) = share_check
-        {
+        if let FileControlBlockShareCheck::ExistingNode(policy) = share_check {
             if matches!(policy.oplock_policy, OplockCreatePolicy::ReserveFilter)
                 && self.shares.active_handle_count() != 0
             {

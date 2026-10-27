@@ -2,7 +2,10 @@
 
 #[cfg(not(test))]
 use super::section::SectionResource;
-use super::section::{PurgeFailurePolicy, ScanSectionChange, SealedSectionMutation, SectionMutationOperation, SectionSynchronization};
+use super::section::{
+    PurgeFailurePolicy, ScanSectionChange, SealedSectionMutation, SectionMutationOperation,
+    SectionSynchronization,
+};
 use super::storage_admission::{ClosePhase, MediaState, StorageAdmission};
 #[cfg(not(test))]
 use alloc::boxed::Box;
@@ -30,7 +33,10 @@ use crate::memory::NativeAllocation;
 
 /// A native paging completion lost its registered map or consumed its in-flight lease twice.
 #[cfg(not(test))]
-#[expect(unsafe_code, reason = "this exported terminal boundary routes native ownership corruption to the sole driver fatal policy")]
+#[expect(
+    unsafe_code,
+    reason = "this exported terminal boundary routes native ownership corruption to the sole driver fatal policy"
+)]
 #[unsafe(no_mangle)]
 extern "system" fn ext4win_paging_ownership_corruption() -> ! {
     KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck()
@@ -38,12 +44,21 @@ extern "system" fn ext4win_paging_ownership_corruption() -> ! {
 
 /// Physical prefix acknowledged before unique native paging setup admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(test, expect(dead_code, reason = "native reservation constructs these acknowledged-map claims in the production FCB boundary"))]
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "native reservation constructs these acknowledged-map claims in the production FCB boundary"
+    )
+)]
 pub(crate) enum PagingFileClaim {
     /// No direct paging address has been published.
     Initial,
     /// Existing direct I/O continues over this acknowledged physical prefix.
-    Extension { physical: ext4_core::ByteOffset, length: FileSize },
+    Extension {
+        physical: ext4_core::ByteOffset,
+        length: FileSize,
+    },
 }
 
 /// Unique native setup reservation; its enclosing deferred FCB lease retains `header`.
@@ -59,46 +74,90 @@ pub(crate) struct PagingFileReservation {
 
 /// Local ownership transition, distinct from the native map's shared admission phase.
 #[derive(Debug, Eq, PartialEq)]
-#[cfg_attr(test, expect(dead_code, reason = "only the production native activation can publish an acknowledged paging map"))]
-enum PagingReservationPhase { Reserved, Activated }
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "only the production native activation can publish an acknowledged paging map"
+    )
+)]
+enum PagingReservationPhase {
+    Reserved,
+    Activated,
+}
 
 impl PagingFileReservation {
     /// Returns the acknowledged prefix while this setup retains exclusive extension authority.
-    pub(crate) const fn claim(&self) -> PagingFileClaim { self.claim }
+    pub(crate) const fn claim(&self) -> PagingFileClaim {
+        self.claim
+    }
 
     /// Activates only an initialized, home-checkpointed projection over the same physical prefix.
     /// # Errors
     /// Returns invalid representation/alignment or revoked native setup before map publication.
-    #[cfg_attr(not(test), expect(unsafe_code, reason = "the enclosing FCB lease retains the native setup token through activation"))]
-    pub(crate) fn activate(mut self, storage: ext4_core::ContiguousFileStorage, route: crate::kernel::storage::MountedStorageRoute) -> DriverResult<()> {
-        let physical = i64::try_from(storage.physical().get()).map_err(|_| DriverError::InvalidParameter)?;
-        let length = i64::try_from(storage.length().bytes()).map_err(|_| DriverError::InvalidParameter)?;
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the enclosing FCB lease retains the native setup token through activation"
+        )
+    )]
+    pub(crate) fn activate(
+        mut self,
+        storage: ext4_core::ContiguousFileStorage,
+        route: crate::kernel::storage::MountedStorageRoute,
+    ) -> DriverResult<()> {
+        let physical =
+            i64::try_from(storage.physical().get()).map_err(|_| DriverError::InvalidParameter)?;
+        let length =
+            i64::try_from(storage.length().bytes()).map_err(|_| DriverError::InvalidParameter)?;
         #[cfg(not(test))]
         {
             let status = unsafe {
                 // SAFETY: The unique reservation and deferred FCB lease retain this native header.
-                ext4win_stream_activate_paging_file(self.header.as_ptr(), u8::from(matches!(self.claim, PagingFileClaim::Extension { .. })), route.filesystem_control_device().as_ptr(), physical, length, route.filesystem_sector_size().as_u32())
+                ext4win_stream_activate_paging_file(
+                    self.header.as_ptr(),
+                    u8::from(matches!(self.claim, PagingFileClaim::Extension { .. })),
+                    route.filesystem_control_device().as_ptr(),
+                    physical,
+                    length,
+                    route.filesystem_sector_size().as_u32(),
+                )
             };
             cache_status(status)?;
             self.phase = PagingReservationPhase::Activated;
             Ok(())
         }
         #[cfg(test)]
-        { let _inputs = (&mut self, physical, length, route); Err(DriverError::NotSupported) }
+        {
+            let _inputs = (&mut self, physical, length, route);
+            Err(DriverError::NotSupported)
+        }
     }
 }
 
 impl Drop for PagingFileReservation {
-    #[cfg_attr(not(test), expect(unsafe_code, reason = "the enclosing deferred FCB lease remains alive until this reservation has released native admission"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the enclosing deferred FCB lease remains alive until this reservation has released native admission"
+        )
+    )]
     fn drop(&mut self) {
         if self.phase == PagingReservationPhase::Reserved {
             #[cfg(not(test))]
             unsafe {
                 // SAFETY: Native setup authority is still unique and the FCB remains retained.
-                ext4win_stream_abort_paging_file(self.header.as_ptr(), u8::from(matches!(self.claim, PagingFileClaim::Extension { .. })));
+                ext4win_stream_abort_paging_file(
+                    self.header.as_ptr(),
+                    u8::from(matches!(self.claim, PagingFileClaim::Extension { .. })),
+                );
             }
             #[cfg(test)]
-            { let _identity = self.header; }
+            {
+                let _identity = self.header;
+            }
         }
     }
 }
@@ -520,7 +579,10 @@ impl VolumeStorageAccess {
     /// Binds the real device once while mount still owns unpublished native admission.
     /// # Errors
     /// Rejects duplicate admission initialization before mount publication.
-    pub(crate) fn bind_verification_device(self, device: super::volume_verify::VerificationDevice) -> DriverResult<()> {
+    pub(crate) fn bind_verification_device(
+        self,
+        device: super::volume_verify::VerificationDevice,
+    ) -> DriverResult<()> {
         self.state().bind_verification_device(device)
     }
     /// Claims independent create exclusion while a clean locked volume removes a key.
@@ -585,7 +647,9 @@ impl VolumeStorageAccess {
     /// Returns media revocation or create exclusion without granting mutation authority.
     pub(crate) fn authorize_create(self) -> DriverResult<()> {
         self.authorize()?;
-        if self.state().verification_required() { return Err(DriverError::VerifyRequired); }
+        if self.state().verification_required() {
+            return Err(DriverError::VerifyRequired);
+        }
         if self.state().creates_admitted() {
             Ok(())
         } else {
@@ -688,15 +752,29 @@ impl StreamContext {
     /// scan release. I/O errors, stale plans and uncertain writeback are never retried here.
     /// # Errors
     /// Returns the original failure or the Filter Manager retry status for an eligible request.
-    fn await_scan_conflict(&self, error: DriverError, policy: PurgeFailurePolicy) -> DriverResult<()> {
-        let mapped = error == DriverError::CannotDelete || matches!(error,
+    fn await_scan_conflict(
+        &self,
+        error: DriverError,
+        policy: PurgeFailurePolicy,
+    ) -> DriverResult<()> {
+        let mapped = error == DriverError::CannotDelete
+            || matches!(error,
             DriverError::CacheManagerFailure(status) if status == wdk_sys::STATUS_USER_MAPPED_FILE
                 || status == wdk_sys::STATUS_CACHE_PAGE_LOCKED || status == wdk_sys::STATUS_PURGE_FAILED);
-        if !mapped || !self.sections.get().scans_active() { return Err(error); }
+        if !mapped || !self.sections.get().scans_active() {
+            return Err(error);
+        }
         match policy {
-            PurgeFailurePolicy::FilterRetry => Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_PURGE_FAILED)),
-            PurgeFailurePolicy::DestructiveCreate => Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_USER_MAPPED_FILE)),
-            PurgeFailurePolicy::WaitForScans => { self.sections.get().wait_for_scans(); Ok(()) }
+            PurgeFailurePolicy::FilterRetry => Err(DriverError::CacheManagerFailure(
+                wdk_sys::STATUS_PURGE_FAILED,
+            )),
+            PurgeFailurePolicy::DestructiveCreate => Err(DriverError::CacheManagerFailure(
+                wdk_sys::STATUS_USER_MAPPED_FILE,
+            )),
+            PurgeFailurePolicy::WaitForScans => {
+                self.sections.get().wait_for_scans();
+                Ok(())
+            }
         }
     }
     /// Observes the archive bit from the sole coherent committed metadata projection.
@@ -833,15 +911,25 @@ impl StreamContext {
     }
 
     /// Reports whether the FCB owns an immutable native paging-file mapping.
-    #[cfg_attr(not(test), expect(unsafe_code, reason = "the retained stream header owns the native one-time paging state"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the retained stream header owns the native one-time paging state"
+        )
+    )]
     pub(crate) fn is_paging_file(&self) -> bool {
         #[cfg(not(test))]
-        { unsafe {
-            // SAFETY: The stream owner retains the native header through this atomic observation.
-            ext4win_stream_is_paging_file(self.header.as_ptr()) != 0
-        } }
+        {
+            unsafe {
+                // SAFETY: The stream owner retains the native header through this atomic observation.
+                ext4win_stream_is_paging_file(self.header.as_ptr()) != 0
+            }
+        }
         #[cfg(test)]
-        { false }
+        {
+            false
+        }
     }
 
     /// Reserves initial setup or extension while a caller-owned deferred FCB lease retains it.
@@ -851,43 +939,78 @@ impl StreamContext {
     /// claim with no previously published FILE_OBJECT or native section residency.
     /// # Errors
     /// Returns competing setup, stale native identity or non-writable media admission failures.
-    #[expect(unsafe_code, reason = "the caller supplies an explicit deferred FCB owner for the returned native reservation")]
-    pub(crate) unsafe fn reserve_paging_file(&self, file: crate::state::KernelFileObject, extension: bool) -> DriverResult<PagingFileReservation> {
+    #[expect(
+        unsafe_code,
+        reason = "the caller supplies an explicit deferred FCB owner for the returned native reservation"
+    )]
+    pub(crate) unsafe fn reserve_paging_file(
+        &self,
+        file: crate::state::KernelFileObject,
+        extension: bool,
+    ) -> DriverResult<PagingFileReservation> {
         #[cfg(not(test))]
         {
             let mut physical = 0;
             let mut length = 0;
             let status = unsafe {
                 // SAFETY: The caller retains the FCB, original FILE_OBJECT and mounted route.
-                ext4win_stream_reserve_paging_file(self.header.as_ptr(), file.as_ptr(), u8::from(extension), &mut physical, &mut length)
+                ext4win_stream_reserve_paging_file(
+                    self.header.as_ptr(),
+                    file.as_ptr(),
+                    u8::from(extension),
+                    &mut physical,
+                    &mut length,
+                )
             };
             cache_status(status)?;
             let claim = if extension {
-                let (Ok(physical), Ok(length)) = (u64::try_from(physical), u64::try_from(length)) else {
+                let (Ok(physical), Ok(length)) = (u64::try_from(physical), u64::try_from(length))
+                else {
                     unsafe {
                         // SAFETY: Setup was acquired above but its scalar outputs are invalid.
                         ext4win_stream_abort_paging_file(self.header.as_ptr(), 1);
                     }
                     return Err(DriverError::InternalInvariantViolation);
                 };
-                PagingFileClaim::Extension { physical: ext4_core::ByteOffset::new(physical), length: FileSize::from_bytes(length) }
-            } else { PagingFileClaim::Initial };
-            Ok(PagingFileReservation { header: self.header, claim, phase: PagingReservationPhase::Reserved })
+                PagingFileClaim::Extension {
+                    physical: ext4_core::ByteOffset::new(physical),
+                    length: FileSize::from_bytes(length),
+                }
+            } else {
+                PagingFileClaim::Initial
+            };
+            Ok(PagingFileReservation {
+                header: self.header,
+                claim,
+                phase: PagingReservationPhase::Reserved,
+            })
         }
         #[cfg(test)]
-        { let _inputs = (file, extension); Err(DriverError::NotSupported) }
+        {
+            let _inputs = (file, extension);
+            Err(DriverError::NotSupported)
+        }
     }
 
     /// Returns the acknowledged paging bound; zero means no active direct-I/O mapping.
-    #[cfg_attr(not(test), expect(unsafe_code, reason = "this stream owner retains the native map through its locked scalar observation"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "this stream owner retains the native map through its locked scalar observation"
+        )
+    )]
     pub(crate) fn paging_file_length(&self) -> u64 {
         #[cfg(not(test))]
         {
             // SAFETY: The map and its spin lock remain retained by this stream borrow.
-            u64::try_from(unsafe { ext4win_stream_paging_length(self.header.as_ptr()) }).unwrap_or(0)
+            u64::try_from(unsafe { ext4win_stream_paging_length(self.header.as_ptr()) })
+                .unwrap_or(0)
         }
         #[cfg(test)]
-        { 0 }
+        {
+            0
+        }
     }
 
     /// Atomically binds one pinned FCB and its embedded byte-range lock package.
@@ -1793,17 +1916,27 @@ impl StreamContext {
     ) -> DriverResult<SealedSectionMutation> {
         if self.is_paging_file() {
             let (deletion, target) = match operation {
-                SectionMutationOperation::Resize(sizes) | SectionMutationOperation::Reset(sizes) => (false, sizes.file_size()),
+                SectionMutationOperation::Resize(sizes)
+                | SectionMutationOperation::Reset(sizes) => (false, sizes.file_size()),
                 SectionMutationOperation::Delete => (true, 0),
                 _ => return Err(DriverError::NotSupported),
             };
             #[cfg(not(test))]
             if unsafe {
                 // SAFETY: The retained stream serializes its setup/retirement admission.
-                ext4win_stream_paging_mutation_allowed(self.header.as_ptr(), u8::from(deletion), target)
-            } == 0 { return Err(DriverError::NotSupported); }
+                ext4win_stream_paging_mutation_allowed(
+                    self.header.as_ptr(),
+                    u8::from(deletion),
+                    target,
+                )
+            } == 0
+            {
+                return Err(DriverError::NotSupported);
+            }
             #[cfg(test)]
-            { let _projection = (deletion, target); }
+            {
+                let _projection = (deletion, target);
+            }
         }
         loop {
             match self.prepare_section_attempt(operation) {
@@ -1816,7 +1949,10 @@ impl StreamContext {
     /// Claims one section preparation and releases it on any failed attempt, before scan waiting.
     /// # Errors
     /// Returns execution-context, resource admission, storage, mapped-view or Cc/MM failures.
-    fn prepare_section_attempt(&self, operation: SectionMutationOperation) -> DriverResult<SealedSectionMutation> {
+    fn prepare_section_attempt(
+        &self,
+        operation: SectionMutationOperation,
+    ) -> DriverResult<SealedSectionMutation> {
         self.trace.record(
             OperationalPath::MappedSection,
             wdk_sys::STATUS_SUCCESS,
@@ -2255,10 +2391,24 @@ fn cache_status(status: NTSTATUS) -> DriverResult<()> {
 )]
 unsafe extern "system" {
     fn ext4win_stream_is_paging_file(header: *mut c_void) -> u8;
-    fn ext4win_stream_reserve_paging_file(header: *mut c_void, file: wdk_sys::PFILE_OBJECT, extension: u8, physical: *mut i64, length: *mut i64) -> NTSTATUS;
+    fn ext4win_stream_reserve_paging_file(
+        header: *mut c_void,
+        file: wdk_sys::PFILE_OBJECT,
+        extension: u8,
+        physical: *mut i64,
+        length: *mut i64,
+    ) -> NTSTATUS;
     fn ext4win_stream_abort_paging_file(header: *mut c_void, extension: u8);
-    fn ext4win_stream_activate_paging_file(header: *mut c_void, extension: u8, lower: wdk_sys::PDEVICE_OBJECT, physical: i64, length: i64, sector_size: u32) -> NTSTATUS;
-    fn ext4win_stream_paging_mutation_allowed(header: *mut c_void, deletion: u8, target: i64) -> u8;
+    fn ext4win_stream_activate_paging_file(
+        header: *mut c_void,
+        extension: u8,
+        lower: wdk_sys::PDEVICE_OBJECT,
+        physical: i64,
+        length: i64,
+        sector_size: u32,
+    ) -> NTSTATUS;
+    fn ext4win_stream_paging_mutation_allowed(header: *mut c_void, deletion: u8, target: i64)
+    -> u8;
     fn ext4win_stream_paging_length(header: *mut c_void) -> i64;
     fn ext4win_stream_prepare_frozen_data(stream_header: *mut c_void) -> NTSTATUS;
     fn ext4win_stream_data_writable(stream_header: *mut c_void) -> u8;
@@ -2439,18 +2589,38 @@ mod tests {
     /// # Panics
     /// Fails if scan retry status escapes its Windows request class or masks an I/O failure.
     #[test]
-    #[expect(clippy::panic_in_result_fn, reason = "fallible stream setup precedes status assertions")]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible stream setup precedes status assertions"
+    )]
     fn scan_conflicts_follow_the_windows_request_policy() -> DriverResult<()> {
         use super::{PurgeFailurePolicy, ScanSectionChange};
-        let stream = StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
+        let stream =
+            StreamContext::try_new_staged_node(StreamSizes::EMPTY, OperationalTrace::host_test())?;
         let conflict = DriverError::CacheManagerFailure(wdk_sys::STATUS_USER_MAPPED_FILE);
-        assert_eq!(stream.await_scan_conflict(conflict, PurgeFailurePolicy::FilterRetry), Err(conflict));
+        assert_eq!(
+            stream.await_scan_conflict(conflict, PurgeFailurePolicy::FilterRetry),
+            Err(conflict)
+        );
         stream.change_scan_section(ScanSectionChange::Enable)?;
-        assert_eq!(stream.await_scan_conflict(conflict, PurgeFailurePolicy::FilterRetry),
-            Err(DriverError::CacheManagerFailure(wdk_sys::STATUS_PURGE_FAILED)));
-        assert_eq!(stream.await_scan_conflict(DriverError::CannotDelete, PurgeFailurePolicy::DestructiveCreate), Err(conflict));
+        assert_eq!(
+            stream.await_scan_conflict(conflict, PurgeFailurePolicy::FilterRetry),
+            Err(DriverError::CacheManagerFailure(
+                wdk_sys::STATUS_PURGE_FAILED
+            ))
+        );
+        assert_eq!(
+            stream.await_scan_conflict(
+                DriverError::CannotDelete,
+                PurgeFailurePolicy::DestructiveCreate
+            ),
+            Err(conflict)
+        );
         let io_failure = DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_DEVICE_ERROR);
-        assert_eq!(stream.await_scan_conflict(io_failure, PurgeFailurePolicy::WaitForScans), Err(io_failure));
+        assert_eq!(
+            stream.await_scan_conflict(io_failure, PurgeFailurePolicy::WaitForScans),
+            Err(io_failure)
+        );
         stream.change_scan_section(ScanSectionChange::Disable)?;
         Ok(())
     }

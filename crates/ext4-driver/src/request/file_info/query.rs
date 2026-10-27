@@ -123,7 +123,9 @@ pub(super) fn query_file_information(
                     completion,
                 });
             }
-            QueryFileInformationClass::Name | QueryFileInformationClass::NormalizedName | QueryFileInformationClass::AlternateName => {
+            QueryFileInformationClass::Name
+            | QueryFileInformationClass::NormalizedName
+            | QueryFileInformationClass::AlternateName => {
                 if information_class == QueryFileInformationClass::NormalizedName {
                     opened_file.require_normalized_name_access()?;
                 }
@@ -196,9 +198,11 @@ pub(super) fn query_file_information(
                     return Err(DriverError::ObjectNameNotFound);
                 }
                 let alias = crate::short_name::visible_alias(read, parent, &name, node)?
-                    .ok_or(DriverError::ObjectNameNotFound)?.windows_name()?;
+                    .ok_or(DriverError::ObjectNameNotFound)?
+                    .windows_name()?;
                 return request.with_active(|active| {
-                    pack_name_information(active.buffered_output(length)?, alias.utf16())?.completion()
+                    pack_name_information(active.buffered_output(length)?, alias.utf16())?
+                        .completion()
                 });
             }
             let name = volume_relative_name(read, node, &location)?;

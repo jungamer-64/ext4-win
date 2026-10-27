@@ -159,15 +159,23 @@ impl LowerOperation {
     /// Returns an ABI width mismatch before initializing a private lower stack.
     fn stack_flags(self) -> DriverResult<u8> {
         if matches!(self, Self::VerifyRead | Self::MountWrite) {
-            u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME).map_err(|_| DriverError::InvalidParameter)
-        } else { Ok(0) }
+            u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME)
+                .map_err(|_| DriverError::InvalidParameter)
+        } else {
+            Ok(0)
+        }
     }
 
     /// Whether the operation exposes a transfer buffer to the lower stack.
     const fn transfers_bytes(self) -> bool {
         matches!(
             self,
-            Self::Read | Self::VerifyRead | Self::Write | Self::MountWrite | Self::QueryLength | Self::Trim
+            Self::Read
+                | Self::VerifyRead
+                | Self::Write
+                | Self::MountWrite
+                | Self::QueryLength
+                | Self::Trim
         )
     }
 }
@@ -1132,21 +1140,29 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
         };
         let transfer_length = match wdk_sys::ULONG::try_from(source.transfer.len()) {
             Ok(length) => length,
-            Err(_) => return Err(LowerBuildError {
-                error: DriverError::InvalidBufferSize,
-                suspended: source.suspended,
-            }),
+            Err(_) => {
+                return Err(LowerBuildError {
+                    error: DriverError::InvalidBufferSize,
+                    suspended: source.suspended,
+                });
+            }
         };
-        let (authority, physical_io) =
-            match prepare_private_irp(target, operation, method, offset, &source.transfer, transfer_length) {
-                Ok(authority) => authority,
-                Err(error) => {
-                    return Err(LowerBuildError {
-                        error,
-                        suspended: source.suspended,
-                    });
-                }
-            };
+        let (authority, physical_io) = match prepare_private_irp(
+            target,
+            operation,
+            method,
+            offset,
+            &source.transfer,
+            transfer_length,
+        ) {
+            Ok(authority) => authority,
+            Err(error) => {
+                return Err(LowerBuildError {
+                    error,
+                    suspended: source.suspended,
+                });
+            }
+        };
         let envelope = match memory::boxed_try_map(source, |source| {
             LowerCompletionEnvelope::new(
                 source.suspended,
@@ -1670,8 +1686,15 @@ mod tests {
         assert!(LowerOperation::Read.transfers_bytes());
         assert!(LowerOperation::VerifyRead.transfers_bytes());
         assert_eq!(LowerOperation::Read.stack_flags(), Ok(0));
-        assert_eq!(LowerOperation::VerifyRead.stack_flags(), u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME).map_err(|_| DriverError::InvalidParameter));
-        assert_eq!(LowerOperation::VerifyRead.major_function(), LowerOperation::Read.major_function());
+        assert_eq!(
+            LowerOperation::VerifyRead.stack_flags(),
+            u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME)
+                .map_err(|_| DriverError::InvalidParameter)
+        );
+        assert_eq!(
+            LowerOperation::VerifyRead.major_function(),
+            LowerOperation::Read.major_function()
+        );
         assert!(LowerOperation::Write.transfers_bytes());
         assert!(!LowerOperation::Flush.transfers_bytes());
         assert!(LowerOperation::QueryLength.transfers_bytes());

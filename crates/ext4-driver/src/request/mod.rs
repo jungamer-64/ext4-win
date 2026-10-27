@@ -5,19 +5,19 @@ pub(crate) type DriverMutationPass<'storage, 'epoch, 'crypto> =
     ext4_core::MutationResolvePass<'storage, 'epoch, 'crypto>;
 
 pub(crate) mod create;
-pub(crate) mod paging_file;
 pub(crate) mod dispatch;
 pub(crate) mod ea;
 pub(crate) mod file_info;
 pub(crate) mod file_system_control;
 pub(crate) mod fsctl;
 pub(crate) mod operation;
+pub(crate) mod paging_file;
 pub(crate) mod reparse;
 pub(crate) mod security;
 pub(crate) mod volume_info;
 
-mod retrieval;
 mod cluster_control;
+mod retrieval;
 mod volume_health;
 
 mod administration_control;

@@ -56,7 +56,13 @@ pub(crate) enum DriverError {
     /// Driver attempted to build a collection larger than `Vec` can represent.
     InvalidBufferSize,
     /// Object Manager or ABI capture rejected an embedded cluster-control handle.
-    #[cfg_attr(test, expect(dead_code, reason = "native cluster-control capture preserves Object Manager NTSTATUS failures"))]
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "native cluster-control capture preserves Object Manager NTSTATUS failures"
+        )
+    )]
     ClusterControlCaptureFailed(NTSTATUS),
     /// A local invariant inside driver-only helper code was violated.
     InternalInvariantViolation,
@@ -299,8 +305,8 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::ReadConflict => wdk_sys::STATUS_RETRY,
         Error::StaleReadContext => STATUS_INTERNAL_ERROR,
         Error::DeviceIo | Error::CryptographicFailure => STATUS_IO_DEVICE_ERROR,
-                Error::MediaVerificationRequired => wdk_sys::STATUS_VERIFY_REQUIRED,
-                Error::MediaChanged => wdk_sys::STATUS_WRONG_VOLUME,
+        Error::MediaVerificationRequired => wdk_sys::STATUS_VERIFY_REQUIRED,
+        Error::MediaChanged => wdk_sys::STATUS_WRONG_VOLUME,
         Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
         Error::UnsupportedBlockSize
         | Error::UnsupportedIncompatFeature

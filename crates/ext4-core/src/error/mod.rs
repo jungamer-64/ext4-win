@@ -152,7 +152,9 @@ impl fmt::Display for Error {
             Self::ReadConflict => "read dependency changed during storage I/O",
             Self::DeviceRange => "block read is outside the backing device",
             Self::DeviceIo => "backing device I/O request failed",
-            Self::MediaVerificationRequired => "device requires mounted-media verification before I/O",
+            Self::MediaVerificationRequired => {
+                "device requires mounted-media verification before I/O"
+            }
             Self::MediaChanged => "physical media identity differs from the mounted filesystem",
             Self::CryptographicFailure => "platform cryptographic operation failed",
             Self::ArithmeticOverflow => "arithmetic overflow while mapping ext4 data",

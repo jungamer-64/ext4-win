@@ -902,13 +902,26 @@ impl MutationResolvePass<'_, '_, '_> {
     /// The result is provisional until commit; it grants no direct-I/O or allocation authority.
     /// # Errors
     /// Rejects non-contiguous/uninitialized/protected files and preserves storage failures.
-    pub fn contiguous_file_storage(&mut self, file: FileNodeId) -> Result<super::node::ContiguousFileStorage> {
+    pub fn contiguous_file_storage(
+        &mut self,
+        file: FileNodeId,
+    ) -> Result<super::node::ContiguousFileStorage> {
         self.edit(|pass| {
             let raw = pass.mutation.raw_inode_for_policy(file.inode())?;
             let inode = raw.parse()?;
-            if inode.kind() != InodeKind::File { return Err(Error::WrongInodeKind); }
-            if pass.mutation.xattr_set_for_raw_inode(&raw)?.public().entries().any(|(name, _)|
-                name.namespace() == crate::XattrNamespace::Security && name.local() == b"capability") {
+            if inode.kind() != InodeKind::File {
+                return Err(Error::WrongInodeKind);
+            }
+            if pass
+                .mutation
+                .xattr_set_for_raw_inode(&raw)?
+                .public()
+                .entries()
+                .any(|(name, _)| {
+                    name.namespace() == crate::XattrNamespace::Security
+                        && name.local() == b"capability"
+                })
+            {
                 return Err(Error::UnsupportedInodeMutation);
             }
             let context = pass.mutation.volume.extent_tree_context(&inode);

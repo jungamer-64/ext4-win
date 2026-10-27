@@ -10,11 +10,17 @@ pub(crate) fn set_purge_failure_mode(active: &mut ActiveIrp<'_>) -> DriverResult
     active.require_kernel_requestor()?;
     let current = active.current_stack()?;
     let control = current.file_system_control()?;
-    if !control.output_buffer_length().is_empty() { return Err(DriverError::InvalidParameter); }
+    if !control.output_buffer_length().is_empty() {
+        return Err(DriverError::InvalidParameter);
+    }
     let input = active.buffered_input(control.input_buffer_length().prefix(4)?)?;
     let change = match LittleEndianInput::new(input).read_u32(WireOffset::new(0))? {
-        wdk_sys::SET_PURGE_FAILURE_MODE_ENABLED => crate::kernel::section::ScanSectionChange::Enable,
-        wdk_sys::SET_PURGE_FAILURE_MODE_DISABLED => crate::kernel::section::ScanSectionChange::Disable,
+        wdk_sys::SET_PURGE_FAILURE_MODE_ENABLED => {
+            crate::kernel::section::ScanSectionChange::Enable
+        }
+        wdk_sys::SET_PURGE_FAILURE_MODE_DISABLED => {
+            crate::kernel::section::ScanSectionChange::Disable
+        }
         _ => return Err(DriverError::InvalidParameter),
     };
     let opened = OpenedRegularFile::decode(current.file_object()?)?;

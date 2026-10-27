@@ -84,7 +84,7 @@ macro_rules! impl_mounted_operation_adapter {
 mod directory;
 pub(crate) use directory::query_directory;
 mod verify;
-pub(crate) use verify::{verify_volume, verify_before_admission};
+pub(crate) use verify::{verify_before_admission, verify_volume};
 mod mdl;
 pub(crate) use mdl::mdl;
 mod cleanup;
@@ -1959,8 +1959,12 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
         };
         let result = match event {
             OperationEvent::Admitted => match self.kind {
-                ImmediateRequestKind::MarkHandle => crate::request::cluster_control::mark_handle(owned.request(), access),
-                ImmediateRequestKind::IsVolumeDirty => crate::request::volume_health::query(owned.request(), access),
+                ImmediateRequestKind::MarkHandle => {
+                    crate::request::cluster_control::mark_handle(owned.request(), access)
+                }
+                ImmediateRequestKind::IsVolumeDirty => {
+                    crate::request::volume_health::query(owned.request(), access)
+                }
                 ImmediateRequestKind::IsPathnameValid => {
                     let mut request = owned.request();
                     crate::request::file_system_control::authorize_path_handle(&mut request, access)
@@ -3573,11 +3577,21 @@ impl PreparedMutationRequest {
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Self> {
         match kind {
-            MutationRequestKind::MoveFile => crate::request::cluster_control::RelocationRequest::prepare(owned.request(), access).map(Self::Relocation),
+            MutationRequestKind::MoveFile => {
+                crate::request::cluster_control::RelocationRequest::prepare(owned.request(), access)
+                    .map(Self::Relocation)
+            }
             MutationRequestKind::MarkVolumeDirty => {
-                if matches!(owned.actor_request(), crate::irp::ActorRequest::Captured(crate::irp::PreparedRequest::MarkVolumeDirty)) {
+                if matches!(
+                    owned.actor_request(),
+                    crate::irp::ActorRequest::Captured(
+                        crate::irp::PreparedRequest::MarkVolumeDirty
+                    )
+                ) {
                     Ok(Self::MarkVolumeDirty)
-                } else { Err(DriverError::AccessDenied) }
+                } else {
+                    Err(DriverError::AccessDenied)
+                }
             }
             MutationRequestKind::SetZeroOnDeallocation => Ok(Self::ZeroOnDeallocation),
             MutationRequestKind::EnableVerity => {
@@ -3807,7 +3821,8 @@ impl PreparedDriverEffect {
     ) -> TopLevelCompletion {
         match self {
             Self::PagingStep(_) => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
             }
             Self::Create(publication) => {
                 TopLevelCompletion::Create((*publication).publish(operations))
@@ -4469,8 +4484,13 @@ impl MutationRequestOperation {
                 Ok(paging) => paging,
                 Err(error) => return Err(AdmitOperationError::new(error, owned)),
             }
-        } else { None };
-        let purge_policy = match owned.request().with_active(|active| active.purge_failure_policy()) {
+        } else {
+            None
+        };
+        let purge_policy = match owned
+            .request()
+            .with_active(|active| active.purge_failure_policy())
+        {
             Ok(policy) => policy,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
@@ -4710,7 +4730,9 @@ impl MutationRequestOperation {
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<DriverResolveDisposition> {
         if let Some(paging) = state.paging {
-            return paging.resolve(mutation).map(|storage| DriverResolveDisposition::Mutation(PendingDriverPublication::PagingStep(storage)));
+            return paging.resolve(mutation).map(|storage| {
+                DriverResolveDisposition::Mutation(PendingDriverPublication::PagingStep(storage))
+            });
         }
         let preservation = match request {
             PreparedMutationRequest::DataWrite(
@@ -4731,19 +4753,32 @@ impl MutationRequestOperation {
         };
         let result: DriverResult<DriverResolveDisposition> = match request {
             PreparedMutationRequest::MarkVolumeDirty => {
-                let completion = crate::request::volume_health::mark(owned.request(), operations, mutation)?;
-                Ok(DriverResolveDisposition::Mutation(PendingDriverPublication::Normal(completion)))
+                let completion =
+                    crate::request::volume_health::mark(owned.request(), operations, mutation)?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
             }
-            PreparedMutationRequest::Relocation(relocation) if relocation.requires_preparation() => {
+            PreparedMutationRequest::Relocation(relocation)
+                if relocation.requires_preparation() =>
+            {
                 Ok(DriverResolveDisposition::PrepareRelocation)
             }
             PreparedMutationRequest::Relocation(relocation) => {
                 let completion = relocation.resolve(mutation)?;
-                Ok(DriverResolveDisposition::Mutation(PendingDriverPublication::Normal(completion)))
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
             }
             PreparedMutationRequest::ZeroOnDeallocation => {
-                let completion = crate::request::cluster_control::set_zero_on_deallocation(owned.request(), operations, mutation)?;
-                Ok(DriverResolveDisposition::Mutation(PendingDriverPublication::Normal(completion)))
+                let completion = crate::request::cluster_control::set_zero_on_deallocation(
+                    owned.request(),
+                    operations,
+                    mutation,
+                )?;
+                Ok(DriverResolveDisposition::Mutation(
+                    PendingDriverPublication::Normal(completion),
+                ))
             }
             PreparedMutationRequest::Create { mapping, creator } => {
                 match crate::request::create::execute(
@@ -5363,15 +5398,20 @@ impl MutationRequestOperation {
                 Ok(DriverResolveDisposition::PrepareRelocation) => {
                     drop(pass);
                     let PreparedMutationRequest::Relocation(relocation) = &mut self.request else {
-                        return MutationStep::Transition(self.complete_error(owned, DriverError::InternalInvariantViolation));
+                        return MutationStep::Transition(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     };
                     let stream = match relocation.begin_preparation() {
                         Ok(stream) => stream,
-                        Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
                     };
                     self.state = MutationOperationState::PreparingRelocation { owned };
                     return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                        work: crate::irp::PassiveWork::PrepareRelocation { stream }, suspended: self,
+                        work: crate::irp::PassiveWork::PrepareRelocation { stream },
+                        suspended: self,
                     });
                 }
                 Ok(DriverResolveDisposition::PrepareWriteOpen { fcb, node }) => {
@@ -5828,11 +5868,13 @@ impl MutationRequestOperation {
         error: DriverError,
     ) -> OperationTransition {
         match acknowledgment {
-            CheckpointAcknowledgment::Terminal { owned, completion, .. } => {
-                OperationTransition::Complete(self.prepare_committed_acknowledgment(
-                    owned, completion, Some(error),
-                ))
-            }
+            CheckpointAcknowledgment::Terminal {
+                owned, completion, ..
+            } => OperationTransition::Complete(self.prepare_committed_acknowledgment(
+                owned,
+                completion,
+                Some(error),
+            )),
             CheckpointAcknowledgment::Paging { owned, .. } => {
                 self.write_effect_observed = true;
                 self.complete_error(owned, error)
@@ -5860,10 +5902,14 @@ impl MutationRequestOperation {
                 return PublicationOutcome::Rejected(self.complete_error(owned, error));
             }
             match complete {
-                Err(error) => return PublicationOutcome::Rejected(self.complete_error(owned, error)),
+                Err(error) => {
+                    return PublicationOutcome::Rejected(self.complete_error(owned, error));
+                }
                 Ok(true) => {
                     let Some(paging) = self.paging.take() else {
-                        return PublicationOutcome::Rejected(self.complete_error(owned, DriverError::InternalInvariantViolation));
+                        return PublicationOutcome::Rejected(
+                            self.complete_error(owned, DriverError::InternalInvariantViolation),
+                        );
                     };
                     if let Err(error) = paging.activate(storage, self.devices) {
                         return PublicationOutcome::Rejected(self.complete_error(owned, error));
@@ -5871,7 +5917,9 @@ impl MutationRequestOperation {
                     let completion = match self.paging_create.take() {
                         Some(effect) => effect.publish(owned.request(), access, |access| {
                             crate::request::create::publish_existing_mutation(
-                                &mut self.pending_existing_create, self.write_open.as_ref(), access,
+                                &mut self.pending_existing_create,
+                                self.write_open.as_ref(),
+                                access,
                             )
                         }),
                         None => TopLevelCompletion::Normal(IrpCompletion::EMPTY),
@@ -5879,7 +5927,10 @@ impl MutationRequestOperation {
                     drop(self.write_open.take());
                     self.state = MutationOperationState::Terminal;
                     let completion = self.prepare_success(owned, completion);
-                    return PublicationOutcome::Published { operation: self, completion: Some(completion) };
+                    return PublicationOutcome::Published {
+                        operation: self,
+                        completion: Some(completion),
+                    };
                 }
                 Ok(false) => {}
             }
@@ -5905,7 +5956,10 @@ impl MutationRequestOperation {
             size_changes: None,
             deletion: None,
         };
-        PublicationOutcome::Published { operation: self, completion: None }
+        PublicationOutcome::Published {
+            operation: self,
+            completion: None,
+        }
     }
 
     /// Integrates one matching detached-checkpoint completion.
@@ -6445,15 +6499,22 @@ impl MutationRequestOperation {
                             size_changes,
                         };
                         return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                            work: crate::irp::PassiveWork::prepare_deletion(stream, self.purge_policy),
+                            work: crate::irp::PassiveWork::prepare_deletion(
+                                stream,
+                                self.purge_policy,
+                            ),
                             suspended: self,
                         });
                     }
                 }
                 let deletion_node = deletion.as_ref().map(|prepared| prepared.node());
                 let reset_node = if self.paging.is_none() {
-                    self.pending_existing_create.as_ref().and_then(|pending| pending.reset_node())
-                } else { None };
+                    self.pending_existing_create
+                        .as_ref()
+                        .and_then(|pending| pending.reset_node())
+                } else {
+                    None
+                };
                 let size_changes = match size_changes {
                     Some(prepared) => {
                         let matches = match access.prepared_stream_size_changes_match(
@@ -6497,7 +6558,10 @@ impl MutationRequestOperation {
                             deletion,
                         };
                         return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                            work: crate::irp::PassiveWork::prepare_size_change(stream, self.purge_policy),
+                            work: crate::irp::PassiveWork::prepare_size_change(
+                                stream,
+                                self.purge_policy,
+                            ),
                             suspended: self,
                         });
                     }
@@ -6875,41 +6939,76 @@ impl PreparedPublication for MutationRequestOperation {
                 };
                 let acknowledgment = match effect {
                     PreparedDriverEffect::PagingStep(storage) => CheckpointAcknowledgment::Paging {
-                        owned, storage: Some(storage), publication_failure,
+                        owned,
+                        storage: Some(storage),
+                        publication_failure,
                     },
                     PreparedDriverEffect::Create(mut publication) => {
                         if let Some(paging) = publication.take_paging() {
                             publication.publish_namespace(access);
                             self.paging = Some(paging);
                             self.paging_create = Some(PreparedDriverEffect::Create(publication));
-                            CheckpointAcknowledgment::Paging { owned, storage: None, publication_failure }
+                            CheckpointAcknowledgment::Paging {
+                                owned,
+                                storage: None,
+                                publication_failure,
+                            }
                         } else {
-                            let completion = TopLevelCompletion::Create((*publication).publish(access));
-                            CheckpointAcknowledgment::Terminal { owned, completion, publication_failure }
+                            let completion =
+                                TopLevelCompletion::Create((*publication).publish(access));
+                            CheckpointAcknowledgment::Terminal {
+                                owned,
+                                completion,
+                                publication_failure,
+                            }
                         }
                     }
                     PreparedDriverEffect::ExistingCreate => {
-                        if let Some(paging) = self.pending_existing_create.as_mut().and_then(|pending| pending.take_paging()) {
+                        if let Some(paging) = self
+                            .pending_existing_create
+                            .as_mut()
+                            .and_then(|pending| pending.take_paging())
+                        {
                             self.paging = Some(paging);
                             self.paging_create = Some(PreparedDriverEffect::ExistingCreate);
-                            CheckpointAcknowledgment::Paging { owned, storage: None, publication_failure }
+                            CheckpointAcknowledgment::Paging {
+                                owned,
+                                storage: None,
+                                publication_failure,
+                            }
                         } else {
-                            let completion = TopLevelCompletion::Create(crate::request::create::publish_existing_mutation(
-                                &mut self.pending_existing_create, self.write_open.as_ref(), access,
-                            ));
-                            CheckpointAcknowledgment::Terminal { owned, completion, publication_failure }
+                            let completion = TopLevelCompletion::Create(
+                                crate::request::create::publish_existing_mutation(
+                                    &mut self.pending_existing_create,
+                                    self.write_open.as_ref(),
+                                    access,
+                                ),
+                            );
+                            CheckpointAcknowledgment::Terminal {
+                                owned,
+                                completion,
+                                publication_failure,
+                            }
                         }
                     }
                     effect => {
                         let completion = effect.publish(owned.request(), access, |access| {
                             crate::request::create::publish_existing_mutation(
-                                &mut self.pending_existing_create, self.write_open.as_ref(), access,
+                                &mut self.pending_existing_create,
+                                self.write_open.as_ref(),
+                                access,
                             )
                         });
-                        CheckpointAcknowledgment::Terminal { owned, completion, publication_failure }
+                        CheckpointAcknowledgment::Terminal {
+                            owned,
+                            completion,
+                            publication_failure,
+                        }
                     }
                 };
-                if self.paging_create.is_none() { drop(self.write_open.take()); }
+                if self.paging_create.is_none() {
+                    drop(self.write_open.take());
+                }
                 drop(size_changes);
                 drop(deletion);
                 drop(self.oplock_mutation.take());
@@ -6926,10 +7025,18 @@ impl PreparedPublication for MutationRequestOperation {
                 }
                 self.state = MutationOperationState::AwaitingCheckpoint(pending);
                 match (self.completion_durability, acknowledgment) {
-                    (ext4_core::MutationCompletionDurability::JournalCommit,
-                        CheckpointAcknowledgment::Terminal { owned, completion, publication_failure }) => Some(
-                            self.prepare_committed_acknowledgment(owned, completion, publication_failure),
-                        ),
+                    (
+                        ext4_core::MutationCompletionDurability::JournalCommit,
+                        CheckpointAcknowledgment::Terminal {
+                            owned,
+                            completion,
+                            publication_failure,
+                        },
+                    ) => Some(self.prepare_committed_acknowledgment(
+                        owned,
+                        completion,
+                        publication_failure,
+                    )),
                     (_, acknowledgment) => {
                         self.checkpoint_acknowledgment = Some(acknowledgment);
                         None
@@ -6944,17 +7051,34 @@ impl PreparedPublication for MutationRequestOperation {
                 if access.publish_checkpoint(durability, publication).is_err() {
                     access.record_durability_unknown();
                     if let Some(acknowledgment) = self.checkpoint_acknowledgment.take() {
-                        return PublicationOutcome::Rejected(self.fail_acknowledgment(acknowledgment, Error::DeviceIo.into()));
+                        return PublicationOutcome::Rejected(
+                            self.fail_acknowledgment(acknowledgment, Error::DeviceIo.into()),
+                        );
                     }
                     return PublicationOutcome::Rejected(OperationTransition::Retired);
                 }
                 self.state = MutationOperationState::Terminal;
                 match self.checkpoint_acknowledgment.take() {
-                    Some(CheckpointAcknowledgment::Terminal { owned, completion, publication_failure }) => {
-                        Some(self.prepare_committed_acknowledgment(owned, completion, publication_failure))
-                    }
-                    Some(CheckpointAcknowledgment::Paging { owned, storage, publication_failure }) => {
-                        return self.continue_paging_checkpoint(owned, storage, publication_failure, access);
+                    Some(CheckpointAcknowledgment::Terminal {
+                        owned,
+                        completion,
+                        publication_failure,
+                    }) => Some(self.prepare_committed_acknowledgment(
+                        owned,
+                        completion,
+                        publication_failure,
+                    )),
+                    Some(CheckpointAcknowledgment::Paging {
+                        owned,
+                        storage,
+                        publication_failure,
+                    }) => {
+                        return self.continue_paging_checkpoint(
+                            owned,
+                            storage,
+                            publication_failure,
+                            access,
+                        );
                     }
                     None => None,
                 }

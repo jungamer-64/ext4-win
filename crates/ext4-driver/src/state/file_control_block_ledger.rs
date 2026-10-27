@@ -520,7 +520,9 @@ pub(crate) struct PagingFileSetupLease {
 
 impl PagingFileSetupLease {
     /// Returns the fixed old prefix whose direct paging I/O remains admitted during extension.
-    pub(crate) const fn claim(&self) -> crate::kernel::stream::PagingFileClaim { self.native.claim() }
+    pub(crate) const fn claim(&self) -> crate::kernel::stream::PagingFileClaim {
+        self.native.claim()
+    }
 
     /// Identifies the retained regular-file inode for initialization transactions.
     pub(crate) fn file(&self) -> DriverResult<ext4_core::FileNodeId> {
@@ -533,7 +535,11 @@ impl PagingFileSetupLease {
     /// Consumes setup after home durability has established the complete initialized prefix.
     /// # Errors
     /// Returns invalid geometry or revoked native admission without widening the old map.
-    pub(crate) fn activate(self, storage: ext4_core::ContiguousFileStorage, route: crate::kernel::storage::MountedStorageRoute) -> DriverResult<()> {
+    pub(crate) fn activate(
+        self,
+        storage: ext4_core::ContiguousFileStorage,
+        route: crate::kernel::storage::MountedStorageRoute,
+    ) -> DriverResult<()> {
         self.native.activate(storage, route)
     }
 }
@@ -694,7 +700,10 @@ impl StreamSizeChangeLease {
     /// # Errors
     ///
     /// Returns the exact cache failure, mapped-view truncation conflict, or executable-image sharing conflict.
-    pub(crate) fn execute(self, policy: crate::kernel::section::PurgeFailurePolicy) -> DriverResult<PreparedStreamSizeChange> {
+    pub(crate) fn execute(
+        self,
+        policy: crate::kernel::section::PurgeFailurePolicy,
+    ) -> DriverResult<PreparedStreamSizeChange> {
         let section = self
             .stream
             .stream()
@@ -828,12 +837,18 @@ impl StreamDeletionLease {
     ///
     /// Returns cannot-delete while an image or mapped data section remains, or the exact native
     /// flush failure. A coherent shared cache map remains under delayed-close ownership.
-    pub(crate) fn execute(self, policy: crate::kernel::section::PurgeFailurePolicy) -> DriverResult<PreparedStreamDeletion> {
+    pub(crate) fn execute(
+        self,
+        policy: crate::kernel::section::PurgeFailurePolicy,
+    ) -> DriverResult<PreparedStreamDeletion> {
         let section = self
             .stream
             .stream()
             .stream_context
-            .prepare_section_mutation(crate::kernel::section::SectionMutationOperation::Delete, policy)?;
+            .prepare_section_mutation(
+                crate::kernel::section::SectionMutationOperation::Delete,
+                policy,
+            )?;
         Ok(PreparedStreamDeletion {
             _section: section,
             stream: self.stream,
@@ -932,7 +947,10 @@ struct ClusterMoveLease {
     fcb: NonNull<FileControlBlock>,
 }
 
-#[expect(unsafe_code, reason = "the enclosing deferred stream retention keeps the ledger and exact FCB alive")]
+#[expect(
+    unsafe_code,
+    reason = "the enclosing deferred stream retention keeps the ledger and exact FCB alive"
+)]
 impl Drop for ClusterMoveLease {
     fn drop(&mut self) {
         let owner = unsafe {
@@ -948,7 +966,9 @@ impl Drop for ClusterMoveLease {
         unsafe {
             // SAFETY: Exact FCB retention and the ledger resource grant this state mutation.
             state.as_mut()
-        }.cluster_mobility.finish_move();
+        }
+        .cluster_mobility
+        .finish_move();
     }
 }
 
@@ -968,12 +988,20 @@ impl StreamRelocationLease {
     /// # Errors
     /// Returns mapped-file, scan, storage or exact cache failure before relocation staging.
     pub(crate) fn execute(self) -> DriverResult<PreparedStreamRelocation> {
-        let section = self.stream.stream().stream_context.prepare_section_mutation(
-            crate::kernel::section::SectionMutationOperation::Relocate,
-            crate::kernel::section::PurgeFailurePolicy::WaitForScans,
-        )?;
-        Ok(PreparedStreamRelocation { _section: section,
-            _admission: self.admission, stream: self.stream, node: self.node })
+        let section = self
+            .stream
+            .stream()
+            .stream_context
+            .prepare_section_mutation(
+                crate::kernel::section::SectionMutationOperation::Relocate,
+                crate::kernel::section::PurgeFailurePolicy::WaitForScans,
+            )?;
+        Ok(PreparedStreamRelocation {
+            _section: section,
+            _admission: self.admission,
+            stream: self.stream,
+            node: self.node,
+        })
     }
 }
 
@@ -1137,8 +1165,13 @@ impl StreamCacheLease {
     /// # Errors
     ///
     /// Returns the exact Cache Manager coherency status.
-    pub(crate) fn purge(&self, policy: crate::kernel::section::PurgeFailurePolicy) -> DriverResult<()> {
-        self.stream().stream_context.coherency_flush_and_purge(policy)
+    pub(crate) fn purge(
+        &self,
+        policy: crate::kernel::section::PurgeFailurePolicy,
+    ) -> DriverResult<()> {
+        self.stream()
+            .stream_context
+            .coherency_flush_and_purge(policy)
     }
 
     /// Flushes cached data and releases every unreferenced data or image section before lock.
@@ -2523,8 +2556,15 @@ impl FileControlBlockLedger {
     /// Protects one active FILE_OBJECT until its cleanup consumes the share obligation.
     /// # Errors
     /// Returns an active relocation conflict or allocation failure without changing protection.
-    #[expect(unsafe_code, reason = "the retained FILE_OBJECT and ledger resource bind this exact FCB state")]
-    pub(super) fn protect_file_clusters(&self, fcb: NonNull<FileControlBlock>, file: KernelFileObject) -> DriverResult<()> {
+    #[expect(
+        unsafe_code,
+        reason = "the retained FILE_OBJECT and ledger resource bind this exact FCB state"
+    )]
+    pub(super) fn protect_file_clusters(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file: KernelFileObject,
+    ) -> DriverResult<()> {
         let _guard = self.lock.acquire();
         let table = unsafe {
             // SAFETY: The ledger resource excludes concurrent registry and open-state mutation.
@@ -2534,14 +2574,23 @@ impl FileControlBlockLedger {
         unsafe {
             // SAFETY: The validated pointer remains retained by the requesting FILE_OBJECT.
             state.as_mut()
-        }.cluster_mobility.protect(file)
+        }
+        .cluster_mobility
+        .protect(file)
     }
 
     /// Atomically excludes protection and retains the exact regular stream for relocation.
     /// # Errors
     /// Returns stale identity, protection conflict or deferred-reference exhaustion.
-    #[expect(unsafe_code, reason = "ledger exclusion owns identity validation and both admission/lifetime transitions")]
-    pub(super) fn prepare_stream_relocation(&self, fcb: NonNull<FileControlBlock>, file: ext4_core::FileNodeId) -> DriverResult<StreamRelocationLease> {
+    #[expect(
+        unsafe_code,
+        reason = "ledger exclusion owns identity validation and both admission/lifetime transitions"
+    )]
+    pub(super) fn prepare_stream_relocation(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        file: ext4_core::FileNodeId,
+    ) -> DriverResult<StreamRelocationLease> {
         let _guard = self.lock.acquire();
         let table = unsafe {
             // SAFETY: The ledger resource serializes exact registry lookup and FCB mutation.
@@ -2559,8 +2608,16 @@ impl FileControlBlockLedger {
         state.cluster_mobility.begin_move()?;
         state.lifetime = lifetime;
         Ok(StreamRelocationLease {
-            admission: ClusterMoveLease { owner: NonNull::from(self), fcb },
-            stream: StreamCacheLease { retained: DeferredStreamLease { owner: NonNull::from(self), fcb } },
+            admission: ClusterMoveLease {
+                owner: NonNull::from(self),
+                fcb,
+            },
+            stream: StreamCacheLease {
+                retained: DeferredStreamLease {
+                    owner: NonNull::from(self),
+                    fcb,
+                },
+            },
             node: file,
         })
     }
@@ -2605,7 +2662,10 @@ impl FileControlBlockLedger {
     /// Reserves one setup while retaining the exact regular stream across actor suspensions.
     /// # Errors
     /// Rejects competing setup, non-first initial claims, native residency or lease exhaustion.
-    #[expect(unsafe_code, reason = "the returned owner drops native setup before the deferred FCB retention")]
+    #[expect(
+        unsafe_code,
+        reason = "the returned owner drops native setup before the deferred FCB retention"
+    )]
     pub(super) fn acquire_paging_file_setup(
         &self,
         fcb: NonNull<FileControlBlock>,
@@ -2615,10 +2675,15 @@ impl FileControlBlockLedger {
         // SAFETY: The actor's original FILE_OBJECT or unpublished create claim retains this FCB.
         let node = unsafe { fcb.as_ref().node };
         let stream = self.retain_regular_stream(fcb, node)?;
-        if !extension && self.stream_open_count(fcb) != 1 { return Err(DriverError::ShareAccessConflict); }
+        if !extension && self.stream_open_count(fcb) != 1 {
+            return Err(DriverError::ShareAccessConflict);
+        }
         let native = unsafe {
             // SAFETY: `stream` owns deferred retention until after native reservation Drop.
-            stream.stream().stream_context.reserve_paging_file(file_object, extension)?
+            stream
+                .stream()
+                .stream_context
+                .reserve_paging_file(file_object, extension)?
         };
         Ok(PagingFileSetupLease { native, stream })
     }
@@ -3295,7 +3360,9 @@ impl VolumeControlBlock {
 
     /// Reports one committed namespace name change to pending directory watchers.
     pub(crate) fn report_directory_change(&self, mut change: DirectoryChange) {
-        if let Some(removal) = change.tunnel.take() { self.name_tunnel.removed(*removal); }
+        if let Some(removal) = change.tunnel.take() {
+            self.name_tunnel.removed(*removal);
+        }
         self.directory_change_notifier.report(change);
     }
 
@@ -3437,7 +3504,8 @@ fn record_reused_file_control_block_open(
         || unsafe {
             // SAFETY: The same retained table member provides a locked native map observation.
             fcb.as_ref().paging_file_length() == 0
-        }) {
+        })
+    {
         return Err(DriverError::ShareAccessConflict);
     }
     let state = unsafe {

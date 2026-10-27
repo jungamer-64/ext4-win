@@ -2133,7 +2133,9 @@ impl<'owner> OpenedRegularFile<'owner> {
     /// Returns SeManageVolumePrivilege retained from this exact handle's initial open.
     pub(crate) fn valid_data_length_access(&self) -> ValidDataLengthAccess {
         match self.opened.handle().kind() {
-            OpenedHandleKind::File { valid_data_length, .. } => *valid_data_length,
+            OpenedHandleKind::File {
+                valid_data_length, ..
+            } => *valid_data_length,
             OpenedHandleKind::Directory { .. } | OpenedHandleKind::Symlink => {
                 KernelWideInconsistency::file_object_context_corruption().bugcheck()
             }

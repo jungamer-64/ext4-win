@@ -90,16 +90,29 @@ struct StorageVerificationOperation {
 }
 
 #[cfg(not(test))]
-#[expect(unsafe_code, reason = "active reactor rundown retains its original mounted VPB through worker completion")]
+#[expect(
+    unsafe_code,
+    reason = "active reactor rundown retains its original mounted VPB through worker completion"
+)]
 // SAFETY: The worker moves only owned commands and scalar retained association identities. VPB
 // access occurs under its global lock after return to the sole mounted actor, without cross-thread borrows.
 unsafe impl Send for StorageVerificationOperation {}
 
 #[cfg(not(test))]
 impl CompletionOperation for StorageVerificationOperation {
-    fn advance(self: Box<Self>, event: CompletionEvent, target: &mut ReactorTarget) -> OperationTransition {
-        let Self { command, association } = *self;
-        let CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::VerifyVolume(result)) = event else {
+    fn advance(
+        self: Box<Self>,
+        event: CompletionEvent,
+        target: &mut ReactorTarget,
+    ) -> OperationTransition {
+        let Self {
+            command,
+            association,
+        } = *self;
+        let CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::VerifyVolume(
+            result,
+        )) = event
+        else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
         let ReactorTarget::MountedVolume(binding) = target else {
@@ -107,7 +120,9 @@ impl CompletionOperation for StorageVerificationOperation {
         };
         let result = result.and_then(|()| association.confirmed());
         let result = binding.with_access(|access| {
-            if result == Err(DriverError::WrongVolume) { access.record_media_changed(); }
+            if result == Err(DriverError::WrongVolume) {
+                access.record_media_changed();
+            }
             result?;
             access.authorize_storage_resumption(command.request())
         });
@@ -116,17 +131,31 @@ impl CompletionOperation for StorageVerificationOperation {
                 Ok(prepared) => OperationTransition::ResumeVerifiedStorage { prepared },
                 Err(error) => {
                     let (error, scheduled, request) = error.into_parts();
-                    scheduled.into_operation().advance(CompletionEvent::Core(OperationEvent::StorageCompleted(failed_unsubmitted_request(request, driver_error_to_core(error)))), target)
+                    scheduled.into_operation().advance(
+                        CompletionEvent::Core(OperationEvent::StorageCompleted(
+                            failed_unsubmitted_request(request, driver_error_to_core(error)),
+                        )),
+                        target,
+                    )
                 }
             },
             Err(error) => {
                 let (scheduled, request) = command.into_parts();
-                scheduled.into_operation().advance(CompletionEvent::Core(OperationEvent::StorageCompleted(failed_unsubmitted_request(request, driver_error_to_core(error)))), target)
+                scheduled.into_operation().advance(
+                    CompletionEvent::Core(OperationEvent::StorageCompleted(
+                        failed_unsubmitted_request(request, driver_error_to_core(error)),
+                    )),
+                    target,
+                )
             }
         }
     }
 
-    fn record_storage_failure(&mut self, _failure: StorageFailureClass, _target: &mut ReactorTarget) {
+    fn record_storage_failure(
+        &mut self,
+        _failure: StorageFailureClass,
+        _target: &mut ReactorTarget,
+    ) {
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     }
 }
@@ -3219,15 +3248,35 @@ impl CompletionReactor {
         loop {
             match transition {
                 OperationTransition::ReadmitCaptured { owned } => {
-                    let identity = self.with_scheduler(|scheduler| scheduler.identity(index)).unwrap_or_else(|| KernelWideInconsistency::completion_reactor_state_corruption().bugcheck());
-                    if !self.with_scheduler(|scheduler| scheduler.consume_device_preflight(identity)) {
+                    let identity = self
+                        .with_scheduler(|scheduler| scheduler.identity(index))
+                        .unwrap_or_else(|| {
+                            KernelWideInconsistency::completion_reactor_state_corruption()
+                                .bugcheck()
+                        });
+                    if !self
+                        .with_scheduler(|scheduler| scheduler.consume_device_preflight(identity))
+                    {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     }
-                    let admitted = self.with_finalization(|pool| self.with_target(|target| crate::request::dispatch::admit_owned(owned, target, self.trace, pool)));
+                    let admitted = self.with_finalization(|pool| {
+                        self.with_target(|target| {
+                            crate::request::dispatch::admit_owned(owned, target, self.trace, pool)
+                        })
+                    });
                     match admitted {
-                        Ok(crate::request::dispatch::AdmittedRequest::Operation(operation)) => { self.install_admitted_at(index, operation); return; }
-                        Ok(crate::request::dispatch::AdmittedRequest::Complete(completion)) => transition = OperationTransition::Complete(completion),
-                        Err(error) => { let (error, owned) = error.into_parts(); transition = OperationTransition::Complete(owned.prepare_result(Err(error))); }
+                        Ok(crate::request::dispatch::AdmittedRequest::Operation(operation)) => {
+                            self.install_admitted_at(index, operation);
+                            return;
+                        }
+                        Ok(crate::request::dispatch::AdmittedRequest::Complete(completion)) => {
+                            transition = OperationTransition::Complete(completion)
+                        }
+                        Err(error) => {
+                            let (error, owned) = error.into_parts();
+                            transition =
+                                OperationTransition::Complete(owned.prepare_result(Err(error)));
+                        }
                     }
                     continue;
                 }
@@ -3305,13 +3354,30 @@ impl CompletionReactor {
                         EffectCancellation::AbortBeforeEffect,
                     );
                 }
-                OperationTransition::SubmitMountLower { devices, request, suspended } => {
-                    if !self.with_target(|target| matches!(target, ReactorTarget::ControlDevice(_))) { KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(); }
-                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else { drop(request); return; };
+                OperationTransition::SubmitMountLower {
+                    devices,
+                    request,
+                    suspended,
+                } => {
+                    if !self.with_target(|target| matches!(target, ReactorTarget::ControlDevice(_)))
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        drop(request);
+                        return;
+                    };
                     self.submit_mount_storage(index, devices, request, suspended);
                 }
-                OperationTransition::SubmitVerificationRead { devices, request, suspended } => {
-                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else { drop(request); return; };
+                OperationTransition::SubmitVerificationRead {
+                    devices,
+                    request,
+                    suspended,
+                } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
+                        drop(request);
+                        return;
+                    };
                     self.submit_verification_read(index, devices, request, suspended);
                 }
                 OperationTransition::SubmitClosingLower {
@@ -3570,9 +3636,13 @@ impl CompletionReactor {
     #[cfg(not(test))]
     fn release_disk_accounting(&self, index: usize) {
         let accounting = self.with_payloads(|payloads| {
-            payloads.get_mut(index).unwrap_or_else(|| {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
-            }).disk_accounting.take()
+            payloads
+                .get_mut(index)
+                .unwrap_or_else(|| {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                })
+                .disk_accounting
+                .take()
         });
         drop(accounting);
     }
@@ -3584,7 +3654,9 @@ impl CompletionReactor {
             let slot = payloads.get(index).unwrap_or_else(|| {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             });
-            if let Some(accounting) = &slot.disk_accounting { accounting.record(transfer); }
+            if let Some(accounting) = &slot.disk_accounting {
+                accounting.record(transfer);
+            }
         });
     }
 
@@ -3964,11 +4036,24 @@ impl CompletionReactor {
 
     /// Submits only the fresh mount's core-authorized recognition or recovery effect.
     #[cfg(not(test))]
-    fn submit_mount_storage(&self, index: usize, devices: MountedStorageRoute, request: StorageRequest, suspended: SuspendedOperation) {
-        let scheduled = ScheduledStorageOperation { operation: suspended, cancellation: EffectCancellation::AbortBeforeEffect };
+    fn submit_mount_storage(
+        &self,
+        index: usize,
+        devices: MountedStorageRoute,
+        request: StorageRequest,
+        suspended: SuspendedOperation,
+    ) {
+        let scheduled = ScheduledStorageOperation {
+            operation: suspended,
+            cancellation: EffectCancellation::AbortBeforeEffect,
+        };
         let prepared = match PreparedStorageCommand::mount_io(devices, request, scheduled) {
             Ok(prepared) => prepared,
-            Err(error) => { let (error, scheduled, request) = error.into_parts(); self.set_ready_storage_failure(index, scheduled.into_operation(), request, error); return; }
+            Err(error) => {
+                let (error, scheduled, request) = error.into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
+                return;
+            }
         };
         self.submit_prepared_storage(index, prepared);
     }
@@ -3976,8 +4061,17 @@ impl CompletionReactor {
     /// Submits a physical verification read through the normal retained completion owner.
     /// It holds no actor borrow or native resource while the lower driver owns the request.
     #[cfg(not(test))]
-    fn submit_verification_read(&self, index: usize, devices: MountedStorageRoute, request: StorageRequest, suspended: SuspendedOperation) {
-        let scheduled = ScheduledStorageOperation { operation: suspended, cancellation: EffectCancellation::AbortBeforeEffect };
+    fn submit_verification_read(
+        &self,
+        index: usize,
+        devices: MountedStorageRoute,
+        request: StorageRequest,
+        suspended: SuspendedOperation,
+    ) {
+        let scheduled = ScheduledStorageOperation {
+            operation: suspended,
+            cancellation: EffectCancellation::AbortBeforeEffect,
+        };
         let prepared = match PreparedStorageCommand::verify_read(devices, request, scheduled) {
             Ok(prepared) => prepared,
             Err(error) => {
@@ -3993,35 +4087,65 @@ impl CompletionReactor {
     /// Unlike Cache Manager suspension, this phase retains its logical grant and resource intent;
     /// the worker owns no native stream resource and raw verification needs neither grant.
     #[cfg(not(test))]
-    fn submit_storage_verification(&self, index: usize, command: VerifyingStorageCommand<ScheduledStorageOperation>) {
+    fn submit_storage_verification(
+        &self,
+        index: usize,
+        command: VerifyingStorageCommand<ScheduledStorageOperation>,
+    ) {
         let captured = MountedVolumeDevice::prepare_storage_verification(self.device);
         let (association, query) = match captured {
             Ok(captured) => captured,
             Err(error) => {
-                if error == DriverError::WrongVolume { self.with_mounted_access(|access| access.record_media_changed()); }
+                if error == DriverError::WrongVolume {
+                    self.with_mounted_access(|access| access.record_media_changed());
+                }
                 let (scheduled, request) = command.into_parts();
                 self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
                 return;
             }
         };
-        let suspended = match crate::memory::boxed_try_map((command, association), |(command, association)| StorageVerificationOperation { command, association }) {
-            Ok(operation) => operation,
-            Err(error) => {
-                let (error, (command, _association)) = error.into_parts();
-                let (scheduled, request) = command.into_parts();
-                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
-                return;
-            }
-        };
+        let suspended =
+            match crate::memory::boxed_try_map((command, association), |(command, association)| {
+                StorageVerificationOperation {
+                    command,
+                    association,
+                }
+            }) {
+                Ok(operation) => operation,
+                Err(error) => {
+                    let (error, (command, _association)) = error.into_parts();
+                    let (scheduled, request) = command.into_parts();
+                    self.set_ready_storage_failure(
+                        index,
+                        scheduled.into_operation(),
+                        request,
+                        error,
+                    );
+                    return;
+                }
+            };
         let work = crate::irp::PassiveWork::VerifyVolume(query);
-        let prepared = match self.completion_rundown.acquire().and_then(|lease| lease.ok_or(DriverError::InvalidDeviceRequest)).and_then(|lease| PassiveWorkEnvelope::prepare_request(self.device, lease)) {
+        let prepared = match self
+            .completion_rundown
+            .acquire()
+            .and_then(|lease| lease.ok_or(DriverError::InvalidDeviceRequest))
+            .and_then(|lease| PassiveWorkEnvelope::prepare_request(self.device, lease))
+        {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.set_ready_operation_event(index, suspended, CompletionEvent::PassiveCompleted(work.failed(error)));
+                self.set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::PassiveCompleted(work.failed(error)),
+                );
                 return;
             }
         };
-        let identity = self.with_scheduler(|scheduler| scheduler.identity(index)).unwrap_or_else(|| KernelWideInconsistency::completion_reactor_state_corruption().bugcheck());
+        let identity = self
+            .with_scheduler(|scheduler| scheduler.identity(index))
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
         let prepared = prepared.bind(NonNull::from(self), identity, work, suspended);
         if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Verifying)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -4092,9 +4216,10 @@ impl CompletionReactor {
         };
         let cancellation = lower.cancellation_identity();
         self.begin_registering(index);
-        match lower.register_and_submit(|probe| {
-            self.acquire_operation_submission(probe.suspended().as_ref())
-        }, |transfer| self.record_physical_io(index, transfer)) {
+        match lower.register_and_submit(
+            |probe| self.acquire_operation_submission(probe.suspended().as_ref()),
+            |transfer| self.record_physical_io(index, transfer),
+        ) {
             Ok(()) => {
                 self.finish_registering_lower(
                     index,
@@ -4175,9 +4300,10 @@ impl CompletionReactor {
             };
         let cancellation = lower.cancellation_identity();
         self.begin_registering(index);
-        match lower.register_and_submit(|command| {
-            self.acquire_operation_submission(command.suspended().as_ref())
-        }, |transfer| self.record_physical_io(index, transfer)) {
+        match lower.register_and_submit(
+            |command| self.acquire_operation_submission(command.suspended().as_ref()),
+            |transfer| self.record_physical_io(index, transfer),
+        ) {
             Ok(()) => self.finish_registering_lower(
                 index,
                 PublishedReactorLower::DeviceControl(cancellation),
@@ -4244,9 +4370,10 @@ impl CompletionReactor {
         };
         let cancellation_identity = lower.cancellation_identity();
         self.begin_registering(index);
-        match lower.register_and_submit(|command| {
-            self.acquire_operation_submission(command.suspended().operation.as_ref())
-        }, |transfer| self.record_physical_io(index, transfer)) {
+        match lower.register_and_submit(
+            |command| self.acquire_operation_submission(command.suspended().operation.as_ref()),
+            |transfer| self.record_physical_io(index, transfer),
+        ) {
             Ok(()) => {
                 self.finish_registering_lower(
                     index,
@@ -4452,7 +4579,9 @@ impl CompletionReactor {
                         StorageRetryPolicy::Classified
                     };
                     match failed.into_retry(policy) {
-                        StorageRetryDecision::Verify(command) => self.submit_storage_verification(index, command),
+                        StorageRetryDecision::Verify(command) => {
+                            self.submit_storage_verification(index, command)
+                        }
                         StorageRetryDecision::Retry(retry) => {
                             self.apply_transition(index, OperationTransition::ArmRetry { retry })
                         }
@@ -4671,7 +4800,9 @@ impl CompletionReactor {
             };
             let index = identity.index();
             let entered = self.with_scheduler(|scheduler| {
-                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Passive | Phase::Verifying))
+                scheduler.enter_phase(index, |phase| {
+                    matches!(phase, Phase::Passive | Phase::Verifying)
+                })
             });
             if entered != Some(identity)
                 || !self.with_payloads(|payloads| {
@@ -6013,7 +6144,9 @@ mod tests {
                 drop(request);
                 drop(suspended);
             }
-            OperationTransition::ReadmitCaptured { owned } => { let _status = owned.prepare_cancelled().notify(); }
+            OperationTransition::ReadmitCaptured { owned } => {
+                let _status = owned.prepare_cancelled().notify();
+            }
             OperationTransition::SubmitLower {
                 devices: _devices,
                 request,
@@ -6024,7 +6157,11 @@ mod tests {
                 request,
                 suspended,
             }
-            | OperationTransition::SubmitMountLower { devices: _devices, request, suspended }
+            | OperationTransition::SubmitMountLower {
+                devices: _devices,
+                request,
+                suspended,
+            }
             | OperationTransition::SubmitOwnershipLower {
                 devices: _devices,
                 request,

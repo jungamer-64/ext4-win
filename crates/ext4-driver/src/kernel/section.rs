@@ -102,9 +102,15 @@ impl SectionSynchronization {
         self.transition(|| {
             let current = self.scans.load(Ordering::Relaxed);
             let next = match change {
-                ScanSectionChange::Enable if current == MAX_SCAN_SECTIONS => return Err(DriverError::TooManyOpenReferences),
-                ScanSectionChange::Enable => current.checked_add(1).ok_or(DriverError::InternalInvariantViolation)?,
-                ScanSectionChange::Disable => current.checked_sub(1).ok_or(DriverError::InvalidParameter)?,
+                ScanSectionChange::Enable if current == MAX_SCAN_SECTIONS => {
+                    return Err(DriverError::TooManyOpenReferences);
+                }
+                ScanSectionChange::Enable => current
+                    .checked_add(1)
+                    .ok_or(DriverError::InternalInvariantViolation)?,
+                ScanSectionChange::Disable => current
+                    .checked_sub(1)
+                    .ok_or(DriverError::InvalidParameter)?,
             };
             self.scans_released.publish(next == 0);
             self.scans.store(next, Ordering::Release);
@@ -758,7 +764,10 @@ mod tests {
     /// # Panics
     /// Fails if a partial release wakes a scan waiter or an unmatched release changes state.
     #[test]
-    #[expect(clippy::panic_in_result_fn, reason = "fallible fixture setup precedes scan lifetime assertions")]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture setup precedes scan lifetime assertions"
+    )]
     fn balanced_scan_sections_release_only_the_last_waiter() -> DriverResult<()> {
         let owner = SectionSynchronization::try_new()?;
         owner.get().change_scan(ScanSectionChange::Enable)?;
@@ -774,12 +783,17 @@ mod tests {
             let still_active = owner.get().scans_active();
             let blocked = result.try_recv();
             owner.get().change_scan(ScanSectionChange::Disable)?;
-            worker.join().map_err(|_| DriverError::InternalInvariantViolation)?
+            worker
+                .join()
+                .map_err(|_| DriverError::InternalInvariantViolation)?
                 .map_err(|_| DriverError::InternalInvariantViolation)?;
             assert!(still_active);
             assert_eq!(blocked, Err(std::sync::mpsc::TryRecvError::Empty));
             assert_eq!(result.recv(), Ok(()));
-            assert_eq!(owner.get().change_scan(ScanSectionChange::Disable), Err(DriverError::InvalidParameter));
+            assert_eq!(
+                owner.get().change_scan(ScanSectionChange::Disable),
+                Err(DriverError::InvalidParameter)
+            );
             assert!(!owner.get().scans_active());
             Ok(())
         })

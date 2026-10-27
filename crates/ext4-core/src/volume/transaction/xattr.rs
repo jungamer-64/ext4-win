@@ -9,14 +9,12 @@ impl MutationResolvePass<'_, '_, '_> {
     /// the caller subsequently stores the attribute in this mutation.
     /// # Errors
     /// Returns malformed existing attributes, inode policy or allocation failures.
-    pub fn xattr_fits(
-        &mut self,
-        node: NodeId,
-        name: XattrName,
-        value: XattrValue,
-    ) -> Result<bool> {
+    pub fn xattr_fits(&mut self, node: NodeId, name: XattrName, value: XattrValue) -> Result<bool> {
         self.edit(|pass| {
-            if matches!(pass.mutation.volume.superblock.xattr_mutation(), XattrMutationSupport::Disabled) {
+            if matches!(
+                pass.mutation.volume.superblock.xattr_mutation(),
+                XattrMutationSupport::Disabled
+            ) {
                 return Ok(false);
             }
             let raw = pass.mutation.raw_inode_for_policy(node.inode())?;

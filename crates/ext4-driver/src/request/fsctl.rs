@@ -44,21 +44,39 @@ pub(crate) fn is_pathname_valid(mut request: PendingIrpLease<'_>) -> DriverResul
 /// # Errors
 /// Returns malformed framing or a component outside the Windows/ext4 name domain.
 fn validate_pathname_buffer(input: &[u8]) -> DriverResult<()> {
-    let header: [u8; 4] = input.get(..4).ok_or(DriverError::InvalidParameter)?
-        .try_into().map_err(|_| DriverError::InvalidParameter)?;
-    let length = usize::try_from(u32::from_le_bytes(header)).map_err(|_| DriverError::InvalidParameter)?;
-    if length == 0 || !length.is_multiple_of(2) { return Err(DriverError::InvalidName); }
-    let bytes = input.get(4..4_usize.checked_add(length).ok_or(DriverError::InvalidParameter)?)
+    let header: [u8; 4] = input
+        .get(..4)
+        .ok_or(DriverError::InvalidParameter)?
+        .try_into()
+        .map_err(|_| DriverError::InvalidParameter)?;
+    let length =
+        usize::try_from(u32::from_le_bytes(header)).map_err(|_| DriverError::InvalidParameter)?;
+    if length == 0 || !length.is_multiple_of(2) {
+        return Err(DriverError::InvalidName);
+    }
+    let bytes = input
+        .get(
+            4..4_usize
+                .checked_add(length)
+                .ok_or(DriverError::InvalidParameter)?,
+        )
         .ok_or(DriverError::InvalidParameter)?;
     let mut path = DriverVec::try_with_capacity(length / 2)?;
     for pair in bytes.as_chunks::<2>().0 {
         path.try_push(u16::from_le_bytes(*pair))?;
     }
-    let mut components = path.as_slice().split(|unit| *unit == u16::from(b'\\')).peekable();
-    if path.as_slice().first() == Some(&u16::from(b'\\')) { components.next(); }
+    let mut components = path
+        .as_slice()
+        .split(|unit| *unit == u16::from(b'\\'))
+        .peekable();
+    if path.as_slice().first() == Some(&u16::from(b'\\')) {
+        components.next();
+    }
     while let Some(component) = components.next() {
         if component.is_empty() {
-            if components.peek().is_none() { return Ok(()); }
+            if components.peek().is_none() {
+                return Ok(());
+            }
             return Err(DriverError::InvalidName);
         }
         crate::namespace::WindowsName::from_utf16(component)?.to_ext4()?;
@@ -75,13 +93,31 @@ mod pathname_tests {
     #[test]
     fn counted_pathname_validation_uses_the_real_component_codec() {
         let result = (|| -> DriverResult<()> {
-            for name in ["\\", "\\directory\\file.txt", "relative\\file.txt", "\\日本語", "\\directory\\"] {
+            for name in [
+                "\\",
+                "\\directory\\file.txt",
+                "relative\\file.txt",
+                "\\日本語",
+                "\\directory\\",
+            ] {
                 let units = name.encode_utf16().collect::<alloc::vec::Vec<_>>();
-                let mut bytes = DriverVec::try_copied_from_slice(&u32::try_from(core::mem::size_of_val(units.as_slice())).map_err(|_| DriverError::InvalidParameter)?.to_le_bytes())?;
-                for unit in units { bytes.try_extend_from_copy_slice(&unit.to_le_bytes())?; }
+                let mut bytes = DriverVec::try_copied_from_slice(
+                    &u32::try_from(core::mem::size_of_val(units.as_slice()))
+                        .map_err(|_| DriverError::InvalidParameter)?
+                        .to_le_bytes(),
+                )?;
+                for unit in units {
+                    bytes.try_extend_from_copy_slice(&unit.to_le_bytes())?;
+                }
                 assert_eq!(validate_pathname_buffer(bytes.as_slice()), Ok(()));
             }
-            for bytes in [&b"\x02\0\0\0\0\0"[..], &b"\x02\0\0\0\0\xd8"[..], &b"\x04\0\0\0a\0"[..], &b"\x01\0\0\0a"[..], &b"\x02\0\0\0*\0"[..]] {
+            for bytes in [
+                &b"\x02\0\0\0\0\0"[..],
+                &b"\x02\0\0\0\0\xd8"[..],
+                &b"\x04\0\0\0a\0"[..],
+                &b"\x01\0\0\0a"[..],
+                &b"\x02\0\0\0*\0"[..],
+            ] {
                 assert!(validate_pathname_buffer(bytes).is_err());
             }
             Ok(())

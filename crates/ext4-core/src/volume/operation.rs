@@ -165,7 +165,10 @@ impl EpochReadPass<'_, '_, '_> {
     /// This observation grants no allocation exclusion or direct-I/O authority.
     /// # Errors
     /// Rejects empty, resident, sparse, unwritten, fragmented, protected or data-journaled files.
-    pub fn contiguous_file_storage(&mut self, file: FileNodeId) -> Result<super::node::ContiguousFileStorage> {
+    pub fn contiguous_file_storage(
+        &mut self,
+        file: FileNodeId,
+    ) -> Result<super::node::ContiguousFileStorage> {
         self.view.contiguous_file_storage(file)
     }
 

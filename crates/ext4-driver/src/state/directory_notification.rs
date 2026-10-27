@@ -73,12 +73,24 @@ impl DirectoryChange {
     /// Captures cache data before mutation; publication remains tied to this durable event.
     /// # Errors
     /// Returns namespace metadata, encoding or allocation failures before staging writes.
-    pub(crate) fn with_tunnel(mut self, read: &mut impl ext4_core::CommittedReadPass, parent: DirectoryNodeId, name: &Ext4Name, node: NodeId) -> DriverResult<Self> {
+    pub(crate) fn with_tunnel(
+        mut self,
+        read: &mut impl ext4_core::CommittedReadPass,
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+        node: NodeId,
+    ) -> DriverResult<Self> {
         let removal = if let NodeId::Directory(directory) = node {
             if self.action == DirectoryChangeAction::Removed {
-                Some(crate::kernel::name_tunnel::TunnelRemoval::directory(read, directory)?)
-            } else { None }
-        } else { crate::kernel::name_tunnel::TunnelRemoval::prepare(read, parent, name, node)? };
+                Some(crate::kernel::name_tunnel::TunnelRemoval::directory(
+                    read, directory,
+                )?)
+            } else {
+                None
+            }
+        } else {
+            crate::kernel::name_tunnel::TunnelRemoval::prepare(read, parent, name, node)?
+        };
         self.tunnel = match removal {
             Some(removal) => Some(memory::boxed_try_with(|| Ok(removal))?),
             None => None,

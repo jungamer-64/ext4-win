@@ -4,7 +4,7 @@
 //! Only submission scopes hold the native resource; revocation never waits for lower completion.
 
 use super::io_reliability::IoReliabilityObservation;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 
 /// Monotonic lower-device availability, independent of filesystem close.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,15 +108,27 @@ impl StorageAdmission {
     /// Publishes the real device exactly once before mounted admission is exposed.
     /// # Errors
     /// Rejects duplicate initialization while retaining the supplied reference for destruction.
-    pub(super) fn bind_verification_device(&self, device: super::volume_verify::VerificationDevice) -> crate::kernel::status::DriverResult<()> {
-        self.verification_device.compare_exchange(core::ptr::null_mut(), device.as_raw(), Ordering::Release, Ordering::Relaxed)
+    pub(super) fn bind_verification_device(
+        &self,
+        device: super::volume_verify::VerificationDevice,
+    ) -> crate::kernel::status::DriverResult<()> {
+        self.verification_device
+            .compare_exchange(
+                core::ptr::null_mut(),
+                device.as_raw(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
             .map_err(|_| crate::kernel::status::DriverError::InternalInvariantViolation)?;
         let _transferred = device.into_raw();
         Ok(())
     }
 
     /// Observes the physical flag independently from cached runtime reliability.
-    #[expect(unsafe_code, reason = "the admission owner retains the published real-device reference through every callback")]
+    #[expect(
+        unsafe_code,
+        reason = "the admission owner retains the published real-device reference through every callback"
+    )]
     pub(super) fn verification_required(&self) -> bool {
         let pointer = self.verification_device.load(Ordering::Acquire);
         // SAFETY: A nonnull slot owns its independently retained device reference until Drop.
@@ -243,9 +255,14 @@ impl StorageAdmission {
 }
 
 impl Drop for StorageAdmission {
-    #[expect(unsafe_code, reason = "native stream destruction precedes consuming the admission owner's transferred real-device reference")]
+    #[expect(
+        unsafe_code,
+        reason = "native stream destruction precedes consuming the admission owner's transferred real-device reference"
+    )]
     fn drop(&mut self) {
-        let pointer = self.verification_device.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let pointer = self
+            .verification_device
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
         // SAFETY: A nonnull pointer is the unique reference transferred into this slot once;
         // the native stream has drained all callbacks before its admission allocation drops.
         let owned = unsafe { super::volume_verify::VerificationDevice::from_owned_raw(pointer) };
@@ -315,7 +332,10 @@ unsafe extern "system" fn ext4win_storage_io_policy(state: *const StorageAdmissi
 /// Reports the current physical flag without changing reliability, admission or acknowledgment.
 /// # Safety
 /// The native volume header must retain this initialized admission allocation through the call.
-#[expect(unsafe_code, reason = "native callbacks borrow the retained volume admission owner")]
+#[expect(
+    unsafe_code,
+    reason = "native callbacks borrow the retained volume admission owner"
+)]
 #[unsafe(no_mangle)]
 unsafe extern "system" fn ext4win_storage_verify_required(state: *const StorageAdmission) -> u8 {
     // SAFETY: The native volume header retains this allocation through its callback.
@@ -332,16 +352,29 @@ mod tests {
     /// # Panics
     /// Fails if physical verification bypasses create gating or restores failed runtime health.
     #[test]
-    #[expect(unsafe_code, reason = "the scoped device allocation outlives admission and all atomic native observations")]
-    #[expect(clippy::panic_in_result_fn, reason = "fallible fixture ownership surrounds independent media and reliability assertions")]
-    fn physical_verify_gate_is_independent_from_runtime_reliability() -> crate::kernel::status::DriverResult<()> {
+    #[expect(
+        unsafe_code,
+        reason = "the scoped device allocation outlives admission and all atomic native observations"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture ownership surrounds independent media and reliability assertions"
+    )]
+    fn physical_verify_gate_is_independent_from_runtime_reliability()
+    -> crate::kernel::status::DriverResult<()> {
         use crate::kernel::io_reliability::{IoReliabilityOwner, NativeIoPolicy};
-        let mut device = wdk_sys::DEVICE_OBJECT { Flags: wdk_sys::DO_VERIFY_VOLUME | 0x4000, ..Default::default() };
+        let mut device = wdk_sys::DEVICE_OBJECT {
+            Flags: wdk_sys::DO_VERIFY_VOLUME | 0x4000,
+            ..Default::default()
+        };
         // SAFETY: The device fixture outlives the admission reference and every native call below.
-        let device = unsafe { crate::state::KernelDevice::from_raw(&raw mut device) }.ok_or(crate::kernel::status::DriverError::InvalidParameter)?;
+        let device = unsafe { crate::state::KernelDevice::from_raw(&raw mut device) }
+            .ok_or(crate::kernel::status::DriverError::InvalidParameter)?;
         let mut reliability = IoReliabilityOwner::try_new()?;
         let state = StorageAdmission::new(reliability.observe()?);
-        state.bind_verification_device(super::super::volume_verify::VerificationDevice::reference(device))?;
+        state.bind_verification_device(
+            super::super::volume_verify::VerificationDevice::reference(device),
+        )?;
         assert!(state.verification_required());
         assert!(!state.creates_admitted());
         assert!(state.reliability.policy().permits(true));

@@ -7,7 +7,9 @@ use super::*;
 /// Returns a truncated superblock state field.
 fn health_word(disk: &Disk) -> Result<u16> {
     let bytes = disk.filesystem.get(1082..1084).ok_or(Error::DeviceRange)?;
-    Ok(u16::from_le_bytes(bytes.try_into().map_err(|_| Error::DeviceRange)?))
+    Ok(u16::from_le_bytes(
+        bytes.try_into().map_err(|_| Error::DeviceRange)?,
+    ))
 }
 
 /// # Errors
@@ -15,7 +17,10 @@ fn health_word(disk: &Disk) -> Result<u16> {
 /// # Panics
 /// Fails if normal writable-session recovery appears dirty or clean close clears an explicit error.
 #[test]
-#[expect(clippy::panic_in_result_fn, reason = "assertions compare committed health with independent ext4 state and recovery fields")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare committed health with independent ext4 state and recovery fields"
+)]
 fn persistent_dirty_marker_survives_clean_close_and_remount() -> Result<()> {
     let mut fixture = Fixture::new()?;
     assert_ne!(fixture_u32(&fixture.disk.filesystem, 1120)? & 4, 0);
@@ -24,8 +29,13 @@ fn persistent_dirty_marker_survives_clean_close_and_remount() -> Result<()> {
     fixture.mutate(|pass| pass.mark_volume_dirty())?;
     assert!(fixture.epoch.requires_check());
     assert_eq!(health_word(&fixture.disk)? & 3, 3);
-    close(&mut fixture.disk, &fixture.profile, &fixture.coordinator,
-        Ext4Timestamp::from_seconds(9), None)?;
+    close(
+        &mut fixture.disk,
+        &fixture.profile,
+        &fixture.coordinator,
+        Ext4Timestamp::from_seconds(9),
+        None,
+    )?;
     assert_eq!(fixture_u32(&fixture.disk.filesystem, 1120)? & 4, 0);
     assert_eq!(health_word(&fixture.disk)? & 3, 3);
     fixture.remount()?;
@@ -39,17 +49,37 @@ fn persistent_dirty_marker_survives_clean_close_and_remount() -> Result<()> {
 /// # Panics
 /// Fails if resolving or writing an uncommitted journal payload publishes persistent dirty health.
 #[test]
-#[expect(clippy::panic_in_result_fn, reason = "assertions observe journal commit authority and independent persistent state")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe journal commit authority and independent persistent state"
+)]
 fn uncommitted_dirty_marker_does_not_publish_health() -> Result<()> {
     let mut fixture = Fixture::new()?;
     let ticket = fixture.coordinator.admit_mutation()?;
-    let (resolved, ()) = fixture.disk.resolve(&fixture.profile, &fixture.epoch, &fixture.coordinator,
-        ticket, &mut PlainCrypto, |pass| pass.mark_volume_dirty())?;
+    let (resolved, ()) = fixture.disk.resolve(
+        &fixture.profile,
+        &fixture.epoch,
+        &fixture.coordinator,
+        ticket,
+        &mut PlainCrypto,
+        |pass| pass.mark_volume_dirty(),
+    )?;
     assert!(!fixture.epoch.requires_check());
     assert_eq!(health_word(&fixture.disk)? & 2, 0);
-    let prepared = resolved.reserve(fixture.coordinator.grant_intent(ticket), &fixture.coordinator)?
-        .prepare_commit(fixture.coordinator.acquire_commit(ticket)?.ok_or(Error::ClusterReferenceConflict)?,
-            &mut fixture.coordinator, &fixture.epoch, &mut fixture.cache)?;
+    let prepared = resolved
+        .reserve(
+            fixture.coordinator.grant_intent(ticket),
+            &fixture.coordinator,
+        )?
+        .prepare_commit(
+            fixture
+                .coordinator
+                .acquire_commit(ticket)?
+                .ok_or(Error::ClusterReferenceConflict)?,
+            &mut fixture.coordinator,
+            &fixture.epoch,
+            &mut fixture.cache,
+        )?;
     let ordered = fixture.disk.sequence(prepared.start())?;
     let payload = fixture.disk.transfer(ordered.submit())?;
     let before_commit = fixture.disk.sequence(payload)?;
@@ -66,16 +96,30 @@ fn uncommitted_dirty_marker_does_not_publish_health() -> Result<()> {
 /// # Panics
 /// Fails if private read-only recovery can admit persistent dirty state or touch media.
 #[test]
-#[expect(clippy::panic_in_result_fn, reason = "assertions observe explicit read-only admission and the physical side-effect counter")]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe explicit read-only admission and the physical side-effect counter"
+)]
 fn read_only_session_cannot_record_a_dirty_marker() -> Result<()> {
     let mut fixture = Fixture::new()?;
-    let (profile, epoch, mut coordinator, _mmp) = fixture.disk.mount(MountAccess::ReadOnly {
-        recovery: ReadOnlyRecovery::Memory { limit: RecoveryMemoryLimit::DEFAULT },
-    })?.into_parts();
+    let (profile, epoch, mut coordinator, _mmp) = fixture
+        .disk
+        .mount(MountAccess::ReadOnly {
+            recovery: ReadOnlyRecovery::Memory {
+                limit: RecoveryMemoryLimit::DEFAULT,
+            },
+        })?
+        .into_parts();
     let ticket = coordinator.admit_mutation()?;
     let before = fixture.disk.storage_effects;
-    let result = fixture.disk.resolve(&profile, &epoch, &coordinator, ticket,
-        &mut PlainCrypto, |pass| pass.mark_volume_dirty());
+    let result = fixture.disk.resolve(
+        &profile,
+        &epoch,
+        &coordinator,
+        ticket,
+        &mut PlainCrypto,
+        |pass| pass.mark_volume_dirty(),
+    );
     assert!(matches!(result, Err(Error::ReadOnlyFilesystem)));
     assert_eq!(fixture.disk.storage_effects, before);
     assert_eq!(health_word(&fixture.disk)? & 2, 0);
