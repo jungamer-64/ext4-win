@@ -533,8 +533,6 @@ pub(super) struct PassiveWorkEnvelope {
     lifetime: PassiveLifetime,
     /// The payload cannot be both a pending native call and a published completion.
     state: PassiveState,
-    /// Finite count of unsuccessful native admissions, separated from native effects.
-    retries: super::scheduler::NativeAdmissionBudget,
 }
 
 /// Native completion either returns resources or retains the exact admission for another attempt.
