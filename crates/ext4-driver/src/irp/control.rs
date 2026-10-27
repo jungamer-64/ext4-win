@@ -254,6 +254,8 @@ pub(crate) enum FsControlCode {
     DismountVolume,
     /// Windows `FSCTL_IS_VOLUME_MOUNTED`.
     IsVolumeMounted,
+    /// Validates a counted Windows path against the mounted namespace codec.
+    IsPathnameValid,
     /// Windows `FSCTL_ALLOW_EXTENDED_DASD_IO`.
     AllowExtendedDasdIo,
     /// Windows `FSCTL_GET_RETRIEVAL_POINTERS`.
@@ -272,18 +274,16 @@ pub(crate) enum FsControlCode {
     MarkVolumeDirty,
     /// Persistent zeroing of retired file allocation.
     SetZeroOnDeallocation,
+    /// Kernel Filter Manager data-scan section lifetime.
+    SetPurgeFailureMode,
     /// Windows `FSCTL_GET_REPARSE_POINT`.
     GetReparsePoint,
     /// Windows `FSCTL_SET_REPARSE_POINT`.
     SetReparsePoint,
-    /// Kernel Filter Manager data-scan section lifetime.
-    SetPurgeFailureMode,
     /// Windows `FSCTL_DELETE_REPARSE_POINT`.
     DeleteReparsePoint,
     /// ext4win private fscrypt add-key control.
     AddEncryptionKey,
-    /// Validates a counted Windows path against the mounted namespace codec.
-    IsPathnameValid,
     /// ext4win private fscrypt remove-key control.
     RemoveEncryptionKey,
     /// ext4win private fscrypt key-status control.
@@ -326,6 +326,7 @@ impl FsControlCode {
             FSCTL_UNLOCK_VOLUME => Ok(Self::UnlockVolume),
             FSCTL_DISMOUNT_VOLUME => Ok(Self::DismountVolume),
             FSCTL_IS_VOLUME_MOUNTED => Ok(Self::IsVolumeMounted),
+            FSCTL_IS_PATHNAME_VALID => Ok(Self::IsPathnameValid),
             FSCTL_ALLOW_EXTENDED_DASD_IO => Ok(Self::AllowExtendedDasdIo),
             FSCTL_GET_RETRIEVAL_POINTERS => Ok(Self::GetRetrievalPointers),
             FSCTL_GET_VOLUME_BITMAP => Ok(Self::GetVolumeBitmap),
@@ -335,10 +336,10 @@ impl FsControlCode {
             FSCTL_IS_VOLUME_DIRTY => Ok(Self::IsVolumeDirty),
             FSCTL_MARK_VOLUME_DIRTY => Ok(Self::MarkVolumeDirty),
             FSCTL_SET_ZERO_ON_DEALLOCATION => Ok(Self::SetZeroOnDeallocation),
+            FSCTL_SET_PURGE_FAILURE_MODE => Ok(Self::SetPurgeFailureMode),
             FSCTL_GET_REPARSE_POINT => Ok(Self::GetReparsePoint),
             FSCTL_SET_REPARSE_POINT => Ok(Self::SetReparsePoint),
             FSCTL_DELETE_REPARSE_POINT => Ok(Self::DeleteReparsePoint),
-            FSCTL_SET_PURGE_FAILURE_MODE => Ok(Self::SetPurgeFailureMode),
             FSCTL_EXT4WIN_ADD_ENCRYPTION_KEY => Ok(Self::AddEncryptionKey),
             FSCTL_EXT4WIN_REMOVE_ENCRYPTION_KEY => Ok(Self::RemoveEncryptionKey),
             FSCTL_EXT4WIN_GET_ENCRYPTION_KEY_STATUS => Ok(Self::GetEncryptionKeyStatus),
@@ -360,7 +361,6 @@ impl FsControlCode {
                 | Self::OplockBreakAckNoLevel2
                 | Self::RequestFilterOplock
                 | Self::RequestOplock
-            FSCTL_IS_PATHNAME_VALID => Ok(Self::IsPathnameValid),
         )
     }
 
@@ -395,6 +395,7 @@ impl FsControlCode {
             | Self::UnlockVolume
             | Self::DismountVolume
             | Self::IsVolumeMounted
+            | Self::IsPathnameValid
             | Self::AllowExtendedDasdIo
             | Self::GetRetrievalPointers
             | Self::GetVolumeBitmap
@@ -404,10 +405,10 @@ impl FsControlCode {
             | Self::IsVolumeDirty
             | Self::MarkVolumeDirty
             | Self::SetZeroOnDeallocation
+            | Self::SetPurgeFailureMode
             | Self::GetReparsePoint
             | Self::SetReparsePoint
             | Self::DeleteReparsePoint
-            | Self::SetPurgeFailureMode
             | Self::AddEncryptionKey
             | Self::RemoveEncryptionKey
             | Self::GetEncryptionKeyStatus
@@ -435,7 +436,6 @@ fn structured_oplock_action(input: &[u8]) -> OplockControlAction {
     };
     let flags = u32::from_le_bytes(*flags);
     if flags & REQUEST_OPLOCK_INPUT_FLAG_ACK != 0 && flags & REQUEST_OPLOCK_INPUT_FLAG_REQUEST == 0
-            | Self::IsPathnameValid
     {
         OplockControlAction::BreakContinuation
     } else {
@@ -470,6 +470,8 @@ const FSCTL_UNLOCK_VOLUME: wdk_sys::ULONG = buffered_file_system_control(7);
 const FSCTL_DISMOUNT_VOLUME: wdk_sys::ULONG = buffered_file_system_control(8);
 /// `FSCTL_IS_VOLUME_MOUNTED`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 10, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_IS_VOLUME_MOUNTED: wdk_sys::ULONG = buffered_file_system_control(10);
+/// `FSCTL_IS_PATHNAME_VALID`, whose input is `PATHNAME_BUFFER`.
+const FSCTL_IS_PATHNAME_VALID: wdk_sys::ULONG = buffered_file_system_control(11);
 /// `FSCTL_ALLOW_EXTENDED_DASD_IO`, from
 /// `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 32, METHOD_NEITHER, FILE_ANY_ACCESS)`.
 const FSCTL_ALLOW_EXTENDED_DASD_IO: wdk_sys::ULONG = neither_file_system_control(32);
@@ -489,12 +491,12 @@ const FSCTL_IS_VOLUME_DIRTY: wdk_sys::ULONG = buffered_file_system_control(30);
 const FSCTL_MARK_VOLUME_DIRTY: wdk_sys::ULONG = buffered_file_system_control(12);
 /// Standard buffered physical zero-retirement control.
 const FSCTL_SET_ZERO_ON_DEALLOCATION: wdk_sys::ULONG = buffered_file_system_control(101);
+/// `FSCTL_SET_PURGE_FAILURE_MODE`.
+const FSCTL_SET_PURGE_FAILURE_MODE: wdk_sys::ULONG = buffered_file_system_control(156);
 /// `FSCTL_GET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 42, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_GET_REPARSE_POINT: wdk_sys::ULONG = 589_992;
 /// `FSCTL_SET_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 41, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_SET_REPARSE_POINT: wdk_sys::ULONG = 589_988;
-/// `FSCTL_SET_PURGE_FAILURE_MODE`.
-const FSCTL_SET_PURGE_FAILURE_MODE: wdk_sys::ULONG = buffered_file_system_control(156);
 /// `FSCTL_DELETE_REPARSE_POINT`, from `CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 43, METHOD_BUFFERED, FILE_ANY_ACCESS)`.
 const FSCTL_DELETE_REPARSE_POINT: wdk_sys::ULONG = 589_996;
 
@@ -522,8 +524,6 @@ const EXT4WIN_ENABLE_VERITY_FUNCTION: wdk_sys::ULONG = 0x903;
 /// Builds a buffered, unrestricted Windows filesystem control code.
 const fn buffered_file_system_control(function: wdk_sys::ULONG) -> wdk_sys::ULONG {
     (FILE_DEVICE_FILE_SYSTEM << 16) | (FILE_ANY_ACCESS << 14) | (function << 2) | METHOD_BUFFERED
-/// `FSCTL_IS_PATHNAME_VALID`, whose input is `PATHNAME_BUFFER`.
-const FSCTL_IS_PATHNAME_VALID: wdk_sys::ULONG = buffered_file_system_control(11);
 }
 
 /// Builds an unrestricted Windows filesystem control code with no transfer buffer.
@@ -642,6 +642,8 @@ pub(crate) enum QueryFileInformationClass {
     Name,
     /// Windows `FileNormalizedNameInformation`.
     NormalizedName,
+    /// Windows `FileAlternateNameInformation`, for the selected directory link.
+    AlternateName,
     /// Windows `FileAttributeTagInformation`.
     AttributeTag,
 }
@@ -664,6 +666,7 @@ impl QueryFileInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileEaInformation => Ok(Self::Ea),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNetworkOpenInformation => Ok(Self::NetworkOpen),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNameInformation => Ok(Self::Name),
+            wdk_sys::_FILE_INFORMATION_CLASS::FileAlternateNameInformation => Ok(Self::AlternateName),
             wdk_sys::_FILE_INFORMATION_CLASS::FileNormalizedNameInformation => {
                 Ok(Self::NormalizedName)
             }
@@ -694,8 +697,6 @@ pub(crate) enum DirectoryInformationClass {
     IdExtdBoth,
     /// Windows `FileId64ExtdDirectoryInformation`.
     Id64Extd,
-    /// Windows `FileAlternateNameInformation`, for the selected directory link.
-    AlternateName,
     /// Windows `FileId64ExtdBothDirectoryInformation`.
     Id64ExtdBoth,
 }
@@ -718,7 +719,6 @@ impl DirectoryInformationClass {
             wdk_sys::_FILE_INFORMATION_CLASS::FileIdExtdBothDirectoryInformation => {
                 Ok(Self::IdExtdBoth)
             }
-            wdk_sys::_FILE_INFORMATION_CLASS::FileAlternateNameInformation => Ok(Self::AlternateName),
             wdk_sys::_FILE_INFORMATION_CLASS::FileId64ExtdDirectoryInformation => {
                 Ok(Self::Id64Extd)
             }

@@ -1695,18 +1695,6 @@ impl StreamContext {
     /// # Errors
     /// Returns native writeback failure or mapped/pinned-page conflict.
     pub(crate) fn close_cache_writeback(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The owning stream lease retains this shared native section set.
-                ext4win_stream_cache_close_writeback(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
         loop {
             match self.close_cache_attempt() {
                 Ok(()) => return Ok(()),
@@ -1719,6 +1707,18 @@ impl StreamContext {
     /// # Errors
     /// Returns the exact native writeback or purge status.
     fn close_cache_attempt(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: The owning stream lease retains this shared native section set.
+                ext4win_stream_cache_close_writeback(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
     }
 
     /// Flushes and purges cached data before a coherent direct mutation or size change.
@@ -1757,18 +1757,6 @@ impl StreamContext {
     ///
     /// Returns the exact Cache Manager exception or mapped-section conflict status.
     pub(crate) fn drain_cache_for_volume_lock(&self) -> DriverResult<()> {
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: `self` owns the live shared section-object set for this call.
-                ext4win_stream_cache_drain_for_volume_lock(self.header.as_ptr())
-            };
-            cache_status(status)
-        }
-        #[cfg(test)]
-        {
-            Ok(())
-        }
         loop {
             match self.drain_cache_attempt() {
                 Ok(()) => return Ok(()),
@@ -1781,6 +1769,18 @@ impl StreamContext {
     /// # Errors
     /// Returns the exact native flush or mapping conflict.
     fn drain_cache_attempt(&self) -> DriverResult<()> {
+        #[cfg(not(test))]
+        {
+            let status = unsafe {
+                // SAFETY: `self` owns the live shared section-object set for this call.
+                ext4win_stream_cache_drain_for_volume_lock(self.header.as_ptr())
+            };
+            cache_status(status)
+        }
+        #[cfg(test)]
+        {
+            Ok(())
+        }
     }
 
     /// Acquires one operation-specific, uniquely owned section gate through committed publication.
@@ -1885,7 +1885,7 @@ impl StreamContext {
                     SectionMutationOperation::EnableVerity | SectionMutationOperation::Relocate => {
                         let status = unsafe {
                             // SAFETY: MainResource excludes mappings/transfers; preparation permits paging reentry.
-                            ext4win_stream_prepare_verity_data(self.header.as_ptr())
+                            ext4win_stream_prepare_frozen_data(self.header.as_ptr())
                         };
                         cache_status(status)?;
                     }
@@ -2260,7 +2260,7 @@ unsafe extern "system" {
     fn ext4win_stream_activate_paging_file(header: *mut c_void, extension: u8, lower: wdk_sys::PDEVICE_OBJECT, physical: i64, length: i64, sector_size: u32) -> NTSTATUS;
     fn ext4win_stream_paging_mutation_allowed(header: *mut c_void, deletion: u8, target: i64) -> u8;
     fn ext4win_stream_paging_length(header: *mut c_void) -> i64;
-    fn ext4win_stream_prepare_verity_data(stream_header: *mut c_void) -> NTSTATUS;
+    fn ext4win_stream_prepare_frozen_data(stream_header: *mut c_void) -> NTSTATUS;
     fn ext4win_stream_data_writable(stream_header: *mut c_void) -> u8;
     fn ext4win_prepare_mdl_completion(
         queue: *const c_void,
@@ -2435,20 +2435,6 @@ unsafe extern "system" {
 #[cfg(test)]
 mod tests {
     /// # Errors
-    /// Returns stream allocation or reference-budget failure.
-    /// # Panics
-    /// Fails if key-removal exclusion is reusable, omitted or restores terminal media on release.
-    #[test]
-    #[expect(
-        unsafe_code,
-        reason = "local stream allocation remains live through every admission lease"
-    )]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "fixture errors propagate while assertions check exclusion lifetime"
-    )]
-    fn key_removal_exclusion_lasts_until_lease_release() -> DriverResult<()> {
-    /// # Errors
     /// Returns allocation or scan-lifetime failure.
     /// # Panics
     /// Fails if scan retry status escapes its Windows request class or masks an I/O failure.
@@ -2468,6 +2454,20 @@ mod tests {
         stream.change_scan_section(ScanSectionChange::Disable)?;
         Ok(())
     }
+    /// # Errors
+    /// Returns stream allocation or reference-budget failure.
+    /// # Panics
+    /// Fails if key-removal exclusion is reusable, omitted or restores terminal media on release.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "local stream allocation remains live through every admission lease"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture errors propagate while assertions check exclusion lifetime"
+    )]
+    fn key_removal_exclusion_lasts_until_lease_release() -> DriverResult<()> {
         let owner = crate::kernel::io_reliability::IoReliabilityOwner::try_new()?;
         let volume = StreamContext::try_new_volume(
             StreamSizes::EMPTY,

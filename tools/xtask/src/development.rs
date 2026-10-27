@@ -252,6 +252,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native verify delegation, exact status and isolated atomic flag acknowledgment",
         ),
         (
+            "tunnel-cache",
+            "tunnel_cache.tests.c",
+            "native tunnel lifetime, counted-name, opaque creation-time and miss contracts",
+        ),
+        (
             "fast-io-transfer",
             "fast_io_transfer.tests.c",
             "native Fast I/O transfer admission contract",
@@ -262,14 +267,14 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native FsRtl file-lock completion delegation contract",
         ),
         (
-            "tunnel-cache",
-            "tunnel_cache.tests.c",
-            "native tunnel lifetime, counted-name, opaque creation-time and miss contracts",
-        ),
-        (
             "irp-forward",
             "irp_forward.tests.c",
             "native immediate and pending IRP stack delegation contract",
+        ),
+        (
+            "paging-file",
+            "paging_file.tests.c",
+            "native fixed paging map, allocation-free original IRP delegation, and kernel mapping ownership contract",
         ),
         (
             "fs-filter-callbacks",

@@ -2,10 +2,10 @@
 
 /* MainResource and section preparation exclude new transfers/mappings. Paging stays
  * admitted until this synchronous Cc flush finishes, then Rust drains and seals it.
- * No data may be hashed until both dirty writeback and cache invalidation succeed. */
+ * Hashing or physical relocation may observe data only after writeback and invalidation succeed. */
 _Must_inspect_result_
 static NTSTATUS
-ext4win_prepare_verified_data(PSECTION_OBJECT_POINTERS sections)
+ext4win_prepare_frozen_data(PSECTION_OBJECT_POINTERS sections)
 {
     LARGE_INTEGER zero;
     IO_STATUS_BLOCK status;

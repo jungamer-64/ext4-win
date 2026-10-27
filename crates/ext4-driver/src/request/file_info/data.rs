@@ -520,7 +520,6 @@ pub(crate) fn prepare_raw_volume_transfer(
     kind: RawVolumeOperationKind,
     access: &MountedVolumeAccess<'_>,
 ) -> DriverResult<Option<PreparedRawVolumeTransfer>> {
-    request.select_direct_data()?;
     let (length, starting_point, buffer_address) = match kind {
         RawVolumeOperationKind::Read => {
             let prepared = request.prepared_read()?;
@@ -828,7 +827,6 @@ fn read_regular_file_direct(
     read: &mut impl CommittedReadPass,
     authority: &RegularFileDataAuthority,
 ) -> DriverResult<IrpCompletion> {
-    request.select_direct_data()?;
     let stack = request.prepared_read()?.stack();
     let cache_policy = request.prepared_read()?.cache_policy();
     let output_address = request.prepared_read()?.output_address();
@@ -940,7 +938,6 @@ fn write_regular_file_windowed(
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     authority: &RegularFileDataAuthority,
 ) -> DriverResult<WriteResolution> {
-    request.select_direct_data()?;
     let stack = request.prepared_write()?.stack();
     let cache_policy = request.prepared_write()?.cache_policy();
     let input_address = request.prepared_write()?.input_address();

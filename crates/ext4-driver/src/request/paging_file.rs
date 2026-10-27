@@ -3,7 +3,7 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::PagingFileSetupLease;
 use ext4_core::{ContiguousFileStorage, FileNodeId, FileSize};
 
-/// Allocation exclusion lasts across every initialization commit and home checkpoint.
+/// Excludes mapping changes to this file across commits; unclaimed tail space remains free.
 #[derive(Debug)]
 pub(crate) struct PagingInitialization {
     /// Exact FCB and unique native setup/extension reservation.

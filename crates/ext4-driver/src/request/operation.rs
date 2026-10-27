@@ -1961,6 +1961,11 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
             OperationEvent::Admitted => match self.kind {
                 ImmediateRequestKind::MarkHandle => crate::request::cluster_control::mark_handle(owned.request(), access),
                 ImmediateRequestKind::IsVolumeDirty => crate::request::volume_health::query(owned.request(), access),
+                ImmediateRequestKind::IsPathnameValid => {
+                    let mut request = owned.request();
+                    crate::request::file_system_control::authorize_path_handle(&mut request, access)
+                        .and_then(|()| crate::request::fsctl::is_pathname_valid(request))
+                }
                 ImmediateRequestKind::GetRetrievalPointerBase => (|| {
                     let origin = access.volume_geometry().allocation_start()?.get();
                     let sector =
@@ -1968,11 +1973,6 @@ impl MountedVolumeOperation for ImmediateRequestOperation {
                     let base = origin
                         .checked_div(sector)
                         .filter(|_| origin.is_multiple_of(sector))
-                ImmediateRequestKind::IsPathnameValid => {
-                    let mut request = owned.request();
-                    crate::request::file_system_control::authorize_path_handle(&mut request, access)
-                        .and_then(|()| crate::request::fsctl::is_pathname_valid(request))
-                }
                         .ok_or(DriverError::NotSupported)?;
                     let base = i64::try_from(base).map_err(|_| DriverError::InvalidParameter)?;
                     owned.request().with_active(|active| {
@@ -4223,13 +4223,13 @@ struct MutationRequestOperation {
     paging: Option<crate::request::paging_file::PagingInitialization>,
     /// Initial create attachment waits until the complete paging map has home durability.
     paging_create: Option<PreparedDriverEffect>,
+    /// Native purge failure behavior follows the original Windows operation class.
+    purge_policy: crate::kernel::section::PurgeFailurePolicy,
     /// Exact resolved effects determine whether acknowledgment must await physical home writes.
     completion_durability: ext4_core::MutationCompletionDurability,
     /// Committed request retained until its required home checkpoint succeeds or fails.
     checkpoint_acknowledgment: Option<CheckpointAcknowledgment>,
     /// Validated mounted lower devices.
-    /// Native purge failure behavior follows the original Windows operation class.
-    purge_policy: crate::kernel::section::PurgeFailurePolicy,
     devices: MountedStorageRoute,
     /// Write-only operational event capability retained with paging writeback continuations.
     trace: OperationalTrace,
@@ -4470,15 +4470,15 @@ impl MutationRequestOperation {
                 Err(error) => return Err(AdmitOperationError::new(error, owned)),
             }
         } else { None };
+        let purge_policy = match owned.request().with_active(|active| active.purge_failure_policy()) {
+            Ok(policy) => policy,
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+        };
         let oplock = match Self::prepare_oplock_check(&request, &mut owned, access) {
             Ok(oplock) => oplock,
             Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         let trace = access.operational_trace();
-        let purge_policy = match owned.request().with_active(|active| active.purge_failure_policy()) {
-            Ok(policy) => policy,
-            Err(error) => return Err(AdmitOperationError::new(error, owned)),
-        };
         let paging = request.is_paging();
         let now = match crate::kernel::time::current_ext4_timestamp() {
             Ok(now) => now,
@@ -4526,12 +4526,12 @@ impl MutationRequestOperation {
                     paging_create: None,
                     completion_durability: ext4_core::MutationCompletionDurability::JournalCommit,
                     checkpoint_acknowledgment: None,
+                    purge_policy,
                     devices,
                     trace,
                     ticket,
                     _activity: activity,
                     now,
-                    purge_policy,
                     request,
                     crypto,
                     oplock_mutation,

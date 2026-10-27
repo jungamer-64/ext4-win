@@ -1,6 +1,5 @@
 #include <ntifs.h>
 #include "file_object_flags.h"
-#include "disk_accounting.h"
 
 C_ASSERT(sizeof(((FILE_OBJECT *)0)->Flags) == sizeof(LONG));
 C_ASSERT((FIELD_OFFSET(FILE_OBJECT, Flags) % TYPE_ALIGNMENT(LONG)) == 0);

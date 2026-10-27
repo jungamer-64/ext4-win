@@ -471,17 +471,10 @@ unsafe fn dispatch(device: PDEVICE_OBJECT, irp: PIRP, major: DispatchMajor) -> N
 
 /// Routes an IRP after any allocation-free MDL completion delegation.
 fn dispatch_received(
-    received: crate::irp::ReceivedIrp,
+    mut received: crate::irp::ReceivedIrp,
     device_kind: DriverDeviceKind,
     major: DispatchMajor,
 ) -> NTSTATUS {
-    match dispatch_policy(device_kind, major) {
-        DispatchPolicy::Immediate(request) => execute_immediate(received, request),
-        DispatchPolicy::Queued => crate::state::queue_device_request(received, major),
-    }
-}
-
-/// Immediate request semantics selected from both the device kind and IRP major function.
     if device_kind == DriverDeviceKind::MountedVolume && major == DispatchMajor::FileSystemControl {
         let result = received.with_active(|active| {
             let current = active.current_stack()?;
@@ -499,6 +492,13 @@ fn dispatch_received(
             Err(error) => return received.complete_result(Err(error)),
         }
     }
+    match dispatch_policy(device_kind, major) {
+        DispatchPolicy::Immediate(request) => execute_immediate(received, request),
+        DispatchPolicy::Queued => crate::state::queue_device_request(received, major),
+    }
+}
+
+/// Immediate request semantics selected from both the device kind and IRP major function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ImmediateDispatch {
     /// Device-scoped storage removal and original-IRP lower delegation.
@@ -890,6 +890,7 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::IsVolumeDirty => Admission::Immediate(ImmediateRequestKind::IsVolumeDirty),
                     crate::irp::FsControlCode::MarkVolumeDirty => Admission::Unsupported,
                     crate::irp::FsControlCode::SetZeroOnDeallocation => Admission::Mutation(MutationRequestKind::SetZeroOnDeallocation),
+                    crate::irp::FsControlCode::SetPurgeFailureMode => Admission::Unsupported,
                     crate::irp::FsControlCode::GetReparsePoint => {
                         Admission::Read(ReadRequestKind::GetReparsePoint)
                     }
@@ -900,7 +901,6 @@ pub(crate) fn admit_owned(
                         Admission::Mutation(MutationRequestKind::DeleteReparsePoint)
                     }
                     crate::irp::FsControlCode::EnableVerity => {
-                    crate::irp::FsControlCode::SetPurgeFailureMode => Admission::Unsupported,
                         Admission::Mutation(MutationRequestKind::EnableVerity)
                     }
                     crate::irp::FsControlCode::AddEncryptionKey
@@ -920,6 +920,9 @@ pub(crate) fn admit_owned(
                     crate::irp::FsControlCode::IsVolumeMounted => Admission::VolumeControl(
                         super::operation::VolumeControlRequestKind::IsMounted,
                     ),
+                    crate::irp::FsControlCode::IsPathnameValid => {
+                        Admission::Immediate(ImmediateRequestKind::IsPathnameValid)
+                    }
                     crate::irp::FsControlCode::AllowExtendedDasdIo => Admission::VolumeControl(
                         super::operation::VolumeControlRequestKind::AllowExtendedDasdIo,
                     ),
@@ -957,9 +960,6 @@ pub(crate) fn admit_owned(
         Admission::Administration | Admission::Mount(_) | Admission::Verify(_) | Admission::QueryRemove => {
             HandleRequestClass::Device
         }
-                    crate::irp::FsControlCode::IsPathnameValid => {
-                        Admission::Immediate(ImmediateRequestKind::IsPathnameValid)
-                    }
         Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
             HandleRequestClass::Paging
         }

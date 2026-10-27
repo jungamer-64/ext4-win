@@ -172,6 +172,34 @@ impl LowerOperation {
     }
 }
 
+/// Physical bytes sealed with the private IRP, independent of logical file completion counts.
+#[cfg(not(test))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PhysicalIo {
+    /// One physical read, including sector coverage or a read-modify-write preparation.
+    Read(u32),
+    /// One physical write, including journal and checkpoint payloads.
+    Write(u32),
+    /// A physical durability command.
+    Flush,
+    /// Device controls have no read/write byte charge.
+    Control,
+}
+
+#[cfg(not(test))]
+impl PhysicalIo {
+    /// Projects the same operation and checked transfer length used to construct the IRP stack.
+    #[cfg(not(test))]
+    fn from_major(major: u8, bytes: u32) -> Self {
+        match u32::from(major) {
+            IRP_MJ_READ => Self::Read(bytes),
+            IRP_MJ_WRITE => Self::Write(bytes),
+            IRP_MJ_FLUSH_BUFFERS => Self::Flush,
+            _ => Self::Control,
+        }
+    }
+}
+
 /// Buffer representation required by one lower device stack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LowerTransferMethod {
@@ -1056,6 +1084,8 @@ impl LowerIrpTransfer {
 /// Fully prepared pre-registration private IRP and stable completion envelope.
 #[cfg(not(test))]
 pub struct PreparedLowerIrp<O, R: LowerCompletionRoute<O>> {
+    /// Infallible accounting projection of this exact private stack's physical transfer.
+    physical_io: PhysicalIo,
     /// Driver-owned device whose image owns the registered completion routine.
     completion_owner: KernelDevice,
     /// Target lower storage device.
@@ -1100,8 +1130,15 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
             destination,
             rundown,
         };
-        let authority =
-            match prepare_private_irp(target, operation, method, offset, &source.transfer) {
+        let transfer_length = match wdk_sys::ULONG::try_from(source.transfer.len()) {
+            Ok(length) => length,
+            Err(_) => return Err(LowerBuildError {
+                error: DriverError::InvalidBufferSize,
+                suspended: source.suspended,
+            }),
+        };
+        let (authority, physical_io) =
+            match prepare_private_irp(target, operation, method, offset, &source.transfer, transfer_length) {
                 Ok(authority) => authority,
                 Err(error) => {
                     return Err(LowerBuildError {
@@ -1128,6 +1165,7 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
             }
         };
         Ok(Self {
+            physical_io,
             completion_owner,
             target,
             irp: authority,
@@ -1156,9 +1194,10 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub fn register_and_submit<P>(
+    pub(crate) fn register_and_submit<P>(
         self,
         authorize: impl FnOnce(&O) -> Result<P, DriverError>,
+        observe: impl FnOnce(PhysicalIo),
     ) -> Result<(), LowerSubmissionError<O>> {
         let _submission = match authorize(&self.envelope.get().suspended) {
             Ok(permit) => permit,
@@ -1183,6 +1222,8 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
             return Err(self.reject_unsubmitted(DriverError::from(Error::DeviceIo)));
         }
 
+        observe(self.physical_io);
+
         // From this point the release authority moves irreversibly into the completion envelope.
         // This infallible move is followed immediately by the sole legal action: IoCallDriver.
         let registered = unsafe {
@@ -1196,6 +1237,7 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     /// Retires an unsubmitted private IRP while preserving the caller's unique completion owner.
     fn reject_unsubmitted(self, error: DriverError) -> LowerSubmissionError<O> {
         let Self {
+            physical_io: _,
             completion_owner: _,
             target: _,
             irp,
@@ -1219,6 +1261,7 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
     )]
     unsafe fn into_registered(self) -> RegisteredLowerRequest {
         let Self {
+            physical_io: _,
             completion_owner: _,
             target,
             irp,
@@ -1256,6 +1299,10 @@ impl RegisteredLowerRequest {
     )]
     fn call_driver(self) {
         unsafe {
+            // SAFETY: This registered private IRP has not reached lower storage; its next stack is live.
+            ffi::ext4win_account_lower_io(self.irp.as_ptr());
+        }
+        unsafe {
             // SAFETY: Successful completion registration transferred all lifetime authority to
             // the callback. Synchronous completion may free the IRP inside this call.
             let _call_status = ffi::IofCallDriver(self.target.as_ptr(), self.irp.as_ptr());
@@ -1266,10 +1313,6 @@ impl RegisteredLowerRequest {
 #[cfg(not(test))]
 /// Builds the private IRP and optional MDL while the ownership-bearing envelope source remains
 /// untouched.
-        unsafe {
-            // SAFETY: This registered private IRP has not reached lower storage; its next stack is live.
-            ffi::ext4win_account_lower_io(self.irp.as_ptr());
-        }
 /// # Errors
 ///
 /// Returns an error when the transfer contract is inconsistent, target geometry is invalid, an
@@ -1284,12 +1327,11 @@ fn prepare_private_irp(
     transfer_method: LowerTransferMethod,
     offset: ByteOffset,
     transfer: &AlignedTransferBuffer,
-) -> DriverResult<LowerIrpReleaseAuthority> {
+    transfer_length: wdk_sys::ULONG,
+) -> DriverResult<(LowerIrpReleaseAuthority, PhysicalIo)> {
     if operation.transfers_bytes() == transfer.is_empty() {
         return Err(DriverError::InvalidBufferSize);
     }
-    let transfer_length =
-        wdk_sys::ULONG::try_from(transfer.len()).map_err(|_| DriverError::InvalidBufferSize)?;
     let starting_offset = LARGE_INTEGER {
         QuadPart: i64::try_from(offset.get()).map_err(|_| DriverError::InvalidParameter)?,
     };
@@ -1444,7 +1486,7 @@ fn prepare_private_irp(
             }
         }
     }
-    Ok(authority)
+    Ok((authority, PhysicalIo::from_major(major, transfer_length)))
 }
 
 #[cfg(not(test))]

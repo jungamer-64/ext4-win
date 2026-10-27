@@ -3,6 +3,8 @@
 use super::*;
 
 mod capture;
+#[cfg(not(test))]
+pub(crate) use capture::DiskAccounting;
 pub(crate) use capture::{
     AllocationStart, CapturedRequestorOutput, PreparedDirectoryControl, PreparedDirectoryPattern,
     PreparedEaSelection, PreparedKeyControl, PreparedQueryDirectory, PreparedQueryEa, PreparedRead,
@@ -1154,12 +1156,6 @@ impl<'a> PendingIrpLease<'a> {
         Ok(CacheMdlTransfer {
             owner: self,
             file_object,
-    /// Transfers logical data accounting from Cc to the selected direct data operation.
-    /// # Errors
-    /// Rejects a captured request that does not carry read/write data.
-    pub(crate) fn select_direct_data(&mut self) -> DriverResult<()> {
-        self.owner.context.select_direct_data()
-    }
             request,
         })
     }
@@ -1191,7 +1187,6 @@ impl<'a> PendingIrpLease<'a> {
     /// Rejects another request kind, an excess prefix or an absent FILE_OBJECT before native access.
     pub(crate) fn cache_write_transfer(
         mut self,
-        self.owner.context.select_cached_data()?;
         length: usize,
     ) -> DriverResult<CacheWriteTransfer<'a>> {
         let length = self.prepared_write()?.stack().length().prefix(length)?;
@@ -1214,7 +1209,6 @@ impl<'a> PendingIrpLease<'a> {
         &mut self,
         operation: impl for<'view> FnOnce(&'view mut ActiveIrp<'view>) -> R,
     ) -> R {
-        self.owner.context.select_cached_data()?;
         let mut active = self.owner.target.active();
         operation(&mut active)
     }
@@ -1326,6 +1320,11 @@ impl<'a> PendingIrpLease<'a> {
 }
 
 impl OwnedIrp {
+    /// Moves original attribution into the fixed operation slot through its final lower I/O.
+    #[cfg(not(test))]
+    pub(super) fn take_disk_accounting(&mut self) -> capture::DiskAccounting {
+        self.context.take_disk_accounting(&self.target.active())
+    }
     /// Retains original captures while consuming the request's sole I/O Manager verify attempt.
     /// # Errors
     /// Returns verify-required after the finite budget, without re-capturing requestor authority.
@@ -1517,7 +1516,6 @@ impl OwnedIrp {
             Ok(completion) => completion,
             Err(error) => IrpCompletion::from_error(error),
         })
-        context.account_completion(target.irp, completion);
     }
 
     /// Prepares a create result, consuming its mutually exclusive completion ownership.

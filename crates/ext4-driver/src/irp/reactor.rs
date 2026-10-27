@@ -846,6 +846,9 @@ impl fmt::Debug for SlotPayload {
 /// One shell-owned payload slot; scheduler metadata lives only in [`Scheduler`].
 #[derive(Debug)]
 struct ShellSlot {
+    /// Original requestor reference survives acknowledgment while this slot checkpoints its I/O.
+    #[cfg(not(test))]
+    disk_accounting: Option<super::DiskAccounting>,
     /// Pointer-bearing or callback-bearing payload owned by the WDK shell.
     payload: SlotPayload,
 }
@@ -1214,6 +1217,8 @@ impl ShellSlot {
     /// Creates one empty shell payload slot.
     const fn vacant() -> Self {
         Self {
+            #[cfg(not(test))]
+            disk_accounting: None,
             payload: SlotPayload::Empty,
         }
     }
@@ -3130,6 +3135,16 @@ impl CompletionReactor {
                 let index = self.reserve_active_slot(class).unwrap_or_else(|_| {
                     KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
                 });
+                let accounting = owned.take_disk_accounting();
+                self.with_payloads(|payloads| {
+                    let slot = payloads.get_mut(index).unwrap_or_else(|| {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+                    });
+                    if slot.disk_accounting.is_some() {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    slot.disk_accounting = Some(accounting);
+                });
                 if class != ExecutionClass::Finalization {
                     let envelope = self.cancel_envelopes.get(index).unwrap_or_else(|| {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
@@ -3155,6 +3170,7 @@ impl CompletionReactor {
                     }
                 };
                 self.retire_cancel_slot(index);
+                self.release_disk_accounting(index);
                 let identity = self
                     .with_scheduler(|scheduler| scheduler.identity(index))
                     .unwrap_or_else(|| {
@@ -3537,6 +3553,7 @@ impl CompletionReactor {
         self.abandon_commit(index);
         self.release_handle_lane(index);
         self.retire_cancel_slot(index);
+        self.release_disk_accounting(index);
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
@@ -3547,6 +3564,28 @@ impl CompletionReactor {
         self.grant_available_commit();
         self.grant_all_available_waits();
         self.grant_all_handle_turns();
+    }
+
+    /// Ends attribution only when no continuation or lower completion retains this slot.
+    #[cfg(not(test))]
+    fn release_disk_accounting(&self, index: usize) {
+        let accounting = self.with_payloads(|payloads| {
+            payloads.get_mut(index).unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            }).disk_accounting.take()
+        });
+        drop(accounting);
+    }
+
+    /// Observes the exact physical transfer after successful registration and before submission.
+    #[cfg(not(test))]
+    fn record_physical_io(&self, index: usize, transfer: super::lower::PhysicalIo) {
+        self.with_payloads(|payloads| {
+            let slot = payloads.get(index).unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
+            if let Some(accounting) = &slot.disk_accounting { accounting.record(transfer); }
+        });
     }
 
     /// Enters the non-interruptible lower-registration phase with no shell payload retained.
@@ -4055,7 +4094,7 @@ impl CompletionReactor {
         self.begin_registering(index);
         match lower.register_and_submit(|probe| {
             self.acquire_operation_submission(probe.suspended().as_ref())
-        }) {
+        }, |transfer| self.record_physical_io(index, transfer)) {
             Ok(()) => {
                 self.finish_registering_lower(
                     index,
@@ -4138,7 +4177,7 @@ impl CompletionReactor {
         self.begin_registering(index);
         match lower.register_and_submit(|command| {
             self.acquire_operation_submission(command.suspended().as_ref())
-        }) {
+        }, |transfer| self.record_physical_io(index, transfer)) {
             Ok(()) => self.finish_registering_lower(
                 index,
                 PublishedReactorLower::DeviceControl(cancellation),
@@ -4207,7 +4246,7 @@ impl CompletionReactor {
         self.begin_registering(index);
         match lower.register_and_submit(|command| {
             self.acquire_operation_submission(command.suspended().operation.as_ref())
-        }) {
+        }, |transfer| self.record_physical_io(index, transfer)) {
             Ok(()) => {
                 self.finish_registering_lower(
                     index,

@@ -45,6 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     const VOLUME_DISCOVERY_SOURCE: &str = "native/volume_discovery.c";
     const NAME_EXPRESSION_SOURCE: &str = "native/name_expression.c";
     const FILE_OBJECT_FLAGS_SOURCE: &str = "native/file_object_flags.c";
+    const DISK_ACCOUNTING_SOURCE: &str = "native/disk_accounting.c";
     const TUNNEL_CACHE_SOURCE: &str = "native/tunnel_cache.c";
     const VOLUME_VERIFY_SOURCE: &str = "native/volume_verify.c";
 
@@ -78,16 +79,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/discovery_io.h");
     println!("cargo:rerun-if-changed={NAME_EXPRESSION_SOURCE}");
     println!("cargo:rerun-if-changed={FILE_OBJECT_FLAGS_SOURCE}");
-    println!("cargo:rerun-if-changed=native/file_object_flags.h");
-    println!("cargo:rerun-if-changed={LIFECYCLE_CONTROL_CONTRACT}");
+    println!("cargo:rerun-if-changed={DISK_ACCOUNTING_SOURCE}");
     println!("cargo:rerun-if-changed={TUNNEL_CACHE_SOURCE}");
     println!("cargo:rerun-if-changed={VOLUME_VERIFY_SOURCE}");
     println!("cargo:rerun-if-changed=native/volume_verify.h");
     println!("cargo:rerun-if-changed=native/tunnel_cache.h");
-    println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_CONTRACT}");
     println!("cargo:rerun-if-changed=native/file_object_flags.h");
     println!("cargo:rerun-if-changed=native/disk_accounting.h");
     println!("cargo:rerun-if-changed={LIFECYCLE_CONTROL_CONTRACT}");
+    println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_CONTRACT}");
     println!("cargo:rerun-if-env-changed={ARTIFACT_ID_ENVIRONMENT}");
 
     let artifact_id = production_artifact_id()?;
@@ -142,6 +142,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .file(VOLUME_DISCOVERY_SOURCE)
         .file(NAME_EXPRESSION_SOURCE)
         .file(FILE_OBJECT_FLAGS_SOURCE)
+        .file(DISK_ACCOUNTING_SOURCE)
         .file(TUNNEL_CACHE_SOURCE)
         .file(VOLUME_VERIFY_SOURCE);
 

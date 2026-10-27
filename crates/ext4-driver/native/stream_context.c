@@ -942,6 +942,9 @@ ext4win_stream_cache_initialize(
                     FALSE,
                     &ext4win_cache_callbacks,
                     &stream->Header);
+                if (PsIsDiskCountersEnabled()) {
+                    CcSetAdditionalCacheAttributesEx(file_object, CC_ENABLE_DISK_IO_ACCOUNTING);
+                }
                 ext4win_file_set_flags(file_object, FO_CACHE_SUPPORTED);
             }
             __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
@@ -999,9 +1002,6 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS NTAPI
-                if (PsIsDiskCountersEnabled()) {
-                    CcSetAdditionalCacheAttributesEx(file_object, CC_ENABLE_DISK_IO_ACCOUNTING);
-                }
 ext4win_stream_cache_close_writeback(_In_ PVOID stream_header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
@@ -1847,11 +1847,11 @@ NTSTATUS NTAPI ext4win_mm_flush_image(PVOID header, MMFLUSH_TYPE operation, PBOO
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
     return STATUS_SUCCESS;
 }
-NTSTATUS NTAPI ext4win_stream_prepare_verity_data(PVOID header)
+NTSTATUS NTAPI ext4win_stream_prepare_frozen_data(PVOID header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
     if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
-    __try { return ext4win_prepare_verified_data(&stream->SectionObjects); }
+    __try { return ext4win_prepare_frozen_data(&stream->SectionObjects); }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { return GetExceptionCode(); }
 }
 

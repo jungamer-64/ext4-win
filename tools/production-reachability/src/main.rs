@@ -132,23 +132,26 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("operational ETW event emission", "ext4win_trace_write"),
     ("operational ETW unregister", "ext4win_trace_unregister"),
     ("native full-EA admission", "IoCheckEaBufferValidity"),
+    ("physical disk I/O accounting", "FsRtlUpdateDiskCounters"),
+    ("process disk I/O accounting", "PsUpdateDiskCounters"),
+    ("requestor process capture", "ext4win_capture_disk_process"),
+    ("lifecycle process capture", "ext4win_capture_lifecycle_disk_process"),
+    ("physical process disk charge", "ext4win_account_process_io"),
+    ("disk counter enablement", "PsIsDiskCountersEnabled"),
+    ("cache disk accounting coordination", "CcSetAdditionalCacheAttributesEx"),
     (
         "native volume lifecycle notification",
         "FsRtlNotifyVolumeEvent",
-    ("physical disk I/O accounting", "FsRtlUpdateDiskCounters"),
-    ("process disk I/O accounting", "PsUpdateDiskCounters"),
-    ("disk counter enablement", "PsIsDiskCountersEnabled"),
-    ("cache disk accounting coordination", "CcSetAdditionalCacheAttributesEx"),
     ),
-    (
-        "native reparse admission",
-        "FsRtlValidateReparsePointBuffer",
     ("native tunnel initialization", "FsRtlInitializeTunnelCache"),
     ("I/O Manager media verification", "IoVerifyVolume"),
     ("native tunnel admission", "FsRtlAddToTunnelCache"),
     ("native tunnel lookup", "FsRtlFindInTunnelCache"),
     ("native tunnel release", "FsRtlDeleteTunnelCache"),
     ("native directory tunnel retirement", "FsRtlDeleteKeyFromTunnelCache"),
+    (
+        "native reparse admission",
+        "FsRtlValidateReparsePointBuffer",
     ),
     ("native ACL initialization", "RtlCreateAcl"),
     ("native ACE placement", "RtlAddAce"),
@@ -2458,23 +2461,26 @@ mod tests {
              ext4win_trace_write\n\
              ext4win_trace_unregister\n\
              IoCheckEaBufferValidity\n\
-             FsRtlNotifyVolumeEvent\n\
-             FsRtlValidateReparsePointBuffer\n\
-             RtlCreateAcl\n\
-             RtlAddAce\n\
-             RtlCreateSecurityDescriptor\n\
-             RtlAbsoluteToSelfRelativeSD\n\
              FsRtlUpdateDiskCounters\n\
              PsUpdateDiskCounters\n\
+             ext4win_capture_disk_process\n\
+             ext4win_capture_lifecycle_disk_process\n\
+             ext4win_account_process_io\n\
              PsIsDiskCountersEnabled\n\
              CcSetAdditionalCacheAttributesEx\n\
-             EtwRegister\n\
+             FsRtlNotifyVolumeEvent\n\
              FsRtlInitializeTunnelCache\n\
              IoVerifyVolume\n\
              FsRtlAddToTunnelCache\n\
              FsRtlFindInTunnelCache\n\
              FsRtlDeleteTunnelCache\n\
              FsRtlDeleteKeyFromTunnelCache\n\
+             FsRtlValidateReparsePointBuffer\n\
+             RtlCreateAcl\n\
+             RtlAddAce\n\
+             RtlCreateSecurityDescriptor\n\
+             RtlAbsoluteToSelfRelativeSD\n\
+             EtwRegister\n\
              EtwEventEnabled\n\
              EtwWrite\n\
              EtwUnregister\n\

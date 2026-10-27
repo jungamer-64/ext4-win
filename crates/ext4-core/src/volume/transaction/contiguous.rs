@@ -10,7 +10,8 @@ static INITIALIZATION_ZEROES: [u8; INITIALIZATION_BYTES] = [0; INITIALIZATION_BY
 impl MutationResolvePass<'_, '_, '_> {
     /// Appends zero-initialized blocks without changing the physical address of the old prefix.
     /// A call initializes at most 64 KiB and acknowledges only after its home checkpoint.
-    /// Callers keep allocation exclusion across calls and resume from the returned length.
+    /// Callers exclude changes to this file's mapping across calls and resume from the returned
+    /// length. Unclaimed tail space remains free and is revalidated by each transaction.
     ///
     /// # Errors
     /// Rejects non-block-aligned bounds, protected or noncontiguous prefixes, allocation failure,
