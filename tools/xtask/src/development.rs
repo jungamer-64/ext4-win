@@ -347,6 +347,11 @@ fn verify_cache_manager(root: &Path) -> TaskResult<()> {
             "native MDL ownership contract",
         ),
         (
+            "cache-initialization",
+            "cache_initialization.tests.c",
+            "native pre-Cc verification provenance, resource release, and cache-entry ownership",
+        ),
+        (
             "stream-metadata",
             "stream_metadata.tests.c",
             "native metadata publication progress contract",

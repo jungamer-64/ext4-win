@@ -730,6 +730,19 @@ impl MountedVolumeAccess<'_> {
         self.storage_access().authorize()
     }
 
+    /// Revalidates a retained cached transfer's independent reliability after media verification.
+    /// # Errors
+    /// Rejects removal or revoked read/write health without restoring any authority.
+    #[cfg(not(test))]
+    pub(crate) fn authorize_cache_resumption(&self, write: bool) -> DriverResult<()> {
+        self.authorize_storage()?;
+        if write {
+            self.runtime.authorize_durability()
+        } else {
+            self.runtime.authorize_media_read()
+        }
+    }
+
     /// Revalidates the original operation's current reliability after same-media verification.
     /// # Errors
     /// Removal, revoked ownership or a failed runtime prevents reissuing even a zero-progress I/O.

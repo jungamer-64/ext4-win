@@ -45,6 +45,10 @@ pub(crate) enum DriverError {
     WrongVolume,
     /// The physical device requires identity verification before any cached or lower data access.
     VerifyRequired,
+    /// This request was stopped before Cc data transfer or MDL-chain acquisition began.
+    MediaAdmissionRequired,
+    /// Native media verification failed without admitting the retained cache/create operation.
+    MediaVerificationFailed(NTSTATUS),
     /// Caller supplied parameters outside the accepted FSD boundary.
     InvalidParameter,
     /// A Windows component cannot be represented by the namespace boundary.
@@ -194,7 +198,8 @@ impl DriverError {
         match self {
             Self::InvalidDeviceRequest => STATUS_INVALID_DEVICE_REQUEST,
             Self::WrongVolume => wdk_sys::STATUS_WRONG_VOLUME,
-            Self::VerifyRequired => wdk_sys::STATUS_VERIFY_REQUIRED,
+            Self::VerifyRequired | Self::MediaAdmissionRequired => wdk_sys::STATUS_VERIFY_REQUIRED,
+            Self::MediaVerificationFailed(status) => status,
             Self::InvalidParameter | Self::InvalidName | Self::InvalidWindowsMetadata => {
                 STATUS_INVALID_PARAMETER
             }

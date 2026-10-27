@@ -4038,6 +4038,14 @@ enum CreateAbortContinuation {
 /// Explicit ownership phase of one journaled mutation operation.
 #[derive(Debug)]
 enum MutationOperationState {
+    /// The current create attempt was denied before new effects; retained claims and committed
+    /// paging-initialization progress survive independent native verification.
+    VerifyingCreateAdmission {
+        /// Original security/input captures and sole completion owner.
+        owned: OwnedIrp,
+        /// Exact original mounted association, confirmed before resolution resumes.
+        association: crate::state::MediaVerificationAssociation,
+    },
     /// Main-resource admission yielded before consuming mandatory native backout authority.
     AbortingCreate {
         /// Create IRP retains the FILE_OBJECT through all resource admission attempts.
@@ -4402,6 +4410,32 @@ enum MutationStep {
 }
 
 impl MutationRequestOperation {
+    /// Restarts only a create's denied pre-effect admission after same-media verification.
+    /// Claims, atomic oplock ownership and checkpointed paging progress remain in this operation.
+    fn verify_create_admission(
+        mut self: Box<Self>,
+        mut owned: OwnedIrp,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        if let Err(error) = owned.claim_media_verification() {
+            return self.complete_error(owned, error);
+        }
+        let device = owned.request().with_active(|active| active.device());
+        let (association, query) = match MountedVolumeDevice::prepare_storage_verification(device) {
+            Ok(captured) => captured,
+            Err(error) => {
+                if error == DriverError::WrongVolume {
+                    access.record_media_changed();
+                }
+                return self.complete_error(owned, error);
+            }
+        };
+        self.state = MutationOperationState::VerifyingCreateAdmission { owned, association };
+        OperationTransition::SubmitPassiveWork {
+            work: crate::irp::PassiveWork::VerifyVolume(query),
+            suspended: self,
+        }
+    }
     /// Retains the current node stream when this request class can break an oplock.
     ///
     /// Position-only updates and paging writeback do not change stream or namespace state, so
@@ -5010,12 +5044,7 @@ impl MutationRequestOperation {
                 } => {
                     self.state = MutationOperationState::CacheWriting { publication };
                     return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                        work: crate::irp::PassiveWork::Write {
-                            file_object,
-                            owned,
-                            offset,
-                            length,
-                        },
+                        work: crate::irp::PassiveWork::write(file_object, owned, offset, length),
                         suspended: self,
                     });
                 }
@@ -5528,6 +5557,14 @@ impl MutationRequestOperation {
                     }
                     publication = Some(prepared);
                     operations.resolve_mutation(pass, self.ticket)
+                }
+                Err(DriverError::MediaAdmissionRequired)
+                    if self.request.kind() == MutationRequestKind::Create =>
+                {
+                    drop(pass);
+                    return MutationStep::Transition(
+                        self.verify_create_admission(owned, operations),
+                    );
                 }
                 Err(DriverError::Core(Error::OperationSuspended)) => Err(Error::OperationSuspended),
                 Err(DriverError::CacheManagerFailure(STATUS_RETRY))
@@ -6056,6 +6093,19 @@ impl MutationRequestOperation {
                 let state = core::mem::replace(&mut self.state, MutationOperationState::Terminal);
                 match (state, completion) {
                     (
+                        MutationOperationState::VerifyingCreateAdmission { owned, association },
+                        crate::irp::PassiveWorkCompletion::VerifyVolume(result),
+                    ) => {
+                        let result = result.and_then(|()| association.confirmed());
+                        return match result {
+                            Ok(()) => self.restart_resolution(owned, None, None, access),
+                            Err(error) => {
+                                if error == DriverError::WrongVolume { access.record_media_changed(); }
+                                MutationStep::Transition(self.complete_error(owned, error))
+                            }
+                        };
+                    }
+                    (
                         MutationOperationState::CacheWriting { publication },
                         crate::irp::PassiveWorkCompletion::Write { owned, result },
                     ) => {
@@ -6414,6 +6464,7 @@ impl MutationRequestOperation {
                     .bugcheck()
             }
             MutationOperationState::PreparingSizeChange { owned, .. }
+            | MutationOperationState::VerifyingCreateAdmission { owned, .. }
             | MutationOperationState::PreparingDeletion { owned, .. }
             | MutationOperationState::PreparingWriteOpen { owned }
             | MutationOperationState::PreparingRelocation { owned }
@@ -6821,6 +6872,7 @@ impl MountedVolumeOperation for MutationRequestOperation {
             )
             | (
                 MutationOperationState::AwaitingIntent { .. }
+                | MutationOperationState::VerifyingCreateAdmission { .. }
                 | MutationOperationState::AbortingCreate { .. }
                 | MutationOperationState::RestartingAfterAbort { .. }
                 | MutationOperationState::CheckingOplock { .. }
@@ -6857,6 +6909,7 @@ impl PreparedPublication for MutationRequestOperation {
                 PublicationAuthority::Checkpoint { epoch: *epoch }
             }
             MutationOperationState::AbortingCreate { .. }
+            | MutationOperationState::VerifyingCreateAdmission { .. }
             | MutationOperationState::RestartingAfterAbort { .. }
             | MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CheckingOplock { .. }
@@ -7084,6 +7137,7 @@ impl PreparedPublication for MutationRequestOperation {
                 }
             }
             MutationOperationState::AbortingCreate { .. }
+            | MutationOperationState::VerifyingCreateAdmission { .. }
             | MutationOperationState::RestartingAfterAbort { .. }
             | MutationOperationState::CacheWriting { .. }
             | MutationOperationState::CheckingOplock { .. }
@@ -7121,7 +7175,8 @@ impl PreparedPublication for MutationRequestOperation {
 )]
 // SAFETY: Every raw identity names VCB/FCB/FILE_OBJECT storage retained through reactor drain;
 // mutable access is confined to the sole reactor thread and completion envelopes move only owned
-// state.
+// state. A pending create remains in the active mounted reactor through native verification,
+// retaining its original VPB; only the actor inspects that association under the global VPB lock.
 unsafe impl Send for MutationRequestOperation {}
 
 impl_mounted_operation_adapter!(ReadRequestOperation);

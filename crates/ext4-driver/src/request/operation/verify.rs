@@ -205,7 +205,7 @@ impl MountedVolumeOperation for VerifyAdmissionOperation {
                 }
             }
             (
-                VerifyAdmissionState::Ready { owned, .. },
+                VerifyAdmissionState::Ready { owned, .. } | VerifyAdmissionState::Waiting(owned),
                 CompletionEvent::Core(OperationEvent::CancelRequested),
             ) => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::from(Error::OperationCancelled))),

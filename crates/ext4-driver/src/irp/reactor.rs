@@ -98,6 +98,82 @@ struct StorageVerificationOperation {
 // access occurs under its global lock after return to the sole mounted actor, without cross-thread borrows.
 unsafe impl Send for StorageVerificationOperation {}
 
+/// The exact denied cached work resumes only after its original mounted association is confirmed.
+#[cfg(not(test))]
+#[derive(Debug)]
+struct CacheVerificationOperation {
+    /// Retains FILE_OBJECT, stream lease, original captures and exact transfer parameters.
+    work: super::PassiveWork,
+    /// Caller state (including its handle lane and prepared publication) remains unchanged.
+    suspended: SuspendedOperation,
+    /// No native VPB or resource borrow crosses native verification.
+    association: crate::state::MediaVerificationAssociation,
+}
+
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the original work, stream lease and active slot retain all native identities through verification"
+)]
+// SAFETY: The queued verification owns only a real-device reference. The actor retains the exact
+// work/VPB identities without borrowing native resources, and alone consumes their continuation.
+unsafe impl Send for CacheVerificationOperation {}
+
+/// Interprets the native verification worker protocol, including cancellation before queueing.
+/// # Errors
+/// Returns the worker's exact failure or a zero-effect cancellation; no result grants replay
+/// without the caller's separate original-association and current-health checks.
+fn verification_completion_result(event: CompletionEvent) -> DriverResult<()> {
+    match event {
+        CompletionEvent::PassiveCompleted(super::PassiveWorkCompletion::VerifyVolume(result)) => {
+            result
+        }
+        CompletionEvent::Core(OperationEvent::CancelRequested) => {
+            Err(DriverError::from(ext4_core::Error::OperationCancelled))
+        }
+        _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+    }
+}
+
+#[cfg(not(test))]
+impl CompletionOperation for CacheVerificationOperation {
+    fn advance(
+        self: Box<Self>,
+        event: CompletionEvent,
+        target: &mut ReactorTarget,
+    ) -> OperationTransition {
+        let Self {
+            work,
+            suspended,
+            association,
+        } = *self;
+        let result = verification_completion_result(event);
+        let result = result.and_then(|()| association.confirmed());
+        let result = target.with_mounted_access(|access| {
+            if result == Err(DriverError::WrongVolume) {
+                access.record_media_changed();
+            }
+            result?;
+            work.authorize_media_resumption(access)
+        });
+        match result {
+            Ok(()) => OperationTransition::SubmitPassiveWork { work, suspended },
+            Err(error) => suspended.advance(
+                CompletionEvent::PassiveCompleted(work.failed(error)),
+                target,
+            ),
+        }
+    }
+
+    fn record_storage_failure(
+        &mut self,
+        _failure: StorageFailureClass,
+        _target: &mut ReactorTarget,
+    ) {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    }
+}
+
 #[cfg(not(test))]
 impl CompletionOperation for StorageVerificationOperation {
     fn advance(
@@ -109,12 +185,7 @@ impl CompletionOperation for StorageVerificationOperation {
             command,
             association,
         } = *self;
-        let CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::VerifyVolume(
-            result,
-        )) = event
-        else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
+        let result = verification_completion_result(event);
         let ReactorTarget::MountedVolume(binding) = target else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
@@ -4153,6 +4224,64 @@ impl CompletionReactor {
         PassiveWorkEnvelope::queue(prepared);
     }
 
+    /// Verifies one pre-Cc denial while retaining the same handle lane and captured work.
+    /// Ordinary Passive admission releases provisional intent and rejects a held commit.
+    #[cfg(not(test))]
+    fn submit_cache_verification(
+        &self,
+        index: usize,
+        mut work: super::PassiveWork,
+        suspended: SuspendedOperation,
+    ) {
+        if self.cancellation_is_pending(index) {
+            self.set_ready_operation_event(index, suspended, work.cancel_before_execution());
+            return;
+        }
+        if let Err(error) = work.claim_media_verification() {
+            self.set_ready_operation_event(
+                index,
+                suspended,
+                CompletionEvent::PassiveCompleted(work.failed(error)),
+            );
+            return;
+        }
+        let (association, query) =
+            match MountedVolumeDevice::prepare_storage_verification(self.device) {
+                Ok(captured) => captured,
+                Err(error) => {
+                    if error == DriverError::WrongVolume {
+                        self.with_mounted_access(|access| access.record_media_changed());
+                    }
+                    self.set_ready_operation_event(
+                        index,
+                        suspended,
+                        CompletionEvent::PassiveCompleted(work.failed(error)),
+                    );
+                    return;
+                }
+            };
+        let verified = match crate::memory::boxed_try_map(
+            (work, suspended, association),
+            |(work, suspended, association)| CacheVerificationOperation {
+                work,
+                suspended,
+                association,
+            },
+        ) {
+            Ok(operation) => operation,
+            Err(error) => {
+                let (error, (work, suspended, _association)) = error.into_parts();
+                self.set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::PassiveCompleted(work.failed(error)),
+                );
+                return;
+            }
+        };
+        self.submit_passive_work(index, super::PassiveWork::VerifyVolume(query), verified);
+    }
+
     /// Builds, registers, and submits the private mount-time length query.
     #[cfg(not(test))]
     fn submit_device_query(
@@ -4852,6 +4981,10 @@ impl CompletionReactor {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     }
                 }
+            }
+            if let super::PassiveWorkCompletion::MediaVerificationRequired(work) = completion {
+                self.submit_cache_verification(index, work, suspended);
+                continue;
             }
             self.set_ready_operation_event(
                 index,
@@ -5881,6 +6014,37 @@ mod tests {
     };
 
     /// # Panics
+    /// Fails if an unqueued native verify cancellation becomes an unexpected event, or if a
+    /// confirmed media mismatch is discarded when cancellation also becomes pending.
+    #[test]
+    fn verification_worker_completion_preserves_cancellation_and_media_failure() {
+        use crate::irp::PassiveWorkCompletion;
+        let completed =
+            |result| CompletionEvent::PassiveCompleted(PassiveWorkCompletion::VerifyVolume(result));
+        for (event, expected) in [
+            (completed(Ok(())), Ok(())),
+            (
+                completed(Err(DriverError::MediaVerificationFailed(
+                    wdk_sys::STATUS_VERIFY_REQUIRED,
+                ))),
+                Err(DriverError::MediaVerificationFailed(
+                    wdk_sys::STATUS_VERIFY_REQUIRED,
+                )),
+            ),
+            (
+                CompletionEvent::Core(OperationEvent::CancelRequested),
+                Err(DriverError::from(ext4_core::Error::OperationCancelled)),
+            ),
+            (
+                completed(Err(DriverError::WrongVolume)).prefer_cancellation(true),
+                Err(DriverError::WrongVolume),
+            ),
+        ] {
+            assert_eq!(super::verification_completion_result(event), expected);
+        }
+    }
+
+    /// # Panics
     /// Native completion remains deliverable even when cancellation wins a concurrent race.
     #[test]
     fn cancellation_preserves_native_completion() {
@@ -6175,7 +6339,7 @@ mod tests {
                     crate::irp::PassiveWork,
                     DriverError,
                 ) -> crate::irp::PassiveWorkCompletion = crate::irp::PassiveWork::failed;
-                let completion = work.execute(false);
+                let completion = work.execute();
                 let event = CompletionEvent::PassiveCompleted(completion);
                 let CompletionEvent::PassiveCompleted(completion) = event else {
                     return;
@@ -6184,7 +6348,8 @@ mod tests {
                     crate::irp::PassiveWorkCompletion::VerifyVolume(result) => {
                         let _result = result;
                     }
-                    crate::irp::PassiveWorkCompletion::Retry(work) => {
+                    crate::irp::PassiveWorkCompletion::Retry(work)
+                    | crate::irp::PassiveWorkCompletion::MediaVerificationRequired(work) => {
                         drop(work);
                     }
                     crate::irp::PassiveWorkCompletion::OpenExternalJournal(result) => {

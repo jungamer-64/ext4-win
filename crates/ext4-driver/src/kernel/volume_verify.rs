@@ -71,7 +71,7 @@ impl VerificationDevice {
         if status == wdk_sys::STATUS_WRONG_VOLUME {
             Err(DriverError::WrongVolume)
         } else if status < 0 {
-            Err(DriverError::CacheManagerFailure(status))
+            Err(DriverError::MediaVerificationFailed(status))
         } else {
             Ok(())
         }

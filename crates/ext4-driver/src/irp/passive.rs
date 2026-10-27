@@ -75,6 +75,8 @@ pub(crate) enum PassiveWork {
         owned: super::OwnedIrp,
         /// Read access or preparation for a within-EOF write.
         transfer: super::MdlTransferRequest,
+        /// Remaining native admission attempts, retained through media verification.
+        native_admission: super::scheduler::NativeAdmissionBudget,
     },
     /// Read cached bytes into a system-addressable top-level IRP mapping.
     Read {
@@ -97,6 +99,8 @@ pub(crate) enum PassiveWork {
         offset: i64,
         /// Exact accepted byte count on success.
         length: usize,
+        /// Remaining native admission attempts, retained through media verification.
+        native_admission: super::scheduler::NativeAdmissionBudget,
     },
     /// Flush every dirty cached page for one stream.
     Flush {
@@ -168,6 +172,8 @@ pub(crate) enum PassiveWork {
 /// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// Cc transfer/MDL acquisition has not begun; all original work and capture owners remain live.
+    MediaVerificationRequired(PassiveWork),
     /// I/O Manager verification completed; original request captures remain with its operation.
     VerifyVolume(DriverResult<()>),
     /// Original request returned after its advisory announcement.
@@ -238,6 +244,50 @@ pub(crate) enum PassiveWorkCompletion {
 }
 
 impl PassiveWork {
+    /// Reserves another attempt of the same transfer without renewing its finite policy.
+    /// # Errors
+    /// Returns exhaustion before transfer, or an invariant error for non-deferrable work.
+    #[cfg(not(test))]
+    fn defer_native_admission(&mut self) -> DriverResult<()> {
+        match self {
+            Self::Write {
+                native_admission, ..
+            }
+            | Self::Mdl {
+                native_admission, ..
+            } => native_admission.defer(),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+    /// Consumes the original captured request's finite media-verify budget.
+    /// # Errors
+    /// Returns budget exhaustion without admitting Cc, or an invariant error for non-transfer work.
+    #[cfg(not(test))]
+    pub(super) fn claim_media_verification(&mut self) -> DriverResult<()> {
+        match self {
+            Self::Read { owned, .. } | Self::Write { owned, .. } | Self::Mdl { owned, .. } => {
+                owned.claim_media_verification()
+            }
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
+
+    /// Rechecks current mounted health for the same cached transfer after media confirmation.
+    /// # Errors
+    /// Rejects revoked media/read/write health; no prior failure is reset by verification.
+    #[cfg(not(test))]
+    pub(super) fn authorize_media_resumption(
+        &self,
+        access: &crate::state::MountedVolumeAccess<'_>,
+    ) -> DriverResult<()> {
+        let write = match self {
+            Self::Read { .. } => false,
+            Self::Write { .. } => true,
+            Self::Mdl { transfer, .. } => transfer.action() == super::MdlTransfer::Write,
+            _ => return Err(DriverError::InternalInvariantViolation),
+        };
+        access.authorize_cache_resumption(write)
+    }
     /// Checks mounted storage only for work that can access the volume's data device.
     /// Registry work owns independent authority; terminal cleanup must remain possible after removal.
     /// # Errors
@@ -290,6 +340,22 @@ impl PassiveWork {
             file_object,
             owned,
             transfer,
+            native_admission: super::scheduler::NativeAdmissionBudget::new(),
+        }
+    }
+    /// Starts native admission for one newly captured within-EOF cached write.
+    pub(crate) const fn write(
+        file_object: FileObjectCacheLease,
+        owned: super::OwnedIrp,
+        offset: i64,
+        length: usize,
+    ) -> Self {
+        Self::Write {
+            file_object,
+            owned,
+            offset,
+            length,
+            native_admission: super::scheduler::NativeAdmissionBudget::new(),
         }
     }
     /// Builds one stream flush.
@@ -340,7 +406,7 @@ impl PassiveWork {
     }
 
     /// Executes the sole native call selected before the actor suspended.
-    pub(super) fn execute(self, retrying: bool) -> PassiveWorkCompletion {
+    pub(super) fn execute(self) -> PassiveWorkCompletion {
         match self {
             Self::NotifyVolume { owned, file, event } => {
                 crate::kernel::volume_event::VolumeNotification::new(file, event).deliver();
@@ -373,13 +439,24 @@ impl PassiveWork {
                 file_object,
                 mut owned,
                 transfer,
+                native_admission,
             } => {
-                let result = file_object.mdl(owned.request(), transfer, retrying);
+                let result =
+                    file_object.mdl(owned.request(), transfer, native_admission.retrying());
+                if result == Err(DriverError::MediaAdmissionRequired) {
+                    return PassiveWorkCompletion::MediaVerificationRequired(Self::Mdl {
+                        file_object,
+                        owned,
+                        transfer,
+                        native_admission,
+                    });
+                }
                 if result == Err(DriverError::NativeAdmissionDenied) {
                     return PassiveWorkCompletion::Retry(Self::Mdl {
                         file_object,
                         owned,
                         transfer,
+                        native_admission,
                     });
                 }
                 PassiveWorkCompletion::Mdl { owned, result }
@@ -391,6 +468,14 @@ impl PassiveWork {
                 length,
             } => {
                 let result = file_object.read(owned.request(), offset, length);
+                if result == Err(DriverError::MediaAdmissionRequired) {
+                    return PassiveWorkCompletion::MediaVerificationRequired(Self::Read {
+                        file_object,
+                        owned,
+                        offset,
+                        length,
+                    });
+                }
                 PassiveWorkCompletion::Read { owned, result }
             }
             Self::Write {
@@ -398,14 +483,26 @@ impl PassiveWork {
                 mut owned,
                 offset,
                 length,
+                native_admission,
             } => {
-                let result = file_object.write(owned.request(), offset, length, retrying);
+                let result =
+                    file_object.write(owned.request(), offset, length, native_admission.retrying());
+                if result == Err(DriverError::MediaAdmissionRequired) {
+                    return PassiveWorkCompletion::MediaVerificationRequired(Self::Write {
+                        file_object,
+                        owned,
+                        offset,
+                        length,
+                        native_admission,
+                    });
+                }
                 if result == Err(DriverError::NativeAdmissionDenied) {
                     return PassiveWorkCompletion::Retry(Self::Write {
                         file_object,
                         owned,
                         offset,
                         length,
+                        native_admission,
                     });
                 }
                 PassiveWorkCompletion::Write { owned, result }
@@ -613,7 +710,6 @@ impl PassiveWorkEnvelope {
             device,
             lifetime,
             state: PassiveState::Dormant,
-            retries: super::scheduler::NativeAdmissionBudget::new(),
         }) {
             Ok(envelope) => Ok(envelope),
             Err(failure) => {
@@ -725,12 +821,14 @@ impl PassiveWorkEnvelope {
         else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        let completion = if let PassiveWorkCompletion::Retry(work) = completion {
-            if envelope.retries.defer().is_ok() {
-                envelope.state = PassiveState::Prepared(job, work);
-                return PassiveReclaim::Deferred(envelope);
+        let completion = if let PassiveWorkCompletion::Retry(mut work) = completion {
+            match work.defer_native_admission() {
+                Ok(()) => {
+                    envelope.state = PassiveState::Prepared(job, work);
+                    return PassiveReclaim::Deferred(envelope);
+                }
+                Err(error) => work.failed(error),
             }
-            work.failed(DriverError::NativeAdmissionExhausted)
         } else {
             completion
         };
@@ -800,7 +898,7 @@ unsafe extern "C" fn passive_work_item(device: wdk_sys::PDEVICE_OBJECT, context:
         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     };
     let reactor = job.reactor;
-    envelope.state = PassiveState::Completed(job, work.execute(envelope.retries.retrying()));
+    envelope.state = PassiveState::Completed(job, work.execute());
     unsafe {
         // SAFETY: The completed envelope retains this destination until publication takes its
         // own lease, then transfers the unique unlinked node without borrowing its payload.
@@ -849,7 +947,7 @@ mod tests {
             let completion = if denied {
                 work.failed(DriverError::AccessDenied)
             } else {
-                work.execute(false)
+                work.execute()
             };
             let PassiveWorkCompletion::NotifyVolume { owned, result } = completion else {
                 return Err(DriverError::InternalInvariantViolation);

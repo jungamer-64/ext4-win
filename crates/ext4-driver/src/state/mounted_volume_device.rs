@@ -65,12 +65,12 @@ impl PreparedVpbLabelPublication {
     }
 }
 
-/// Exact mounted association retained by the kernel verify IRP while raw I/O suspends.
+/// Exact mounted association retained by the actor's active request while verification suspends.
 #[derive(Debug)]
 pub(crate) struct MediaVerificationAssociation {
     /// Mounted filesystem device whose reactor owns this operation.
     device: KernelDevice,
-    /// Original VPB protected by the I/O Manager's pending verify ownership.
+    /// Original VPB retained by mounted-device rundown through the request continuation.
     vpb: KernelVpb,
     /// Real device whose verify flag may be acknowledged after a matching physical read.
     real_device: KernelDevice,

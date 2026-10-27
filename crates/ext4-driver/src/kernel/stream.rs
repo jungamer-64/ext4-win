@@ -651,7 +651,7 @@ impl VolumeStorageAccess {
     pub(crate) fn authorize_create(self) -> DriverResult<()> {
         self.authorize()?;
         if self.state().verification_required() {
-            return Err(DriverError::VerifyRequired);
+            return Err(DriverError::MediaAdmissionRequired);
         }
         if self.state().creates_admitted() {
             Ok(())
@@ -1550,13 +1550,13 @@ impl StreamContext {
             let result = (|| {
                 self.initialize_cache(transfer.file_object())?;
                 let _main = self.main_resource()?.ordinary_shared(self.sections.get());
-                self.ensure_ordinary_io(false)?;
                 super::cache_transfer::validate_copy_range(
                     _offset,
                     _length,
                     self.sizes()?.file_size(),
                 )?;
                 let mut information = 0;
+                self.ensure_ordinary_io(false)?;
                 let status = unsafe {
                     // SAFETY: The sealed transfer retains its writable mapping and file; Rust
                     // selected the current in-EOF range under MainResource before the SEH call.
@@ -1617,7 +1617,6 @@ impl StreamContext {
                         }
                     }
                     let main = self.main_resource()?.ordinary_shared(self.sections.get());
-                    self.ensure_ordinary_io(true)?;
                     if !self.archive_is_set() {
                         return Err(DriverError::CacheManagerFailure(
                             crate::kernel::status::STATUS_RETRY,
@@ -1635,6 +1634,7 @@ impl StreamContext {
                         _length,
                         self.sizes()?.file_size(),
                     )?;
+                    self.ensure_ordinary_io(true)?;
                     let status = unsafe {
                         // SAFETY: The sealed transfer retains its readable mapping and file; current EOF
                         // cannot change under MainResource, and C owns expected SEH status capture.
@@ -1661,11 +1661,16 @@ impl StreamContext {
     /// Returns the exact native initialization or admission failure.
     #[cfg(not(test))]
     fn initialize_cache(&self, file: NonNull<wdk_sys::FILE_OBJECT>) -> DriverResult<()> {
+        let mut verify_before_entry = 0;
         let status = unsafe {
             // SAFETY: The cache lease retains this exact stream and FILE_OBJECT through Cc initialization.
-            ext4win_stream_cache_initialize(self.header.as_ptr(), file.as_ptr())
+            ext4win_stream_cache_initialize(
+                self.header.as_ptr(),
+                file.as_ptr(),
+                &mut verify_before_entry,
+            )
         };
-        cache_status(status)
+        decode_cache_initialization(status, verify_before_entry)
     }
 
     /// Executes an already captured MDL IRP without borrowing requestor byte memory.
@@ -1718,7 +1723,6 @@ impl StreamContext {
                     }
                 }
                 let _main = self.main_resource()?.ordinary_shared(self.sections.get());
-                self.ensure_ordinary_io(request.action() == crate::irp::MdlTransfer::Write)?;
                 if request.action() == crate::irp::MdlTransfer::Write && !self.archive_is_set() {
                     return Err(DriverError::NotSupported);
                 }
@@ -1739,6 +1743,7 @@ impl StreamContext {
                 let offset = i64::try_from(request.start().bytes())
                     .map_err(|_| DriverError::InvalidParameter)?;
                 let mut information = 0;
+                self.ensure_ordinary_io(request.action() == crate::irp::MdlTransfer::Write)?;
                 let status = match request.action() {
                     crate::irp::MdlTransfer::Read => unsafe {
                         // SAFETY: Current-EOF selection holds MainResource; C owns partial read-chain cleanup.
@@ -1771,7 +1776,8 @@ impl StreamContext {
 
     /// Rejects ordinary cache acquisition independently of lower media presence.
     /// # Errors
-    /// Returns removal, terminal filesystem close or a missing bound volume invariant.
+    /// Returns a pre-transfer media-verification requirement, removal, terminal filesystem close,
+    /// or a missing bound volume invariant. Cache-map and MDL-completion preparation may exist.
     #[cfg(not(test))]
     fn ensure_ordinary_io(&self, write: bool) -> DriverResult<()> {
         self.ensure_storage()?;
@@ -1783,6 +1789,9 @@ impl StreamContext {
             // SAFETY: Successful storage validation established this immutable, retained allocation identity.
             &*address.cast::<StorageAdmission>()
         };
+        if state.verification_required() {
+            return Err(DriverError::MediaAdmissionRequired);
+        }
         if state.close() == ClosePhase::Open && state.reliability.policy().permits(write) {
             if write
                 && unsafe {
@@ -2390,12 +2399,29 @@ fn cache_status(status: NTSTATUS) -> DriverResult<()> {
     }
 }
 
+/// Decodes native admission separately from a status raised after entering Cache Manager.
+/// # Errors
+/// A tagged pre-entry gate retains zero-transfer semantics. Untagged failures retain their
+/// original Cc classification; an inconsistent ABI result is an internal invariant failure.
+fn decode_cache_initialization(status: NTSTATUS, verify_before_entry: u8) -> DriverResult<()> {
+    match verify_before_entry {
+        0 => cache_status(status),
+        1 if status == wdk_sys::STATUS_VERIFY_REQUIRED => Err(DriverError::MediaAdmissionRequired),
+        _ => Err(DriverError::InternalInvariantViolation),
+    }
+}
+
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "these declarations expose the audited native advanced-FCB-header ownership boundary"
 )]
 unsafe extern "system" {
+    fn ext4win_stream_cache_initialize(
+        header: *mut c_void,
+        file: wdk_sys::PFILE_OBJECT,
+        verify_before_entry: *mut u8,
+    ) -> NTSTATUS;
     fn ext4win_stream_is_paging_file(header: *mut c_void) -> u8;
     fn ext4win_stream_reserve_paging_file(
         header: *mut c_void,
@@ -2591,6 +2617,114 @@ unsafe extern "system" {
 
 #[cfg(test)]
 mod tests {
+    /// # Panics
+    /// Fails if a status raised inside Cc becomes replay authority, or if native provenance
+    /// inconsistent with its status can be accepted as a pre-transfer verification gate.
+    #[test]
+    fn cache_initialization_verification_requires_native_pre_entry_provenance() {
+        use super::decode_cache_initialization;
+        for (status, marker, expected) in [
+            (
+                wdk_sys::STATUS_VERIFY_REQUIRED,
+                1,
+                Err(DriverError::MediaAdmissionRequired),
+            ),
+            (
+                wdk_sys::STATUS_VERIFY_REQUIRED,
+                0,
+                Err(DriverError::CacheManagerFailure(
+                    wdk_sys::STATUS_VERIFY_REQUIRED,
+                )),
+            ),
+            (
+                wdk_sys::STATUS_IO_DEVICE_ERROR,
+                0,
+                Err(DriverError::CacheManagerFailure(
+                    wdk_sys::STATUS_IO_DEVICE_ERROR,
+                )),
+            ),
+            (wdk_sys::STATUS_SUCCESS, 0, Ok(())),
+            (
+                wdk_sys::STATUS_SUCCESS,
+                1,
+                Err(DriverError::InternalInvariantViolation),
+            ),
+            (
+                wdk_sys::STATUS_VERIFY_REQUIRED,
+                2,
+                Err(DriverError::InternalInvariantViolation),
+            ),
+        ] {
+            assert_eq!(decode_cache_initialization(status, marker), expected);
+        }
+    }
+
+    /// # Errors
+    /// Propagates stream construction, native device binding or retained admission failures.
+    /// # Panics
+    /// Fails if create's pre-effect verification gate becomes a Cc failure, or if confirmation
+    /// can restore create admission after physical removal.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "scoped device and volume allocations outlive every captured admission and native flag observation"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture setup precedes independent native-flag and terminal-removal assertions"
+    )]
+    fn create_media_admission_tracks_native_confirmation_without_restoring_removed_media()
+    -> DriverResult<()> {
+        for remove_before_confirmation in [false, true] {
+            let mut raw_device = wdk_sys::DEVICE_OBJECT {
+                Flags: wdk_sys::DO_VERIFY_VOLUME,
+                ..Default::default()
+            };
+            let device = unsafe {
+                // SAFETY: The device fixture outlives this iteration's volume and native owner.
+                crate::state::KernelDevice::from_raw(core::ptr::from_mut(&mut raw_device))
+            }
+            .ok_or(DriverError::InvalidParameter)?;
+            let volume = StreamContext::try_new_volume(
+                StreamSizes::EMPTY,
+                OperationalTrace::host_test(),
+                crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+            )?;
+            let storage = unsafe {
+                // SAFETY: This volume stays live and unmoved through every captured capability.
+                volume.storage_access()
+            }?;
+            storage.bind_verification_device(
+                crate::kernel::volume_verify::VerificationDevice::reference(device),
+            )?;
+            assert_eq!(
+                storage.authorize_create(),
+                Err(DriverError::MediaAdmissionRequired)
+            );
+            let publisher = unsafe {
+                // SAFETY: The fixture owns PnP publication until its volume is dropped.
+                volume.storage_removal_publisher()
+            }?;
+            if remove_before_confirmation {
+                publisher.publish(super::StorageRemovalNotification::Surprise);
+                assert_eq!(storage.authorize_create(), Err(DriverError::DeviceRemoved));
+            }
+            crate::kernel::volume_verify::acknowledge(device);
+            assert_eq!(
+                storage.authorize_create(),
+                if remove_before_confirmation {
+                    Err(DriverError::DeviceRemoved)
+                } else {
+                    Ok(())
+                }
+            );
+            publisher.publish(super::StorageRemovalNotification::Surprise);
+            crate::kernel::volume_verify::acknowledge(device);
+            assert_eq!(storage.authorize_create(), Err(DriverError::DeviceRemoved));
+        }
+        Ok(())
+    }
+
     /// # Errors
     /// Returns allocation or scan-lifetime failure.
     /// # Panics
