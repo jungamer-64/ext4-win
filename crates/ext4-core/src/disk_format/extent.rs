@@ -531,6 +531,40 @@ impl MutableExtentTree {
         normalize_extents(&mut self.extents)
     }
 
+    /// Encodes visible initialized blocks and an unwritten allocation tail without payload I/O.
+    /// The owning transaction must independently establish initialization before exposing blocks.
+    /// # Errors
+    /// Preserves allocation, extent-length and coordinate overflow failures before publication.
+    pub(crate) fn set_initialized_prefix(&mut self, blocks: u64) -> Result<()> {
+        let mut replacement = Vec::new();
+        for extent in &self.extents {
+            let mut start = extent.logical_start().as_u64();
+            let end = extent.end_logical();
+            while start < end {
+                let initialized = start < blocks;
+                let boundary = if initialized { end.min(blocks) } else { end };
+                let count = boundary
+                    .checked_sub(start)
+                    .ok_or(Error::ArithmeticOverflow)?
+                    .min(u64::from(EXTENT_LEN_UNINITIALIZED_MAX_U32));
+                let logical = LogicalBlock::try_from(start)?;
+                let physical = extent.physical_at(logical)?;
+                let len = ExtentLength::new(
+                    u16::try_from(count).map_err(|_| Error::ArithmeticOverflow)?,
+                )?;
+                replacement.try_push(if initialized {
+                    Extent::initialized(logical, len, physical)
+                } else {
+                    Extent::uninitialized(logical, len, physical)
+                })?;
+                start = start.checked_add(count).ok_or(Error::ArithmeticOverflow)?;
+            }
+        }
+        normalize_extents(&mut replacement)?;
+        self.extents = replacement;
+        Ok(())
+    }
+
     /// Splits an unwritten run to initialize exactly one block. The owning transaction stages
     /// a complete initialized block before publishing this tree; failure discards the staged tree.
     /// # Errors

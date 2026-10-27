@@ -26,16 +26,10 @@ pub(crate) fn prepare_paging_extension(
         }
         let target = file_size_from_large_integer(read_end_of_file_input(active, stack.length())?)?;
         let acknowledged = opened.file_control_block().paging_file_length();
-        if target.bytes() < acknowledged {
-            return Err(DriverError::InvalidParameter);
-        }
-        if target.bytes() == acknowledged {
+        if target.bytes() <= acknowledged {
             return Ok(None);
         }
-        let current = FileSize::from_bytes(
-            u64::try_from(opened.file_control_block().stream_sizes()?.file_size())
-                .map_err(|_| DriverError::InternalInvariantViolation)?,
-        );
+        let current = FileSize::from_bytes(acknowledged);
         Ok(Some((
             NonNull::from(opened.file_control_block()),
             opened.file_object(),
@@ -47,10 +41,15 @@ pub(crate) fn prepare_paging_extension(
         return Ok(None);
     };
     let lease = operations.acquire_paging_file_setup(fcb, file, true)?;
+    let physical = crate::request::paging_file::allocation_bound(
+        target,
+        operations.volume_geometry().block_size(),
+    )?;
     crate::request::paging_file::PagingInitialization::new(
         lease,
-        target,
+        physical,
         current,
+        target,
         operations.volume_geometry().block_size(),
     )
     .map(Some)
@@ -77,6 +76,15 @@ enum SetFilePlan {
         file: FileNodeId,
         /// Requested logical size.
         size: FileSize,
+    },
+    /// Updates visible EOF while retaining the active fixed map's initialized physical interval.
+    PagingEndOfFile {
+        /// Exact regular-file inode owned by the Memory Manager's file object.
+        file: FileNodeId,
+        /// Requested visible EOF within the initialized prefix.
+        size: FileSize,
+        /// Native acknowledged physical bound, revalidated against staged extents.
+        initialized: ext4_core::ContiguousFileStorage,
     },
     /// Set physical allocation independently of EOF, truncating EOF when required.
     Allocation {
@@ -331,7 +339,31 @@ pub(super) fn set_file_information(
                         read_allocation_size_input(active, stack.length())?
                     };
                     let requested = file_size_from_large_integer(requested)?;
-                    if requested.bytes() != opened_file.file_control_block().paging_file_length() {
+                    let initialized =
+                        FileSize::from_bytes(opened_file.file_control_block().paging_file_length());
+                    if stack.operation() == SetFileOperation::Resize {
+                        active.require_kernel_requestor()?;
+                        let regular = OpenedRegularFile::decode(file_object)?;
+                        if regular.write_access() != RegularFileWriteAccess::Positional {
+                            return Err(DriverError::AccessDenied);
+                        }
+                        if requested > initialized {
+                            return Err(DriverError::NotSupported);
+                        }
+                        let storage = opened_file
+                            .file_control_block()
+                            .paging_storage()
+                            .ok_or(DriverError::InternalInvariantViolation)?;
+                        if storage.initialized_length() != initialized {
+                            return Err(DriverError::InternalInvariantViolation);
+                        }
+                        return Ok(SetFilePlan::PagingEndOfFile {
+                            file: regular.id(),
+                            size: requested,
+                            initialized: storage,
+                        });
+                    }
+                    if requested != initialized {
                         return Err(DriverError::NotSupported);
                     }
                     return Ok(SetFilePlan::Complete);
@@ -456,6 +488,14 @@ pub(super) fn set_file_information(
             );
         }
         SetFilePlan::EndOfFile { file, size } => set_regular_file_size(mutation, file, size)?,
+        SetFilePlan::PagingEndOfFile {
+            file,
+            size,
+            initialized,
+        } => {
+            let file = mutation.file(file)?;
+            mutation.set_contiguous_file_eof(file, size, initialized)?;
+        }
         SetFilePlan::Allocation { file, size } => {
             let current = regular_file_size(mutation, file)?;
             if size.bytes() < current.bytes() {
@@ -886,7 +926,10 @@ impl FileDispositionTarget {
         match (self, create_deletion) {
             (Self::CreateDeleteOnClose, CreateDeletion::Retain) => Err(DriverError::NotSupported),
             (Self::Mutable, _)
-            | (Self::CreateDeleteOnClose, CreateDeletion::DeleteOnClose | CreateDeletion::KernelPagingDeleteOnClose) => Ok(()),
+            | (
+                Self::CreateDeleteOnClose,
+                CreateDeletion::DeleteOnClose | CreateDeletion::KernelPagingDeleteOnClose,
+            ) => Ok(()),
         }
     }
 }

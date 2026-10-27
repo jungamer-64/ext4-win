@@ -56,10 +56,10 @@ fn contiguous_storage_requires_initialized_payload_and_matches_inode_vector() ->
     let storage = fixture.read(|pass| pass.contiguous_file_storage(file))?;
     assert_eq!(storage.physical().get(), expected_physical);
     assert_eq!(
-        storage.length().bytes(),
+        storage.logical_size().bytes(),
         u64::from(fixture_u32(&fixture.disk.filesystem, inode + 4)?)
     );
-    let previous = storage.length().bytes();
+    let previous = storage.initialized_length().bytes();
     fixture.mutate(|pass| {
         let target = pass.file(file)?;
         pass.reserve_file_allocation(target, FileAllocationSize::from_bytes(previous + bytes))?;

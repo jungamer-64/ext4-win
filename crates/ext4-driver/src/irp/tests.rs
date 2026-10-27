@@ -1627,10 +1627,15 @@ fn paging_file_create_accepts_initialization_and_shared_control_opens() {
             super::CreateDeletion::Retain,
         ),
         (
-            wdk_sys::SYNCHRONIZE | wdk_sys::WRITE_DAC | wdk_sys::FILE_READ_DATA | wdk_sys::FILE_WRITE_DATA,
+            wdk_sys::SYNCHRONIZE
+                | wdk_sys::WRITE_DAC
+                | wdk_sys::FILE_READ_DATA
+                | wdk_sys::FILE_WRITE_DATA,
             super::FILE_SUPERSEDE_DISPOSITION,
             u16::try_from(wdk_sys::FILE_SHARE_WRITE).unwrap_or_default(),
-            wdk_sys::FILE_DELETE_ON_CLOSE | wdk_sys::FILE_NO_COMPRESSION | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
+            wdk_sys::FILE_DELETE_ON_CLOSE
+                | wdk_sys::FILE_NO_COMPRESSION
+                | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
             super::CreateDeletion::KernelPagingDeleteOnClose,
         ),
         (

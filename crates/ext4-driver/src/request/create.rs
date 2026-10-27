@@ -1329,7 +1329,6 @@ impl PendingExistingCreateOpen {
         policy: CreateHandlePolicy,
         pending_deletion: Option<PendingFileDeletion>,
         intent: ExistingCreateIntent,
-        paging_target: Option<ext4_core::FileSize>,
     ) -> DriverResult<Self> {
         let ExistingNodeTarget {
             volume,
@@ -1359,7 +1358,6 @@ impl PendingExistingCreateOpen {
             fcb: admission.file_control_block(),
             file_object,
         };
-        let mut paging_target = paging_target;
         if policy.file_mode == crate::irp::CreateFileMode::PagingFile {
             if node_mode != OpenedNodeMode::Direct
                 || policy.regular_file_write_access() != RegularFileWriteAccess::Positional
@@ -1370,9 +1368,6 @@ impl PendingExistingCreateOpen {
             if acknowledged != 0 {
                 if !matches!(intent, ExistingCreateIntent::Open(_)) {
                     return Err(DriverError::ShareAccessConflict);
-                }
-                if paging_target.is_some_and(|target| target.bytes() <= acknowledged) {
-                    paging_target = None;
                 }
             } else if admission.residency() != ExistingStreamResidency::FirstOpen
                 || admission.open_count().get() != 1
@@ -1402,7 +1397,7 @@ impl PendingExistingCreateOpen {
             admission.open_count(),
         );
         Ok(Self {
-            paging_target,
+            paging_target: None,
             paging: None,
             claim,
             node,
@@ -1546,7 +1541,9 @@ impl PendingExistingCreateOpen {
             if self.policy.deletion() == CreateDeletion::KernelPagingDeleteOnClose {
                 self.handle.arm_paging_file_cleanup_deletion(deletion);
                 None
-            } else { Some(deletion) }
+            } else {
+                Some(deletion)
+            }
         });
         let (fcb, file_object) = self.claim.consume();
         publish_node_stream_raw(
@@ -1712,10 +1709,21 @@ fn finish_existing_create(
         .ok_or(DriverError::InternalInvariantViolation)?;
     open.validate_gate(gate)?;
     if open.paging_target.is_some() && open.paging.is_none() {
-        let current = if matches!(open.intent, ExistingCreateIntent::Reset { .. }) {
-            ext4_core::FileSize::from_bytes(0)
+        let (current, logical_size) = if matches!(open.intent, ExistingCreateIntent::Reset { .. }) {
+            (
+                ext4_core::FileSize::from_bytes(0),
+                ext4_core::FileSize::from_bytes(0),
+            )
         } else {
-            mutation.staged_node_metadata(open.node)?.size()
+            let NodeId::File(file) = open.node else {
+                return Err(DriverError::InternalInvariantViolation);
+            };
+            (
+                open.claim
+                    .contiguous_storage(file, mutation)?
+                    .initialized_length(),
+                mutation.staged_node_metadata(open.node)?.size(),
+            )
         };
         let extension = open.claim.paging_file_length() != 0;
         let lease = operations.acquire_paging_file_setup(
@@ -1728,6 +1736,7 @@ fn finish_existing_create(
             open.paging_target
                 .ok_or(DriverError::InternalInvariantViolation)?,
             current,
+            logical_size,
             operations.volume_geometry().block_size(),
         )?);
     }
@@ -1853,36 +1862,39 @@ fn open_existing_node(
         )?,
         operations.current_epoch_sequence(),
     );
-    let paging_target = if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
+    let mut pending =
+        PendingExistingCreateOpen::prepare(request, target, stream, policy, deletion, intent)?;
+    if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
         let NodeId::File(file) = node else {
             return Err(DriverError::NotSupported);
         };
-        let current = if matches!(intent, ExistingCreateIntent::Reset { .. }) {
+        let current = if matches!(pending.intent, ExistingCreateIntent::Reset { .. }) {
             ext4_core::FileSize::from_bytes(0)
         } else {
-            mutation.load_file(file)?.size()
+            pending
+                .claim
+                .contiguous_storage(file, mutation)?
+                .initialized_length()
         };
-        let requested = u64::try_from(request.owner.metadata.allocation)
-            .map_err(|_| DriverError::InvalidParameter)?;
-        let target = ext4_core::FileSize::from_bytes(requested.max(current.bytes()));
+        let target = if matches!(pending.intent, ExistingCreateIntent::Reset { .. }) {
+            let requested = u64::try_from(request.owner.metadata.allocation)
+                .map_err(|_| DriverError::InvalidParameter)?;
+            super::paging_file::allocation_bound(
+                ext4_core::FileSize::from_bytes(requested),
+                operations.volume_geometry().block_size(),
+            )?
+        } else {
+            current
+        };
         super::paging_file::validate_bound(
             target,
             current,
             u64::from(operations.volume_geometry().block_size().bytes()).max(4096),
         )?;
-        Some(target)
-    } else {
-        None
-    };
-    let pending = PendingExistingCreateOpen::prepare(
-        request,
-        target,
-        stream,
-        policy,
-        deletion,
-        intent,
-        paging_target,
-    )?;
+        if target.bytes() > pending.claim.paging_file_length() {
+            pending.paging_target = Some(target);
+        }
+    }
     select_existing_open_gate(pending, pending_existing, operations, mutation)
 }
 
@@ -1996,7 +2008,6 @@ fn open_target_directory(
         policy,
         None,
         ExistingCreateIntent::Open(action),
-        None,
     )
 }
 
@@ -2040,10 +2051,13 @@ fn create_missing_node(
 ) -> DriverResult<PendingCreatePublication> {
     let parameters = request.parameters();
     let paging_target = if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
-        let target = ext4_core::FileSize::from_bytes(
-            u64::try_from(request.owner.metadata.allocation)
-                .map_err(|_| DriverError::InvalidParameter)?,
-        );
+        let target = super::paging_file::allocation_bound(
+            ext4_core::FileSize::from_bytes(
+                u64::try_from(request.owner.metadata.allocation)
+                    .map_err(|_| DriverError::InvalidParameter)?,
+            ),
+            operations.volume_geometry().block_size(),
+        )?;
         super::paging_file::validate_bound(
             target,
             ext4_core::FileSize::from_bytes(0),
@@ -2541,6 +2555,7 @@ impl PendingCreatePublication {
                 lease,
                 target,
                 ext4_core::FileSize::from_bytes(0),
+                ext4_core::FileSize::from_bytes(0),
                 operations.volume_geometry().block_size(),
             )?)
         } else {
@@ -2632,7 +2647,9 @@ impl PreparedCreatePublication {
             if handle.create_deletion() == CreateDeletion::KernelPagingDeleteOnClose {
                 handle.arm_paging_file_cleanup_deletion(pending);
                 None
-            } else { Some(pending) }
+            } else {
+                Some(pending)
+            }
         });
         let (fcb, file_object) = claim.consume();
         publish_node_stream_raw(file_object, fcb, handle, flags);
@@ -2656,6 +2673,28 @@ struct PendingFileControlBlockClaim {
 }
 
 impl PendingFileControlBlockClaim {
+    /// Revalidates raw initialization only while this claim retains the exact FCB witness owner.
+    /// # Errors
+    /// Rejects stale or mismatched witnesses, unsupported storage and core read failures.
+    #[expect(
+        unsafe_code,
+        reason = "the unpublished share/reference claim pins the FCB through its locked witness observation"
+    )]
+    fn contiguous_storage(
+        &self,
+        file: ext4_core::FileNodeId,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+    ) -> DriverResult<ext4_core::ContiguousFileStorage> {
+        let retained = unsafe {
+            // SAFETY: The claim owns this FCB until consume or Drop; its ledger protects the fact.
+            self.fcb.as_ref().paging_storage()
+        };
+        match retained {
+            Some(storage) => Ok(mutation.retained_contiguous_file_storage(file, storage)?),
+            None => Ok(mutation.contiguous_file_storage(file)?),
+        }
+    }
+
     /// Observes the native acknowledged prefix while this provisional claim retains its FCB.
     #[expect(
         unsafe_code,

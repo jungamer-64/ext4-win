@@ -11,7 +11,8 @@ impl MutationResolvePass<'_, '_, '_> {
     /// Appends zero-initialized blocks without changing the physical address of the old prefix.
     /// A call initializes at most 64 KiB and acknowledges only after its home checkpoint.
     /// Callers exclude changes to this file's mapping across calls and resume from the returned
-    /// length. Unclaimed tail space remains free and is revalidated by each transaction.
+    /// initialized length. Logical EOF is retained in the same transaction. Unclaimed tail space
+    /// remains free and is revalidated by each transaction.
     ///
     /// # Errors
     /// Rejects non-block-aligned bounds, protected or noncontiguous prefixes, allocation failure,
@@ -21,12 +22,18 @@ impl MutationResolvePass<'_, '_, '_> {
         &mut self,
         file: TransactionFile,
         target: FileSize,
+        retained: Option<super::super::node::ContiguousFileStorage>,
     ) -> Result<super::super::node::ContiguousFileStorage> {
         self.edit(|pass| {
             let size = pass.mutation.volume.superblock.block_size();
             let raw = pass.mutation.raw_inode_for_policy(file.inode())?;
             let inode = raw.parse()?;
-            let current = inode.size();
+            let logical_size = inode.size();
+            let previous = pass.contiguous_file_allocation(file.id(), retained)?;
+            let mut initialized = previous;
+            let current = previous.map_or(FileSize::from_bytes(0), |storage| {
+                storage.initialized_length()
+            });
             let width = u64::from(size.bytes());
             if target.bytes() < current.bytes()
                 || target.bytes() == 0
@@ -35,11 +42,6 @@ impl MutationResolvePass<'_, '_, '_> {
             {
                 return Err(Error::InvalidWriteRange);
             }
-            let previous = if current.bytes() == 0 {
-                None
-            } else {
-                Some(pass.contiguous_file_storage(file.id())?)
-            };
             let remaining = target
                 .bytes()
                 .checked_sub(current.bytes())
@@ -105,6 +107,15 @@ impl MutationResolvePass<'_, '_, '_> {
                     }
                 }
                 pass.mutation.stage_extent_tree(&mut raw, tree)?;
+                // The old physical prefix is already initialized. Advancing the provisional
+                // EOF prevents generic write-gap zeroing from overwriting its retained bytes.
+                raw.set_encoded_size(
+                    pass.mutation
+                        .volume
+                        .superblock
+                        .inode_data_encoding()
+                        .encode_file_size(current)?,
+                )?;
                 pass.mutation.replace_live_inode(index, raw)?;
                 pass.write_file_range(
                     file,
@@ -113,18 +124,81 @@ impl MutationResolvePass<'_, '_, '_> {
                         .get(..count)
                         .ok_or(Error::InvalidWriteRange)?,
                 )?;
+                let mut raw = pass.mutation.staged_live_inode(index)?;
+                let mut tree = pass.mutation.mutable_extent_tree(&raw.parse()?)?;
+                tree.set_initialized_prefix(round_up_div(logical_size.bytes(), width)?)?;
+                pass.mutation.stage_extent_tree(&mut raw, tree)?;
+                raw.set_encoded_size(
+                    pass.mutation
+                        .volume
+                        .superblock
+                        .inode_data_encoding()
+                        .encode_file_size(logical_size)?,
+                )?;
+                pass.mutation.replace_live_inode(index, raw)?;
+                initialized = Some(super::super::node::ContiguousFileStorage {
+                    mount: *pass.mutation.volume.mount.ok_or(Error::InvalidWriteRange)?,
+                    inode: inode.id(),
+                    generation: inode.generation(),
+                    physical: size.offset_of(origin)?,
+                    initialized_length: FileSize::from_bytes(
+                        end.checked_mul(width).ok_or(Error::ArithmeticOverflow)?,
+                    ),
+                    logical_size,
+                });
             } else {
                 let index = pass.mutation.ensure_inode_update(file.inode())?;
                 let mut raw = pass.mutation.staged_live_inode(index)?;
                 raw.touch_metadata(pass.now)?;
                 pass.mutation.replace_live_inode(index, raw)?;
             }
-            let initialized = pass.contiguous_file_storage(file.id())?;
+            let initialized = pass.retained_contiguous_file_storage(
+                file.id(),
+                initialized.ok_or(Error::InvalidWriteRange)?,
+            )?;
             if previous.is_some_and(|previous| previous.physical() != initialized.physical()) {
                 return Err(Error::ClusterReferenceConflict);
             }
             pass.mutation.completion_durability = MutationCompletionDurability::HomeCheckpoint;
             Ok(initialized)
+        })
+    }
+
+    /// Changes logical EOF within a separately validated initialized physical allocation.
+    /// Allocation and payload bytes remain unchanged. Extents past EOF are unwritten, preserving
+    /// the independent raw initialization fact held by the fixed-map owner. That owner excludes
+    /// allocation retirement, inode reuse and independent mapping/protection changes.
+    /// # Errors
+    /// Rejects a changed/non-initialized map, an excessive EOF, inode encoding or metadata failure.
+    pub fn set_contiguous_file_eof(
+        &mut self,
+        file: TransactionFile,
+        size: FileSize,
+        initialized: super::super::node::ContiguousFileStorage,
+    ) -> Result<super::super::node::ContiguousFileStorage> {
+        self.edit(|pass| {
+            let storage = pass.retained_contiguous_file_storage(file.id(), initialized)?;
+            if size > storage.initialized_length() {
+                return Err(Error::InvalidWriteRange);
+            }
+            let encoded = pass
+                .mutation
+                .volume
+                .superblock
+                .inode_data_encoding()
+                .encode_file_size(size)?;
+            let index = pass.mutation.ensure_inode_update(file.inode())?;
+            let mut raw = pass.mutation.staged_live_inode(index)?;
+            let mut tree = pass.mutation.mutable_extent_tree(&raw.parse()?)?;
+            tree.set_initialized_prefix(round_up_div(
+                size.bytes(),
+                u64::from(pass.mutation.volume.superblock.block_size().bytes()),
+            )?)?;
+            pass.mutation.stage_extent_tree(&mut raw, tree)?;
+            raw.set_encoded_size(encoded)?;
+            raw.touch_contents(pass.now)?;
+            pass.mutation.replace_live_inode(index, raw)?;
+            pass.retained_contiguous_file_storage(file.id(), initialized)
         })
     }
 }

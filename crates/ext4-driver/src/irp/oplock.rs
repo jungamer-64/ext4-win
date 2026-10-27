@@ -268,7 +268,9 @@ impl CleanupOplock {
 const fn cleanup_oplock_flags(deletion: CreateDeletion) -> u32 {
     match deletion {
         CreateDeletion::Retain => 0,
-        CreateDeletion::DeleteOnClose | CreateDeletion::KernelPagingDeleteOnClose => wdk_sys::OPLOCK_FLAG_CLOSING_DELETE_ON_CLOSE,
+        CreateDeletion::DeleteOnClose | CreateDeletion::KernelPagingDeleteOnClose => {
+            wdk_sys::OPLOCK_FLAG_CLOSING_DELETE_ON_CLOSE
+        }
     }
 }
 

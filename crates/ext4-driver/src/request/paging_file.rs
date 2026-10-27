@@ -3,6 +3,29 @@ use crate::kernel::status::{DriverError, DriverResult};
 use crate::state::PagingFileSetupLease;
 use ext4_core::{ContiguousFileStorage, FileNodeId, FileSize};
 
+/// Rounds a Memory Manager byte bound to complete filesystem blocks and host pages.
+/// # Errors
+/// Rejects zero or arithmetic/signed-byte-domain overflow before physical admission.
+pub(crate) fn allocation_bound(
+    requested: FileSize,
+    block: ext4_core::BlockSize,
+) -> DriverResult<FileSize> {
+    let alignment = u64::from(block.bytes()).max(4096);
+    let padding = alignment
+        .checked_sub(1)
+        .ok_or(DriverError::InvalidParameter)?;
+    let bytes = requested
+        .bytes()
+        .checked_add(padding)
+        .and_then(|bytes| bytes.checked_div(alignment))
+        .and_then(|blocks| blocks.checked_mul(alignment))
+        .ok_or(DriverError::InvalidParameter)?;
+    if bytes == 0 || i64::try_from(bytes).is_err() {
+        return Err(DriverError::InvalidParameter);
+    }
+    Ok(FileSize::from_bytes(bytes))
+}
+
 /// Excludes mapping changes to this file across commits; unclaimed tail space remains free.
 #[derive(Debug)]
 pub(crate) struct PagingInitialization {
@@ -12,6 +35,10 @@ pub(crate) struct PagingInitialization {
     target: FileSize,
     /// Last home-checkpointed prefix; provisional resolve results cannot advance it.
     initialized: FileSize,
+    /// Logical EOF requested by this operation; physical initialization alone does not publish it.
+    logical_size: FileSize,
+    /// Core-issued raw-byte initialization fact; unwritten extent flags cannot recreate it.
+    storage: Option<ContiguousFileStorage>,
 }
 
 impl PagingInitialization {
@@ -22,18 +49,25 @@ impl PagingInitialization {
         lease: PagingFileSetupLease,
         target: FileSize,
         current: FileSize,
+        logical_size: FileSize,
         block: ext4_core::BlockSize,
     ) -> DriverResult<Self> {
         validate_bound(target, current, u64::from(block.bytes()).max(4096))?;
+        if logical_size > target {
+            return Err(DriverError::InvalidParameter);
+        }
         if matches!(lease.claim(), crate::kernel::stream::PagingFileClaim::Extension { length, .. }
             if current.bytes() < length.bytes())
         {
             return Err(DriverError::InternalInvariantViolation);
         }
+        let storage = lease.storage();
         Ok(Self {
             lease,
             target,
             initialized: current,
+            logical_size,
+            storage,
         })
     }
 
@@ -52,15 +86,32 @@ impl PagingInitialization {
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<ContiguousFileStorage> {
         let file = self.file()?;
-        if mutation
-            .staged_node_metadata(ext4_core::NodeId::File(file))?
-            .size()
-            != self.initialized
-        {
+        if self.initialized.bytes() == 0 {
+            if mutation
+                .staged_node_metadata(ext4_core::NodeId::File(file))?
+                .size()
+                .bytes()
+                != 0
+            {
+                return Err(DriverError::InternalInvariantViolation);
+            }
+        }
+        let retained = match self.storage {
+            Some(storage) => Some(mutation.retained_contiguous_file_storage(file, storage)?),
+            None if self.initialized.bytes() != 0 => Some(mutation.contiguous_file_storage(file)?),
+            None => None,
+        };
+        if retained.is_some_and(|storage| storage.initialized_length() != self.initialized) {
             return Err(DriverError::InternalInvariantViolation);
         }
         let selected = mutation.file(file)?;
-        let storage = mutation.initialize_contiguous_file_tail(selected, self.target)?;
+        let mut storage =
+            mutation.initialize_contiguous_file_tail(selected, self.target, retained)?;
+        if storage.initialized_length() == self.target
+            && storage.logical_size() != self.logical_size
+        {
+            storage = mutation.set_contiguous_file_eof(selected, self.logical_size, storage)?;
+        }
         if let crate::kernel::stream::PagingFileClaim::Extension { physical, .. } =
             self.lease.claim()
             && physical != storage.physical()
@@ -74,7 +125,7 @@ impl PagingInitialization {
     /// # Errors
     /// Rejects a shrinking, excessive or discontinuous progress result.
     pub(crate) fn checkpointed(&mut self, storage: ContiguousFileStorage) -> DriverResult<bool> {
-        let length = storage.length();
+        let length = storage.initialized_length();
         if length.bytes() < self.initialized.bytes()
             || length.bytes() > self.target.bytes()
             || length.bytes().saturating_sub(self.initialized.bytes()) > 65_536
@@ -82,6 +133,7 @@ impl PagingInitialization {
             return Err(DriverError::InternalInvariantViolation);
         }
         self.initialized = length;
+        self.storage = Some(storage);
         Ok(length == self.target)
     }
 
@@ -93,7 +145,10 @@ impl PagingInitialization {
         storage: ContiguousFileStorage,
         route: crate::kernel::storage::MountedStorageRoute,
     ) -> DriverResult<()> {
-        if storage.length() != self.target || self.initialized != self.target {
+        if storage.initialized_length() != self.target
+            || self.initialized != self.target
+            || storage.logical_size() != self.logical_size
+        {
             return Err(self.failure(DriverError::InternalInvariantViolation, false));
         }
         let file = self.file()?;
@@ -173,5 +228,34 @@ mod tests {
                 accepted
             );
         }
+    }
+
+    /// # Errors
+    /// Returns invalid constant filesystem block geometry.
+    /// # Panics
+    /// Fails if MM page bounds truncate a filesystem block or overflow the native signed domain.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "constant geometry construction is fallible while assertions compare independent rounding vectors"
+    )]
+    fn physical_allocation_rounds_without_changing_logical_eof() -> DriverResult<()> {
+        let block = ext4_core::BlockSize::from_superblock_log(6)?;
+        for (requested, expected) in [
+            (4096, Some(65_536)),
+            (69_632, Some(131_072)),
+            (131_072, Some(131_072)),
+            (0, None),
+            (u64::MAX, None),
+            (i64::MAX as u64, None),
+        ] {
+            assert_eq!(
+                allocation_bound(FileSize::from_bytes(requested), block)
+                    .ok()
+                    .map(FileSize::bytes),
+                expected
+            );
+        }
+        Ok(())
     }
 }

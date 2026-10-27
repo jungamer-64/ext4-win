@@ -811,7 +811,8 @@ impl HandleDeletion {
                 })
             }
             CreateDeletion::KernelPagingDeleteOnClose => Ok(Self::KernelPagingDeleteOnClose {
-                delete_access, file_attributes_write_access,
+                delete_access,
+                file_attributes_write_access,
             }),
         }
     }
@@ -822,7 +823,8 @@ impl HandleDeletion {
     /// Returns access denied when a retained handle was not opened with `DELETE`.
     fn require_delete_access(self) -> DriverResult<()> {
         match self {
-            Self::Retain { delete_access, .. } | Self::KernelPagingDeleteOnClose { delete_access, .. } => delete_access.require(),
+            Self::Retain { delete_access, .. }
+            | Self::KernelPagingDeleteOnClose { delete_access, .. } => delete_access.require(),
             Self::DeleteOnClose { .. } => Ok(()),
         }
     }
@@ -845,8 +847,10 @@ impl HandleDeletion {
             }
             | Self::DeleteOnClose {
                 file_attributes_write_access,
-            } | Self::KernelPagingDeleteOnClose {
-                file_attributes_write_access, ..
+            }
+            | Self::KernelPagingDeleteOnClose {
+                file_attributes_write_access,
+                ..
             } => file_attributes_write_access,
         }
     }
@@ -2450,11 +2454,21 @@ mod paging_deletion_tests {
     /// Fails if kernel paging cleanup synthesizes ordinary handle deletion authority.
     #[test]
     fn kernel_paging_cleanup_retains_the_original_disposition_authority() {
-        for (access, expected) in [(DeleteAccess::Denied, Err(DriverError::AccessDenied)), (DeleteAccess::Granted, Ok(()))] {
-            let deletion = HandleDeletion::from_create(CreateDeletion::KernelPagingDeleteOnClose, access, FileAttributesWriteAccess::Denied);
+        for (access, expected) in [
+            (DeleteAccess::Denied, Err(DriverError::AccessDenied)),
+            (DeleteAccess::Granted, Ok(())),
+        ] {
+            let deletion = HandleDeletion::from_create(
+                CreateDeletion::KernelPagingDeleteOnClose,
+                access,
+                FileAttributesWriteAccess::Denied,
+            );
             assert!(deletion.is_ok());
             if let Ok(deletion) = deletion {
-                assert_eq!(deletion.create_deletion(), CreateDeletion::KernelPagingDeleteOnClose);
+                assert_eq!(
+                    deletion.create_deletion(),
+                    CreateDeletion::KernelPagingDeleteOnClose
+                );
                 assert_eq!(deletion.require_delete_access(), expected);
             }
         }

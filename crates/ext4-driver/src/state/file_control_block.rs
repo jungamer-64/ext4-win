@@ -178,6 +178,27 @@ impl FileControlBlock {
         self.stream_context.paging_file_length()
     }
 
+    /// Retains the core-issued raw initialization fact while this FCB excludes mapping changes.
+    /// Its logical size is an issuance-time observation; current EOF comes from core revalidation.
+    #[expect(
+        unsafe_code,
+        reason = "the retained FCB owns its ledger and the exclusive ledger resource protects its initialization observation"
+    )]
+    pub(crate) fn paging_storage(&self) -> Option<ext4_core::ContiguousFileStorage> {
+        // SAFETY: The retaining FILE_OBJECT/deferred lease keeps this ledger owner live.
+        unsafe { self.owner.as_ref() }.paging_storage(NonNull::from(self))
+    }
+
+    /// Publishes a home-checkpointed raw initialization observation without changing native bounds.
+    #[expect(
+        unsafe_code,
+        reason = "the exclusive ledger resource serializes the retained initialization fact"
+    )]
+    pub(super) fn publish_paging_storage(&self, storage: ext4_core::ContiguousFileStorage) {
+        // SAFETY: The live FCB retains its immutable ledger identity.
+        unsafe { self.owner.as_ref() }.publish_paging_storage(NonNull::from(self), storage);
+    }
+
     /// Observes the committed archive attribute before selecting a data-only cache write.
     pub(crate) fn archive_is_set(&self) -> bool {
         self.stream_context.archive_is_set()
@@ -523,6 +544,8 @@ impl DurablePublicationOutcome {
 
 /// Mutable FCB lifecycle state owned exclusively by `FileControlBlockLedger`.
 pub(super) struct FileControlBlockOpenState {
+    /// Raw payload initialization retained independently of ext4 unwritten visibility beyond EOF.
+    pub(super) paging_storage: Option<ext4_core::ContiguousFileStorage>,
     /// Handle-owned protection is mutually exclusive with a retained physical relocation.
     pub(super) cluster_mobility: ClusterMobility,
     /// Active FILE_OBJECT opens and their separate native sharing constraints.
@@ -537,6 +560,7 @@ impl FileControlBlockOpenState {
     /// Creates empty share accounting for the first FILE_OBJECT reference.
     pub(super) const fn new() -> Self {
         Self {
+            paging_storage: None,
             cluster_mobility: ClusterMobility::Movable,
             shares: FileObjectShares::new(),
             lifetime: StreamLifetimeState::OpenHandles {

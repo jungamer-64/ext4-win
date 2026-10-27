@@ -109,8 +109,10 @@ impl PagingFileReservation {
     ) -> DriverResult<()> {
         let physical =
             i64::try_from(storage.physical().get()).map_err(|_| DriverError::InvalidParameter)?;
-        let length =
-            i64::try_from(storage.length().bytes()).map_err(|_| DriverError::InvalidParameter)?;
+        let length = i64::try_from(storage.initialized_length().bytes())
+            .map_err(|_| DriverError::InvalidParameter)?;
+        let logical_size = i64::try_from(storage.logical_size().bytes())
+            .map_err(|_| DriverError::InvalidParameter)?;
         #[cfg(not(test))]
         {
             let status = unsafe {
@@ -121,6 +123,7 @@ impl PagingFileReservation {
                     route.filesystem_control_device().as_ptr(),
                     physical,
                     length,
+                    logical_size,
                     route.filesystem_sector_size().as_u32(),
                 )
             };
@@ -130,7 +133,7 @@ impl PagingFileReservation {
         }
         #[cfg(test)]
         {
-            let _inputs = (&mut self, physical, length, route);
+            let _inputs = (&mut self, physical, length, logical_size, route);
             Err(DriverError::NotSupported)
         }
     }
@@ -1915,10 +1918,12 @@ impl StreamContext {
         policy: PurgeFailurePolicy,
     ) -> DriverResult<SealedSectionMutation> {
         if self.is_paging_file() {
-            let (deletion, target) = match operation {
+            let (deletion, target, allocation) = match operation {
                 SectionMutationOperation::Resize(sizes)
-                | SectionMutationOperation::Reset(sizes) => (false, sizes.file_size()),
-                SectionMutationOperation::Delete => (true, 0),
+                | SectionMutationOperation::Reset(sizes) => {
+                    (false, sizes.file_size(), sizes.allocation_size)
+                }
+                SectionMutationOperation::Delete => (true, 0, 0),
                 _ => return Err(DriverError::NotSupported),
             };
             #[cfg(not(test))]
@@ -1928,6 +1933,7 @@ impl StreamContext {
                     self.header.as_ptr(),
                     u8::from(deletion),
                     target,
+                    allocation,
                 )
             } == 0
             {
@@ -1935,7 +1941,7 @@ impl StreamContext {
             }
             #[cfg(test)]
             {
-                let _projection = (deletion, target);
+                let _projection = (deletion, target, allocation);
             }
         }
         loop {
@@ -2405,10 +2411,15 @@ unsafe extern "system" {
         lower: wdk_sys::PDEVICE_OBJECT,
         physical: i64,
         length: i64,
+        logical_size: i64,
         sector_size: u32,
     ) -> NTSTATUS;
-    fn ext4win_stream_paging_mutation_allowed(header: *mut c_void, deletion: u8, target: i64)
-    -> u8;
+    fn ext4win_stream_paging_mutation_allowed(
+        header: *mut c_void,
+        deletion: u8,
+        target: i64,
+        allocation: i64,
+    ) -> u8;
     fn ext4win_stream_paging_length(header: *mut c_void) -> i64;
     fn ext4win_stream_prepare_frozen_data(stream_header: *mut c_void) -> NTSTATUS;
     fn ext4win_stream_data_writable(stream_header: *mut c_void) -> u8;

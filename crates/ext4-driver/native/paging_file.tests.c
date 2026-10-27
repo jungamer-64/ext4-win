@@ -245,6 +245,14 @@ int main(void) {
         assert(ext4win_paging_activate(&setup, TRUE, &lower, 2097152, 131072, 512) == STATUS_INVALID_PARAMETER);
         assert(ext4win_paging_activate(&setup, TRUE, &lower, 1048576, 131072, 512) == STATUS_SUCCESS);
         assert(setup.Length == 131072);
+        assert(ext4win_paging_mutation_allowed(&setup, FALSE, 0, 131072));
+        assert(ext4win_paging_mutation_allowed(&setup, FALSE, 126976, 131072));
+        assert(ext4win_paging_mutation_allowed(&setup, FALSE, 131072, 131072));
+        assert(!ext4win_paging_mutation_allowed(&setup, FALSE, 0, 0));
+        assert(!ext4win_paging_mutation_allowed(&setup, FALSE, -1, 131072));
+        assert(!ext4win_paging_mutation_allowed(&setup, FALSE, 135168, 135168));
+        assert(!ext4win_paging_mutation_allowed(&setup, TRUE, 0, 0));
+        assert(setup.Length == 131072);
         hold_completions = 1;
         first.RequestorMode = KernelMode; first.Flags = IRP_PAGING_IO; first.MdlAddress = &mdl;
         first.Stack[0].MajorFunction = IRP_MJ_WRITE; first.Stack[0].FileObject = &setup;

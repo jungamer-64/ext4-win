@@ -636,12 +636,20 @@ pub enum ChildLookup {
     NotFound,
 }
 
-/// A fully initialized, unprotected regular file occupying one physical byte interval.
+/// The initialized physical allocation and logical EOF of one unprotected regular file.
 ///
-/// This is an epoch-local observation, not permission to bypass the filesystem. A direct-I/O
-/// owner must exclude changes to allocation, size, protection, and data persistence for its lifetime.
+/// This physical initialization observation is valid only in its issuing mount while a fixed-map
+/// owner excludes independent allocation, EOF, protection and persistence changes. Unwritten
+/// extent flags cannot reconstruct it. A provisional mutation result requires home checkpoint
+/// before publication to a physical-I/O owner; releasing mapping exclusion ends its use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContiguousFileStorage {
+    /// Session replacement invalidates the observation even if inode and physical addresses recur.
+    pub(super) mount: super::mount::MountIdentity,
+    /// Inode identity and generation whose excluded physical mapping establishes this byte fact.
+    pub(super) inode: InodeId,
+    /// Allocation retirement and inode reuse invalidate this observation.
+    pub(super) generation: crate::InodeGeneration,
     /// Physical byte address corresponding to file offset zero.
     pub(super) physical: crate::ByteOffset,
     /// Fully initialized physical prefix, including retained allocation beyond EOF.

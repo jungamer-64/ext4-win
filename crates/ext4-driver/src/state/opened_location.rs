@@ -242,8 +242,13 @@ impl LinkTable {
     fn set_pending(&mut self, pending: PendingFileDeletion) {
         let index = self.target(pending.target_ref());
         let link = self.link_mut(index);
-        if matches!(&link.deletion, LinkDeletion::Pending(existing) if existing.cause() == super::FileDeletionCause::DeleteOnClose) { return; }
-        if !matches!(link.deletion, LinkDeletion::Live | LinkDeletion::Pending(_)) { corruption::<()>(); }
+        if matches!(&link.deletion, LinkDeletion::Pending(existing) if existing.cause() == super::FileDeletionCause::DeleteOnClose)
+        {
+            return;
+        }
+        if !matches!(link.deletion, LinkDeletion::Live | LinkDeletion::Pending(_)) {
+            corruption::<()>();
+        }
         link.deletion = LinkDeletion::Pending(pending);
     }
     /// Finalization must match the exact claimed allocation, rather than a reusable name.
@@ -478,9 +483,14 @@ pub(crate) struct OpenedLocationLease {
 impl OpenedLocationLease {
     /// Binds a preallocated target to this retained link and its unique handle-cleanup obligation.
     pub(super) fn arm_paging_cleanup(&self, pending: PendingFileDeletion) {
-        if pending.cause() != super::FileDeletionCause::DeleteOnClose || !self.active.get()
-            || borrow(self.identity.table.get()).target(pending.target_ref()) != self.identity.index()
-            || borrow_mut(&self.paging_cleanup).replace(pending).is_some() { corruption::<()>(); }
+        if pending.cause() != super::FileDeletionCause::DeleteOnClose
+            || !self.active.get()
+            || borrow(self.identity.table.get()).target(pending.target_ref())
+                != self.identity.index()
+            || borrow_mut(&self.paging_cleanup).replace(pending).is_some()
+        {
+            corruption::<()>();
+        }
     }
     /// The returned guard must retire before any namespace publication or suspension.
     pub(crate) fn location(&self) -> Ref<'_, OpenedLocation> {
@@ -501,7 +511,9 @@ impl OpenedLocationLease {
             corruption::<()>();
         }
         let mut table = borrow_mut(self.identity.table.get());
-        if let Some(pending) = borrow_mut(&self.paging_cleanup).take() { table.set_pending(pending); }
+        if let Some(pending) = borrow_mut(&self.paging_cleanup).take() {
+            table.set_pending(pending);
+        }
         table.deactivate(self.identity.index());
     }
     /// Normal disposition cancellation cannot revoke mandatory delete-on-close.
@@ -711,8 +723,12 @@ mod tests {
     /// Fails if a shared control handle consumes the paging owner's deletion or prevents a later
     /// control reopen before owner cleanup, or if cleanup can unlink a still-active control link.
     #[test]
-    #[expect(clippy::panic_in_result_fn, reason = "assertions observe paging-owner cleanup through ordinary live-link admission and final-link deletion")]
-    fn paging_owner_deletion_waits_for_its_cleanup_and_remaining_control_handles() -> DriverResult<()> {
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions observe paging-owner cleanup through ordinary live-link admission and final-link deletion"
+    )]
+    fn paging_owner_deletion_waits_for_its_cleanup_and_remaining_control_handles()
+    -> DriverResult<()> {
         let mut links = OpenedLocations::new();
         let owner = links.acquire(location(b"paging")?)?;
         let deletion = PendingFileDeletion::try_from_delete_on_close(&owner.location())?;
@@ -725,10 +741,16 @@ mod tests {
         assert_eq!(links.claim_deletion(), FileCleanupDisposition::Retained);
         let remaining = links.acquire(location(b"paging")?)?;
         owner.cleanup();
-        assert_eq!(links.ensure_openable(Some(&location(b"paging")?)), Err(DriverError::DeletePending));
+        assert_eq!(
+            links.ensure_openable(Some(&location(b"paging")?)),
+            Err(DriverError::DeletePending)
+        );
         assert_eq!(links.claim_deletion(), FileCleanupDisposition::Retained);
         remaining.cleanup();
-        assert_eq!(links.claim_deletion(), FileCleanupDisposition::Delete(target));
+        assert_eq!(
+            links.claim_deletion(),
+            FileCleanupDisposition::Delete(target)
+        );
         links.finish_deletion(target, LinkDeletionOutcome::Removed);
         Ok(())
     }

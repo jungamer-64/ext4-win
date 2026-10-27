@@ -24,6 +24,7 @@ typedef struct _EXT4WIN_PAGING_FILE {
     PFILE_OBJECT Owner;
     PDEVICE_OBJECT Lower;
     LONGLONG PhysicalStart;
+    /* Core-acknowledged initialized physical bound, independent of logical Header.FileSize. */
     LONGLONG Length;
     ULONG SectorSize;
 } EXT4WIN_PAGING_FILE, *PEXT4WIN_PAGING_FILE;
@@ -68,6 +69,22 @@ ext4win_paging_abort(PEXT4WIN_PAGING_FILE map, BOOLEAN extension)
         KeSetEvent(&map->SetupDone, IO_NO_INCREMENT, FALSE);
     }
     KeReleaseSpinLock(&map->Lock, irql);
+}
+
+/* Logical EOF may move within the initialized map without releasing its physical tail.
+ * Preparing/Extending own their separate bounded initialization authority. */
+static BOOLEAN
+ext4win_paging_mutation_allowed(PEXT4WIN_PAGING_FILE map, BOOLEAN deletion, LONGLONG target, LONGLONG allocation)
+{
+    KIRQL irql;
+    BOOLEAN allowed;
+    KeAcquireSpinLock(&map->Lock, &irql);
+    allowed = deletion ? map->Active == EXT4WIN_PAGING_RETIRED :
+        (target >= 0 && allocation >= target && (map->Active == EXT4WIN_PAGING_PREPARING ||
+         (map->Active == EXT4WIN_PAGING_EXTENDING && allocation >= map->Length) ||
+         (map->Active == EXT4WIN_PAGING_ACTIVE && target <= map->Length && allocation >= map->Length)));
+    KeReleaseSpinLock(&map->Lock, irql);
+    return allowed;
 }
 
 static NTSTATUS

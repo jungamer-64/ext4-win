@@ -519,6 +519,10 @@ pub(crate) struct PagingFileSetupLease {
 }
 
 impl PagingFileSetupLease {
+    /// Borrows the old active map's core initialization observation under the ledger resource.
+    pub(crate) fn storage(&self) -> Option<ext4_core::ContiguousFileStorage> {
+        self.stream.stream().paging_storage()
+    }
     /// Returns the fixed old prefix whose direct paging I/O remains admitted during extension.
     pub(crate) const fn claim(&self) -> crate::kernel::stream::PagingFileClaim {
         self.native.claim()
@@ -540,7 +544,9 @@ impl PagingFileSetupLease {
         storage: ext4_core::ContiguousFileStorage,
         route: crate::kernel::storage::MountedStorageRoute,
     ) -> DriverResult<()> {
-        self.native.activate(storage, route)
+        self.native.activate(storage, route)?;
+        self.stream.stream().publish_paging_storage(storage);
+        Ok(())
     }
 }
 
@@ -2686,6 +2692,41 @@ impl FileControlBlockLedger {
                 .reserve_paging_file(file_object, extension)?
         };
         Ok(PagingFileSetupLease { native, stream })
+    }
+
+    /// Returns only the core-issued initialization observation under this ledger's mutation lock.
+    #[expect(
+        unsafe_code,
+        reason = "the retaining FCB and exclusive ledger resource protect its initialization field"
+    )]
+    pub(super) fn paging_storage(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+    ) -> Option<ext4_core::ContiguousFileStorage> {
+        let _guard = self.lock.acquire();
+        // SAFETY: The caller retains this exact ledger-owned FCB through the locked observation.
+        let stream = unsafe { fcb.as_ref() };
+        // SAFETY: This field is accessed only under the same exclusive ledger resource.
+        unsafe { (*stream.open_state.get()).paging_storage }
+    }
+
+    /// Publishes the completed physical observation while native mapping exclusion remains active.
+    #[expect(
+        unsafe_code,
+        reason = "the retaining setup lease and exclusive ledger resource own this publication"
+    )]
+    pub(super) fn publish_paging_storage(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        storage: ext4_core::ContiguousFileStorage,
+    ) {
+        let _guard = self.lock.acquire();
+        // SAFETY: Setup/deferred lifetime retains this table entry through publication.
+        let stream = unsafe { fcb.as_ref() };
+        // SAFETY: The same resource excludes every initialization observer and publisher.
+        unsafe {
+            (*stream.open_state.get()).paging_storage = Some(storage);
+        }
     }
 
     /// Retires freed allocations before any fallible native projection, preserving their exact

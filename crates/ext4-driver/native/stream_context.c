@@ -209,14 +209,15 @@ ext4win_stream_abort_paging_file(PVOID header, BOOLEAN extension)
 
 NTSTATUS NTAPI
 ext4win_stream_activate_paging_file(PVOID header, BOOLEAN extension, PDEVICE_OBJECT lower,
-    LONGLONG physical, LONGLONG length, ULONG sector_size)
+    LONGLONG physical, LONGLONG length, LONGLONG logical_size, ULONG sector_size)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
     NTSTATUS status;
     if (stream == NULL || lower == NULL || physical < 0 || length <= 0 ||
         physical > MAXLONGLONG - length || sector_size == 0 ||
         ((ULONGLONG)physical % sector_size) != 0 || ((ULONGLONG)length % sector_size) != 0 ||
-        stream->Header.FileSize.QuadPart != length) { return STATUS_INVALID_PARAMETER; }
+        logical_size < 0 || logical_size > length ||
+        stream->Header.FileSize.QuadPart != logical_size) { return STATUS_INVALID_PARAMETER; }
     status = ext4win_paging_activate(&stream->PagingFile, extension, lower, physical, length, sector_size);
     if (NT_SUCCESS(status) && !extension) {
         stream->Header.Flags2 &= (UCHAR)~FSRTL_FLAG2_SUPPORTS_FILTER_CONTEXTS;
@@ -227,18 +228,11 @@ ext4win_stream_activate_paging_file(PVOID header, BOOLEAN extension, PDEVICE_OBJ
 }
 
 BOOLEAN NTAPI
-ext4win_stream_paging_mutation_allowed(PVOID header, BOOLEAN deletion, LONGLONG target)
+ext4win_stream_paging_mutation_allowed(PVOID header, BOOLEAN deletion, LONGLONG target, LONGLONG allocation)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
-    KIRQL irql;
-    BOOLEAN allowed;
     if (stream == NULL) { return FALSE; }
-    KeAcquireSpinLock(&stream->PagingFile.Lock, &irql);
-    allowed = deletion ? stream->PagingFile.Active == EXT4WIN_PAGING_RETIRED :
-        (stream->PagingFile.Active == EXT4WIN_PAGING_PREPARING ||
-         (stream->PagingFile.Active == EXT4WIN_PAGING_EXTENDING && target >= stream->PagingFile.Length));
-    KeReleaseSpinLock(&stream->PagingFile.Lock, irql);
-    return allowed;
+    return ext4win_paging_mutation_allowed(&stream->PagingFile, deletion, target, allocation);
 }
 
 LONGLONG NTAPI

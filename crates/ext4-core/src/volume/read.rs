@@ -13,7 +13,9 @@ pub(super) fn initialized_contiguous_storage(
     size: BlockSize,
     context: ExtentTreeContext,
     source: &mut impl crate::disk_format::extent::ExtentNodeReader,
-) -> Result<super::node::ContiguousFileStorage> {
+    mount: super::mount::MountIdentity,
+    retained: Option<super::node::ContiguousFileStorage>,
+) -> Result<Option<super::node::ContiguousFileStorage>> {
     inode.file_payload_mutation()?;
     if inode.protection() != crate::disk_format::inode::InodeProtection::Plain
         || inode.data_persistence() == crate::disk_format::inode::FileDataPersistence::Journaled
@@ -22,21 +24,51 @@ pub(super) fn initialized_contiguous_storage(
     {
         return Err(Error::UnsupportedInodeMutation);
     }
-    let crate::disk_format::inode::InodeStorage::Extents(root) = inode.storage() else {
-        return Err(Error::UnsupportedInodeMutation);
+    let root = match inode.storage() {
+        crate::disk_format::inode::InodeStorage::Extents(root) => root,
+        crate::disk_format::inode::InodeStorage::InlineData(data)
+            if inode.size().bytes() == 0 && data.file()?.is_empty() =>
+        {
+            return Ok(None);
+        }
+        _ => return Err(Error::UnsupportedInodeMutation),
     };
     let bytes = u64::from(size.bytes());
-    let length = inode.size();
-    if length.bytes() == 0 {
-        return Err(Error::InvalidWriteRange);
-    }
-    let blocks = length
-        .bytes()
-        .checked_add(bytes - 1)
-        .ok_or(Error::ArithmeticOverflow)?
-        .checked_div(bytes)
-        .ok_or(Error::ArithmeticOverflow)?;
+    let logical_size = inode.size();
     let mut mapping = ExtentMappingCursor::new(root, size, context)?;
+    let allocated_blocks = mapping.allocation_end(source)?;
+    let blocks = if let Some(retained) = retained {
+        if retained.mount != mount
+            || retained.inode != inode.id()
+            || retained.generation != inode.generation()
+            || !retained.initialized_length.bytes().is_multiple_of(bytes)
+        {
+            return Err(Error::InvalidWriteRange);
+        }
+        let blocks = retained
+            .initialized_length
+            .bytes()
+            .checked_div(bytes)
+            .ok_or(Error::ArithmeticOverflow)?;
+        if blocks > allocated_blocks {
+            return Err(Error::InvalidWriteRange);
+        }
+        blocks
+    } else {
+        allocated_blocks
+    };
+    let initialized_length =
+        FileSize::from_bytes(blocks.checked_mul(bytes).ok_or(Error::ArithmeticOverflow)?);
+    if initialized_length.bytes() == 0 {
+        return if logical_size.bytes() == 0 {
+            Ok(None)
+        } else {
+            Err(Error::UnsupportedInodeMutation)
+        };
+    }
+    if logical_size > initialized_length {
+        return Err(Error::UnsupportedInodeMutation);
+    }
     let mut cursor = 0_u64;
     let mut origin = None;
     while cursor < blocks {
@@ -50,8 +82,16 @@ pub(super) fn initialized_contiguous_storage(
             .ok_or(Error::InvalidExtentTree)?,
             source,
         )?;
-        let ExtentBlockRun::Initialized { physical_start, .. } = run else {
-            return Err(Error::UnsupportedInodeMutation);
+        let physical_start = match run {
+            ExtentBlockRun::Initialized { physical_start, .. } => physical_start,
+            ExtentBlockRun::Uninitialized { physical_start, .. }
+                if retained.is_some()
+                    && cursor.checked_mul(bytes).ok_or(Error::ArithmeticOverflow)?
+                        >= logical_size.bytes() =>
+            {
+                physical_start
+            }
+            _ => return Err(Error::UnsupportedInodeMutation),
         };
         let physical = size.offset_of(physical_start)?.get();
         let base = *origin.get_or_insert(physical);
@@ -64,10 +104,14 @@ pub(super) fn initialized_contiguous_storage(
             .checked_add(run.blocks().get())
             .ok_or(Error::ArithmeticOverflow)?;
     }
-    Ok(super::node::ContiguousFileStorage {
+    Ok(Some(super::node::ContiguousFileStorage {
+        mount,
+        inode: inode.id(),
+        generation: inode.generation(),
         physical: ByteOffset::new(origin.ok_or(Error::InvalidExtentTree)?),
-        length,
-    })
+        initialized_length,
+        logical_size,
+    }))
 }
 
 impl EpochReadView<'_, '_> {
@@ -475,7 +519,8 @@ impl EpochReadView<'_, '_> {
 
     /// Validates an initialized, contiguous regular-file payload for an external fixed-map owner.
     /// # Errors
-    /// Rejects empty, resident, sparse, unwritten, fragmented, protected, or data-journaled files.
+    /// Rejects absent initialized allocation, resident data, sparse/unwritten or fragmented ranges,
+    /// protected files and data-journaled payloads.
     pub(super) fn contiguous_file_storage(
         &mut self,
         id: FileNodeId,
@@ -497,7 +542,10 @@ impl EpochReadView<'_, '_> {
             self.superblock.block_size(),
             context,
             &mut self.device,
-        )
+            *self.mount.ok_or(Error::InvalidWriteRange)?,
+            None,
+        )?
+        .ok_or(Error::InvalidWriteRange)
     }
 
     /// Observes one payload allocation run without reading file contents or building a full tree.

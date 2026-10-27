@@ -907,32 +907,72 @@ impl MutationResolvePass<'_, '_, '_> {
         file: FileNodeId,
     ) -> Result<super::node::ContiguousFileStorage> {
         self.edit(|pass| {
-            let raw = pass.mutation.raw_inode_for_policy(file.inode())?;
-            let inode = raw.parse()?;
-            if inode.kind() != InodeKind::File {
-                return Err(Error::WrongInodeKind);
-            }
-            if pass
-                .mutation
-                .xattr_set_for_raw_inode(&raw)?
-                .public()
-                .entries()
-                .any(|(name, _)| {
-                    name.namespace() == crate::XattrNamespace::Security
-                        && name.local() == b"capability"
-                })
-            {
-                return Err(Error::UnsupportedInodeMutation);
-            }
-            let context = pass.mutation.volume.extent_tree_context(&inode);
-            let size = pass.mutation.volume.superblock.block_size();
-            let mut source = TransactionExtentSource {
-                device: &mut pass.mutation.volume.device,
-                staged: &pass.mutation.extent_updates,
-                block_size: size,
-            };
-            super::read::initialized_contiguous_storage(&inode, size, context, &mut source)
+            pass.contiguous_file_allocation(file, None)?
+                .ok_or(Error::InvalidWriteRange)
         })
+    }
+
+    /// Revalidates a core-issued physical initialization observation while its fixed-map owner
+    /// excludes allocation retirement, inode reuse and independent mapping/protection changes.
+    /// Unwritten extents beyond EOF retain raw initialized bytes but cannot recreate this fact.
+    /// # Errors
+    /// Rejects a stale inode, generation, physical interval, missing allocation or invalid payload.
+    pub fn retained_contiguous_file_storage(
+        &mut self,
+        file: FileNodeId,
+        retained: super::node::ContiguousFileStorage,
+    ) -> Result<super::node::ContiguousFileStorage> {
+        self.edit(|pass| {
+            pass.contiguous_file_allocation(file, Some(retained))?
+                .ok_or(Error::InvalidWriteRange)
+        })
+    }
+
+    /// Empty initialized allocation is a valid starting state for bounded initialization.
+    /// # Errors
+    /// Preserves malformed, protected, discontinuous or uninitialized allocation failures.
+    fn contiguous_file_allocation(
+        &mut self,
+        file: FileNodeId,
+        retained: Option<super::node::ContiguousFileStorage>,
+    ) -> Result<Option<super::node::ContiguousFileStorage>> {
+        let raw = self.mutation.raw_inode_for_policy(file.inode())?;
+        let inode = raw.parse()?;
+        if inode.kind() != InodeKind::File {
+            return Err(Error::WrongInodeKind);
+        }
+        if self
+            .mutation
+            .xattr_set_for_raw_inode(&raw)?
+            .public()
+            .entries()
+            .any(|(name, _)| {
+                name.namespace() == crate::XattrNamespace::Security && name.local() == b"capability"
+            })
+        {
+            return Err(Error::UnsupportedInodeMutation);
+        }
+        let context = self.mutation.volume.extent_tree_context(&inode);
+        let size = self.mutation.volume.superblock.block_size();
+        let mut source = TransactionExtentSource {
+            device: &mut self.mutation.volume.device,
+            staged: &self.mutation.extent_updates,
+            block_size: size,
+        };
+        let storage = super::read::initialized_contiguous_storage(
+            &inode,
+            size,
+            context,
+            &mut source,
+            *self.mutation.volume.mount.ok_or(Error::InvalidWriteRange)?,
+            retained,
+        )?;
+        if retained.is_some_and(|retained| {
+            storage.is_none_or(|storage| storage.physical() != retained.physical())
+        }) {
+            return Err(Error::ClusterReferenceConflict);
+        }
+        Ok(storage)
     }
 
     /// Observes this pass's latest staged inode metadata.

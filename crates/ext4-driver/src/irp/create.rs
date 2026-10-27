@@ -63,7 +63,9 @@ impl CreateParameters {
         let desired_access = DesiredAccess::from_raw(desired_access);
         let file_mode = if stack_flag(stack_flags, wdk_sys::SL_OPEN_PAGING_FILE) {
             CreateFileMode::PagingFile
-        } else { CreateFileMode::Ordinary };
+        } else {
+            CreateFileMode::Ordinary
+        };
         let share_access = ShareAccess::from_raw(share_access)?;
         let disposition = CreateDisposition::from_options(options)?;
         let create_options = CreateOptions::decode(options, desired_access, file_mode)?;
@@ -116,7 +118,9 @@ impl CreateParameters {
     pub(crate) const fn existing_operation_required_access(self) -> wdk_sys::ACCESS_MASK {
         // Kernel paging setup owns its reset and cleanup; those operations do not add ordinary
         // handle DELETE or metadata rights to the Memory Manager's requested share contract.
-        if matches!(self.file_mode, CreateFileMode::PagingFile) { return 0; }
+        if matches!(self.file_mode, CreateFileMode::PagingFile) {
+            return 0;
+        }
         match self.disposition {
             CreateDisposition::Overwrite | CreateDisposition::OverwriteIf => {
                 wdk_sys::FILE_WRITE_DATA | wdk_sys::FILE_WRITE_EA | wdk_sys::FILE_WRITE_ATTRIBUTES
@@ -1299,9 +1303,15 @@ impl CreateDeletion {
     ///
     /// Ordinary delete-on-close requires `DELETE`. Paging intent is consumed only after the
     /// create boundary has independently required a kernel requestor.
-    fn from_options(options: wdk_sys::ULONG, desired_access: DesiredAccess, mode: CreateFileMode) -> DriverResult<Self> {
+    fn from_options(
+        options: wdk_sys::ULONG,
+        desired_access: DesiredAccess,
+        mode: CreateFileMode,
+    ) -> DriverResult<Self> {
         if create_option_selected(options, wdk_sys::FILE_DELETE_ON_CLOSE) {
-            if matches!(mode, CreateFileMode::PagingFile) { return Ok(Self::KernelPagingDeleteOnClose); }
+            if matches!(mode, CreateFileMode::PagingFile) {
+                return Ok(Self::KernelPagingDeleteOnClose);
+            }
             if !desired_access.requests(wdk_sys::DELETE) {
                 return Err(DriverError::AccessDenied);
             }
@@ -1312,7 +1322,9 @@ impl CreateDeletion {
     }
 
     /// Whether cleanup must remove the selected link, regardless of how that authority arose.
-    pub(crate) const fn deletes_on_close(self) -> bool { !matches!(self, Self::Retain) }
+    pub(crate) const fn deletes_on_close(self) -> bool {
+        !matches!(self, Self::Retain)
+    }
 }
 
 impl CreateNameInterpretation {
@@ -1367,7 +1379,11 @@ impl CreateOptions {
     /// # Errors
     ///
     /// Returns an error when create options include bits outside the accepted ext4win boundary.
-    fn decode(options: wdk_sys::ULONG, desired_access: DesiredAccess, mode: CreateFileMode) -> DriverResult<Self> {
+    fn decode(
+        options: wdk_sys::ULONG,
+        desired_access: DesiredAccess,
+        mode: CreateFileMode,
+    ) -> DriverResult<Self> {
         let raw_options = options & CREATE_OPTIONS_MASK;
         if raw_options & !ACCEPTED_CREATE_OPTIONS != 0 {
             return Err(DriverError::NotSupported);
