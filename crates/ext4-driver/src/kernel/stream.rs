@@ -2441,10 +2441,6 @@ unsafe extern "system" {
         chain: *mut wdk_sys::PMDL,
         information: *mut usize,
     ) -> NTSTATUS;
-    fn ext4win_stream_cache_initialize(
-        header: *mut c_void,
-        file: wdk_sys::PFILE_OBJECT,
-    ) -> NTSTATUS;
     fn ext4win_stream_create(
         kind: wdk_sys::ULONG,
         allocation_size: i64,
