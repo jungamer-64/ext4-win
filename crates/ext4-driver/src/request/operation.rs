@@ -83,6 +83,8 @@ macro_rules! impl_mounted_operation_adapter {
 #[path = "operation/directory.rs"]
 mod directory;
 pub(crate) use directory::query_directory;
+mod verify;
+pub(crate) use verify::{verify_volume, verify_before_admission};
 mod mdl;
 pub(crate) use mdl::mdl;
 mod cleanup;
@@ -329,7 +331,7 @@ impl MountRequestOperation {
                     devices,
                     probe: suspended,
                 };
-                OperationTransition::SubmitLower {
+                OperationTransition::SubmitMountLower {
                     devices: route,
                     request,
                     suspended: self,
@@ -414,7 +416,7 @@ impl MountRequestOperation {
                     devices,
                     mount: suspended,
                 };
-                OperationTransition::SubmitLower {
+                OperationTransition::SubmitMountLower {
                     devices: route,
                     request,
                     suspended: self,
@@ -521,7 +523,7 @@ impl MountRequestOperation {
                     candidate,
                     probe: suspended,
                 };
-                OperationTransition::SubmitLower {
+                OperationTransition::SubmitMountLower {
                     devices: route,
                     request,
                     suspended: self,
@@ -568,7 +570,7 @@ impl MountRequestOperation {
                     context,
                     probe: suspended,
                 };
-                OperationTransition::SubmitLower {
+                OperationTransition::SubmitMountLower {
                     devices: route,
                     request,
                     suspended: self,

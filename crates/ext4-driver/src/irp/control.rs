@@ -191,6 +191,8 @@ impl MdlAction {
 pub(crate) enum FileSystemControlMinorFunction {
     /// I/O Manager mount request.
     MountVolume,
+    /// Kernel I/O Manager verification of an already mounted volume.
+    VerifyVolume,
     /// User FSCTL request.
     UserFsRequest,
     /// Unsupported file-system-control minor function.

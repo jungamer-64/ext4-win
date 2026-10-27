@@ -24,6 +24,10 @@ pub enum Error {
     DeviceRange,
     /// The backing device failed an in-range I/O request.
     DeviceIo,
+    /// The device refused a zero-progress request until its mounted media identity is verified.
+    MediaVerificationRequired,
+    /// The physical device no longer belongs to the mounted media identity.
+    MediaChanged,
     /// The platform cryptographic provider rejected a valid operation request.
     CryptographicFailure,
     /// The requested byte range overflowed integer arithmetic.
@@ -148,6 +152,8 @@ impl fmt::Display for Error {
             Self::ReadConflict => "read dependency changed during storage I/O",
             Self::DeviceRange => "block read is outside the backing device",
             Self::DeviceIo => "backing device I/O request failed",
+            Self::MediaVerificationRequired => "device requires mounted-media verification before I/O",
+            Self::MediaChanged => "physical media identity differs from the mounted filesystem",
             Self::CryptographicFailure => "platform cryptographic operation failed",
             Self::ArithmeticOverflow => "arithmetic overflow while mapping ext4 data",
             Self::TruncatedStructure => "on-disk structure is truncated",

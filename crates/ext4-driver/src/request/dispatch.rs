@@ -692,6 +692,24 @@ pub(crate) fn admit_owned(
     {
         return Err(AdmitOperationError::new(error, owned));
     }
+    if matches!(target, ReactorTarget::MountedVolume(_))
+        && owned.allows_media_verification()
+        && !matches!(owned.actor_request(), ActorRequest::Cleanup | ActorRequest::Close | ActorRequest::Captured(PreparedRequest::QueryRemove))
+    {
+        let device = owned.request().with_active(|active| active.device());
+        let query = match crate::state::MountedVolumeDevice::prepare_verify_work(device) {
+            Ok(query) => query,
+            Err(error) => {
+                if error == DriverError::WrongVolume { target.with_mounted_access(|access| access.record_media_changed()); }
+                return Err(AdmitOperationError::new(error, owned));
+            }
+        };
+        if let Some(query) = query {
+            if let Err(error) = owned.claim_media_verification() { return Err(AdmitOperationError::new(error, owned)); }
+            let operation = super::operation::verify_before_admission(owned, query)?;
+            return Ok(AdmittedRequest::Operation(AdmittedOperation::new(operation, OperationAdmission::Device)));
+        }
+    }
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum HandleRequestClass {
         Device,
@@ -718,6 +736,7 @@ pub(crate) fn admit_owned(
         Close,
         Mdl(crate::irp::MdlTransfer),
         Mount(super::file_system_control::MountAdmission),
+        Verify(crate::irp::VerifyVolumeTarget),
         Read(ReadRequestKind),
         Directory,
         Raw(crate::state::RawVolumeOperationKind),
@@ -736,6 +755,12 @@ pub(crate) fn admit_owned(
 
     let admission = match owned.actor_request() {
         ActorRequest::Captured(PreparedRequest::Administration(_)) => Admission::Administration,
+        ActorRequest::Captured(PreparedRequest::VerifyVolume(verify)) => {
+            if !matches!(target, ReactorTarget::MountedVolume(_)) {
+                return Err(AdmitOperationError::new(DriverError::InvalidDeviceRequest, owned));
+            }
+            Admission::Verify(*verify)
+        }
         ActorRequest::Captured(PreparedRequest::Mdl(action)) => Admission::Mdl(*action),
         ActorRequest::Captured(PreparedRequest::Read(_)) => Admission::Read(ReadRequestKind::Read),
         ActorRequest::Captured(PreparedRequest::QueryInformation) => {
@@ -929,7 +954,7 @@ pub(crate) fn admit_owned(
     };
     let handle_class = match &admission {
         Admission::Mdl(_) => HandleRequestClass::Ordinary,
-        Admission::Administration | Admission::Mount(_) | Admission::QueryRemove => {
+        Admission::Administration | Admission::Mount(_) | Admission::Verify(_) | Admission::QueryRemove => {
             HandleRequestClass::Device
         }
                     crate::irp::FsControlCode::IsPathnameValid => {
@@ -1070,9 +1095,13 @@ pub(crate) fn admit_owned(
                 target.with_mounted_access(|access| super::operation::mdl(owned, action, access))
             }
             Admission::Mount(admission) => {
+                if !matches!(target, ReactorTarget::ControlDevice(_)) {
+                    return Err(AdmitOperationError::new(DriverError::InvalidDeviceRequest, owned));
+                }
                 target.require_control_device();
                 super::operation::mount(owned, admission, trace)
             }
+            Admission::Verify(verify) => target.with_mounted_access(|access| super::operation::verify_volume(owned, verify, access)),
             Admission::Directory => target
                 .with_mounted_access(|access| super::operation::query_directory(owned, access)),
             Admission::Read(kind) => {

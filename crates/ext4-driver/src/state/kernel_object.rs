@@ -654,7 +654,7 @@ impl KernelVpb {
     /// Converts a raw WDK VPB pointer into the non-null boundary type.
     /// # Safety
     ///
-    /// A non-null pointer must identify a live I/O Manager-owned `VPB` for the mount operation.
+    /// A non-null pointer must identify a live I/O Manager-owned `VPB` for the mount or verify operation.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"

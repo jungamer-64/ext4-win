@@ -17,6 +17,8 @@ mod metadata_cache;
 mod metadata_image;
 mod mmp;
 mod mount;
+mod media_verification;
+pub use media_verification::{MediaVerificationOperation, MediaVerificationTransition, MediaVerificationOutcome};
 pub(crate) use metadata_cache::CacheReadStamp;
 pub use metadata_cache::{MetadataCache, MetadataCacheAccess};
 pub use mmp::{

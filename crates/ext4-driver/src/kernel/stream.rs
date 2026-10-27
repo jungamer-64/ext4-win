@@ -442,6 +442,12 @@ impl StorageRemovalPublisher {
 }
 
 impl VolumeStorageAccess {
+    /// Binds the real device once while mount still owns unpublished native admission.
+    /// # Errors
+    /// Rejects duplicate admission initialization before mount publication.
+    pub(crate) fn bind_verification_device(self, device: super::volume_verify::VerificationDevice) -> DriverResult<()> {
+        self.state().bind_verification_device(device)
+    }
     /// Claims independent create exclusion while a clean locked volume removes a key.
     /// # Errors
     /// Returns device busy if a key-removal lease already owns the exclusion.
@@ -504,6 +510,7 @@ impl VolumeStorageAccess {
     /// Returns media revocation or create exclusion without granting mutation authority.
     pub(crate) fn authorize_create(self) -> DriverResult<()> {
         self.authorize()?;
+        if self.state().verification_required() { return Err(DriverError::VerifyRequired); }
         if self.state().creates_admitted() {
             Ok(())
         } else {

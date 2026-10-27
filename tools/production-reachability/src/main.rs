@@ -142,6 +142,7 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "native reparse admission",
         "FsRtlValidateReparsePointBuffer",
     ("native tunnel initialization", "FsRtlInitializeTunnelCache"),
+    ("I/O Manager media verification", "IoVerifyVolume"),
     ("native tunnel admission", "FsRtlAddToTunnelCache"),
     ("native tunnel lookup", "FsRtlFindInTunnelCache"),
     ("native tunnel release", "FsRtlDeleteTunnelCache"),
@@ -2465,6 +2466,7 @@ mod tests {
              CcSetAdditionalCacheAttributesEx\n\
              EtwRegister\n\
              FsRtlInitializeTunnelCache\n\
+             IoVerifyVolume\n\
              FsRtlAddToTunnelCache\n\
              FsRtlFindInTunnelCache\n\
              FsRtlDeleteTunnelCache\n\

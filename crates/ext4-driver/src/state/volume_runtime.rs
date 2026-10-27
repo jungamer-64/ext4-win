@@ -414,9 +414,16 @@ impl VolumeRuntime {
     ///
     /// Returns an error when reads are no longer authorized.
     pub(crate) fn acquire_epoch(&mut self) -> DriverResult<EpochLease> {
-        self.authorize_ownership()?;
-        self.failure.authorize_read()?;
+        self.authorize_media_read()?;
         self.epochs.acquire_current()
+    }
+
+    /// Requires current ownership and read reliability without acquiring another epoch lease.
+    /// # Errors
+    /// Returns revoked ownership or terminal read failure; verification never resets either.
+    pub(crate) fn authorize_media_read(&self) -> DriverResult<()> {
+        self.authorize_ownership()?;
+        self.failure.authorize_read()
     }
 
     /// Current epoch for one non-suspending projection.
@@ -840,6 +847,13 @@ impl VolumeRuntime {
     /// Marks lower reads untrustworthy.
     pub(crate) fn record_read_unreliable(&mut self) {
         self.set_failure(self.failure.read_unreliable());
+    }
+
+    /// A replacement medium invalidates every prepared grant and native cache admission.
+    /// Physical ownership is revoked without issuing a clean marker to the replacement medium.
+    pub(crate) fn record_media_changed(&mut self) {
+        self.revoke_media_ownership();
+        self.record_read_unreliable();
     }
 
     /// Records an exact post-commit Cc/MM publication failure and stream progress.

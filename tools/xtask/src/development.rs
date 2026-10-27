@@ -247,6 +247,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native mount event failure and temporary stream ownership contract",
         ),
         (
+            "volume-verify",
+            "volume_verify.tests.c",
+            "native verify delegation, exact status and isolated atomic flag acknowledgment",
+        ),
+        (
             "fast-io-transfer",
             "fast_io_transfer.tests.c",
             "native Fast I/O transfer admission contract",

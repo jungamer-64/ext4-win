@@ -28,6 +28,10 @@ pub(crate) enum DriverError {
     MountFailure(ext4_core::MountFailure),
     /// IRP is not valid for this device or stack state.
     InvalidDeviceRequest,
+    /// Fresh physical metadata does not identify this mounted filesystem.
+    WrongVolume,
+    /// The physical device requires identity verification before any cached or lower data access.
+    VerifyRequired,
     /// Caller supplied parameters outside the accepted FSD boundary.
     InvalidParameter,
     /// A Windows component cannot be represented by the namespace boundary.
@@ -170,6 +174,8 @@ impl DriverError {
     pub(crate) const fn ntstatus(self) -> NTSTATUS {
         match self {
             Self::InvalidDeviceRequest => STATUS_INVALID_DEVICE_REQUEST,
+            Self::WrongVolume => wdk_sys::STATUS_WRONG_VOLUME,
+            Self::VerifyRequired => wdk_sys::STATUS_VERIFY_REQUIRED,
             Self::InvalidParameter | Self::InvalidName | Self::InvalidWindowsMetadata => {
                 STATUS_INVALID_PARAMETER
             }
@@ -279,6 +285,8 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::ReadConflict => wdk_sys::STATUS_RETRY,
         Error::StaleReadContext => STATUS_INTERNAL_ERROR,
         Error::DeviceIo | Error::CryptographicFailure => STATUS_IO_DEVICE_ERROR,
+                Error::MediaVerificationRequired => wdk_sys::STATUS_VERIFY_REQUIRED,
+                Error::MediaChanged => wdk_sys::STATUS_WRONG_VOLUME,
         Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
         Error::UnsupportedBlockSize
         | Error::UnsupportedIncompatFeature

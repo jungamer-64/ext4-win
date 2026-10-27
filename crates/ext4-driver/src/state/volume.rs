@@ -717,6 +717,18 @@ impl MountedVolumeAccess<'_> {
         self.storage_access().authorize()
     }
 
+    /// Revalidates the original operation's current reliability after same-media verification.
+    /// # Errors
+    /// Removal, revoked ownership or a failed runtime prevents reissuing even a zero-progress I/O.
+    #[cfg(not(test))]
+    pub(crate) fn authorize_storage_resumption(&self, request: &ext4_core::StorageRequest) -> DriverResult<()> {
+        self.authorize_storage()?;
+        match request {
+            ext4_core::StorageRequest::Read { .. } => self.runtime.authorize_media_read(),
+            ext4_core::StorageRequest::Write { .. } | ext4_core::StorageRequest::Flush { .. } => self.runtime.authorize_durability(),
+        }
+    }
+
     /// Retains one same-thread lower-submission permit through IoCallDriver's return.
     /// # Errors
     ///
@@ -1909,6 +1921,11 @@ impl MountedVolumeAccess<'_> {
     /// Records that committed reads can no longer be trusted.
     pub(crate) fn record_read_unreliable(&mut self) {
         self.runtime.record_read_unreliable();
+    }
+
+    /// Revokes old epochs, commit grants and native cache access after physical identity changed.
+    pub(crate) fn record_media_changed(&mut self) {
+        self.runtime.record_media_changed();
     }
 
     /// Records an exact post-commit Cc/MM publication failure and its aggregate stream progress.

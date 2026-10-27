@@ -13,6 +13,20 @@ pub(crate) struct MountVolumeStack {
     pub(super) output_buffer_length: IrpBufferLength,
 }
 
+/// Kernel-origin verify tuple whose I/O Manager ownership lasts through the original IRP.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VerifyVolumeTarget {
+    /// Mounted filesystem volume device, rather than a requestor-supplied file handle.
+    pub(crate) device: KernelDevice,
+    /// Original mounted association retained by the I/O Manager.
+    pub(crate) vpb: KernelVpb,
+}
+
+#[expect(unsafe_code, reason = "kernel-origin capture and the original pending verify IRP retain both nonpaged I/O Manager identities")]
+// SAFETY: The I/O Manager retains the mounted device and VPB until verify completion; moving
+// these opaque observations exposes no references or mutation outside the mounted actor.
+unsafe impl Send for VerifyVolumeTarget {}
+
 /// Decoded user file-system-control stack parameters.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FileSystemControlStack {
@@ -167,6 +181,8 @@ pub(crate) enum SetFileOperation<'owner> {
     Resize,
     /// Cache Manager notification that only advances on-disk valid-data length.
     AdvanceValidDataLength,
+    /// Explicit privileged valid-data-length assignment.
+    ValidDataLength,
     /// Physical allocation and optional EOF reduction.
     Allocation,
     /// Boolean namespace deletion state.

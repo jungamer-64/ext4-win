@@ -46,6 +46,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     const NAME_EXPRESSION_SOURCE: &str = "native/name_expression.c";
     const FILE_OBJECT_FLAGS_SOURCE: &str = "native/file_object_flags.c";
     const TUNNEL_CACHE_SOURCE: &str = "native/tunnel_cache.c";
+    const VOLUME_VERIFY_SOURCE: &str = "native/volume_verify.c";
 
     println!("cargo:rerun-if-changed={IDENTITY_SOURCE}");
     println!("cargo:rerun-if-changed=native/requestor_subject.h");
@@ -80,6 +81,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/file_object_flags.h");
     println!("cargo:rerun-if-changed={LIFECYCLE_CONTROL_CONTRACT}");
     println!("cargo:rerun-if-changed={TUNNEL_CACHE_SOURCE}");
+    println!("cargo:rerun-if-changed={VOLUME_VERIFY_SOURCE}");
+    println!("cargo:rerun-if-changed=native/volume_verify.h");
     println!("cargo:rerun-if-changed=native/tunnel_cache.h");
     println!("cargo:rerun-if-changed={OPERATIONAL_TRACE_CONTRACT}");
     println!("cargo:rerun-if-changed=native/file_object_flags.h");
@@ -139,7 +142,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .file(VOLUME_DISCOVERY_SOURCE)
         .file(NAME_EXPRESSION_SOURCE)
         .file(FILE_OBJECT_FLAGS_SOURCE)
-        .file(TUNNEL_CACHE_SOURCE);
+        .file(TUNNEL_CACHE_SOURCE)
+        .file(VOLUME_VERIFY_SOURCE);
 
     if is_msvc_frontend {
         native.flag("/kernel").flag("/W4").flag("/WX");

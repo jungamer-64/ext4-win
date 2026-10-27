@@ -601,6 +601,8 @@ impl Drop for CapturedAuxiliaryInput {
 /// Request identity captured before the IRP enters the cancel-safe queue.
 #[derive(Debug)]
 pub(super) struct QueueContext {
+    /// One physical verify attempt per original captured request, independent from read retries.
+    verification: VerificationBudget,
     /// The data operation selected the core/lower path rather than a Cc cache transfer.
     direct_data: bool,
     /// Complete typed request classification plus any requestor-context capture.
@@ -609,6 +611,15 @@ pub(super) struct QueueContext {
     execution: super::scheduler::ExecutionClass,
     /// Stable cleanup cancellation identity; no queued stack re-decode is required.
     cancellation_key: QueueCancellationKey,
+}
+
+/// A repeated physical verify condition must become an error rather than an unbounded loop.
+#[derive(Debug)]
+enum VerificationBudget {
+    /// No I/O Manager verify has been requested for this capture.
+    Available,
+    /// One worker has consumed this request's sole verify attempt.
+    Spent,
 }
 
 /// Queue metadata ownership after dispatch selects allocation-free lifecycle requests or captured
@@ -624,6 +635,16 @@ pub(super) enum QueueContextOwnership {
 }
 
 impl QueueContextOwnership {
+    /// Consumes this original request's finite verify admission before worker publication.
+    /// # Errors
+    /// Returns verify-required after the sole attempt, or invalid-device-request for finalization.
+    pub(super) fn claim_media_verification(&mut self) -> DriverResult<()> {
+        let Self::Captured(context) = self else { return Err(DriverError::InvalidDeviceRequest); };
+        match context.verification {
+            VerificationBudget::Available => { context.verification = VerificationBudget::Spent; Ok(()) },
+            VerificationBudget::Spent => Err(DriverError::VerifyRequired),
+        }
+    }
     /// Records the selected data path; retries keep the same accounting responsibility.
     /// # Errors
     /// Rejects non-data requests before changing their capture.
@@ -860,7 +881,7 @@ impl QueueContext {
         };
         let execution = if paging {
             super::scheduler::ExecutionClass::Paging
-        } else if release {
+        } else if release || matches!(prepared, PreparedRequest::VerifyVolume(_)) {
             super::scheduler::ExecutionClass::Release
         } else {
             super::scheduler::ExecutionClass::Ordinary
@@ -870,6 +891,7 @@ impl QueueContext {
                 prepared,
                 execution,
                 cancellation_key,
+                verification: VerificationBudget::Available,
                 direct_data: false,
             })
         })
@@ -888,6 +910,7 @@ impl QueueContext {
                 execution: super::scheduler::ExecutionClass::Ordinary,
                 prepared: PreparedRequest::Create,
                 cancellation_key: QueueCancellationKey::Device,
+                verification: VerificationBudget::Available,
                 direct_data: false,
             })
         })
@@ -1099,6 +1122,8 @@ pub(crate) enum PreparedRequest {
     DirectoryControl(PreparedDirectoryControl),
     /// File-system control with a sealed minor-function classification.
     FileSystemControl(FileSystemControlMinorFunction),
+    /// Kernel-captured mounted association for a physical verification read.
+    VerifyVolume(super::VerifyVolumeTarget),
     /// Embedded handle reference and immutable cluster-control scalars captured before deferral.
     ClusterControl(PreparedClusterControl),
     /// SeManageVolumePrivilege admitted on the original thread for one persistent dirty marker.
@@ -1286,7 +1311,16 @@ impl PreparedRequest {
             DispatchMajor::FileSystemControl => {
                 let minor = stack.file_system_control_minor();
                 let key = match minor {
-                    FileSystemControlMinorFunction::MountVolume => QueueCancellationKey::Device,
+                    FileSystemControlMinorFunction::MountVolume => {
+                        if target.requestor_mode() != 0 { return Err(IrpCompletion::from_error(DriverError::AccessDenied)); }
+                        QueueCancellationKey::Device
+                    }
+                    FileSystemControlMinorFunction::VerifyVolume => {
+                        if target.requestor_mode() != 0 { return Err(IrpCompletion::from_error(DriverError::AccessDenied)); }
+                        let verify = stack.verify_volume().map_err(IrpCompletion::from_error)?;
+                        if verify.device != target.device() { return Err(IrpCompletion::from_error(DriverError::InvalidParameter)); }
+                        return Ok((Self::VerifyVolume(verify), QueueCancellationKey::Device));
+                    }
                     FileSystemControlMinorFunction::UserFsRequest => {
                         let control = stack
                             .file_system_control()
@@ -1871,6 +1905,45 @@ mod tests {
         DispatchMajor, FileSystemControlMinorFunction, IrpCompletion, KernelIrp, PendingIrp,
         PreparedDirectoryControl, ReceivedIrp,
     };
+
+    /// # Errors
+    /// Returns fixture identity/capture failure before queued ownership exists.
+    /// # Panics
+    /// Fails if requestor-supplied tuples enter raw verification or verification loses release capacity.
+    #[test]
+    #[expect(unsafe_code, reason = "scoped native device, VPB, IRP and stack allocations survive consuming capture and rejection")]
+    #[expect(clippy::panic_in_result_fn, reason = "fallible fixture capture surrounds kernel-origin and finite-budget assertions")]
+    fn media_verification_capture_requires_kernel_origin_and_the_dispatch_device()
+    -> crate::kernel::status::DriverResult<()> {
+        use crate::kernel::status::DriverError;
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut foreign = wdk_sys::DEVICE_OBJECT::default();
+        let mut vpb = wdk_sys::VPB::default();
+        for (mode, other, expected) in [(0_i8, false, wdk_sys::STATUS_SUCCESS), (1, false, wdk_sys::STATUS_ACCESS_DENIED), (0, true, wdk_sys::STATUS_INVALID_PARAMETER)] {
+            let mut irp = wdk_sys::IRP { RequestorMode: mode, ..Default::default() };
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: 0x0d, MinorFunction: 2, ..Default::default()
+            };
+            stack.Parameters.VerifyVolume.Vpb = &raw mut vpb;
+            stack.Parameters.VerifyVolume.DeviceObject = if other { &raw mut foreign } else { &raw mut device };
+            // SAFETY: The original local allocations outlive capture and consuming rejection.
+            let received = unsafe { build_target(&raw mut device, &raw mut irp, &raw mut stack) }.ok_or(DriverError::InvalidParameter)?;
+            let captured = PendingIrp::capture(received, DispatchMajor::FileSystemControl);
+            match captured {
+                Ok(captured) => {
+                    assert_eq!(expected, wdk_sys::STATUS_SUCCESS);
+                    assert_eq!(captured.execution_class(), super::super::scheduler::ExecutionClass::Release);
+                    assert!(matches!(&captured.context, QueueContextOwnership::Captured(context) if matches!(context.prepared, PreparedRequest::VerifyVolume(_))));
+                    let _status = captured.reject(DriverError::InsufficientResources);
+                }
+                Err(status) => assert_eq!(status, expected),
+            }
+        }
+        let mut context = QueueContextOwnership::Captured(QueueContext::for_test_create()?);
+        assert_eq!(context.claim_media_verification(), Ok(()));
+        assert_eq!(context.claim_media_verification(), Err(DriverError::VerifyRequired));
+        Ok(())
+    }
 
     /// Builds a typed target without reborrowing the native fixture allocations.
     /// # Safety
@@ -2927,6 +3000,7 @@ mod tests {
     #[test]
     fn cleanup_preserves_queued_flushes() {
         let flush = QueueContext {
+            verification: super::VerificationBudget::Available,
             execution: super::super::scheduler::ExecutionClass::Ordinary,
             prepared: PreparedRequest::FlushBuffers,
             cancellation_key: QueueCancellationKey::Device,
@@ -2934,6 +3008,7 @@ mod tests {
         assert!(!flush.cleanup_cancel_eligible());
 
         let ordinary = QueueContext {
+            verification: super::VerificationBudget::Available,
             execution: super::super::scheduler::ExecutionClass::Ordinary,
             direct_data: false,
             prepared: PreparedRequest::QueryInformation,

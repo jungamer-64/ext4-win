@@ -450,6 +450,12 @@ pub struct MountedProfile {
 }
 
 impl MountedProfile {
+    /// Starts a fresh physical primary observation using this mount's immutable interpretation.
+    /// No mounted cache, epoch overlay, recovery state or media-write authority is borrowed.
+    #[must_use]
+    pub fn verify_media(&self) -> super::MediaVerificationOperation {
+        super::MediaVerificationOperation::new(self.superblock, self.access, self.filesystem_length)
+    }
     /// Media authority fixed before recovery; failure state cannot widen it.
     #[must_use]
     pub const fn access(&self) -> super::MediaAccess {

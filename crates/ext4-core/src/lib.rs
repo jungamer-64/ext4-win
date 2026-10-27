@@ -61,6 +61,7 @@ pub use volume::{
     MmpCompletion, MmpDeadline, MmpEffect, MmpEvent, MmpFailure, MmpLease, MmpOperation, MmpOwner,
     MmpRenewal, MmpRenewingLease, MmpTime, MmpTransition, MountAccess, MountFailure,
     MountMediaOutcome, MountOperation, MountProbeOperation, MountProbeTransition, MountTransition,
+    MediaVerificationOperation, MediaVerificationTransition, MediaVerificationOutcome,
     MountedProfile, MutationCoordinatorState, MutationLease, MutationResolveContext,
     MutationCompletionDurability, MutationResolveOperation, MutationResolvePass, MutationResolveReady, MutationResolveTransition,
     MutationResource, NamespaceDestination, NodeDataPolicy, NodeId, NodeMetadataSnapshot,

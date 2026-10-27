@@ -65,7 +65,115 @@ impl PreparedVpbLabelPublication {
     }
 }
 
+/// Exact mounted association retained by the kernel verify IRP while raw I/O suspends.
+#[derive(Debug)]
+pub(crate) struct MediaVerificationAssociation {
+    /// Mounted filesystem device whose reactor owns this operation.
+    device: KernelDevice,
+    /// Original VPB protected by the I/O Manager's pending verify ownership.
+    vpb: KernelVpb,
+    /// Real device whose verify flag may be acknowledged after a matching physical read.
+    real_device: KernelDevice,
+}
+
+impl MediaVerificationAssociation {
+    /// Consumes same-association evidence after I/O Manager verification, without clearing flags.
+    /// # Errors
+    /// Returns a replaced/removed association or a new verification requirement; no retry is granted.
+    #[expect(unsafe_code, reason = "retained mounted lifetime and VPB lock protect both exact association observations")]
+    pub(crate) fn confirmed(self) -> DriverResult<()> {
+        VpbSpinLock::with_mounted(self.device, |vpb| {
+            if core::ptr::from_ref(vpb).cast_mut() != self.vpb.as_non_null().as_ptr()
+                || vpb.RealDevice != self.real_device.as_ptr()
+                || vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED) == 0 {
+                return Err(DriverError::WrongVolume);
+            }
+            // SAFETY: Mounted lifetime retains this native device; global VPB lock protects association.
+            let current = unsafe { (*self.real_device.as_ptr()).Vpb };
+            if current != self.vpb.as_non_null().as_ptr() { return Err(DriverError::WrongVolume); }
+            if vpb.Flags & vpb_flag(wdk_sys::VPB_REMOVE_PENDING) != 0 { return Err(DriverError::DeviceRemoved); }
+            if crate::kernel::volume_verify::required(self.real_device) { return Err(DriverError::VerifyRequired); }
+            Ok(())
+        })?
+    }
+    /// Consumes acknowledgment authority only after revalidating the original mounted association.
+    /// # Errors
+    /// Returns changed association or removal without clearing any verify flag.
+    #[expect(unsafe_code, reason = "the global VPB lock protects association checks; native acknowledgment atomically updates only the retained real-device flag")]
+    pub(crate) fn acknowledge(self) -> DriverResult<()> {
+        VpbSpinLock::with_mounted(self.device, |vpb| {
+            if core::ptr::from_ref(vpb).cast_mut() != self.vpb.as_non_null().as_ptr()
+                || vpb.RealDevice != self.real_device.as_ptr()
+                || vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED) == 0 {
+                return Err(DriverError::WrongVolume);
+            }
+            // SAFETY: The pending verify IRP retains this real device; the global lock protects its VPB association.
+            let current = unsafe { (*self.real_device.as_ptr()).Vpb };
+            if current != self.vpb.as_non_null().as_ptr() { return Err(DriverError::WrongVolume); }
+            if vpb.Flags & vpb_flag(wdk_sys::VPB_REMOVE_PENDING) != 0 { return Err(DriverError::DeviceRemoved); }
+            crate::kernel::volume_verify::acknowledge(self.real_device);
+            Ok(())
+        })?
+    }
+}
+
 impl MountedVolumeDevice {
+    /// Captures the exact mounted association and separately retained real device for a lower gate.
+    /// # Errors
+    /// Returns missing/replaced/removing association before any native worker is queued.
+    #[expect(unsafe_code, reason = "VPB lock and mounted lifetime retain the original association before independent worker reference acquisition")]
+    pub(crate) fn prepare_storage_verification(device: KernelDevice) -> DriverResult<(MediaVerificationAssociation, crate::kernel::volume_verify::VerificationDevice)> {
+        VpbSpinLock::with_mounted(device, |vpb| {
+            if vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED) == 0 { return Err(DriverError::WrongVolume); }
+            // SAFETY: The mounted lifetime owns this VPB, and the original operation retains it.
+            let identity = unsafe { KernelVpb::from_raw(core::ptr::from_ref(vpb).cast_mut()) }.ok_or(DriverError::InvalidParameter)?;
+            // SAFETY: Mounted VPB retention and its global lock protect real-device liveness.
+            let real_device = unsafe { KernelDevice::from_raw(vpb.RealDevice) }.ok_or(DriverError::InvalidParameter)?;
+            // SAFETY: The same VPB lock protects the current real-device association.
+            let current = unsafe { (*real_device.as_ptr()).Vpb };
+            if current != identity.as_non_null().as_ptr() { return Err(DriverError::WrongVolume); }
+            if vpb.Flags & vpb_flag(wdk_sys::VPB_REMOVE_PENDING) != 0 { return Err(DriverError::DeviceRemoved); }
+            Ok((MediaVerificationAssociation { device, vpb: identity, real_device }, crate::kernel::volume_verify::VerificationDevice::reference(real_device)))
+        })?
+    }
+    /// Retains a required I/O Manager verify before ordinary work can inspect a mounted cache.
+    /// # Errors
+    /// Returns withdrawn association or removal without issuing native I/O under the VPB lock.
+    #[expect(unsafe_code, reason = "the mounted VPB lock establishes real-device liveness before the worker acquires its own reference")]
+    pub(crate) fn prepare_verify_work(device: KernelDevice) -> DriverResult<Option<crate::kernel::volume_verify::VerificationDevice>> {
+        VpbSpinLock::with_mounted(device, |vpb| {
+            if vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED) == 0 { return Err(DriverError::WrongVolume); }
+            // SAFETY: The mounted association retains the real device while the global lock is held.
+            let real_device = unsafe { KernelDevice::from_raw(vpb.RealDevice) }.ok_or(DriverError::InvalidParameter)?;
+            // SAFETY: The same mounted reference and lock protect this association read.
+            let current = unsafe { (*real_device.as_ptr()).Vpb };
+            if current != core::ptr::from_ref(vpb).cast_mut() { return Err(DriverError::WrongVolume); }
+            if vpb.Flags & vpb_flag(wdk_sys::VPB_REMOVE_PENDING) != 0 { return Err(DriverError::DeviceRemoved); }
+            if crate::kernel::volume_verify::required(real_device) {
+                Ok(Some(crate::kernel::volume_verify::VerificationDevice::reference(real_device)))
+            } else { Ok(None) }
+        })?
+    }
+    /// Validates a captured kernel verify tuple before any raw I/O or mounted-state change.
+    /// No VPB borrow, lock or actor reference survives the returned scalar association.
+    /// # Errors
+    /// Returns a foreign, withdrawn, removing or incomplete mounted association.
+    #[expect(unsafe_code, reason = "kernel verify ownership retains both native identities while the global VPB lock protects their association")]
+    pub(crate) fn prepare_media_verification(target: crate::irp::VerifyVolumeTarget) -> DriverResult<MediaVerificationAssociation> {
+        VpbSpinLock::with_mounted(target.device, |vpb| {
+            if core::ptr::from_ref(vpb).cast_mut() != target.vpb.as_non_null().as_ptr()
+                || vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED) == 0 {
+                return Err(DriverError::InvalidParameter);
+            }
+            // SAFETY: The mounted VPB retains its real device under the global VPB lock.
+            let real_device = unsafe { KernelDevice::from_raw(vpb.RealDevice) }.ok_or(DriverError::InvalidParameter)?;
+            // SAFETY: Kernel verify ownership and the VPB lock retain this native association.
+            let current = unsafe { (*real_device.as_ptr()).Vpb };
+            if current != target.vpb.as_non_null().as_ptr() { return Err(DriverError::WrongVolume); }
+            if vpb.Flags & vpb_flag(wdk_sys::VPB_REMOVE_PENDING) != 0 { return Err(DriverError::DeviceRemoved); }
+            Ok(MediaVerificationAssociation { device: target.device, vpb: target.vpb, real_device })
+        })?
+    }
     /// Associates an uninitialized create FILE_OBJECT with this mount's original VPB.
     ///
     /// The I/O Manager owns the create's VPB reference and releases it after the FILE_OBJECT
@@ -158,6 +266,15 @@ impl MountedVolumeDevice {
             // SAFETY: The pinned VCB outlives every reactor/dispatch lease on this extension.
             binding.volume().stream_context.storage_access()?
         };
+        let verification_device = {
+            let _lock = VpbSpinLock::acquire();
+            // SAFETY: The mount IRP retains this supplied VPB while the global lock excludes changes.
+            let supplied = unsafe { vpb.as_non_null().as_ref() };
+            // SAFETY: The supplied VPB retains its real device during mount preparation.
+            let real = unsafe { KernelDevice::from_raw(supplied.RealDevice) }.ok_or(DriverError::InvalidParameter)?;
+            crate::kernel::volume_verify::VerificationDevice::reference(real)
+        };
+        storage.bind_verification_device(verification_device)?;
         let removal = unsafe {
             // SAFETY: This mount installs the sole PnP publisher under device dispatch rundown.
             binding
@@ -759,7 +876,8 @@ impl MountedVpb {
             // SAFETY: The mount IRP retains the supplied VPB while the global lock excludes mutation.
             &mut *supplied.as_non_null().as_ptr()
         };
-        let real = NonNull::new(vpb.RealDevice).ok_or(DriverError::InvalidParameter)?;
+        // SAFETY: The mount IRP retains this real device while the global VPB lock is held.
+        let real = unsafe { KernelDevice::from_raw(vpb.RealDevice) }.ok_or(DriverError::InvalidParameter)?;
         let current = unsafe {
             // SAFETY: The mount request retains the real device; its VPB association uses this lock.
             (*real.as_ptr()).Vpb
@@ -785,6 +903,9 @@ impl MountedVpb {
             // SAFETY: The unpublished mounted device's association publishes with the owned reference.
             (*device.as_ptr()).Vpb = supplied.as_non_null().as_ptr();
         }
+        // All fallible mount initialization precedes this association publication. Only its
+        // freshly validated mount/recovery protocol may acknowledge the physical verify flag.
+        crate::kernel::volume_verify::acknowledge(real);
         Ok(Self {
             device,
             publication: UnsafeCell::new(VpbPublication::Mounted(replacement)),
@@ -1163,6 +1284,40 @@ impl VpbLabel {
 mod tests {
     use super::*;
     use ext4_core::Ext4VolumeLabel;
+
+    /// # Errors
+    /// Returns native fixture allocation/publication or finalization failure.
+    /// # Panics
+    /// Fails if success without acknowledgment, a new verify gate or a stale VPB permits resubmission.
+    #[test]
+    #[expect(clippy::panic_in_result_fn, reason = "fallible native fixture setup surrounds exact identity and flag assertions")]
+    fn media_verification_requires_same_association_and_explicit_acknowledgment() -> DriverResult<()> {
+        let mut fixture = VpbFixture::new()?;
+        fixture.real.Flags = wdk_sys::DO_VERIFY_VOLUME | 0x4000;
+        let publication = fixture.publish()?;
+        assert_eq!(fixture.real.Flags, 0x4000);
+        let device = fixture.device()?;
+        fixture.real.Flags |= wdk_sys::DO_VERIFY_VOLUME;
+        let (association, query) = MountedVolumeDevice::prepare_storage_verification(device)?;
+        assert_eq!(query.execute(), Ok(()));
+        assert_eq!(association.confirmed(), Err(DriverError::VerifyRequired));
+        assert_ne!(fixture.real.Flags & wdk_sys::DO_VERIFY_VOLUME, 0);
+        let (association, query) = MountedVolumeDevice::prepare_storage_verification(device)?;
+        drop(query);
+        association.acknowledge()?;
+        assert_eq!(fixture.real.Flags, 0x4000);
+        let (association, query) = MountedVolumeDevice::prepare_storage_verification(device)?;
+        drop(query);
+        assert_eq!(association.confirmed(), Ok(()));
+        let (stale, query) = MountedVolumeDevice::prepare_storage_verification(device)?;
+        drop(query);
+        publication.publish_dismount();
+        fixture.real.Flags |= wdk_sys::DO_VERIFY_VOLUME;
+        assert_eq!(stale.confirmed(), Err(DriverError::WrongVolume));
+        assert_eq!(fixture.real.Flags, wdk_sys::DO_VERIFY_VOLUME | 0x4000);
+        drop(publication.begin_retirement().try_finish().map_err(|_| DriverError::DeviceBusy)?);
+        fixture.finish()
+    }
 
     /// Host I/O Manager allocation and device identities retained through native retirement.
     struct VpbFixture {

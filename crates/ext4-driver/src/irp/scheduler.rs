@@ -256,6 +256,9 @@ pub(crate) enum Phase {
     Lower,
     /// A non-cancellable native work envelope owns the operation without intent or commit grants.
     Passive,
+    /// A guaranteed pre-I/O media gate freezes logical grants while raw verification reenters.
+    /// It retains no lower IRP or native resource and cannot execute Cache Manager work.
+    Verifying,
     /// FsRtl owns the top-level IRP while an oplock break is pending.
     Oplock,
 }
@@ -489,6 +492,15 @@ impl Scheduler {
         true
     }
 
+    /// Consumes only a preflight device admission before the same captured request is classified.
+    pub(crate) fn consume_device_preflight(&mut self, identity: SlotId) -> bool {
+        let Some(slot) = self.slot_mut(identity) else { return false; };
+        if !matches!(slot.phase, Phase::Actor) || slot.admission != Some(Admission::Device)
+            || slot.intent.is_some() || slot.commit.is_some() { return false; }
+        slot.admission = None;
+        true
+    }
+
     /// Installs scheduler admission for one actor-owned reservation.
     pub(crate) fn install(
         &mut self,
@@ -718,7 +730,7 @@ impl Scheduler {
             Phase::Oplock => CancelDisposition::CancelOplock,
             Phase::Retry => CancelDisposition::AwaitRetry,
             Phase::Registering | Phase::Actor => CancelDisposition::AwaitRegistration,
-            Phase::Passive | Phase::Vacant => CancelDisposition::Ignored,
+            Phase::Passive | Phase::Verifying | Phase::Vacant => CancelDisposition::Ignored,
         }
     }
 
@@ -1874,6 +1886,11 @@ mod tests {
         );
         assert!(scheduler.grant_commit(mutation, 7));
         assert!(!scheduler.set_phase(mutation, Phase::Passive));
+        assert!(scheduler.set_phase(mutation, Phase::Verifying));
+        assert!(!scheduler.checkpoint_authority_is_clear(mutation));
+        assert_eq!(scheduler.request_cancel(mutation.index()), CancelDisposition::Ignored);
+        assert_eq!(scheduler.enter_phase(mutation.index(), |phase| matches!(phase, Phase::Verifying)), Some(mutation));
+        assert!(!scheduler.checkpoint_authority_is_clear(mutation));
         assert!(!scheduler.consume_cancel_before_effect(mutation.index(), false));
         assert_eq!(
             scheduler.request_cancel(mutation.index()),
@@ -1890,5 +1907,7 @@ mod tests {
         );
         let device = require_some!(scheduler.take_ready());
         assert!(scheduler.checkpoint_authority_is_clear(device));
+        assert!(scheduler.consume_device_preflight(device));
+        assert_eq!(scheduler.install(device, Admission::Device, false), Some(AdmissionStart::Admitted));
     }
 }

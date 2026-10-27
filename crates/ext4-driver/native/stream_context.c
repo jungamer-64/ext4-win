@@ -30,6 +30,7 @@ extern BOOLEAN NTAPI ext4win_section_acquire_paging(const VOID *state, PERESOURC
 extern UCHAR NTAPI ext4win_storage_media_state(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_close_phase(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_io_policy(_In_ const VOID *state);
+extern UCHAR NTAPI ext4win_storage_verify_required(_In_ const VOID *state);
 extern NTSTATUS NTAPI ext4win_prepare_mdl_completion(_In_ const VOID *queue, _In_ PFILE_OBJECT file_object);
 
 typedef struct _EXT4WIN_PUBLISHED_STREAM_METADATA {
@@ -235,6 +236,7 @@ ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
     return ext4win_stream_storage_available(stream)
+        && !ext4win_storage_verify_required(volume->RustState)
         && (ext4win_storage_close_phase(volume->RustState) == 0)
         && (ext4win_storage_io_policy(volume->RustState) < 2);
 }
@@ -879,13 +881,13 @@ ext4win_stream_cache_initialize(
         return STATUS_INVALID_PARAMETER;
     }
     if (stream->PagingFile.Active == 1) { return STATUS_INVALID_DEVICE_REQUEST; }
-    if (!ext4win_stream_ordinary_io_available(stream)) { return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED; }
+    if (!ext4win_stream_ordinary_io_available(stream)) { return ext4win_storage_verify_required(stream->VolumeStream->RustState) ? STATUS_VERIFY_REQUIRED : (ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED); }
 
     status = STATUS_SUCCESS;
     (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
     if (!ext4win_stream_ordinary_io_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
-        return ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
+        return ext4win_storage_verify_required(stream->VolumeStream->RustState) ? STATUS_VERIFY_REQUIRED : (ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED);
     }
     __try {
         if (file_object->PrivateCacheMap == NULL) {
@@ -1140,7 +1142,8 @@ ext4win_acquire_fast_io_query_stream(
     PEXT4WIN_STREAM_CONTEXT stream;
 
     if (!ext4win_stream_fast_io_stream(file_object, &stream) || (stream->VolumeStream == NULL)) { return FALSE; }
-    if (!ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
+    if (ext4win_storage_verify_required(stream->VolumeStream->RustState) ||
+        !ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
         (UCHAR)ext4win_section_phase(stream->SectionState),
@@ -1151,7 +1154,8 @@ ext4win_acquire_fast_io_query_stream(
     else if (!ext4win_acquire_resource_shared(&stream->MainResource, FALSE)) {
         return FALSE;
     }
-    if (!ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
+    if (ext4win_storage_verify_required(stream->VolumeStream->RustState) ||
+        !ext4win_fast_io_query_admit(ext4win_file_flags(file_object), file_object->ReadAccess,
         stream->Header.IsFastIoPossible == FastIoIsPossible,
         ext4win_storage_media_state(stream->VolumeStream->RustState),
         (UCHAR)ext4win_section_phase(stream->SectionState),
@@ -1736,7 +1740,7 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     output->Mutation = (UCHAR)ext4win_section_phase(stream->SectionState);
     output->ReadAccess = file->ReadAccess;
     output->WriteAccess = file->WriteAccess;
-    output->Policy = ext4win_storage_io_policy(stream->VolumeStream->RustState);
+    output->Policy = ext4win_storage_verify_required(volume->RustState) ? 2 : ext4win_storage_io_policy(stream->VolumeStream->RustState);
     return TRUE;
 }
 

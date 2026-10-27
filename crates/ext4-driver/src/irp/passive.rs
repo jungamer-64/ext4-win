@@ -35,6 +35,8 @@ use super::scheduler::SlotId;
 /// One captured native call whose resource lease owns every identity through worker completion.
 #[derive(Debug)]
 pub(crate) enum PassiveWork {
+    /// Calls the I/O Manager outside actor/resource ownership while retaining its real device.
+    VerifyVolume(crate::kernel::volume_verify::VerificationDevice),
     /// A lock announcement can reenter the filesystem; its worker retains the original IRP.
     NotifyVolume {
         /// Original request returned to the actor after delivery.
@@ -166,6 +168,8 @@ pub(crate) enum PassiveWork {
 /// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// I/O Manager verification completed; original request captures remain with its operation.
+    VerifyVolume(DriverResult<()>),
     /// Original request returned after its advisory announcement.
     NotifyVolume {
         /// Original request retained through cancellation or delivery.
@@ -250,6 +254,7 @@ impl PassiveWork {
             | Self::Uninitialize { .. }
             | Self::CleanupOplock { .. } => Ok(()),
             Self::SectorSize { .. }
+            | Self::VerifyVolume(_)
             | Self::Mdl { .. }
             | Self::Read { .. }
             | Self::Write { .. }
@@ -335,6 +340,7 @@ impl PassiveWork {
                     result: Ok(()),
                 }
             }
+            Self::VerifyVolume(device) => PassiveWorkCompletion::VerifyVolume(device.execute()),
             Self::OpenExternalJournal { selected, access } => {
                 PassiveWorkCompletion::OpenExternalJournal(
                     crate::kernel::external_journal::ExclusiveExternalJournal::open(
@@ -438,6 +444,7 @@ impl PassiveWork {
                 owned,
                 result: Err(error),
             },
+            Self::VerifyVolume(_) => PassiveWorkCompletion::VerifyVolume(Err(error)),
             Self::OpenExternalJournal { .. } => {
                 PassiveWorkCompletion::OpenExternalJournal(Err(error))
             }

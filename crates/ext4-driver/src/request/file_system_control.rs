@@ -106,6 +106,7 @@ pub(crate) fn classify(
             Ok(FsControlAdmission::User(stack.fs_control_code()))
         }
         FileSystemControlMinorFunction::Unsupported => Ok(FsControlAdmission::Unsupported),
+        FileSystemControlMinorFunction::VerifyVolume => Err(DriverError::InvalidDeviceRequest),
     })
 }
 

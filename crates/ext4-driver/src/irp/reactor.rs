@@ -50,7 +50,7 @@ use super::{
 use crate::kernel::storage::{
     DeviceControlCommand, DeviceControlCompletion, PreparedStorageCommand, RetryingStorageCommand,
     StorageCommand, StorageCommandStep, StorageRetryDecision, StorageRetryDelay,
-    StorageRetryPolicy, failed_unsubmitted_request,
+    StorageRetryPolicy, VerifyingStorageCommand, failed_unsubmitted_request,
 };
 use crate::kernel::storage::{MountedStorageRoute, StorageFailureClass};
 
@@ -76,6 +76,58 @@ impl ScheduledStorageOperation {
     /// Recovers the suspended filesystem operation after lower-command ownership ends.
     fn into_operation(self) -> SuspendedOperation {
         self.operation
+    }
+}
+
+/// A zero-progress lower gate keeps the exact operation frozen through native verification.
+#[cfg(not(test))]
+#[derive(Debug)]
+struct StorageVerificationOperation {
+    /// Only this typed command may be resubmitted after same-media confirmation.
+    command: VerifyingStorageCommand<ScheduledStorageOperation>,
+    /// Original VPB relation must still be current after I/O Manager reentry.
+    association: crate::state::MediaVerificationAssociation,
+}
+
+#[cfg(not(test))]
+#[expect(unsafe_code, reason = "active reactor rundown retains its original mounted VPB through worker completion")]
+// SAFETY: The worker moves only owned commands and scalar retained association identities. VPB
+// access occurs under its global lock after return to the sole mounted actor, without cross-thread borrows.
+unsafe impl Send for StorageVerificationOperation {}
+
+#[cfg(not(test))]
+impl CompletionOperation for StorageVerificationOperation {
+    fn advance(self: Box<Self>, event: CompletionEvent, target: &mut ReactorTarget) -> OperationTransition {
+        let Self { command, association } = *self;
+        let CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::VerifyVolume(result)) = event else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let ReactorTarget::MountedVolume(binding) = target else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        let result = result.and_then(|()| association.confirmed());
+        let result = binding.with_access(|access| {
+            if result == Err(DriverError::WrongVolume) { access.record_media_changed(); }
+            result?;
+            access.authorize_storage_resumption(command.request())
+        });
+        match result {
+            Ok(()) => match command.verified() {
+                Ok(prepared) => OperationTransition::ResumeVerifiedStorage { prepared },
+                Err(error) => {
+                    let (error, scheduled, request) = error.into_parts();
+                    scheduled.into_operation().advance(CompletionEvent::Core(OperationEvent::StorageCompleted(failed_unsubmitted_request(request, driver_error_to_core(error)))), target)
+                }
+            },
+            Err(error) => {
+                let (scheduled, request) = command.into_parts();
+                scheduled.into_operation().advance(CompletionEvent::Core(OperationEvent::StorageCompleted(failed_unsubmitted_request(request, driver_error_to_core(error)))), target)
+            }
+        }
+    }
+
+    fn record_storage_failure(&mut self, _failure: StorageFailureClass, _target: &mut ReactorTarget) {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
     }
 }
 /// One concrete storage command captured by a private lower IRP.
@@ -500,6 +552,8 @@ pub(crate) enum PublicationOutcome {
 /// One consuming action emitted by an event-driven operation.
 #[derive(Debug)]
 pub(crate) enum OperationTransition {
+    /// Native preflight finished before any filesystem or handle admission; reuse sealed captures.
+    ReadmitCaptured { owned: OwnedIrp },
     /// A complete monotonic observation delay, retaining no intent or commit authority.
     WaitForTimer {
         /// Required elapsed seconds, independent of wall-clock changes.
@@ -543,6 +597,24 @@ pub(crate) enum OperationTransition {
         /// Owned core transfer token.
         request: StorageRequest,
         /// Operation moved by value into the lower completion envelope.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// New mount/recovery alone carries override through its core-owned effect protocol.
+    SubmitMountLower {
+        /// Devices retained by the kernel mount request.
+        devices: MountedStorageRoute,
+        /// Read or independently admitted recovery/session effect.
+        request: StorageRequest,
+        /// Sole new-mount protocol owner.
+        suspended: Box<dyn CompletionOperation>,
+    },
+    /// Submit only a raw read with verify override, without ordinary retry authority.
+    SubmitVerificationRead {
+        /// Stable mounted storage route retained by the original verify IRP.
+        devices: MountedStorageRoute,
+        /// Physical read from the fresh core verification transcript.
+        request: StorageRequest,
+        /// Sole consumer of raw completion and the mounted association acknowledgment.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Submit one close-durability command after the one-way `Closing` boundary.
@@ -595,6 +667,12 @@ pub(crate) enum OperationTransition {
     ArmRetry {
         /// Failed command retaining the original suspended operation.
         retry: RetryingStorageCommand<ScheduledStorageOperation>,
+    },
+    /// One verified, unchanged mounted association can reissue its original zero-progress phase.
+    #[cfg(not(test))]
+    ResumeVerifiedStorage {
+        /// Consumed same-media gate with original operation, buffer and ordinary lower flags.
+        prepared: PreparedStorageCommand<ScheduledStorageOperation>,
     },
     /// Wait for a visibility, checkpoint, or terminal-barrier grant.
     Wait {
@@ -3124,6 +3202,19 @@ impl CompletionReactor {
     fn apply_transition(&self, index: usize, mut transition: OperationTransition) {
         loop {
             match transition {
+                OperationTransition::ReadmitCaptured { owned } => {
+                    let identity = self.with_scheduler(|scheduler| scheduler.identity(index)).unwrap_or_else(|| KernelWideInconsistency::completion_reactor_state_corruption().bugcheck());
+                    if !self.with_scheduler(|scheduler| scheduler.consume_device_preflight(identity)) {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    let admitted = self.with_finalization(|pool| self.with_target(|target| crate::request::dispatch::admit_owned(owned, target, self.trace, pool)));
+                    match admitted {
+                        Ok(crate::request::dispatch::AdmittedRequest::Operation(operation)) => { self.install_admitted_at(index, operation); return; }
+                        Ok(crate::request::dispatch::AdmittedRequest::Complete(completion)) => transition = OperationTransition::Complete(completion),
+                        Err(error) => { let (error, owned) = error.into_parts(); transition = OperationTransition::Complete(owned.prepare_result(Err(error))); }
+                    }
+                    continue;
+                }
                 OperationTransition::SubmitOwnershipLower {
                     devices,
                     request,
@@ -3197,6 +3288,15 @@ impl CompletionReactor {
                         suspended,
                         EffectCancellation::AbortBeforeEffect,
                     );
+                }
+                OperationTransition::SubmitMountLower { devices, request, suspended } => {
+                    if !self.with_target(|target| matches!(target, ReactorTarget::ControlDevice(_))) { KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(); }
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else { drop(request); return; };
+                    self.submit_mount_storage(index, devices, request, suspended);
+                }
+                OperationTransition::SubmitVerificationRead { devices, request, suspended } => {
+                    let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else { drop(request); return; };
+                    self.submit_verification_read(index, devices, request, suspended);
                 }
                 OperationTransition::SubmitClosingLower {
                     devices,
@@ -3309,6 +3409,9 @@ impl CompletionReactor {
                 }
                 OperationTransition::ArmRetry { retry } => {
                     self.arm_retry(index, retry);
+                }
+                OperationTransition::ResumeVerifiedStorage { prepared } => {
+                    self.submit_prepared_storage(index, prepared);
                 }
                 OperationTransition::Wait {
                     condition,
@@ -3820,6 +3923,73 @@ impl CompletionReactor {
         self.submit_prepared_storage(index, prepared);
     }
 
+    /// Submits only the fresh mount's core-authorized recognition or recovery effect.
+    #[cfg(not(test))]
+    fn submit_mount_storage(&self, index: usize, devices: MountedStorageRoute, request: StorageRequest, suspended: SuspendedOperation) {
+        let scheduled = ScheduledStorageOperation { operation: suspended, cancellation: EffectCancellation::AbortBeforeEffect };
+        let prepared = match PreparedStorageCommand::mount_io(devices, request, scheduled) {
+            Ok(prepared) => prepared,
+            Err(error) => { let (error, scheduled, request) = error.into_parts(); self.set_ready_storage_failure(index, scheduled.into_operation(), request, error); return; }
+        };
+        self.submit_prepared_storage(index, prepared);
+    }
+
+    /// Submits a physical verification read through the normal retained completion owner.
+    /// It holds no actor borrow or native resource while the lower driver owns the request.
+    #[cfg(not(test))]
+    fn submit_verification_read(&self, index: usize, devices: MountedStorageRoute, request: StorageRequest, suspended: SuspendedOperation) {
+        let scheduled = ScheduledStorageOperation { operation: suspended, cancellation: EffectCancellation::AbortBeforeEffect };
+        let prepared = match PreparedStorageCommand::verify_read(devices, request, scheduled) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let (error, scheduled, request) = error.into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
+                return;
+            }
+        };
+        self.submit_prepared_storage(index, prepared);
+    }
+
+    /// Freezes only a typed zero-progress command while I/O Manager verification reenters.
+    /// Unlike Cache Manager suspension, this phase retains its logical grant and resource intent;
+    /// the worker owns no native stream resource and raw verification needs neither grant.
+    #[cfg(not(test))]
+    fn submit_storage_verification(&self, index: usize, command: VerifyingStorageCommand<ScheduledStorageOperation>) {
+        let captured = MountedVolumeDevice::prepare_storage_verification(self.device);
+        let (association, query) = match captured {
+            Ok(captured) => captured,
+            Err(error) => {
+                if error == DriverError::WrongVolume { self.with_mounted_access(|access| access.record_media_changed()); }
+                let (scheduled, request) = command.into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
+                return;
+            }
+        };
+        let suspended = match crate::memory::boxed_try_map((command, association), |(command, association)| StorageVerificationOperation { command, association }) {
+            Ok(operation) => operation,
+            Err(error) => {
+                let (error, (command, _association)) = error.into_parts();
+                let (scheduled, request) = command.into_parts();
+                self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
+                return;
+            }
+        };
+        let work = crate::irp::PassiveWork::VerifyVolume(query);
+        let prepared = match self.completion_rundown.acquire().and_then(|lease| lease.ok_or(DriverError::InvalidDeviceRequest)).and_then(|lease| PassiveWorkEnvelope::prepare_request(self.device, lease)) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.set_ready_operation_event(index, suspended, CompletionEvent::PassiveCompleted(work.failed(error)));
+                return;
+            }
+        };
+        let identity = self.with_scheduler(|scheduler| scheduler.identity(index)).unwrap_or_else(|| KernelWideInconsistency::completion_reactor_state_corruption().bugcheck());
+        let prepared = prepared.bind(NonNull::from(self), identity, work, suspended);
+        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Verifying)) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        PassiveWorkEnvelope::queue(prepared);
+    }
+
     /// Builds, registers, and submits the private mount-time length query.
     #[cfg(not(test))]
     fn submit_device_query(
@@ -4243,10 +4413,12 @@ impl CompletionReactor {
                         StorageRetryPolicy::Classified
                     };
                     match failed.into_retry(policy) {
+                        StorageRetryDecision::Verify(command) => self.submit_storage_verification(index, command),
                         StorageRetryDecision::Retry(retry) => {
                             self.apply_transition(index, OperationTransition::ArmRetry { retry })
                         }
                         StorageRetryDecision::Terminal(failed) => {
+                            let domain_error = failed.domain_error();
                             let (scheduled, request, class) = failed.into_failure();
                             let mut suspended = scheduled.into_operation();
                             self.with_target(|target| {
@@ -4256,7 +4428,7 @@ impl CompletionReactor {
                                 index,
                                 suspended,
                                 CompletionEvent::Core(OperationEvent::StorageCompleted(
-                                    failed_unsubmitted_request(request, ext4_core::Error::DeviceIo),
+                                    failed_unsubmitted_request(request, domain_error),
                                 )),
                             );
                         }
@@ -4460,7 +4632,7 @@ impl CompletionReactor {
             };
             let index = identity.index();
             let entered = self.with_scheduler(|scheduler| {
-                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Passive))
+                scheduler.enter_phase(index, |phase| matches!(phase, Phase::Passive | Phase::Verifying))
             });
             if entered != Some(identity)
                 || !self.with_payloads(|payloads| {
@@ -5035,6 +5207,8 @@ fn driver_error_to_core(error: DriverError) -> ext4_core::Error {
             ext4_core::Error::OutOfMemory
         }
         DriverError::Core(error) => error,
+        DriverError::VerifyRequired => ext4_core::Error::MediaVerificationRequired,
+        DriverError::WrongVolume => ext4_core::Error::MediaChanged,
         _ => ext4_core::Error::DeviceIo,
     }
 }
@@ -5800,11 +5974,18 @@ mod tests {
                 drop(request);
                 drop(suspended);
             }
+            OperationTransition::ReadmitCaptured { owned } => { let _status = owned.prepare_cancelled().notify(); }
             OperationTransition::SubmitLower {
                 devices: _devices,
                 request,
                 suspended,
             }
+            | OperationTransition::SubmitVerificationRead {
+                devices: _devices,
+                request,
+                suspended,
+            }
+            | OperationTransition::SubmitMountLower { devices: _devices, request, suspended }
             | OperationTransition::SubmitOwnershipLower {
                 devices: _devices,
                 request,
@@ -5824,6 +6005,9 @@ mod tests {
                     return;
                 };
                 match completion {
+                    crate::irp::PassiveWorkCompletion::VerifyVolume(result) => {
+                        let _result = result;
+                    }
                     crate::irp::PassiveWorkCompletion::Retry(work) => {
                         drop(work);
                     }

@@ -1326,6 +1326,16 @@ impl<'a> PendingIrpLease<'a> {
 }
 
 impl OwnedIrp {
+    /// Retains original captures while consuming the request's sole I/O Manager verify attempt.
+    /// # Errors
+    /// Returns verify-required after the finite budget, without re-capturing requestor authority.
+    pub(crate) fn claim_media_verification(&mut self) -> DriverResult<()> {
+        self.context.claim_media_verification()
+    }
+    /// Reserved release/finalization requests must keep making progress during native verification.
+    pub(crate) fn allows_media_verification(&self) -> bool {
+        matches!(self.context.execution_class(), super::scheduler::ExecutionClass::Ordinary | super::scheduler::ExecutionClass::Paging)
+    }
     /// Removal consumes the pending reservation of the immutable captured progress class.
     pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
         self.context.execution_class()

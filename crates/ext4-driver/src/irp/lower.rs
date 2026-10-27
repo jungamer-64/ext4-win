@@ -113,6 +113,10 @@ const TEST_RUNDOWN_CLOSED: usize = 1_usize << (usize::BITS - 1);
 pub enum LowerOperation {
     /// Read device bytes into the nonpaged transfer buffer.
     Read,
+    /// Read physical media while its verify-required flag blocks ordinary requests.
+    VerifyRead,
+    /// Mount/recovery write authorized only by the new mount's validated effect protocol.
+    MountWrite,
     /// Write nonpaged transfer-buffer bytes to the device.
     Write,
     /// Persist all previously submitted writes.
@@ -132,8 +136,8 @@ impl LowerOperation {
     /// Returns an error if the WDK constant cannot fit its ABI field.
     fn major_function(self) -> DriverResult<u8> {
         let major = match self {
-            Self::Read => IRP_MJ_READ,
-            Self::Write => IRP_MJ_WRITE,
+            Self::Read | Self::VerifyRead => IRP_MJ_READ,
+            Self::Write | Self::MountWrite => IRP_MJ_WRITE,
             Self::Flush => IRP_MJ_FLUSH_BUFFERS,
             Self::QueryLength | Self::QueryWriteAccess | Self::Trim => IRP_MJ_DEVICE_CONTROL,
         };
@@ -143,18 +147,27 @@ impl LowerOperation {
     /// I/O Manager operation flags for this private IRP.
     const fn irp_flags(self) -> wdk_sys::ULONG {
         match self {
-            Self::Read => wdk_sys::IRP_READ_OPERATION,
-            Self::Write => wdk_sys::IRP_WRITE_OPERATION,
+            Self::Read | Self::VerifyRead => wdk_sys::IRP_READ_OPERATION,
+            Self::Write | Self::MountWrite => wdk_sys::IRP_WRITE_OPERATION,
             Self::Flush => 0,
             Self::QueryLength | Self::QueryWriteAccess | Self::Trim => 0,
         }
+    }
+
+    /// Verify override belongs only to physical verification or fresh mount/recovery.
+    /// # Errors
+    /// Returns an ABI width mismatch before initializing a private lower stack.
+    fn stack_flags(self) -> DriverResult<u8> {
+        if matches!(self, Self::VerifyRead | Self::MountWrite) {
+            u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME).map_err(|_| DriverError::InvalidParameter)
+        } else { Ok(0) }
     }
 
     /// Whether the operation exposes a transfer buffer to the lower stack.
     const fn transfers_bytes(self) -> bool {
         matches!(
             self,
-            Self::Read | Self::Write | Self::QueryLength | Self::Trim
+            Self::Read | Self::VerifyRead | Self::Write | Self::MountWrite | Self::QueryLength | Self::Trim
         )
     }
 }
@@ -1333,9 +1346,10 @@ fn prepare_private_irp(
         &mut *stack
     };
     stack.MajorFunction = major;
+    stack.Flags = operation.stack_flags()?;
     stack.FileObject = core::ptr::null_mut();
     match operation {
-        LowerOperation::Read => {
+        LowerOperation::Read | LowerOperation::VerifyRead => {
             stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
                 Length: transfer_length,
                 __bindgen_padding_0: 0,
@@ -1344,7 +1358,7 @@ fn prepare_private_irp(
                 ByteOffset: starting_offset,
             };
         }
-        LowerOperation::Write => {
+        LowerOperation::Write | LowerOperation::MountWrite => {
             stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
                 Length: transfer_length,
                 __bindgen_padding_0: 0,
@@ -1612,6 +1626,10 @@ mod tests {
             u8::try_from(wdk_sys::IRP_MJ_DEVICE_CONTROL).map_err(|_| DriverError::InvalidParameter)
         );
         assert!(LowerOperation::Read.transfers_bytes());
+        assert!(LowerOperation::VerifyRead.transfers_bytes());
+        assert_eq!(LowerOperation::Read.stack_flags(), Ok(0));
+        assert_eq!(LowerOperation::VerifyRead.stack_flags(), u8::try_from(wdk_sys::SL_OVERRIDE_VERIFY_VOLUME).map_err(|_| DriverError::InvalidParameter));
+        assert_eq!(LowerOperation::VerifyRead.major_function(), LowerOperation::Read.major_function());
         assert!(LowerOperation::Write.transfers_bytes());
         assert!(!LowerOperation::Flush.transfers_bytes());
         assert!(LowerOperation::QueryLength.transfers_bytes());
