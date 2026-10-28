@@ -317,6 +317,7 @@ pub(crate) fn stage_cleanup_deletion(
             continue;
         }
         let notification = DirectoryChange::new(
+            mutation,
             target.parent(),
             target.name(),
             plan.node,

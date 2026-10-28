@@ -15,12 +15,12 @@ static PIRP ext4win_enter_fsrtl_completion(VOID)
 }
 
 VOID NTAPI ext4win_notify_register(PNOTIFY_SYNC sync, PLIST_ENTRY list, PVOID context,
-    PSTRING directory, ULONG filter, PIRP irp)
+    PSTRING directory, ULONG filter, BOOLEAN subtree, PIRP irp)
 {
     PIRP previous = ext4win_enter_fsrtl_completion();
     __try {
         FsRtlNotifyFullChangeDirectory(sync, list, context, directory,
-            FALSE, FALSE, filter, irp, NULL, NULL);
+            subtree, FALSE, filter, irp, NULL, NULL);
     }
     __finally { IoSetTopLevelIrp(previous); }
 }

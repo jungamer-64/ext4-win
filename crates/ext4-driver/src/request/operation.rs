@@ -1,5 +1,7 @@
 //! Concrete top-level request operations advanced only by scheduler events.
 
+mod notification;
+
 use alloc::boxed::Box;
 use ext4_core::{
     CheckpointPublication, CleanCloseOperation, CleanCloseTransition, CleanJournalDurability,
@@ -3683,7 +3685,7 @@ enum TopLevelCompletion {
 
 /// Driver-visible values produced by one successful mutation resolve pass.
 #[derive(Debug)]
-enum PendingDriverPublication {
+enum PendingDriverEffect {
     /// One initialized prefix awaits its matching home checkpoint before setup can continue.
     PagingStep(ext4_core::ContiguousFileStorage),
     /// Create must acquire its FCB/share claim before the first write.
@@ -3702,6 +3704,15 @@ enum PendingDriverPublication {
     Normal(IrpCompletion),
 }
 
+/// Owns each mutation's effect and preallocated notification paths until commit publication.
+#[derive(Debug)]
+struct PendingDriverPublication {
+    /// Operation-specific driver state.
+    effect: PendingDriverEffect,
+    /// Actual metadata changes prepared from the same restart-local epoch.
+    changes: crate::memory::DriverVec<crate::state::DirectoryChange>,
+}
+
 /// Post-commit driver publication whose durable path cannot allocate or fail.
 #[derive(Debug)]
 struct PreparedDriverPublication {
@@ -3709,6 +3720,8 @@ struct PreparedDriverPublication {
     stream_metadata: crate::state::PreparedStreamMetadataPublications,
     /// Handle, cursor, notification, or volume state published after stream metadata.
     effect: PreparedDriverEffect,
+    /// Prepared notifications become observable only after durable epoch publication.
+    changes: crate::memory::DriverVec<crate::state::DirectoryChange>,
 }
 
 impl PreparedDriverPublication {
@@ -3781,6 +3794,14 @@ enum PreparedDriverEffect {
 }
 
 impl PendingDriverPublication {
+    /// Begins a publication before restart-local metadata observations are attached.
+    fn new(effect: PendingDriverEffect) -> Self {
+        Self {
+            effect,
+            changes: crate::memory::DriverVec::new(),
+        }
+    }
+
     /// Completes every fallible driver-side acquisition before commit I/O can start.
     /// # Errors
     ///
@@ -3791,22 +3812,25 @@ impl PendingDriverPublication {
         stream_metadata: crate::state::PreparedStreamMetadataPublications,
         operations: &MountedVolumeAccess<'_>,
     ) -> DriverResult<PreparedDriverPublication> {
-        let effect = match self {
-            Self::PagingStep(storage) => PreparedDriverEffect::PagingStep(storage),
-            Self::Create(publication) => {
+        let effect = match self.effect {
+            PendingDriverEffect::PagingStep(storage) => PreparedDriverEffect::PagingStep(storage),
+            PendingDriverEffect::Create(publication) => {
                 let publication = (*publication).prepare(operations)?;
                 PreparedDriverEffect::Create(memory::boxed_try_with(move || Ok(publication))?)
             }
-            Self::ExistingCreate => PreparedDriverEffect::ExistingCreate,
-            Self::Write(publication) => PreparedDriverEffect::Write(publication),
-            Self::SetFile(publication) => PreparedDriverEffect::SetFile(publication),
-            Self::Cleanup(publication) => PreparedDriverEffect::Cleanup(publication),
-            Self::VolumeLabel(publication) => PreparedDriverEffect::VolumeLabel(publication),
-            Self::Normal(completion) => PreparedDriverEffect::Normal(completion),
+            PendingDriverEffect::ExistingCreate => PreparedDriverEffect::ExistingCreate,
+            PendingDriverEffect::Write(publication) => PreparedDriverEffect::Write(publication),
+            PendingDriverEffect::SetFile(publication) => PreparedDriverEffect::SetFile(publication),
+            PendingDriverEffect::Cleanup(publication) => PreparedDriverEffect::Cleanup(publication),
+            PendingDriverEffect::VolumeLabel(publication) => {
+                PreparedDriverEffect::VolumeLabel(publication)
+            }
+            PendingDriverEffect::Normal(completion) => PreparedDriverEffect::Normal(completion),
         };
         Ok(PreparedDriverPublication {
             stream_metadata,
             effect,
+            changes: self.changes,
         })
     }
 }
@@ -4765,7 +4789,9 @@ impl MutationRequestOperation {
     ) -> DriverResult<DriverResolveDisposition> {
         if let Some(paging) = state.paging {
             return paging.resolve(mutation).map(|storage| {
-                DriverResolveDisposition::Mutation(PendingDriverPublication::PagingStep(storage))
+                DriverResolveDisposition::Mutation(PendingDriverPublication::new(
+                    PendingDriverEffect::PagingStep(storage),
+                ))
             });
         }
         let preservation = match request {
@@ -4790,7 +4816,7 @@ impl MutationRequestOperation {
                 let completion =
                     crate::request::volume_health::mark(owned.request(), operations, mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::Relocation(relocation)
@@ -4801,7 +4827,7 @@ impl MutationRequestOperation {
             PreparedMutationRequest::Relocation(relocation) => {
                 let completion = relocation.resolve(mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::ZeroOnDeallocation => {
@@ -4811,7 +4837,7 @@ impl MutationRequestOperation {
                     mutation,
                 )?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::Create { mapping, creator } => {
@@ -4844,12 +4870,12 @@ impl MutationRequestOperation {
                     }
                     crate::request::create::CreateResolution::ExistingMutation => {
                         Ok(DriverResolveDisposition::Mutation(
-                            PendingDriverPublication::ExistingCreate,
+                            PendingDriverPublication::new(PendingDriverEffect::ExistingCreate),
                         ))
                     }
                     crate::request::create::CreateResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
-                            PendingDriverPublication::Create(publication),
+                            PendingDriverPublication::new(PendingDriverEffect::Create(publication)),
                         ))
                     }
                 }
@@ -4861,7 +4887,7 @@ impl MutationRequestOperation {
                     ),
                     crate::request::file_info::WriteResolution::Mutation(publication) => {
                         Ok(DriverResolveDisposition::Mutation(
-                            PendingDriverPublication::Write(publication),
+                            PendingDriverPublication::new(PendingDriverEffect::Write(publication)),
                         ))
                     }
                 }
@@ -4885,24 +4911,24 @@ impl MutationRequestOperation {
                     crate::request::file_info::SetFileResolution::CheckNamespaceOplocks(plan) => {
                         Ok(DriverResolveDisposition::CheckNamespaceOplocks { plan })
                     }
-                    crate::request::file_info::SetFileResolution::Mutation(publication) => {
-                        Ok(DriverResolveDisposition::Mutation(
-                            PendingDriverPublication::SetFile(publication),
-                        ))
-                    }
+                    crate::request::file_info::SetFileResolution::Mutation(publication) => Ok(
+                        DriverResolveDisposition::Mutation(PendingDriverPublication::new(
+                            PendingDriverEffect::SetFile(publication),
+                        )),
+                    ),
                 }
             }
             PreparedMutationRequest::SetEa => {
                 let completion = crate::request::ea::set(owned.request(), mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::Security(mapping) => {
                 let completion =
                     crate::request::security::set(owned.request(), mutation, &mapping.get().map)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::DirectoryCasefold { directory, state } => {
@@ -4914,7 +4940,9 @@ impl MutationRequestOperation {
                 let directory = mutation.directory(*directory)?;
                 mutation.set_directory_casefold(directory, *state)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(IrpCompletion::EMPTY),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(
+                        IrpCompletion::EMPTY,
+                    )),
                 ))
             }
             PreparedMutationRequest::SetVolumeInformation => {
@@ -4922,11 +4950,11 @@ impl MutationRequestOperation {
                     crate::request::volume_info::SetVolumeResolution::Complete(completion) => Ok(
                         DriverResolveDisposition::Complete(TopLevelCompletion::Normal(completion)),
                     ),
-                    crate::request::volume_info::SetVolumeResolution::Mutation(publication) => {
-                        Ok(DriverResolveDisposition::Mutation(
-                            PendingDriverPublication::VolumeLabel(publication),
-                        ))
-                    }
+                    crate::request::volume_info::SetVolumeResolution::Mutation(publication) => Ok(
+                        DriverResolveDisposition::Mutation(PendingDriverPublication::new(
+                            PendingDriverEffect::VolumeLabel(publication),
+                        )),
+                    ),
                 }
             }
             PreparedMutationRequest::SetReparsePoint => {
@@ -4937,7 +4965,7 @@ impl MutationRequestOperation {
                 )?;
                 let completion = crate::request::reparse::set_reparse_point(request, mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::DeleteReparsePoint => {
@@ -4948,7 +4976,7 @@ impl MutationRequestOperation {
                 )?;
                 let completion = crate::request::reparse::delete_reparse_point(request, mutation)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::Verity(VerityPreparation::Sealed(prepared)) => {
@@ -4959,7 +4987,7 @@ impl MutationRequestOperation {
                 )?;
                 let completion = crate::request::fsctl::enable_verity(request, mutation, prepared)?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Normal(completion),
+                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
                 ))
             }
             PreparedMutationRequest::Verity(VerityPreparation::Required(_)) => {
@@ -4991,15 +5019,23 @@ impl MutationRequestOperation {
                 };
                 let publication = memory::boxed_try_with(move || Ok(publication))?;
                 Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::Cleanup(publication),
+                    PendingDriverPublication::new(PendingDriverEffect::Cleanup(publication)),
                 ))
             }
         };
-        let result = result?;
+        let mut result = result?;
         if matches!(result, DriverResolveDisposition::Mutation(_))
             && let Some(preservation) = preservation
         {
             preservation.restore(mutation)?;
+        }
+        if let DriverResolveDisposition::Mutation(publication) = &mut result {
+            publication.changes = notification::prepare(
+                request,
+                state.pending_existing_create.as_ref(),
+                owned,
+                mutation,
+            )?;
         }
         Ok(result)
     }
@@ -5543,9 +5579,9 @@ impl MutationRequestOperation {
                     return self.restart_resolution(owned, None, None, operations);
                 }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
-                    let claim_valid = match &prepared {
-                        PendingDriverPublication::PagingStep(_) => self.paging.is_some(),
-                        PendingDriverPublication::ExistingCreate => {
+                    let claim_valid = match &prepared.effect {
+                        PendingDriverEffect::PagingStep(_) => self.paging.is_some(),
+                        PendingDriverEffect::ExistingCreate => {
                             self.pending_existing_create.is_some()
                         }
                         _ => self.pending_existing_create.is_none() && self.write_open.is_none(),
@@ -6955,6 +6991,7 @@ impl PreparedPublication for MutationRequestOperation {
                 let PreparedDriverPublication {
                     stream_metadata,
                     effect,
+                    changes,
                 } = publication;
                 let publication = match access.publish_durable(
                     durable,
@@ -6969,6 +7006,7 @@ impl PreparedPublication for MutationRequestOperation {
                         let publication = PreparedDriverPublication {
                             stream_metadata,
                             effect,
+                            changes,
                         };
                         return PublicationOutcome::Rejected(self.abort_create(
                             owned,
@@ -6978,6 +7016,10 @@ impl PreparedPublication for MutationRequestOperation {
                     }
                 };
                 let (pending, stream_projection) = publication.into_parts();
+                let mut changes = changes;
+                while let Some(change) = changes.pop() {
+                    access.report_directory_change(change);
+                }
                 let publication_failure = match stream_projection {
                     StreamProjectionOutcome::Complete => None,
                     StreamProjectionOutcome::Incomplete(failure) => {

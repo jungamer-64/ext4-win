@@ -313,7 +313,7 @@ impl MetadataMutation<'_, '_> {
             let resource = MutationResource::block_group(delta.group);
             observed.include(resource, coordinator.resource_version(resource))?;
         }
-        for ancestor in &self.namespace_ancestors {
+        for ancestor in &self.directory_dependencies {
             let resource = MutationResource::inode(*ancestor);
             observed.include(resource, coordinator.resource_version(resource))?;
         }

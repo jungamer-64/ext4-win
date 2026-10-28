@@ -235,6 +235,11 @@ impl DirectoryReader {
         }
     }
 
+    /// Directory whose namespace relation is observed by a mutation read pass.
+    pub(crate) const fn directory(&self) -> DirectoryNodeId {
+        self.directory
+    }
+
     /// Last consumed position; publishing it is the caller's responsibility.
     #[must_use]
     pub const fn cursor(&self) -> &DirectoryScanCursor {

@@ -366,8 +366,8 @@ struct MetadataMutation<'storage, 'epoch> {
     volume_label_update: Option<Ext4VolumeLabel>,
     /// Explicit persistent filesystem error to include in this transaction's superblock image.
     mark_filesystem_error: bool,
-    /// Ancestors whose committed parent relation authorizes a directory move.
-    namespace_ancestors: Vec<InodeId>,
+    /// Committed directory relations used by this mutation and its post-commit publications.
+    directory_dependencies: Vec<InodeId>,
 }
 
 impl core::fmt::Debug for MutationResolvePass<'_, '_, '_> {
@@ -1267,6 +1267,26 @@ impl MutationResolvePass<'_, '_, '_> {
     }
 }
 
+impl MutationResolvePass<'_, '_, '_> {
+    /// Retains a committed directory relation until its mutation intent can revalidate it.
+    /// # Errors
+    /// Returns allocation failure without accepting an untracked dependency.
+    fn observe_directory(&mut self, directory: DirectoryNodeId) -> Result<()> {
+        self.edit(|pass| {
+            if !pass
+                .mutation
+                .directory_dependencies
+                .contains(&directory.inode())
+            {
+                pass.mutation
+                    .directory_dependencies
+                    .try_push(directory.inode())?;
+            }
+            Ok(())
+        })
+    }
+}
+
 impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
     fn load_access(&mut self, node: NodeId) -> Result<Ext4Access> {
         self.mutation.volume.load_access(node)
@@ -1284,6 +1304,7 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
     }
 
     fn load_directory(&mut self, id: DirectoryNodeId) -> Result<DirectoryNode> {
+        self.observe_directory(id)?;
         self.mutation.volume.load_directory(id)
     }
 
@@ -1324,16 +1345,22 @@ impl super::CommittedReadPass for MutationResolvePass<'_, '_, '_> {
         &mut self,
         reader: &mut DirectoryReader,
     ) -> Result<Option<ScannedDirectoryEntry>> {
+        self.observe_directory(reader.directory())?;
         self.mutation
             .volume
             .next_directory_entry(reader, self.crypto)
     }
 
     fn read_hard_links(&mut self, target: HardLinkNodeId) -> Result<HardLinks> {
-        self.mutation.volume.read_hard_links(target, self.crypto)
+        let links = self.mutation.volume.read_hard_links(target, self.crypto)?;
+        for link in links.entries() {
+            self.observe_directory(link.parent())?;
+        }
+        Ok(links)
     }
 
     fn lookup_child(&mut self, parent: DirectoryNodeId, name: &Ext4Name) -> Result<ChildLookup> {
+        self.observe_directory(parent)?;
         let parent = self.mutation.volume.load_directory(parent)?;
         self.mutation
             .volume
@@ -1385,7 +1412,7 @@ impl<'storage, 'epoch> MetadataMutation<'storage, 'epoch> {
             free_inodes_delta: 0,
             volume_label_update: None,
             mark_filesystem_error: false,
-            namespace_ancestors: Vec::new(),
+            directory_dependencies: Vec::new(),
         }
     }
 }

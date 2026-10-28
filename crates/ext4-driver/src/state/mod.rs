@@ -75,8 +75,6 @@ use control_device::DeviceExtensionHeader;
 pub(crate) use control_device::*;
 #[cfg(test)]
 use control_device::{ControlDeviceLifecycle, ControlDevicePhase, RetirementAdmission};
-#[cfg(test)]
-use directory_notification::DIRECTORY_NOTIFICATION_DIRECTORY_UNITS;
 use directory_notification::DirectoryNotificationDirectoryName;
 pub(crate) use directory_notification::*;
 #[cfg(test)]

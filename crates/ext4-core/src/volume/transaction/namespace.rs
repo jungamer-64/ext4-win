@@ -716,8 +716,8 @@ impl MutationResolvePass<'_, '_, '_> {
                 .inode();
         }
         for ancestor in ancestors {
-            if !self.mutation.namespace_ancestors.contains(&ancestor) {
-                self.mutation.namespace_ancestors.try_push(ancestor)?;
+            if !self.mutation.directory_dependencies.contains(&ancestor) {
+                self.mutation.directory_dependencies.try_push(ancestor)?;
             }
         }
         Ok(())

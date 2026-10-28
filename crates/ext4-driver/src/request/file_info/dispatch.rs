@@ -130,16 +130,14 @@ impl<'owner> DirectoryNotificationRequest<'owner> {
     /// Converts this request into the exact FsRtl registration semantics this driver supports.
     /// # Errors
     ///
-    /// Returns an error when recursive watching or non-name completion filters are requested.
+    /// Returns invalid filter, handle, registration allocation, or native notification failures.
     fn registration(&mut self) -> DriverResult<DirectoryNotificationRegistration> {
-        if self.watch_scope.watches_subtree() {
-            return Err(DriverError::NotSupported);
-        }
         let full_directory_name = self.opened_directory.notification_directory_name()?;
         Ok(DirectoryNotificationRegistration::new(
             full_directory_name,
             self.opened_directory.notification_context(),
-            self.completion_filter.namespace_name_filter()?,
+            self.completion_filter.bits(),
+            self.watch_scope.watches_subtree(),
         ))
     }
 }

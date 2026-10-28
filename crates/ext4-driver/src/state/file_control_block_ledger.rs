@@ -3510,7 +3510,6 @@ impl PendingChildCreation {
         transaction.set_xattr(node, name, value)?;
         Ok(())
     }
-
 }
 
 /// Records a share claim and then publishes one additional FILE_OBJECT reference.

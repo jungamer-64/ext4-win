@@ -142,10 +142,6 @@ mod set_path_tests;
 
 /// Result of one restartable set-information resolve pass.
 #[derive(Debug)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the bounded publication carries prepared notifications inline and cannot add allocation after durable commit"
-)]
 pub(crate) enum SetFileResolution {
     /// No ext4 mutation was staged; all requested control-plane work is complete.
     Complete(IrpCompletion),
@@ -1390,6 +1386,7 @@ fn prepare_hard_link_destination(
             HardLinkCountEffect::Increase,
             HardLinkDirectoryChanges {
                 first: DirectoryChange::new(
+                    read,
                     target_parent,
                     target_name,
                     source_node,
@@ -1419,30 +1416,31 @@ fn prepare_hard_link_destination(
     }
 
     let existing_name = target.name().try_to_owned_name()?;
-    let changes =
-        if target.name() == target_name {
-            HardLinkDirectoryChanges {
-                first: DirectoryChange::hard_link_replaced(target_parent, target_name)?
-                    .with_tunnel(read, target_parent, target.name(), target_node)?,
-                second: None,
-            }
-        } else {
-            HardLinkDirectoryChanges {
-                first: DirectoryChange::new(
-                    target_parent,
-                    target.name(),
-                    target_node,
-                    DirectoryChangeAction::Removed,
-                )?
+    let changes = if target.name() == target_name {
+        HardLinkDirectoryChanges {
+            first: DirectoryChange::hard_link_replaced(read, target_parent, target_name)?
                 .with_tunnel(read, target_parent, target.name(), target_node)?,
-                second: Some(DirectoryChange::new(
-                    target_parent,
-                    target_name,
-                    source_node,
-                    DirectoryChangeAction::Added,
-                )?),
-            }
-        };
+            second: None,
+        }
+    } else {
+        HardLinkDirectoryChanges {
+            first: DirectoryChange::new(
+                read,
+                target_parent,
+                target.name(),
+                target_node,
+                DirectoryChangeAction::Removed,
+            )?
+            .with_tunnel(read, target_parent, target.name(), target_node)?,
+            second: Some(DirectoryChange::new(
+                read,
+                target_parent,
+                target_name,
+                source_node,
+                DirectoryChangeAction::Added,
+            )?),
+        }
+    };
     let count_effect = if target_node == source_node {
         HardLinkCountEffect::Preserve
     } else {
@@ -1597,10 +1595,6 @@ enum RenameLinkPublication {
 }
 
 /// Result of a committed rename with mutually exclusive no-op and changed states.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "prepared notification ownership moves directly to publication without fallible allocation after commit"
-)]
 enum PreparedRename {
     /// The transaction preserved the existing handle location and emitted no notifications.
     Unchanged,
@@ -1694,6 +1688,7 @@ impl PreparedRenameMutation {
                         if child.name() != &target_name {
                             Some(
                                 DirectoryChange::new(
+                                    read,
                                     target_parent,
                                     child.name(),
                                     source_node,
@@ -1747,6 +1742,7 @@ impl PreparedRenameMutation {
                     }),
                     Some(
                         DirectoryChange::new(
+                            read,
                             target_parent,
                             child.name(),
                             *child.node(),
@@ -1765,6 +1761,7 @@ impl PreparedRenameMutation {
         let notifications = RenameDirectoryNameChanges {
             replaced_target,
             old_source_name: DirectoryChange::new(
+                read,
                 source_parent,
                 &source_name,
                 source_node,
@@ -1782,12 +1779,14 @@ impl PreparedRenameMutation {
                     None
                 }
                 RenameNamespaceAction::Coalesce { .. } => Some(DirectoryChange::new(
+                    read,
                     target_parent,
                     &target_name,
                     source_node,
                     DirectoryChangeAction::Added,
                 )?),
                 RenameNamespaceAction::Move(_) => Some(DirectoryChange::new(
+                    read,
                     target_parent,
                     &target_name,
                     source_node,

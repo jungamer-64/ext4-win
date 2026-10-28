@@ -974,35 +974,11 @@ fn directory_relative_name(
             return Err(ext4_core::Error::InvalidDirectoryEntry.into());
         }
         visited.try_push(directory)?;
-        let loaded = read.load_directory(directory)?;
-        let parent = match read.lookup_child(loaded.id(), &Ext4Name::new(b"..")?)? {
-            ChildLookup::Found(child) => match *child.node() {
-                NodeId::Directory(parent) => parent,
-                NodeId::File(_) | NodeId::Symlink(_) => {
-                    return Err(ext4_core::Error::InvalidDirectoryEntry.into());
-                }
-            },
-            ChildLookup::NotFound => return Err(ext4_core::Error::InvalidDirectoryEntry.into()),
-        };
-        let mut reader =
-            ext4_core::DirectoryReader::new(parent, ext4_core::DirectoryScanCursor::start());
-        let mut name = None;
-        while let Some(scanned) = read.next_directory_entry(&mut reader)? {
-            let entry = scanned.into_entry();
-            if entry.name().bytes() == b"." || entry.name().bytes() == b".." {
-                continue;
-            }
-            if *entry.node() == NodeId::Directory(directory) {
-                if name.is_some() {
-                    return Err(ext4_core::Error::InvalidDirectoryEntry.into());
-                }
-                name = Some(WindowsName::from_ext4(entry.name())?);
-            }
-        }
+        let parent = crate::namespace::directory_parent(read, directory)?;
         components
-            .try_push_owned(name.ok_or(ext4_core::Error::InvalidDirectoryEntry)?)
+            .try_push_owned(parent.name)
             .map_err(|error| error.into_parts().0)?;
-        directory = parent;
+        directory = parent.directory;
     }
     assemble_relative_name(components.as_slice())
 }

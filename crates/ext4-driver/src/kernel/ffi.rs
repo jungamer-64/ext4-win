@@ -308,6 +308,7 @@ unsafe extern "system" {
         context: wdk_sys::PVOID,
         directory: wdk_sys::PSTRING,
         filter: u32,
+        subtree: u8,
         irp: wdk_sys::PIRP,
     );
 

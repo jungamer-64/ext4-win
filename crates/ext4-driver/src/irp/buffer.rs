@@ -1104,6 +1104,10 @@ impl DirectoryWatchScope {
 pub(crate) struct DirectoryChangeFilter(pub(super) wdk_sys::ULONG);
 
 impl DirectoryChangeFilter {
+    /// Returns the validated Windows completion-filter mask.
+    pub(crate) const fn bits(self) -> wdk_sys::ULONG {
+        self.0
+    }
     /// Decodes a Windows completion-filter bit set.
     /// # Errors
     ///
@@ -1115,7 +1119,6 @@ impl DirectoryChangeFilter {
         }
         Ok(Self(value))
     }
-
 }
 
 /// EA entry index selected by a query-EA request.

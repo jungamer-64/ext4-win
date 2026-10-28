@@ -6309,3 +6309,62 @@ fn journal_acquisition_revocation_and_preparation_are_exclusive() -> Result<()> 
     );
     Ok(())
 }
+
+/// # Errors
+/// Returns fixture, directory observation, or namespace mutation failures.
+/// # Panics
+/// Fails if a prepared publication can use directory observations invalidated before commit.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "the conflict assertion checks committed directory dependencies after fallible setup"
+)]
+fn committed_directory_reads_are_revalidated_before_publication() -> Result<()> {
+    for observation in 0..3 {
+        let mut fixture = Fixture::new()?;
+        let child = Ext4Name::new(b"observed-child")?;
+        let ticket = fixture.coordinator.admit_mutation()?;
+        let (resolved, ()) = fixture.disk.resolve(
+            &fixture.profile,
+            &fixture.epoch,
+            &fixture.coordinator,
+            ticket,
+            &mut PlainCrypto,
+            |pass| {
+                match observation {
+                    0 => {
+                        CommittedReadPass::load_directory(pass, DirectoryNodeId::ROOT)?;
+                    }
+                    1 => {
+                        CommittedReadPass::lookup_child(pass, DirectoryNodeId::ROOT, &child)?;
+                    }
+                    _ => {
+                        let mut reader = DirectoryReader::new(
+                            DirectoryNodeId::ROOT,
+                            DirectoryScanCursor::start(),
+                        );
+                        CommittedReadPass::next_directory_entry(pass, &mut reader)?;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        fixture.mutate(|pass| {
+            let root = pass.directory(DirectoryNodeId::ROOT)?;
+            pass.create_directory(
+                root,
+                &child,
+                NewDirectoryMetadata::new(namespace_owner(), Ext4Permissions::new(0o755)?),
+            )?;
+            Ok(())
+        })?;
+        assert!(matches!(
+            resolved.reserve(
+                fixture.coordinator.grant_intent(ticket),
+                &fixture.coordinator
+            ),
+            Err(Error::ClusterReferenceConflict)
+        ));
+    }
+    Ok(())
+}

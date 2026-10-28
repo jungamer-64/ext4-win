@@ -9,6 +9,8 @@ pub(crate) struct DirectoryNotificationRegistration {
     full_directory_name: NonNull<UNICODE_STRING>,
     /// Stable unique CCB address that identifies the owning FILE_OBJECT to FsRtl.
     context: NonNull<c_void>,
+    /// Recursive observation is owned by this individual registration.
+    subtree: bool,
     /// Supported Windows completion-filter bits.
     completion_filter: wdk_sys::ULONG,
 }
@@ -19,11 +21,13 @@ impl DirectoryNotificationRegistration {
         full_directory_name: NonNull<UNICODE_STRING>,
         context: NonNull<c_void>,
         completion_filter: wdk_sys::ULONG,
+        subtree: bool,
     ) -> Self {
         Self {
             full_directory_name,
             context,
             completion_filter,
+            subtree,
         }
     }
 }
@@ -62,7 +66,7 @@ pub(crate) struct DirectoryChange {
     /// Removing-link data admitted before staging and cached only after durable publication.
     pub(super) tunnel: Option<Box<crate::kernel::name_tunnel::TunnelRemoval>>,
     /// Full synthetic target name used only by the FsRtl notifier package.
-    pub(super) target: DirectoryNotificationTarget,
+    pub(super) targets: DriverVec<DirectoryNotificationTarget>,
     /// FILE_NOTIFY_CHANGE_FILE_NAME or FILE_NOTIFY_CHANGE_DIR_NAME.
     pub(super) completion_filter: wdk_sys::ULONG,
     /// FILE_ACTION_* payload written to matching watcher buffers.
@@ -102,6 +106,7 @@ impl DirectoryChange {
     ///
     /// Returns an encoding, length, or allocation error while preparing the notification payload.
     pub(crate) fn new(
+        read: &mut impl ext4_core::CommittedReadPass,
         parent: DirectoryNodeId,
         name: &Ext4Name,
         node: NodeId,
@@ -113,10 +118,27 @@ impl DirectoryChange {
             wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME
         };
         Ok(Self {
-            target: DirectoryNotificationTarget::new(parent, name)?,
+            targets: DirectoryNotificationTarget::ancestors(read, parent, name)?,
             tunnel: None,
             completion_filter,
             action,
+        })
+    }
+
+    /// Prepares an actual metadata transition for one reachable link.
+    /// # Errors
+    /// Returns ancestry, encoding or allocation failure before any media write.
+    pub(crate) fn modified(
+        read: &mut impl ext4_core::CommittedReadPass,
+        parent: DirectoryNodeId,
+        name: &Ext4Name,
+        filter: u32,
+    ) -> DriverResult<Self> {
+        Ok(Self {
+            targets: DirectoryNotificationTarget::ancestors(read, parent, name)?,
+            tunnel: None,
+            completion_filter: filter,
+            action: DirectoryChangeAction::Modified,
         })
     }
 
@@ -125,6 +147,7 @@ impl DirectoryChange {
     ///
     /// Returns an encoding, length, or allocation error while preparing the notification payload.
     pub(crate) fn hard_link_replaced(
+        read: &mut impl ext4_core::CommittedReadPass,
         parent: DirectoryNodeId,
         name: &Ext4Name,
     ) -> DriverResult<Self> {
@@ -136,7 +159,7 @@ impl DirectoryChange {
             | wdk_sys::FILE_NOTIFY_CHANGE_SECURITY
             | wdk_sys::FILE_NOTIFY_CHANGE_EA;
         Ok(Self {
-            target: DirectoryNotificationTarget::new(parent, name)?,
+            targets: DirectoryNotificationTarget::ancestors(read, parent, name)?,
             tunnel: None,
             completion_filter: FILTER,
             action: DirectoryChangeAction::Modified,
@@ -290,6 +313,7 @@ impl DirectoryChangeNotifier {
                     registration.context.as_ptr(),
                     registration.full_directory_name.as_ptr().cast(),
                     registration.completion_filter,
+                    u8::from(registration.subtree),
                     target.into_raw_irp(),
                 );
             }
@@ -301,8 +325,15 @@ impl DirectoryChangeNotifier {
                 full_directory_name,
                 context,
                 completion_filter,
+                subtree,
             } = registration;
-            core::hint::black_box((target, full_directory_name, context, completion_filter));
+            core::hint::black_box((
+                target,
+                full_directory_name,
+                context,
+                completion_filter,
+                subtree,
+            ));
             STATUS_SUCCESS
         }
     }
@@ -321,34 +352,43 @@ impl DirectoryChangeNotifier {
             if !self.initialized {
                 return;
             }
-            let mut full_target_name = change.target.unicode_string();
-            let native = self.native.get();
-            let sync = unsafe {
-                // SAFETY: `initialized` guarantees FsRtl populated this
-                // mounted VCB's synchronization pointer.
-                (*native).sync
-            };
-            let list_head = unsafe {
-                // SAFETY: The native storage stays pinned inside the mounted
-                // VCB and FsRtl synchronizes access to the list links.
-                core::ptr::addr_of_mut!((*native).list_head)
-            };
-            unsafe {
-                // SAFETY: This runs after the namespace transaction commits
-                // at PASSIVE_LEVEL. FsRtl consumes the event synchronously.
-                ffi::ext4win_notify_report(
-                    sync,
-                    list_head,
-                    core::ptr::from_mut(&mut full_target_name).cast(),
-                    change.target.name_offset_bytes,
-                    change.completion_filter,
-                    change.action.as_ulong(),
-                );
+            for target in change.targets.iter() {
+                let mut full_target_name = target.unicode_string();
+                let native = self.native.get();
+                let sync = unsafe {
+                    // SAFETY: `initialized` guarantees FsRtl populated this
+                    // mounted VCB's synchronization pointer.
+                    (*native).sync
+                };
+                let list_head = unsafe {
+                    // SAFETY: The native storage stays pinned inside the mounted
+                    // VCB and FsRtl synchronizes access to the list links.
+                    core::ptr::addr_of_mut!((*native).list_head)
+                };
+                unsafe {
+                    // SAFETY: This runs after the namespace transaction commits
+                    // at PASSIVE_LEVEL. FsRtl consumes the event synchronously.
+                    ffi::ext4win_notify_report(
+                        sync,
+                        list_head,
+                        core::ptr::from_mut(&mut full_target_name).cast(),
+                        target.name_offset_bytes,
+                        change.completion_filter,
+                        change.action.as_ulong(),
+                    );
+                }
             }
         }
         #[cfg(test)]
         {
-            let _change = change;
+            for target in change.targets.iter() {
+                core::hint::black_box((
+                    target.unicode_string(),
+                    target.name_offset_bytes,
+                    change.completion_filter,
+                    change.action.as_ulong(),
+                ));
+            }
         }
     }
 
@@ -532,6 +572,67 @@ pub(super) struct DirectoryNotificationTarget {
 }
 
 impl DirectoryNotificationTarget {
+    /// Prepares one anchored path for each ancestor before mutation publication.
+    /// Synthetic roots identify watched directories by inode, so moving a directory never
+    /// invalidates an outstanding watch. Each suffix is the actual relative Windows path.
+    /// # Errors
+    /// Returns cyclic/malformed ancestry, encoding, length or allocation failures.
+    fn ancestors(
+        read: &mut impl ext4_core::CommittedReadPass,
+        mut parent: DirectoryNodeId,
+        name: &Ext4Name,
+    ) -> DriverResult<DriverVec<Self>> {
+        let mut components = DriverVec::new();
+        components
+            .try_push_owned(WindowsName::from_ext4(name)?)
+            .map_err(|error| error.into_parts().0)?;
+        let mut visited = DriverVec::new();
+        let mut targets = DriverVec::new();
+        loop {
+            if visited.as_slice().contains(&parent) {
+                return Err(ext4_core::Error::InvalidDirectoryEntry.into());
+            }
+            visited.try_push(parent)?;
+            targets
+                .try_push_owned(Self::from_components(parent, components.as_slice())?)
+                .map_err(|error| error.into_parts().0)?;
+            if parent == DirectoryNodeId::ROOT {
+                break;
+            }
+            let link = crate::namespace::directory_parent(read, parent)?;
+            components
+                .try_push_owned(link.name)
+                .map_err(|error| error.into_parts().0)?;
+            parent = link.directory;
+        }
+        Ok(targets)
+    }
+
+    /// Encodes an inode anchor followed by leaf-to-root input components in path order.
+    /// # Errors
+    /// Rejects empty paths, counted-string overflow or allocation failure.
+    fn from_components(anchor: DirectoryNodeId, components: &[WindowsName]) -> DriverResult<Self> {
+        if components.is_empty() {
+            return Err(DriverError::InvalidParameter);
+        }
+        let mut units = DriverVec::new();
+        units.try_extend_from_copy_slice(&DirectoryNotificationDirectoryName::encode(anchor))?;
+        let mut name_offset_bytes = 0;
+        for component in components.iter().rev() {
+            units.try_push(DIRECTORY_NOTIFICATION_SEPARATOR)?;
+            name_offset_bytes = u16::try_from(core::mem::size_of_val(units.as_slice()))
+                .map_err(|_| DriverError::InvalidBufferSize)?;
+            units.try_extend_from_copy_slice(component.utf16())?;
+        }
+        let byte_length = u16::try_from(core::mem::size_of_val(units.as_slice()))
+            .map_err(|_| DriverError::InvalidBufferSize)?;
+        Ok(Self {
+            units,
+            byte_length,
+            name_offset_bytes,
+        })
+    }
+
     /// Views this complete target as the layout accepted by FsRtl's PSTRING ABI.
     pub(super) fn unicode_string(&self) -> UNICODE_STRING {
         UNICODE_STRING {
@@ -548,3 +649,50 @@ const DIRECTORY_NOTIFICATION_SEPARATOR: u16 = 0x005C;
 const DIRECTORY_NOTIFICATION_INODE_MARKER: u16 = 0x0100;
 /// `\\` plus four lossless inode-identity units.
 pub(super) const DIRECTORY_NOTIFICATION_DIRECTORY_UNITS: usize = 5;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails when the native suffix or final-component byte offset differs from the Windows path.
+    #[test]
+    fn ancestor_notification_contains_relative_path_in_component_order() {
+        let result = (|| -> DriverResult<()> {
+            let components = [
+                WindowsName::from_utf16(&[99, 104, 105, 108, 100])?,
+                WindowsName::from_utf16(&[115, 117, 98])?,
+            ];
+            let target =
+                DirectoryNotificationTarget::from_components(DirectoryNodeId::ROOT, &components)?;
+            assert_eq!(
+                target.units.as_slice().get(5..),
+                Some([92_u16, 115, 117, 98, 92, 99, 104, 105, 108, 100].as_slice())
+            );
+            assert_eq!(target.name_offset_bytes, 20);
+            assert_eq!(target.unicode_string().Length, 30);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails if Unicode names lose UTF-16 units or the direct-parent notification boundary.
+    #[test]
+    fn notification_preserves_unicode_and_maximum_component() {
+        let result = (|| -> DriverResult<()> {
+            for name in ["é😀".as_bytes(), [b'a'; 255].as_slice()] {
+                let component = WindowsName::from_ext4(&Ext4Name::new(name)?)?;
+                let expected = DriverVec::try_copied_from_slice(component.utf16())?;
+                let target = DirectoryNotificationTarget::from_components(
+                    DirectoryNodeId::ROOT,
+                    &[component],
+                )?;
+                assert_eq!(target.name_offset_bytes, 12);
+                assert_eq!(target.units.as_slice().get(6..), Some(expected.as_slice()));
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+}

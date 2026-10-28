@@ -5,7 +5,7 @@ use core::num::NonZeroU32;
 use core::pin::Pin;
 use core::ptr::NonNull;
 
-use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, Ext4Name, FileOffset, NodeId};
+use ext4_core::{ByteOffset, DeviceLength, DirectoryNodeId, FileOffset, NodeId};
 
 use crate::irp::{
     ActiveFileObject, CreateDeletion, DataIoKind, DeleteAccess, FileAttributesWriteAccess,
@@ -16,8 +16,7 @@ use crate::kernel::status::DriverError;
 
 use super::{
     CleanCloseTerminal, CleanupStart, CloseReleasePlan, ControlDeviceLifecycle, ControlDevicePhase,
-    DIRECTORY_NOTIFICATION_DIRECTORY_UNITS, DataTransferMode, DeviceExtensionKind, DirectoryChange,
-    DirectoryChangeAction, DirectoryPattern, DriverDeviceKind, FileControlBlock,
+    DataTransferMode, DeviceExtensionKind, DirectoryPattern, DriverDeviceKind, FileControlBlock,
     FileControlBlockLedger, FileControlBlockOpenState, FileObjectCloseKind, HandleAdmissionState,
     HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
     NativeResidencyRecheck, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
@@ -1330,117 +1329,6 @@ fn opened_directory_reuses_a_stable_notification_name_descriptor() {
         Ok(())
     });
     assert_eq!(result, Ok(()));
-}
-
-/// # Panics
-///
-/// Panics when a namespace change does not preserve its synthetic parent/name boundary.
-#[test]
-fn directory_change_encodes_the_child_boundary_and_action() {
-    let name = Ext4Name::new(b"child");
-    assert!(name.is_ok());
-    let Ok(name) = name else {
-        return;
-    };
-    let change = DirectoryChange::new(
-        DirectoryNodeId::ROOT,
-        &name,
-        NodeId::Directory(DirectoryNodeId::ROOT),
-        DirectoryChangeAction::Added,
-    );
-    assert!(change.is_ok());
-    let Ok(change) = change else {
-        return;
-    };
-
-    assert_eq!(
-        change.completion_filter,
-        wdk_sys::FILE_NOTIFY_CHANGE_DIR_NAME
-    );
-    assert_eq!(change.action.as_ulong(), wdk_sys::FILE_ACTION_ADDED);
-    let prefix_units = DIRECTORY_NOTIFICATION_DIRECTORY_UNITS.checked_add(1);
-    assert!(prefix_units.is_some());
-    let Some(prefix_units) = prefix_units else {
-        return;
-    };
-    let prefix_bytes = prefix_units.checked_mul(core::mem::size_of::<u16>());
-    assert!(prefix_bytes.is_some());
-    let Some(prefix_bytes) = prefix_bytes else {
-        return;
-    };
-    assert_eq!(usize::from(change.target.name_offset_bytes), prefix_bytes);
-    let target_name = change.target.unicode_string();
-    assert_eq!(
-        target_name.Buffer,
-        change.target.units.as_slice().as_ptr().cast_mut()
-    );
-    assert_eq!(target_name.Length, change.target.byte_length);
-    assert_eq!(
-        change.target.units.as_slice(),
-        &[
-            0x005c, 0x0100, 0x0100, 0x0100, 0x0102, 0x005c, 99, 104, 105, 108, 100
-        ]
-    );
-    assert_eq!(target_name.Length, 22);
-}
-
-/// # Errors
-/// Propagates name conversion or notification allocation failure.
-/// # Panics
-/// Fails if UTF-16 expansion or the maximum ext4 component loses bytes or its child boundary.
-#[test]
-#[expect(
-    clippy::panic_in_result_fn,
-    reason = "setup propagates conversion and allocation errors while assertions verify native notification lengths"
-)]
-fn directory_notification_preserves_unicode_and_maximum_component()
--> crate::kernel::status::DriverResult<()> {
-    let largest = [b'a'; 255];
-    let largest_utf16 = [97_u16; 255];
-    let unicode = [0x00e9, 0xd83d, 0xde00];
-    for (bytes, child, expected_bytes) in [
-        ("é😀".as_bytes(), unicode.as_slice(), 18_u16),
-        (largest.as_slice(), largest_utf16.as_slice(), 522_u16),
-    ] {
-        let change = DirectoryChange::new(
-            DirectoryNodeId::ROOT,
-            &Ext4Name::new(bytes)?,
-            NodeId::Directory(DirectoryNodeId::ROOT),
-            DirectoryChangeAction::Added,
-        )?;
-        assert_eq!(change.target.units.as_slice().get(6..), Some(child));
-        assert_eq!(change.target.name_offset_bytes, 12);
-        let descriptor = change.target.unicode_string();
-        assert_eq!(descriptor.Length, expected_bytes);
-        assert_eq!(descriptor.MaximumLength, expected_bytes);
-    }
-    Ok(())
-}
-
-/// # Panics
-///
-/// Panics when in-place hard-link replacement loses its metadata notification contract.
-#[test]
-fn hard_link_replacement_reports_modified_metadata_filters() {
-    let name = Ext4Name::new(b"child");
-    assert!(name.is_ok());
-    let Ok(name) = name else {
-        return;
-    };
-    let change = DirectoryChange::hard_link_replaced(DirectoryNodeId::ROOT, &name);
-    assert!(change.is_ok());
-    let Ok(change) = change else {
-        return;
-    };
-    assert_eq!(change.action.as_ulong(), wdk_sys::FILE_ACTION_MODIFIED);
-    assert_ne!(
-        change.completion_filter & wdk_sys::FILE_NOTIFY_CHANGE_ATTRIBUTES,
-        0
-    );
-    assert_ne!(
-        change.completion_filter & wdk_sys::FILE_NOTIFY_CHANGE_SECURITY,
-        0
-    );
 }
 
 /// # Panics

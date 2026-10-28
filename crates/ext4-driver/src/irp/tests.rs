@@ -3374,12 +3374,12 @@ fn notify_directory_stack_decodes_filter_and_scope() {
     }
 
     assert_eq!(
-        DirectoryChangeFilter(wdk_sys::FILE_NOTIFY_CHANGE_NAME).namespace_name_filter(),
-        Ok(wdk_sys::FILE_NOTIFY_CHANGE_NAME)
+        DirectoryChangeFilter(wdk_sys::FILE_NOTIFY_CHANGE_NAME).bits(),
+        wdk_sys::FILE_NOTIFY_CHANGE_NAME
     );
     assert_eq!(
-        DirectoryChangeFilter(completion_filter).namespace_name_filter(),
-        Err(crate::kernel::status::DriverError::NotSupported)
+        DirectoryChangeFilter(completion_filter).bits(),
+        completion_filter
     );
 
     stack.Flags = 0;
