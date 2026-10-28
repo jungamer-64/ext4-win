@@ -1921,6 +1921,44 @@ fn require_free_space_delta(
     Ok(())
 }
 
+/// Interprets dump bytes against the independent inode size and storage observation.
+///
+/// The pinned debugfs emits the complete inline storage area, including bytes beyond EOF.
+/// Only that explicitly reported capacity may extend a dump beyond its logical file size.
+/// # Errors
+/// Returns malformed stat fields, a truncated dump, or an unreported dump length.
+fn debugfs_file_content<'data>(stat: &str, dump: &'data [u8]) -> TaskResult<&'data [u8]> {
+    let size = debugfs_stat_count(stat, "Size:")?;
+    let inline_capacity = stat
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Size of inline data:"))
+        .map(|value| value.trim().parse::<usize>())
+        .transpose()?;
+    if inline_capacity.is_some_and(|capacity| capacity < size)
+        || (dump.len() != size && inline_capacity != Some(dump.len()))
+    {
+        return Err(io::Error::other(format!(
+            "debugfs dump length {} does not match EOF {size} or inline capacity {inline_capacity:?}",
+            dump.len()
+        ))
+        .into());
+    }
+    dump.get(..size)
+        .ok_or_else(|| io::Error::other("debugfs dump is shorter than EOF").into())
+}
+
+/// Reads one decimal inode-stat field using complete tokens rather than numeric prefixes.
+/// # Errors
+/// Returns a missing, incomplete, malformed or out-of-range field.
+fn debugfs_stat_count(stat: &str, field: &str) -> TaskResult<usize> {
+    let mut words = stat.split_whitespace();
+    let value = words
+        .find(|word| *word == field)
+        .and_then(|_| words.next())
+        .ok_or_else(|| io::Error::other(format!("debugfs stat omits {field}")))?;
+    Ok(value.parse()?)
+}
+
 /// Requires one debugfs-visible regular file to have exact content, size, and link count.
 ///
 /// # Errors
@@ -1936,9 +1974,10 @@ fn debugfs_require_file(
     label: &str,
 ) -> TaskResult<()> {
     let stat = debugfs_request_output(linux, image, &format!("stat \"{path}\""))?;
-    let size_field = format!("Size: {}", expected.len());
-    let links_field = format!("Links: {links}");
-    if !stat.contains("Inode:") || !stat.contains(&size_field) || !stat.contains(&links_field) {
+    if debugfs_stat_count(&stat, "Inode:")? == 0
+        || debugfs_stat_count(&stat, "Size:")? != expected.len()
+        || debugfs_stat_count(&stat, "Links:")? != usize::from(links)
+    {
         return Err(
             io::Error::other(format!("{label} stat mismatch for {path}: {}", stat.trim())).into(),
         );
@@ -1949,13 +1988,13 @@ fn debugfs_require_file(
     let mut command = linux.command("debugfs");
     command.args([
         "-R",
-        &format!("dump -p \"{path}\" \"{dump_path}\""),
+        &format!("dump \"{path}\" \"{dump_path}\""),
         &image_path,
     ]);
     run_checked(command, &format!("debugfs dump for {label}"))?;
     let observed = fs::read(&dump)?;
     fs::remove_file(&dump)?;
-    if observed != expected {
+    if debugfs_file_content(&stat, &observed)? != expected {
         return Err(io::Error::other(format!("{label} content mismatch for {path}")).into());
     }
     Ok(())
@@ -4340,6 +4379,74 @@ fn verify_locked_directory_enumeration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns fixture construction or stat/dump interpretation failure.
+    /// # Panics
+    /// Fails if storage padding changes file content or a dump length lacks independent evidence.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independent stat and dump vectors with logical EOF"
+    )]
+    fn debugfs_inline_dumps_expose_only_logical_file_bytes() -> TaskResult<()> {
+        for (size, capacity) in [(0, 60), (7, 60), (60, 60), (65, 80)] {
+            let stat = format!(
+                "Inode: 12 Type: regular Flags: 0x10000000\n\
+                 User: 1000 Group: 1000 Size: {size}\n\
+                 Links: 1 Blockcount: 0\n\
+                 Fragment: Address: 0 Number: 0 Size: 0\n\
+                 Size of inline data: {capacity}\n"
+            );
+            let mut dump = vec![0x42; capacity];
+            dump.get_mut(..size)
+                .ok_or_else(|| io::Error::other("fixture payload exceeds capacity"))?
+                .fill(0x71);
+            let expected = vec![0x71; size];
+            assert_eq!(debugfs_file_content(&stat, &dump)?, expected);
+            assert_eq!(debugfs_file_content(&stat, &expected)?, expected);
+            assert!(debugfs_file_content(&stat, &vec![0x71; capacity + 1]).is_err());
+            if size < capacity {
+                assert!(debugfs_file_content(&stat, &vec![0x71; capacity - 1]).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns decimal stat parsing or dump interpretation failure.
+    /// # Panics
+    /// Fails if numeric prefixes or unsupported storage lengths satisfy exact file observations.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions cover exact stat values and malformed external observations"
+    )]
+    fn debugfs_file_observations_require_exact_metadata_and_complete_dumps() -> TaskResult<()> {
+        let stat = "Inode: 12 Type: regular\nUser: 0 Group: 0 Size: 7\nLinks: 1 Blockcount: 8\n";
+        assert_eq!(debugfs_file_content(stat, b"PAYLOAD")?, b"PAYLOAD");
+        assert!(debugfs_file_content(stat, b"PAYLOA").is_err());
+        assert!(debugfs_file_content(stat, b"PAYLOAD!").is_err());
+        assert!(debugfs_file_content(stat, &[0; 60]).is_err());
+        for inline in ["6", "invalid"] {
+            assert!(
+                debugfs_file_content(
+                    &format!("{stat}Size of inline data: {inline}\n"),
+                    b"PAYLOAD"
+                )
+                .is_err()
+            );
+        }
+        let longer =
+            "Inode: 12 Type: regular\nUser: 0 Group: 0 Size: 70\nLinks: 10 Blockcount: 8\n";
+        assert_eq!(debugfs_stat_count(longer, "Size:")?, 70);
+        assert_eq!(debugfs_stat_count(longer, "Links:")?, 10);
+        assert!(debugfs_file_content(longer, b"PAYLOAD").is_err());
+        for malformed in ["", "Size:", "Size: invalid", "Size: -1"] {
+            assert!(debugfs_stat_count(malformed, "Size:").is_err());
+        }
+        Ok(())
+    }
 
     /// The provenance grammar accepts exactly the three promised profiles and rejects path escape.
     ///
