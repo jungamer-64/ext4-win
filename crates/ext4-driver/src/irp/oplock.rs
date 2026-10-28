@@ -629,6 +629,10 @@ impl OplockEnvelope {
     /// # Errors
     ///
     /// Returns the allocation failure together with every unconsumed pre-effect authority.
+    #[expect(
+        clippy::result_large_err,
+        reason = "allocation failure must return the unconsumed IRP and continuation without another allocation"
+    )]
     pub(super) fn try_new(
         reactor: NonNull<CompletionReactor>,
         identity: SlotId,

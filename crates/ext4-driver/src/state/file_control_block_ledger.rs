@@ -529,6 +529,8 @@ impl PagingFileSetupLease {
     }
 
     /// Identifies the retained regular-file inode for initialization transactions.
+    /// # Errors
+    /// Returns an invariant violation if the retained setup identity is not a regular file.
     pub(crate) fn file(&self) -> DriverResult<ext4_core::FileNodeId> {
         match self.stream.stream().node {
             NodeId::File(file) => Ok(file),

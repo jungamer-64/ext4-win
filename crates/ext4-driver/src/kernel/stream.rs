@@ -56,7 +56,9 @@ pub(crate) enum PagingFileClaim {
     Initial,
     /// Existing direct I/O continues over this acknowledged physical prefix.
     Extension {
+        /// Lower-device coordinate that subsequent map publication must preserve.
         physical: ext4_core::ByteOffset,
+        /// Previously acknowledged prefix; extension may only append beyond it.
         length: FileSize,
     },
 }
@@ -82,7 +84,9 @@ pub(crate) struct PagingFileReservation {
     )
 )]
 enum PagingReservationPhase {
+    /// Dropping setup releases the unique native reservation without publishing a map.
     Reserved,
+    /// Native map publication consumed rollback authority.
     Activated,
 }
 

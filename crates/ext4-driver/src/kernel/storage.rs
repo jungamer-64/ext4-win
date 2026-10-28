@@ -828,6 +828,10 @@ impl<O> PreparedStorageCommand<O> {
     /// Returns the suspended command when IRP, MDL, envelope, or completion-rundown preparation
     /// fails before registration.
     #[cfg(not(test))]
+    #[expect(
+        clippy::result_large_err,
+        reason = "lower preparation failure returns the exact suspended command without allocating its recovery path"
+    )]
     pub fn build_lower<R>(
         self,
         destination: R,
@@ -1628,6 +1632,11 @@ mod tests {
     /// # Panics
     /// Fails if a media gate retries uncertain progress, changes its write image or loses its bound.
     #[test]
+    #[expect(
+        clippy::panic,
+        clippy::disallowed_macros,
+        reason = "test fixture and continuation-shape failures must terminate the storage protocol assertions"
+    )]
     fn zero_progress_media_gate_requires_verification_and_preserves_the_exact_phase() {
         let Some(fixture) = storage_fixture() else {
             return;
@@ -1718,6 +1727,11 @@ mod tests {
     /// # Panics
     /// Fails if new-mount override is lost between the read and write halves of sector recovery.
     #[test]
+    #[expect(
+        clippy::panic,
+        clippy::disallowed_macros,
+        reason = "test fixture and continuation-shape failures must terminate the storage protocol assertions"
+    )]
     fn mount_recovery_override_follows_the_exact_read_modify_write_phase() {
         let Some(fixture) = storage_fixture() else {
             return;

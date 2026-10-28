@@ -151,7 +151,9 @@ impl_mounted_operation_adapter!(VerifyOperation);
 enum VerifyAdmissionState {
     /// No filesystem operation or handle lane has been admitted.
     Ready {
+        /// Captured request whose completion authority stays local during native verification.
         owned: OwnedIrp,
+        /// Real-device reference acquired before scheduling the native worker.
         query: crate::kernel::volume_verify::VerificationDevice,
     },
     /// The worker owns only the real-device reference; captures remain local.
@@ -163,6 +165,7 @@ enum VerifyAdmissionState {
 /// A finite preflight gate runs before any cache, inode or mutation work.
 #[derive(Debug)]
 struct VerifyAdmissionOperation {
+    /// Tracks completion and capture ownership through preflight and re-admission.
     state: VerifyAdmissionState,
 }
 

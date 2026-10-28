@@ -86,15 +86,14 @@ impl PagingInitialization {
         mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<ContiguousFileStorage> {
         let file = self.file()?;
-        if self.initialized.bytes() == 0 {
-            if mutation
+        if self.initialized.bytes() == 0
+            && mutation
                 .staged_node_metadata(ext4_core::NodeId::File(file))?
                 .size()
                 .bytes()
                 != 0
-            {
-                return Err(DriverError::InternalInvariantViolation);
-            }
+        {
+            return Err(DriverError::InternalInvariantViolation);
         }
         let retained = match self.storage {
             Some(storage) => Some(mutation.retained_contiguous_file_storage(file, storage)?),
@@ -247,7 +246,7 @@ mod tests {
             (131_072, Some(131_072)),
             (0, None),
             (u64::MAX, None),
-            (i64::MAX as u64, None),
+            (u64::MAX >> 1, None),
         ] {
             assert_eq!(
                 allocation_bound(FileSize::from_bytes(requested), block)

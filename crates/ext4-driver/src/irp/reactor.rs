@@ -653,7 +653,10 @@ pub(crate) enum PublicationOutcome {
 #[derive(Debug)]
 pub(crate) enum OperationTransition {
     /// Native preflight finished before any filesystem or handle admission; reuse sealed captures.
-    ReadmitCaptured { owned: OwnedIrp },
+    ReadmitCaptured {
+        /// Original completion authority and sealed captures retained across native preflight.
+        owned: OwnedIrp,
+    },
     /// A complete monotonic observation delay, retaining no intent or commit authority.
     WaitForTimer {
         /// Required elapsed seconds, independent of wall-clock changes.

@@ -38,8 +38,10 @@ const MOUNT_VOLUME_MINOR: wdk_sys::UCHAR = 1;
 )]
 fn scan_lifetime_rejects_user_origin_before_file_object_access() -> Result<(), DriverError> {
     let mut device = wdk_sys::DEVICE_OBJECT::default();
-    let mut irp = wdk_sys::IRP::default();
-    irp.RequestorMode = 1;
+    let mut irp = wdk_sys::IRP {
+        RequestorMode: 1,
+        ..wdk_sys::IRP::default()
+    };
     let mut received = received_irp_fixture(&mut device, &mut irp)?;
     assert_eq!(
         received.with_active(crate::request::file_info::set_purge_failure_mode),
