@@ -21,9 +21,9 @@ use ext4_core::{ClusterSize, EpochSequence, FileAllocationSize, FileSize, NodeId
 #[cfg(test)]
 use std::sync::Mutex;
 
-use wdk_sys::NTSTATUS;
 #[cfg(not(test))]
-use wdk_sys::{STATUS_INSUFFICIENT_RESOURCES, STATUS_SUCCESS};
+use wdk_sys::STATUS_INSUFFICIENT_RESOURCES;
+use wdk_sys::{NTSTATUS, STATUS_SUCCESS};
 
 #[cfg(not(test))]
 use crate::kernel::fatal::KernelWideInconsistency;
@@ -2386,7 +2386,6 @@ fn native_status(status: NTSTATUS) -> DriverResult<()> {
     }
 }
 
-#[cfg(not(test))]
 /// Preserves one Cache Manager or Memory Manager status for the IRP completion boundary.
 /// # Errors
 ///
