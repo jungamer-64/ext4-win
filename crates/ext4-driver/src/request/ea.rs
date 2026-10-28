@@ -545,34 +545,6 @@ fn validate_enumeration_start(
     Ok(start)
 }
 
-/// Reads all ext4win Windows EA xattrs for the opened node.
-/// # Errors
-///
-/// Returns an error when node xattrs cannot be read or any stored ext4win EA name/value no longer
-/// fits the Windows EA record domain.
-fn load_windows_eas(
-    read: &mut impl CommittedReadPass,
-    node: ext4_core::NodeId,
-) -> DriverResult<DriverVec<WindowsEaRecord>> {
-    let xattrs = read.read_xattrs(node)?;
-    let mut entries = DriverVec::new();
-    for (name, value) in xattrs.entries() {
-        if name.namespace() != XattrNamespace::User {
-            continue;
-        }
-        let Some(ea_name) = name.local().strip_prefix(EA_XATTR_PREFIX) else {
-            continue;
-        };
-        entries
-            .try_push_owned(WindowsEaRecord::new(
-                WindowsEaName::new(ea_name)?,
-                WindowsEaValue::new(value.bytes())?,
-            ))
-            .map_err(|error| error.into_parts().0)?;
-    }
-    Ok(entries)
-}
-
 /// Applies parsed set-EA records in one journal transaction.
 /// # Errors
 ///
@@ -596,24 +568,6 @@ fn apply_set_ea_entries(
         }
     }
     Ok(())
-}
-
-/// Applies one EA record to a pending create transaction.
-/// # Errors
-///
-/// Returns an error when the EA name cannot be mapped to an xattr or the pending child rejects the
-/// xattr mutation.
-fn apply_ea_record_to_pending_child(
-    creation: &mut PendingChildCreation,
-    transaction: &mut DriverMutationPass<'_, '_, '_>,
-    entry: &WindowsEaRecord,
-) -> DriverResult<()> {
-    let name = xattr_name_from_ea_name(&entry.name)?;
-    if entry.value.is_empty() {
-        creation.remove_xattr(transaction, &name)
-    } else {
-        creation.set_xattr(transaction, name, XattrValue::new(entry.value.as_bytes())?)
-    }
 }
 
 /// Parses the set-EA input buffer.
@@ -938,21 +892,6 @@ fn get_ea_record_length(name_len: usize) -> DriverResult<usize> {
         .checked_add(name_len)
         .and_then(|length| length.checked_add(1))
         .ok_or(DriverError::EaListInconsistent)
-}
-
-/// Maps a Windows EA name to the ext4 xattr namespace.
-/// # Errors
-///
-/// Returns an error when the reserved prefix plus EA name cannot form a valid `user.*` xattr name.
-fn xattr_name_from_ea_name(name: &WindowsEaName) -> DriverResult<XattrName> {
-    let local_len = EA_XATTR_PREFIX
-        .len()
-        .checked_add(name.len())
-        .ok_or(DriverError::InvalidEaName)?;
-    let mut local = DriverVec::try_with_capacity(local_len)?;
-    local.try_extend_from_copy_slice(EA_XATTR_PREFIX)?;
-    local.try_extend_from_copy_slice(name.as_bytes())?;
-    Ok(XattrName::new(XattrNamespace::User, local.as_slice())?)
 }
 
 /// Aligns a byte count to a four-byte boundary.
