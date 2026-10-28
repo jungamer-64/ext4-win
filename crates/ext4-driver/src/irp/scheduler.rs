@@ -121,6 +121,8 @@ pub(crate) enum PostCleanupRequest {
 pub(crate) enum HandleOperationLane {
     /// Normal request admitted only while the handle is open.
     Ordinary,
+    /// Unlock or oplock response that must progress independently of ordinary handle work.
+    Release,
     /// Terminal cleanup barrier that closes ordinary admission.
     Cleanup,
     /// Explicitly legal post-cleanup request.
@@ -294,8 +296,9 @@ struct Slot {
     cancel_enabled: bool,
     /// Device or handle lane.
     admission: Option<Admission>,
-    /// Exact earlier same-handle slot.
-    predecessor: Option<SlotId>,
+    /// Earlier handle operations that must relinquish their lane before this request runs.
+    /// Every dependency is cleared before its slot can be reused.
+    handle_dependencies: u64,
     /// Current scheduling phase.
     phase: Phase,
 }
@@ -310,7 +313,7 @@ impl Slot {
             cancel_pending: false,
             cancel_enabled: false,
             admission: None,
-            predecessor: None,
+            handle_dependencies: 0,
             phase: Phase::Vacant,
         }
     }
@@ -1005,42 +1008,6 @@ impl Scheduler {
             .filter(|slot| slot.generation == identity.generation)
     }
 
-    /// Reports whether an exact predecessor generation still owns work.
-    fn predecessor_is_live(&self, predecessor: SlotId) -> bool {
-        self.slot(predecessor)
-            .is_some_and(|slot| !matches!(slot.phase, Phase::Vacant))
-    }
-
-    /// Finds the unique tail of one handle lane before installing a reserved slot.
-    fn latest_handle_predecessor(&self, reserved_index: usize, handle: HandleId) -> Option<SlotId> {
-        let mut tail = None;
-        for (index, slot) in self.slots.iter().enumerate() {
-            if index == reserved_index
-                || matches!(slot.phase, Phase::Vacant | Phase::Actor)
-                || slot.admission.and_then(Admission::handle) != Some(handle)
-            {
-                continue;
-            }
-            let identity = SlotId {
-                index,
-                generation: slot.generation,
-            };
-            let has_successor =
-                self.slots
-                    .iter()
-                    .enumerate()
-                    .any(|(successor_index, successor)| {
-                        successor_index != reserved_index
-                            && !matches!(successor.phase, Phase::Vacant)
-                            && successor.admission.and_then(Admission::handle) == Some(handle)
-                            && successor.predecessor == Some(identity)
-                    });
-            if !has_successor && tail.replace(identity).is_some() {
-                return None;
-            }
-        }
-        tail
-    }
 }
 
 /// Whether two complete resource sets overlap.
