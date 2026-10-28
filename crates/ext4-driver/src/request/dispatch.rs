@@ -605,9 +605,8 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
         let lower = received.with_active(|active| {
             let current = active.current_stack()?;
             let stack = current.device_control()?;
-            // Snapshot freeze needs a filesystem durability barrier before lower submission.
             if stack.io_control_code() == IOCTL_VOLSNAP_FLUSH_AND_HOLD_WRITES {
-                return Err(DriverError::NotSupported);
+                return super::operation::snapshot_target(current);
             }
             let volume = crate::state::OpenedVolume::decode(current.file_object()?)?;
             volume.control_device()

@@ -9,15 +9,6 @@ const DSM_RANGES_OFFSET: usize = 32;
 /// One signed starting byte offset and one unsigned byte length.
 const DSM_RANGE_BYTES: usize = 16;
 
-/// Independent read-only device observations needed before filesystem admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DeviceQuery {
-    /// Byte length with one positive signed output field.
-    Length,
-    /// Write protection represented by native completion status, with no payload.
-    WriteAccess,
-}
-
 /// Distinct native input/output contracts retained inside one stable completion envelope.
 #[derive(Debug)]
 pub(crate) enum DeviceControlCommand<O> {
