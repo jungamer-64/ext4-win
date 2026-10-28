@@ -323,6 +323,7 @@ impl<'a> CreateCompletionOwner<'a> {
         node: NodeId,
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
+        crate::request::ea::authorize_open(read, node, self.parameters.no_ea_knowledge())?;
         let metadata = crate::metadata::load_node_metadata(read, node)?;
         let descriptor = CreateSecurityDescriptor::for_node(read, node, self.identity)?;
         let required = self.parameters.existing_operation_required_access();
@@ -2050,6 +2051,7 @@ fn create_missing_node(
     name: &Ext4Name,
 ) -> DriverResult<PendingCreatePublication> {
     let parameters = request.parameters();
+    create_ea.authorize_knowledge(parameters.no_ea_knowledge())?;
     let paging_target = if parameters.file_mode() == crate::irp::CreateFileMode::PagingFile {
         let target = super::paging_file::allocation_bound(
             ext4_core::FileSize::from_bytes(

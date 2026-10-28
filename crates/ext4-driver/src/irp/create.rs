@@ -43,6 +43,8 @@ pub(crate) struct CreateParameters {
     file_mode: CreateFileMode,
     /// Whether excluding readers additionally requires native write permission.
     require_writable_exclusive: bool,
+    /// Caller cannot interpret files carrying a required Windows EA.
+    no_ea_knowledge: bool,
     /// Native privilege protocol selected for the open.
     intent: CreateIntent,
 }
@@ -96,12 +98,18 @@ impl CreateParameters {
             require_writable_exclusive: options & wdk_sys::FILE_DISALLOW_EXCLUSIVE != 0
                 && share_access.as_ulong() & wdk_sys::FILE_SHARE_READ == 0,
             intent: CreateIntent::from_options(options),
+            no_ea_knowledge: options & wdk_sys::FILE_NO_EA_KNOWLEDGE != 0,
         })
     }
 
     /// Returns the privilege protocol sealed with this create request.
     pub(super) const fn intent(self) -> CreateIntent {
         self.intent
+    }
+
+    /// Reports FILE_NO_EA_KNOWLEDGE without treating it as an optional hint.
+    pub(crate) const fn no_ea_knowledge(self) -> bool {
+        self.no_ea_knowledge
     }
 
     /// Reports the admission check required by FILE_DISALLOW_EXCLUSIVE.
@@ -1488,10 +1496,10 @@ const DOMAIN_CREATE_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_DIRECTORY_FILE
     | wdk_sys::FILE_OPEN_REQUIRING_OPLOCK
     | wdk_sys::FILE_RESERVE_OPFILTER
     | wdk_sys::FILE_DISALLOW_EXCLUSIVE
-    | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT;
+    | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT
+    | wdk_sys::FILE_NO_EA_KNOWLEDGE;
 /// Create options consumed as Windows boundary hints.
 const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONLY
-    | wdk_sys::FILE_NO_EA_KNOWLEDGE
     | wdk_sys::FILE_RANDOM_ACCESS
     | wdk_sys::FILE_NO_COMPRESSION
     | wdk_sys::FILE_OPEN_NO_RECALL

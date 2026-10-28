@@ -102,6 +102,28 @@ pub(crate) fn uppercase(units: &mut [u16]) -> DriverResult<()> {
     Ok(())
 }
 
+/// Canonicalizes counted EA bytes with Windows' native single-byte uppercase table.
+#[expect(
+    unsafe_code,
+    reason = "each native scalar call accepts every byte and retains no storage"
+)]
+pub(crate) fn uppercase_ea(bytes: &mut [u8]) {
+    for byte in bytes {
+        let input = i8::from_ne_bytes([*byte]);
+        #[cfg(not(test))]
+        let output = unsafe {
+            // SAFETY: RtlUpperChar accepts one arbitrary ANSI byte by value.
+            wdk_sys::ntddk::RtlUpperChar(input)
+        };
+        #[cfg(test)]
+        let output = unsafe {
+            // SAFETY: ntdll supplies the host's native single-byte mapping by value.
+            RtlUpperChar(input)
+        };
+        *byte = u8::from_ne_bytes(output.to_ne_bytes());
+    }
+}
+
 /// Returns the UTF-16 byte length for UNICODE_STRING.
 /// # Errors
 /// Returns invalid-buffer-size when the native byte-length field cannot represent the slice.
@@ -133,6 +155,8 @@ unsafe extern "system" {
 )]
 #[link(name = "ntdll")]
 unsafe extern "system" {
+    /// Native Windows single-byte uppercase mapping.
+    fn RtlUpperChar(character: i8) -> i8;
     /// Native Windows uppercase mapping for one UTF-16 code unit.
     fn RtlUpcaseUnicodeChar(unit: u16) -> u16;
     /// Both counted strings and the optional uppercase table remain live through evaluation.

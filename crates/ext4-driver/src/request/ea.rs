@@ -12,8 +12,8 @@ use ext4_core::{CommittedReadPass, XattrName, XattrNamespace, XattrValue};
 
 use super::DriverMutationPass;
 
-/// Local xattr prefix used to store Windows EA records under `user.*`.
-const EA_XATTR_PREFIX: &[u8] = b"ext4win.ea.";
+/// One atomic Windows EA set; names are payload bytes, independent of xattr naming limits.
+const EA_XATTR_NAME: &[u8] = b"ext4win.eas";
 /// Reserved public EA-name prefix that would collide with ext4win metadata.
 const RESERVED_EA_NAME_PREFIX: &[u8] = b"ext4win.";
 /// Bytes before `EaName` in `FILE_FULL_EA_INFORMATION`.
@@ -40,17 +40,10 @@ pub(crate) fn information_size(
 ///
 /// Rejects malformed stored Windows EA names/values or a charge exceeding its 32-bit wire domain.
 pub(crate) fn information_size_from_xattrs(xattrs: &ext4_core::XattrSet) -> DriverResult<u32> {
+    let entries = stored_eas(xattrs)?;
     let mut payload = 0_usize;
-    for (name, value) in xattrs.entries() {
-        if name.namespace() != XattrNamespace::User {
-            continue;
-        }
-        let Some(name) = name.local().strip_prefix(EA_XATTR_PREFIX) else {
-            continue;
-        };
-        WindowsEaName::validate(name)?;
-        WindowsEaValue::validate(value.bytes())?;
-        let packed = full_ea_record_length(name.len(), value.bytes().len())?
+    for entry in entries.iter() {
+        let packed = full_ea_record_length(entry.name.len(), entry.value.len())?
             .checked_sub(4)
             .ok_or(DriverError::InternalInvariantViolation)?;
         payload = payload
@@ -177,8 +170,9 @@ impl CreateEa {
             });
         }
         let input = target.buffered_input(length)?;
+        let changes = FullEaList::new(input)?.decode()?;
         Ok(Self {
-            entries: FullEaList::new(input)?.decode()?,
+            entries: update_eas(DriverVec::new(), changes.as_slice())?,
         })
     }
 
@@ -190,12 +184,14 @@ impl CreateEa {
         node: ext4_core::NodeId,
         mutation: &mut DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<()> {
-        let current = load_windows_eas(mutation, node)?;
-        let target = mutation.node(node)?;
-        for entry in current.iter() {
-            mutation.remove_xattr(target, &xattr_name_from_ea_name(&entry.name)?)?;
-        }
-        apply_set_ea_entries(mutation, node, self.entries.as_slice())
+        store_eas(mutation, node, self.entries.as_slice())
+    }
+
+    /// Rejects creation of a required-EA file for a caller that cannot interpret EAs.
+    /// # Errors
+    /// Returns access denied when the resulting set requires EA knowledge.
+    pub(crate) fn authorize_knowledge(&self, no_ea_knowledge: bool) -> DriverResult<()> {
+        authorize_knowledge(self.entries.as_slice(), no_ea_knowledge)
     }
 
     /// Returns whether this create supplied no extended attributes.
@@ -213,10 +209,15 @@ impl CreateEa {
         creation: &mut PendingChildCreation,
         mutation: &mut DriverMutationPass<'_, '_, '_>,
     ) -> DriverResult<()> {
-        for entry in self.entries.iter() {
-            apply_ea_record_to_pending_child(creation, mutation, entry)?;
+        if self.entries.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let encoded = encode_eas(self.entries.as_slice())?;
+        creation.set_xattr(
+            mutation,
+            ea_storage_name()?,
+            XattrValue::new(encoded.as_slice())?,
+        )
     }
 }
 
@@ -235,9 +236,9 @@ impl WindowsEaName {
     /// or exceeds the one-byte FILE_FULL_EA_INFORMATION name length.
     fn new(name: &[u8]) -> DriverResult<Self> {
         Self::validate(name)?;
-        Ok(Self {
-            bytes: DriverVec::try_copied_from_slice(name)?,
-        })
+        let mut bytes = DriverVec::try_copied_from_slice(name)?;
+        crate::kernel::name_expression::uppercase_ea(bytes.as_mut_slice());
+        Ok(Self { bytes })
     }
 
     /// Checks stored or caller EA name bytes without copying their payload.
@@ -269,10 +270,16 @@ impl WindowsEaName {
         {
             return Err(DriverError::InvalidEaName);
         }
-        if name.starts_with(RESERVED_EA_NAME_PREFIX) {
+        if name.len() >= RESERVED_EA_NAME_PREFIX.len()
+            && name
+                .get(..RESERVED_EA_NAME_PREFIX.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_EA_NAME_PREFIX))
+        {
             return Err(DriverError::InvalidEaName);
         }
-        u8::try_from(name.len()).map_err(|_| DriverError::InvalidEaName)?;
+        if name.len() >= usize::from(u8::MAX) {
+            return Err(DriverError::InvalidEaName);
+        }
         Ok(())
     }
 
@@ -353,6 +360,8 @@ impl WindowsEaValue {
 /// Windows EA entry after parsing or before packing.
 #[derive(Debug, Eq, PartialEq)]
 struct WindowsEaRecord {
+    /// Whether an opener must understand this EA to interpret the file.
+    required: bool,
     /// Windows EA name.
     name: WindowsEaName,
     /// Windows EA value.
@@ -362,7 +371,11 @@ struct WindowsEaRecord {
 impl WindowsEaRecord {
     /// Creates a flagless Windows EA record.
     fn new(name: WindowsEaName, value: WindowsEaValue) -> Self {
-        Self { name, value }
+        Self {
+            name,
+            value,
+            required: false,
+        }
     }
 
     /// Creates a Windows EA record from wire fields.
@@ -370,13 +383,14 @@ impl WindowsEaRecord {
     ///
     /// Returns an error when the record has unsupported flags or invalid EA name/value fields.
     fn from_wire(flags: u8, name: &[u8], value: &[u8]) -> DriverResult<Self> {
-        if flags != 0 {
-            return Err(DriverError::NotSupported);
+        if flags != 0 && flags != 0x80 {
+            return Err(DriverError::InvalidEaName);
         }
-        Ok(Self::new(
-            WindowsEaName::new(name)?,
-            WindowsEaValue::new(value)?,
-        ))
+        Ok(Self {
+            name: WindowsEaName::new(name)?,
+            value: WindowsEaValue::new(value)?,
+            required: flags == 0x80,
+        })
     }
 
     /// Copies this EA record without using infallible allocation.
@@ -384,7 +398,11 @@ impl WindowsEaRecord {
     ///
     /// Returns an error when copying the record name or value cannot allocate.
     fn try_clone(&self) -> DriverResult<Self> {
-        Ok(Self::new(self.name.try_clone()?, self.value.try_clone()?))
+        Ok(Self {
+            name: self.name.try_clone()?,
+            value: self.value.try_clone()?,
+            required: self.required,
+        })
     }
 }
 
@@ -422,7 +440,7 @@ fn query_ea(
     mut request: QueryEaRequest<'_>,
     read: &mut impl CommittedReadPass,
 ) -> DriverResult<IrpCompletion> {
-    let entries = load_windows_eas(read, request.node)?;
+    let entries = stored_eas(&read.read_xattrs(request.node)?)?;
     let (entries, start, cursor) = match request.selection {
         WindowsEaSelection::Names(names) => (collect_named_query_entries(entries, names)?, 0, None),
         WindowsEaSelection::Enumerate { cursor, origin } => {
@@ -482,7 +500,7 @@ fn query_ea(
     Ok(completion)
 }
 
-/// Applies set-EA records to `user.ext4win.ea.*` xattrs.
+/// Applies set-EA records to the Windows-owned EA set.
 /// # Errors
 ///
 /// Returns an error when the set-EA input list is malformed or the xattr update transaction fails.
@@ -504,11 +522,19 @@ fn collect_named_query_entries(
 ) -> DriverResult<DriverVec<WindowsEaRecord>> {
     let mut selected = DriverVec::new();
     for requested in names.iter() {
-        if let Some(entry) = entries.iter().find(|entry| entry.name == *requested) {
-            selected
-                .try_push_owned(entry.try_clone()?)
-                .map_err(|error| error.into_parts().0)?;
+        if selected
+            .iter()
+            .any(|entry: &WindowsEaRecord| entry.name == *requested)
+        {
+            continue;
         }
+        let entry = match entries.iter().find(|entry| entry.name == *requested) {
+            Some(entry) => entry.try_clone()?,
+            None => WindowsEaRecord::new(requested.try_clone()?, WindowsEaValue::new(&[])?),
+        };
+        selected
+            .try_push_owned(entry)
+            .map_err(|error| error.into_parts().0)?;
     }
     Ok(selected)
 }
@@ -545,27 +571,123 @@ fn validate_enumeration_start(
     Ok(start)
 }
 
-/// Applies parsed set-EA records in one journal transaction.
+/// Reads the one Windows-owned EA value; unrelated ext4 attributes remain opaque.
 /// # Errors
-///
-/// Returns an error when EA names cannot be mapped to xattrs or the journaled xattr set/remove
-/// operation fails.
-fn apply_set_ea_entries(
+/// Rejects malformed storage, duplicate canonical names, empty stored values, or allocation failure.
+fn stored_eas(xattrs: &ext4_core::XattrSet) -> DriverResult<DriverVec<WindowsEaRecord>> {
+    let Some(value) = xattrs.get(&ea_storage_name()?) else {
+        return Ok(DriverVec::new());
+    };
+    let entries = FullEaList {
+        bytes: value.bytes(),
+    }
+    .decode()?;
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.value.is_empty()
+            || entries
+                .iter()
+                .take(index)
+                .any(|other| other.name == entry.name)
+        {
+            return Err(DriverError::InvalidWindowsMetadata);
+        }
+    }
+    Ok(entries)
+}
+
+/// Windows-owned storage key, whose size does not depend on an EA name.
+/// # Errors
+/// Returns an error if the fixed key is outside the ext4 namespace contract.
+fn ea_storage_name() -> DriverResult<XattrName> {
+    Ok(XattrName::new(XattrNamespace::User, EA_XATTR_NAME)?)
+}
+
+/// Encodes the complete validated set before staging its single atomic attribute replacement.
+/// # Errors
+/// Returns size, allocation or wire representation failures.
+fn encode_eas(entries: &[WindowsEaRecord]) -> DriverResult<DriverVec<u8>> {
+    let size = packed_full_ea_length(entries)?;
+    if size > usize::from(u16::MAX) {
+        return Err(DriverError::EaTooLarge);
+    }
+    let mut bytes = DriverVec::try_repeated_copy(0_u8, size)?;
+    pack_full_ea_entries(entries, bytes.as_mut_slice())?;
+    Ok(bytes)
+}
+
+/// Replaces or removes the single storage authority within the caller's ext4 transaction.
+/// # Errors
+/// Returns encoding, allocation or ext4 mutation failures before transaction publication.
+fn store_eas(
     transaction: &mut DriverMutationPass<'_, '_, '_>,
-    node_id: ext4_core::NodeId,
+    node: ext4_core::NodeId,
     entries: &[WindowsEaRecord],
 ) -> DriverResult<()> {
+    let name = ea_storage_name()?;
+    let node = transaction.node(node)?;
     if entries.is_empty() {
-        return Ok(());
+        transaction.remove_xattr(node, &name)?;
+    } else {
+        let bytes = encode_eas(entries)?;
+        transaction.set_xattr(node, name, XattrValue::new(bytes.as_slice())?)?;
     }
-    let node = transaction.node(node_id)?;
-    for entry in entries {
-        let name = xattr_name_from_ea_name(&entry.name)?;
-        if entry.value.is_empty() {
-            transaction.remove_xattr(node, &name)?;
-        } else {
-            transaction.set_xattr(node, name, XattrValue::new(entry.value.as_bytes())?)?;
+    Ok(())
+}
+
+/// Applies ordered EA updates to the canonical set; a zero-length value removes that name.
+/// # Errors
+/// Returns allocation failure while preparing the successor set.
+fn update_eas(
+    mut current: DriverVec<WindowsEaRecord>,
+    changes: &[WindowsEaRecord],
+) -> DriverResult<DriverVec<WindowsEaRecord>> {
+    for change in changes {
+        if let Some(index) = current.iter().position(|entry| entry.name == change.name) {
+            current
+                .swap_remove(index)
+                .ok_or(DriverError::InternalInvariantViolation)?;
         }
+        if !change.value.is_empty() {
+            current
+                .try_push_owned(change.try_clone()?)
+                .map_err(|error| error.into_parts().0)?;
+        }
+    }
+    Ok(current)
+}
+
+/// Applies parsed EA changes through the one journaled storage boundary.
+/// # Errors
+/// Returns persisted metadata, allocation or mutation failures.
+fn apply_set_ea_entries(
+    transaction: &mut DriverMutationPass<'_, '_, '_>,
+    node: ext4_core::NodeId,
+    entries: &[WindowsEaRecord],
+) -> DriverResult<()> {
+    let successor = update_eas(stored_eas(&transaction.read_xattrs(node)?)?, entries)?;
+    store_eas(transaction, node, successor.as_slice())
+}
+
+/// Checks FILE_NO_EA_KNOWLEDGE against the same committed EA set used by queries.
+/// # Errors
+/// Returns access denied for required EAs, or a persisted metadata/read failure.
+pub(crate) fn authorize_open(
+    read: &mut impl CommittedReadPass,
+    node: ext4_core::NodeId,
+    no_ea_knowledge: bool,
+) -> DriverResult<()> {
+    authorize_knowledge(
+        stored_eas(&read.read_xattrs(node)?)?.as_slice(),
+        no_ea_knowledge,
+    )
+}
+
+/// Admission depends on required-EA semantics, independently from name/value validity.
+/// # Errors
+/// Returns access denied if this caller cannot interpret one of the required attributes.
+fn authorize_knowledge(entries: &[WindowsEaRecord], no_ea_knowledge: bool) -> DriverResult<()> {
+    if no_ea_knowledge && entries.iter().any(|entry| entry.required) {
+        return Err(DriverError::AccessDenied);
     }
     Ok(())
 }
@@ -773,7 +895,7 @@ fn pack_full_ea_entries(entries: &[WindowsEaRecord], output: &mut [u8]) -> Drive
         output.write_u32(wire_offset(offset), next)?;
         output.write_u8(
             wire_offset(offset.checked_add(4).ok_or(DriverError::InvalidParameter)?),
-            0,
+            if entry.required { 0x80 } else { 0 },
         )?;
         output.write_u8(
             wire_offset(offset.checked_add(5).ok_or(DriverError::InvalidParameter)?),
@@ -932,15 +1054,17 @@ mod tests {
         let result = (|| -> Result<(), DriverError> {
             let mut xattrs = ext4_core::XattrSet::empty();
             assert_eq!(super::information_size_from_xattrs(&xattrs), Ok(0));
-            for (name, value) in [
-                (b"ext4win.ea.alpha".as_slice(), b"one".as_slice()),
-                (b"ext4win.ea.beta".as_slice(), b"two".as_slice()),
-            ] {
-                xattrs.insert(
-                    ext4_core::XattrName::new(ext4_core::XattrNamespace::User, name)?,
-                    ext4_core::XattrValue::new(value)?,
-                )?;
-            }
+            let entries = sample_ea_records();
+            let bytes = super::encode_eas(
+                entries
+                    .as_slice()
+                    .get(..2)
+                    .ok_or(DriverError::InternalInvariantViolation)?,
+            )?;
+            xattrs.insert(
+                super::ea_storage_name()?,
+                ext4_core::XattrValue::new(bytes.as_slice())?,
+            )?;
             assert_eq!(super::information_size_from_xattrs(&xattrs), Ok(29));
             xattrs.insert(
                 ext4_core::XattrName::new(ext4_core::XattrNamespace::User, b"unrelated")?,
@@ -965,7 +1089,7 @@ mod tests {
     use super::{
         CreateEa, EaEnumerationOrigin, FullEaList, WindowsEaName, WindowsEaRecord, WindowsEaValue,
         fitting_full_ea_prefix, pack_full_ea_entries, parse_get_ea_list,
-        validate_enumeration_start, wire_offset, xattr_name_from_ea_name,
+        validate_enumeration_start, wire_offset,
     };
 
     /// Builds a create dispatch target carrying one EA system buffer.
@@ -1229,23 +1353,6 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn ea_name_maps_to_ext4win_user_xattr() {
-        let ea_name = WindowsEaName::new(b"alpha");
-        assert!(ea_name.is_ok());
-        let Ok(ea_name) = ea_name else {
-            return;
-        };
-        let name = xattr_name_from_ea_name(&ea_name);
-        assert!(name.is_ok());
-        if let Ok(name) = name {
-            assert_eq!(name.qualified(), Ok(b"user.ext4win.ea.alpha".to_vec()));
-        }
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
     fn invalid_ea_names_are_rejected() {
         for byte in (0..0x20).chain(b"\\/:*?\"<>|,+=[];".iter().copied()) {
             assert_eq!(
@@ -1268,7 +1375,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn nonzero_ea_flags_are_rejected() {
+    fn invalid_ea_flags_are_rejected() {
         let mut input = vec![0; 16];
         {
             let mut output = LittleEndianOutput::new(input.as_mut_slice());
@@ -1280,7 +1387,7 @@ mod tests {
 
         assert_eq!(
             decode_full_ea_fixture(input.as_slice()),
-            Err(DriverError::NotSupported)
+            Err(DriverError::InvalidEaName)
         );
     }
 
@@ -1297,5 +1404,95 @@ mod tests {
             WindowsEaValue::new(value.as_slice()),
             Err(DriverError::EaTooLarge)
         );
+    }
+}
+
+#[cfg(test)]
+mod contracts {
+    use super::*;
+
+    /// # Panics
+    /// Fails when the Windows EA contract or its fixed fixture cannot be established.
+    #[test]
+    fn named_query_matches_windows_case_missing_and_duplicate_results() {
+        let result = (|| -> DriverResult<()> {
+            let mut entries = DriverVec::new();
+            entries
+                .try_push_owned(WindowsEaRecord::from_wire(0, b"alpha", b"one")?)
+                .map_err(|error| error.into_parts().0)?;
+            let mut names = DriverVec::new();
+            for name in [
+                b"ALPHA".as_slice(),
+                b"missing".as_slice(),
+                b"alpha".as_slice(),
+            ] {
+                names
+                    .try_push_owned(WindowsEaName::new(name)?)
+                    .map_err(|error| error.into_parts().0)?;
+            }
+            let result = collect_named_query_entries(entries, names)?;
+            assert_eq!(result.len(), 2);
+            let first = result
+                .as_slice()
+                .first()
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            let last = result
+                .as_slice()
+                .last()
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            assert_eq!(first.name.as_bytes(), b"ALPHA");
+            assert_eq!(first.value.as_bytes(), b"one");
+            assert_eq!(last.name.as_bytes(), b"MISSING");
+            assert!(last.value.is_empty());
+            assert!(!last.required);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails when the Windows EA contract or its fixed fixture cannot be established.
+    #[test]
+    fn canonical_name_updates_and_deletes_one_attribute() {
+        let result = (|| -> DriverResult<()> {
+            let first = WindowsEaRecord::from_wire(0, b"alpha", b"one")?;
+            let replacement = WindowsEaRecord::from_wire(0x80, b"ALPHA", b"two")?;
+            let deletion = WindowsEaRecord::from_wire(0, b"AlPhA", b"")?;
+            let current = update_eas(DriverVec::new(), &[first])?;
+            let current = update_eas(current, &[replacement])?;
+            assert_eq!(current.len(), 1);
+            let record = current
+                .as_slice()
+                .first()
+                .ok_or(DriverError::InternalInvariantViolation)?;
+            assert_eq!(record.value.as_bytes(), b"two");
+            assert!(record.required);
+            assert!(update_eas(current, &[deletion])?.is_empty());
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails when the Windows EA contract or its fixed fixture cannot be established.
+    #[test]
+    fn full_length_names_and_required_flags_survive_atomic_storage() {
+        let result = (|| -> DriverResult<()> {
+            let name = [b'a'; 254];
+            let records = [WindowsEaRecord::from_wire(0x80, &name, b"value")?];
+            let bytes = encode_eas(&records)?;
+            let mut xattrs = ext4_core::XattrSet::empty();
+            xattrs.insert(ea_storage_name()?, XattrValue::new(bytes.as_slice())?)?;
+            let stored = stored_eas(&xattrs)?;
+            assert_eq!(stored.as_slice(), records.as_slice());
+            assert_eq!(
+                authorize_knowledge(stored.as_slice(), true),
+                Err(DriverError::AccessDenied)
+            );
+            assert_eq!(authorize_knowledge(stored.as_slice(), false), Ok(()));
+            assert_eq!(information_size_from_xattrs(&xattrs)?, 268);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
     }
 }

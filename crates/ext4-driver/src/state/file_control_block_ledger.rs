@@ -3511,19 +3511,6 @@ impl PendingChildCreation {
         Ok(())
     }
 
-    /// Removes one xattr from the staged child in this create transaction.
-    /// # Errors
-    ///
-    /// Returns an error when the staged node rejects xattr mutation.
-    pub(crate) fn remove_xattr(
-        &mut self,
-        transaction: &mut MutationResolvePass<'_, '_, '_>,
-        name: &XattrName,
-    ) -> DriverResult<()> {
-        let node = transaction.node(self.node)?;
-        transaction.remove_xattr(node, name)?;
-        Ok(())
-    }
 }
 
 /// Records a share claim and then publishes one additional FILE_OBJECT reference.
