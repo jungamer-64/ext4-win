@@ -1,20 +1,23 @@
 //! Reversible snapshot exclusion retains one owner through Cc, journal drain and lower completion.
 
 use super::*;
-use crate::irp::{ActorRequest, DataIoKind, PreparedRequest};
+use crate::irp::{ActorRequest, DataIoKind, ExecutionClass, PreparedRequest};
 use crate::kernel::stream::{SnapshotLease, SnapshotPhase};
 use crate::memory::DriverVec;
 use crate::state::StreamCacheLease;
 
 /// Keeps oplock responses and mandatory handle releases available while old mutations drain.
 /// Paging is admitted only during writeback; new changes retain their captured IRPs until thaw.
-pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, access: &MountedVolumeAccess<'_>) -> bool {
-    let phase = access.storage_access().snapshot_phase();
+pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, phase: SnapshotPhase) -> bool {
     if phase == SnapshotPhase::Open {
         return false;
     }
+    let execution = owned.execution_class();
     match owned.actor_request() {
         ActorRequest::Cleanup | ActorRequest::Close => false,
+        ActorRequest::Captured(PreparedRequest::LockControl) => {
+            execution != ExecutionClass::Release
+        }
         ActorRequest::Captured(PreparedRequest::Read(read))
             if read.kind() == DataIoKind::Paging =>
         {

@@ -2206,7 +2206,7 @@ enum ByteRangeLockOperationState {
     Terminal,
 }
 
-/// One handle-serialized lock-control request delegated to FsRtl exactly once.
+/// One lock-control request delegated to FsRtl; unlocks use independent release admission.
 #[derive(Debug)]
 struct ByteRangeLockOperation {
     /// Finite pre-effect main-resource admission policy.
@@ -2391,7 +2391,7 @@ enum OplockControlOperationState {
     Terminal,
 }
 
-/// One handle-serialized oplock FSCTL delegated to the stream-owned FsRtl package exactly once.
+/// One oplock FSCTL delegated to FsRtl; break responses use independent release admission.
 #[derive(Debug)]
 struct OplockControlOperation {
     /// Finite pre-effect main-resource admission policy.
@@ -7256,7 +7256,7 @@ pub(crate) fn notification(
     NotificationOperation::try_new(owned)
 }
 
-/// Allocates one handle-serialized byte-range lock delegation.
+/// Allocates byte-range lock delegation with independent admission for unlocks.
 /// # Errors
 ///
 /// Returns the still-owned IRP when target validation, stream retention, or allocation fails.
@@ -7267,7 +7267,7 @@ pub(crate) fn byte_range_lock(
     ByteRangeLockOperation::try_new(owned, access)
 }
 
-/// Allocates one handle-serialized stream oplock control delegation.
+/// Allocates stream oplock delegation with independent admission for break responses.
 /// # Errors
 ///
 /// Returns the still-owned IRP when target validation or allocation fails.

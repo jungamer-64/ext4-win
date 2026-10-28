@@ -3013,6 +3013,27 @@ mod tests {
                 );
                 if let Ok(captured) = captured {
                     assert_eq!(captured.execution_class(), expected);
+                    let device = captured.target.device;
+                    let irp = captured.publish();
+                    let mut owned = unsafe {
+                        // SAFETY: Publication transfers this fixture's sole queued ownership;
+                        // local IRP, stack, file and input remain live until completion below.
+                        super::super::OwnedIrp::from_queued_raw(device, irp)
+                    };
+                    for phase in [
+                        crate::kernel::stream::SnapshotPhase::Draining,
+                        crate::kernel::stream::SnapshotPhase::Frozen,
+                    ] {
+                        assert_eq!(
+                            crate::request::operation::snapshot_should_wait(&mut owned, phase),
+                            major == DispatchMajor::LockControl
+                                && expected == ExecutionClass::Ordinary,
+                            "{major:?} minor={minor} must preserve release progress during {phase:?}"
+                        );
+                    }
+                    let _status = owned
+                        .prepare_result(Ok(super::super::IrpCompletion::EMPTY))
+                        .notify();
                 }
             }
         }

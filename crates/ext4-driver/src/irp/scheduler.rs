@@ -96,7 +96,7 @@ impl SlotId {
     }
 }
 
-/// Pointer-free identity of one FILE_OBJECT serialization lane.
+/// Pointer-free identity of one FILE_OBJECT's scheduler lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct HandleId(usize);
 
@@ -134,7 +134,7 @@ pub(crate) enum HandleOperationLane {
 pub(crate) enum Admission {
     /// Device-wide request with no handle serialization requirement.
     Device,
-    /// Request serialized in one stable handle lane.
+    /// Request bound to one handle's ordering and lifecycle policy.
     Handle {
         /// Opaque handle identity.
         handle: HandleId,
@@ -152,12 +152,12 @@ impl Admission {
         }
     }
 
-    /// Returns whether CLEANUP may cancel this active operation.
-    const fn is_ordinary_handle(self) -> bool {
+    /// Returns whether CLEANUP may cancel this active operation before releasing its contexts.
+    const fn is_cleanup_cancellable(self) -> bool {
         matches!(
             self,
             Self::Handle {
-                lane: HandleOperationLane::Ordinary,
+                lane: HandleOperationLane::Ordinary | HandleOperationLane::Release,
                 ..
             }
         )
@@ -173,6 +173,31 @@ impl Admission {
                 ..
             }
         )
+    }
+
+    /// Releases bypass ordered work; terminal lifecycle operations drain every earlier request.
+    /// Ordinary ordering does not depend on releases, which may be needed by its current owner.
+    fn waits_for(self, earlier: Self) -> bool {
+        let (
+            Self::Handle { handle, lane },
+            Self::Handle {
+                handle: earlier_handle,
+                lane: earlier_lane,
+            },
+        ) = (self, earlier)
+        else {
+            return false;
+        };
+        handle == earlier_handle
+            && match lane {
+                HandleOperationLane::Release => false,
+                HandleOperationLane::Ordinary
+                | HandleOperationLane::PostCleanup(PostCleanupRequest::FlushBuffers) => {
+                    !matches!(earlier_lane, HandleOperationLane::Release)
+                }
+                HandleOperationLane::Cleanup
+                | HandleOperationLane::PostCleanup(PostCleanupRequest::Close) => true,
+            }
     }
 }
 
@@ -239,7 +264,7 @@ pub(crate) enum Phase {
     Actor,
     /// One concrete event is ready for delivery.
     Ready,
-    /// Admission waits for the exact earlier handle predecessor.
+    /// Admission waits for its earlier ordered or terminal lifecycle dependencies.
     HandleTurn,
     /// Resource intent is queued under FIFO arbitration.
     Intent(IntentRequest),
@@ -324,7 +349,7 @@ impl Slot {
 pub(crate) enum AdmissionStart {
     /// Cancellation was already published and must be delivered first.
     Cancelled,
-    /// Exact same-handle predecessor must terminate first.
+    /// Earlier dependent handle operations must relinquish their lanes first.
     HandleTurn,
     /// Admission may be delivered immediately.
     Admitted,
@@ -458,7 +483,7 @@ impl Scheduler {
         slot.cancel_pending = false;
         slot.cancel_enabled = cancel_enabled;
         slot.admission = None;
-        slot.predecessor = None;
+        slot.handle_dependencies = 0;
         slot.phase = Phase::Actor;
         Some(SlotId {
             index,
@@ -518,9 +543,17 @@ impl Scheduler {
         admission: Admission,
         cancelled: bool,
     ) -> Option<AdmissionStart> {
-        let predecessor = admission
-            .handle()
-            .and_then(|handle| self.latest_handle_predecessor(identity.index, handle));
+        let dependencies = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(index, slot)| {
+                *index != identity.index
+                    && slot
+                        .admission
+                        .is_some_and(|earlier| admission.waits_for(earlier))
+            })
+            .fold(0_u64, |mask, (index, _)| mask | (1_u64 << index));
         let slot = self.slot_mut(identity)?;
         if !matches!(slot.phase, Phase::Actor)
             || slot.intent.is_some()
@@ -533,10 +566,10 @@ impl Scheduler {
         slot.cancel_enabled = slot.cancel_enabled && !terminal;
         slot.cancel_pending = cancelled && slot.cancel_enabled;
         slot.admission = Some(admission);
-        slot.predecessor = predecessor;
+        slot.handle_dependencies = dependencies;
         let start = if slot.cancel_pending {
             AdmissionStart::Cancelled
-        } else if predecessor.is_some() {
+        } else if dependencies != 0 {
             AdmissionStart::HandleTurn
         } else {
             AdmissionStart::Admitted
@@ -638,10 +671,11 @@ impl Scheduler {
             return false;
         }
         slot.admission = None;
-        slot.predecessor = None;
+        slot.handle_dependencies = 0;
         slot.cancel_pending = false;
         slot.cancel_enabled = false;
         slot.phase = Phase::Vacant;
+        self.clear_handle_dependency(identity.index);
         true
     }
 
@@ -658,19 +692,20 @@ impl Scheduler {
             return false;
         };
         slot.admission = None;
-        slot.predecessor = None;
+        slot.handle_dependencies = 0;
+        self.clear_handle_dependency(identity.index);
         true
     }
 
-    /// Returns active ordinary-handle slots preceding one cleanup operation.
-    pub(crate) fn ordinary_handle_mask(&self, excluded: usize, handle: HandleId) -> u64 {
+    /// Selects ordinary and release requests that CLEANUP must cancel and drain.
+    pub(crate) fn handle_cleanup_cancel_mask(&self, excluded: usize, handle: HandleId) -> u64 {
         self.slots
             .iter()
             .enumerate()
             .filter(|(index, slot)| {
                 *index != excluded
                     && slot.admission.is_some_and(|admission| {
-                        admission.handle() == Some(handle) && admission.is_ordinary_handle()
+                        admission.handle() == Some(handle) && admission.is_cleanup_cancellable()
                     })
             })
             .fold(0_u64, |mask, (index, _)| mask | (1_u64 << index))
@@ -930,25 +965,23 @@ impl Scheduler {
         self.enter_phase(index, |phase| matches!(phase, Phase::Waiting(_)))
     }
 
-    /// Returns handle-turn slots whose exact predecessor has terminated.
+    /// Returns handle-turn slots whose required earlier operations relinquished their lanes.
     pub(crate) fn ready_handle_turns(&self) -> u64 {
         self.slots
             .iter()
             .enumerate()
             .filter(|(_, slot)| {
-                matches!(slot.phase, Phase::HandleTurn)
-                    && slot
-                        .predecessor
-                        .is_none_or(|predecessor| !self.predecessor_is_live(predecessor))
+                matches!(slot.phase, Phase::HandleTurn) && slot.handle_dependencies == 0
             })
             .fold(0_u64, |mask, (index, _)| mask | (1_u64 << index))
     }
 
     /// Grants one handle turn and enters actor ownership.
     pub(crate) fn grant_handle_turn(&mut self, index: usize) -> Option<SlotId> {
-        let identity = self.enter_phase(index, |phase| matches!(phase, Phase::HandleTurn))?;
-        self.slot_mut(identity)?.predecessor = None;
-        Some(identity)
+        if self.slots.get(index)?.handle_dependencies != 0 {
+            return None;
+        }
+        self.enter_phase(index, |phase| matches!(phase, Phase::HandleTurn))
     }
 
     /// Checks whether a barrier is currently releasable.
@@ -956,7 +989,7 @@ impl Scheduler {
         let Some(slot) = self.slots.get(index) else {
             return false;
         };
-        if slot.predecessor.is_some() {
+        if slot.handle_dependencies != 0 {
             return false;
         }
         matches!(
@@ -1008,6 +1041,12 @@ impl Scheduler {
             .filter(|slot| slot.generation == identity.generation)
     }
 
+    /// Retires all references to one admission before its storage may be reused for another handle.
+    fn clear_handle_dependency(&mut self, index: usize) {
+        for slot in &mut self.slots {
+            slot.handle_dependencies &= !(1_u64 << index);
+        }
+    }
 }
 
 /// Whether two complete resource sets overlap.
@@ -1730,7 +1769,7 @@ mod tests {
             Some(AdmissionStart::Admitted)
         );
         assert_eq!(
-            scheduler.ordinary_handle_mask(cleanup.index(), handle),
+            scheduler.handle_cleanup_cancel_mask(cleanup.index(), handle),
             1_u64 << first.index()
         );
         assert!(!scheduler.terminal_barrier_is_releasable(cleanup.index(), CLEANUP_HANDLE_BARRIER));
@@ -1754,6 +1793,220 @@ mod tests {
             })
         );
         assert_eq!(scheduler.grant_wait(cleanup.index()), Some(cleanup));
+    }
+
+    /// # Panics
+    /// Unlocks and break responses must run while an earlier rename retains its handle lane.
+    #[test]
+    fn releases_progress_while_an_oplock_wait_holds_the_handle() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "initialization filled every field of the exclusively owned scheduler fixture"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; the fixture takes sole drop ownership.
+            storage.assume_init()
+        };
+        let first_handle = HandleId::from_address(1);
+        let oplock_owner = HandleId::from_address(2);
+        let rename = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        assert_eq!(
+            scheduler.install(
+                rename,
+                Admission::Handle {
+                    handle: first_handle,
+                    lane: HandleOperationLane::Ordinary,
+                },
+                false
+            ),
+            Some(AdmissionStart::Admitted)
+        );
+        assert_eq!(scheduler.take_ready(), Some(rename));
+        assert!(scheduler.set_phase(rename, Phase::Oplock));
+
+        let unlock = require_some!(scheduler.reserve(ExecutionClass::Release));
+        assert_eq!(
+            scheduler.install(
+                unlock,
+                Admission::Handle {
+                    handle: first_handle,
+                    lane: HandleOperationLane::Release,
+                },
+                false
+            ),
+            Some(AdmissionStart::Admitted)
+        );
+        assert_eq!(scheduler.take_ready(), Some(unlock));
+        assert!(scheduler.complete(unlock));
+
+        let acknowledgment = require_some!(scheduler.reserve(ExecutionClass::Release));
+        assert_eq!(
+            scheduler.install(
+                acknowledgment,
+                Admission::Handle {
+                    handle: oplock_owner,
+                    lane: HandleOperationLane::Release,
+                },
+                false
+            ),
+            Some(AdmissionStart::Admitted)
+        );
+        assert_eq!(scheduler.take_ready(), Some(acknowledgment));
+        assert!(scheduler.complete(acknowledgment));
+        assert!(scheduler.reclaim_oplock(rename));
+        assert!(scheduler.complete(rename));
+        assert!(!scheduler.has_active());
+    }
+
+    /// # Panics
+    /// Terminal context release must drain both independent releases and ordered work;
+    /// reusing an earlier slot cannot recreate an already retired dependency.
+    #[test]
+    fn terminal_handle_admission_drains_ordered_work_and_releases() {
+        for (lane, barrier) in [
+            (HandleOperationLane::Cleanup, CLEANUP_HANDLE_BARRIER),
+            (
+                HandleOperationLane::PostCleanup(PostCleanupRequest::Close),
+                super::CLOSE_HANDLE_BARRIER,
+            ),
+        ] {
+            let mut storage = core::mem::MaybeUninit::uninit();
+            Scheduler::initialize(&mut storage);
+            #[expect(
+                unsafe_code,
+                reason = "initialization filled every field of the exclusively owned scheduler fixture"
+            )]
+            let mut scheduler = unsafe {
+                // SAFETY: Initialization completed; the fixture takes sole drop ownership.
+                storage.assume_init()
+            };
+            let handle = HandleId::from_address(1);
+            let release = require_some!(scheduler.reserve(ExecutionClass::Release));
+            assert_eq!(
+                scheduler.install(
+                    release,
+                    Admission::Handle {
+                        handle,
+                        lane: HandleOperationLane::Release,
+                    },
+                    false
+                ),
+                Some(AdmissionStart::Admitted)
+            );
+            assert_eq!(scheduler.take_ready(), Some(release));
+            assert!(scheduler.set_phase(release, Phase::Retry));
+            let ordinary = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+            assert_eq!(
+                scheduler.install(
+                    ordinary,
+                    Admission::Handle {
+                        handle,
+                        lane: HandleOperationLane::Ordinary,
+                    },
+                    false
+                ),
+                Some(AdmissionStart::Admitted)
+            );
+            assert_eq!(scheduler.take_ready(), Some(ordinary));
+            assert!(scheduler.set_phase(ordinary, Phase::Lower));
+            let terminal = require_some!(scheduler.reserve(ExecutionClass::Finalization));
+            assert_eq!(
+                scheduler.install(terminal, Admission::Handle { handle, lane }, false),
+                Some(AdmissionStart::HandleTurn)
+            );
+            assert_eq!(
+                scheduler.handle_cleanup_cancel_mask(terminal.index(), handle),
+                (1_u64 << ordinary.index()) | (1_u64 << release.index())
+            );
+            assert_eq!(scheduler.grant_handle_turn(terminal.index()), None);
+            assert_eq!(
+                scheduler.enter_phase(ordinary.index(), |phase| matches!(phase, Phase::Lower)),
+                Some(ordinary)
+            );
+            assert!(scheduler.complete(ordinary));
+            assert_eq!(scheduler.ready_handle_turns(), 0);
+
+            let reused = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+            assert_eq!(reused.index(), ordinary.index());
+            assert_eq!(
+                scheduler.install(reused, Admission::Device, false),
+                Some(AdmissionStart::Admitted)
+            );
+            assert_eq!(scheduler.take_ready(), Some(reused));
+            assert!(scheduler.set_phase(reused, Phase::Lower));
+            assert!(scheduler.enter_retry(release));
+            assert!(scheduler.complete(release));
+            assert_eq!(scheduler.ready_handle_turns(), 1_u64 << terminal.index());
+            assert_eq!(
+                scheduler.grant_handle_turn(terminal.index()),
+                Some(terminal)
+            );
+            assert!(scheduler.terminal_barrier_is_releasable(terminal.index(), barrier));
+            assert!(scheduler.complete(terminal));
+            assert_eq!(
+                scheduler.enter_phase(reused.index(), |phase| matches!(phase, Phase::Lower)),
+                Some(reused)
+            );
+            assert!(scheduler.complete(reused));
+            assert!(!scheduler.has_active());
+        }
+    }
+
+    /// # Panics
+    /// Cancelling a queued operation must not let its successor overtake live earlier work.
+    #[test]
+    fn cancelled_handle_wait_preserves_other_dependencies() {
+        let mut storage = core::mem::MaybeUninit::uninit();
+        Scheduler::initialize(&mut storage);
+        #[expect(
+            unsafe_code,
+            reason = "initialization filled every field of the exclusively owned scheduler fixture"
+        )]
+        let mut scheduler = unsafe {
+            // SAFETY: Initialization completed; the fixture takes sole drop ownership.
+            storage.assume_init()
+        };
+        let admission = Admission::Handle {
+            handle: HandleId::from_address(1),
+            lane: HandleOperationLane::Ordinary,
+        };
+        let first = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        assert_eq!(
+            scheduler.install(first, admission, false),
+            Some(AdmissionStart::Admitted)
+        );
+        assert_eq!(scheduler.take_ready(), Some(first));
+        assert!(scheduler.set_phase(first, Phase::Lower));
+        let cancelled = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        assert_eq!(
+            scheduler.install(cancelled, admission, false),
+            Some(AdmissionStart::HandleTurn)
+        );
+        let last = require_some!(scheduler.reserve(ExecutionClass::Ordinary));
+        assert_eq!(
+            scheduler.install(last, admission, false),
+            Some(AdmissionStart::HandleTurn)
+        );
+        assert_eq!(
+            scheduler.request_cancel(cancelled.index()),
+            CancelDisposition::ResumeOperation
+        );
+        assert_eq!(scheduler.take_ready(), Some(cancelled));
+        assert!(scheduler.complete(cancelled));
+        assert_eq!(scheduler.ready_handle_turns(), 0);
+
+        assert!(scheduler.release_handle_lane(first));
+        assert_eq!(scheduler.ready_handle_turns(), 1_u64 << last.index());
+        assert_eq!(scheduler.grant_handle_turn(last.index()), Some(last));
+        assert!(scheduler.complete(last));
+        assert_eq!(
+            scheduler.enter_phase(first.index(), |phase| matches!(phase, Phase::Lower)),
+            Some(first)
+        );
+        assert!(scheduler.complete(first));
+        assert!(!scheduler.has_active());
     }
 
     /// Verifies retry events cannot target a recycled slot generation.

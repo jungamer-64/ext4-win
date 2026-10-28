@@ -4,8 +4,8 @@ use wdk_sys::{DRIVER_OBJECT, NTSTATUS, PDEVICE_OBJECT, PDRIVER_OBJECT, PIRP};
 
 use crate::{
     irp::{
-        ActorRequest, DataIoKind, DispatchMajor, IrpCompletion, OwnedIrp, PreparedDirectoryControl,
-        PreparedIrpCompletion, PreparedRequest, ReceivedIrp,
+        ActorRequest, DataIoKind, DispatchMajor, ExecutionClass, IrpCompletion, OwnedIrp,
+        PreparedDirectoryControl, PreparedIrpCompletion, PreparedRequest, ReceivedIrp,
     },
     kernel::status::{DriverError, DriverResult},
 };
@@ -664,6 +664,26 @@ fn execute_immediate(mut received: ReceivedIrp, request: ImmediateDispatch) -> N
     received.complete_result(result)
 }
 
+/// Selects open-handle ordering from the captured progress class, retaining cleanup admission.
+/// Releases may unblock an earlier request on this same FILE_OBJECT and cannot join its FIFO.
+/// # Errors
+/// Returns `FileClosed` after cleanup admission, or a misclassified open-handle request.
+fn open_handle_lane(
+    state: HandleAdmissionState,
+    execution: ExecutionClass,
+) -> DriverResult<HandleOperationLane> {
+    if state != HandleAdmissionState::OpenHandle {
+        return Err(DriverError::FileClosed);
+    }
+    match execution {
+        ExecutionClass::Ordinary => Ok(HandleOperationLane::Ordinary),
+        ExecutionClass::Release => Ok(HandleOperationLane::Release),
+        ExecutionClass::Paging | ExecutionClass::Finalization => {
+            Err(DriverError::InternalInvariantViolation)
+        }
+    }
+}
+
 /// Selects the scheduler lane shared by requests that remain legal across CLEANUP.
 /// # Errors
 ///
@@ -698,7 +718,10 @@ pub(crate) fn admit_owned(
 ) -> Result<AdmittedRequest, AdmitOperationError> {
     if matches!(target, ReactorTarget::MountedVolume(_))
         && target.with_mounted_access(|access| {
-            super::operation::snapshot_should_wait(&mut owned, access)
+            super::operation::snapshot_should_wait(
+                &mut owned,
+                access.storage_access().snapshot_phase(),
+            )
         })
     {
         let operation = super::operation::wait_for_snapshot(owned)?;
@@ -1077,14 +1100,12 @@ pub(crate) fn admit_owned(
                 let state = prepared.state();
                 match handle_class {
                     HandleRequestClass::Ordinary => {
-                        if state != HandleAdmissionState::OpenHandle {
-                            return Err(AdmitOperationError::new(DriverError::FileClosed, owned));
-                        }
+                        let lane = match open_handle_lane(state, owned.execution_class()) {
+                            Ok(lane) => lane,
+                            Err(error) => return Err(AdmitOperationError::new(error, owned)),
+                        };
                         (
-                            OperationAdmission::Handle {
-                                file_object,
-                                lane: HandleOperationLane::Ordinary,
-                            },
+                            OperationAdmission::Handle { file_object, lane },
                             LifecyclePublication::None,
                         )
                     }
@@ -1252,14 +1273,41 @@ mod tests {
     }
     use crate::{
         irp::{
-            DispatchMajor,
+            DispatchMajor, ExecutionClass,
             reactor::{HandleOperationLane, PostCleanupRequest},
         },
         kernel::status::DriverError,
         state::{DriverDeviceKind, HandleAdmissionState},
     };
 
-    use super::{DispatchPolicy, ImmediateDispatch, dispatch_policy, post_cleanup_lane};
+    use super::{
+        DispatchPolicy, ImmediateDispatch, dispatch_policy, open_handle_lane, post_cleanup_lane,
+    };
+
+    /// # Panics
+    /// Releases bypass ordinary ordering without gaining admission after cleanup closes the handle.
+    #[test]
+    fn open_handle_admission_preserves_release_progress_and_lifecycle() {
+        assert_eq!(
+            open_handle_lane(HandleAdmissionState::OpenHandle, ExecutionClass::Ordinary),
+            Ok(HandleOperationLane::Ordinary)
+        );
+        assert_eq!(
+            open_handle_lane(HandleAdmissionState::OpenHandle, ExecutionClass::Release),
+            Ok(HandleOperationLane::Release)
+        );
+        for state in [
+            HandleAdmissionState::CleanupDraining,
+            HandleAdmissionState::CleanedHandle,
+            HandleAdmissionState::ClosingHandle,
+            HandleAdmissionState::ClosedHandle,
+        ] {
+            assert_eq!(
+                open_handle_lane(state, ExecutionClass::Release),
+                Err(DriverError::FileClosed)
+            );
+        }
+    }
 
     /// Keeps the production operation-construction graph inside the unit-test reachability set.
     ///

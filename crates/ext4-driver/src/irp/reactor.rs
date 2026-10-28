@@ -420,7 +420,7 @@ impl PendingIrpSelection {
 pub(crate) enum OperationAdmission {
     /// Device-wide request with no FILE_OBJECT serialization requirement.
     Device,
-    /// Request serialized in one stable FILE_OBJECT lane.
+    /// Request bound to one stable FILE_OBJECT's ordering and lifecycle policy.
     Handle {
         /// Stable FILE_OBJECT identity retained until CLOSE consumes the lane.
         file_object: KernelFileObject,
@@ -2447,8 +2447,9 @@ impl CompletionReactor {
         file_object: KernelFileObject,
     ) {
         let handle = HandleId::from_address(file_object.as_ptr().addr());
-        let mut targets =
-            self.with_scheduler(|scheduler| scheduler.ordinary_handle_mask(cleanup_index, handle));
+        let mut targets = self.with_scheduler(|scheduler| {
+            scheduler.handle_cleanup_cancel_mask(cleanup_index, handle)
+        });
         while targets != 0 {
             let index = match usize::try_from(targets.trailing_zeros()) {
                 Ok(index) => index,
@@ -3791,7 +3792,7 @@ impl CompletionReactor {
         }
     }
 
-    /// Delivers admission only to handle operations whose exact predecessor has terminated.
+    /// Delivers admission after every required earlier handle operation relinquishes its lane.
     #[cfg(not(test))]
     fn grant_all_handle_turns(&self) {
         let mut ready = self.with_scheduler(|scheduler| scheduler.ready_handle_turns());

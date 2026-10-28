@@ -1357,8 +1357,8 @@ impl OwnedIrp {
             super::scheduler::ExecutionClass::Ordinary | super::scheduler::ExecutionClass::Paging
         )
     }
-    /// Removal consumes the pending reservation of the immutable captured progress class.
-    pub(super) fn execution_class(&self) -> super::scheduler::ExecutionClass {
+    /// Captured progress class shared by queue capacity and handle admission, independent of reentry.
+    pub(crate) fn execution_class(&self) -> super::scheduler::ExecutionClass {
         self.context.execution_class()
     }
 

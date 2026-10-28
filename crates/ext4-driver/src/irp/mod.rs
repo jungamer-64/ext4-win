@@ -37,7 +37,7 @@ mod oplock;
 mod passive;
 pub(crate) mod reactor;
 mod scheduler;
-pub(crate) use scheduler::NativeAdmissionBudget;
+pub(crate) use scheduler::{ExecutionClass, NativeAdmissionBudget};
 mod stack;
 
 pub(crate) use buffer::*;
