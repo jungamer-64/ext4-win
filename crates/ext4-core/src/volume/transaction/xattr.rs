@@ -328,7 +328,10 @@ impl MetadataMutation<'_, '_> {
             return Err(Error::InvalidXattr);
         }
         self.free_inode(raw.id())?;
-        self.stage_attribute_record(raw.retire(block_size)?.into())
+        self.stage_attribute_record(
+            raw.retire(block_size, self.volume.superblock.inode_count())?
+                .into(),
+        )
     }
     /// Releases inode-body value entries; shared external-block entries have separate ownership.
     /// # Errors

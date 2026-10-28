@@ -825,13 +825,18 @@ impl AttributeInodeRecord {
     /// Consumes the final reference after all value blocks have been released in this transaction.
     /// # Errors
     /// Rejects nonterminal reference count or failed inode-field encoding.
-    pub(super) fn retire(mut self, block_size: BlockSize) -> Result<DeletedInodeRecord> {
+    pub(super) fn retire(
+        mut self,
+        block_size: BlockSize,
+        inode_count: crate::disk_format::superblock::InodeCount,
+    ) -> Result<DeletedInodeRecord> {
         if self.parse()?.references() != 1 {
             return Err(Error::InvalidXattr);
         }
-        // Internal value ownership carries no namespace clock. A nonzero retirement marker
-        // records deletion without interpreting the overloaded reference fields as a timestamp.
-        self.raw.set_deletion_time(1)?;
+        // Value headers carry no namespace clock. The terminal marker must be at least the
+        // filesystem's inode count: smaller nonzero i_dtime values denote orphan-chain links
+        // to the independent filesystem checker. Never derive time from the reference fields.
+        self.raw.set_deletion_time(inode_count.as_u32())?;
         self.raw.set_deleted_links_count()?;
         self.raw.set_encoded_size(
             self.raw
@@ -1692,6 +1697,47 @@ mod tests {
 
     fn now() -> Ext4Timestamp {
         Ext4Timestamp::from_seconds(7)
+    }
+
+    /// # Errors
+    /// Returns fixture construction, attribute parsing, or retirement encoding failures.
+    /// # Panics
+    /// Fails if a freed value inode resembles an orphan-chain link or retains live storage.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions inspect the persisted retirement fields against independent disk values"
+    )]
+    fn attribute_retirement_encodes_a_terminal_inode_marker() -> Result<()> {
+        for count in [32, 8192, u32::MAX] {
+            let mut raw = raw_record(16)?;
+            raw.encoding = InodeDataEncoding::new(
+                crate::disk_format::inode::FileSizeEncoding::LargeFile,
+                crate::disk_format::inode::DirectorySizeEncoding::LargeDirectory,
+                crate::disk_format::inode::InodeBlockCountEncoding::HugeFile,
+                block_size()?,
+                crate::disk_format::inode::DirectoryLinkEncoding::Counted,
+                false,
+                true,
+                false,
+            );
+            let value = raw.into_allocated().initialize_attribute_value(
+                FileSize::from_bytes(4096),
+                0x1234_5678,
+                block_size()?,
+                InodeTimestampEncoding::LegacySeconds,
+            )?;
+            let deleted = value.retire(
+                block_size()?,
+                crate::disk_format::superblock::InodeCount::new(count)?,
+            )?;
+            assert_eq!(le_u32(deleted.raw.bytes(), disk_offset(20))?, count);
+            assert_eq!(links(&deleted.raw)?, 0);
+            assert_eq!(le_u32(deleted.raw.bytes(), disk_offset(4))?, 0);
+            assert_eq!(le_u32(deleted.raw.bytes(), disk_offset(28))?, 0);
+            assert_eq!(flags(&deleted.raw)?, 0x0008_0000);
+        }
+        Ok(())
     }
 
     /// Builds the default 1024-byte test block size.
