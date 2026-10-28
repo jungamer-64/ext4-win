@@ -182,7 +182,7 @@ mod tests {
             ledger.prepare_volume_lock_cache_drain(),
             Err(DriverError::AccessDenied)
         ));
-        let mut streams = ledger.prepare_close_cache_writeback()?;
+        let mut streams = ledger.prepare_cache_writeback()?;
         assert_eq!(streams.len(), 1);
         let retained_fcb = unsafe {
             // SAFETY: The ledger and snapshot both retain this live FCB at its original address.

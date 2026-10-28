@@ -125,6 +125,8 @@ pub enum LowerOperation {
     QueryLength,
     /// Query `IOCTL_DISK_IS_WRITABLE`; status is the entire output.
     QueryWriteAccess,
+    /// Hold a consistent filesystem image until lower snapshot completion.
+    SnapshotHold,
     /// Release filesystem-admitted free device ranges through buffered DSM input.
     Trim,
 }
@@ -139,7 +141,9 @@ impl LowerOperation {
             Self::Read | Self::VerifyRead => IRP_MJ_READ,
             Self::Write | Self::MountWrite => IRP_MJ_WRITE,
             Self::Flush => IRP_MJ_FLUSH_BUFFERS,
-            Self::QueryLength | Self::QueryWriteAccess | Self::Trim => IRP_MJ_DEVICE_CONTROL,
+            Self::QueryLength | Self::QueryWriteAccess | Self::SnapshotHold | Self::Trim => {
+                IRP_MJ_DEVICE_CONTROL
+            }
         };
         u8::try_from(major).map_err(|_| DriverError::InvalidParameter)
     }
@@ -150,7 +154,7 @@ impl LowerOperation {
             Self::Read | Self::VerifyRead => wdk_sys::IRP_READ_OPERATION,
             Self::Write | Self::MountWrite => wdk_sys::IRP_WRITE_OPERATION,
             Self::Flush => 0,
-            Self::QueryLength | Self::QueryWriteAccess | Self::Trim => 0,
+            Self::QueryLength | Self::QueryWriteAccess | Self::SnapshotHold | Self::Trim => 0,
         }
     }
 
@@ -1437,14 +1441,18 @@ fn prepare_private_irp(
                 };
         }
         LowerOperation::Flush => {}
-        LowerOperation::QueryWriteAccess => {
+        LowerOperation::QueryWriteAccess | LowerOperation::SnapshotHold => {
             stack.Parameters.DeviceIoControl =
                 wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
                     OutputBufferLength: 0,
                     __bindgen_padding_0: 0,
                     InputBufferLength: 0,
                     __bindgen_padding_1: 0,
-                    IoControlCode: 0x0007_0024,
+                    IoControlCode: if operation == LowerOperation::SnapshotHold {
+                        crate::irp::IOCTL_VOLSNAP_FLUSH_AND_HOLD_WRITES
+                    } else {
+                        0x0007_0024
+                    },
                     Type3InputBuffer: core::ptr::null_mut(),
                 };
         }
@@ -1699,6 +1707,8 @@ mod tests {
         assert!(!LowerOperation::Flush.transfers_bytes());
         assert!(LowerOperation::QueryLength.transfers_bytes());
         assert!(!LowerOperation::QueryWriteAccess.transfers_bytes());
+        assert!(!LowerOperation::SnapshotHold.transfers_bytes());
+        assert_eq!(LowerOperation::SnapshotHold.major_function(), Ok(0x0e));
         assert_eq!(
             LowerOperation::QueryWriteAccess.major_function(),
             LowerOperation::QueryLength.major_function()

@@ -1085,15 +1085,11 @@ impl MountedVolumeAccess<'_> {
         })
     }
 
-    /// Captures every resident inode stream after pre-close mutations have drained.
+    /// Captures every resident inode stream after admission has excluded new cache owners.
     /// # Errors
     /// Returns snapshot allocation or retained-stream capacity failure.
-    pub(crate) fn prepare_close_cache_writeback(
-        &self,
-    ) -> DriverResult<DriverVec<StreamCacheLease>> {
-        self.volume
-            .file_control_blocks
-            .prepare_close_cache_writeback()
+    pub(crate) fn prepare_cache_writeback(&self) -> DriverResult<DriverVec<StreamCacheLease>> {
+        self.volume.file_control_blocks.prepare_cache_writeback()
     }
 
     /// Revokes new paging mutations before waiting for admitted writeback to drain.

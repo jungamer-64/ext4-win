@@ -2095,12 +2095,10 @@ impl FileControlBlockLedger {
         self.prepare_stream_cache_snapshot(StreamCacheSnapshotPurpose::VolumeLock)
     }
 
-    /// Retains every resident stream, including active handles, for terminal writeback.
+    /// Retains every resident stream, including active handles, through volume cache writeback.
     /// # Errors
     /// Returns snapshot allocation or deferred-lease capacity failure.
-    pub(super) fn prepare_close_cache_writeback(
-        &self,
-    ) -> DriverResult<DriverVec<StreamCacheLease>> {
+    pub(super) fn prepare_cache_writeback(&self) -> DriverResult<DriverVec<StreamCacheLease>> {
         self.prepare_stream_cache_snapshot(StreamCacheSnapshotPurpose::CloseWriteback)
             .map(|snapshot| snapshot.remaining)
     }

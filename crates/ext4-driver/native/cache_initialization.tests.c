@@ -54,7 +54,7 @@ static BOOLEAN ext4win_stream_matches_file_object(PEXT4WIN_STREAM_CONTEXT select
 {
     return selected == &stream && selected_file == &file && file.FsContext == &stream.Header;
 }
-static BOOLEAN ext4win_stream_ordinary_io_available(PEXT4WIN_STREAM_CONTEXT selected)
+static BOOLEAN ext4win_stream_admitted_cache_io_available(PEXT4WIN_STREAM_CONTEXT selected)
 {
     assert(selected == &stream);
     ++gate_calls;

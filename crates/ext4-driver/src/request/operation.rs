@@ -82,6 +82,9 @@ macro_rules! impl_mounted_operation_adapter {
     };
 }
 
+mod snapshot;
+pub(crate) use snapshot::{snapshot, snapshot_should_wait, wait_for_snapshot};
+
 #[path = "operation/directory.rs"]
 mod directory;
 pub(crate) use directory::query_directory;
@@ -475,8 +478,8 @@ impl MountRequestOperation {
             };
             let completion_owner = context.admission.file_system_device();
             self.state = MountRequestState::DiscoveringCandidateLength { context };
-            OperationTransition::QueryDevice {
-                query: crate::kernel::storage::DeviceQuery::Length,
+            OperationTransition::SubmitDeviceControl {
+                query: crate::kernel::storage::DeviceControlKind::Length,
                 completion_owner,
                 target,
                 suspended: self,
@@ -696,8 +699,8 @@ impl ControlDeviceOperation for MountRequestOperation {
             MountRequestState::QueryLength { owned, admission } => match event {
                 OperationEvent::Admitted => {
                     self.state = MountRequestState::QueryLength { owned, admission };
-                    OperationTransition::QueryDevice {
-                        query: crate::kernel::storage::DeviceQuery::Length,
+                    OperationTransition::SubmitDeviceControl {
+                        query: crate::kernel::storage::DeviceControlKind::Length,
                         completion_owner: admission.file_system_device(),
                         target: admission.target_device(),
                         suspended: self,
@@ -716,8 +719,8 @@ impl ControlDeviceOperation for MountRequestOperation {
                         admission,
                         devices,
                     };
-                    OperationTransition::QueryDevice {
-                        query: crate::kernel::storage::DeviceQuery::WriteAccess,
+                    OperationTransition::SubmitDeviceControl {
+                        query: crate::kernel::storage::DeviceControlKind::WriteAccess,
                         completion_owner: admission.file_system_device(),
                         target: admission.target_device(),
                         suspended: self,
@@ -900,8 +903,8 @@ impl ControlDeviceOperation for MountRequestOperation {
                         requirement,
                         length,
                     };
-                    OperationTransition::QueryDevice {
-                        query: crate::kernel::storage::DeviceQuery::WriteAccess,
+                    OperationTransition::SubmitDeviceControl {
+                        query: crate::kernel::storage::DeviceControlKind::WriteAccess,
                         completion_owner: admission.file_system_device(),
                         target,
                         suspended: self,
@@ -964,8 +967,8 @@ impl CompletionOperation for MountRequestOperation {
                 requirement,
                 external,
             };
-            OperationTransition::QueryDevice {
-                query: crate::kernel::storage::DeviceQuery::Length,
+            OperationTransition::SubmitDeviceControl {
+                query: crate::kernel::storage::DeviceControlKind::Length,
                 completion_owner,
                 target,
                 suspended: self,
@@ -2839,7 +2842,7 @@ impl MountedVolumeOperation for VolumeControlOperation {
                     Err(error) => Self::fail_lock_cache_drain(owned, transition, error, access),
                 };
             }
-            CompletionEvent::TrimCompleted { .. } => {
+            CompletionEvent::SnapshotCompleted(_) | CompletionEvent::TrimCompleted { .. } => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
                 )
                 .bugcheck();
@@ -3326,7 +3329,7 @@ impl MountedVolumeOperation for FlushRequestOperation {
                     }
                 };
             }
-            CompletionEvent::TrimCompleted { .. } => {
+            CompletionEvent::SnapshotCompleted(_) | CompletionEvent::TrimCompleted { .. } => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
                 )
                 .bugcheck();
@@ -6306,7 +6309,7 @@ impl MutationRequestOperation {
                     }
                 }
             }
-            CompletionEvent::TrimCompleted { .. } => {
+            CompletionEvent::SnapshotCompleted(_) | CompletionEvent::TrimCompleted { .. } => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption(
                 )
                 .bugcheck();

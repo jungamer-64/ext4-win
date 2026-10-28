@@ -1,5 +1,7 @@
 //! Native Windows stream-header ownership boundary.
 
+pub(crate) use super::storage_admission::SnapshotPhase;
+
 #[cfg(not(test))]
 use super::ffi::ext4win_stream_get_sizes;
 use super::paging_file::PagingFileReservation;
@@ -461,7 +463,50 @@ impl StorageRemovalPublisher {
     }
 }
 
+/// Unique reversible freeze owner. The suspended mounted operation and reactor rundown retain
+/// its admission allocation until cache work and every submitted lower request complete.
+#[derive(Debug)]
+pub(crate) struct SnapshotLease {
+    /// Narrow snapshot admission authority; no filesystem or media revocation authority.
+    storage: VolumeStorageAccess,
+}
+#[expect(
+    unsafe_code,
+    reason = "the suspended mounted operation and reactor rundown retain admission storage through atomic snapshot transitions"
+)]
+// SAFETY: This unique lease accesses only atomic admission state, never a native thread-owned
+// resource. Its mounted operation retains the VCB through every worker and lower completion.
+unsafe impl Send for SnapshotLease {}
+
+impl SnapshotLease {
+    /// Excludes new actor paging mutations after the clean-journal grant in the same actor turn.
+    pub(crate) fn seal(&mut self) {
+        self.storage.state().seal_snapshot();
+    }
+}
+impl Drop for SnapshotLease {
+    fn drop(&mut self) {
+        self.storage.state().end_snapshot();
+    }
+}
+
 impl VolumeStorageAccess {
+    /// Observes snapshot exclusion without acquiring transition authority.
+    pub(crate) fn snapshot_phase(self) -> super::storage_admission::SnapshotPhase {
+        self.state().snapshot()
+    }
+    /// Acquires one reversible snapshot barrier without reopening independent volume gates.
+    /// # Errors
+    /// Returns removed media or competing/terminal exclusion before snapshot work starts.
+    pub(crate) fn begin_snapshot(self) -> DriverResult<SnapshotLease> {
+        self.authorize()?;
+        if self.state().begin_snapshot() {
+            Ok(SnapshotLease { storage: self })
+        } else {
+            Err(DriverError::DeviceBusy)
+        }
+    }
+
     /// Binds the real device once while mount still owns unpublished native admission.
     /// # Errors
     /// Rejects duplicate admission initialization before mount publication.
@@ -1634,7 +1679,7 @@ impl StreamContext {
         if state.verification_required() {
             return Err(DriverError::MediaAdmissionRequired);
         }
-        if state.close() == ClosePhase::Open && state.reliability.policy().permits(write) {
+        if state.admitted_cache_io(write) {
             if write
                 && unsafe {
                     // SAFETY: This stream retains its coherent native metadata; caller holds MainResource.
@@ -2982,6 +3027,45 @@ mod tests {
             )?,
             StreamSizes::EMPTY
         );
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns stream, retained-policy or exclusion admission failure.
+    /// # Panics
+    /// Fails if snapshot release restores revoked media or leaves a healthy volume frozen.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the scoped native volume retains admission storage through every lease"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible native setup precedes lease assertions"
+    )]
+    fn snapshot_lease_releases_only_its_own_reversible_gate() -> DriverResult<()> {
+        let volume = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
+        // SAFETY: The volume allocation outlives every admission lease and observation below.
+        let storage = unsafe { volume.storage_access() }?;
+        let lease = storage.begin_snapshot()?;
+        assert_eq!(storage.snapshot_phase(), super::SnapshotPhase::Draining);
+        assert!(storage.begin_snapshot().is_err());
+        drop(lease);
+        assert_eq!(storage.snapshot_phase(), super::SnapshotPhase::Open);
+        let mut lease = storage.begin_snapshot()?;
+        lease.seal();
+        assert_eq!(storage.snapshot_phase(), super::SnapshotPhase::Frozen);
+        // SAFETY: This same scoped volume retains the independent PnP publisher.
+        unsafe { volume.storage_removal_publisher() }?
+            .publish(super::StorageRemovalNotification::Surprise);
+        drop(lease);
+        assert_eq!(storage.snapshot_phase(), super::SnapshotPhase::Open);
+        assert_eq!(storage.authorize(), Err(DriverError::DeviceRemoved));
+        assert!(storage.begin_snapshot().is_err());
         Ok(())
     }
 }

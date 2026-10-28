@@ -524,6 +524,8 @@ pub(crate) enum CompletionEvent {
     /// One PASSIVE_LEVEL native work item returned to the unique reactor owner.
     PassiveCompleted(crate::irp::PassiveWorkCompletion),
     /// Returned discard owner; cancellation cannot hide acknowledged or uncertain physical progress.
+    SnapshotCompleted(wdk_sys::NTSTATUS),
+    /// Returned discard owner; cancellation cannot hide physical progress.
     TrimCompleted {
         /// Unique physical request after all lower access ended.
         completion: ext4_core::TrimCompletion,
@@ -538,7 +540,9 @@ impl CompletionEvent {
     /// Native completion must return its resources before cancellation can retire the request.
     fn prefer_cancellation(self, cancelled: bool) -> Self {
         match self {
-            Self::PassiveCompleted(_) | Self::TrimCompleted { .. } => self,
+            Self::PassiveCompleted(_) | Self::TrimCompleted { .. } | Self::SnapshotCompleted(_) => {
+                self
+            }
             _ if cancelled => Self::Core(OperationEvent::CancelRequested),
             _ => self,
         }
@@ -552,7 +556,8 @@ impl CompletionEvent {
             Self::BarrierReleased(_)
             | Self::PassiveCompleted(_)
             | Self::VolumeFailed(_)
-            | Self::TrimCompleted { .. } => {
+            | Self::TrimCompleted { .. }
+            | Self::SnapshotCompleted(_) => {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             }
         }
@@ -673,15 +678,15 @@ pub(crate) enum OperationTransition {
         /// Completion owner retaining mount or mounted-volume lifetime.
         suspended: Box<dyn CompletionOperation>,
     },
-    /// Build and submit one mount-time lower device-length query.
-    QueryDevice {
-        /// The physical fact being observed.
-        query: crate::kernel::storage::DeviceQuery,
+    /// Submit one non-retrying native control while its continuation retains admission authority.
+    SubmitDeviceControl {
+        /// Exact one-shot native control.
+        query: crate::kernel::storage::DeviceControlKind,
         /// Driver-owned device whose image pins the completion callback.
         completion_owner: KernelDevice,
         /// Lower storage device being mounted.
         target: KernelDevice,
-        /// Mount operation moved by value into the stable completion envelope.
+        /// Unique operation moved into the stable completion envelope.
         suspended: Box<dyn CompletionOperation>,
     },
     /// Submit one separately reserved free-space discard without storage retry.
@@ -3393,7 +3398,7 @@ impl CompletionReactor {
                             TimerDelay::ObservationSeconds(seconds),
                         );
                 }
-                OperationTransition::QueryDevice {
+                OperationTransition::SubmitDeviceControl {
                     query,
                     completion_owner,
                     target,
@@ -3402,7 +3407,7 @@ impl CompletionReactor {
                     let Some(suspended) = self.resume_cancel_if_requested(index, suspended) else {
                         return;
                     };
-                    self.submit_device_query(index, query, completion_owner, target, suspended);
+                    self.submit_device_control(index, query, completion_owner, target, suspended);
                 }
                 OperationTransition::SubmitTrim {
                     devices,
@@ -4287,10 +4292,10 @@ impl CompletionReactor {
 
     /// Builds, registers, and submits the private mount-time length query.
     #[cfg(not(test))]
-    fn submit_device_query(
+    fn submit_device_control(
         &self,
         index: usize,
-        query: crate::kernel::storage::DeviceQuery,
+        query: crate::kernel::storage::DeviceControlKind,
         completion_owner: KernelDevice,
         target: KernelDevice,
         suspended: SuspendedOperation,
@@ -4301,10 +4306,13 @@ impl CompletionReactor {
                 self.set_ready_control_completion(
                     index,
                     match query {
-                        crate::kernel::storage::DeviceQuery::Length => {
+                        crate::kernel::storage::DeviceControlKind::SnapshotHold => {
+                            DeviceControlCommand::SnapshotHold { suspended }
+                        }
+                        crate::kernel::storage::DeviceControlKind::Length => {
                             DeviceControlCommand::Length { suspended }
                         }
-                        crate::kernel::storage::DeviceQuery::WriteAccess => {
+                        crate::kernel::storage::DeviceControlKind::WriteAccess => {
                             DeviceControlCommand::WriteAccess { suspended }
                         }
                     }
@@ -4316,10 +4324,13 @@ impl CompletionReactor {
                 self.set_ready_control_completion(
                     index,
                     match query {
-                        crate::kernel::storage::DeviceQuery::Length => {
+                        crate::kernel::storage::DeviceControlKind::SnapshotHold => {
+                            DeviceControlCommand::SnapshotHold { suspended }
+                        }
+                        crate::kernel::storage::DeviceControlKind::Length => {
                             DeviceControlCommand::Length { suspended }
                         }
-                        crate::kernel::storage::DeviceQuery::WriteAccess => {
+                        crate::kernel::storage::DeviceControlKind::WriteAccess => {
                             DeviceControlCommand::WriteAccess { suspended }
                         }
                     }
@@ -4331,7 +4342,7 @@ impl CompletionReactor {
         let destination = DeviceControlCompletionRoute {
             reactor: NonNull::from(self),
         };
-        let lower = match DeviceControlCommand::query(
+        let lower = match DeviceControlCommand::prepare(
             query,
             completion_owner,
             target,
@@ -4568,6 +4579,12 @@ impl CompletionReactor {
         completed: DeviceControlCompletion<SuspendedOperation>,
     ) {
         match completed {
+            DeviceControlCompletion::SnapshotHold { suspended, status } => self
+                .set_ready_operation_event(
+                    index,
+                    suspended,
+                    CompletionEvent::SnapshotCompleted(status),
+                ),
             DeviceControlCompletion::WriteAccess { suspended, result } => self
                 .set_ready_operation_event(
                     index,
@@ -6199,6 +6216,10 @@ mod tests {
     /// Panics when a failed volume wait produces a success permit or loses the native status.
     #[test]
     fn durability_wait_distinguishes_pending_grant_and_volume_failure() {
+        assert!(matches!(
+            CompletionEvent::SnapshotCompleted(wdk_sys::STATUS_SUCCESS).prefer_cancellation(true),
+            CompletionEvent::SnapshotCompleted(wdk_sys::STATUS_SUCCESS)
+        ));
         assert!(CompletionEvent::durability_wait(1, Ok(false)).is_none());
         let released = CompletionEvent::durability_wait(1, Ok(true));
         assert!(matches!(
@@ -6285,7 +6306,7 @@ mod tests {
                 suspended,
             } => drop(suspended),
             OperationTransition::ForwardQueryRemove(forwarding) => forwarding.queue(),
-            OperationTransition::QueryDevice {
+            OperationTransition::SubmitDeviceControl {
                 query: _query,
                 completion_owner: _completion_owner,
                 target: _target,

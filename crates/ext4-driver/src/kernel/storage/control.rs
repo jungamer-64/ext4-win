@@ -9,9 +9,25 @@ const DSM_RANGES_OFFSET: usize = 32;
 /// One signed starting byte offset and one unsigned byte length.
 const DSM_RANGE_BYTES: usize = 16;
 
+/// One-shot native controls with no implicit retry authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeviceControlKind {
+    /// Positive signed device length before mount admission.
+    Length,
+    /// Physical write protection, independent of filesystem write permission.
+    WriteAccess,
+    /// Filesystem consistency is held until the lower stack completes this control.
+    SnapshotHold,
+}
+
 /// Distinct native input/output contracts retained inside one stable completion envelope.
 #[derive(Debug)]
 pub(crate) enum DeviceControlCommand<O> {
+    /// The continuation retains filesystem freeze authority through lower completion.
+    SnapshotHold {
+        /// Sole snapshot request owner.
+        suspended: O,
+    },
     /// Write-protection observation grants no write authority by itself.
     WriteAccess {
         /// Unique mount continuation.
@@ -34,6 +50,13 @@ pub(crate) enum DeviceControlCommand<O> {
 /// Native completion preserves each control's own observable outcome and unique continuation.
 #[derive(Debug)]
 pub(crate) enum DeviceControlCompletion<O> {
+    /// Lower access ended; freeze authority can now be released without retrying the control.
+    SnapshotHold {
+        /// Sole snapshot request owner.
+        suspended: O,
+        /// Exact native status, including cancellation or unsupported lower stacks.
+        status: NTSTATUS,
+    },
     /// Physical availability, including a protected device as a successful observation.
     WriteAccess {
         /// Sole mount continuation.
@@ -64,18 +87,19 @@ impl<O> DeviceControlCommand<O> {
     #[cfg(not(test))]
     pub(crate) const fn suspended(&self) -> &O {
         match self {
-            Self::Length { suspended }
+            Self::SnapshotHold { suspended }
+            | Self::Length { suspended }
             | Self::WriteAccess { suspended }
             | Self::Trim { suspended, .. } => suspended,
         }
     }
 
-    /// Prepares an output-only length control with no filesystem-write authority.
+    /// Prepares one native control; its continuation retains the selected observation or effect authority.
     /// # Errors
     /// Returns the unchanged command on allocation, native request or rundown preparation failure.
     #[cfg(not(test))]
-    pub(crate) fn query<R>(
-        query: DeviceQuery,
+    pub(crate) fn prepare<R>(
+        query: DeviceControlKind,
         completion_owner: KernelDevice,
         target: KernelDevice,
         suspended: O,
@@ -87,12 +111,17 @@ impl<O> DeviceControlCommand<O> {
         R: LowerCompletionRoute<Self>,
     {
         let (command, operation, bytes) = match query {
-            DeviceQuery::Length => (
+            DeviceControlKind::SnapshotHold => (
+                Self::SnapshotHold { suspended },
+                LowerOperation::SnapshotHold,
+                0,
+            ),
+            DeviceControlKind::Length => (
                 Self::Length { suspended },
                 LowerOperation::QueryLength,
                 size_of::<i64>(),
             ),
-            DeviceQuery::WriteAccess => (
+            DeviceControlKind::WriteAccess => (
                 Self::WriteAccess { suspended },
                 LowerOperation::QueryWriteAccess,
                 0,
@@ -163,6 +192,10 @@ impl<O> DeviceControlCommand<O> {
     /// Reclaims a command known not to have reached any lower device.
     pub(crate) fn unsubmitted(self, error: DriverError) -> DeviceControlCompletion<O> {
         match self {
+            Self::SnapshotHold { suspended } => DeviceControlCompletion::SnapshotHold {
+                suspended,
+                status: error.ntstatus(),
+            },
             Self::WriteAccess { suspended } => DeviceControlCompletion::WriteAccess {
                 suspended,
                 result: Err(error),
@@ -299,6 +332,16 @@ impl<O> CompletedLowerIrp<DeviceControlCommand<O>> {
             information,
         } = self;
         match command {
+            DeviceControlCommand::SnapshotHold { suspended } => {
+                DeviceControlCompletion::SnapshotHold {
+                    suspended,
+                    status: if status >= wdk_sys::STATUS_SUCCESS && information != 0 {
+                        wdk_sys::STATUS_INVALID_BUFFER_SIZE
+                    } else {
+                        status
+                    },
+                }
+            }
             DeviceControlCommand::WriteAccess { suspended } => {
                 let result = if information != 0 {
                     Err(DriverError::InvalidParameter)

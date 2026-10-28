@@ -22,7 +22,7 @@ use crate::memory;
 use crate::state::{KernelDevice, TransferSectorSize};
 
 mod control;
-pub(crate) use control::{DeviceControlCommand, DeviceControlCompletion, DeviceQuery};
+pub(crate) use control::{DeviceControlCommand, DeviceControlCompletion, DeviceControlKind};
 
 /// Retryable lower status `STATUS_DEVICE_BUSY`.
 const STATUS_DEVICE_BUSY: NTSTATUS = i32::from_ne_bytes(0x8000_0011_u32.to_ne_bytes());

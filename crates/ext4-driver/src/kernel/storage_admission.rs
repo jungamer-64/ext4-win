@@ -75,6 +75,17 @@ impl QueryPhase {
     }
 }
 
+/// Reversible volume snapshot admission, independent of media, reliability and terminal close.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotPhase {
+    /// Normal request admission.
+    Open,
+    /// Ordinary cache changes are blocked while admitted mutations and paging drain.
+    Draining,
+    /// New paging mutations wait until lower snapshot completion.
+    Frozen,
+}
+
 /// Sole admission authority. Atomics permit observations from native cache callbacks.
 #[derive(Debug)]
 pub(super) struct StorageAdmission {
@@ -90,6 +101,8 @@ pub(super) struct StorageAdmission {
     query: AtomicU8,
     /// Independent namespace exclusion retained while a drained-volume key is removed.
     key_removal: AtomicBool,
+    /// Unique snapshot lease controls this reversible exclusion.
+    snapshot: AtomicU8,
 }
 
 impl StorageAdmission {
@@ -102,6 +115,7 @@ impl StorageAdmission {
             close: AtomicU8::new(0),
             query: AtomicU8::new(0),
             key_removal: AtomicBool::new(false),
+            snapshot: AtomicU8::new(0),
         }
     }
 
@@ -154,12 +168,43 @@ impl StorageAdmission {
         }
     }
 
-    /// Ordinary native transfers require verified media and open filesystem admission.
-    pub(super) fn ordinary_io_admitted(&self, write: bool) -> bool {
+    /// Observes only snapshot exclusion; it cannot restore independent authority.
+    pub(super) fn snapshot(&self) -> SnapshotPhase {
+        match self.snapshot.load(Ordering::Acquire) {
+            0 => SnapshotPhase::Open,
+            1 => SnapshotPhase::Draining,
+            _ => SnapshotPhase::Frozen,
+        }
+    }
+    /// Claims the sole reversible snapshot exclusion on a live open volume.
+    pub(super) fn begin_snapshot(&self) -> bool {
         self.media() == MediaState::Present
             && self.close() == ClosePhase::Open
+            && self
+                .snapshot
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+    /// The actor seals only after cache work and every admitted mutation/checkpoint have drained.
+    pub(super) fn seal_snapshot(&self) {
+        self.snapshot.store(2, Ordering::Release);
+    }
+    /// Only the unique snapshot owner releases this gate after every lower/native access ended.
+    pub(super) fn end_snapshot(&self) {
+        self.snapshot.store(0, Ordering::Release);
+    }
+
+    /// Previously admitted cache workers drain before snapshot sealing; they cannot start while frozen.
+    pub(super) fn admitted_cache_io(&self, write: bool) -> bool {
+        self.media() == MediaState::Present
+            && self.close() == ClosePhase::Open
+            && self.snapshot() != SnapshotPhase::Frozen
             && !self.verification_required()
             && self.reliability.policy().permits(write)
+    }
+    /// New Fast I/O and section callers require ordinary snapshot admission as well.
+    pub(super) fn ordinary_io_admitted(&self, write: bool) -> bool {
+        self.snapshot() == SnapshotPhase::Open && self.admitted_cache_io(write)
     }
 
     /// Paging may drain during terminal writeback, independently from ordinary verification.
@@ -179,6 +224,7 @@ impl StorageAdmission {
     pub(super) fn creates_admitted(&self) -> bool {
         self.media() == MediaState::Present
             && self.close() == ClosePhase::Open
+            && self.snapshot() == SnapshotPhase::Open
             && self.query.load(Ordering::Acquire) == QueryPhase::Open.raw()
             && !self.key_removal_active()
             && !self.verification_required()
@@ -326,7 +372,7 @@ unsafe extern "system" fn ext4win_storage_present(state: *const StorageAdmission
     u8::from(unsafe { &*state }.media() == MediaState::Present)
 }
 
-/// Selects ordinary cache admission from the sole Rust policy owner.
+/// Selects already-admitted cache worker execution from the sole Rust policy owner.
 /// # Safety
 /// The enclosing volume retains `state` throughout this callback.
 #[cfg(not(test))]
@@ -335,9 +381,9 @@ unsafe extern "system" fn ext4win_storage_present(state: *const StorageAdmission
     reason = "native callbacks borrow the retained volume admission allocation"
 )]
 #[unsafe(no_mangle)]
-unsafe extern "system" fn ext4win_storage_ordinary_io(state: *const StorageAdmission) -> u8 {
+unsafe extern "system" fn ext4win_storage_cache_io(state: *const StorageAdmission) -> u8 {
     // SAFETY: The native volume retains this allocation through the call.
-    u8::from(unsafe { &*state }.ordinary_io_admitted(false))
+    u8::from(unsafe { &*state }.admitted_cache_io(false))
 }
 
 /// Selects backing-file section authority after native resource acquisition.
@@ -387,7 +433,7 @@ unsafe extern "system" fn ext4win_storage_paging_io(
 unsafe extern "system" fn ext4win_storage_cached_policy(state: *const StorageAdmission) -> u8 {
     // SAFETY: The native volume retains this allocation through the call.
     let state = unsafe { &*state };
-    if state.verification_required() {
+    if state.verification_required() || state.snapshot() != SnapshotPhase::Open {
         super::io_reliability::NativeIoPolicy::Unavailable.raw()
     } else {
         state.reliability.policy().raw()
@@ -590,6 +636,48 @@ mod tests {
         state.cancel_query();
         assert_eq!(state.media(), MediaState::Removed);
         assert!(!state.prepare_query());
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns only retained-policy allocation or budget failure during setup.
+    /// # Panics
+    /// Fails if reversible thaw bypasses removal, reliability, or one-way close revocation.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible setup precedes independent admission assertions"
+    )]
+    fn snapshot_exclusion_drains_paging_and_never_restores_revoked_authority()
+    -> crate::kernel::status::DriverResult<()> {
+        use crate::kernel::io_reliability::{IoReliabilityOwner, NativeIoPolicy};
+        let mut owner = IoReliabilityOwner::try_new()?;
+        let state = StorageAdmission::new(owner.observe()?);
+        assert!(state.begin_snapshot());
+        assert!(!state.begin_snapshot());
+        assert_eq!(state.snapshot(), SnapshotPhase::Draining);
+        assert!(!state.ordinary_io_admitted(true));
+        assert!(!state.creates_admitted());
+        assert!(!state.section_admitted(true, wdk_sys::PAGE_READWRITE));
+        assert!(state.paging_io_admitted(true));
+        assert!(state.admitted_cache_io(true));
+        state.seal_snapshot();
+        assert_eq!(state.snapshot(), SnapshotPhase::Frozen);
+        assert!(!state.admitted_cache_io(true));
+        owner.publish(NativeIoPolicy::ReadOnly, None);
+        state.end_snapshot();
+        assert!(state.ordinary_io_admitted(false));
+        assert!(!state.ordinary_io_admitted(true));
+        assert!(state.begin_snapshot());
+        assert!(state.begin_close());
+        state.seal_close();
+        state.remove(MediaState::SurpriseRemoved);
+        state.end_snapshot();
+        assert!(!state.ordinary_io_admitted(false));
+        assert!(!state.creates_admitted());
+        assert!(!state.begin_snapshot());
+        assert_eq!(state.close(), ClosePhase::Sealed);
+        assert_eq!(state.media(), MediaState::SurpriseRemoved);
         Ok(())
     }
 }

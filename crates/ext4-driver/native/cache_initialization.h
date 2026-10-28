@@ -21,7 +21,7 @@ ext4win_stream_cache_initialize(
         return STATUS_INVALID_PARAMETER;
     }
     if (ext4win_paging_is_special(stream->PagingState)) { return STATUS_INVALID_DEVICE_REQUEST; }
-    if (!ext4win_stream_ordinary_io_available(stream)) {
+    if (!ext4win_stream_admitted_cache_io_available(stream)) {
         if (ext4win_storage_verify_required(stream->VolumeStream->RustState)) {
             *verify_before_entry = 1;
             return STATUS_VERIFY_REQUIRED;
@@ -31,7 +31,7 @@ ext4win_stream_cache_initialize(
 
     status = STATUS_SUCCESS;
     (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
-    if (!ext4win_stream_ordinary_io_available(stream)) {
+    if (!ext4win_stream_admitted_cache_io_available(stream)) {
         if (ext4win_storage_verify_required(stream->VolumeStream->RustState)) {
             *verify_before_entry = 1;
             status = STATUS_VERIFY_REQUIRED;

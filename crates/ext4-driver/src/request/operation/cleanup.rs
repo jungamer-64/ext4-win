@@ -17,6 +17,8 @@ enum CleanupState {
     Notifying(OwnedIrp),
     /// Native private cache-map release runs outside the actor.
     Uninitializing,
+    /// Native releases ended; optional namespace deletion waits for snapshot thaw.
+    Releasing(OwnedIrp),
     /// A terminal completion or deletion mutation owns the original IRP.
     Terminal,
 }
@@ -160,6 +162,11 @@ impl CleanupOperation {
         mut owned: OwnedIrp,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        if access.storage_access().snapshot_phase() == crate::kernel::stream::SnapshotPhase::Frozen
+        {
+            self.state = CleanupState::Releasing(owned);
+            return OperationTransition::DeferOperation { suspended: self };
+        }
         let result = crate::request::file_info::cleanup(owned.request(), access);
         match result {
             Ok(crate::request::file_info::CleanupResolution::Complete(completion)) => {
@@ -206,6 +213,10 @@ impl MountedVolumeOperation for CleanupOperation {
     ) -> OperationTransition {
         let state = core::mem::replace(&mut self.state, CleanupState::Terminal);
         match (state, event) {
+            (
+                CleanupState::Releasing(owned),
+                CompletionEvent::Core(OperationEvent::Admitted | OperationEvent::CancelRequested),
+            ) => self.release(owned, access),
             (CleanupState::Ready(owned), CompletionEvent::Core(OperationEvent::Admitted)) => {
                 self.state = CleanupState::Waiting(owned);
                 OperationTransition::Wait {

@@ -218,6 +218,17 @@ impl MountedVolumeOperation for VolumeCloseOperation {
         event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        if matches!(
+            (&self.state, &event),
+            (
+                CloseState::Ready { .. },
+                CompletionEvent::Core(OperationEvent::Admitted)
+            )
+        ) && access.storage_access().snapshot_phase()
+            != crate::kernel::stream::SnapshotPhase::Open
+        {
+            return OperationTransition::DeferOperation { suspended: self };
+        }
         let state = core::mem::replace(&mut self.state, CloseState::Terminal);
         match (state, event) {
             (
@@ -262,7 +273,7 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                         access,
                     );
                 }
-                let streams = match access.prepare_close_cache_writeback() {
+                let streams = match access.prepare_cache_writeback() {
                     Ok(streams) => streams,
                     Err(error) => return Self::fail(owned, transition, error, access),
                 };

@@ -1145,6 +1145,8 @@ pub(crate) enum PreparedRequest {
         /// Owned descriptor snapshot.
         descriptor: CapturedSetSecurityDescriptor,
     },
+    /// Volume shadow-copy consistency barrier; no requestor buffer is deferred.
+    Snapshot,
     /// Filesystem shutdown request.
     Shutdown,
     /// Device-scoped reversible removal preparation; no FILE_OBJECT is required.
@@ -1165,6 +1167,9 @@ impl PreparedRequest {
         match major {
             DispatchMajor::DeviceControl => {
                 let control = stack.device_control().map_err(IrpCompletion::from_error)?;
+                if control.io_control_code() == super::super::IOCTL_VOLSNAP_FLUSH_AND_HOLD_WRITES {
+                    return Ok((Self::Snapshot, QueueCancellationKey::Device));
+                }
                 let length = control.input_buffer_length().as_usize();
                 if length > ext4_security::MAX_MAPPING_BYTES {
                     return Err(IrpCompletion::from_error(DriverError::InvalidBufferSize));

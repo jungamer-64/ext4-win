@@ -71,6 +71,14 @@ impl IrpCompletion {
         information: InformationLength::ZERO,
     };
 
+    /// Preserves the authoritative native status of a zero-output lower control.
+    pub(crate) const fn native_status(status: NTSTATUS) -> Self {
+        Self {
+            status,
+            information: InformationLength::ZERO,
+        }
+    }
+
     /// Builds a successful completion from an information length.
     pub(crate) const fn with_information(information: InformationLength) -> Self {
         Self {

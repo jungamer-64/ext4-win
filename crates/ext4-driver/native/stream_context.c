@@ -32,7 +32,7 @@ extern UCHAR NTAPI ext4win_storage_close_phase(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_io_policy(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_verify_required(_In_ const VOID *state);
 extern BOOLEAN NTAPI ext4win_storage_present(const VOID *state);
-extern BOOLEAN NTAPI ext4win_storage_ordinary_io(const VOID *state);
+extern BOOLEAN NTAPI ext4win_storage_cache_io(const VOID *state);
 extern BOOLEAN NTAPI ext4win_storage_section_io(const VOID *state, BOOLEAN writable, ULONG protection);
 extern BOOLEAN NTAPI ext4win_storage_paging_io(const VOID *state, BOOLEAN write);
 extern UCHAR NTAPI ext4win_storage_cached_policy(const VOID *state);
@@ -208,10 +208,10 @@ VOID NTAPI ext4win_stream_mark_paging_file(PVOID header)
 
 /* Cache/Fast I/O authority is independent from lower storage presence. */
 static BOOLEAN
-ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
+ext4win_stream_admitted_cache_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
-    return volume != NULL && ext4win_storage_ordinary_io(volume->RustState);
+    return volume != NULL && ext4win_storage_cache_io(volume->RustState);
 }
 
 /* Only the coherent committed inode projection determines data protection. */
@@ -864,7 +864,8 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
     status = STATUS_SUCCESS;
-    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, FALSE, TRUE, NULL);
+    /* Drain cached transfers admitted before volume snapshot exclusion, then flush their data. */
+    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
     if (!ext4win_stream_storage_available(stream)) {
         ext4win_release_resource(&stream->MainResource);
         return STATUS_DEVICE_REMOVED;

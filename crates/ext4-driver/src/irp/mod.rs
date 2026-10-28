@@ -78,3 +78,6 @@ use stack::signed_special_offset;
 
 #[cfg(test)]
 mod tests;
+
+/// CTL_CODE(VOLSNAPCONTROLTYPE, 0, METHOD_BUFFERED, FILE_READ_ACCESS | FILE_WRITE_ACCESS).
+pub(crate) const IOCTL_VOLSNAP_FLUSH_AND_HOLD_WRITES: u32 = (0x53 << 16) | (3 << 14);

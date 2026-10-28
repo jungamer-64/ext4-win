@@ -340,3 +340,52 @@ fn native_discard_outcomes_return_the_exact_physical_owner() {
     })();
     assert_eq!(result, Ok(()));
 }
+
+/// # Errors
+/// Returns transfer allocation failure before constructing the independent native completion.
+/// # Panics
+/// Fails if a completed snapshot control loses its continuation, status, or zero-output contract.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fallible allocation precedes native boundary assertions"
+)]
+fn snapshot_completion_preserves_native_result_without_retry() -> DriverResult<()> {
+    for (status, information, expected) in [
+        (wdk_sys::STATUS_SUCCESS, 0, wdk_sys::STATUS_SUCCESS),
+        (wdk_sys::STATUS_CANCELLED, 0, wdk_sys::STATUS_CANCELLED),
+        (
+            wdk_sys::STATUS_NOT_SUPPORTED,
+            0,
+            wdk_sys::STATUS_NOT_SUPPORTED,
+        ),
+        (wdk_sys::STATUS_IO_TIMEOUT, 0, wdk_sys::STATUS_IO_TIMEOUT),
+        (
+            wdk_sys::STATUS_SUCCESS,
+            1,
+            wdk_sys::STATUS_INVALID_BUFFER_SIZE,
+        ),
+    ] {
+        let completed = CompletedLowerIrp {
+            suspended: DeviceControlCommand::SnapshotHold { suspended: 41 },
+            transfer: AlignedTransferBuffer::try_zeroed(0, 8)?,
+            status,
+            information,
+        }
+        .finish_control();
+        let DeviceControlCompletion::SnapshotHold { suspended, status } = completed else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        assert_eq!(suspended, 41);
+        assert_eq!(status, expected);
+    }
+    let DeviceControlCompletion::SnapshotHold { suspended, status } =
+        (DeviceControlCommand::SnapshotHold { suspended: 42 })
+            .unsubmitted(DriverError::InsufficientResources)
+    else {
+        return Err(DriverError::InternalInvariantViolation);
+    };
+    assert_eq!(suspended, 42);
+    assert_eq!(status, wdk_sys::STATUS_INSUFFICIENT_RESOURCES);
+    Ok(())
+}
