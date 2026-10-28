@@ -12,6 +12,7 @@ pub(super) fn prepare(
     existing: Option<&crate::request::create::PendingExistingCreateOpen>,
     owned: &mut OwnedIrp,
     mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
+    capture_identity: impl FnOnce() -> DriverResult<crate::identity::IdentitySnapshot>,
 ) -> DriverResult<DriverVec<DirectoryChange>> {
     let node = match request {
         PreparedMutationRequest::Create { .. } => {
@@ -64,12 +65,23 @@ pub(super) fn prepare(
     if filter == 0 {
         return Ok(changes);
     }
+    let captured_identity;
+    let mapping = match request {
+        PreparedMutationRequest::Create { mapping, .. }
+        | PreparedMutationRequest::Security(mapping)
+        | PreparedMutationRequest::SetInformation(mapping) => &mapping.get().map,
+        _ => {
+            captured_identity = capture_identity()?;
+            &captured_identity.get().map
+        }
+    };
     match node {
         NodeId::Directory(directory) if directory != ext4_core::DirectoryNodeId::ROOT => {
             let parent = crate::namespace::directory_parent(mutation, directory)?;
             changes
                 .try_push_owned(DirectoryChange::modified(
                     mutation,
+                    mapping,
                     parent.directory,
                     &parent.name.to_ext4()?,
                     filter,
@@ -103,7 +115,9 @@ pub(super) fn prepare(
                     && matches!(mutation.lookup_child(parent, &name)?, ext4_core::ChildLookup::Found(child) if *child.node() == node)
                 {
                     changes
-                        .try_push_owned(DirectoryChange::modified(mutation, parent, &name, filter)?)
+                        .try_push_owned(DirectoryChange::modified(
+                            mutation, mapping, parent, &name, filter,
+                        )?)
                         .map_err(|error| error.into_parts().0)?;
                     return Ok(changes);
                 }
@@ -114,6 +128,7 @@ pub(super) fn prepare(
                 changes
                     .try_push_owned(DirectoryChange::modified(
                         mutation,
+                        mapping,
                         link.parent(),
                         link.name(),
                         filter,

@@ -5038,6 +5038,7 @@ impl MutationRequestOperation {
                 state.pending_existing_create.as_ref(),
                 owned,
                 mutation,
+                || operations.identity_snapshot(),
             )?;
         }
         Ok(result)

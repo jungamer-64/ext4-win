@@ -2113,8 +2113,14 @@ fn create_missing_node(
     )?;
     let mut creation = operations.begin_child_creation(mutation, parent, name, target)?;
     let node = creation.node();
-    let notification =
-        DirectoryChange::new(mutation, parent, name, node, DirectoryChangeAction::Added)?;
+    let notification = DirectoryChange::new(
+        mutation,
+        request.owner.identity,
+        parent,
+        name,
+        node,
+        DirectoryChangeAction::Added,
+    )?;
     create_ea.apply_to_pending_child(&mut creation, mutation)?;
     request
         .owner

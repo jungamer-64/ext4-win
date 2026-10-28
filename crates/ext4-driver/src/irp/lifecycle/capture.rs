@@ -640,6 +640,22 @@ pub(super) enum QueueContextOwnership {
 }
 
 impl QueueContextOwnership {
+    /// Consumes captured notification authority while releasing every other queue resource.
+    /// # Errors
+    /// Rejects a request that did not capture an original notification subject.
+    pub(super) fn into_notification_subject(
+        self,
+    ) -> DriverResult<crate::kernel::requestor_subject::NotificationSubject> {
+        let Self::Captured(context) = self else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        match context.prepared {
+            PreparedRequest::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory(
+                subject,
+            )) => Ok(subject),
+            _ => Err(DriverError::InternalInvariantViolation),
+        }
+    }
     /// Consumes this original request's finite verify admission before worker publication.
     /// # Errors
     /// Returns verify-required after the sole attempt, or invalid-device-request for finalization.

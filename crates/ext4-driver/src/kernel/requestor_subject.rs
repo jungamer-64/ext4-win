@@ -6,7 +6,16 @@ use crate::state::KernelDevice;
 
 /// Traversal authority captured on the requesting thread before notification queueing.
 #[derive(Debug)]
-pub(crate) enum NotificationSubject {
+pub(crate) struct NotificationSubject {
+    /// Only original-context native capture may establish either authority.
+    #[cfg(not(test))]
+    authority: NotificationTraversalAuthority,
+}
+
+/// Captured bypass and retained-token checks are mutually exclusive.
+#[derive(Debug)]
+#[cfg(not(test))]
+enum NotificationTraversalAuthority {
     /// The original subject has traversal bypass authority.
     Bypass,
     /// Tokens remain owned through cancellation or consuming FsRtl registration.
@@ -38,9 +47,13 @@ impl NotificationSubject {
             if status < 0 {
                 return Err(DriverError::SecurityCheckFailed(status));
             }
-            Ok(match core::ptr::NonNull::new(native) {
-                Some(native) => Self::Traverse(RequestorSubject { native }),
-                None => Self::Bypass,
+            Ok(Self {
+                authority: match core::ptr::NonNull::new(native) {
+                    Some(native) => {
+                        NotificationTraversalAuthority::Traverse(RequestorSubject { native })
+                    }
+                    None => NotificationTraversalAuthority::Bypass,
+                },
             })
         }
         #[cfg(test)]
@@ -57,9 +70,9 @@ impl NotificationSubject {
         reason = "consuming notification authority withdraws Rust cleanup before FsRtl can complete synchronously"
     )]
     pub(crate) fn into_fsrtl(self) -> *mut wdk_sys::SECURITY_SUBJECT_CONTEXT {
-        match self {
-            Self::Bypass => core::ptr::null_mut(),
-            Self::Traverse(subject) => {
+        match self.authority {
+            NotificationTraversalAuthority::Bypass => core::ptr::null_mut(),
+            NotificationTraversalAuthority::Traverse(subject) => {
                 let subject = core::mem::ManuallyDrop::new(subject);
                 unsafe {
                     // SAFETY: This consumes the sole native owner; C removes its worker and

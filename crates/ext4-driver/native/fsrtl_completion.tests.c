@@ -3,6 +3,11 @@
 #define NTAPI
 #define NULL ((void *)0)
 #define FALSE 0
+#define TRUE 1
+#define UserMode 1
+#define FILE_TRAVERSE 0x20
+#define STATUS_ACCESS_DENIED ((NTSTATUS)0xC0000022UL)
+#define UNREFERENCED_PARAMETER(value) ((void)(value))
 #define FSRTL_FSP_TOP_LEVEL_IRP 1
 #define FSRTL_CACHE_TOP_LEVEL_IRP 2
 #define STATUS_PENDING ((NTSTATUS)0x103)
@@ -26,6 +31,11 @@ typedef struct { USHORT Length, MaximumLength; char *Buffer; } STRING, *PSTRING;
 typedef PVOID OPLOCK, *POPLOCK;
 typedef VOID (*POPLOCK_WAIT_COMPLETE_ROUTINE)(PVOID, PIRP);
 typedef VOID (*POPLOCK_FS_PREPOST_IRP)(PVOID, PIRP);
+typedef struct { unsigned token; } SECURITY_SUBJECT_CONTEXT, *PSECURITY_SUBJECT_CONTEXT;
+typedef struct { unsigned allowed; } SECURITY_DESCRIPTOR, *PSECURITY_DESCRIPTOR;
+typedef struct { unsigned used; } PRIVILEGE_SET, *PPRIVILEGE_SET;
+typedef unsigned ACCESS_MASK;
+typedef BOOLEAN (*PCHECK_FOR_TRAVERSE_ACCESS)(PVOID, PVOID, PSECURITY_SUBJECT_CONTEXT);
 
 __declspec(dllimport) void __stdcall RaiseException(ULONG, ULONG, ULONG, const ULONG_PTR *);
 
@@ -38,6 +48,30 @@ static unsigned context;
 static PIRP top_level, expected_marker;
 static NTSTATUS native_exception, native_status = STATUS_PENDING;
 static unsigned completions, nest_completion;
+static SECURITY_SUBJECT_CONTEXT original_subject = {77};
+static SECURITY_DESCRIPTOR traversal = {1};
+static PRIVILEGE_SET privilege;
+static unsigned subject_locks, traverse_calls, privilege_frees;
+static int mapping;
+
+static VOID SeLockSubjectContext(PSECURITY_SUBJECT_CONTEXT subject)
+{ assert(subject == &original_subject && subject->token == 77 && subject_locks == 0); subject_locks++; }
+static VOID SeUnlockSubjectContext(PSECURITY_SUBJECT_CONTEXT subject)
+{ assert(subject == &original_subject && subject_locks == 1); subject_locks--; }
+static PVOID IoGetFileObjectGenericMapping(VOID) { return &mapping; }
+static BOOLEAN SeAccessCheck(PSECURITY_DESCRIPTOR descriptor, PSECURITY_SUBJECT_CONTEXT subject,
+    BOOLEAN locked, ACCESS_MASK desired, ACCESS_MASK previous, PPRIVILEGE_SET *used,
+    PVOID generic, int mode, ACCESS_MASK *granted, NTSTATUS *status)
+{
+    assert(subject == &original_subject && subject->token == 77 && subject_locks == 1 && locked);
+    assert(desired == FILE_TRAVERSE && previous == 0 && generic == &mapping && mode == UserMode);
+    *used = &privilege; *granted = descriptor->allowed ? desired : 0;
+    *status = descriptor->allowed ? 0 : STATUS_ACCESS_DENIED;
+    traverse_calls++;
+    return (BOOLEAN)descriptor->allowed;
+}
+static VOID SeFreePrivileges(PPRIVILEGE_SET used) { assert(used == &privilege); privilege_frees++; }
+BOOLEAN ext4win_notification_traverse(const VOID *target, PSECURITY_SUBJECT_CONTEXT subject);
 
 static PIRP IoGetTopLevelIrp(VOID) { return top_level; }
 static VOID IoSetTopLevelIrp(PIRP marker) { top_level = marker; }
@@ -56,11 +90,18 @@ static VOID prepost(PVOID owner, PIRP irp)
 
 static VOID FsRtlNotifyFullChangeDirectory(PNOTIFY_SYNC lock, PLIST_ENTRY head, PVOID owner,
     PSTRING directory, BOOLEAN subtree, BOOLEAN ignore_buffer, ULONG filter, PIRP irp,
-    PVOID traverse, PVOID subject)
+    PCHECK_FOR_TRAVERSE_ACCESS traverse, PSECURITY_SUBJECT_CONTEXT subject)
 {
     assert(lock == &sync && head == &list && owner == &context && directory == &name);
     assert(subtree && !ignore_buffer && filter == 0x13 && irp == &watched_irp);
-    assert(traverse == NULL && subject == NULL);
+    if (subject == NULL) { assert(traverse == NULL); }
+    else {
+        assert(traverse != NULL && subject == &original_subject);
+        assert(traverse(owner, &traversal, subject) == traversal.allowed);
+        assert(!traverse(owner, NULL, subject));
+        assert(!traverse(owner, &traversal, NULL));
+        assert(subject_locks == 0);
+    }
     observe_completion();
 }
 static VOID FsRtlNotifyFullReportChange(PNOTIFY_SYNC lock, PLIST_ENTRY head, PSTRING target,
@@ -68,7 +109,7 @@ static VOID FsRtlNotifyFullReportChange(PNOTIFY_SYNC lock, PLIST_ENTRY head, PST
 {
     assert(lock == &sync && head == &list && target == &name && offset == 6);
     assert(stream == NULL && parent == NULL && filter == 0x13 && action == 2);
-    assert(target_context == NULL);
+    assert(target_context == &traversal);
     observe_completion();
 }
 static VOID FsRtlNotifyCleanup(PNOTIFY_SYNC lock, PLIST_ENTRY head, PVOID owner)
@@ -109,6 +150,12 @@ static VOID FsRtlUninitializeOplock(POPLOCK state)
 
 #include "fsrtl_completion.h"
 
+BOOLEAN ext4win_notification_traverse(const VOID *target, PSECURITY_SUBJECT_CONTEXT subject)
+{
+    assert(target == &traversal);
+    return ext4win_notification_check_traverse(subject, (PSECURITY_DESCRIPTOR)target);
+}
+
 static VOID observe_completion(VOID)
 {
     /* Filter Manager must see recursion before an upper completion can query a name. */
@@ -127,8 +174,8 @@ static VOID observe_completion(VOID)
 static VOID invoke(unsigned operation)
 {
     switch (operation) {
-    case 0: ext4win_notify_register(&sync, &list, &context, &name, 0x13, 1, &watched_irp); break;
-    case 1: ext4win_notify_report(&sync, &list, &name, 6, 0x13, 2); break;
+    case 0: ext4win_notify_register(&sync, &list, &context, &name, 0x13, 1, &watched_irp, &original_subject); break;
+    case 1: ext4win_notify_report(&sync, &list, &name, 6, 0x13, 2, &traversal); break;
     case 2: ext4win_notify_cleanup(&sync, &list, &context); break;
     case 3: ext4win_notify_cleanup_all(&sync, &list); break;
     case 4:
@@ -184,5 +231,9 @@ int main(void)
     check(4, NULL, 0);
     check(5, &incoming_irp, 0);
     check(6, NULL, 0);
+    traversal.allowed = 0;
+    check(0, NULL, 0);
+    assert(traverse_calls != 0 && traverse_calls == privilege_frees && subject_locks == 0);
+    ext4win_notify_register(&sync, &list, &context, &name, 0x13, 1, &watched_irp, NULL);
     return 0;
 }

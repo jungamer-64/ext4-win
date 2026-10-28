@@ -139,6 +139,11 @@ POSIX rwx does not grant DELETE; applications requesting it can receive access d
 Backup-intent opens evaluate enabled backup and restore privileges before remaining descriptor
 rights, and record privilege use before publishing handle authority. Ordinary opens do not
 receive these privilege grants.
+Recursive directory watches capture the requesting effective subject before queueing. Without
+traversal-bypass privilege, every directory crossed below the watched directory must grant
+`FILE_TRAVERSE` before a descendant name is returned. Notification paths and their POSIX-derived
+access projections are prepared before mutation commit; native callbacks perform no filesystem
+I/O. FsRtl owns transferred subject references until it retires the watch.
 Security queries support variable SID lengths and report the required size for short buffers.
 Security mutations accept the owner/group/mode projection for inodes without an access ACL.
 An inode with an access ACL accepts owner/group updates and an unchanged projected DACL;

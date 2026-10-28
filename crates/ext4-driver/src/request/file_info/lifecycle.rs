@@ -288,6 +288,7 @@ pub(crate) fn stage_cleanup_deletion(
     operations: &MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<Option<PreparedCleanupPublication>> {
+    let identity = operations.identity_snapshot()?;
     let mut links = DriverVec::try_with_capacity(
         plan.additional
             .len()
@@ -318,6 +319,7 @@ pub(crate) fn stage_cleanup_deletion(
         }
         let notification = DirectoryChange::new(
             mutation,
+            &identity.get().map,
             target.parent(),
             target.name(),
             plan.node,

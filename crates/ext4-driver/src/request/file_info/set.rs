@@ -523,7 +523,8 @@ pub(super) fn set_file_information(
             return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
         }
         SetFilePlan::Link { mutation: request } => {
-            let prepared = PreparedHardLinkMutation::prepare(request, operations, mutation)?;
+            let prepared =
+                PreparedHardLinkMutation::prepare(request, operations, mutation, mapping)?;
             let oplocks = prepared.oplock_plan();
             if namespace_oplocks != Some(oplocks) {
                 return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
@@ -1266,6 +1267,7 @@ impl PreparedHardLinkMutation {
         request: HardLinkMutation,
         operations: &mut MountedVolumeAccess<'_>,
         read: &mut impl CommittedReadPass,
+        mapping: &ext4_security::IdentityMap,
     ) -> DriverResult<Self> {
         let HardLinkMutation {
             source,
@@ -1284,6 +1286,7 @@ impl PreparedHardLinkMutation {
             &target_name,
             target.target_name(),
             target_collision,
+            mapping,
         )?;
         count_effect.validate(source_metadata.links_count)?;
         let location = match (&destination, count_effect) {
@@ -1361,6 +1364,10 @@ impl PreparedHardLinkMutation {
 ///
 /// Returns an error when a rejected collision exists, the target is a directory, read-only,
 /// delete-pending, or still has an active handle.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "namespace collision policy needs both Windows lookup spelling and ext4 destination plus the operation-pinned identity projection"
+)]
 fn prepare_hard_link_destination(
     operations: &mut MountedVolumeAccess<'_>,
     read: &mut impl CommittedReadPass,
@@ -1369,6 +1376,7 @@ fn prepare_hard_link_destination(
     target_name: &Ext4Name,
     target_windows_name: &WindowsName,
     target_collision: HardLinkTargetCollision,
+    mapping: &ext4_security::IdentityMap,
 ) -> DriverResult<(
     PreparedNamespaceDestination,
     HardLinkCountEffect,
@@ -1387,6 +1395,7 @@ fn prepare_hard_link_destination(
             HardLinkDirectoryChanges {
                 first: DirectoryChange::new(
                     read,
+                    mapping,
                     target_parent,
                     target_name,
                     source_node,
@@ -1418,7 +1427,7 @@ fn prepare_hard_link_destination(
     let existing_name = target.name().try_to_owned_name()?;
     let changes = if target.name() == target_name {
         HardLinkDirectoryChanges {
-            first: DirectoryChange::hard_link_replaced(read, target_parent, target_name)?
+            first: DirectoryChange::hard_link_replaced(read, mapping, target_parent, target_name)?
                 .with_tunnel(read, target_parent, target.name(), target_node)?,
             second: None,
         }
@@ -1426,6 +1435,7 @@ fn prepare_hard_link_destination(
         HardLinkDirectoryChanges {
             first: DirectoryChange::new(
                 read,
+                mapping,
                 target_parent,
                 target.name(),
                 target_node,
@@ -1434,6 +1444,7 @@ fn prepare_hard_link_destination(
             .with_tunnel(read, target_parent, target.name(), target_node)?,
             second: Some(DirectoryChange::new(
                 read,
+                mapping,
                 target_parent,
                 target_name,
                 source_node,
@@ -1689,6 +1700,7 @@ impl PreparedRenameMutation {
                             Some(
                                 DirectoryChange::new(
                                     read,
+                                    mapping,
                                     target_parent,
                                     child.name(),
                                     source_node,
@@ -1743,6 +1755,7 @@ impl PreparedRenameMutation {
                     Some(
                         DirectoryChange::new(
                             read,
+                            mapping,
                             target_parent,
                             child.name(),
                             *child.node(),
@@ -1762,6 +1775,7 @@ impl PreparedRenameMutation {
             replaced_target,
             old_source_name: DirectoryChange::new(
                 read,
+                mapping,
                 source_parent,
                 &source_name,
                 source_node,
@@ -1780,6 +1794,7 @@ impl PreparedRenameMutation {
                 }
                 RenameNamespaceAction::Coalesce { .. } => Some(DirectoryChange::new(
                     read,
+                    mapping,
                     target_parent,
                     &target_name,
                     source_node,
@@ -1787,6 +1802,7 @@ impl PreparedRenameMutation {
                 )?),
                 RenameNamespaceAction::Move(_) => Some(DirectoryChange::new(
                     read,
+                    mapping,
                     target_parent,
                     &target_name,
                     source_node,

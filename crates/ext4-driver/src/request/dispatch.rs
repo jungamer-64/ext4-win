@@ -881,7 +881,7 @@ pub(crate) fn admit_owned(
         ActorRequest::Captured(PreparedRequest::QueryRemove) => Admission::QueryRemove,
         ActorRequest::Close => Admission::Close,
         ActorRequest::Captured(PreparedRequest::DirectoryControl(
-            PreparedDirectoryControl::NotifyChangeDirectory,
+            PreparedDirectoryControl::NotifyChangeDirectory(_),
         )) => Admission::Notification,
         ActorRequest::Captured(PreparedRequest::LockControl) => Admission::ByteRangeLock,
         ActorRequest::Captured(PreparedRequest::AllocationQuery { start, .. }) => {

@@ -13,8 +13,6 @@ pub(crate) struct DirectoryNotificationRegistration {
     subtree: bool,
     /// Supported Windows completion-filter bits.
     completion_filter: wdk_sys::ULONG,
-    /// Original requestor authority, consumed only at FsRtl registration.
-    subject: crate::kernel::requestor_subject::NotificationSubject,
 }
 
 impl DirectoryNotificationRegistration {
@@ -24,14 +22,12 @@ impl DirectoryNotificationRegistration {
         context: NonNull<c_void>,
         completion_filter: wdk_sys::ULONG,
         subtree: bool,
-        subject: crate::kernel::requestor_subject::NotificationSubject,
     ) -> Self {
         Self {
             full_directory_name,
             context,
             completion_filter,
             subtree,
-            subject,
         }
     }
 }
@@ -296,6 +292,7 @@ impl DirectoryChangeNotifier {
         &self,
         target: DispatchTarget,
         registration: DirectoryNotificationRegistration,
+        subject: crate::kernel::requestor_subject::NotificationSubject,
     ) -> wdk_sys::NTSTATUS {
         #[cfg(not(test))]
         {
@@ -322,7 +319,7 @@ impl DirectoryChangeNotifier {
                     registration.completion_filter,
                     u8::from(registration.subtree),
                     target.into_raw_irp(),
-                    registration.subject.into_fsrtl(),
+                    subject.into_fsrtl(),
                 );
             }
             STATUS_PENDING
@@ -334,7 +331,6 @@ impl DirectoryChangeNotifier {
                 context,
                 completion_filter,
                 subtree,
-                subject,
             } = registration;
             core::hint::black_box((
                 target,
@@ -587,19 +583,31 @@ pub(super) struct DirectoryNotificationTarget {
 /// are built under one committed read pass and identity snapshot before durable publication.
 #[derive(Debug)]
 struct DirectoryNotificationPath {
-    /// Immediate-parent event requires no traversal beyond its opened directory.
-    direct: DirectoryNotificationTarget,
-    /// Nearest-parent first; prefixes determine traversal to each outer anchor.
-    ancestors: DriverVec<DirectoryNotificationAncestor>,
+    /// Immediate parent followed by outward traversal; each prefix ends at one watch anchor.
+    steps: DriverVec<DirectoryNotificationStep>,
 }
 
-/// One enclosing anchor and the directory newly crossed to reach the change.
+/// Direct-child visibility and traversal into another directory have different authority.
 #[derive(Debug)]
-struct DirectoryNotificationAncestor {
-    /// Synthetic name for this exact watched-directory identity.
-    target: DirectoryNotificationTarget,
-    /// Complete aligned projection of the crossed directory's access policy.
-    descriptor: ext4_security::Descriptor,
+enum DirectoryNotificationStep {
+    /// No traversal beyond the directory whose open handle owns the watch.
+    Direct(DirectoryNotificationTarget),
+    /// Reaching the change from this enclosing anchor crosses another directory.
+    Crossed {
+        /// Synthetic name for this exact watched-directory identity.
+        target: DirectoryNotificationTarget,
+        /// Complete aligned projection of the crossed directory's access policy.
+        descriptor: ext4_security::Descriptor,
+    },
+}
+
+impl DirectoryNotificationStep {
+    /// Borrows the anchored name without granting traversal authority.
+    fn target(&self) -> &DirectoryNotificationTarget {
+        match self {
+            Self::Direct(target) | Self::Crossed { target, .. } => target,
+        }
+    }
 }
 
 impl DirectoryNotificationPath {
@@ -619,8 +627,12 @@ impl DirectoryNotificationPath {
             .try_push_owned(WindowsName::from_ext4(name)?)
             .map_err(|error| error.into_parts().0)?;
         let mut visited = DriverVec::new();
-        let direct = DirectoryNotificationTarget::from_components(parent, components.as_slice())?;
-        let mut ancestors = DriverVec::new();
+        let mut steps = DriverVec::new();
+        steps
+            .try_push_owned(DirectoryNotificationStep::Direct(
+                DirectoryNotificationTarget::from_components(parent, components.as_slice())?,
+            ))
+            .map_err(|error| error.into_parts().0)?;
         while parent != DirectoryNodeId::ROOT {
             if visited.as_slice().contains(&parent) {
                 return Err(ext4_core::Error::InvalidDirectoryEntry.into());
@@ -634,8 +646,8 @@ impl DirectoryNotificationPath {
                 .try_push_owned(link.name)
                 .map_err(|error| error.into_parts().0)?;
             parent = link.directory;
-            ancestors
-                .try_push_owned(DirectoryNotificationAncestor {
+            steps
+                .try_push_owned(DirectoryNotificationStep::Crossed {
                     target: DirectoryNotificationTarget::from_components(
                         parent,
                         components.as_slice(),
@@ -644,7 +656,7 @@ impl DirectoryNotificationPath {
                 })
                 .map_err(|error| error.into_parts().0)?;
         }
-        Ok(Self { direct, ancestors })
+        Ok(Self { steps })
     }
 
     /// Lends only complete path prefixes for synchronous native reporting.
@@ -652,10 +664,9 @@ impl DirectoryNotificationPath {
         &self,
         mut report: impl FnMut(&DirectoryNotificationTarget, NotificationTraversal<'_>),
     ) {
-        report(&self.direct, NotificationTraversal { ancestors: &[] });
-        let mut prefix = self.ancestors.as_slice();
+        let mut prefix = self.steps.as_slice();
         while let Some((last, preceding)) = prefix.split_last() {
-            report(&last.target, NotificationTraversal { ancestors: prefix });
+            report(last.target(), NotificationTraversal { steps: prefix });
             prefix = preceding;
         }
     }
@@ -665,15 +676,16 @@ impl DirectoryNotificationPath {
 #[derive(Debug)]
 struct NotificationTraversal<'a> {
     /// Crossed directories, excluding the directory whose handle owns the watch.
-    ancestors: &'a [DirectoryNotificationAncestor],
+    steps: &'a [DirectoryNotificationStep],
 }
 
 impl NotificationTraversal<'_> {
     /// Every crossed directory must grant traversal to the same captured subject.
     fn permits(&self, mut check: impl FnMut(&ext4_security::Descriptor) -> bool) -> bool {
-        self.ancestors
-            .iter()
-            .all(|ancestor| check(&ancestor.descriptor))
+        self.steps.iter().all(|step| match step {
+            DirectoryNotificationStep::Direct(_) => true,
+            DirectoryNotificationStep::Crossed { descriptor, .. } => check(descriptor),
+        })
     }
 }
 
@@ -749,6 +761,78 @@ pub(super) const DIRECTORY_NOTIFICATION_DIRECTORY_UNITS: usize = 5;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Produces distinct valid native policy images for independent traversal decisions.
+    /// # Errors
+    /// Returns fixture permission or native descriptor construction failure.
+    fn traversal_descriptor(mode: u16) -> DriverResult<ext4_security::Descriptor> {
+        let access = ext4_core::Ext4Access::from_mode(ext4_core::Ext4Security::new(
+            ext4_core::Ext4Owner::new(
+                ext4_core::Ext4Uid::from_u32(1000),
+                ext4_core::Ext4Gid::from_u32(100),
+            ),
+            ext4_core::Ext4Permissions::new(mode)?,
+        ));
+        Ok(ext4_security::Descriptor::for_request(
+            &access,
+            &ext4_security::IdentityMap::empty(),
+            wdk_sys::FILE_TRAVERSE,
+        )?)
+    }
+
+    /// # Errors
+    /// Returns fixture name, permission, native descriptor or vector allocation failure.
+    /// # Panics
+    /// Fails if an enclosing watch skips a crossed directory or checks beyond its own anchor.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture construction propagates errors while assertions verify path visibility"
+    )]
+    fn recursive_notification_checks_only_the_intervening_directory_prefix() -> DriverResult<()> {
+        let name = WindowsName::from_utf16(&[102])?;
+        let mut steps = DriverVec::new();
+        steps
+            .try_push_owned(DirectoryNotificationStep::Direct(
+                DirectoryNotificationTarget::from_components(DirectoryNodeId::ROOT, &[name])?,
+            ))
+            .map_err(|error| error.into_parts().0)?;
+        for mode in [0o700, 0o711] {
+            steps
+                .try_push_owned(DirectoryNotificationStep::Crossed {
+                    target: DirectoryNotificationTarget::from_components(
+                        DirectoryNodeId::ROOT,
+                        &[WindowsName::from_utf16(&[102])?],
+                    )?,
+                    descriptor: traversal_descriptor(mode)?,
+                })
+                .map_err(|error| error.into_parts().0)?;
+        }
+        let path = DirectoryNotificationPath { steps };
+        for denied in 1..=2 {
+            let DirectoryNotificationStep::Crossed {
+                descriptor: blocked,
+                ..
+            } = path
+                .steps
+                .as_slice()
+                .get(denied)
+                .ok_or(DriverError::InternalInvariantViolation)?
+            else {
+                return Err(DriverError::InternalInvariantViolation);
+            };
+            let mut decisions = alloc::vec::Vec::new();
+            path.for_each(|_, traversal| {
+                let allowed = traversal.permits(|descriptor| !core::ptr::eq(descriptor, blocked));
+                decisions.push((traversal.steps.len(), allowed));
+            });
+            assert!(decisions.contains(&(1, true)));
+            assert!(decisions.contains(&(2, denied != 1)));
+            assert!(decisions.contains(&(3, false)));
+        }
+        path.for_each(|_, traversal| assert!(traversal.permits(|_| true)));
+        Ok(())
+    }
 
     /// # Panics
     /// Fails when the native suffix or final-component byte offset differs from the Windows path.

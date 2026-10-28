@@ -1610,26 +1610,31 @@ impl OwnedIrp {
         } = self;
         #[cfg(not(test))]
         drop(active_cancellation);
-        drop(context);
         let notifier = unsafe {
             // SAFETY: Registration decoded the notifier from the mounted VCB kept live by this
             // consumed pending IRP.
             notifier.as_ref()
         };
-        if let Err(error) = notifier.ensure_registration_ready() {
-            let completion = IrpCompletion::from_error(error);
-            target.irp.write_status_block(completion);
-            return Err(PreparedIrpCompletion {
-                volume_event: None,
-                #[cfg(not(test))]
-                notification,
-                irp: target.irp,
-                status: completion.status(),
-            });
-        }
+        let subject = match notifier
+            .ensure_registration_ready()
+            .and_then(|()| context.into_notification_subject())
+        {
+            Ok(subject) => subject,
+            Err(error) => {
+                let completion = IrpCompletion::from_error(error);
+                target.irp.write_status_block(completion);
+                return Err(PreparedIrpCompletion {
+                    volume_event: None,
+                    #[cfg(not(test))]
+                    notification,
+                    irp: target.irp,
+                    status: completion.status(),
+                });
+            }
+        };
         #[cfg(not(test))]
         drop(notification);
-        Ok(notifier.register(target, registration))
+        Ok(notifier.register(target, registration, subject))
     }
 
     /// Transfers this queued lock-control IRP's terminal completion authority to FsRtl.

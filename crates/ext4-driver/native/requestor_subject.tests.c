@@ -8,6 +8,12 @@
 #define STATUS_INVALID_DEVICE_STATE (-1)
 #define STATUS_INSUFFICIENT_RESOURCES (-2)
 #define STATUS_ACCESS_DENIED (-3)
+#define STATUS_INVALID_PARAMETER (-4)
+#define KernelMode 0
+#define UserMode 1
+#define SE_CHANGE_NOTIFY_PRIVILEGE 23
+#define FIELD_OFFSET(type, field) offsetof(type, field)
+#define C_ASSERT(condition) _Static_assert(condition, #condition)
 #define FILE_WRITE_ATTRIBUTES 0x100
 #define TRUE 1
 #define DelayedWorkQueue 0
@@ -19,6 +25,7 @@ typedef int NTSTATUS, KPROCESSOR_MODE, BOOLEAN;
 typedef unsigned ACCESS_MASK;
 typedef void *PVOID;
 typedef struct { unsigned token; } SECURITY_SUBJECT_CONTEXT;
+typedef SECURITY_SUBJECT_CONTEXT *PSECURITY_SUBJECT_CONTEXT;
 typedef struct { unsigned identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct { int allowed; } SECURITY_DESCRIPTOR, *PSECURITY_DESCRIPTOR;
 typedef struct { int used; } PRIVILEGE_SET, *PPRIVILEGE_SET;
@@ -28,6 +35,7 @@ typedef struct { PIO_WORKITEM_ROUTINE routine; PVOID context; } IO_WORKITEM, *PI
 static DEVICE_OBJECT device;
 static int irql, pools, works, subjects, locks, fail_pool, fail_work;
 static unsigned caller_token;
+static int traversal_privilege;
 static PIO_WORKITEM queued;
 static PRIVILEGE_SET privilege;
 static SECURITY_DESCRIPTOR writable = {1}, denied = {0};
@@ -35,6 +43,12 @@ static int mapping;
 static _Alignas(16) unsigned char pool[256];
 static IO_WORKITEM release_work;
 static int KeGetCurrentIrql(void) { return irql; }
+static unsigned RtlConvertLongToLuid(unsigned privilege_id) { return privilege_id; }
+static BOOLEAN SeSinglePrivilegeCheck(unsigned privilege_id, KPROCESSOR_MODE mode)
+{
+    assert(irql == PASSIVE_LEVEL && privilege_id == SE_CHANGE_NOTIFY_PRIVILEGE);
+    return mode == KernelMode || traversal_privilege;
+}
 static PVOID ExAllocatePool2(int flags, size_t bytes, unsigned tag)
 {
     assert(flags == POOL_FLAG_NON_PAGED && tag != 0);
@@ -99,6 +113,43 @@ int main(void)
     assert(subjects == 0 && works == 0 && pools == 0 && locks == 0);
     caller_token = 77;
     assert(ext4win_subject_capture(&device, 1, &subject) == STATUS_SUCCESS);
+    irql = DISPATCH_LEVEL;
+    ext4win_subject_release(subject);
+    assert(subjects == 1 && works == 1 && pools == 1 && queued != NULL);
+    irql = PASSIVE_LEVEL;
+    {
+        PIO_WORKITEM owner = queued;
+        queued = NULL;
+        owner->routine(&device, owner->context);
+    }
+    assert(subjects == 0 && works == 0 && pools == 0);
+
+    assert(ext4win_notification_subject_capture(&device, 2, &subject) == STATUS_INVALID_PARAMETER);
+    assert(subject == NULL && subjects == 0 && pools == 0);
+    assert(ext4win_notification_subject_capture(&device, KernelMode, &subject) == STATUS_SUCCESS);
+    assert(subject == NULL && subjects == 0 && works == 0);
+    traversal_privilege = 1;
+    assert(ext4win_notification_subject_capture(&device, UserMode, &subject) == STATUS_SUCCESS);
+    assert(subject == NULL && subjects == 0 && works == 0);
+    traversal_privilege = 0;
+    caller_token = 77;
+    fail_pool = 1;
+    assert(ext4win_notification_subject_capture(&device, UserMode, &subject) == STATUS_INSUFFICIENT_RESOURCES);
+    assert(subject == NULL && subjects == 0 && works == 0);
+    fail_pool = 0;
+    assert(ext4win_notification_subject_capture(&device, UserMode, &subject) == STATUS_SUCCESS);
+    caller_token = 99;
+    {
+        PSECURITY_SUBJECT_CONTEXT transferred = ext4win_subject_transfer_notification(subject);
+        assert(transferred == (PSECURITY_SUBJECT_CONTEXT)pool && transferred->token == 77);
+        assert(works == 0 && subjects == 1 && pools == 1);
+        /* FsRtl alone now consumes the context and the matching pool allocation. */
+        SeReleaseSubjectContext(transferred);
+        ExFreePool(transferred);
+    }
+    assert(subjects == 0 && works == 0 && pools == 0);
+    caller_token = 77;
+    assert(ext4win_notification_subject_capture(&device, UserMode, &subject) == STATUS_SUCCESS);
     irql = DISPATCH_LEVEL;
     ext4win_subject_release(subject);
     assert(subjects == 1 && works == 1 && pools == 1 && queued != NULL);
