@@ -19,10 +19,3 @@ ext4win_prepare_frozen_data(PSECTION_OBJECT_POINTERS sections)
     return status.Status == STATUS_CACHE_PAGE_LOCKED ? STATUS_USER_MAPPED_FILE : status.Status;
 }
 
-/* PAGE_WRITECOPY changes a private page, never the protected backing file. */
-static BOOLEAN
-ext4win_section_data_admitted(UCHAR policy, BOOLEAN writable_data, ULONG protection)
-{
-    BOOLEAN write = (protection & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0;
-    return (policy < 2) && (!write || ((policy == 0) && writable_data));
-}

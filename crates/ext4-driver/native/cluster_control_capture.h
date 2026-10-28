@@ -62,9 +62,6 @@ NTSTATUS NTAPI ext4win_capture_cluster_control(
             handle = input.VolumeHandle;
             *source_info = input.UsnSourceInfo; *flags = input.HandleInfo;
         }
-        if (*source_info != 0 || (*flags & ~MARK_HANDLE_PROTECT_CLUSTERS) != 0) {
-            return STATUS_NOT_SUPPORTED;
-        }
         if (handle == NULL) { return STATUS_SUCCESS; }
     } else { return STATUS_INVALID_DEVICE_REQUEST; }
     status = ObReferenceObjectByHandle(handle, 0, *IoFileObjectType,
