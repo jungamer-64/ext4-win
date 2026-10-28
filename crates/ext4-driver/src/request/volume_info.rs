@@ -424,7 +424,7 @@ fn pack_size_information(
             FILE_FS_SIZE_INFORMATION,
             AvailableAllocationUnits
         )),
-        i64::try_from(geometry.free_cluster_count().as_u64())
+        i64::try_from(geometry.available_cluster_count().as_u64())
             .map_err(|_| DriverError::InvalidParameter)?,
     )?;
     writer.write_u32(
@@ -483,7 +483,9 @@ fn pack_full_size_information(
 ) -> DriverResult<IrpCompletion> {
     let total = i64::try_from(geometry.cluster_count().as_u64())
         .map_err(|_| DriverError::InvalidParameter)?;
-    let available = i64::try_from(geometry.free_cluster_count().as_u64())
+    let available = i64::try_from(geometry.available_cluster_count().as_u64())
+        .map_err(|_| DriverError::InvalidParameter)?;
+    let free = i64::try_from(geometry.free_cluster_count().as_u64())
         .map_err(|_| DriverError::InvalidParameter)?;
     let size = core::mem::size_of::<FILE_FS_FULL_SIZE_INFORMATION>();
     let mut writer = fixed_record_writer(output, size)?;
@@ -506,7 +508,7 @@ fn pack_full_size_information(
             FILE_FS_FULL_SIZE_INFORMATION,
             ActualAvailableAllocationUnits
         )),
-        available,
+        free,
     )?;
     writer.write_u32(
         WireOffset::new(core::mem::offset_of!(
@@ -649,7 +651,7 @@ fn fixed_record_writer(output: &mut [u8], size: usize) -> DriverResult<LittleEnd
 
 #[cfg(test)]
 mod tests {
-    use alloc::{vec, vec::Vec};
+    use alloc::{boxed::Box, vec, vec::Vec};
 
     use crate::{
         irp::IrpCompletion,
@@ -661,6 +663,141 @@ mod tests {
         pack_attribute_information, pack_device_information, volume_label_from_file_fs_label,
     };
     use ext4_core::{Ext4VolumeLabel, FilesystemUuid};
+
+    /// Completes only filesystem reads; read-only noload mount must not issue media effects.
+    /// # Errors
+    /// Returns unexpected storage operations, target mismatches or malformed read ranges.
+    fn complete_geometry_read(
+        mut request: ext4_core::StorageRequest,
+        filesystem: &[u8],
+    ) -> Result<ext4_core::StorageCompletion, DriverError> {
+        if request.target() != ext4_core::StorageTarget::Filesystem {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        let ext4_core::StorageRequest::Read { offset, buffer, .. } = &mut request else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        let start = usize::try_from(offset.get()).map_err(|_| DriverError::InvalidParameter)?;
+        let end = start
+            .checked_add(buffer.len())
+            .ok_or(DriverError::InvalidParameter)?;
+        crate::memory::copy_exact(
+            buffer,
+            filesystem
+                .get(start..end)
+                .ok_or(DriverError::InvalidParameter)?,
+        )?;
+        let length = request.byte_count();
+        Ok(ext4_core::StorageCompletion::success(
+            ext4_core::CompletedStorageTransfer::from_request(request),
+            length,
+        ))
+    }
+
+    /// Obtains volume geometry through the production mount boundary of the external fixture.
+    /// # Errors
+    /// Returns read-only mount, storage or geometry validation failure.
+    fn fixture_geometry(filesystem: &[u8]) -> Result<ext4_core::VolumeGeometry, DriverError> {
+        use ext4_core::*;
+        let length = DeviceLength::from_bytes(
+            u64::try_from(filesystem.len()).map_err(|_| DriverError::InvalidParameter)?,
+        );
+        let mut probe = Box::try_new(MountProbeOperation::new(length))
+            .map_err(|_| DriverError::InsufficientResources)?
+            .advance(OperationEvent::Admitted);
+        let prepared = loop {
+            probe = match probe {
+                MountProbeTransition::SubmitLower { request, suspended } => suspended.advance(
+                    OperationEvent::StorageCompleted(complete_geometry_read(request, filesystem)?),
+                ),
+                MountProbeTransition::Complete(result) => break result?,
+            };
+        };
+        let now = MmpTime::new(0, 0);
+        let mut step = Box::try_new(prepared.start(
+            FscryptKeySet::empty(),
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::NoLoad,
+            },
+            DeviceWriteAccess::ReadOnly,
+            MmpOwner::new([0x35; 16])?,
+            now,
+        )?)
+        .map_err(|_| DriverError::InsufficientResources)?
+        .advance(OperationEvent::Admitted, now);
+        loop {
+            step = match step {
+                MountTransition::SubmitLower { request, suspended } => suspended.advance(
+                    OperationEvent::StorageCompleted(complete_geometry_read(request, filesystem)?),
+                    now,
+                ),
+                MountTransition::Complete(result) => {
+                    return Ok(result.map_err(DriverError::from)?.into_parts().1.geometry());
+                }
+                _ => return Err(DriverError::InternalInvariantViolation),
+            };
+        }
+    }
+
+    /// # Errors
+    /// Returns fixture access, production mount or Windows record encoding failure.
+    /// # Panics
+    /// Fails if caller availability includes reserved blocks or physical free space excludes them.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare Windows record fields with independently decoded ext4 counts"
+    )]
+    fn size_information_distinguishes_reserved_and_physical_free_space() -> Result<(), DriverError>
+    {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tools/xtask/fixtures/journal/external-4k-v3-64.filesystem.img");
+        let filesystem = std::fs::read(path).map_err(|_| DriverError::InvalidParameter)?;
+        let disk = LittleEndianInput::new(&filesystem);
+        let reserved = u64::from(disk.read_u32(WireOffset::new(1032))?)
+            | (u64::from(disk.read_u32(WireOffset::new(1364))?) << 32);
+        let free = u64::from(disk.read_u32(WireOffset::new(1036))?)
+            | (u64::from(disk.read_u32(WireOffset::new(1368))?) << 32);
+        let available = free
+            .checked_sub(reserved)
+            .ok_or(DriverError::InvalidParameter)?;
+        assert!(reserved > 0);
+        let geometry = fixture_geometry(&filesystem)?;
+        assert_eq!(geometry.cluster_size().bytes(), 4096);
+        let sector = crate::state::TransferSectorSize::from_bytes(512)?;
+        let mut size = [0xA5; 24];
+        assert_eq!(
+            super::pack_size_information(geometry, sector, &mut size)?,
+            IrpCompletion::from_usize(24)?
+        );
+        let record = LittleEndianInput::new(&size);
+        assert_eq!(record.read_u64(WireOffset::new(8))?, available);
+        assert_eq!(record.read_u32(WireOffset::new(16))?, 8);
+        assert_eq!(record.read_u32(WireOffset::new(20))?, 512);
+        let mut full = [0xA5; 32];
+        assert_eq!(
+            super::pack_full_size_information(geometry, sector, &mut full)?,
+            IrpCompletion::from_usize(32)?
+        );
+        let record = LittleEndianInput::new(&full);
+        assert_eq!(record.read_u64(WireOffset::new(8))?, available);
+        assert_eq!(record.read_u64(WireOffset::new(16))?, free);
+        assert_eq!(record.read_u32(WireOffset::new(24))?, 8);
+        assert_eq!(record.read_u32(WireOffset::new(28))?, 512);
+        let mut short_size = [0xA5; 23];
+        assert_eq!(
+            super::pack_size_information(geometry, sector, &mut short_size),
+            Err(DriverError::InfoLengthMismatch)
+        );
+        assert_eq!(short_size, [0xA5; 23]);
+        let mut short_full = [0xA5; 31];
+        assert_eq!(
+            super::pack_full_size_information(geometry, sector, &mut short_full),
+            Err(DriverError::InfoLengthMismatch)
+        );
+        assert_eq!(short_full, [0xA5; 31]);
+        Ok(())
+    }
 
     /// # Errors
     /// Returns malformed fixture labels or bounded serialization failures.

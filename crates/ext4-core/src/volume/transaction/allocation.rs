@@ -383,6 +383,13 @@ impl MetadataMutation<'_, '_> {
         if !self.cluster_available(cluster, position, &bitmap.bytes)? {
             return Ok(None);
         }
+        // Staged frees and claims share the transaction's accounting. Ordinary mutation has no
+        // authority to consume the reserved pool, including exact-placement allocation.
+        let mut superblock = self.volume.superblock;
+        superblock.apply_free_cluster_delta(self.free_clusters_delta)?;
+        if superblock.available_cluster_count().as_u64() == 0 {
+            return Err(Error::NoSpace);
+        }
         let bitmap = self
             .block_bitmap_updates
             .get_mut(bitmap_index)

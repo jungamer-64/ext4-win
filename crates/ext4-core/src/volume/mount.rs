@@ -373,6 +373,8 @@ pub struct VolumeGeometry {
     cluster_count: crate::disk_format::superblock::ClusterCount,
     /// Free allocation clusters in the selected committed epoch.
     free_cluster_count: FreeClusterCount,
+    /// Whole free clusters outside the filesystem's reserved-block pool.
+    available_cluster_count: FreeClusterCount,
 }
 
 impl VolumeGeometry {
@@ -404,6 +406,12 @@ impl VolumeGeometry {
     #[must_use]
     pub const fn free_cluster_count(self) -> FreeClusterCount {
         self.free_cluster_count
+    }
+
+    /// Whole free clusters available to ordinary allocation, excluding reserved blocks.
+    #[must_use]
+    pub const fn available_cluster_count(self) -> FreeClusterCount {
+        self.available_cluster_count
     }
 }
 
@@ -605,6 +613,7 @@ impl CommittedEpoch {
             cluster_size: self.superblock.cluster_size(),
             cluster_count: self.superblock.cluster_count(),
             free_cluster_count: self.superblock.free_cluster_count(),
+            available_cluster_count: self.superblock.available_cluster_count(),
         }
     }
 

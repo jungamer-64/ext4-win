@@ -22,6 +22,125 @@ mod session;
 mod trim;
 
 /// # Errors
+/// Returns fixture encoding, mounting, allocation or recovery failure.
+/// # Panics
+/// Fails if allocation consumes reserved blocks, a rejected pass writes, or frees stay unavailable.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions check committed and rejected allocation effects against independent reservation bytes"
+)]
+fn reserved_blocks_bound_staged_allocation_and_survive_remount() -> Result<()> {
+    let baseline = Fixture::new()?;
+    let reserved = u32::try_from(baseline.epoch.geometry().free_cluster_count().as_u64())
+        .map_err(|_| Error::ArithmeticOverflow)?
+        .checked_sub(1)
+        .ok_or(Error::NoSpace)?;
+    let mut disk = Disk::fixture();
+    for (destination, source) in disk
+        .filesystem
+        .get_mut(1032..1036)
+        .ok_or(Error::DeviceRange)?
+        .iter_mut()
+        .zip(reserved.to_le_bytes())
+    {
+        *destination = source;
+    }
+    let crc = fixture_crc32c(
+        u32::MAX,
+        disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+    );
+    for (destination, source) in disk
+        .filesystem
+        .get_mut(2044..2048)
+        .ok_or(Error::DeviceRange)?
+        .iter_mut()
+        .zip(crc.to_le_bytes())
+    {
+        *destination = source;
+    }
+    let mut fixture = Fixture::from_disk(disk)?;
+    let file = fixture.a;
+    let block_bytes = u64::from(fixture.epoch.geometry().block_size().bytes());
+    let two_blocks = FileAllocationSize::from_bytes(
+        block_bytes
+            .checked_mul(2)
+            .ok_or(Error::ArithmeticOverflow)?,
+    );
+    let three_blocks = FileAllocationSize::from_bytes(
+        block_bytes
+            .checked_mul(3)
+            .ok_or(Error::ArithmeticOverflow)?,
+    );
+    let four_blocks = FileAllocationSize::from_bytes(
+        block_bytes
+            .checked_mul(4)
+            .ok_or(Error::ArithmeticOverflow)?,
+    );
+    assert_eq!(
+        fixture.epoch.geometry().available_cluster_count().as_u64(),
+        1
+    );
+    let effects = fixture.disk.storage_effects;
+    assert_eq!(
+        fixture.mutate(|pass| {
+            let file = pass.file(file)?;
+            pass.reserve_file_allocation(file, four_blocks)
+        }),
+        Err(Error::NoSpace)
+    );
+    assert_eq!(fixture.disk.storage_effects, effects);
+    assert_eq!(
+        fixture.epoch.geometry().available_cluster_count().as_u64(),
+        1
+    );
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.reserve_file_allocation(file, two_blocks)
+    })?;
+    assert_eq!(
+        fixture.epoch.geometry().available_cluster_count().as_u64(),
+        0
+    );
+    assert_eq!(
+        fixture.epoch.geometry().free_cluster_count().as_u64(),
+        u64::from(reserved)
+    );
+    fixture.remount()?;
+    assert_eq!(
+        fixture.epoch.geometry().available_cluster_count().as_u64(),
+        0
+    );
+    assert_eq!(fixture_u32(&fixture.disk.filesystem, 1032)?, reserved);
+    assert_eq!(fixture_u32(&fixture.disk.filesystem, 1364)?, 0);
+    let effects = fixture.disk.storage_effects;
+    assert_eq!(
+        fixture.mutate(|pass| {
+            let file = pass.file(file)?;
+            pass.reserve_file_allocation(file, three_blocks)
+        }),
+        Err(Error::NoSpace)
+    );
+    assert_eq!(fixture.disk.storage_effects, effects);
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.write_file_range(file, FileOffset::ZERO, b"reserved-space overwrite")
+    })?;
+    let other = fixture.b;
+    fixture.mutate(|pass| {
+        let file = pass.file(file)?;
+        pass.truncate_file(file, FileSize::from_bytes(0))?;
+        let other = pass.file(other)?;
+        pass.reserve_file_allocation(other, two_blocks)
+    })?;
+    assert_eq!(
+        fixture.epoch.geometry().available_cluster_count().as_u64(),
+        1
+    );
+    Ok(())
+}
+
+/// # Errors
 /// Propagates fixture setup, independent inode decoding, and committed allocation observation failures.
 /// # Panics
 /// Fails if direct-map admission exposes unwritten or sparse bytes, or changes physical coordinates.

@@ -16,6 +16,10 @@ use crate::memory;
 const SUPERBLOCK_OFFSET: u64 = 1024;
 /// Fixed byte length of an ext4 superblock.
 const SUPERBLOCK_SIZE: usize = 1024;
+/// Byte offset of `s_r_blocks_count_lo` inside the superblock.
+const RESERVED_BLOCKS_COUNT_LO_OFFSET: usize = 8;
+/// Byte offset of `s_r_blocks_count_hi` inside the superblock.
+const RESERVED_BLOCKS_COUNT_HI_OFFSET: usize = 340;
 /// Byte offset of `s_free_blocks_count_lo` inside the superblock.
 const FREE_BLOCKS_COUNT_LO_OFFSET: usize = 12;
 /// Byte offset of `s_free_blocks_count_hi` inside the superblock.
@@ -408,6 +412,45 @@ impl FreeClusterCount {
     #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0
+    }
+}
+
+/// Allocation clusters withheld from ordinary allocation by `s_r_blocks_count`.
+/// The on-disk reservation is measured in blocks and need not be cluster aligned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ReservedClusterCount(u64);
+
+impl ReservedClusterCount {
+    /// Validates the block reservation and withholds any partially reserved cluster.
+    /// # Errors
+    /// Returns truncated fields, a reservation exceeding the filesystem, or invalid geometry.
+    fn parse(
+        raw: &[u8],
+        has_high_field: bool,
+        block_count: BlockCount,
+        blocks_per_cluster: BlocksPerCluster,
+    ) -> Result<Self> {
+        let low = u64::from(le_u32(raw, disk_offset(RESERVED_BLOCKS_COUNT_LO_OFFSET))?);
+        let high = if has_high_field {
+            u64::from(le_u32(raw, disk_offset(RESERVED_BLOCKS_COUNT_HI_OFFSET))?) << 32
+        } else {
+            0
+        };
+        let blocks = low | high;
+        if blocks > block_count.as_u64() {
+            return Err(Error::InvalidSuperblock);
+        }
+        let ratio = u64::from(blocks_per_cluster.as_u32());
+        let clusters = blocks
+            .checked_div(ratio)
+            .and_then(|whole| whole.checked_add(u64::from(!blocks.is_multiple_of(ratio))))
+            .ok_or(Error::InvalidClusterGeometry)?;
+        Ok(Self(clusters))
+    }
+
+    /// Preserves physical free space while excluding the ordinary allocation reserve.
+    const fn available(self, free: FreeClusterCount) -> FreeClusterCount {
+        FreeClusterCount::new(free.as_u64().saturating_sub(self.0))
     }
 }
 
@@ -1655,6 +1698,8 @@ pub struct Superblock {
     cluster_count: ClusterCount,
     /// Total free cluster count advertised by the superblock.
     free_clusters_count: FreeClusterCount,
+    /// Mount-fixed reservation in the allocation domain; it is not allocated bitmap space.
+    reserved_clusters_count: ReservedClusterCount,
     /// Total free inode count advertised by the superblock.
     free_inodes_count: FreeInodeCount,
     /// First block that can contain filesystem data.
@@ -1707,6 +1752,7 @@ impl Superblock {
             && self.block_size == other.block_size
             && self.inode_count == other.inode_count
             && self.block_count == other.block_count
+            && self.reserved_clusters_count == other.reserved_clusters_count
             && self.cluster_size == other.cluster_size
             && self.first_data_block == other.first_data_block
             && self.blocks_per_group == other.blocks_per_group
@@ -1961,6 +2007,12 @@ impl Superblock {
         })?;
         let free_clusters_count = free_blocks_count
             .into_free_cluster_count(geometry.blocks_per_cluster, geometry.cluster_count)?;
+        let reserved_clusters_count = ReservedClusterCount::parse(
+            raw,
+            features.has_64bit(),
+            block_count,
+            geometry.blocks_per_cluster,
+        )?;
         match (features.metadata_checksum(), checksum_validation) {
             (MetadataChecksum::None, _) => {}
             (MetadataChecksum::Crc32c, SuperblockChecksumValidation::DeferredToJournalReplay) => {}
@@ -2068,6 +2120,7 @@ impl Superblock {
             blocks_per_cluster: geometry.blocks_per_cluster,
             cluster_count: geometry.cluster_count,
             free_clusters_count,
+            reserved_clusters_count,
             free_inodes_count,
             first_data_block,
             blocks_per_group,
@@ -2194,6 +2247,14 @@ impl Superblock {
     #[must_use]
     pub const fn free_cluster_count(self) -> FreeClusterCount {
         self.free_clusters_count
+    }
+
+    /// Free whole clusters available without authority to consume reserved blocks.
+    /// The reservation may exceed current free space; that leaves zero available clusters.
+    #[must_use]
+    pub const fn available_cluster_count(self) -> FreeClusterCount {
+        self.reserved_clusters_count
+            .available(self.free_clusters_count)
     }
 
     /// First data block.
@@ -2714,6 +2775,126 @@ fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::disk::endian::put_le_u16;
+
+    /// # Errors
+    /// Returns independent field encoding or superblock validation failure.
+    /// # Panics
+    /// Fails if the 64bit feature does not control the reserved count's high word.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare independently encoded block counts with available allocation space"
+    )]
+    fn reserved_block_words_follow_the_64bit_feature() -> Result<()> {
+        for wide in [false, true] {
+            let mut raw = primary(false, false, false)?;
+            for (offset, value) in [
+                (4, 64),
+                (8, 3),
+                (12, 32),
+                (
+                    96,
+                    INCOMPAT_EXTENTS | INCOMPAT_FILETYPE | if wide { INCOMPAT_64BIT } else { 0 },
+                ),
+                (336, 2),
+                (340, 1),
+                (344, 1),
+            ] {
+                put_le_u32(&mut raw, disk_offset(offset), value)?;
+            }
+            Superblock::refresh_checksum(&mut raw)?;
+            for parsed in [
+                Superblock::parse_read_only(&raw)?,
+                Superblock::parse_read_write(&raw)?,
+            ] {
+                assert_eq!(parsed.available_cluster_count().as_u64(), 29);
+                assert_eq!(
+                    parsed.free_cluster_count().as_u64(),
+                    if wide { 0x1_0000_0020 } else { 32 }
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns independent field encoding or superblock validation failure.
+    /// # Panics
+    /// Fails if a partial reserved cluster is offered for allocation or availability underflows.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare block-unit reservation vectors with whole-cluster availability"
+    )]
+    fn reserved_blocks_exclude_whole_bigalloc_clusters() -> Result<()> {
+        for (reserved, available) in [
+            (0, 16),
+            (1, 15),
+            (3, 15),
+            (4, 15),
+            (5, 14),
+            (64, 0),
+            (65, 0),
+            (4096, 0),
+        ] {
+            let mut raw = primary(false, false, false)?;
+            for (offset, value) in [
+                (8, reserved),
+                (12, 64),
+                (20, 0),
+                (24, 2),
+                (28, 4),
+                (32, 32768),
+                (36, 8192),
+                (100, RO_COMPAT_METADATA_CSUM | RO_COMPAT_BIGALLOC),
+            ] {
+                put_le_u32(&mut raw, disk_offset(offset), value)?;
+            }
+            Superblock::refresh_checksum(&mut raw)?;
+            for parsed in [
+                Superblock::parse_read_only(&raw)?,
+                Superblock::parse_read_write(&raw)?,
+            ] {
+                assert_eq!(parsed.free_cluster_count().as_u64(), 16);
+                assert_eq!(parsed.available_cluster_count().as_u64(), available);
+            }
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns independent field encoding or checksum generation failure.
+    /// # Panics
+    /// Fails if a reservation beyond the filesystem is admitted, or free space bounds it instead.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions check reservation bounds independently of current free space"
+    )]
+    fn reserved_block_count_is_bounded_by_total_space() -> Result<()> {
+        for (low, high, wide) in [(4097, 0, false), (0, 1, true)] {
+            let mut raw = primary(false, false, false)?;
+            put_le_u32(&mut raw, disk_offset(8), low)?;
+            put_le_u32(&mut raw, disk_offset(340), high)?;
+            if wide {
+                put_le_u32(
+                    &mut raw,
+                    disk_offset(96),
+                    INCOMPAT_EXTENTS | INCOMPAT_FILETYPE | INCOMPAT_64BIT,
+                )?;
+            }
+            Superblock::refresh_checksum(&mut raw)?;
+            assert_eq!(
+                Superblock::parse_read_only(&raw),
+                Err(Error::InvalidSuperblock)
+            );
+            assert_eq!(
+                Superblock::parse_read_write(&raw),
+                Err(Error::InvalidSuperblock)
+            );
+        }
+        Ok(())
+    }
 
     /// # Errors
     /// Returns independent fixture serialization or superblock parsing failure.
