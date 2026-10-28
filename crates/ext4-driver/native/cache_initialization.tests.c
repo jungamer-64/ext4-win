@@ -12,7 +12,6 @@ unsigned long __cdecl _exception_code(void);
 #define TRUE 1
 #define FALSE 0
 #define VOID void
-#define EXT4WIN_PAGING_VACANT 0
 #define STATUS_SUCCESS 0L
 #define STATUS_INVALID_PARAMETER ((long)0xc000000dL)
 #define STATUS_INVALID_DEVICE_REQUEST ((long)0xc0000010L)
@@ -33,12 +32,13 @@ typedef struct { long long AllocationSize, FileSize, ValidDataLength; } CC_FILE_
 typedef struct { ULONG Flags; PVOID PrivateCacheMap, FsContext; } FILE_OBJECT, *PFILE_OBJECT;
 typedef struct _EXT4WIN_STREAM_CONTEXT {
     struct { long long Size; } Header;
-    struct { long Active; } PagingFile;
+    PVOID PagingState;
     struct _EXT4WIN_STREAM_CONTEXT *VolumeStream;
     PVOID RustState, SectionState;
     ERESOURCE MainResource;
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 static EXT4WIN_STREAM_CONTEXT stream, volume;
+static BOOLEAN ext4win_paging_is_special(const VOID *state) { return state != NULL; }
 static FILE_OBJECT file;
 static unsigned cache_identity, callbacks_identity, section_identity, runtime_identity;
 #define ext4win_cache_callbacks callbacks_identity
@@ -124,7 +124,7 @@ static VOID reset(VOID)
     assert(!stream.MainResource.Held);
     stream.VolumeStream = &volume;
     stream.SectionState = &section_identity;
-    stream.PagingFile.Active = EXT4WIN_PAGING_VACANT;
+    stream.PagingState = NULL;
     volume.RustState = &runtime_identity;
     file.FsContext = &stream.Header;
     file.PrivateCacheMap = NULL;
@@ -183,7 +183,7 @@ int main(void)
     reset(); before = 99; closing = 1;
     assert(ext4win_stream_cache_initialize(&stream.Header, &file, &before) == STATUS_VOLUME_DISMOUNTED && before == 0);
     assert(entries == 0 && acquisitions == 0);
-    reset(); before = 99; stream.PagingFile.Active = 1; verify_required = 1;
+    reset(); before = 99; stream.PagingState = &stream; verify_required = 1;
     assert(ext4win_stream_cache_initialize(&stream.Header, &file, &before) == STATUS_INVALID_DEVICE_REQUEST && before == 0);
     assert(entries == 0 && acquisitions == 0 && gate_calls == 0);
     reset(); before = 99;

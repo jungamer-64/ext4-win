@@ -300,6 +300,7 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
                 .args([
                     "--target=x86_64-pc-windows-msvc",
                     "-std=c11",
+                    "-fasync-exceptions",
                     "-Wall",
                     "-Wextra",
                     "-Werror",
@@ -365,6 +366,7 @@ fn verify_cache_manager(root: &Path) -> TaskResult<()> {
                 .args([
                     "--target=x86_64-pc-windows-msvc",
                     "-std=c11",
+                    "-fasync-exceptions",
                     "-Wall",
                     "-Wextra",
                     "-Werror",

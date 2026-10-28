@@ -1,6 +1,9 @@
 //! Native Windows stream-header ownership boundary.
 
 #[cfg(not(test))]
+use super::ffi::ext4win_stream_get_sizes;
+use super::paging_file::PagingFileReservation;
+#[cfg(not(test))]
 use super::section::SectionResource;
 use super::section::{
     PurgeFailurePolicy, ScanSectionChange, SealedSectionMutation, SectionMutationOperation,
@@ -40,133 +43,6 @@ use crate::memory::NativeAllocation;
 #[unsafe(no_mangle)]
 extern "system" fn ext4win_paging_ownership_corruption() -> ! {
     KernelWideInconsistency::lower_completion_ownership_corruption().bugcheck()
-}
-
-/// Physical prefix acknowledged before unique native paging setup admission.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "native reservation constructs these acknowledged-map claims in the production FCB boundary"
-    )
-)]
-pub(crate) enum PagingFileClaim {
-    /// No direct paging address has been published.
-    Initial,
-    /// Existing direct I/O continues over this acknowledged physical prefix.
-    Extension {
-        /// Lower-device coordinate that subsequent map publication must preserve.
-        physical: ext4_core::ByteOffset,
-        /// Previously acknowledged prefix; extension may only append beyond it.
-        length: FileSize,
-    },
-}
-
-/// Unique native setup reservation; its enclosing deferred FCB lease retains `header`.
-#[derive(Debug)]
-pub(crate) struct PagingFileReservation {
-    /// Address-stable native FCB retained independently by the constructing owner.
-    header: NonNull<c_void>,
-    /// Initial admission or immutable-prefix extension.
-    claim: PagingFileClaim,
-    /// Consumption prevents rollback after map publication.
-    phase: PagingReservationPhase,
-}
-
-/// Local ownership transition, distinct from the native map's shared admission phase.
-#[derive(Debug, Eq, PartialEq)]
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "only the production native activation can publish an acknowledged paging map"
-    )
-)]
-enum PagingReservationPhase {
-    /// Dropping setup releases the unique native reservation without publishing a map.
-    Reserved,
-    /// Native map publication consumed rollback authority.
-    Activated,
-}
-
-impl PagingFileReservation {
-    /// Returns the acknowledged prefix while this setup retains exclusive extension authority.
-    pub(crate) const fn claim(&self) -> PagingFileClaim {
-        self.claim
-    }
-
-    /// Activates only an initialized, home-checkpointed projection over the same physical prefix.
-    /// # Errors
-    /// Returns invalid representation/alignment or revoked native setup before map publication.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "the enclosing FCB lease retains the native setup token through activation"
-        )
-    )]
-    pub(crate) fn activate(
-        mut self,
-        storage: ext4_core::ContiguousFileStorage,
-        route: crate::kernel::storage::MountedStorageRoute,
-    ) -> DriverResult<()> {
-        let physical =
-            i64::try_from(storage.physical().get()).map_err(|_| DriverError::InvalidParameter)?;
-        let length = i64::try_from(storage.initialized_length().bytes())
-            .map_err(|_| DriverError::InvalidParameter)?;
-        let logical_size = i64::try_from(storage.logical_size().bytes())
-            .map_err(|_| DriverError::InvalidParameter)?;
-        #[cfg(not(test))]
-        {
-            let status = unsafe {
-                // SAFETY: The unique reservation and deferred FCB lease retain this native header.
-                ext4win_stream_activate_paging_file(
-                    self.header.as_ptr(),
-                    u8::from(matches!(self.claim, PagingFileClaim::Extension { .. })),
-                    route.filesystem_control_device().as_ptr(),
-                    physical,
-                    length,
-                    logical_size,
-                    route.filesystem_sector_size().as_u32(),
-                )
-            };
-            cache_status(status)?;
-            self.phase = PagingReservationPhase::Activated;
-            Ok(())
-        }
-        #[cfg(test)]
-        {
-            let _inputs = (&mut self, physical, length, logical_size, route);
-            Err(DriverError::NotSupported)
-        }
-    }
-}
-
-impl Drop for PagingFileReservation {
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "the enclosing deferred FCB lease remains alive until this reservation has released native admission"
-        )
-    )]
-    fn drop(&mut self) {
-        if self.phase == PagingReservationPhase::Reserved {
-            #[cfg(not(test))]
-            unsafe {
-                // SAFETY: Native setup authority is still unique and the FCB remains retained.
-                ext4win_stream_abort_paging_file(
-                    self.header.as_ptr(),
-                    u8::from(matches!(self.claim, PagingFileClaim::Extension { .. })),
-                );
-            }
-            #[cfg(test)]
-            {
-                let _identity = self.header;
-            }
-        }
-    }
 }
 
 /// Native stream owner domain encoded beside the advanced FCB header.
@@ -389,6 +265,8 @@ pub(crate) struct StreamContext {
 enum StreamRuntime {
     /// Node-only consuming MDL completion resource.
     Node {
+        /// Sole paging-map state, retained through native dispatch and lower completion.
+        paging: NativeAllocation<super::paging_file::PagingFile>,
         /// Address-stable completion ownership, prepared before cache pages are exposed.
         #[cfg(not(test))]
         completion: core::pin::Pin<Box<crate::irp::mdl_completion::MdlCompletionQueue>>,
@@ -403,6 +281,7 @@ impl StreamRuntime {
     /// Returns nonpaged completion-inbox allocation failure.
     fn try_node() -> DriverResult<Self> {
         Ok(Self::Node {
+            paging: super::paging_file::PagingFile::try_new()?,
             #[cfg(not(test))]
             completion: crate::irp::mdl_completion::MdlCompletionQueue::try_new()?,
         })
@@ -420,7 +299,7 @@ impl StreamRuntime {
     #[cfg(not(test))]
     fn as_ptr(&self) -> *mut c_void {
         match self {
-            Self::Node { completion } => completion.as_ref().as_ptr(),
+            Self::Node { completion, .. } => completion.as_ref().as_ptr(),
             Self::Volume(admission) => admission.address().as_ptr().cast(),
         }
     }
@@ -886,6 +765,10 @@ impl StreamContext {
                     trace.handle(),
                     runtime.as_ptr(),
                     core::ptr::from_ref(sections.get()).cast(),
+                    match &runtime {
+                        StreamRuntime::Node { paging, .. } => paging.address().as_ptr().cast(),
+                        StreamRuntime::Volume(_) => core::ptr::null_mut(),
+                    },
                     core::ptr::addr_of_mut!(header),
                 )
             };
@@ -917,38 +800,29 @@ impl StreamContext {
         }
     }
 
-    /// Reports whether the FCB owns an immutable native paging-file mapping.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "the retained stream header owns the native one-time paging state"
-        )
-    )]
+    /// Observes special-file ownership from the sole shared Rust lifecycle.
     pub(crate) fn is_paging_file(&self) -> bool {
-        #[cfg(not(test))]
-        {
-            unsafe {
-                // SAFETY: The stream owner retains the native header through this atomic observation.
-                ext4win_stream_is_paging_file(self.header.as_ptr()) != 0
-            }
-        }
-        #[cfg(test)]
-        {
-            false
+        self.paging_state()
+            .is_some_and(|state| state.get().is_special())
+    }
+
+    /// Borrows the node-only paging owner without granting setup or mutation authority.
+    fn paging_state(&self) -> Option<&NativeAllocation<super::paging_file::PagingFile>> {
+        match &self.runtime {
+            StreamRuntime::Node { paging, .. } => Some(paging),
+            StreamRuntime::Volume(_) => None,
         }
     }
 
-    /// Reserves initial setup or extension while a caller-owned deferred FCB lease retains it.
+    /// Reserves setup while the enclosing deferred FCB lease retains every callback pointer.
     /// # Safety
-    /// The caller must keep this exact stream alive until the returned reservation is consumed
-    /// or dropped, including every failure path. Initial setup additionally owns its first-open
-    /// claim with no previously published FILE_OBJECT or native section residency.
+    /// The caller must retain this exact FCB and original FILE_OBJECT through reservation consumption.
+    /// Initial setup must own the first-open claim before publishing a FILE_OBJECT or section.
     /// # Errors
-    /// Returns competing setup, stale native identity or non-writable media admission failures.
+    /// Returns competing setup, native residency, or non-writable volume admission failures.
     #[expect(
         unsafe_code,
-        reason = "the caller supplies an explicit deferred FCB owner for the returned native reservation"
+        reason = "the deferred FCB owner retains the shared state through reservation consumption"
     )]
     pub(crate) unsafe fn reserve_paging_file(
         &self,
@@ -957,40 +831,19 @@ impl StreamContext {
     ) -> DriverResult<PagingFileReservation> {
         #[cfg(not(test))]
         {
-            let mut physical = 0;
-            let mut length = 0;
-            let status = unsafe {
-                // SAFETY: The caller retains the FCB, original FILE_OBJECT and mounted route.
-                ext4win_stream_reserve_paging_file(
-                    self.header.as_ptr(),
-                    file.as_ptr(),
-                    u8::from(extension),
-                    &mut physical,
-                    &mut length,
-                )
-            };
-            cache_status(status)?;
-            let claim = if extension {
-                let (Ok(physical), Ok(length)) = (u64::try_from(physical), u64::try_from(length))
-                else {
-                    unsafe {
-                        // SAFETY: Setup was acquired above but its scalar outputs are invalid.
-                        ext4win_stream_abort_paging_file(self.header.as_ptr(), 1);
-                    }
-                    return Err(DriverError::InternalInvariantViolation);
-                };
-                PagingFileClaim::Extension {
-                    physical: ext4_core::ByteOffset::new(physical),
-                    length: FileSize::from_bytes(length),
-                }
-            } else {
-                PagingFileClaim::Initial
-            };
-            Ok(PagingFileReservation {
-                header: self.header,
-                claim,
-                phase: PagingReservationPhase::Reserved,
-            })
+            self.ensure_storage()?;
+            // SAFETY: Storage validation established this retained volume admission identity.
+            let address = unsafe { ext4win_stream_storage_admission(self.header.as_ptr()) };
+            // SAFETY: The enclosing mounted FCB retains its volume through setup.
+            let admission = unsafe { &*address.cast::<StorageAdmission>() };
+            if !admission.ordinary_io_admitted(true)
+                || (!extension && self.section_residency() != 0)
+            {
+                return Err(DriverError::InvalidParameter);
+            }
+            let state = self.paging_state().ok_or(DriverError::InvalidParameter)?;
+            // SAFETY: The caller's deferred FCB lease retains state and header through consumption.
+            unsafe { PagingFileReservation::acquire(state, self.header, file, extension) }
         }
         #[cfg(test)]
         {
@@ -999,25 +852,10 @@ impl StreamContext {
         }
     }
 
-    /// Returns the acknowledged paging bound; zero means no active direct-I/O mapping.
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "this stream owner retains the native map through its locked scalar observation"
-        )
-    )]
+    /// Returns the acknowledged direct-I/O prefix, independently of logical EOF.
     pub(crate) fn paging_file_length(&self) -> u64 {
-        #[cfg(not(test))]
-        {
-            // SAFETY: The map and its spin lock remain retained by this stream borrow.
-            u64::try_from(unsafe { ext4win_stream_paging_length(self.header.as_ptr()) })
-                .unwrap_or(0)
-        }
-        #[cfg(test)]
-        {
-            0
-        }
+        self.paging_state()
+            .map_or(0, |state| state.get().length().bytes())
     }
 
     /// Atomically binds one pinned FCB and its embedded byte-range lock package.
@@ -1930,31 +1768,20 @@ impl StreamContext {
         operation: SectionMutationOperation,
         policy: PurgeFailurePolicy,
     ) -> DriverResult<SealedSectionMutation> {
-        if self.is_paging_file() {
-            let (deletion, target, allocation) = match operation {
+        if let Some(state) = self.paging_state().filter(|state| state.get().is_special()) {
+            let mutation = match operation {
                 SectionMutationOperation::Resize(sizes)
                 | SectionMutationOperation::Reset(sizes) => {
-                    (false, sizes.file_size(), sizes.allocation_size)
+                    super::paging_file::PagingMutation::Resize {
+                        file_size: FileSize::from_bytes(sizes.file_size.unsigned_abs()),
+                        allocation: FileSize::from_bytes(sizes.allocation_size.unsigned_abs()),
+                    }
                 }
-                SectionMutationOperation::Delete => (true, 0, 0),
+                SectionMutationOperation::Delete => super::paging_file::PagingMutation::Delete,
                 _ => return Err(DriverError::NotSupported),
             };
-            #[cfg(not(test))]
-            if unsafe {
-                // SAFETY: The retained stream serializes its setup/retirement admission.
-                ext4win_stream_paging_mutation_allowed(
-                    self.header.as_ptr(),
-                    u8::from(deletion),
-                    target,
-                    allocation,
-                )
-            } == 0
-            {
+            if !state.get().permits_mutation(mutation) {
                 return Err(DriverError::NotSupported);
-            }
-            #[cfg(test)]
-            {
-                let _projection = (deletion, target, allocation);
             }
         }
         loop {
@@ -2425,31 +2252,6 @@ unsafe extern "system" {
         file: wdk_sys::PFILE_OBJECT,
         verify_before_entry: *mut u8,
     ) -> NTSTATUS;
-    fn ext4win_stream_is_paging_file(header: *mut c_void) -> u8;
-    fn ext4win_stream_reserve_paging_file(
-        header: *mut c_void,
-        file: wdk_sys::PFILE_OBJECT,
-        extension: u8,
-        physical: *mut i64,
-        length: *mut i64,
-    ) -> NTSTATUS;
-    fn ext4win_stream_abort_paging_file(header: *mut c_void, extension: u8);
-    fn ext4win_stream_activate_paging_file(
-        header: *mut c_void,
-        extension: u8,
-        lower: wdk_sys::PDEVICE_OBJECT,
-        physical: i64,
-        length: i64,
-        logical_size: i64,
-        sector_size: u32,
-    ) -> NTSTATUS;
-    fn ext4win_stream_paging_mutation_allowed(
-        header: *mut c_void,
-        deletion: u8,
-        target: i64,
-        allocation: i64,
-    ) -> u8;
-    fn ext4win_stream_paging_length(header: *mut c_void) -> i64;
     fn ext4win_stream_prepare_frozen_data(stream_header: *mut c_void) -> NTSTATUS;
     fn ext4win_stream_data_writable(stream_header: *mut c_void) -> u8;
     fn ext4win_prepare_mdl_completion(
@@ -2480,6 +2282,7 @@ unsafe extern "system" {
         trace_registration_handle: u64,
         runtime: *mut c_void,
         section_state: *const c_void,
+        paging_state: *mut c_void,
         stream_header_out: *mut wdk_sys::PVOID,
     ) -> NTSTATUS;
 
@@ -2543,14 +2346,6 @@ unsafe extern "system" {
     fn ext4win_stream_section_objects(
         stream_header: wdk_sys::PVOID,
         section_objects_out: *mut *mut wdk_sys::SECTION_OBJECT_POINTERS,
-    ) -> NTSTATUS;
-
-    fn ext4win_stream_get_sizes(
-        stream_header: wdk_sys::PVOID,
-        allocation_size_out: *mut i64,
-        file_size_out: *mut i64,
-        valid_data_length_out: *mut i64,
-        allocation_charge_out: *mut i64,
     ) -> NTSTATUS;
 
     /// Observes the committed archive attribute under the native header mutex.

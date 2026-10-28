@@ -1,23 +1,21 @@
 #ifndef EXT4WIN_CLUSTER_CONTROL_CAPTURE_H
 #define EXT4WIN_CLUSTER_CONTROL_CAPTURE_H
 
-/* Embedded handles must be interpreted in the requesting process before queue publication.
- * A successful result transfers one FILE_OBJECT reference, including the optional volume
- * reference in MARK_HANDLE. Scalar outputs are independent of the buffered input lifetime. */
+/* ABI capture and handle resolution both run in the requesting process before queue publication.
+ * Rust admits the captured semantics before resolving a handle. Successful resolution transfers
+ * one FILE_OBJECT reference; capture alone transfers no object ownership. */
 _IRQL_requires_max_(APC_LEVEL)
 NTSTATUS NTAPI ext4win_capture_cluster_control(
-    PIRP irp, PFILE_OBJECT *file, PULONGLONG vcn, PULONGLONG lcn,
-    PULONG count, PULONG source_info, PULONG flags, PACCESS_MASK granted)
+    PIRP irp, HANDLE *handle_out, PULONGLONG vcn, PULONGLONG lcn,
+    PULONG count, PULONG source_info, PULONG flags)
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
     ULONG code = stack->Parameters.FileSystemControl.FsControlCode;
     ULONG length = stack->Parameters.FileSystemControl.InputBufferLength;
     HANDLE handle = NULL;
     LARGE_INTEGER starting_vcn = {0}, starting_lcn = {0};
-    OBJECT_HANDLE_INFORMATION information = {0};
-    NTSTATUS status;
-    *file = NULL; *vcn = 0; *lcn = 0; *count = 0;
-    *source_info = 0; *flags = 0; *granted = 0;
+    *handle_out = NULL; *vcn = 0; *lcn = 0; *count = 0;
+    *source_info = 0; *flags = 0;
     if (stack->MajorFunction != IRP_MJ_FILE_SYSTEM_CONTROL ||
         stack->MinorFunction != IRP_MN_USER_FS_REQUEST ||
         stack->Parameters.FileSystemControl.OutputBufferLength != 0 ||
@@ -62,10 +60,21 @@ NTSTATUS NTAPI ext4win_capture_cluster_control(
             handle = input.VolumeHandle;
             *source_info = input.UsnSourceInfo; *flags = input.HandleInfo;
         }
-        if (handle == NULL) { return STATUS_SUCCESS; }
     } else { return STATUS_INVALID_DEVICE_REQUEST; }
+    *handle_out = handle;
+    return STATUS_SUCCESS;
+}
+
+/* Only synchronous requestor-context admission may use this captured handle identity. */
+_IRQL_requires_max_(APC_LEVEL)
+NTSTATUS NTAPI ext4win_reference_cluster_file(HANDLE handle, KPROCESSOR_MODE mode,
+    PFILE_OBJECT *file, PACCESS_MASK granted)
+{
+    OBJECT_HANDLE_INFORMATION information = {0};
+    NTSTATUS status;
+    *file = NULL; *granted = 0;
     status = ObReferenceObjectByHandle(handle, 0, *IoFileObjectType,
-        irp->RequestorMode, (PVOID *)file, &information);
+        mode, (PVOID *)file, &information);
     if (NT_SUCCESS(status)) { *granted = information.GrantedAccess; }
     return status;
 }

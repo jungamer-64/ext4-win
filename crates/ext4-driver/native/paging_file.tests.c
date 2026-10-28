@@ -1,3 +1,4 @@
+/* Native original-IRP transport and kernel pointer-return ABI. Rust owns map policy. */
 #include <stddef.h>
 __declspec(dllimport) __declspec(noreturn) void __stdcall ExitProcess(unsigned);
 __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long, unsigned long, const unsigned long long *);
@@ -19,31 +20,20 @@ __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long
 #define STATUS_PENDING 0x103L
 #define STATUS_INVALID_PARAMETER ((long)0xc000000d)
 #define STATUS_INSUFFICIENT_RESOURCES ((long)0xc000009a)
-#define STATUS_DEVICE_NOT_CONNECTED ((long)0xc000009d)
 #define STATUS_ACCESS_VIOLATION ((long)0xc0000005)
-#define STATUS_SHARING_VIOLATION ((long)0xc0000043)
-#define STATUS_FILE_CLOSED ((long)0xc0000128)
 #define STATUS_CONTINUE_COMPLETION STATUS_SUCCESS
-#define MAXULONG 0xffffffffUL
-#define NotificationEvent 0
-#define Executive 0
 #define UNREFERENCED_PARAMETER(value) ((void)(value))
 #define POOL_FLAG_NON_PAGED 1
-#define EXCEPTION_EXECUTE_HANDLER 1
-#define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS EXCEPTION_EXECUTE_HANDLER
+#define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS 1
 unsigned long __cdecl _exception_code(void);
 #define GetExceptionCode() ((long)_exception_code())
-typedef long NTSTATUS, LONG;
+typedef long NTSTATUS;
 typedef long long LONGLONG;
 typedef unsigned long long ULONGLONG;
 typedef unsigned long ULONG;
-typedef unsigned char BOOLEAN;
-typedef void *PVOID;
+typedef unsigned char UCHAR, BOOLEAN;
+typedef void *PVOID, *PFILE_OBJECT;
 typedef void VOID;
-typedef void *PFILE_OBJECT;
-typedef unsigned char KIRQL;
-typedef unsigned long long KSPIN_LOCK;
-typedef struct { unsigned Signaled; } KEVENT;
 typedef struct _IRP IRP, *PIRP;
 typedef struct { int Identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef NTSTATUS (NTAPI *COMPLETION)(PDEVICE_OBJECT, PIRP, PVOID);
@@ -51,8 +41,8 @@ typedef NTSTATUS (NTAPI IO_COMPLETION_ROUTINE)(PDEVICE_OBJECT, PIRP, PVOID);
 typedef struct { LONGLONG QuadPart; } LARGE_INTEGER;
 typedef struct { ULONG ByteCount; } MDL;
 typedef struct {
-    unsigned char MajorFunction, MinorFunction, Control;
-    void *FileObject;
+    UCHAR MajorFunction, MinorFunction, Control;
+    PFILE_OBJECT FileObject;
     union {
         struct { ULONG Length; LARGE_INTEGER ByteOffset; } Read;
         struct { ULONG InputBufferLength, OutputBufferLength, FsControlCode; void *Type3InputBuffer; } FileSystemControl;
@@ -60,7 +50,7 @@ typedef struct {
 } IO_STACK_LOCATION, *PIO_STACK_LOCATION;
 struct _IRP {
     struct { NTSTATUS Status; size_t Information; } IoStatus;
-    unsigned RequestorMode, Flags, Cancel;
+    unsigned RequestorMode, Flags;
     MDL *MdlAddress;
     void *UserBuffer;
     IO_STACK_LOCATION Stack[2];
@@ -68,50 +58,35 @@ struct _IRP {
     PVOID Context;
 };
 static DEVICE_OBJECT lower;
-static unsigned calls, completions, allocations, frees, deny_allocation;
-static unsigned physical_charges, request_charges;
-static ULONGLONG charged_reads, charged_writes;
-static unsigned raise_copy;
-static unsigned locks, references, dereferences, hold_completions;
-static PIRP pending[2];
-static unsigned pending_count;
-static void (*wait_action)(void);
-static NTSTATUS lower_result = STATUS_PENDING;
+static unsigned state_identity, file_identity;
+static unsigned calls, completions, allocations, frees, deny_allocation, raise_copy;
+static unsigned references, dereferences, obligations, hold_completion, physical_charges, request_charges;
+static BOOLEAN observed_valid, observed_available;
+static UCHAR selected_action = 2;
+static NTSTATUS selected_status = STATUS_INVALID_PARAMETER;
+static BOOLEAN query_admitted = TRUE;
 static unsigned long long pool[4];
 static IO_STACK_LOCATION *IoGetCurrentIrpStackLocation(PIRP irp) { return &irp->Stack[0]; }
 static IO_STACK_LOCATION *IoGetNextIrpStackLocation(PIRP irp) { return &irp->Stack[1]; }
 static void IoMarkIrpPending(PIRP irp) { irp->Stack[0].Control |= 1; }
 static void IoCopyCurrentIrpStackLocationToNext(PIRP irp) { irp->Stack[1] = irp->Stack[0]; irp->Stack[1].Control = 0; }
 static ULONG MmGetMdlByteCount(MDL *mdl) { return mdl->ByteCount; }
-static VOID KeInitializeSpinLock(KSPIN_LOCK *lock) { *lock = 0; }
-static VOID KeAcquireSpinLock(KSPIN_LOCK *lock, KIRQL *irql) { (void)lock; assert(locks == 0); ++locks; *irql = 0; }
-static VOID KeReleaseSpinLock(KSPIN_LOCK *lock, KIRQL irql) { (void)lock; (void)irql; assert(locks == 1); --locks; }
-static VOID KeInitializeEvent(KEVENT *event, unsigned type, unsigned state) { assert(type == NotificationEvent); event->Signaled = state; }
-static VOID KeClearEvent(KEVENT *event) { event->Signaled = 0; }
-static LONG KeSetEvent(KEVENT *event, unsigned increment, unsigned wait) { assert(increment == 0 && !wait); event->Signaled = 1; return 0; }
-static NTSTATUS KeWaitForSingleObject(KEVENT *event, unsigned reason, unsigned mode, unsigned alertable, void *timeout) {
-    assert(locks == 0 && reason == Executive && mode == KernelMode && !alertable && timeout == NULL);
-    if (!event->Signaled && wait_action != NULL) { wait_action(); }
-    assert(event->Signaled);
-    return STATUS_SUCCESS;
-}
-static VOID ObReferenceObject(PVOID file) { assert(file != NULL); ++references; }
-static VOID ObDereferenceObject(PVOID file) { assert(file != NULL && locks == 0); ++dereferences; }
+static VOID ObReferenceObject(PVOID file) { assert(file == &file_identity); ++references; }
+static VOID ObDereferenceObject(PVOID file) { assert(file == &file_identity); ++dereferences; }
 static __declspec(noreturn) VOID NTAPI ext4win_paging_ownership_corruption(VOID) { ExitProcess(1); }
 static VOID IoSetCompletionRoutine(PIRP irp, COMPLETION completion, PVOID context, BOOLEAN success, BOOLEAN error, BOOLEAN cancel) {
-    assert(success && error && cancel);
-    irp->Completion = completion; irp->Context = context;
+    assert(success && error && cancel); irp->Completion = completion; irp->Context = context;
 }
-static void IoCompleteRequest(PIRP irp, int increment) { (void)irp; assert(increment == 0); ++completions; }
+static void IoCompleteRequest(PIRP irp, int increment) { assert(irp != NULL && increment == 0); ++completions; }
 static NTSTATUS IoCallDriver(PDEVICE_OBJECT device, PIRP irp) {
-    assert(device == &lower && irp->MdlAddress != NULL);
-    assert(irp->Stack[1].FileObject == NULL);
-    assert(irp->Stack[1].Parameters.Read.ByteOffset.QuadPart == 1048576 + irp->Stack[0].Parameters.Read.ByteOffset.QuadPart);
-    assert(irp->Stack[1].Parameters.Read.Length == irp->Stack[0].Parameters.Read.Length);
+    assert(device == &lower && irp->MdlAddress != NULL && irp->Stack[0].Control == 1);
+    assert(irp->Stack[0].FileObject == &file_identity && irp->Stack[1].FileObject == NULL);
+    assert(irp->Stack[0].Parameters.Read.ByteOffset.QuadPart == 4096);
+    assert(irp->Stack[1].Parameters.Read.ByteOffset.QuadPart == 1052672);
+    assert(irp->Stack[1].Parameters.Read.Length == 4096);
     ++calls;
-    if (hold_completions) { assert(pending_count < 2); pending[pending_count++] = irp; }
-    else { assert(irp->Completion(device, irp, irp->Context) == STATUS_CONTINUE_COMPLETION); }
-    return lower_result;
+    if (!hold_completion) { assert(irp->Completion(device, irp, irp->Context) == STATUS_CONTINUE_COMPLETION); }
+    return STATUS_SUCCESS;
 }
 static __declspec(noinline) void RtlCopyMemory(void *out, const void *input, size_t length) {
     size_t i;
@@ -120,157 +95,90 @@ static __declspec(noinline) void RtlCopyMemory(void *out, const void *input, siz
 }
 static void *ExAllocatePool2(unsigned flags, size_t length, ULONG tag) {
     assert(flags == POOL_FLAG_NON_PAGED && length == sizeof(pool) && tag == 0x50703445UL);
-    ++allocations;
-    return deny_allocation ? NULL : pool;
+    ++allocations; return deny_allocation ? NULL : pool;
 }
 static void ExFreePool(void *value) { assert(value == pool); ++frees; }
-static VOID NTAPI ext4win_account_lower_io(PIRP irp) {
-    assert(irp->Stack[1].FileObject == NULL);
-    ++physical_charges;
-}
+static VOID NTAPI ext4win_account_lower_io(PIRP irp) { assert(irp->Stack[1].FileObject == NULL); ++physical_charges; }
 static VOID NTAPI ext4win_account_paging_io(PIRP irp, ULONGLONG read, ULONGLONG written, ULONG flush) {
     assert(flush == 0);
     assert(read == (irp->Stack[0].MajorFunction == IRP_MJ_READ ? 4096 : 0));
     assert(written == (irp->Stack[0].MajorFunction == IRP_MJ_WRITE ? 4096 : 0));
-    charged_reads += read;
-    charged_writes += written;
     ++request_charges;
+}
+UCHAR NTAPI ext4win_paging_begin(const VOID *state, LONGLONG offset, ULONG length, BOOLEAN valid,
+    BOOLEAN available, NTSTATUS *status, PDEVICE_OBJECT *target, LONGLONG *physical) {
+    assert(state == &state_identity && offset == 4096 && length == 4096);
+    observed_valid = valid; observed_available = available;
+    *status = selected_status;
+    if (selected_action == 2) { *target = &lower; *physical = 1052672; ++obligations; }
+    return selected_action;
+}
+VOID NTAPI ext4win_paging_complete_transfer(const VOID *state) {
+    assert(state == &state_identity && obligations != 0); --obligations;
+}
+BOOLEAN NTAPI ext4win_paging_query_prefix(const VOID *state, LONGLONG requested, LONGLONG *physical) {
+    assert(state == &state_identity && requested == 65536); *physical = 1048576; return query_admitted;
 }
 #include "paging_file.h"
 
-static PEXT4WIN_PAGING_FILE retiring_map;
-static void finish_retirement_work(void) {
-    if (retiring_map->Active == EXT4WIN_PAGING_EXTENDING) {
-        ext4win_paging_abort(retiring_map, TRUE);
-    } else {
-        assert(retiring_map->Active == EXT4WIN_PAGING_RETIRING);
-        while (pending_count != 0) {
-            PIRP irp = pending[--pending_count];
-            assert(irp->Completion(&lower, irp, irp->Context) == STATUS_CONTINUE_COMPLETION);
-        }
-    }
-}
-
 int main(void) {
-    EXT4WIN_PAGING_FILE map = { 0 };
-    MDL mdl = { 4096 };
-    unsigned operation, scenario;
+    IRP irp = {0};
+    MDL mdl = {4096};
     NTSTATUS result;
-    ext4win_paging_initialize(&map);
-    map.Active = EXT4WIN_PAGING_ACTIVE; map.Owner = &map;
-    map.Lower = &lower; map.PhysicalStart = 1048576; map.Length = 65536; map.SectorSize = 512;
-    for (scenario = 0; scenario < 3; ++scenario) {
-    lower_result = scenario == 0 ? STATUS_SUCCESS : scenario == 1 ? STATUS_PENDING : STATUS_DEVICE_NOT_CONNECTED;
-    for (operation = IRP_MJ_READ; operation <= IRP_MJ_WRITE; ++operation) {
-        IRP irp = { 0 };
-        unsigned completed_before = completions;
-        irp.RequestorMode = KernelMode;
-        irp.Flags = IRP_PAGING_IO;
-        irp.Cancel = 1;
-        irp.MdlAddress = &mdl;
-        irp.Stack[0].MajorFunction = (unsigned char)operation;
-        irp.Stack[0].FileObject = &map;
+    unsigned mode;
+    for (mode = 0; mode < 2; ++mode) {
+        irp.RequestorMode = KernelMode; irp.Flags = IRP_PAGING_IO; irp.MdlAddress = &mdl;
+        irp.Stack[0].MajorFunction = mode ? IRP_MJ_WRITE : IRP_MJ_READ;
+        irp.Stack[0].FileObject = &file_identity;
+        irp.Stack[0].Parameters.Read.ByteOffset.QuadPart = 4096;
         irp.Stack[0].Parameters.Read.Length = 4096;
-        irp.Stack[0].Parameters.Read.ByteOffset.QuadPart = 61440;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_PENDING && irp.Cancel == 1);
-        assert(irp.Stack[0].Control == 1 && irp.Stack[1].Control == 0);
-        assert(irp.Stack[0].Parameters.Read.ByteOffset.QuadPart == 61440);
-        assert(allocations == 0 && completions == completed_before);
-        irp.Stack[0].Parameters.Read.ByteOffset.QuadPart = 65536;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_INVALID_PARAMETER);
-        irp.Stack[0].Parameters.Read.ByteOffset.QuadPart = 0;
-        assert(ext4win_paging_dispatch(&map, &irp, FALSE, &result));
-        assert(result == STATUS_DEVICE_NOT_CONNECTED);
-        irp.Flags = 0;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_INVALID_PARAMETER);
-        assert(!ext4win_paging_dispatch(NULL, &irp, TRUE, &result));
+        irp.Stack[0].Control = 0;
+        assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+        assert(result == STATUS_PENDING && obligations == 0 && references == dereferences);
+        assert(observed_valid && observed_available && allocations == 0);
     }
-    }
-    assert(calls == 6 && allocations == 0);
-    assert(physical_charges == 6 && request_charges == 6);
-    assert(charged_reads == 12288 && charged_writes == 12288);
+    assert(calls == 2 && physical_charges == 2 && request_charges == 2);
+    hold_completion = 1; irp.Stack[0].Control = 0;
+    assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+    assert(result == STATUS_PENDING && obligations == 1 && references == dereferences + 1);
+    assert(irp.Completion(&lower, &irp, irp.Context) == STATUS_CONTINUE_COMPLETION);
+    assert(obligations == 0 && references == dereferences);
+    selected_action = 0;
+    assert(!ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+    assert(references == dereferences && calls == 3);
+    selected_action = 1; irp.MdlAddress = NULL;
+    assert(ext4win_paging_dispatch(&state_identity, &irp, FALSE, &result));
+    assert(result == STATUS_INVALID_PARAMETER && !observed_valid && !observed_available);
+    assert(references == dereferences && calls == 3);
     {
-        IRP irp = { 0 };
-        LONGLONG requested = 32768;
+        LARGE_INTEGER requested = {65536};
         EXT4WIN_PAGING_MAPPING_PAIR *returned = NULL;
-        irp.RequestorMode = KernelMode;
-        irp.UserBuffer = &returned;
         irp.Stack[0].MajorFunction = IRP_MJ_FILE_SYSTEM_CONTROL;
         irp.Stack[0].Parameters.FileSystemControl.FsControlCode = FSCTL_QUERY_RETRIEVAL_POINTERS;
-        irp.Stack[0].Parameters.FileSystemControl.InputBufferLength = sizeof(LARGE_INTEGER);
-        irp.Stack[0].Parameters.FileSystemControl.OutputBufferLength = sizeof(void *);
+        irp.Stack[0].Parameters.FileSystemControl.InputBufferLength = sizeof(requested);
+        irp.Stack[0].Parameters.FileSystemControl.OutputBufferLength = sizeof(returned);
         irp.Stack[0].Parameters.FileSystemControl.Type3InputBuffer = &requested;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_SUCCESS && returned != NULL);
-        assert(returned[0].Length == requested && returned[0].PhysicalStart == 1048576);
+        irp.UserBuffer = &returned;
+        assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+        assert(result == STATUS_SUCCESS && returned == (PVOID)pool && irp.IoStatus.Information == 0);
+        assert(returned[0].Length == 65536 && returned[0].PhysicalStart == 1048576);
         assert(returned[1].Length == 0 && returned[1].PhysicalStart == 0);
-        assert(irp.IoStatus.Information == 0 && frees == 0);
         ExFreePool(returned);
-        requested = 65537;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
+        query_admitted = FALSE;
+        assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
         assert(result == STATUS_INVALID_PARAMETER && allocations == 1);
-        requested = 0;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_INVALID_PARAMETER && allocations == 1);
-        requested = 65536;
-        deny_allocation = 1;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_INSUFFICIENT_RESOURCES && allocations == 2 && frees == 1);
-        irp.RequestorMode = UserMode;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_INVALID_PARAMETER && allocations == 2);
-        irp.RequestorMode = KernelMode;
-        deny_allocation = 0;
-        raise_copy = 1;
-        assert(ext4win_paging_dispatch(&map, &irp, TRUE, &result));
-        assert(result == STATUS_ACCESS_VIOLATION && allocations == 2 && frees == 1);
-    }
-    {
-        EXT4WIN_PAGING_FILE setup = { 0 };
-        LONGLONG physical, length;
-        IRP first = { 0 }, second = { 0 };
-        ext4win_paging_initialize(&setup);
-        assert(ext4win_paging_reserve(&setup, &setup, FALSE, &physical, &length) == STATUS_SUCCESS);
-        assert(setup.Active == EXT4WIN_PAGING_PREPARING && physical == 0 && length == 0);
-        assert(ext4win_paging_reserve(&setup, &setup, FALSE, &physical, &length) == STATUS_SHARING_VIOLATION);
-        ext4win_paging_abort(&setup, FALSE);
-        assert(setup.Active == EXT4WIN_PAGING_VACANT && setup.Owner == NULL);
-        assert(ext4win_paging_reserve(&setup, &setup, FALSE, &physical, &length) == STATUS_SUCCESS);
-        assert(ext4win_paging_activate(&setup, FALSE, &lower, 1048576, 65536, 512) == STATUS_SUCCESS);
-        assert(ext4win_paging_reserve(&setup, &setup, TRUE, &physical, &length) == STATUS_SUCCESS);
-        assert(physical == 1048576 && length == 65536);
-        assert(ext4win_paging_activate(&setup, TRUE, &lower, 2097152, 131072, 512) == STATUS_INVALID_PARAMETER);
-        assert(ext4win_paging_activate(&setup, TRUE, &lower, 1048576, 131072, 512) == STATUS_SUCCESS);
-        assert(setup.Length == 131072);
-        assert(ext4win_paging_mutation_allowed(&setup, FALSE, 0, 131072));
-        assert(ext4win_paging_mutation_allowed(&setup, FALSE, 126976, 131072));
-        assert(ext4win_paging_mutation_allowed(&setup, FALSE, 131072, 131072));
-        assert(!ext4win_paging_mutation_allowed(&setup, FALSE, 0, 0));
-        assert(!ext4win_paging_mutation_allowed(&setup, FALSE, -1, 131072));
-        assert(!ext4win_paging_mutation_allowed(&setup, FALSE, 135168, 135168));
-        assert(!ext4win_paging_mutation_allowed(&setup, TRUE, 0, 0));
-        assert(setup.Length == 131072);
-        hold_completions = 1;
-        first.RequestorMode = KernelMode; first.Flags = IRP_PAGING_IO; first.MdlAddress = &mdl;
-        first.Stack[0].MajorFunction = IRP_MJ_WRITE; first.Stack[0].FileObject = &setup;
-        first.Stack[0].Parameters.Read.Length = 4096;
-        second = first; second.Stack[0].MajorFunction = IRP_MJ_READ;
-        assert(ext4win_paging_dispatch(&setup, &first, TRUE, &result));
-        assert(ext4win_paging_dispatch(&setup, &second, TRUE, &result));
-        assert(setup.InFlight == 2 && !setup.Idle.Signaled && references == dereferences + 2);
-        assert(ext4win_paging_reserve(&setup, &setup, TRUE, &physical, &length) == STATUS_SUCCESS);
-        ext4win_paging_retire(&setup, &lower);
-        assert(setup.Active == EXT4WIN_PAGING_EXTENDING);
-        retiring_map = &setup; wait_action = finish_retirement_work;
-        ext4win_paging_retire(&setup, &setup);
-        assert(setup.Active == EXT4WIN_PAGING_RETIRED && setup.InFlight == 0);
-        assert(setup.Idle.Signaled && references == dereferences && pending_count == 0);
-        assert(ext4win_paging_dispatch(&setup, &first, TRUE, &result));
-        assert(result == STATUS_FILE_CLOSED && references == dereferences);
-        assert(allocations == 2 && locks == 0);
+        query_admitted = TRUE; deny_allocation = TRUE;
+        assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+        assert(result == STATUS_INSUFFICIENT_RESOURCES);
+        deny_allocation = FALSE; raise_copy = TRUE;
+        assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+        assert(result == STATUS_ACCESS_VIOLATION && allocations == 2);
+        raise_copy = FALSE; irp.UserBuffer = (PVOID)1;
+        assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+        assert(result == STATUS_ACCESS_VIOLATION && allocations == 3 && frees == 2);
+        irp.UserBuffer = &returned; irp.RequestorMode = UserMode;
+        assert(ext4win_paging_dispatch(&state_identity, &irp, TRUE, &result));
+        assert(result == STATUS_INVALID_PARAMETER && allocations == 3);
     }
     return 0;
 }

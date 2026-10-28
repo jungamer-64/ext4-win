@@ -20,7 +20,7 @@ ext4win_stream_cache_initialize(
     if (!ext4win_stream_matches_file_object(stream, file_object)) {
         return STATUS_INVALID_PARAMETER;
     }
-    if (stream->PagingFile.Active != EXT4WIN_PAGING_VACANT) { return STATUS_INVALID_DEVICE_REQUEST; }
+    if (ext4win_paging_is_special(stream->PagingState)) { return STATUS_INVALID_DEVICE_REQUEST; }
     if (!ext4win_stream_ordinary_io_available(stream)) {
         if (ext4win_storage_verify_required(stream->VolumeStream->RustState)) {
             *verify_before_entry = 1;

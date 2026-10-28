@@ -83,21 +83,26 @@ const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
         "ext4win_stream_set_namespace_query_fallback",
     ),
     ("native stream destruction", "ext4win_stream_destroy"),
+    ("paging-file transfer admission", "ext4win_paging_begin"),
     (
-        "paging-file setup reservation",
-        "ext4win_stream_reserve_paging_file",
+        "paging-file transfer completion ownership",
+        "ext4win_paging_complete_transfer",
     ),
     (
-        "paging-file setup rollback",
-        "ext4win_stream_abort_paging_file",
-    ),
-    (
-        "paging-file fixed-map activation",
-        "ext4win_stream_activate_paging_file",
+        "paging-file native header publication",
+        "ext4win_stream_mark_paging_file",
     ),
     (
         "paging-file allocation ownership",
-        "ext4win_stream_is_paging_file",
+        "ext4win_paging_is_special",
+    ),
+    (
+        "paging-file acknowledged prefix query",
+        "ext4win_paging_query_prefix",
+    ),
+    (
+        "paging-file owner retirement",
+        "ext4win_paging_retire_owner",
     ),
     (
         "allocation-free paging-file dispatch",
@@ -2457,10 +2462,12 @@ mod tests {
              ext4win_stream_publish_metadata\n\
              ext4win_stream_set_namespace_query_fallback\n\
              ext4win_stream_destroy\n\
-             ext4win_stream_reserve_paging_file\n\
-             ext4win_stream_abort_paging_file\n\
-             ext4win_stream_activate_paging_file\n\
-             ext4win_stream_is_paging_file\n\
+             ext4win_paging_begin\n\
+             ext4win_paging_complete_transfer\n\
+             ext4win_stream_mark_paging_file\n\
+             ext4win_paging_is_special\n\
+             ext4win_paging_query_prefix\n\
+             ext4win_paging_retire_owner\n\
              ext4win_stream_paging_file_dispatch\n\
              ext4win_stream_cache_initialize\n\
              ext4win_cc_copy_read\n\

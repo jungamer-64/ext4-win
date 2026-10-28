@@ -513,7 +513,7 @@ pub(crate) struct StreamCacheLease {
 #[derive(Debug)]
 pub(crate) struct PagingFileSetupLease {
     /// Drops native reservation before releasing the deferred stream owner below.
-    native: crate::kernel::stream::PagingFileReservation,
+    native: crate::kernel::paging_file::PagingFileReservation,
     /// Explicit nonpaged FCB lifetime through activation, abort, or checkpoint failure.
     stream: StreamCacheLease,
 }
@@ -524,7 +524,7 @@ impl PagingFileSetupLease {
         self.stream.stream().paging_storage()
     }
     /// Returns the fixed old prefix whose direct paging I/O remains admitted during extension.
-    pub(crate) const fn claim(&self) -> crate::kernel::stream::PagingFileClaim {
+    pub(crate) const fn claim(&self) -> crate::kernel::paging_file::PagingFileClaim {
         self.native.claim()
     }
 
@@ -546,7 +546,11 @@ impl PagingFileSetupLease {
         storage: ext4_core::ContiguousFileStorage,
         route: crate::kernel::storage::MountedStorageRoute,
     ) -> DriverResult<()> {
-        self.native.activate(storage, route)?;
+        self.native.activate(
+            storage,
+            route.filesystem_control_device(),
+            route.filesystem_sector_size(),
+        )?;
         self.stream.stream().publish_paging_storage(storage);
         Ok(())
     }

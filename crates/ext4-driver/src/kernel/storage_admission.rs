@@ -154,6 +154,27 @@ impl StorageAdmission {
         }
     }
 
+    /// Ordinary native transfers require verified media and open filesystem admission.
+    pub(super) fn ordinary_io_admitted(&self, write: bool) -> bool {
+        self.media() == MediaState::Present
+            && self.close() == ClosePhase::Open
+            && !self.verification_required()
+            && self.reliability.policy().permits(write)
+    }
+
+    /// Paging may drain during terminal writeback, independently from ordinary verification.
+    pub(super) fn paging_io_admitted(&self, write: bool) -> bool {
+        self.media() == MediaState::Present
+            && self.close() != ClosePhase::Sealed
+            && self.reliability.policy().permits(write)
+    }
+
+    /// Private copy-on-write sections do not acquire backing-file write authority.
+    pub(super) fn section_admitted(&self, writable_data: bool, protection: u32) -> bool {
+        let write = protection & (wdk_sys::PAGE_READWRITE | wdk_sys::PAGE_EXECUTE_READWRITE) != 0;
+        self.ordinary_io_admitted(write) && (!write || writable_data)
+    }
+
     /// Creates require every independent gate to admit them.
     pub(super) fn creates_admitted(&self) -> bool {
         self.media() == MediaState::Present
@@ -291,6 +312,88 @@ unsafe extern "system" fn ext4win_storage_media_state(state: *const StorageAdmis
     state.media() as u8
 }
 
+/// Observes media presence without exposing its representation to native policy code.
+/// # Safety
+/// The enclosing volume retains `state` throughout this callback.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "native callbacks borrow the retained volume admission allocation"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_storage_present(state: *const StorageAdmission) -> u8 {
+    // SAFETY: The native volume retains this allocation through the call.
+    u8::from(unsafe { &*state }.media() == MediaState::Present)
+}
+
+/// Selects ordinary cache admission from the sole Rust policy owner.
+/// # Safety
+/// The enclosing volume retains `state` throughout this callback.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "native callbacks borrow the retained volume admission allocation"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_storage_ordinary_io(state: *const StorageAdmission) -> u8 {
+    // SAFETY: The native volume retains this allocation through the call.
+    u8::from(unsafe { &*state }.ordinary_io_admitted(false))
+}
+
+/// Selects backing-file section authority after native resource acquisition.
+/// # Safety
+/// The enclosing volume retains `state`; `writable_data` is its committed inode observation.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "native callbacks lend immutable policy and inode observations"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_storage_section_io(
+    state: *const StorageAdmission,
+    writable_data: u8,
+    protection: u32,
+) -> u8 {
+    // SAFETY: The native volume retains this allocation through the call.
+    u8::from(unsafe { &*state }.section_admitted(writable_data != 0, protection))
+}
+
+/// Selects direct paging admission without exposing phase encodings to C.
+/// # Safety
+/// The enclosing volume retains `state` throughout this callback.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "native dispatch borrows the retained volume admission allocation"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_storage_paging_io(
+    state: *const StorageAdmission,
+    write: u8,
+) -> u8 {
+    // SAFETY: The native volume retains this allocation through the call.
+    u8::from(unsafe { &*state }.paging_io_admitted(write != 0))
+}
+
+/// Returns a cached-I/O observation with physical verification folded into Rust policy.
+/// # Safety
+/// The enclosing volume retains `state` throughout this callback.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "native dispatch borrows the retained volume admission allocation"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_storage_cached_policy(state: *const StorageAdmission) -> u8 {
+    // SAFETY: The native volume retains this allocation through the call.
+    let state = unsafe { &*state };
+    if state.verification_required() {
+        super::io_reliability::NativeIoPolicy::Unavailable.raw()
+    } else {
+        state.reliability.policy().raw()
+    }
+}
+
 /// Native callbacks borrow only filesystem admission observation.
 /// # Safety
 /// `state` must be the volume's live admission allocation retained by its VCB.
@@ -348,6 +451,48 @@ mod tests {
     use super::*;
 
     /// # Errors
+    /// Returns allocation or retained-observation budget failure.
+    /// # Panics
+    /// Fails if native admission bypasses inode protection, terminal close or reliability.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture setup precedes native admission assertions"
+    )]
+    fn native_io_classes_share_volume_policy_and_keep_writeback_independent()
+    -> crate::kernel::status::DriverResult<()> {
+        use crate::kernel::io_reliability::{IoReliabilityOwner, NativeIoPolicy};
+        let mut owner = IoReliabilityOwner::try_new()?;
+        let state = StorageAdmission::new(owner.observe()?);
+        assert!(state.section_admitted(true, wdk_sys::PAGE_READWRITE));
+        assert!(!state.section_admitted(false, wdk_sys::PAGE_READWRITE));
+        assert!(!state.section_admitted(false, wdk_sys::PAGE_EXECUTE_READWRITE));
+        assert!(state.section_admitted(false, wdk_sys::PAGE_READONLY));
+        assert!(state.section_admitted(false, wdk_sys::PAGE_WRITECOPY));
+        assert!(state.section_admitted(false, wdk_sys::PAGE_EXECUTE_WRITECOPY));
+        owner.publish(NativeIoPolicy::ReadOnly, None);
+        assert!(state.ordinary_io_admitted(false));
+        assert!(!state.ordinary_io_admitted(true));
+        assert!(!state.section_admitted(true, wdk_sys::PAGE_READWRITE));
+        assert!(state.section_admitted(false, wdk_sys::PAGE_WRITECOPY));
+        assert!(state.paging_io_admitted(false));
+        assert!(!state.paging_io_admitted(true));
+        owner.publish(NativeIoPolicy::Unavailable, None);
+        assert!(!state.section_admitted(true, wdk_sys::PAGE_READONLY));
+        assert!(!state.paging_io_admitted(false));
+        owner.publish(NativeIoPolicy::ReadWrite, None);
+        assert!(state.begin_close());
+        assert!(!state.ordinary_io_admitted(false));
+        assert!(state.paging_io_admitted(true));
+        state.seal_close();
+        assert!(!state.paging_io_admitted(false));
+        state.remove(MediaState::SurpriseRemoved);
+        assert!(!state.ordinary_io_admitted(false));
+        assert!(!state.paging_io_admitted(true));
+        Ok(())
+    }
+
+    /// # Errors
     /// Returns fixture retention or native-observation allocation failure.
     /// # Panics
     /// Fails if physical verification bypasses create gating or restores failed runtime health.
@@ -377,10 +522,13 @@ mod tests {
         )?;
         assert!(state.verification_required());
         assert!(!state.creates_admitted());
+        assert!(!state.ordinary_io_admitted(false));
+        assert!(!state.section_admitted(true, wdk_sys::PAGE_READWRITE));
         assert!(state.reliability.policy().permits(true));
         super::super::volume_verify::acknowledge(device);
         assert!(!state.verification_required());
         assert!(state.creates_admitted());
+        assert!(state.ordinary_io_admitted(true));
         reliability.publish(NativeIoPolicy::Unavailable, None);
         super::super::volume_verify::acknowledge(device);
         assert!(!state.reliability.policy().permits(false));

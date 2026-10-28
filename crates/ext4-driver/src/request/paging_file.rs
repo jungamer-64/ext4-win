@@ -56,7 +56,7 @@ impl PagingInitialization {
         if logical_size > target {
             return Err(DriverError::InvalidParameter);
         }
-        if matches!(lease.claim(), crate::kernel::stream::PagingFileClaim::Extension { length, .. }
+        if matches!(lease.claim(), crate::kernel::paging_file::PagingFileClaim::Extension { length, .. }
             if current.bytes() < length.bytes())
         {
             return Err(DriverError::InternalInvariantViolation);
@@ -111,7 +111,7 @@ impl PagingInitialization {
         {
             storage = mutation.set_contiguous_file_eof(selected, self.logical_size, storage)?;
         }
-        if let crate::kernel::stream::PagingFileClaim::Extension { physical, .. } =
+        if let crate::kernel::paging_file::PagingFileClaim::Extension { physical, .. } =
             self.lease.claim()
             && physical != storage.physical()
         {

@@ -92,25 +92,47 @@ impl PreparedClusterControl {
     ) -> DriverResult<Self> {
         #[cfg(not(test))]
         {
-            let mut file = core::ptr::null_mut();
+            let mut handle = core::ptr::null_mut();
             let (mut vcn, mut lcn) = (0, 0);
             let (mut count, mut source_info, mut flags, mut granted) = (0, 0, 0, 0);
             let status = unsafe {
                 // SAFETY: Capture runs synchronously in the requestor process. Outputs are uniquely
-                // borrowed stack storage; a successful native call transfers its object reference.
+                // borrowed stack storage; the captured handle is not used outside this dispatch context.
                 ffi::ext4win_capture_cluster_control(
                     target.irp.as_ptr(),
-                    &raw mut file,
+                    &raw mut handle,
                     &raw mut vcn,
                     &raw mut lcn,
                     &raw mut count,
                     &raw mut source_info,
                     &raw mut flags,
-                    &raw mut granted,
                 )
             };
             if status < wdk_sys::STATUS_SUCCESS {
                 return Err(DriverError::ClusterControlCaptureFailed(status));
+            }
+            let protect = match code {
+                super::super::super::FsControlCode::MarkHandle => {
+                    mark_protection(source_info, flags)?
+                }
+                super::super::super::FsControlCode::MoveFile => false,
+                _ => return Err(DriverError::InvalidDeviceRequest),
+            };
+            let mut file = core::ptr::null_mut();
+            if !handle.is_null() {
+                let status = unsafe {
+                    // SAFETY: This call remains on the captured IRP's original requestor thread;
+                    // Rust admitted the complete semantics before acquiring an object reference.
+                    ffi::ext4win_reference_cluster_file(
+                        handle,
+                        target.requestor_mode(),
+                        &raw mut file,
+                        &raw mut granted,
+                    )
+                };
+                if status < wdk_sys::STATUS_SUCCESS {
+                    return Err(DriverError::ClusterControlCaptureFailed(status));
+                }
             }
             let file = unsafe {
                 // SAFETY: Success transferred the reference; a null identity means optional MARK volume.
@@ -127,7 +149,7 @@ impl PreparedClusterControl {
                 }),
                 super::super::super::FsControlCode::MarkHandle => Ok(Self::Mark {
                     volume: file,
-                    protect: flags == 1,
+                    protect,
                 }),
                 _ => Err(DriverError::InvalidDeviceRequest),
             }
@@ -137,5 +159,34 @@ impl PreparedClusterControl {
             let _input = (target, code);
             Err(DriverError::NotSupported)
         }
+    }
+}
+
+/// Selects supported marking semantics independently from ABI capture and handle retention.
+/// # Errors
+/// Returns unsupported for source annotations or flags without an implemented filesystem effect.
+fn mark_protection(source_info: u32, flags: u32) -> DriverResult<bool> {
+    if source_info != 0 || flags & !wdk_sys::MARK_HANDLE_PROTECT_CLUSTERS != 0 {
+        return Err(DriverError::NotSupported);
+    }
+    Ok(flags & wdk_sys::MARK_HANDLE_PROTECT_CLUSTERS != 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails if unsupported marking semantics become a silent no-op.
+    #[test]
+    fn supported_marking_requires_complete_semantic_admission() {
+        assert_eq!(mark_protection(0, 0), Ok(false));
+        assert_eq!(
+            mark_protection(0, wdk_sys::MARK_HANDLE_PROTECT_CLUSTERS),
+            Ok(true)
+        );
+        assert_eq!(mark_protection(1, 0), Err(DriverError::NotSupported));
+        assert_eq!(mark_protection(0, 2), Err(DriverError::NotSupported));
+        assert_eq!(mark_protection(0, u32::MAX), Err(DriverError::NotSupported));
     }
 }

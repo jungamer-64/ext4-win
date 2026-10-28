@@ -22,6 +22,7 @@ __declspec(dllimport) void * __cdecl memcpy(void *, const void *, size_t);
 #define RtlCopyMemory(target, source, width) copy_bytes((target), (source), (width))
 #define UlongToHandle(value) ((HANDLE)(uintptr_t)(value))
 typedef int NTSTATUS;
+typedef unsigned char KPROCESSOR_MODE;
 typedef unsigned ULONG, *PULONG, ACCESS_MASK, *PACCESS_MASK;
 typedef unsigned long long ULONGLONG, *PULONGLONG;
 typedef void *PVOID, *HANDLE;
@@ -72,6 +73,7 @@ int main(void)
     IRP irp = {0};
     unsigned char input[32] = {0};
     PFILE_OBJECT file;
+    HANDLE handle;
     ULONGLONG vcn, lcn;
     ULONG count, source, flags;
     ACCESS_MASK granted;
@@ -87,15 +89,17 @@ int main(void)
         irp.stack.Parameters.FileSystemControl.FsControlCode = FSCTL_MOVE_FILE;
         irp.stack.Parameters.FileSystemControl.InputBufferLength = 32;
         put32(input, 0, 0x44); put32(input, 8, 7); put32(input, 16, 109); put32(input, 24, 3);
-        assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_SUCCESS);
-        assert(file == &object && vcn == 7 && lcn == 109 && count == 3 && granted == 0x123);
+        assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_SUCCESS);
+        assert(handle == (HANDLE)(uintptr_t)0x44 && vcn == 7 && lcn == 109 && count == 3);
+        assert(ext4win_reference_cluster_file(handle, irp.RequestorMode, &file, &granted) == STATUS_SUCCESS);
+        assert(file == &object && granted == 0x123);
         irp.stack.Parameters.FileSystemControl.InputBufferLength = 31;
-        assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_BUFFER_TOO_SMALL);
+        assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_BUFFER_TOO_SMALL);
         irp.stack.Parameters.FileSystemControl.InputBufferLength = 32;
         put32(input, 12, 0x80000000U);
-        assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_INVALID_PARAMETER);
+        assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_INVALID_PARAMETER);
         put32(input, 12, 0); put32(input, 24, 0);
-        assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_INVALID_PARAMETER);
+        assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_INVALID_PARAMETER);
     }
     for (mode = 0; mode < 2; mode++) {
         unsigned i, before;
@@ -104,19 +108,20 @@ int main(void)
         irp.stack.Parameters.FileSystemControl.FsControlCode = FSCTL_MARK_HANDLE;
         irp.stack.Parameters.FileSystemControl.InputBufferLength = mode ? 12 : 24;
         put32(input, mode ? 4 : 8, 0x44); put32(input, mode ? 8 : 16, 1);
-        assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_SUCCESS);
-        assert(file == &object && source == 0 && flags == 1);
+        assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_SUCCESS);
+        assert(handle == (HANDLE)(uintptr_t)0x44 && source == 0 && flags == 1);
         put32(input, mode ? 4 : 8, 0);
         before = references;
-        assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_SUCCESS);
-        assert(file == NULL && references == before);
+        assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_SUCCESS);
+        assert(handle == NULL && references == before);
         put32(input, 0, 1);
-        assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_NOT_SUPPORTED);
+        assert(ext4win_capture_cluster_control(&irp, &handle, &vcn, &lcn, &count, &source, &flags) == STATUS_SUCCESS);
+        assert(source == 1);
         assert(references == before);
     }
     reference_status = STATUS_ACCESS_DENIED;
     put32(input, 0, 0); put32(input, 4, 0x44);
-    assert(ext4win_capture_cluster_control(&irp, &file, &vcn, &lcn, &count, &source, &flags, &granted) == STATUS_ACCESS_DENIED);
+    assert(ext4win_reference_cluster_file((HANDLE)(uintptr_t)0x44, irp.RequestorMode, &file, &granted) == STATUS_ACCESS_DENIED);
     assert(file == NULL);
     ExitProcess(0);
 }

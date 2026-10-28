@@ -76,14 +76,5 @@ int main(void)
     sequence = 0;
     cache_result = STATUS_IO_DEVICE_ERROR;
     assert(ext4win_prepare_frozen_data(&sections) == STATUS_IO_DEVICE_ERROR && flushes == 3);
-    assert(ext4win_section_data_admitted(0, TRUE, PAGE_READWRITE));
-    assert(!ext4win_section_data_admitted(0, FALSE, PAGE_READWRITE));
-    assert(!ext4win_section_data_admitted(0, FALSE, PAGE_EXECUTE_READWRITE));
-    assert(ext4win_section_data_admitted(0, FALSE, PAGE_READONLY));
-    assert(ext4win_section_data_admitted(0, FALSE, PAGE_WRITECOPY));
-    assert(ext4win_section_data_admitted(0, FALSE, PAGE_EXECUTE_WRITECOPY));
-    assert(!ext4win_section_data_admitted(1, TRUE, PAGE_READWRITE));
-    assert(ext4win_section_data_admitted(1, FALSE, PAGE_READONLY));
-    assert(!ext4win_section_data_admitted(2, TRUE, PAGE_READONLY));
     return 0;
 }

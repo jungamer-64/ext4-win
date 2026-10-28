@@ -150,7 +150,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     if is_msvc_frontend {
         native.flag("/kernel").flag("/W4").flag("/WX");
 
-        if !is_clang_cl {
+        if is_clang_cl {
+            // Native SEH must catch hardware faults in requestor-memory accesses as well as calls.
+            native.flag("/EHa");
+        } else {
             // MSVC can suppress diagnostics originating in angle-bracket WDK/system
             // headers while preserving /W4 /WX for repository-owned native sources.
             native

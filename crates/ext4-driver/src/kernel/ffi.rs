@@ -351,17 +351,36 @@ unsafe extern "system" {
         value: *mut i64,
     ) -> wdk_sys::NTSTATUS;
 
-    /// Snapshots buffered cluster controls and references an embedded handle in requestor context.
+    /// Snapshots buffered cluster-control ABI fields without acquiring object authority.
     pub(crate) fn ext4win_capture_cluster_control(
         irp: wdk_sys::PIRP,
-        file: *mut wdk_sys::PFILE_OBJECT,
+        handle: *mut wdk_sys::HANDLE,
         vcn: *mut u64,
         lcn: *mut u64,
         count: *mut u32,
         source_info: *mut u32,
         flags: *mut u32,
+    ) -> wdk_sys::NTSTATUS;
+
+    /// Resolves an admitted embedded handle before leaving its original requestor context.
+    pub(crate) fn ext4win_reference_cluster_file(
+        handle: wdk_sys::HANDLE,
+        mode: wdk_sys::KPROCESSOR_MODE,
+        file: *mut wdk_sys::PFILE_OBJECT,
         granted: *mut u32,
     ) -> wdk_sys::NTSTATUS;
+
+    /// Borrows one coherent native size tuple under the retained header mutex.
+    pub(crate) fn ext4win_stream_get_sizes(
+        header: *mut core::ffi::c_void,
+        allocation: *mut i64,
+        eof: *mut i64,
+        valid: *mut i64,
+        charge: *mut i64,
+    ) -> wdk_sys::NTSTATUS;
+
+    /// Projects an activated paging map into the native advanced-header flags.
+    pub(crate) fn ext4win_stream_mark_paging_file(header: *mut core::ffi::c_void);
 
     /// Locks a bounded writable requestor prefix as an opaque owning native target.
     pub(crate) fn ext4win_capture_requestor_output(

@@ -1,5 +1,7 @@
 //! Fast I/O admission and fixed metadata records. Native code owns resource/SEH operations.
 
+use super::io_reliability::NativeIoPolicy;
+
 #[cfg(not(test))]
 use wdk_sys::{PDEVICE_OBJECT, PFILE_OBJECT, PIO_STATUS_BLOCK, PLARGE_INTEGER};
 
@@ -63,7 +65,7 @@ fn cached_transfer_admitted(
     policy: u8,
 ) -> bool {
     media == 0
-        && policy < 2
+        && NativeIoPolicy::from_raw(policy).permits(false)
         && close == 0
         && mutation == 0
         && cached != 0
@@ -101,7 +103,7 @@ fn metadata_query_admitted(
     policy: u8,
 ) -> bool {
     media == 0
-        && policy < 2
+        && NativeIoPolicy::from_raw(policy).permits(false)
         && mutation == 0
         && read_access != 0
         && fast_possible != 0
@@ -136,9 +138,9 @@ extern "system" fn ext4win_fast_io_query_admit(
 /// Independent inode and volume facts govern acceptance of cached data.
 fn data_transfer_admitted(policy: u8, writable_data: u8, archive: u8, read: bool) -> bool {
     if read {
-        policy < 2
+        NativeIoPolicy::from_raw(policy).permits(false)
     } else {
-        policy == 0 && writable_data != 0 && archive != 0
+        NativeIoPolicy::from_raw(policy).permits(true) && writable_data != 0 && archive != 0
     }
 }
 

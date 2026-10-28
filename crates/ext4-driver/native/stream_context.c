@@ -31,6 +31,11 @@ extern UCHAR NTAPI ext4win_storage_media_state(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_close_phase(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_io_policy(_In_ const VOID *state);
 extern UCHAR NTAPI ext4win_storage_verify_required(_In_ const VOID *state);
+extern BOOLEAN NTAPI ext4win_storage_present(const VOID *state);
+extern BOOLEAN NTAPI ext4win_storage_ordinary_io(const VOID *state);
+extern BOOLEAN NTAPI ext4win_storage_section_io(const VOID *state, BOOLEAN writable, ULONG protection);
+extern BOOLEAN NTAPI ext4win_storage_paging_io(const VOID *state, BOOLEAN write);
+extern UCHAR NTAPI ext4win_storage_cached_policy(const VOID *state);
 extern NTSTATUS NTAPI ext4win_prepare_mdl_completion(_In_ const VOID *queue, _In_ PFILE_OBJECT file_object);
 
 typedef struct _EXT4WIN_PUBLISHED_STREAM_METADATA {
@@ -100,7 +105,8 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     BOOLEAN PagingResourceInitialized;
     BOOLEAN HeaderInitialized;
     BOOLEAN OplockInitialized;
-    EXT4WIN_PAGING_FILE PagingFile;
+    /* Rust owns the shared paging lifecycle and acknowledged physical map. */
+    PVOID PagingState;
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 
 C_ASSERT(FIELD_OFFSET(EXT4WIN_STREAM_CONTEXT, Header) == 0);
@@ -173,7 +179,7 @@ static BOOLEAN
 ext4win_stream_storage_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
-    return (volume != NULL) && (ext4win_storage_media_state(volume->RustState) == 0);
+    return (volume != NULL) && ext4win_storage_present(volume->RustState);
 }
 
 BOOLEAN NTAPI
@@ -185,12 +191,19 @@ ext4win_stream_paging_file_dispatch(PIRP irp, NTSTATUS *status_out)
     BOOLEAN available;
     if (stream != NULL && stream->Kind != 1) { stream = NULL; }
     available = stream != NULL && stream->VolumeStream != NULL &&
-        ext4win_stream_storage_available(stream) &&
-        ext4win_storage_close_phase(stream->VolumeStream->RustState) < 2 &&
-        ext4win_storage_io_policy(stream->VolumeStream->RustState) <
-            (stack->MajorFunction == IRP_MJ_WRITE ? 1 : 2);
-    return ext4win_paging_dispatch(stream == NULL ? NULL : &stream->PagingFile, irp,
+        ext4win_storage_paging_io(stream->VolumeStream->RustState,
+            stack->MajorFunction == IRP_MJ_WRITE);
+    return ext4win_paging_dispatch(stream == NULL ? NULL : stream->PagingState, irp,
         available, status_out);
+}
+
+/* The Rust activation owner has already validated EOF and consumed setup authority. */
+VOID NTAPI ext4win_stream_mark_paging_file(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    stream->Header.Flags2 &= (UCHAR)~FSRTL_FLAG2_SUPPORTS_FILTER_CONTEXTS;
+    stream->Header.Flags2 |= FSRTL_FLAG2_IS_PAGING_FILE;
+    stream->Header.IsFastIoPossible = FastIoIsNotPossible;
 }
 
 /* Cache/Fast I/O authority is independent from lower storage presence. */
@@ -198,10 +211,7 @@ static BOOLEAN
 ext4win_stream_ordinary_io_available(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
-    return ext4win_stream_storage_available(stream)
-        && !ext4win_storage_verify_required(volume->RustState)
-        && (ext4win_storage_close_phase(volume->RustState) == 0)
-        && (ext4win_storage_io_policy(volume->RustState) < 2);
+    return volume != NULL && ext4win_storage_ordinary_io(volume->RustState);
 }
 
 /* Only the coherent committed inode projection determines data protection. */
@@ -222,9 +232,8 @@ static BOOLEAN
 ext4win_stream_section_io_available(PEXT4WIN_STREAM_CONTEXT stream, ULONG protection)
 {
     PEXT4WIN_STREAM_CONTEXT volume = (stream->Kind == 2) ? stream : stream->VolumeStream;
-    return ext4win_stream_ordinary_io_available(stream)
-        && ext4win_section_data_admitted(ext4win_storage_io_policy(volume->RustState),
-            ext4win_stream_data_writable(&stream->Header), protection);
+    return volume != NULL && ext4win_storage_section_io(volume->RustState,
+        ext4win_stream_data_writable(&stream->Header), protection);
 }
 
 static BOOLEAN
@@ -364,7 +373,7 @@ ext4win_stream_section_callback_stream(
 static VOID
 ext4win_stream_refresh_fast_io_projection(_In_ PEXT4WIN_STREAM_CONTEXT stream)
 {
-    if ((stream == NULL) || (stream->PagingFile.Active != EXT4WIN_PAGING_VACANT) || (stream->ByteRangeLocks == NULL) ||
+    if ((stream == NULL) || ext4win_paging_is_special(stream->PagingState) || (stream->ByteRangeLocks == NULL) ||
         !FsRtlOplockIsFastIoPossible(&stream->Header.Oplock)) {
         if (stream != NULL) {
             stream->Header.IsFastIoPossible = FastIoIsNotPossible;
@@ -402,6 +411,7 @@ ext4win_stream_create(
     _In_ REGHANDLE trace_registration_handle,
     _In_ PVOID rust_state,
     _In_ const VOID *section_state,
+    _In_opt_ PVOID paging_state,
     _Outptr_ PVOID *stream_header_out)
 {
     PEXT4WIN_STREAM_CONTEXT stream;
@@ -413,7 +423,8 @@ ext4win_stream_create(
     }
     *stream_header_out = NULL;
     metadata_valid = FALSE;
-    if ((rust_state == NULL) || (section_state == NULL) || ((kind != 1) && (kind != 2))) {
+    if ((rust_state == NULL) || (section_state == NULL) || ((kind != 1) && (kind != 2)) ||
+        ((kind == 1) != (paging_state != NULL))) {
         return STATUS_INVALID_PARAMETER;
     }
     if ((kind == 2) && (metadata != NULL)) {
@@ -436,7 +447,7 @@ ext4win_stream_create(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     RtlZeroMemory(stream, sizeof(*stream));
-    ext4win_paging_initialize(&stream->PagingFile);
+    stream->PagingState = paging_state;
     stream->TraceRegistrationHandle = trace_registration_handle;
     stream->RustState = rust_state;
     stream->SectionState = section_state;
@@ -1019,7 +1030,7 @@ ext4win_stream_cache_uninitialize(
     if (!ext4win_stream_matches_file_object(stream, file_object)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ext4win_paging_retire(&stream->PagingFile, file_object);
+    ext4win_paging_retire_owner(stream->PagingState, file_object);
     status = STATUS_SUCCESS;
     __try {
         (VOID)CcUninitializeCacheMap(file_object, NULL, NULL);
@@ -1657,7 +1668,7 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     output->Mutation = (UCHAR)ext4win_section_phase(stream->SectionState);
     output->ReadAccess = file->ReadAccess;
     output->WriteAccess = file->WriteAccess;
-    output->Policy = ext4win_storage_verify_required(volume->RustState) ? 2 : ext4win_storage_io_policy(stream->VolumeStream->RustState);
+    output->Policy = ext4win_storage_cached_policy(volume->RustState);
     return TRUE;
 }
 

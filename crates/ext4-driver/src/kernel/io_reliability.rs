@@ -18,6 +18,14 @@ pub(crate) enum NativeIoPolicy {
 }
 
 impl NativeIoPolicy {
+    /// Decodes the native observation, rejecting unknown representations conservatively.
+    pub(super) const fn from_raw(value: u8) -> Self {
+        match value {
+            0 => Self::ReadWrite,
+            1 => Self::ReadOnly,
+            _ => Self::Unavailable,
+        }
+    }
     /// One scalar snapshot decides a callback's read and write permissions together.
     pub(crate) const fn permits(self, write: bool) -> bool {
         match self {
