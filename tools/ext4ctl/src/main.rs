@@ -4,6 +4,7 @@ use std::process::ExitCode;
 /// Resolves parsed updates against one observed policy before acquiring persistence authority.
 /// # Errors
 /// Rejects recovery options on RW and memory budgets outside the memory recovery mode.
+#[cfg(any(windows, test))]
 fn replace_policy_fields(
     observed: ext4_core::MountAccess,
     access: Option<ext4_control::AccessMode>,
