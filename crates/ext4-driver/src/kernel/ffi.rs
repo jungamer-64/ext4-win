@@ -210,6 +210,16 @@ unsafe extern "system" {
     ) -> wdk_sys::NTSTATUS;
     /// Consumes the subject; raised-IRQL cancellation defers token retirement to its retained worker.
     pub(crate) fn ext4win_subject_release(subject: wdk_sys::PVOID);
+    /// Captures notification traversal authority on the original dispatch thread.
+    pub(crate) fn ext4win_notification_subject_capture(
+        device: wdk_sys::PDEVICE_OBJECT,
+        mode: wdk_sys::KPROCESSOR_MODE,
+        output: *mut wdk_sys::PVOID,
+    ) -> wdk_sys::NTSTATUS;
+    /// Consumes a captured subject and transfers its token/pool ownership to FsRtl.
+    pub(crate) fn ext4win_subject_transfer_notification(
+        subject: wdk_sys::PVOID,
+    ) -> *mut wdk_sys::SECURITY_SUBJECT_CONTEXT;
     /// Checks target attribute rights against the retained effective subject at PASSIVE_LEVEL.
     pub(crate) fn ext4win_subject_write_attributes(
         subject: wdk_sys::PVOID,
@@ -310,6 +320,7 @@ unsafe extern "system" {
         filter: u32,
         subtree: u8,
         irp: wdk_sys::PIRP,
+        subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
     );
 
     /// Reports a borrowed name synchronously under a saved/restored completion marker.
@@ -321,7 +332,14 @@ unsafe extern "system" {
         name_offset: u16,
         filter: u32,
         action: u32,
+        traversal: *const core::ffi::c_void,
     );
+
+    /// Checks one aligned descriptor against the callback's already-locked captured subject.
+    pub(crate) fn ext4win_notification_check_traverse(
+        subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
+        descriptor: wdk_sys::PSECURITY_DESCRIPTOR,
+    ) -> u8;
 
     /// Completes watches for a live CCB context under a saved/restored completion marker.
     /// The sync/list must remain initialized and pinned through completion.

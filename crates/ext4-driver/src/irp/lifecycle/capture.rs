@@ -69,8 +69,8 @@ pub(crate) enum PreparedEaSelection {
 pub(crate) enum PreparedDirectoryControl {
     /// Query-directory request with an owned filename pattern.
     QueryDirectory(PreparedQueryDirectory),
-    /// Standard directory-change notification.
-    NotifyChangeDirectory,
+    /// Standard change notification retaining the original subject's traversal authority.
+    NotifyChangeDirectory(crate::kernel::requestor_subject::NotificationSubject),
 }
 
 /// Complete QueryDirectory payload sealed at queue entry.
@@ -1273,7 +1273,15 @@ impl PreparedRequest {
                         stack
                             .notify_directory()
                             .map_err(IrpCompletion::from_error)?;
-                        Self::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory)
+                        let subject =
+                            crate::kernel::requestor_subject::NotificationSubject::capture(
+                                target.device(),
+                                target.requestor_mode(),
+                            )
+                            .map_err(IrpCompletion::from_error)?;
+                        Self::DirectoryControl(PreparedDirectoryControl::NotifyChangeDirectory(
+                            subject,
+                        ))
                     }
                     DirectoryControlMinorFunction::NotifyChangeDirectoryEx => {
                         let information_class = stack

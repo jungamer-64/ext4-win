@@ -1,8 +1,75 @@
-//! Request-owned effective token context for rename target attribute authorization.
+//! Effective requestor tokens retained through queued authorization or FsRtl watch ownership.
 
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::security_descriptor::SecurityDescriptorRef;
 use crate::state::KernelDevice;
+
+/// Traversal authority captured on the requesting thread before notification queueing.
+#[derive(Debug)]
+pub(crate) enum NotificationSubject {
+    /// The original subject has traversal bypass authority.
+    Bypass,
+    /// Tokens remain owned through cancellation or consuming FsRtl registration.
+    Traverse(RequestorSubject),
+}
+
+impl NotificationSubject {
+    /// Captures traversal bypass or the effective subject before leaving requestor context.
+    /// # Errors
+    /// Returns native IRQL/allocation failure; host fixtures cannot fabricate token authority.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "native capture interprets the original effective token before queue publication"
+        )
+    )]
+    pub(crate) fn capture(
+        device: KernelDevice,
+        mode: wdk_sys::KPROCESSOR_MODE,
+    ) -> DriverResult<Self> {
+        #[cfg(not(test))]
+        {
+            let mut native = core::ptr::null_mut();
+            let status = unsafe {
+                // SAFETY: Original dispatch retains the device and this output during capture.
+                super::ffi::ext4win_notification_subject_capture(device.as_ptr(), mode, &mut native)
+            };
+            if status < 0 {
+                return Err(DriverError::SecurityCheckFailed(status));
+            }
+            Ok(match core::ptr::NonNull::new(native) {
+                Some(native) => Self::Traverse(RequestorSubject { native }),
+                None => Self::Bypass,
+            })
+        }
+        #[cfg(test)]
+        {
+            core::hint::black_box((device, mode));
+            Err(DriverError::NotSupported)
+        }
+    }
+
+    /// Transfers the captured tokens and matching pool allocation to FsRtl at PASSIVE_LEVEL.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "consuming notification authority withdraws Rust cleanup before FsRtl can complete synchronously"
+    )]
+    pub(crate) fn into_fsrtl(self) -> *mut wdk_sys::SECURITY_SUBJECT_CONTEXT {
+        match self {
+            Self::Bypass => core::ptr::null_mut(),
+            Self::Traverse(subject) => {
+                let subject = core::mem::ManuallyDrop::new(subject);
+                unsafe {
+                    // SAFETY: This consumes the sole native owner; C removes its worker and
+                    // returns the allocation prefix that FsRtl releases and pool-frees once.
+                    super::ffi::ext4win_subject_transfer_notification(subject.native.as_ptr())
+                }
+            }
+        }
+    }
+}
 
 /// The original requestor's token references, retained until authorization or cancellation.
 /// Native release owns a device-referenced work item when cancellation runs above PASSIVE_LEVEL.

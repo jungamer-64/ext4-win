@@ -3,7 +3,7 @@
 use super::*;
 
 /// One validated directory-notification registration owned by a FILE_OBJECT.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub(crate) struct DirectoryNotificationRegistration {
     /// Stable CCB-owned `UNICODE_STRING` retained by FsRtl until cleanup.
     full_directory_name: NonNull<UNICODE_STRING>,
@@ -13,6 +13,8 @@ pub(crate) struct DirectoryNotificationRegistration {
     subtree: bool,
     /// Supported Windows completion-filter bits.
     completion_filter: wdk_sys::ULONG,
+    /// Original requestor authority, consumed only at FsRtl registration.
+    subject: crate::kernel::requestor_subject::NotificationSubject,
 }
 
 impl DirectoryNotificationRegistration {
@@ -22,12 +24,14 @@ impl DirectoryNotificationRegistration {
         context: NonNull<c_void>,
         completion_filter: wdk_sys::ULONG,
         subtree: bool,
+        subject: crate::kernel::requestor_subject::NotificationSubject,
     ) -> Self {
         Self {
             full_directory_name,
             context,
             completion_filter,
             subtree,
+            subject,
         }
     }
 }
@@ -65,8 +69,8 @@ impl DirectoryChangeAction {
 pub(crate) struct DirectoryChange {
     /// Removing-link data admitted before staging and cached only after durable publication.
     pub(super) tunnel: Option<Box<crate::kernel::name_tunnel::TunnelRemoval>>,
-    /// Full synthetic target name used only by the FsRtl notifier package.
-    pub(super) targets: DriverVec<DirectoryNotificationTarget>,
+    /// Anchored names and crossed-directory access projections prepared together.
+    path: DirectoryNotificationPath,
     /// FILE_NOTIFY_CHANGE_FILE_NAME or FILE_NOTIFY_CHANGE_DIR_NAME.
     pub(super) completion_filter: wdk_sys::ULONG,
     /// FILE_ACTION_* payload written to matching watcher buffers.
@@ -107,6 +111,7 @@ impl DirectoryChange {
     /// Returns an encoding, length, or allocation error while preparing the notification payload.
     pub(crate) fn new(
         read: &mut impl ext4_core::CommittedReadPass,
+        mapping: &ext4_security::IdentityMap,
         parent: DirectoryNodeId,
         name: &Ext4Name,
         node: NodeId,
@@ -118,7 +123,7 @@ impl DirectoryChange {
             wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME
         };
         Ok(Self {
-            targets: DirectoryNotificationTarget::ancestors(read, parent, name)?,
+            path: DirectoryNotificationPath::prepare(read, mapping, parent, name)?,
             tunnel: None,
             completion_filter,
             action,
@@ -130,12 +135,13 @@ impl DirectoryChange {
     /// Returns ancestry, encoding or allocation failure before any media write.
     pub(crate) fn modified(
         read: &mut impl ext4_core::CommittedReadPass,
+        mapping: &ext4_security::IdentityMap,
         parent: DirectoryNodeId,
         name: &Ext4Name,
         filter: u32,
     ) -> DriverResult<Self> {
         Ok(Self {
-            targets: DirectoryNotificationTarget::ancestors(read, parent, name)?,
+            path: DirectoryNotificationPath::prepare(read, mapping, parent, name)?,
             tunnel: None,
             completion_filter: filter,
             action: DirectoryChangeAction::Modified,
@@ -148,6 +154,7 @@ impl DirectoryChange {
     /// Returns an encoding, length, or allocation error while preparing the notification payload.
     pub(crate) fn hard_link_replaced(
         read: &mut impl ext4_core::CommittedReadPass,
+        mapping: &ext4_security::IdentityMap,
         parent: DirectoryNodeId,
         name: &Ext4Name,
     ) -> DriverResult<Self> {
@@ -159,7 +166,7 @@ impl DirectoryChange {
             | wdk_sys::FILE_NOTIFY_CHANGE_SECURITY
             | wdk_sys::FILE_NOTIFY_CHANGE_EA;
         Ok(Self {
-            targets: DirectoryNotificationTarget::ancestors(read, parent, name)?,
+            path: DirectoryNotificationPath::prepare(read, mapping, parent, name)?,
             tunnel: None,
             completion_filter: FILTER,
             action: DirectoryChangeAction::Modified,
@@ -315,6 +322,7 @@ impl DirectoryChangeNotifier {
                     registration.completion_filter,
                     u8::from(registration.subtree),
                     target.into_raw_irp(),
+                    registration.subject.into_fsrtl(),
                 );
             }
             STATUS_PENDING
@@ -326,6 +334,7 @@ impl DirectoryChangeNotifier {
                 context,
                 completion_filter,
                 subtree,
+                subject,
             } = registration;
             core::hint::black_box((
                 target,
@@ -333,6 +342,7 @@ impl DirectoryChangeNotifier {
                 context,
                 completion_filter,
                 subtree,
+                subject,
             ));
             STATUS_SUCCESS
         }
@@ -352,7 +362,7 @@ impl DirectoryChangeNotifier {
             if !self.initialized {
                 return;
             }
-            for target in change.targets.iter() {
+            change.path.for_each(|target, traversal| {
                 let mut full_target_name = target.unicode_string();
                 let native = self.native.get();
                 let sync = unsafe {
@@ -375,20 +385,22 @@ impl DirectoryChangeNotifier {
                         target.name_offset_bytes,
                         change.completion_filter,
                         change.action.as_ulong(),
+                        core::ptr::from_ref(&traversal).cast(),
                     );
                 }
-            }
+            });
         }
         #[cfg(test)]
         {
-            for target in change.targets.iter() {
+            change.path.for_each(|target, traversal| {
                 core::hint::black_box((
                     target.unicode_string(),
                     target.name_offset_bytes,
                     change.completion_filter,
                     change.action.as_ulong(),
+                    traversal,
                 ));
-            }
+            });
         }
     }
 
@@ -571,43 +583,127 @@ pub(super) struct DirectoryNotificationTarget {
     pub(super) name_offset_bytes: u16,
 }
 
-impl DirectoryNotificationTarget {
+/// Each enclosing watch anchor adds the directory crossed below it. Descriptors and names
+/// are built under one committed read pass and identity snapshot before durable publication.
+#[derive(Debug)]
+struct DirectoryNotificationPath {
+    /// Immediate-parent event requires no traversal beyond its opened directory.
+    direct: DirectoryNotificationTarget,
+    /// Nearest-parent first; prefixes determine traversal to each outer anchor.
+    ancestors: DriverVec<DirectoryNotificationAncestor>,
+}
+
+/// One enclosing anchor and the directory newly crossed to reach the change.
+#[derive(Debug)]
+struct DirectoryNotificationAncestor {
+    /// Synthetic name for this exact watched-directory identity.
+    target: DirectoryNotificationTarget,
+    /// Complete aligned projection of the crossed directory's access policy.
+    descriptor: ext4_security::Descriptor,
+}
+
+impl DirectoryNotificationPath {
     /// Prepares one anchored path for each ancestor before mutation publication.
     /// Synthetic roots identify watched directories by inode, so moving a directory never
     /// invalidates an outstanding watch. Each suffix is the actual relative Windows path.
     /// # Errors
     /// Returns cyclic/malformed ancestry, encoding, length or allocation failures.
-    fn ancestors(
+    fn prepare(
         read: &mut impl ext4_core::CommittedReadPass,
+        mapping: &ext4_security::IdentityMap,
         mut parent: DirectoryNodeId,
         name: &Ext4Name,
-    ) -> DriverResult<DriverVec<Self>> {
+    ) -> DriverResult<Self> {
         let mut components = DriverVec::new();
         components
             .try_push_owned(WindowsName::from_ext4(name)?)
             .map_err(|error| error.into_parts().0)?;
         let mut visited = DriverVec::new();
-        let mut targets = DriverVec::new();
-        loop {
+        let direct = DirectoryNotificationTarget::from_components(parent, components.as_slice())?;
+        let mut ancestors = DriverVec::new();
+        while parent != DirectoryNodeId::ROOT {
             if visited.as_slice().contains(&parent) {
                 return Err(ext4_core::Error::InvalidDirectoryEntry.into());
             }
             visited.try_push(parent)?;
-            targets
-                .try_push_owned(Self::from_components(parent, components.as_slice())?)
-                .map_err(|error| error.into_parts().0)?;
-            if parent == DirectoryNodeId::ROOT {
-                break;
-            }
+            let access = read.load_access(NodeId::Directory(parent))?;
+            let descriptor =
+                ext4_security::Descriptor::for_request(&access, mapping, wdk_sys::FILE_TRAVERSE)?;
             let link = crate::namespace::directory_parent(read, parent)?;
             components
                 .try_push_owned(link.name)
                 .map_err(|error| error.into_parts().0)?;
             parent = link.directory;
+            ancestors
+                .try_push_owned(DirectoryNotificationAncestor {
+                    target: DirectoryNotificationTarget::from_components(
+                        parent,
+                        components.as_slice(),
+                    )?,
+                    descriptor,
+                })
+                .map_err(|error| error.into_parts().0)?;
         }
-        Ok(targets)
+        Ok(Self { direct, ancestors })
     }
 
+    /// Lends only complete path prefixes for synchronous native reporting.
+    fn for_each(
+        &self,
+        mut report: impl FnMut(&DirectoryNotificationTarget, NotificationTraversal<'_>),
+    ) {
+        report(&self.direct, NotificationTraversal { ancestors: &[] });
+        let mut prefix = self.ancestors.as_slice();
+        while let Some((last, preceding)) = prefix.split_last() {
+            report(&last.target, NotificationTraversal { ancestors: prefix });
+            prefix = preceding;
+        }
+    }
+}
+
+/// Immutable descriptors for the exact synthetic watch anchor currently being reported.
+#[derive(Debug)]
+struct NotificationTraversal<'a> {
+    /// Crossed directories, excluding the directory whose handle owns the watch.
+    ancestors: &'a [DirectoryNotificationAncestor],
+}
+
+impl NotificationTraversal<'_> {
+    /// Every crossed directory must grant traversal to the same captured subject.
+    fn permits(&self, mut check: impl FnMut(&ext4_security::Descriptor) -> bool) -> bool {
+        self.ancestors
+            .iter()
+            .all(|ancestor| check(&ancestor.descriptor))
+    }
+}
+
+/// Evaluates prepared access projections while C holds the original token lock.
+/// # Safety
+/// C lends the live report-local traversal and an already-locked FsRtl-owned subject.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "FsRtl invokes this callback synchronously while both borrowed inputs remain live"
+)]
+#[unsafe(no_mangle)]
+unsafe extern "system" fn ext4win_notification_traverse(
+    target: *const NotificationTraversal<'_>,
+    subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
+) -> u8 {
+    let traversal = unsafe {
+        // SAFETY: C passes the borrowed report-local traversal unchanged.
+        &*target
+    };
+    u8::from(traversal.permits(|descriptor| unsafe {
+        // SAFETY: RTL built this aligned immutable image; C retains and locks subject.
+        ffi::ext4win_notification_check_traverse(
+            subject,
+            descriptor.bytes().as_ptr().cast_mut().cast(),
+        ) != 0
+    }))
+}
+
+impl DirectoryNotificationTarget {
     /// Encodes an inode anchor followed by leaf-to-root input components in path order.
     /// # Errors
     /// Rejects empty paths, counted-string overflow or allocation failure.
