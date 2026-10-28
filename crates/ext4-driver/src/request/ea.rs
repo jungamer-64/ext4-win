@@ -14,8 +14,6 @@ use super::DriverMutationPass;
 
 /// One atomic Windows EA set; names are payload bytes, independent of xattr naming limits.
 const EA_XATTR_NAME: &[u8] = b"ext4win.eas";
-/// Reserved public EA-name prefix that would collide with ext4win metadata.
-const RESERVED_EA_NAME_PREFIX: &[u8] = b"ext4win.";
 /// Bytes before `EaName` in `FILE_FULL_EA_INFORMATION`.
 const FILE_FULL_EA_NAME_OFFSET: usize = 8;
 /// Bytes before `EaName` in `FILE_GET_EA_INFORMATION`.
@@ -35,7 +33,7 @@ pub(crate) fn information_size(
 }
 
 /// Windows charges one list header and packed attributes without `NextEntryOffset` or padding.
-/// Only the Windows EA namespace contributes; borrowed name/value validation avoids payload copies.
+/// Only records in the persisted Windows EA set contribute to this charge.
 /// # Errors
 ///
 /// Rejects malformed stored Windows EA names/values or a charge exceeding its 32-bit wire domain.
@@ -232,8 +230,7 @@ impl WindowsEaName {
     /// Validates and stores a Windows EA name.
     /// # Errors
     ///
-    /// Returns an error when the EA name is empty, contains Windows-prohibited characters, uses the reserved ext4win prefix,
-    /// or exceeds the one-byte FILE_FULL_EA_INFORMATION name length.
+    /// Rejects empty names, Windows-prohibited bytes, or names exceeding 254 bytes.
     fn new(name: &[u8]) -> DriverResult<Self> {
         Self::validate(name)?;
         let mut bytes = DriverVec::try_copied_from_slice(name)?;
@@ -243,7 +240,7 @@ impl WindowsEaName {
 
     /// Checks stored or caller EA name bytes without copying their payload.
     /// # Errors
-    /// Returns invalid-EA-name for prohibited bytes, the reserved prefix, or a wire-length overflow.
+    /// Returns invalid-EA-name for prohibited bytes or a wire-length overflow.
     fn validate(name: &[u8]) -> DriverResult<()> {
         if name.is_empty()
             || name.iter().any(|byte| {
@@ -267,13 +264,6 @@ impl WindowsEaName {
                             | b';'
                     )
             })
-        {
-            return Err(DriverError::InvalidEaName);
-        }
-        if name.len() >= RESERVED_EA_NAME_PREFIX.len()
-            && name
-                .get(..RESERVED_EA_NAME_PREFIX.len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_EA_NAME_PREFIX))
         {
             return Err(DriverError::InvalidEaName);
         }
@@ -592,6 +582,9 @@ fn stored_eas(xattrs: &ext4_core::XattrSet) -> DriverResult<DriverVec<WindowsEaR
             return Err(DriverError::InvalidWindowsMetadata);
         }
     }
+    if encode_eas(entries.as_slice())?.as_slice() != value.bytes() {
+        return Err(DriverError::InvalidWindowsMetadata);
+    }
     Ok(entries)
 }
 
@@ -749,9 +742,9 @@ fn requested_eas(
     }
 }
 
-/// Immutable full-EA buffer admitted by the I/O Manager format validator.
+/// Immutable full-EA record decoder; request admission and canonical storage have distinct checks.
 struct FullEaList<'a> {
-    /// Only this stable snapshot may be decoded after native validation.
+    /// Stable snapshot remains immutable through interpretation and any canonical storage check.
     bytes: &'a [u8],
 }
 impl<'a> FullEaList<'a> {
@@ -1365,10 +1358,8 @@ mod tests {
             WindowsEaName::new(b"has\0nul"),
             Err(DriverError::InvalidEaName)
         );
-        assert_eq!(
-            WindowsEaName::new(b"ext4win.attributes"),
-            Err(DriverError::InvalidEaName)
-        );
+        assert!(WindowsEaName::new(b"ext4win.attributes").is_ok());
+        assert!(WindowsEaName::new(b"ext4win.eas").is_ok());
     }
 
     /// # Panics
@@ -1491,6 +1482,31 @@ mod contracts {
             );
             assert_eq!(authorize_knowledge(stored.as_slice(), false), Ok(()));
             assert_eq!(information_size_from_xattrs(&xattrs)?, 268);
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
+
+    /// # Panics
+    /// Fails if malformed persisted offsets, terminators or noncanonical names become admitted EAs.
+    #[test]
+    fn persisted_ea_set_requires_canonical_record_bytes() {
+        let result = (|| -> DriverResult<()> {
+            let record = WindowsEaRecord::from_wire(0, b"ALPHA", b"one")?;
+            let bytes = encode_eas(&[record])?;
+            for (offset, replacement) in [(8, b'a'), (13, b'x')] {
+                let mut changed = DriverVec::try_copied_from_slice(bytes.as_slice())?;
+                *changed
+                    .as_mut_slice()
+                    .get_mut(offset)
+                    .ok_or(DriverError::InternalInvariantViolation)? = replacement;
+                let mut xattrs = ext4_core::XattrSet::empty();
+                xattrs.insert(ea_storage_name()?, XattrValue::new(changed.as_slice())?)?;
+                assert_eq!(
+                    stored_eas(&xattrs),
+                    Err(DriverError::InvalidWindowsMetadata)
+                );
+            }
             Ok(())
         })();
         assert_eq!(result, Ok(()));
