@@ -14,52 +14,81 @@ $arguments = @{
     Day = [datetime]::Today.AddDays(1).DayOfWeek
     At = '12:34'
 }
+$service = New-Object -ComObject 'Schedule.Service'
+$service.Connect()
 
 function Assert-TaskContract(
     [xml]$Document,
     [System.DayOfWeek]$ExpectedDay = $arguments.Day,
     [string]$ExpectedTime = $arguments.At
 ) {
-    $namespace = [System.Xml.XmlNamespaceManager]::new($Document.NameTable)
-    $namespace.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
-    $expected = @{
-        '/t:Task/t:Principals/t:Principal/t:UserId' = 'S-1-5-18'
-        '/t:Task/t:Principals/t:Principal/t:RunLevel' = 'HighestAvailable'
-        '/t:Task/t:Settings/t:MultipleInstancesPolicy' = 'IgnoreNew'
-        '/t:Task/t:Settings/t:StartWhenAvailable' = 'true'
-        '/t:Task/t:Settings/t:DisallowStartIfOnBatteries' = 'true'
-        '/t:Task/t:Settings/t:StopIfGoingOnBatteries' = 'false'
-        '/t:Task/t:Settings/t:AllowHardTerminate' = 'false'
-        '/t:Task/t:Settings/t:ExecutionTimeLimit' = 'PT0S'
-        '/t:Task/t:Settings/t:Enabled' = 'true'
-        '/t:Task/t:Actions/t:Exec/t:Command' = $executable
-        '/t:Task/t:Actions/t:Exec/t:Arguments' = "trim $($uuid.ToString('D'))"
-        '/t:Task/t:Triggers/t:CalendarTrigger/t:ScheduleByWeek/t:WeeksInterval' = '1'
-        '/t:Task/t:Triggers/t:CalendarTrigger/t:Enabled' = 'true'
+    # Task Scheduler owns XML defaults and account-name normalization.
+    $definition = $service.NewTask(0)
+    $definition.XmlText = $Document.OuterXml
+    $identity = $definition.Principal.UserId
+    if ($identity -notmatch '^S-1-') {
+        $identity = [System.Security.Principal.NTAccount]::new($identity).
+            Translate([System.Security.Principal.SecurityIdentifier]).Value
     }
-    foreach ($path in $expected.Keys) {
-        $node = $Document.SelectSingleNode($path, $namespace)
-        if ($null -eq $node -or $node.InnerText -cne $expected[$path]) {
-            throw "Native task contract failed at $path"
+    if ($definition.Triggers.Count -ne 1 -or $definition.Actions.Count -ne 1) {
+        throw 'The task must contain exactly one weekly trigger and one executable action.'
+    }
+    $trigger = $definition.Triggers.Item(1)
+    $command = $definition.Actions.Item(1)
+    $checks = @{
+        'Principal.UserId' = @($identity, 'S-1-5-18')
+        'Principal.LogonType' = @($definition.Principal.LogonType, 5)
+        'Principal.RunLevel' = @($definition.Principal.RunLevel, 1)
+        'Settings.MultipleInstances' = @($definition.Settings.MultipleInstances, 2)
+        'Settings.StartWhenAvailable' = @($definition.Settings.StartWhenAvailable, $true)
+        'Settings.DisallowStartIfOnBatteries' = @($definition.Settings.DisallowStartIfOnBatteries, $true)
+        'Settings.StopIfGoingOnBatteries' = @($definition.Settings.StopIfGoingOnBatteries, $false)
+        'Settings.AllowHardTerminate' = @($definition.Settings.AllowHardTerminate, $false)
+        'Settings.ExecutionTimeLimit' = @($definition.Settings.ExecutionTimeLimit, 'PT0S')
+        'Settings.Enabled' = @($definition.Settings.Enabled, $true)
+        'Settings.RestartCount' = @($definition.Settings.RestartCount, 0)
+        'Action.Type' = @($command.Type, 0)
+        'Action.Path' = @($command.Path, $executable)
+        'Action.Arguments' = @($command.Arguments, "trim $($uuid.ToString('D'))")
+        'Trigger.Type' = @($trigger.Type, 3)
+        'Trigger.WeeksInterval' = @($trigger.WeeksInterval, 1)
+        'Trigger.Enabled' = @($trigger.Enabled, $true)
+        'Trigger.DaysOfWeek' = @($trigger.DaysOfWeek, (1 -shl [int]$ExpectedDay))
+    }
+    foreach ($field in $checks.Keys) {
+        $actual, $expected = $checks[$field]
+        if ($actual -cne $expected) {
+            throw "Native task contract failed at $field"
         }
     }
-    $start = $Document.SelectSingleNode('/t:Task/t:Triggers/t:CalendarTrigger/t:StartBoundary', $namespace)
-    if ([datetime]::Parse($start.InnerText) -le [datetime]::Now) {
+    $start = [datetime]::Parse($trigger.StartBoundary)
+    if ($start -le [datetime]::Now) {
         throw 'Task registration can start before the explicitly selected future trigger.'
     }
-    if ([datetime]::Parse($start.InnerText).ToString('HH:mm') -ne $ExpectedTime) {
+    if ($start.ToString('HH:mm') -ne $ExpectedTime) {
         throw 'The native trigger does not match the selected local clock time.'
-    }
-    $days = $Document.SelectSingleNode('/t:Task/t:Triggers/t:CalendarTrigger/t:ScheduleByWeek/t:DaysOfWeek', $namespace)
-    if ($days.ChildNodes.Count -ne 1 -or $days.FirstChild.LocalName -ne $ExpectedDay.ToString()) {
-        throw 'The native weekly trigger does not match the selected local day.'
-    }
-    if ($null -ne $Document.SelectSingleNode('/t:Task/t:Settings/t:RestartOnFailure', $namespace)) {
-        throw 'An uncertain TRIM result must not cause automatic failure retries.'
     }
 }
 
-Assert-TaskContract ([xml](& $scriptPath -Action Export @arguments))
+$document = [xml](& $scriptPath -Action Export @arguments)
+Assert-TaskContract $document
+# Omitted defaults and explicitly disabled values must retain their native meaning.
+$namespace = [System.Xml.XmlNamespaceManager]::new($document.NameTable)
+$namespace.AddNamespace('t', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+foreach ($node in @($document.SelectNodes('//t:Enabled', $namespace))) {
+    $null = $node.ParentNode.RemoveChild($node)
+}
+Assert-TaskContract $document
+foreach ($field in @('Settings.Enabled', 'Trigger.Enabled')) {
+    $disabled = $service.NewTask(0)
+    $disabled.XmlText = $document.OuterXml
+    if ($field -eq 'Settings.Enabled') { $disabled.Settings.Enabled = $false }
+    else { $disabled.Triggers.Item(1).Enabled = $false }
+    $rejected = $false
+    try { Assert-TaskContract ([xml]$disabled.XmlText) }
+    catch { $rejected = $_.Exception.Message -ceq "Native task contract failed at $field" }
+    if (-not $rejected) { throw "A disabled native task field was admitted: $field" }
+}
 Assert-TaskContract ([xml](& $scriptPath -Action Export -FilesystemUuid $uuid -Executable $executable)) `
     -ExpectedDay Sunday -ExpectedTime '03:00'
 foreach ($invalid in @('24:00', '12:60', '3:00', '12:34 extra')) {
@@ -71,8 +100,6 @@ foreach ($invalid in @('24:00', '12:60', '3:00', '12:34 extra')) {
 
 if ($Registration) {
     $taskName = "ext4win-TRIM-$($uuid.ToString('D'))"
-    $service = New-Object -ComObject 'Schedule.Service'
-    $service.Connect()
     $folder = $service.GetFolder('\')
     try {
         $registered = & $scriptPath -Action Register @arguments -Confirm:$false
