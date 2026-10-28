@@ -14,7 +14,9 @@ pub(super) fn prepare(
     mutation: &mut crate::request::DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<DriverVec<DirectoryChange>> {
     let node = match request {
-        PreparedMutationRequest::Create { .. } => existing.and_then(|open| open.reset_node()),
+        PreparedMutationRequest::Create { .. } => {
+            existing.and_then(|open| open.reset_target().map(|(node, _)| node))
+        }
         PreparedMutationRequest::DataWrite(
             crate::request::file_info::RegularFileDataAuthority::Paging(lease),
         ) => Some(owned.request().with_active(|active| {
@@ -76,6 +78,36 @@ pub(super) fn prepare(
         }
         NodeId::Directory(_) => {}
         NodeId::File(_) | NodeId::Symlink(_) => {
+            if before_inode.links_count().on_disk_count() == 0 {
+                return Ok(changes);
+            }
+            // A sole validated link identifies the complete notification target without a
+            // filesystem-wide hard-link query. File-id and CCB-less paging retain discovery.
+            if before_inode.links_count().on_disk_count() == 1 {
+                let selected = match request {
+                    PreparedMutationRequest::Create { .. } => existing
+                        .and_then(|open| open.reset_target())
+                        .map(|(_, location)| location.try_to_owned_location())
+                        .transpose()?,
+                    _ => owned.request().with_active(|active| {
+                        let file = active.current_stack()?.file_object()?;
+                        if file.handle_context().is_null() {
+                            return Ok::<_, DriverError>(None);
+                        }
+                        let opened = crate::state::OpenedObject::decode(file)?;
+                        opened.location().try_to_owned_location().map(Some)
+                    })?,
+                };
+                if let Some(crate::state::OpenedLocation::DirectoryEntry { parent, name }) =
+                    selected
+                    && matches!(mutation.lookup_child(parent, &name)?, ext4_core::ChildLookup::Found(child) if *child.node() == node)
+                {
+                    changes
+                        .try_push_owned(DirectoryChange::modified(mutation, parent, &name, filter)?)
+                        .map_err(|error| error.into_parts().0)?;
+                    return Ok(changes);
+                }
+            }
             let target = ext4_core::HardLinkNodeId::try_from(node)?;
             let links = mutation.read_hard_links(target)?;
             for link in links.entries() {

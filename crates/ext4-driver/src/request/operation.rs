@@ -6598,7 +6598,7 @@ impl MutationRequestOperation {
                 let reset_node = if self.paging.is_none() {
                     self.pending_existing_create
                         .as_ref()
-                        .and_then(|pending| pending.reset_node())
+                        .and_then(|pending| pending.reset_target().map(|(node, _)| node))
                 } else {
                     None
                 };

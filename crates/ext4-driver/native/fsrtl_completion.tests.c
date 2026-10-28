@@ -127,7 +127,7 @@ static VOID observe_completion(VOID)
 static VOID invoke(unsigned operation)
 {
     switch (operation) {
-    case 0: ext4win_notify_register(&sync, &list, &context, &name, 0x13, TRUE, &watched_irp); break;
+    case 0: ext4win_notify_register(&sync, &list, &context, &name, 0x13, 1, &watched_irp); break;
     case 1: ext4win_notify_report(&sync, &list, &name, 6, 0x13, 2); break;
     case 2: ext4win_notify_cleanup(&sync, &list, &context); break;
     case 3: ext4win_notify_cleanup_all(&sync, &list); break;

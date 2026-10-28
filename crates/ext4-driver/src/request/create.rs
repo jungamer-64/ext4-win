@@ -1489,10 +1489,10 @@ impl PendingExistingCreateOpen {
         }
     }
 
-    /// Selects the reset whose image and truncation checks share the final size-plan permit.
-    pub(crate) fn reset_node(&self) -> Option<NodeId> {
+    /// Identifies the validated reset and selected link retained across native image and truncation gates.
+    pub(crate) fn reset_target(&self) -> Option<(NodeId, &OpenedLocation)> {
         match self.intent {
-            ExistingCreateIntent::Reset { .. } => Some(self.node),
+            ExistingCreateIntent::Reset { .. } => Some((self.node, &self.validation_location)),
             ExistingCreateIntent::Open(_) => None,
         }
     }
