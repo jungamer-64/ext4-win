@@ -1116,17 +1116,6 @@ impl DirectoryChangeFilter {
         Ok(Self(value))
     }
 
-    /// Returns the filter bits supported by the driver's namespace-only notifier.
-    /// # Errors
-    ///
-    /// Returns an error when the request asks for attribute, data, security, stream, or other
-    /// change kinds that the current notifier cannot report precisely.
-    pub(crate) fn namespace_name_filter(self) -> DriverResult<wdk_sys::ULONG> {
-        if self.0 & !wdk_sys::FILE_NOTIFY_CHANGE_NAME != 0 {
-            return Err(DriverError::NotSupported);
-        }
-        Ok(self.0)
-    }
 }
 
 /// EA entry index selected by a query-EA request.

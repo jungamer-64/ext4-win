@@ -532,42 +532,6 @@ pub(super) struct DirectoryNotificationTarget {
 }
 
 impl DirectoryNotificationTarget {
-    /// Builds one complete target path from a directory entry identity.
-    /// # Errors
-    ///
-    /// Returns an encoding, length, or allocation error before namespace commit can begin.
-    fn new(parent: DirectoryNodeId, name: &Ext4Name) -> DriverResult<Self> {
-        let directory_units = DirectoryNotificationDirectoryName::encode(parent);
-        let name = WindowsName::from_ext4(name)?;
-        let prefix_length = DIRECTORY_NOTIFICATION_DIRECTORY_UNITS
-            .checked_add(1)
-            .ok_or(DriverError::InvalidBufferSize)?;
-        let length = prefix_length
-            .checked_add(name.utf16().len())
-            .ok_or(DriverError::InvalidBufferSize)?;
-        let byte_length = u16::try_from(
-            length
-                .checked_mul(core::mem::size_of::<u16>())
-                .ok_or(DriverError::InvalidBufferSize)?,
-        )
-        .map_err(|_| DriverError::InvalidBufferSize)?;
-        let name_offset_bytes = u16::try_from(
-            prefix_length
-                .checked_mul(core::mem::size_of::<u16>())
-                .ok_or(DriverError::InvalidBufferSize)?,
-        )
-        .map_err(|_| DriverError::InvalidBufferSize)?;
-        let mut units = DriverVec::try_with_capacity(length)?;
-        units.try_extend_from_copy_slice(&directory_units)?;
-        units.try_push(DIRECTORY_NOTIFICATION_SEPARATOR)?;
-        units.try_extend_from_copy_slice(name.utf16())?;
-        Ok(Self {
-            units,
-            byte_length,
-            name_offset_bytes,
-        })
-    }
-
     /// Views this complete target as the layout accepted by FsRtl's PSTRING ABI.
     pub(super) fn unicode_string(&self) -> UNICODE_STRING {
         UNICODE_STRING {
