@@ -7,7 +7,11 @@ use crate::{
 use alloc::collections::BTreeSet;
 #[cfg(windows)]
 use std::{env, process::Command};
-use std::{fs, io, path::Path};
+use std::{fs, io, io::Write as _, path::Path};
+
+/// Input limits belong to the same source compiled into the fuzz harness.
+#[path = "../../../fuzz/limits.rs"]
+mod fuzz_limits;
 
 /// Fetches locked source inputs and runs formatting, checking, tests, and Clippy without
 /// compiling the WDK crate. Source-notice verification also reads the driver's dependencies.
@@ -399,7 +403,7 @@ fn verify_cache_manager(root: &Path) -> TaskResult<()> {
     Ok(())
 }
 
-/// Replays every declared fuzz target against its tracked corpus exactly once.
+/// Replays every declared fuzz target against tracked inputs and an independent full-image seed.
 ///
 /// The target list comes from `cargo fuzz list`; adding a target therefore cannot silently omit
 /// it from the deterministic pull-request gate. The separately pinned cargo-fuzz version remains
@@ -411,6 +415,43 @@ fn verify_cache_manager(root: &Path) -> TaskResult<()> {
 /// target discovery fails, a target name is unsafe as one corpus path component, a corpus is
 /// missing or empty, or a replay exits unsuccessfully.
 pub(crate) fn verify_fuzz_replay(repository_root: &Path) -> TaskResult<()> {
+    run_fuzz(repository_root, FuzzMode::Replay)
+}
+
+/// Runs every discovered target for one bounded mutation campaign.
+/// # Errors
+/// Returns dependency, target discovery, seed construction or fuzz execution failures.
+pub(crate) fn fuzz_campaign(repository_root: &Path) -> TaskResult<()> {
+    run_fuzz(repository_root, FuzzMode::Campaign)
+}
+
+/// Distinct stopping policies for deterministic replay and coverage-guided mutation.
+#[derive(Clone, Copy)]
+enum FuzzMode {
+    /// Execute every initial corpus entry without a mutation campaign.
+    Replay,
+    /// Mutate each target's seeded corpus for five minutes.
+    Campaign,
+}
+
+/// Checks the locked dependency graph before cargo-fuzz can invoke an unlocked child Cargo.
+/// # Errors
+/// Returns an inconsistent lockfile, unavailable dependency source or rejected seed/test result.
+fn run_fuzz(repository_root: &Path, mode: FuzzMode) -> TaskResult<()> {
+    let mut format = cargo_command(repository_root, &["fmt", "--manifest-path"]);
+    format
+        .arg(repository_root.join("fuzz/Cargo.toml"))
+        .args(["--", "--check"]);
+    run_checked(format, "fuzz formatting gate")?;
+    let mut fetch = cargo_command(repository_root, &["fetch", "--locked", "--manifest-path"]);
+    fetch.arg(repository_root.join("fuzz/Cargo.toml"));
+    run_checked(fetch, "locked fuzz dependency source fetch")?;
+    let mut tests = cargo_command(
+        repository_root,
+        &["test", "--locked", "--lib", "--manifest-path"],
+    );
+    tests.arg(repository_root.join("fuzz/Cargo.toml"));
+    run_checked(tests, "independent fuzz seed acceptance")?;
     let required_version = required_cargo_fuzz_version(repository_root)?;
     let version_command = cargo_command(repository_root, &["fuzz", "--version"]);
     let version_output = run_checked_output(version_command, "cargo-fuzz version query")?;
@@ -422,17 +463,83 @@ pub(crate) fn verify_fuzz_replay(repository_root: &Path) -> TaskResult<()> {
     let targets = parse_fuzz_targets(&String::from_utf8(list_output.stdout)?)?;
     #[cfg(windows)]
     let windows_runtime = WindowsFuzzRuntime::discover(repository_root)?;
+    // Corpus discoveries and crash inputs are evidence retained for CI artifact collection.
+    let corpus_root = crate::process::create_task_directory(repository_root, "fuzz-corpus")?;
     for target in targets {
-        let corpus = repository_root.join("fuzz").join("corpus").join(&target);
-        require_nonempty_corpus(&corpus, &target)?;
+        let corpus = corpus_root.join(&target);
+        prepare_fuzz_corpus(repository_root, &target, &corpus)?;
 
         let mut command = cargo_command(repository_root, &["fuzz", "run"]);
-        command.arg(&target).arg(&corpus).args(["--", "-runs=1"]);
+        command
+            .env("CARGO_NET_OFFLINE", "true")
+            .arg(&target)
+            .arg(&corpus)
+            .arg("--")
+            .arg(format!("-max_len={}", fuzz_limits::MAX_INPUT_BYTES));
+        match mode {
+            FuzzMode::Replay => command.arg("-runs=1"),
+            FuzzMode::Campaign => command.arg("-max_total_time=300"),
+        };
         #[cfg(windows)]
         windows_runtime.apply(&mut command);
-        run_checked(command, &format!("{target} tracked-corpus replay"))?;
+        run_checked(command, &format!("{target} seeded fuzz execution"))?;
     }
-    println!("tracked fuzz corpus replay: PASS");
+    println!(
+        "seeded fuzz execution: PASS; corpus={}",
+        corpus_root.display()
+    );
+    Ok(())
+}
+
+/// Combines tracked malformed inputs with an independently generated complete image or pair.
+/// # Errors
+/// Returns missing inputs, an unknown encoding, oversized seeds or file I/O failures.
+fn prepare_fuzz_corpus(root: &Path, target: &str, destination: &Path) -> TaskResult<()> {
+    let tracked = root.join("fuzz/corpus").join(target);
+    require_nonempty_corpus(&tracked, target)?;
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(tracked)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            fs::copy(entry.path(), destination.join(entry.file_name()))?;
+        }
+    }
+    let fixtures = root.join("tools/xtask/fixtures/journal");
+    let filesystem = fs::read(fixtures.join("external-4k-v3-64.filesystem.img"))?;
+    let mut seed = fs::File::create(destination.join("external-journal-image"))?;
+    match target {
+        "mount_image" => {
+            require_fuzz_seed_length(filesystem.len())?;
+            seed.write_all(&filesystem)?;
+        }
+        "journal_recovery" => {
+            let journal = fs::read(fixtures.join("external-4k-v3-64.journal.img"))?;
+            let length = filesystem
+                .len()
+                .checked_add(journal.len())
+                .and_then(|length| length.checked_add(4))
+                .ok_or_else(|| io::Error::other("fuzz seed length overflow"))?;
+            require_fuzz_seed_length(length)?;
+            seed.write_all(&u32::try_from(filesystem.len())?.to_le_bytes())?;
+            seed.write_all(&filesystem)?;
+            seed.write_all(&journal)?;
+        }
+        _ => {
+            return Err(
+                io::Error::other(format!("no independent seed encoding for {target}")).into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Rejects a seed which the harness would discard before observing storage.
+/// # Errors
+/// Returns an error when a seed is empty or exceeds the shared encoded-input budget.
+fn require_fuzz_seed_length(length: usize) -> TaskResult<()> {
+    if length == 0 || length > fuzz_limits::MAX_INPUT_BYTES {
+        return Err(io::Error::other("fuzz seed exceeds the encoded-input policy").into());
+    }
     Ok(())
 }
 
@@ -591,7 +698,19 @@ fn require_nonempty_corpus(corpus: &Path, target: &str) -> TaskResult<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_fuzz_targets, require_cargo_fuzz_version};
+    use super::{
+        fuzz_limits, parse_fuzz_targets, require_cargo_fuzz_version, require_fuzz_seed_length,
+    };
+
+    /// Corpus admission and harness rejection use the same encoded-input byte limit.
+    /// # Panics
+    /// Fails if an empty or oversized seed can be silently discarded by the harness.
+    #[test]
+    fn fuzz_seed_length_uses_the_harness_budget() {
+        assert!(require_fuzz_seed_length(0).is_err());
+        assert!(require_fuzz_seed_length(fuzz_limits::MAX_INPUT_BYTES).is_ok());
+        assert!(require_fuzz_seed_length(fuzz_limits::MAX_INPUT_BYTES.saturating_add(1)).is_err());
+    }
 
     /// Version reports match only the exact pinned cargo-fuzz executable identity.
     ///

@@ -1,6 +1,8 @@
 use crate::{
     TaskResult,
-    development::{verify_driver, verify_fuzz_replay, verify_portable, verify_windows_host},
+    development::{
+        fuzz_campaign, verify_driver, verify_fuzz_replay, verify_portable, verify_windows_host,
+    },
     driver_load::{
         check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload,
         verify_hosted_driver_load,
@@ -30,6 +32,8 @@ enum Task {
     Driver,
     /// Replays every tracked corpus through its declared fuzz target once.
     FuzzReplay,
+    /// Runs bounded mutation campaigns over independently seeded corpora.
+    FuzzCampaign,
     /// Generates Linux JBD2 transactions and verifies core recovery in both directions.
     JournalInterop,
     /// Exercises bounded HTree reads and local updates against fresh ext4 images.
@@ -69,6 +73,8 @@ impl Task {
             Some(Self::Driver)
         } else if argument == "verify-fuzz-replay" {
             Some(Self::FuzzReplay)
+        } else if argument == "fuzz" {
+            Some(Self::FuzzCampaign)
         } else if argument == "verify-journal-interop" {
             Some(Self::JournalInterop)
         } else if argument == "verify-ro-interop" {
@@ -148,6 +154,7 @@ fn execute() -> TaskResult<()> {
         | Task::WindowsHost
         | Task::Driver
         | Task::FuzzReplay
+        | Task::FuzzCampaign
         | Task::JournalInterop
         | Task::HtreeInterop
         | Task::RoInterop
@@ -166,6 +173,7 @@ fn execute() -> TaskResult<()> {
                 Task::WindowsHost => verify_windows_host(&repository_root),
                 Task::Driver => verify_driver(&repository_root),
                 Task::FuzzReplay => verify_fuzz_replay(&repository_root),
+                Task::FuzzCampaign => fuzz_campaign(&repository_root),
                 Task::JournalInterop => verify_journal_interop(&repository_root),
                 Task::HtreeInterop => verify_htree_interop(&repository_root),
                 Task::RoInterop => verify_ro_interop(&repository_root),
@@ -191,7 +199,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -223,6 +231,7 @@ mod tests {
             Task::parse(OsStr::new("verify-fuzz-replay")),
             Some(Task::FuzzReplay)
         );
+        assert_eq!(Task::parse(OsStr::new("fuzz")), Some(Task::FuzzCampaign));
         assert_eq!(
             Task::parse(OsStr::new("verify-journal-interop")),
             Some(Task::JournalInterop)

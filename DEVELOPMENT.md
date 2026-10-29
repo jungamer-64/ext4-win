@@ -17,7 +17,8 @@ compile the driver or require WDK.
 | `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, runs the portable tests and Clippy, and documents the shared ownership and host boundaries. |
 | `cargo xtask verify-windows-host` | Elevated Windows host | Exercises native Windows ETW and token/privilege contracts without installing a driver. |
 | `cargo xtask verify-driver` | Windows with MSVC, WDK, and Clang configured | Checks, tests, lints, and documents the kernel-driver crate and its native boundaries. |
-| `cargo xtask verify-fuzz-replay` | Host with the repository-pinned cargo-fuzz installed | Discovers every declared fuzz target and replays its tracked corpus once under the bounded fuzz harness. |
+| `cargo xtask verify-fuzz-replay` | Pinned cargo-fuzz; Windows also requires MSVC AddressSanitizer libraries and Clang compiler-rt | Checks the locked fuzz dependencies and independent seed acceptance, then replays every target's tracked and generated corpus under the bounded harness. |
+| `cargo xtask fuzz` | Same requirements as fuzz replay | Runs each discovered target for a bounded mutation campaign and retains discoveries under `target/fuzz-corpus`. |
 | `cargo xtask verify-journal-interop` | Native Linux or Windows with WSL; e2fsprogs | Exercises ext4 mutation and recovery against independently generated `debugfs` and `e2fsck` evidence. |
 | `cargo xtask verify-ro-interop` | Native Linux or Windows with WSL; e2fsprogs and Linux root loop-mount authority | Compares RO acceptance, recovery state, orphan cleanup and file observations with native Linux mounts of disposable image copies. |
 | `cargo xtask verify-htree-interop` | Native Linux or Windows with WSL; e2fsprogs and root loop-mount authority | Exercises bounded HTree lookup, paging, and local mutation against independently generated ext4 images. |

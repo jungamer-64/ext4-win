@@ -9,11 +9,12 @@ use ext4_core::{
 };
 use std::boxed::Box;
 
-/// Largest complete input retained by either fuzz target.
-pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+#[path = "../limits.rs"]
+mod limits;
+pub use limits::MAX_INPUT_BYTES;
 
 /// Largest individual lower-storage transfer accepted by the harness.
-const MAX_REQUEST_BYTES: usize = 128 * 1024;
+const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Maximum completion-driven transitions before the harness rejects one input.
 const MAX_STEPS: usize = 4096;
@@ -41,7 +42,9 @@ pub fn assert_deterministic_mount(filesystem: &[u8], external_journal: Option<&[
     for access in [
         ext4_core::MountAccess::ReadWrite,
         ext4_core::MountAccess::ReadOnly {
-            recovery: ext4_core::ReadOnlyRecovery::Memory { limit: ext4_core::RecoveryMemoryLimit::DEFAULT },
+            recovery: ext4_core::ReadOnlyRecovery::Memory {
+                limit: ext4_core::RecoveryMemoryLimit::DEFAULT,
+            },
         },
     ] {
         let first = run_mount(filesystem, external_journal, access);
@@ -191,20 +194,29 @@ fn run_mount(
                 suspended.advance(OperationEvent::StorageCompleted(completion))
             }
             ext4_core::MountProbeTransition::Complete(result) => {
-                prepared = result.ok();
+                match result {
+                    Ok(value) => prepared = Some(value),
+                    Err(_) => return MountOutcome::Rejected,
+                }
                 break;
             }
         };
     }
     let Some(prepared) = prepared else {
-        return MountOutcome::Rejected;
+        return MountOutcome::StepBudgetExhausted;
     };
     let mut millis = 0_u64;
     let now = ext4_core::MmpTime::new(millis, 0);
     let Ok(owner) = ext4_core::MmpOwner::new([0x35; 16]) else {
         return MountOutcome::Rejected;
     };
-    let Ok(operation) = prepared.start(FscryptKeySet::empty(), access, ext4_core::DeviceWriteAccess::Writable, owner, now) else {
+    let Ok(operation) = prepared.start(
+        FscryptKeySet::empty(),
+        access,
+        ext4_core::DeviceWriteAccess::Writable,
+        owner,
+        now,
+    ) else {
         return MountOutcome::Rejected;
     };
     let Ok(operation) = Box::try_new(operation) else {
@@ -243,8 +255,11 @@ fn run_mount(
                             return MountOutcome::StepBudgetExhausted;
                         }
                     };
-                transition = suspended
-                    .attach_external_journal(validated, ext4_core::DeviceWriteAccess::Writable, ext4_core::MmpTime::new(millis, 0));
+                transition = suspended.attach_external_journal(
+                    validated,
+                    ext4_core::DeviceWriteAccess::Writable,
+                    ext4_core::MmpTime::new(millis, 0),
+                );
             }
             MountTransition::WaitForTimer { seconds, suspended } => {
                 millis = millis.saturating_add(u64::from(seconds).saturating_mul(1000));
@@ -291,4 +306,37 @@ fn validate_external_journal(
         }
     }
     ExternalValidation::StepBudgetExhausted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::Path};
+
+    #[test]
+    fn independent_seed_reaches_external_recovery() -> Result<(), Box<dyn std::error::Error>> {
+        let fixtures =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/xtask/fixtures/journal");
+        let filesystem = fs::read(fixtures.join("external-4k-v3-64.filesystem.img"))?;
+        let journal = fs::read(fixtures.join("external-4k-v3-64.journal.img"))?;
+        assert!(filesystem.len() + journal.len() + 4 <= MAX_INPUT_BYTES);
+        for access in [
+            ext4_core::MountAccess::ReadWrite,
+            ext4_core::MountAccess::ReadOnly {
+                recovery: ext4_core::ReadOnlyRecovery::Memory {
+                    limit: ext4_core::RecoveryMemoryLimit::DEFAULT,
+                },
+            },
+        ] {
+            assert_eq!(
+                run_mount(&filesystem, Some(&journal), access),
+                MountOutcome::Mounted
+            );
+            assert_eq!(
+                run_mount(&filesystem, None, access),
+                MountOutcome::ExternalJournalUnavailable
+            );
+        }
+        Ok(())
+    }
 }
