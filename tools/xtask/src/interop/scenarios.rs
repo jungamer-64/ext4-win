@@ -2115,27 +2115,50 @@ fn debugfs_require_xattr(
     Ok(())
 }
 
-/// Requires one xattr name to be absent from debugfs's decoded list.
+/// Requires debugfs to explicitly report that one xattr key does not exist.
 ///
 /// # Errors
 ///
-/// Returns an error when debugfs fails or reports the removed name.
+/// Returns an error for command failure, a present key, or any unrecognized oracle result.
 fn debugfs_require_xattr_absent(
     linux: LinuxEnvironment,
     image: &Path,
     path: &str,
     qualified_name: &[u8],
 ) -> TaskResult<()> {
-    let output = debugfs_request_output(linux, image, &format!("ea_list {path}"))?;
-    let qualified_name = String::from_utf8(qualified_name.to_vec())?;
-    if output.contains(&qualified_name) {
-        Err(io::Error::other(format!(
-            "debugfs still reports removed xattr {qualified_name} on {path}"
+    let qualified_name = core::str::from_utf8(qualified_name)?;
+    let image_path = linux.tool_path(image)?;
+    let request = format!("ea_get \"{path}\" \"{qualified_name}\"");
+    let mut command = linux.command_with_environment("debugfs", "LC_ALL", "C");
+    command.args(["-R", &request, &image_path]);
+    let output = run_checked_output(command, &format!("debugfs xattr absence for {path}"))?;
+    require_debugfs_xattr_missing(&output.stdout, &output.stderr)
+}
+
+/// Interprets only the oracle's missing-key result as evidence of xattr absence.
+///
+/// `ea_get` can exit successfully after an internal read failure. Its C-locale
+/// missing-key diagnostic distinguishes that failure from a completed negative lookup.
+///
+/// # Errors
+///
+/// Rejects value output, silent failures, other diagnostics, and additional error lines.
+fn require_debugfs_xattr_missing(stdout: &[u8], stderr: &[u8]) -> TaskResult<()> {
+    let diagnostics = core::str::from_utf8(stderr)?;
+    let mut lines = diagnostics.lines();
+    let banner = lines
+        .next()
+        .is_some_and(|line| line.starts_with("debugfs "));
+    let missing = lines.next()
+        == Some("ea_get: Extended attribute key not found while getting extended attribute");
+    if !stdout.is_empty() || !banner || !missing || lines.next().is_some() {
+        return Err(io::Error::other(format!(
+            "debugfs did not establish xattr absence: stdout={:?}; stderr={diagnostics}",
+            String::from_utf8_lossy(stdout)
         ))
-        .into())
-    } else {
-        Ok(())
+        .into());
     }
+    Ok(())
 }
 
 /// Requires e2fsck to accept one internal-journal mutation image without modification.
@@ -4395,6 +4418,47 @@ fn verify_locked_directory_enumeration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty listing or a failed read cannot substitute for an explicit missing-key result.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when independent oracle output is misclassified.
+    #[test]
+    fn xattr_absence_requires_an_explicit_completed_lookup() -> TaskResult<()> {
+        let banner = "debugfs 9.8.7 (test oracle)\n";
+        let missing = "ea_get: Extended attribute key not found while getting extended attribute\n";
+        let absent = format!("{banner}{missing}");
+        require_debugfs_xattr_missing(b"", absent.as_bytes())?;
+        for diagnostics in [
+            banner.to_owned(),
+            format!(
+                "{banner}ea_get: Extended attribute block checksum does not match block while getting extended attribute\n"
+            ),
+            format!("{banner}/linked.bin: File not found by ext2_lookup\n"),
+            format!("{banner}{missing}unexpected extra error\n"),
+            missing.to_owned(),
+        ] {
+            if require_debugfs_xattr_missing(b"", diagnostics.as_bytes()).is_ok() {
+                return Err(
+                    io::Error::other("oracle failure was accepted as an absent xattr").into(),
+                );
+            }
+        }
+        for value in [
+            b"user.ext4win.interop (0)\n".as_slice(),
+            b"\n",
+            missing.as_bytes(),
+        ] {
+            if require_debugfs_xattr_missing(value, absent.as_bytes()).is_ok() {
+                return Err(io::Error::other(
+                    "oracle value output was accepted as an absent xattr",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
 
     /// # Errors
     /// Returns fixture construction or stat/dump interpretation failure.
