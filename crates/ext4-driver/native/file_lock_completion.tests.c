@@ -47,14 +47,14 @@ static PEXT4WIN_STREAM_CONTEXT ext4win_stream_from_header(PVOID header)
     return header;
 }
 
-static void ext4win_acquire_resource_exclusive(PERESOURCE resource, int wait)
+static void wdk_sys_acquire_resource_exclusive(PERESOURCE resource, int wait)
 {
     assert(resource == &stream.MainResource && resource->held == 0 && wait);
     resource->held = 1;
     acquisitions++;
 }
 
-static void ext4win_release_resource(PERESOURCE resource)
+static void wdk_sys_release_resource(PERESOURCE resource)
 {
     assert(resource == &stream.MainResource && resource->held == 1);
     resource->held = 0;

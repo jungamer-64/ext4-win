@@ -38,7 +38,7 @@ ext4win_stream_cache_initialize(
         } else {
             status = ext4win_stream_storage_available(stream) ? STATUS_VOLUME_DISMOUNTED : STATUS_DEVICE_REMOVED;
         }
-        ext4win_release_resource(&stream->MainResource);
+        wdk_sys_release_resource(&stream->MainResource);
         return status;
     }
     __try {
@@ -62,7 +62,7 @@ ext4win_stream_cache_initialize(
         }
     }
     __finally {
-        ext4win_release_resource(&stream->MainResource);
+        wdk_sys_release_resource(&stream->MainResource);
     }
     return status;
 }

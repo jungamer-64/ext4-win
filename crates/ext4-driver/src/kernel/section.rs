@@ -10,9 +10,11 @@ use ext4_shared::Shared;
 
 use super::notification::AdmissionNotification;
 use super::status::{DriverError, DriverResult};
+#[cfg(not(test))]
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 #[cfg(not(test))]
-use core::{cell::UnsafeCell, marker::PhantomData, ptr::NonNull};
+use wdk::file_system::{ResourceGuard, ResourceRef};
 
 /// Independent native callback admission during one stream mutation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,35 +340,74 @@ impl core::fmt::Debug for SealedSectionMutation {
     }
 }
 
-/// Acquires under the predicate and revalidates after resource acquisition before exposing success.
+/// Acquires under the predicate and rechecks admission while holding the resource.
 #[cfg(not(test))]
-fn acquire_callback(
+#[expect(
+    unsafe_code,
+    reason = "the stream or native callback retains storage and same-thread APC_LEVEL execution"
+)]
+fn acquire_callback<'a>(
     state: &SectionSynchronization,
-    resource: SectionResource<'_>,
+    resource: ResourceRef<'a>,
     exclusive: bool,
     wait: bool,
     admission: SectionAdmission,
-) -> (bool, bool) {
+) -> (Option<ResourceGuard<'a>>, bool) {
     let mut waited = false;
     loop {
         if !admission.accepts(state.phase()) {
             if !wait {
-                return (false, waited);
+                return (None, waited);
             }
             waited = true;
             state.wait(admission);
         }
-        if !resource.acquire(exclusive, wait) {
-            return (false, waited);
-        }
+        let acquisition = match (exclusive, wait) {
+            // SAFETY: The enclosing stream/callback establishes resource order, storage and IRQL.
+            (false, true) => unsafe { resource.acquire_shared() },
+            // SAFETY: This callback retains storage and does not upgrade a shared acquisition.
+            (true, true) => unsafe { resource.acquire_exclusive() },
+            // SAFETY: The same retained storage and execution contract covers a nonblocking try.
+            (false, false) => unsafe { resource.try_acquire_shared() },
+            // SAFETY: The same retained storage and exclusive acquisition contract applies.
+            (true, false) => unsafe { resource.try_acquire_exclusive() },
+        };
+        let Ok(guard) = acquisition else {
+            return (None, waited);
+        };
         if admission.accepts(state.phase()) {
-            return (true, waited);
+            return (Some(guard), waited);
         }
-        resource.release();
+        drop(guard);
         if !wait {
-            return (false, waited);
+            return (None, waited);
         }
         waited = true;
+    }
+}
+
+/// Retains ordinary stream access after checking admission under the native resource.
+#[cfg(not(test))]
+pub(super) fn ordinary_shared<'a>(
+    resource: ResourceRef<'a>,
+    state: &SectionSynchronization,
+) -> ResourceGuard<'a> {
+    acquire_callback(state, resource, false, true, SectionAdmission::Ordinary)
+        .0
+        .unwrap_or_else(|| {
+            super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption()
+                .bugcheck()
+        })
+}
+
+/// Transfers a successful resource/APC scope to the native paired release callback.
+#[cfg(not(test))]
+fn transfer_callback_scope(guard: Option<ResourceGuard<'_>>) -> u8 {
+    if let Some(guard) = guard {
+        let _native_resource = guard.into_raw();
+        1
+    } else {
+        0
     }
 }
 
@@ -412,12 +453,12 @@ unsafe extern "system" fn ext4win_section_acquire_sync(
     };
     let resource = unsafe {
         // SAFETY: The native callback retains resource through its paired same-thread release.
-        SectionResource::from_raw(resource)
+        ResourceRef::from_raw(resource)
     }
     .unwrap_or_else(|_| {
         super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
     });
-    u8::from(
+    transfer_callback_scope(
         acquire_callback(
             state,
             resource,
@@ -452,7 +493,7 @@ unsafe extern "system" fn ext4win_section_acquire_main(
     };
     let resource = unsafe {
         // SAFETY: Native callback retention covers its resource/release pair.
-        SectionResource::from_raw(resource)
+        ResourceRef::from_raw(resource)
     }
     .unwrap_or_else(|_| {
         super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
@@ -470,7 +511,7 @@ unsafe extern "system" fn ext4win_section_acquire_main(
             waited.write(u8::from(did_wait));
         }
     }
-    u8::from(acquired)
+    transfer_callback_scope(acquired)
 }
 
 /// Acquires paging or flush admission, permitting preparation-driven Cc/MM reentry.
@@ -494,12 +535,12 @@ unsafe extern "system" fn ext4win_section_acquire_paging(
     };
     let resource = unsafe {
         // SAFETY: The native callback retains resource through paired release.
-        SectionResource::from_raw(resource)
+        ResourceRef::from_raw(resource)
     }
     .unwrap_or_else(|_| {
         super::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
     });
-    u8::from(
+    transfer_callback_scope(
         acquire_callback(
             state,
             resource,

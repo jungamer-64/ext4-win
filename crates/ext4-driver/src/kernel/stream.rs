@@ -7,8 +7,6 @@ pub(crate) use super::storage_admission::SnapshotPhase;
 #[cfg(not(test))]
 use super::ffi::ext4win_stream_get_sizes;
 use super::paging_file::PagingFileReservation;
-#[cfg(not(test))]
-use super::section::SectionResource;
 use super::section::{
     PurgeFailurePolicy, ScanSectionChange, SealedSectionMutation, SectionMutationOperation,
     SectionSynchronization,
@@ -18,6 +16,8 @@ use super::storage_admission::{ClosePhase, MediaState, StorageAdmission};
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::ptr::NonNull;
+#[cfg(not(test))]
+use wdk::file_system::ResourceRef;
 
 use crate::metadata::WindowsNodeMetadata;
 #[cfg(test)]
@@ -1102,7 +1102,10 @@ impl StreamContext {
         #[cfg(not(test))]
         let _guard = {
             let resource = self.main_resource().unwrap_or_else(|_| crate::kernel::fatal::KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck());
-            let Some(guard) = resource.try_exclusive() else {
+            let Ok(guard) = (unsafe {
+                // SAFETY: The retained stream runs on this passive actor thread without blocking paging.
+                resource.try_acquire_exclusive()
+            }) else {
                 return Err(input);
             };
             guard
@@ -1438,7 +1441,8 @@ impl StreamContext {
             );
             let result = (|| {
                 self.initialize_cache(transfer.file_object())?;
-                let _main = self.main_resource()?.ordinary_shared(self.sections.get());
+                let _main =
+                    super::section::ordinary_shared(self.main_resource()?, self.sections.get());
                 super::cache_transfer::validate_copy_range(
                     _offset,
                     _length,
@@ -1505,7 +1509,8 @@ impl StreamContext {
                             return Err(DriverError::NativeAdmissionDenied);
                         }
                     }
-                    let main = self.main_resource()?.ordinary_shared(self.sections.get());
+                    let main =
+                        super::section::ordinary_shared(self.main_resource()?, self.sections.get());
                     if !self.archive_is_set() {
                         return Err(DriverError::CacheManagerFailure(
                             crate::kernel::status::STATUS_RETRY,
@@ -1611,7 +1616,8 @@ impl StreamContext {
                         }
                     }
                 }
-                let _main = self.main_resource()?.ordinary_shared(self.sections.get());
+                let _main =
+                    super::section::ordinary_shared(self.main_resource()?, self.sections.get());
                 if request.action() == crate::irp::MdlTransfer::Write && !self.archive_is_set() {
                     return Err(DriverError::NotSupported);
                 }
@@ -1865,7 +1871,11 @@ impl StreamContext {
             let preparation = SectionSynchronization::begin(&self.sections)?;
             #[cfg(not(test))]
             {
-                let main = self.main_resource()?.exclusive();
+                let main = unsafe {
+                    // SAFETY: This retained stream owns same-thread passive exclusion before Cc entry.
+                    self.main_resource()?.acquire_exclusive()
+                }
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
                 self.ensure_storage()?;
                 match operation {
                     SectionMutationOperation::Resize(sizes)
@@ -1919,7 +1929,11 @@ impl StreamContext {
                         cache_status(status)?;
                     }
                 }
-                let paging = self.paging_resource()?.exclusive();
+                let paging = unsafe {
+                    // SAFETY: MainResource precedes paging in this passive stream mutation scope.
+                    self.paging_resource()?.acquire_exclusive()
+                }
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
                 let sealed = preparation.seal();
                 // Publish exclusion before releasing either resource. Every Cc flush and
                 // modified-page writer has drained through PagingIoResource at this point.
@@ -1953,14 +1967,14 @@ impl StreamContext {
     /// # Errors
     /// Returns an invariant violation for a malformed stream.
     #[cfg(not(test))]
-    fn main_resource(&self) -> DriverResult<SectionResource<'_>> {
+    fn main_resource(&self) -> DriverResult<ResourceRef<'_>> {
         let pointer = unsafe {
             // SAFETY: The owning stream borrow retains native resource storage.
             ext4win_stream_main_resource(self.header.as_ptr())
         };
         unsafe {
             // SAFETY: The resource borrow cannot outlive this stream borrow.
-            SectionResource::from_raw(pointer)
+            ResourceRef::from_raw(pointer).map_err(|_| DriverError::InternalInvariantViolation)
         }
     }
 
@@ -1968,14 +1982,14 @@ impl StreamContext {
     /// # Errors
     /// Returns an invariant violation for a malformed stream.
     #[cfg(not(test))]
-    fn paging_resource(&self) -> DriverResult<SectionResource<'_>> {
+    fn paging_resource(&self) -> DriverResult<ResourceRef<'_>> {
         let pointer = unsafe {
             // SAFETY: This stream borrow retains the native paging resource.
             ext4win_stream_paging_resource(self.header.as_ptr())
         };
         unsafe {
             // SAFETY: Resource storage remains live through the returned stream-bound borrow.
-            SectionResource::from_raw(pointer)
+            ResourceRef::from_raw(pointer).map_err(|_| DriverError::InternalInvariantViolation)
         }
     }
 

@@ -59,10 +59,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/input_validation.h");
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");
     println!("cargo:rerun-if-changed=native/cache_initialization.h");
-    println!("cargo:rerun-if-changed=native/executive_resource.h");
     println!("cargo:rerun-if-changed=native/fast_io_transfer.h");
     println!("cargo:rerun-if-changed=native/file_lock_completion.h");
-    println!("cargo:rerun-if-changed=native/irp_forward.h");
     println!("cargo:rerun-if-changed=native/paging_file.h");
     println!("cargo:rerun-if-changed=native/directory_notification.h");
     println!("cargo:rerun-if-changed=native/fsrtl_completion.h");
@@ -103,6 +101,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     let is_msvc_target =
         std::env::var_os("CARGO_CFG_TARGET_ENV").is_some_and(|target| target == "msvc");
     let mut native = cc::Build::new();
+    let native_include = std::env::var_os("DEP_WDK_NATIVE_INCLUDE")
+        .ok_or_else(|| io::Error::other("wdk-sys did not publish its native include directory"))?;
+    native.include(native_include);
     let compiler = native.get_compiler();
     let is_msvc_frontend = compiler.is_like_msvc();
     let is_clang_cl = compiler.is_like_clang_cl();

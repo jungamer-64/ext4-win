@@ -7,10 +7,10 @@ static BOOLEAN
 ext4win_cache_may_have_residency(PSECTION_OBJECT_POINTERS sections, PERESOURCE resource)
 {
     BOOLEAN resident;
-    if (!ext4win_acquire_resource_shared(resource, FALSE)) { return TRUE; }
+    if (!wdk_sys_acquire_resource_shared(resource, FALSE)) { return TRUE; }
     resident = (sections->DataSectionObject != NULL) ||
         (sections->SharedCacheMap != NULL) || (sections->ImageSectionObject != NULL);
-    ext4win_release_resource(resource);
+    wdk_sys_release_resource(resource);
     return resident;
 }
 

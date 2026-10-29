@@ -20,7 +20,7 @@ ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
     if ((data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection)
         && !ext4win_stream_section_io_available(stream,
             data->Parameters.AcquireForSectionSynchronization.PageProtection)) {
-        ext4win_release_resource(&stream->MainResource);
+        wdk_sys_release_resource(&stream->MainResource);
         return STATUS_FILE_LOCK_CONFLICT;
     }
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
@@ -36,7 +36,7 @@ ext4win_pre_release_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
     if (!ext4win_stream_section_callback_stream(data->FileObject, &stream)) {
         return STATUS_SUCCESS;
     }
-    ext4win_release_resource(&stream->MainResource);
+    wdk_sys_release_resource(&stream->MainResource);
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
@@ -86,7 +86,7 @@ ext4win_pre_release_mod_write(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOI
         (resource_to_release != &stream->PagingIoResource)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ext4win_release_resource(resource_to_release);
+    wdk_sys_release_resource(resource_to_release);
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 
@@ -123,7 +123,7 @@ ext4win_pre_release_cc_flush(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID
         ((stream = ext4win_stream_from_header(file_object->FsContext)) == NULL)) {
         return STATUS_INVALID_PARAMETER;
     }
-    ext4win_release_resource(&stream->PagingIoResource);
+    wdk_sys_release_resource(&stream->PagingIoResource);
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 

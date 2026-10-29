@@ -80,14 +80,14 @@ typedef struct {
     void *DataSectionObject, *SharedCacheMap, *ImageSectionObject;
 } SECTION_OBJECT_POINTERS, *PSECTION_OBJECT_POINTERS;
 typedef struct { unsigned exclusive, acquisitions, releases; } ERESOURCE, *PERESOURCE;
-static BOOLEAN ext4win_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait)
+static BOOLEAN wdk_sys_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait)
 {
     /* An exclusive Cc owner is suspended awaiting this reactor's paging completion. */
     assert(wait == FALSE);
     resource->acquisitions++;
     return !resource->exclusive;
 }
-static void ext4win_release_resource(PERESOURCE resource)
+static void wdk_sys_release_resource(PERESOURCE resource)
 {
     assert(!resource->exclusive);
     resource->releases++;

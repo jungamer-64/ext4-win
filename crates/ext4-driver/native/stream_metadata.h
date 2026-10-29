@@ -50,7 +50,7 @@ ext4win_stream_publish_metadata(
         (stream->Header.ValidDataLength.QuadPart != valid_data_length);
     if (size_change) {
         ExReleaseFastMutex(&stream->HeaderMutex);
-        ext4win_acquire_resource_exclusive(&stream->MainResource, TRUE);
+        wdk_sys_acquire_resource_exclusive(&stream->MainResource, TRUE);
         ExAcquireFastMutex(&stream->HeaderMutex);
         stream->Header.AllocationSize.QuadPart = allocation_size;
         stream->Header.FileSize.QuadPart = file_size;
@@ -83,7 +83,7 @@ ext4win_stream_publish_metadata(
     }
     *cache_status_out = cache_status;
     if (size_change) {
-        ext4win_release_resource(&stream->MainResource);
+        wdk_sys_release_resource(&stream->MainResource);
     }
     return STATUS_SUCCESS;
 }

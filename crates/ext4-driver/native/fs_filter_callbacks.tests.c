@@ -122,7 +122,7 @@ static BOOLEAN ext4win_stream_section_io_available(PEXT4WIN_STREAM_CONTEXT objec
     assert(object == &stream && stream.MainResource.held == 1);
     return ordinary_io_available;
 }
-static void ext4win_release_resource(PERESOURCE resource)
+static void wdk_sys_release_resource(PERESOURCE resource)
 {
     assert((resource == &stream.MainResource || resource == &stream.PagingIoResource)
         && resource->held == 1);

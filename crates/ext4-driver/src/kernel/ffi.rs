@@ -32,9 +32,9 @@ unsafe extern "system" {
 )]
 unsafe extern "C" {}
 
-pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 #[cfg(not(test))]
-pub(crate) use wdk_sys::ntddk::IoCompleteRequest;
+pub(crate) use wdk::file_system::complete_request;
+pub(crate) use wdk_sys::FILE_DEVICE_DISK_FILE_SYSTEM;
 #[cfg(not(test))]
 pub(crate) use wdk_sys::ntddk::{
     IoCheckShareAccess, IoCreateDevice, IoDeleteDevice, IoRemoveShareAccess,
@@ -275,14 +275,13 @@ pub(crate) use wdk_sys::ntddk::{
     FsRtlInitializeFileLock, FsRtlNotifyUninitializeSync, FsRtlUninitializeFileLock,
     IoAcquireVpbSpinLock, IoAllocateIrp, IoAllocateMdl, IoAllocateWorkItem, IoCancelIrp,
     IoCsqInitialize, IoCsqInsertIrp, IoCsqRemoveNextIrp, IoFreeIrp, IoFreeMdl, IoFreeWorkItem,
-    IoGetNextIrpStackLocation, IoGetRequestorProcess, IoGetTopLevelIrp, IoQueueWorkItem,
+    IoGetNextIrpStackLocation, IoGetRequestorProcess, IoQueueWorkItem,
     IoRegisterShutdownNotification, IoReleaseVpbSpinLock, IoSetCompletionRoutineEx,
-    IoSetTopLevelIrp, IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc,
-    KeCancelTimer, KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock,
-    KeInitializeTimer, KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent, KeSetTimer,
-    KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages, ObfDereferenceObject,
-    ObfReferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
-    ZwWaitForSingleObject,
+    IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeCancelTimer,
+    KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer,
+    KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject,
+    MmBuildMdlForNonPagedPool, MmUnlockPages, ObfDereferenceObject, ObfReferenceObject,
+    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]

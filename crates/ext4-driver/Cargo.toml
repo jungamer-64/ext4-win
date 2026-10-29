@@ -21,6 +21,7 @@ ext4-shared = { path = "../ext4-shared" }
 ext4-control = { path = "../ext4-control" }
 ext4-core = { path = "../ext4-core" }
 ext4-security = { path = "../ext4-security" }
+wdk.workspace = true
 wdk-alloc.workspace = true
 wdk-sys.workspace = true
 zeroize.workspace = true

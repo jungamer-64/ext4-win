@@ -68,7 +68,7 @@ static void ExReleaseFastMutex(FAST_MUTEX *mutex)
     assert(mutex == &stream.HeaderMutex && mutex->held == 1);
     mutex->held = 0;
 }
-static BOOLEAN ext4win_acquire_resource_exclusive(ERESOURCE *resource, BOOLEAN wait)
+static BOOLEAN wdk_sys_acquire_resource_exclusive(ERESOURCE *resource, BOOLEAN wait)
 {
     /* Waiting with a read-ahead owner would stop the reactor that must unblock it. */
     assert(resource == &stream.MainResource && wait == TRUE);
@@ -76,7 +76,7 @@ static BOOLEAN ext4win_acquire_resource_exclusive(ERESOURCE *resource, BOOLEAN w
     resource->writer = 1;
     return TRUE;
 }
-static void ext4win_release_resource(ERESOURCE *resource)
+static void wdk_sys_release_resource(ERESOURCE *resource)
 {
     assert(resource == &stream.MainResource && resource->writer == 1);
     assert(stream.HeaderMutex.held == 0);

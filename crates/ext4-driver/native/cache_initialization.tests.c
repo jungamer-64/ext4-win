@@ -80,7 +80,7 @@ static BOOLEAN ext4win_section_acquire_main(PVOID state, PERESOURCE resource,
     if (set_verify_on_lock) { verify_required = 1; }
     return TRUE;
 }
-static VOID ext4win_release_resource(PERESOURCE resource)
+static VOID wdk_sys_release_resource(PERESOURCE resource)
 {
     assert(resource == &stream.MainResource && resource->Held);
     resource->Held = 0;

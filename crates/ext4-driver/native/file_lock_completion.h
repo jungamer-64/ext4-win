@@ -26,10 +26,10 @@ ext4win_stream_process_file_lock(
         (VOID)ext4win_complete_file_lock(completion, irp);
         return STATUS_INVALID_PARAMETER;
     }
-    ext4win_acquire_resource_exclusive(&stream->MainResource, TRUE);
+    wdk_sys_acquire_resource_exclusive(&stream->MainResource, TRUE);
     status = FsRtlProcessFileLock(stream->ByteRangeLocks, irp, completion);
     ext4win_stream_refresh_fast_io_projection(stream);
-    ext4win_release_resource(&stream->MainResource);
+    wdk_sys_release_resource(&stream->MainResource);
     return status;
 }
 

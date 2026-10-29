@@ -239,11 +239,6 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native cluster-control WOW64 ABI and requestor handle-reference ownership contract",
         ),
         (
-            "executive-resource",
-            "executive_resource.tests.c",
-            "native executive resource APC contract",
-        ),
-        (
             "discovery-io",
             "discovery_io.tests.c",
             "native bounded discovery completion and cancellation ownership contract",
@@ -277,11 +272,6 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "file-lock-completion",
             "file_lock_completion.tests.c",
             "native FsRtl file-lock completion delegation contract",
-        ),
-        (
-            "irp-forward",
-            "irp_forward.tests.c",
-            "native immediate and pending IRP stack delegation contract",
         ),
         (
             "paging-file",

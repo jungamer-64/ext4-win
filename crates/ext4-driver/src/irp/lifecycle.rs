@@ -1,6 +1,8 @@
 //! Active, received, pending, and owned IRP lifecycle states.
 
 use super::*;
+#[cfg(not(test))]
+use wdk_sys::file_system::{forward_pending_irp, forward_unpended_irp};
 
 mod capture;
 #[cfg(not(test))]
@@ -817,7 +819,7 @@ impl ReceivedIrp {
         unsafe {
             // SAFETY: Dispatch validated a direct-volume handle. The I/O Manager retains that
             // FILE_OBJECT and its mount through completion; no driver queue context was installed.
-            ext4win_forward_original_irp(_lower.as_ptr(), self.target.into_raw_irp())
+            forward_unpended_irp(_lower.as_ptr(), self.target.into_raw_irp())
         }
         #[cfg(test)]
         self.complete_result(Err(DriverError::NotSupported))
@@ -839,7 +841,7 @@ impl ReceivedIrp {
         unsafe {
             // SAFETY: No CSQ capture or cancel routine is installed. The caller retains the
             // lower route through this consuming call; the I/O Manager then owns the IRP.
-            ext4win_forward_original_irp(_lower.as_ptr(), self.target.into_raw_irp())
+            forward_unpended_irp(_lower.as_ptr(), self.target.into_raw_irp())
         }
         #[cfg(test)]
         self.complete_result(Err(DriverError::NotSupported))
@@ -935,17 +937,11 @@ impl ReceivedIrp {
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
-    reason = "native consuming boundaries preserve the distinct dispatch and pending stack protocols"
+    reason = "the native boundary retains paging dispatch and MDL queue ownership contracts"
 )]
 unsafe extern "system" {
     fn ext4win_stream_paging_file_dispatch(irp: PIRP, status: *mut NTSTATUS) -> u8;
     fn ext4win_stream_mdl_queue(file: *mut wdk_sys::FILE_OBJECT) -> *mut c_void;
-    fn ext4win_forward_original_irp(
-        device: wdk_sys::PDEVICE_OBJECT,
-        irp: wdk_sys::PIRP,
-    ) -> NTSTATUS;
-    fn ext4win_forward_pending_irp(device: wdk_sys::PDEVICE_OBJECT, irp: wdk_sys::PIRP)
-    -> NTSTATUS;
 }
 
 /// Prepared IRP ready to transfer into the cancel-safe queue.
@@ -1798,7 +1794,7 @@ impl PnpSubmission {
             // SAFETY: Queue and driver cancellation capture were removed before publication.
             // Lower drivers consume the original IRP; no driver completion callback remains.
             // Pending dispatch retains its own stack location while lower drivers use a copy.
-            let _status = ext4win_forward_pending_irp(self.lower.as_ptr(), self.irp.as_ptr());
+            let _status = forward_pending_irp(self.lower.as_ptr(), self.irp.as_ptr());
         }
         #[cfg(test)]
         {
@@ -1874,27 +1870,15 @@ impl KernelIrp {
         .cast()
     }
 
-    /// Reads only the initialized current-stack pointer from a retained request.
+    /// Borrows the current WDK stack pointer without creating a Rust IRP reference.
     #[expect(
         unsafe_code,
-        reason = "the owning IRP contract retains its initialized stack-pointer field"
+        reason = "the completion owner retains the initialized IRP and current stack"
     )]
     fn current_stack_address(self) -> PIO_STACK_LOCATION {
-        let slot = unsafe {
-            // SAFETY: The generated offset is inside this retained IRP allocation; no unrelated
-            // tail fields are read or borrowed while projecting the pointer slot.
-            self.irp.byte_add(core::mem::offset_of!(
-                wdk_sys::IRP,
-                Tail.Overlay
-                    .__bindgen_anon_2
-                    .__bindgen_anon_1
-                    .CurrentStackLocation
-            ))
-        }
-        .cast::<PIO_STACK_LOCATION>();
         unsafe {
-            // SAFETY: Dispatch initialized this stable pointer before transferring IRP ownership.
-            slot.as_ptr().read()
+            // SAFETY: Dispatch initialized the current stack before transferring this live owner.
+            wdk_sys::ntddk::IoGetCurrentIrpStackLocation(self.irp.as_ptr())
         }
     }
     /// Converts a raw WDK IRP pointer into the private non-null boundary type.
@@ -1910,27 +1894,15 @@ impl KernelIrp {
         NonNull::new(irp).map(|irp| Self { irp })
     }
 
-    /// Marks pending before publication to either the CSQ or the non-cancellable terminal FIFO.
+    /// Marks pending before publication to the CSQ or terminal FIFO.
     #[expect(
         unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+        reason = "queue publication uniquely owns the live IRP pending transition"
     )]
     pub(super) fn mark_pending(self) {
-        let pending_bit = match u8::try_from(wdk_sys::SL_PENDING_RETURNED) {
-            Ok(bit) => bit,
-            Err(_) => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                    .bugcheck()
-            }
-        };
-        let current_stack = self.current_stack_address();
-        let Some(stack) = NonNull::new(current_stack) else {
-            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                .bugcheck();
-        };
         unsafe {
-            // SAFETY: Queue publication uniquely owns the pending bit in the live stack location.
-            (*stack.as_ptr()).Control |= pending_bit;
+            // SAFETY: This owner retains a current stack and has not yet published the IRP.
+            wdk_sys::ntddk::IoMarkIrpPending(self.irp.as_ptr());
         }
     }
 
@@ -2125,27 +2097,10 @@ impl KernelIrp {
     pub(super) fn finish_completion(self, status: NTSTATUS) -> NTSTATUS {
         #[cfg(not(test))]
         {
-            // Preserve the filesystem recursion context across synchronous upper callbacks.
-            let previous = unsafe {
-                // SAFETY: This only observes the current thread's opaque filesystem context.
-                ffi::IoGetTopLevelIrp()
-            };
-            if previous.is_null() {
-                unsafe {
-                    // SAFETY: This filesystem owns the live IRP through native completion. The
-                    // thread-local marker is restored below before returning to any caller.
-                    ffi::IoSetTopLevelIrp(self.as_mut_ptr());
-                }
-            }
             unsafe {
-                // SAFETY: The unique completion owner wrote all terminal fields and released its
-                // mappings and cancellation state before invoking the I/O Manager.
-                ffi::IoCompleteRequest(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
-            }
-            // The IRP may now be freed. Restore only the saved thread value; never inspect it.
-            unsafe {
-                // SAFETY: `previous` is the unchanged opaque value belonging to this same thread.
-                ffi::IoSetTopLevelIrp(previous);
+                // SAFETY: Terminal ownership has retired mappings, cancellation and scheduling
+                // borrows. The shared boundary preserves context without reusing the completed IRP.
+                ffi::complete_request(self.as_mut_ptr(), IO_NO_INCREMENT_PRIORITY);
             }
         }
         status

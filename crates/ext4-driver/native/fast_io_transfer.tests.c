@@ -108,7 +108,7 @@ static BOOLEAN CcCanIWrite(PFILE_OBJECT observed_file, ULONG length, BOOLEAN wai
     return write_admitted;
 }
 
-static BOOLEAN ext4win_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait)
+static BOOLEAN wdk_sys_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait)
 {
     assert(resource == &stream.MainResource && wait);
     assert(resource->held == 0);
@@ -127,7 +127,7 @@ static BOOLEAN ext4win_acquire_resource_shared(PERESOURCE resource, BOOLEAN wait
     return TRUE;
 }
 
-static void ext4win_release_resource(PERESOURCE resource)
+static void wdk_sys_release_resource(PERESOURCE resource)
 {
     assert(resource == &stream.MainResource && resource->held == 1);
     resource->held = 0;
@@ -239,7 +239,7 @@ int main(void)
                 assert(admitted && stream.MainResource.held == 1 && releases == 0);
                 /* Cc sees the same retained scope as the admission decision. */
                 assert(checks == 1);
-                ext4win_release_resource(&stream.MainResource);
+                wdk_sys_release_resource(&stream.MainResource);
             } else {
                 assert(!admitted && stream.MainResource.held == 0 && releases == 1);
                 assert(checks == ((scenario == ADMISSION_CLOSED || scenario == STREAM_REPLACED)
