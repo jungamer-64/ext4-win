@@ -387,6 +387,8 @@ struct Function {
 struct IrModule {
     /// All function definitions and declarations by LLVM symbol.
     functions: BTreeMap<String, Function>,
+    /// Direct LLVM alias relations, resolved before a symbol becomes a graph edge or root.
+    aliases: BTreeMap<String, String>,
     /// Functions used as values rather than direct call targets.
     address_taken: BTreeSet<String>,
     /// Explicit production roots.
@@ -1190,6 +1192,7 @@ impl IrModule {
     /// required `DriverEntry` root cannot be represented.
     fn parse(ir: &str) -> GateResult<Self> {
         let mut functions = BTreeMap::new();
+        let mut aliases = BTreeMap::new();
         let mut pending_display: Option<String> = None;
         let mut inside_function = false;
 
@@ -1203,6 +1206,12 @@ impl IrModule {
             }
             if let Some(comment) = function_name_comment(trimmed) {
                 pending_display = Some(comment.to_owned());
+                continue;
+            }
+            if let Some((symbol, target)) = parse_alias_definition(trimmed)? {
+                if aliases.insert(symbol.clone(), target).is_some() {
+                    return Err(GateError::InvalidIr(format!("duplicate alias {symbol}")));
+                }
                 continue;
             }
             let definition = trimmed.starts_with("define ");
@@ -1241,20 +1250,36 @@ impl IrModule {
             inside_function = definition;
         }
 
-        if !functions.contains_key(DRIVER_ENTRY) {
-            return Err(GateError::InvalidIr(
-                "DriverEntry definition is absent from the release module".to_owned(),
-            ));
-        }
-
         let mut module = Self {
             functions,
+            aliases,
             address_taken: BTreeSet::new(),
             roots: BTreeSet::new(),
         };
         module.collect_edges(ir)?;
-        module.collect_roots();
+        module.collect_roots()?;
         Ok(module)
+    }
+
+    /// Resolves a symbol through direct aliases to one declared or defined function.
+    ///
+    /// # Errors
+    ///
+    /// Rejects alias cycles rather than discarding their execution edges. Data references
+    /// return `None`; a caller using the symbol as a callee must reject that result.
+    fn function_reference(&self, symbol: &str) -> GateResult<Option<String>> {
+        let mut current = symbol;
+        let mut visited = BTreeSet::new();
+        while let Some(target) = self.aliases.get(current) {
+            if !visited.insert(current) {
+                return Err(GateError::InvalidIr(format!("cyclic alias {symbol}")));
+            }
+            current = target;
+        }
+        Ok(self
+            .functions
+            .contains_key(current)
+            .then(|| current.to_owned()))
     }
 
     /// Collects direct calls, function-address flows, and indirect call sites.
@@ -1305,9 +1330,9 @@ impl IrModule {
 
             let references = symbol_references(line)?;
             for reference in references {
-                if !self.functions.contains_key(&reference) {
+                let Some(reference) = self.function_reference(&reference)? else {
                     continue;
-                }
+                };
                 self.address_taken.insert(reference.clone());
                 if external_global {
                     self.roots.insert(reference);
@@ -1330,12 +1355,24 @@ impl IrModule {
         line_number: usize,
     ) -> GateResult<()> {
         let call = parse_call_site(line);
-        let direct_target = call.as_ref().and_then(|site| site.direct_target.as_ref());
+        let direct_target = call
+            .as_ref()
+            .and_then(|site| site.direct_target.as_deref())
+            .map(|symbol| {
+                self.function_reference(symbol)?.ok_or_else(|| {
+                    GateError::InvalidIr(format!(
+                        "unresolved direct call to {symbol} at LLVM IR line {line_number}"
+                    ))
+                })
+            })
+            .transpose()?;
         let references = symbol_references(line)?;
-        let known_references: Vec<String> = references
-            .into_iter()
-            .filter(|reference| self.functions.contains_key(reference))
-            .collect();
+        let mut known_references = Vec::new();
+        for reference in references {
+            if let Some(reference) = self.function_reference(&reference)? {
+                known_references.push(reference);
+            }
+        }
 
         let caller_node = self.functions.get_mut(caller).ok_or_else(|| {
             GateError::InvalidIr(format!("body found for unknown function {caller}"))
@@ -1349,7 +1386,7 @@ impl IrModule {
             caller_node.returns.push(return_instruction.to_owned());
         }
         for reference in known_references {
-            if direct_target == Some(&reference) {
+            if direct_target.as_ref() == Some(&reference) {
                 caller_node.direct_calls.push(reference.clone());
                 caller_node.edges.insert(reference);
             } else {
@@ -1369,13 +1406,23 @@ impl IrModule {
     }
 
     /// Adds exported definitions and the driver entry point as roots.
-    fn collect_roots(&mut self) {
-        self.roots.insert(DRIVER_ENTRY.to_owned());
+    ///
+    /// # Errors
+    ///
+    /// Rejects an absent entry point or an entry-point alias without a concrete function.
+    fn collect_roots(&mut self) -> GateResult<()> {
+        let entry = self.function_reference(DRIVER_ENTRY)?.ok_or_else(|| {
+            GateError::InvalidIr(
+                "DriverEntry definition is absent from the release module".to_owned(),
+            )
+        })?;
+        self.roots.insert(entry);
         for (symbol, function) in &self.functions {
             if function.externally_visible {
                 self.roots.insert(symbol.clone());
             }
         }
+        Ok(())
     }
 
     /// Applies the complete ext4win release contract to a resolved production graph.
@@ -1996,6 +2043,57 @@ const fn matching_type_delimiter(open: char) -> Option<char> {
         '<' => Some('>'),
         _ => None,
     }
+}
+
+/// Parses the direct opaque-pointer alias form emitted by the production toolchain.
+///
+/// # Errors
+///
+/// Rejects alias expressions that cannot be resolved to one complete symbol instead of
+/// treating an address expression as a callable function or dropping it from the graph.
+fn parse_alias_definition(line: &str) -> GateResult<Option<(String, String)>> {
+    if !line.starts_with('@') {
+        return Ok(None);
+    }
+    let Some((_, definition)) = line.split_once(" = ") else {
+        return Ok(None);
+    };
+    for token in definition.split_whitespace() {
+        if token == "alias" {
+            let references = symbol_references(line)?;
+            let [symbol, target] = references.as_slice() else {
+                return Err(GateError::InvalidIr(format!("unmodeled alias: {line}")));
+            };
+            if definition.rsplit_once(',').map(|(_, target)| target.trim())
+                != Some(format!("ptr @{target}").as_str())
+            {
+                return Err(GateError::InvalidIr(format!("unmodeled alias: {line}")));
+            }
+            return Ok(Some((symbol.clone(), target.clone())));
+        }
+        if !matches!(
+            token,
+            "private"
+                | "internal"
+                | "linkonce"
+                | "weak"
+                | "linkonce_odr"
+                | "weak_odr"
+                | "external"
+                | "default"
+                | "hidden"
+                | "protected"
+                | "dllimport"
+                | "dllexport"
+                | "unnamed_addr"
+                | "local_unnamed_addr"
+                | "dso_local"
+                | "dso_preemptable"
+        ) {
+            return Ok(None);
+        }
+    }
+    Ok(None)
 }
 
 /// Extracts all unquoted LLVM symbol references from one line.
@@ -2834,6 +2932,119 @@ mod tests {
         require(
             violation.path.join(" -> ") == "root -> work -> core::panicking::panic_fmt",
             "reachable panic path differed",
+        )
+    }
+
+    /// Release audits follow direct aliases all the way to forbidden execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed-fixture errors or a missed reachable trap.
+    #[test]
+    fn release_audits_follow_alias_chains() -> Result<(), GateError> {
+        let mut fixture = release_contract_fixture(
+            successful_lower_submission(),
+            "ret i32 -1073741802",
+            "  call void @first()",
+        );
+        fixture.push_str(
+            "\n@first = internal alias void (), ptr @second\n\
+             @second = internal alias void (), ptr @hidden\n\
+             define internal void @hidden() {\n  call void @llvm.trap()\n  unreachable\n}\n\
+             declare void @llvm.trap()\n",
+        );
+        let report = IrModule::parse(&fixture)?.analyze_release()?;
+        require(
+            report
+                .violations
+                .iter()
+                .any(|violation| violation.category == Sink::TrapOrAbort.category()),
+            "release audit missed an aliased trap",
+        )
+    }
+
+    /// Alias addresses participate in exported roots and typed indirect expansion.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed-fixture errors or a missed aliased callback.
+    #[test]
+    fn alias_addresses_reach_callbacks() -> Result<(), GateError> {
+        for binding in ["internal", ""] {
+            let fixture = format!(
+                "@callback_alias = {binding} alias void (), ptr @callback\n\
+                 define void @DriverEntry(ptr %slot, ptr %indirect) {{\n\
+                   store ptr @callback_alias, ptr %slot\n\
+                   call void %indirect()\n  ret void\n}}\n\
+                 define internal void @callback() {{\n  call void @llvm.trap()\n  unreachable\n}}\n\
+                 declare void @llvm.trap()\n",
+            );
+            let report = analyze_root_fixture(&fixture)?;
+            require(
+                report.violations.len() == 1
+                    && report
+                        .violations
+                        .iter()
+                        .all(|violation| violation.category == Sink::TrapOrAbort.category()),
+                "alias callback address did not resolve to its concrete signature and body",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// An exported alias roots its internal body even without an in-module caller.
+    ///
+    /// # Errors
+    ///
+    /// Returns malformed-fixture errors or a missing exported root.
+    #[test]
+    fn exported_alias_roots_its_internal_function() -> Result<(), GateError> {
+        let report = analyze_root_fixture(
+            "@exported = alias void (), ptr @hidden\n\
+             @DriverEntry = alias void (), ptr @entry\n\
+             define internal void @entry() {\n  ret void\n}\n\
+             define internal void @hidden() {\n  call void @llvm.trap()\n  unreachable\n}\n\
+             declare void @llvm.trap()\n",
+        )?;
+        require(
+            report.violations.len() == 1,
+            "exported alias failed to root its internal function",
+        )
+    }
+
+    /// Unresolved callable symbols and unsupported alias expressions cannot lose graph edges.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if unmodeled execution is accepted.
+    #[test]
+    fn callable_symbols_require_resolved_functions() -> Result<(), GateError> {
+        for aliases in [
+            "@callee = internal alias void (), ptr @missing\n",
+            "@callee = internal alias void (), ptr @other\n@other = internal alias void (), ptr @callee\n",
+            "@callee = internal alias void (), ptr getelementptr (i8, ptr @data, i64 1)\n",
+            "",
+        ] {
+            let fixture = format!(
+                "{aliases}define void @DriverEntry() {{\n  call void @callee()\n  ret void\n}}\n",
+            );
+            require(
+                IrModule::parse(&fixture).is_err(),
+                "unresolved callable symbol was accepted",
+            )?;
+        }
+        let report = analyze_root_fixture(
+            r#"@data_alias = internal alias i8, ptr @data
+@data = internal constant i8 0
+@message = private constant [7 x i8] c" alias "
+define void @DriverEntry() {
+  ret void
+}
+"#,
+        )?;
+        require(
+            report.violations.is_empty(),
+            "noncallable data was rejected",
         )
     }
 
