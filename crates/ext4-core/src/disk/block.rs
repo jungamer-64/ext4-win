@@ -82,13 +82,15 @@ impl BlockSize {
             .checked_add(10)
             .ok_or(Error::ArithmeticOverflow)?;
         let bytes = 1_u32.checked_shl(shift).ok_or(Error::ArithmeticOverflow)?;
-        Ok(Self(bytes))
+        Ok(Self(
+            NonZeroU32::new(bytes).ok_or(Error::UnsupportedBlockSize)?,
+        ))
     }
 
     /// Returns the block size in bytes.
     #[must_use]
     pub const fn bytes(self) -> u32 {
-        self.0
+        self.0.get()
     }
 
     /// Maps a block number to an absolute byte offset.
@@ -98,7 +100,7 @@ impl BlockSize {
     pub fn offset_of(self, block: BlockAddress) -> Result<ByteOffset> {
         let bytes = block
             .get()
-            .checked_mul(u64::from(self.0))
+            .checked_mul(u64::from(self.0.get()))
             .ok_or(Error::ArithmeticOverflow)?;
         Ok(ByteOffset::new(bytes))
     }

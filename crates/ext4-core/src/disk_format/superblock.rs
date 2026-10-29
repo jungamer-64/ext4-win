@@ -336,17 +336,15 @@ impl ClusterSize {
     /// # Errors
     /// Returns an error when the allocation cluster size is zero.
     pub fn new(value: u32) -> Result<Self> {
-        if value == 0 {
-            Err(Error::InvalidClusterGeometry)
-        } else {
-            Ok(Self(value))
-        }
+        Ok(Self(
+            NonZeroU32::new(value).ok_or(Error::InvalidClusterGeometry)?,
+        ))
     }
 
     /// Returns the allocation cluster size in bytes.
     #[must_use]
     pub const fn bytes(self) -> u32 {
-        self.0
+        self.0.get()
     }
 }
 
