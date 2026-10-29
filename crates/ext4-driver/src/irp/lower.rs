@@ -1,5 +1,7 @@
 //! Driver-created lower IRPs with completion-owned lifetime and no future/waker state.
 
+use ext4_shared::{Shared, SharedSlot};
+
 use alloc::alloc::{alloc_zeroed, dealloc};
 use alloc::boxed::Box;
 use core::alloc::Layout;
@@ -24,7 +26,7 @@ use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
 #[cfg(not(test))]
 use crate::memory;
-use crate::memory::{DriverShared, DriverSharedLease, DriverSharedSlot, NativeAllocation};
+use crate::memory::NativeAllocation;
 #[cfg(not(test))]
 use crate::state::KernelDevice;
 
@@ -371,8 +373,8 @@ impl CompletionRundownState {
             reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
         )
     )]
-    fn try_new() -> DriverResult<DriverShared<Self>> {
-        let slot = DriverSharedSlot::try_new()?;
+    fn try_new() -> DriverResult<Shared<Self>> {
+        let slot = SharedSlot::try_new()?;
         let state = slot.initialize(Self {
             #[cfg(not(test))]
             native: UnsafeCell::new(MaybeUninit::uninit()),
@@ -381,7 +383,7 @@ impl CompletionRundownState {
         });
         #[cfg(not(test))]
         unsafe {
-            // SAFETY: DriverShared placed the state at its final address, and this is the unique
+            // SAFETY: Shared placed the state at its final address, and this is the unique
             // initialization before the owner is exposed.
             ffi::ExInitializeRundownProtection(state.get().native.get().cast());
         }
@@ -399,7 +401,7 @@ impl CompletionRundownState {
             reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
         )
     )]
-    fn acquire(owner: &DriverShared<Self>) -> DriverResult<Option<CompletionRundownLease>> {
+    fn acquire(owner: &Shared<Self>) -> DriverResult<Option<CompletionRundownLease>> {
         let lease = owner.try_acquire()?;
         #[cfg(not(test))]
         {
@@ -487,7 +489,7 @@ impl CompletionRundownState {
 /// Stable rundown gate protecting completion destinations beyond completion-routine invocation.
 pub struct CompletionRundown {
     /// Shared owner retained by the reactor and every successful acquisition.
-    owner: DriverShared<CompletionRundownState>,
+    owner: Shared<CompletionRundownState>,
 }
 
 impl CompletionRundown {
@@ -535,7 +537,7 @@ impl fmt::Debug for CompletionRundown {
 /// One successful acquisition that structurally retains its release destination.
 pub struct CompletionRundownLease {
     /// Shared release owner; forgetting the lease delays teardown but cannot dangle.
-    owner: DriverSharedLease<CompletionRundownState>,
+    owner: Shared<CompletionRundownState>,
 }
 
 impl fmt::Debug for CompletionRundownLease {

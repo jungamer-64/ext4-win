@@ -9,6 +9,7 @@ license.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+ext4-shared = { path = "../ext4-shared" }
 zeroize.workspace = true
 siphasher.workspace = true
 

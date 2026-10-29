@@ -1,9 +1,11 @@
 //! Search expression and published continuation owned by one directory handle.
 
+use ext4_shared::Shared;
+
 use crate::irp::PreparedDirectoryPattern;
 use crate::kernel::name_expression::NameCase;
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
+use crate::memory::DriverVec;
 use crate::namespace::WindowsName;
 use core::cell::{Cell, OnceCell};
 use ext4_core::DirectoryScanCursor;
@@ -14,7 +16,7 @@ pub(crate) struct DirectorySearch {
     /// Last continuation published after a successful requestor copy.
     cursor: Cell<DirectoryScanCursor>,
     /// Unset until the first request captures its expression.
-    pattern: OnceCell<DriverShared<DirectoryPattern>>,
+    pattern: OnceCell<Shared<DirectoryPattern>>,
     /// Distinguishes initial no-match/overflow semantics from subsequent queries.
     completed: Cell<bool>,
 }
@@ -55,11 +57,12 @@ impl DirectorySearch {
     /// Leases the original expression without parsing later caller input.
     /// # Errors
     /// Returns reference-budget exhaustion without changing the search.
-    pub(crate) fn expression(&self) -> DriverResult<Option<DriverSharedLease<DirectoryPattern>>> {
+    pub(crate) fn expression(&self) -> DriverResult<Option<Shared<DirectoryPattern>>> {
         self.pattern
             .get()
-            .map(DriverShared::try_acquire)
+            .map(Shared::try_acquire)
             .transpose()
+            .map_err(Into::into)
     }
 
     /// Only the first request selects an expression. The handle lane excludes competing queries.
@@ -68,16 +71,17 @@ impl DirectorySearch {
     pub(crate) fn capture_pattern(
         &self,
         input: DirectoryPattern,
-    ) -> DriverResult<DriverSharedLease<DirectoryPattern>> {
+    ) -> DriverResult<Shared<DirectoryPattern>> {
         if self.pattern.get().is_none() {
             self.pattern
-                .set(DriverShared::try_new(input)?)
+                .set(Shared::try_new(input)?)
                 .map_err(|_| DriverError::InternalInvariantViolation)?;
         }
         self.pattern
             .get()
             .ok_or(DriverError::InternalInvariantViolation)?
             .try_acquire()
+            .map_err(Into::into)
     }
 }
 

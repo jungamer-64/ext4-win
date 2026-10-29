@@ -1,5 +1,7 @@
 //! Directory query planning, wildcard matching, and record packing.
 
+use ext4_shared::Shared;
+
 use super::*;
 use crate::kernel::name_expression::NameCase;
 
@@ -555,7 +557,7 @@ pub(crate) struct DirectoryQuery {
     /// Exact directory retained by the enumeration handle.
     directory: DirectoryNodeId,
     /// Retains the handle-selected expression independently of later IRP captures.
-    pattern: crate::memory::DriverSharedLease<DirectoryPattern>,
+    pattern: Shared<DirectoryPattern>,
     /// Requested Windows wire layout.
     class: DirectoryInformationClass,
     /// Caller capacity retained through deferred copy.

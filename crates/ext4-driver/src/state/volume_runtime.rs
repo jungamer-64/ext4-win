@@ -1,5 +1,7 @@
 //! Mounted profile, bounded epoch leases, mutation coordination, and volume failure state.
 
+use ext4_shared::{Shared, SharedSlot};
+
 mod mmp;
 use mmp::MediaOwnership;
 
@@ -18,7 +20,6 @@ use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::io_reliability::{IoReliabilityObservation, IoReliabilityOwner, NativeIoPolicy};
 use crate::kernel::status::{DriverError, DriverResult};
 use crate::kernel::storage::{MountedStorage, MountedStorageRoute};
-use crate::memory::{DriverShared, DriverSharedLease, DriverSharedSlot};
 
 /// Volume reliability state after lower-device or checkpoint failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,7 +157,7 @@ impl VolumeFailureState {
 #[derive(Debug)]
 pub(crate) struct EpochRegistry {
     /// Epoch selected for new operations.
-    current: DriverShared<CommittedEpoch>,
+    current: Shared<CommittedEpoch>,
 }
 
 impl EpochRegistry {
@@ -165,7 +166,7 @@ impl EpochRegistry {
     ///
     /// Returns an error when storage for the initial immutable epoch cannot be allocated.
     pub(crate) fn try_new(initial: CommittedEpoch) -> DriverResult<Self> {
-        let current = DriverShared::try_new(initial)?;
+        let current = Shared::try_new(initial)?;
         Ok(Self { current })
     }
 
@@ -200,7 +201,7 @@ impl EpochRegistry {
     /// Returns insufficient resources before publication can start.
     fn reserve_slot(&self) -> DriverResult<EpochPublicationSlot> {
         Ok(EpochPublicationSlot {
-            storage: DriverSharedSlot::try_new()?,
+            storage: SharedSlot::try_new()?,
         })
     }
 
@@ -214,7 +215,7 @@ impl EpochRegistry {
 #[derive(Debug)]
 pub(crate) struct EpochLease {
     /// Shared immutable epoch owner.
-    epoch: DriverSharedLease<CommittedEpoch>,
+    epoch: Shared<CommittedEpoch>,
 }
 
 impl EpochLease {
@@ -227,12 +228,12 @@ impl EpochLease {
 /// Preallocated storage for one infallible post-commit epoch publication.
 pub(crate) struct EpochPublicationSlot {
     /// Uninitialized shared allocation that becomes the published epoch owner.
-    storage: DriverSharedSlot<CommittedEpoch>,
+    storage: SharedSlot<CommittedEpoch>,
 }
 
 impl EpochPublicationSlot {
     /// Initializes this uniquely owned reservation and converts it to immutable epoch ownership.
-    fn initialize(self, epoch: CommittedEpoch) -> DriverShared<CommittedEpoch> {
+    fn initialize(self, epoch: CommittedEpoch) -> Shared<CommittedEpoch> {
         self.storage.initialize(epoch)
     }
 }
@@ -284,7 +285,7 @@ pub(crate) struct VolumeRuntime {
     /// Sole publisher of the native observation of `failure`.
     native_reliability: IoReliabilityOwner,
     /// Mutations admitted before closing and not yet fully checkpointed or abandoned.
-    active_mutations: DriverShared<AtomicU32>,
+    active_mutations: Shared<AtomicU32>,
 }
 
 impl VolumeRuntime {
@@ -321,7 +322,7 @@ impl VolumeRuntime {
             crypto,
             failure: VolumeFailureState::Operational,
             native_reliability,
-            active_mutations: DriverShared::try_new(AtomicU32::new(0))?,
+            active_mutations: Shared::try_new(AtomicU32::new(0))?,
         })
     }
 
@@ -893,7 +894,7 @@ impl VolumeRuntime {
 #[derive(Debug)]
 pub(crate) struct MutationActivityLease {
     /// Shared mutation-count owner retained independently from the runtime field.
-    active: DriverSharedLease<AtomicU32>,
+    active: Shared<AtomicU32>,
 }
 
 impl MutationActivityLease {
@@ -901,7 +902,7 @@ impl MutationActivityLease {
     /// # Errors
     ///
     /// Returns insufficient resources when the finite mutation count is exhausted.
-    fn acquire(active: &DriverShared<AtomicU32>) -> DriverResult<Self> {
+    fn acquire(active: &Shared<AtomicU32>) -> DriverResult<Self> {
         let lease = active.try_acquire()?;
         lease
             .get()

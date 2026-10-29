@@ -1,8 +1,9 @@
 //! Read/write permission projected from the reactor's authoritative reliability state.
 //! Native observers cannot change policy or recover the publication owner.
 
+use ext4_shared::Shared;
+
 use crate::kernel::status::DriverResult;
-use crate::memory::{DriverShared, DriverSharedLease};
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Native I/O classes permitted by the last authoritative volume failure transition.
@@ -82,7 +83,7 @@ impl NativeIoSnapshot {
 #[derive(Debug)]
 pub(crate) struct IoReliabilityOwner {
     /// Release/acquire projection; it never independently determines volume failure.
-    policy: DriverShared<AtomicU64>,
+    policy: Shared<AtomicU64>,
 }
 
 impl IoReliabilityOwner {
@@ -91,7 +92,7 @@ impl IoReliabilityOwner {
     /// Returns nonpaged allocation failure before native callbacks exist.
     pub(crate) fn try_new() -> DriverResult<Self> {
         Ok(Self {
-            policy: DriverShared::try_new(AtomicU64::new(0))?,
+            policy: Shared::try_new(AtomicU64::new(0))?,
         })
     }
 
@@ -102,6 +103,7 @@ impl IoReliabilityOwner {
         self.policy
             .try_acquire()
             .map(|policy| IoReliabilityObservation { policy })
+            .map_err(Into::into)
     }
 
     /// Publishes immediately with the actor's failure transition, without allocation.
@@ -120,7 +122,7 @@ impl IoReliabilityOwner {
 #[derive(Debug)]
 pub(crate) struct IoReliabilityObservation {
     /// This lease exposes neither the publication owner nor mutable atomic access.
-    policy: DriverSharedLease<AtomicU64>,
+    policy: Shared<AtomicU64>,
 }
 
 impl IoReliabilityObservation {

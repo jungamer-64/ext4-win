@@ -1,20 +1,22 @@
 //! UUID-scoped immutable identity publication; metadata requests pin one snapshot at admission.
+
 use crate::kernel::configuration_registry::{
     ConfigurationDomain, RegistryStore, SaveOutcome, key_text,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{DriverShared, DriverSharedLease, DriverVec, ShortLock};
+use crate::memory::{DriverVec, ShortLock};
 use alloc::vec::Vec;
 use ext4_core::FilesystemUuid;
 use ext4_security::{IdentityMap, MappingReply, MappingSnapshot, PublicationOutcome, Replacement};
+use ext4_shared::Shared;
 /// Whole identity record and the native query header.
 const READ_CAPACITY: usize =
     ext4_security::MAX_MAPPING_BYTES + crate::kernel::configuration_registry::QUERY_HEADER_BYTES;
 
 /// Operation-owned table; acquired access remains independent of later slot publication.
-pub(crate) type IdentitySnapshot = DriverSharedLease<MappingSnapshot>;
+pub(crate) type IdentitySnapshot = Shared<MappingSnapshot>;
 /// Mount-owned access to exactly one filesystem's identity slot.
-pub(crate) type IdentityBinding = DriverSharedLease<IdentitySlot>;
+pub(crate) type IdentityBinding = Shared<IdentitySlot>;
 
 /// Effective creator identity captured once even when the create ultimately opens an existing inode.
 #[derive(Clone, Copy, Debug)]
@@ -49,7 +51,7 @@ pub(crate) struct CreationContext<'a> {
 #[derive(Debug)]
 struct SlotState {
     /// One authoritative current table owner.
-    active: DriverShared<MappingSnapshot>,
+    active: Shared<MappingSnapshot>,
     /// Known durable generation, independent of applied generation.
     saved: u64,
     /// Persistence/publication phase retained after acknowledgement loss.
@@ -74,7 +76,7 @@ impl IdentitySlot {
         let saved = snapshot.generation;
         Ok(Self {
             state: ShortLock::new(SlotState {
-                active: DriverShared::try_new(snapshot)?,
+                active: Shared::try_new(snapshot)?,
                 saved,
                 outcome: PublicationOutcome::Applied,
                 status: 0,
@@ -87,7 +89,9 @@ impl IdentitySlot {
     /// # Errors
     /// Returns finite reference-budget exhaustion.
     pub(crate) fn capture(&self) -> DriverResult<IdentitySnapshot> {
-        self.state.with(|state| state.active.try_acquire())
+        self.state
+            .with(|state| state.active.try_acquire())
+            .map_err(Into::into)
     }
     /// Captures independent persistence and application facts together with immutable ownership.
     /// # Errors
@@ -103,7 +107,7 @@ impl IdentitySlot {
         })
     }
     /// Publishes a preallocated durable successor; old owners drop outside the critical section.
-    fn publish(&self, next: DriverShared<MappingSnapshot>) {
+    fn publish(&self, next: Shared<MappingSnapshot>) {
         let old = self.state.with(|state| {
             state.saved = next.get().generation;
             state.outcome = PublicationOutcome::Applied;
@@ -139,7 +143,7 @@ struct CatalogEntry {
     /// Core UUID, independent of Windows volume-path identity.
     uuid: FilesystemUuid,
     /// Shared publication slot retained through mounted-device and worker drain.
-    slot: DriverShared<IdentitySlot>,
+    slot: Shared<IdentitySlot>,
 }
 /// UUID slot registration authority; mounts can acquire snapshots without registry or replacement authority.
 #[derive(Debug)]
@@ -153,7 +157,7 @@ pub(crate) struct IdentityCatalog {
     /// Registration can be borrowed without exposing the service's registry authority.
     directory: IdentityDirectory,
     /// Narrow service registry authority retained by catalog and submitted workers.
-    registry: Option<DriverShared<RegistryStore>>,
+    registry: Option<Shared<RegistryStore>>,
 }
 impl IdentityCatalog {
     /// Constructs the unpublished empty catalog.
@@ -179,7 +183,7 @@ impl IdentityDirectory {
             return Err(DriverError::InvalidParameter);
         }
         let uuid = snapshot.uuid;
-        let slot = DriverShared::try_new(IdentitySlot::new(snapshot)?)?;
+        let slot = Shared::try_new(IdentitySlot::new(snapshot)?)?;
         self.entries
             .try_push_owned(CatalogEntry { uuid, slot })
             .map_err(|error| error.into_parts().0)
@@ -189,7 +193,7 @@ impl IdentityDirectory {
     /// Returns allocation or reference-budget failure before publication.
     pub(crate) fn binding(&mut self, uuid: FilesystemUuid) -> DriverResult<IdentityBinding> {
         if let Some(entry) = self.entries.iter().find(|entry| entry.uuid == uuid) {
-            return entry.slot.try_acquire();
+            return entry.slot.try_acquire().map_err(Into::into);
         }
         self.restore(MappingSnapshot {
             uuid,
@@ -202,6 +206,7 @@ impl IdentityDirectory {
             .ok_or(DriverError::InternalInvariantViolation)?
             .slot
             .try_acquire()
+            .map_err(Into::into)
     }
 }
 
@@ -256,7 +261,7 @@ impl IdentityCatalog {
             }
             index = index.checked_add(1).ok_or(DriverError::InvalidBufferSize)?;
         }
-        catalog.registry = Some(DriverShared::try_new(registry)?);
+        catalog.registry = Some(Shared::try_new(registry)?);
         Ok(catalog)
     }
     /// Prepares every allocation and reply before a persistence worker can accept an effect.
@@ -319,7 +324,7 @@ impl IdentityCatalog {
                     return Err(DriverError::BufferTooSmall);
                 }
                 let next_reply = MappingReply::prepare(replacement.next())?;
-                let next = DriverShared::try_new(replacement.into_next())?;
+                let next = Shared::try_new(replacement.into_next())?;
                 let registry = self
                     .registry
                     .as_ref()
@@ -414,7 +419,7 @@ enum IdentityWorkKind {
     /// Save and flush one complete validated successor.
     Replace {
         /// Infallible publication owner prepared before persistence.
-        next: DriverShared<MappingSnapshot>,
+        next: Shared<MappingSnapshot>,
         /// One complete registry value.
         record: Vec<u8>,
         /// Active-table reply for pre-effect or uncertain failure.
@@ -442,7 +447,7 @@ enum IdentityWorkKind {
 #[derive(Debug)]
 pub(crate) struct IdentityWork {
     /// Root authority outlives the native call even during control-device drain.
-    registry: DriverSharedLease<RegistryStore>,
+    registry: Shared<RegistryStore>,
     /// Unique update/reconciliation authority.
     reservation: UpdateReservation,
     /// Fixed native subkey name prepared before persistence.
@@ -511,7 +516,7 @@ impl IdentityWork {
                         return Err(DriverError::InvalidParameter);
                     }
                     let reply = MappingReply::prepare(&snapshot)?;
-                    let next = DriverShared::try_new(snapshot)?;
+                    let next = Shared::try_new(snapshot)?;
                     self.registry.get().flush(&self.key)?;
                     Ok(Some((next, reply)))
                 })();
@@ -580,7 +585,7 @@ mod tests {
             uid: ext4_core::Ext4Uid::from_u32(1000),
         });
         let mut catalog = IdentityCatalog::empty();
-        catalog.registry = Some(DriverShared::try_new(RegistryStore {})?);
+        catalog.registry = Some(Shared::try_new(RegistryStore {})?);
         let command = IdentityCommand::Replace(Replacement::new(
             0,
             MappingSnapshot {
@@ -658,7 +663,7 @@ mod tests {
             UpdateReservation::acquire(catalog.directory.binding(uuid)?),
             Err(DriverError::DeviceBusy)
         ));
-        let next = DriverShared::try_new(MappingSnapshot {
+        let next = Shared::try_new(MappingSnapshot {
             uuid,
             generation: 1,
             map: IdentityMap::empty(),
@@ -714,7 +719,7 @@ mod tests {
     #[test]
     fn pre_effect_failure_and_cancellation_keep_the_active_table() -> DriverResult<()> {
         let mut catalog = IdentityCatalog::empty();
-        catalog.registry = Some(DriverShared::try_new(RegistryStore {})?);
+        catalog.registry = Some(Shared::try_new(RegistryStore {})?);
         let uuid = FilesystemUuid::from_bytes([9; 16]);
         assert!(matches!(
             catalog.prepare(IdentityCommand::Query(uuid), 1),

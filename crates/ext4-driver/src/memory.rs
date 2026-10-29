@@ -6,16 +6,8 @@ use alloc::{
     collections::{TryReserveError, TryReserveErrorKind},
     vec::Vec,
 };
-use core::{
-    alloc::Layout,
-    fmt,
-    marker::PhantomData,
-    mem::{ManuallyDrop, MaybeUninit},
-    ptr::NonNull,
-    sync::atomic::{AtomicUsize, Ordering, fence},
-};
+use core::{alloc::Layout, fmt, marker::PhantomData, ptr::NonNull};
 
-use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::{DriverError, DriverResult};
 use zeroize::Zeroize;
 
@@ -632,7 +624,7 @@ mod tests {
     use core::ptr::NonNull;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use super::{DriverShared, DriverSharedSlot, InPlaceInitialization, SensitiveBytes};
+    use super::{InPlaceInitialization, SensitiveBytes};
     use crate::kernel::status::{DriverError, DriverResult};
 
     /// Observes captured bytes while their allocation is still live at release.
@@ -786,78 +778,5 @@ mod tests {
             published.drop_in_place();
         }
         assert_eq!(drops.load(Ordering::Acquire), 2);
-    }
-
-    /// # Panics
-    ///
-    /// Panics if dropping the primary owner invalidates retained leases or destroys the value more
-    /// than once.
-    #[test]
-    fn shared_leases_retain_the_value_until_the_final_release() {
-        let drops = AtomicUsize::new(0);
-        let Ok(owner) = DriverShared::try_new(DropProbe { drops: &drops }) else {
-            return;
-        };
-        let Ok(first) = owner.try_acquire() else {
-            return;
-        };
-        drop(owner);
-        let Ok(second) = first.try_acquire() else {
-            return;
-        };
-        assert_eq!(drops.load(Ordering::Acquire), 0);
-        drop(first);
-        assert_eq!(drops.load(Ordering::Acquire), 0);
-        drop(second);
-        assert_eq!(drops.load(Ordering::Acquire), 1);
-    }
-
-    /// # Panics
-    ///
-    /// Panics if preallocated publication does not initialize exactly one retained value.
-    #[test]
-    fn shared_slot_publishes_without_an_additional_allocation() {
-        let Ok(slot) = DriverSharedSlot::try_new() else {
-            return;
-        };
-        let owner = slot.initialize(0x5A_u32);
-        let Ok(lease) = owner.try_acquire() else {
-            return;
-        };
-        drop(owner);
-        assert_eq!(*lease.get(), 0x5A);
-    }
-
-    /// # Panics
-    ///
-    /// Panics if reference-budget exhaustion traps or mutates the owner count.
-    #[test]
-    #[expect(
-        unsafe_code,
-        reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-    )]
-    fn shared_reference_exhaustion_is_recoverable() {
-        let Ok(owner) = DriverShared::try_new(0xA5_u32) else {
-            return;
-        };
-        let Ok(lease) = owner.try_acquire() else {
-            return;
-        };
-        let references = unsafe {
-            // SAFETY: This test retains the owner and lease and restores both live references
-            // before either is dropped.
-            &owner.inner.as_ref().references
-        };
-        references.store(usize::MAX, Ordering::Release);
-        assert!(matches!(
-            owner.try_acquire(),
-            Err(DriverError::InsufficientResources)
-        ));
-        assert!(matches!(
-            lease.try_acquire(),
-            Err(DriverError::InsufficientResources)
-        ));
-        assert_eq!(references.load(Ordering::Acquire), usize::MAX);
-        references.store(2, Ordering::Release);
     }
 }

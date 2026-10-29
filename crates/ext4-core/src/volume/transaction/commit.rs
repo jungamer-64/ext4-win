@@ -474,7 +474,7 @@ impl ReservedMutation {
             durable_keys,
             Some(durable_clusters),
             overlay,
-        );
+        )?;
         let checkpointed_epoch = CommittedEpoch::prepared(
             current_epoch,
             checkpoint_sequence,
@@ -482,7 +482,7 @@ impl ReservedMutation {
             checkpoint_keys,
             Some(checkpoint_clusters),
             Vec::new(),
-        );
+        )?;
         let checkpoint = CheckpointOperation {
             home_writes,
             clean_write: planned_clean_write.into_request(),

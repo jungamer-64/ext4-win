@@ -75,11 +75,6 @@ impl KernelWideInconsistency {
         Self::without_location(FatalReason::LowerCompletionOwnershipCorruption)
     }
 
-    /// Constructs a fatal state for an impossible shared-owner reference transition.
-    pub(crate) const fn shared_ownership_corruption() -> Self {
-        Self::without_location(FatalReason::SharedOwnershipCorruption)
-    }
-
     /// Constructs a fatal state without source location context.
     const fn without_location(reason: FatalReason) -> Self {
         Self {
@@ -147,8 +142,6 @@ enum FatalReason {
     DriverDeviceTeardownCorruption,
     /// A private lower IRP, MDL, envelope, or release authority was consumed inconsistently.
     LowerCompletionOwnershipCorruption,
-    /// A driver-owned shared allocation observed an impossible reference transition.
-    SharedOwnershipCorruption,
 }
 
 impl FatalReason {
@@ -164,7 +157,6 @@ impl FatalReason {
             Self::MountedVolumeStateCorruption => 7,
             Self::DriverDeviceTeardownCorruption => 8,
             Self::LowerCompletionOwnershipCorruption => 9,
-            Self::SharedOwnershipCorruption => 10,
         }
     }
 }
@@ -223,7 +215,6 @@ mod tests {
             FatalReason::LowerCompletionOwnershipCorruption.as_parameter(),
             9
         );
-        assert_eq!(FatalReason::SharedOwnershipCorruption.as_parameter(), 10);
     }
 
     /// # Panics
@@ -262,10 +253,6 @@ mod tests {
         assert_eq!(
             KernelWideInconsistency::lower_completion_ownership_corruption().reason,
             FatalReason::LowerCompletionOwnershipCorruption
-        );
-        assert_eq!(
-            KernelWideInconsistency::shared_ownership_corruption().reason,
-            FatalReason::SharedOwnershipCorruption
         );
     }
 }

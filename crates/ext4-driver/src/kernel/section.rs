@@ -6,9 +6,10 @@
 //! authority. Each admission class has a level-triggered notification projected under the phase
 //! transition lock. Preparing closes ordinary admission while keeping paging signaled.
 
+use ext4_shared::Shared;
+
 use super::notification::AdmissionNotification;
 use super::status::{DriverError, DriverResult};
-use crate::memory::{DriverShared, DriverSharedLease};
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 #[cfg(not(test))]
 use core::{cell::UnsafeCell, marker::PhantomData, ptr::NonNull};
@@ -76,8 +77,8 @@ impl SectionSynchronization {
     /// Allocates before stream publication and initializes the notification at its final address.
     /// # Errors
     /// Returns nonpaged allocation failure before any native callback can observe the state.
-    pub(super) fn try_new() -> DriverResult<DriverShared<Self>> {
-        let owner = DriverShared::try_new(Self {
+    pub(super) fn try_new() -> DriverResult<Shared<Self>> {
+        let owner = Shared::try_new(Self {
             scans: AtomicU32::new(0),
             scans_released: AdmissionNotification::new(),
             phase: AtomicU8::new(0),
@@ -181,7 +182,7 @@ impl SectionSynchronization {
     /// Claims a unique preparation while retaining its state independently of owner movement.
     /// # Errors
     /// Returns finite shared-reference exhaustion before admission changes.
-    pub(super) fn begin(owner: &DriverShared<Self>) -> DriverResult<SectionPreparation> {
+    pub(super) fn begin(owner: &Shared<Self>) -> DriverResult<SectionPreparation> {
         let state = owner.try_acquire()?;
         while !state.get().try_begin() {
             state.get().wait(SectionAdmission::Ordinary);
@@ -266,7 +267,7 @@ impl SectionAdmission {
 #[derive(Debug)]
 struct MutationOwnership {
     /// Retains notification storage independently until this sole release authority is consumed.
-    state: DriverSharedLease<SectionSynchronization>,
+    state: Shared<SectionSynchronization>,
 }
 impl Drop for MutationOwnership {
     fn drop(&mut self) {

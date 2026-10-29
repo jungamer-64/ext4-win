@@ -1028,7 +1028,7 @@ mod tests {
             crate::FscryptKeySet::empty(),
             Some(ClusterReferenceIndex::new()),
             alloc::vec![changed],
-        );
+        )?;
         let writes = [
             StorageRequest::Write {
                 target: StorageTarget::Filesystem,
@@ -1129,7 +1129,7 @@ mod tests {
             crate::FscryptKeySet::empty(),
             Some(ClusterReferenceIndex::new()),
             Vec::new(),
-        );
+        )?;
         cache.publish(&checkpoint);
         assert_eq!(
             cached_metadata_read(

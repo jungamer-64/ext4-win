@@ -569,6 +569,8 @@ impl CommittedEpoch {
     }
 
     /// Builds a post-commit epoch from values allocated before the first lower write.
+    /// # Errors
+    /// Returns reference exhaustion before any effect or publication when retaining recovery data.
     pub(super) fn prepared(
         current: &Self,
         sequence: EpochSequence,
@@ -585,7 +587,11 @@ impl CommittedEpoch {
             fscrypt_keys,
             clusters,
             overlay,
-            recovery: current.recovery.as_ref().map(|overlay| overlay.try_acquire().map_err(crate::memory::shared_failure)).transpose()?,
+            recovery: current
+                .recovery
+                .as_ref()
+                .map(|overlay| overlay.try_acquire().map_err(crate::memory::shared_failure))
+                .transpose()?,
         })
     }
 
@@ -638,7 +644,7 @@ impl StorageReadOverlay for CommittedEpoch {
             return Ok(true);
         }
         if let Some(recovery) = &self.recovery
-            && recovery.read(target, offset, out)?
+            && recovery.get().read(target, offset, out)?
         {
             overlay.apply(target, offset, out)?;
             return Ok(true);
@@ -647,7 +653,7 @@ impl StorageReadOverlay for CommittedEpoch {
     }
     fn apply(&self, target: StorageTarget, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
         if let Some(recovery) = &self.recovery {
-            recovery.apply(target, offset, out)?;
+            recovery.get().apply(target, offset, out)?;
         }
         crate::disk_format::journal::JournalOverlay::new(
             self.superblock.block_size(),
@@ -924,7 +930,8 @@ impl MutationCoordinatorState {
 
     /// Admits staging against this session's current writable epoch.
     /// # Errors
-    /// Returns write protection, revoked ownership or a foreign/superseded metadata snapshot.
+    /// Returns write protection, revoked ownership, a foreign/superseded metadata snapshot, or
+    /// reference exhaustion while retaining active discard exclusions.
     pub fn mutation_context<'state>(
         &self,
         cache: crate::MetadataCacheAccess<'state>,
@@ -939,7 +946,7 @@ impl MutationCoordinatorState {
         }
         Ok(MutationResolveContext {
             cache,
-            exclusions: self.trims.observe(),
+            exclusions: self.trims.observe()?,
         })
     }
 

@@ -3,8 +3,9 @@
 //! A reservation excludes allocation without changing the ext4 bitmap or committed ownership.
 //! Its exact lower completion releases that exclusion even after session revocation. Dropping a
 //! pending operation cannot release ranges still owned by a lower device.
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 use core::num::{NonZeroU32, NonZeroU64};
+use ext4_shared::Shared;
 
 use super::mount::{
     CommittedEpoch, CommittedReadContext, EpochSequence, MountIdentity, MountedProfile,
@@ -235,13 +236,13 @@ struct TrimClaim {
 #[derive(Debug)]
 pub(super) struct TrimReservations {
     /// A single bounded lower command may own ranges at a time.
-    active: Option<Arc<TrimClaim>>,
+    active: Option<Shared<TrimClaim>>,
     /// Prevents late completions from releasing a successor's ranges.
     next_identity: u64,
 }
 /// Provisional immutable snapshot; commit preparation still checks current reservations.
 #[derive(Debug)]
-pub(super) struct AllocationExclusions(Option<Arc<TrimClaim>>);
+pub(super) struct AllocationExclusions(Option<Shared<TrimClaim>>);
 impl AllocationExclusions {
     /// Mount recovery has no concurrent discard owner.
     pub(super) const fn unreserved() -> Self {
@@ -249,7 +250,9 @@ impl AllocationExclusions {
     }
     /// Tests an allocation candidate without modifying committed ownership or ext4 bitmaps.
     pub(super) fn contains(&self, cluster: ClusterAddress) -> bool {
-        self.0.as_ref().is_some_and(|claim| claim.contains(cluster))
+        self.0
+            .as_ref()
+            .is_some_and(|claim| claim.get().contains(cluster))
     }
 }
 impl TrimClaim {
@@ -272,14 +275,22 @@ impl TrimReservations {
         }
     }
     /// Detaches only immutable allocation exclusions for a synchronous provisional pass.
-    pub(super) fn observe(&self) -> AllocationExclusions {
-        AllocationExclusions(self.active.as_ref().map(Arc::clone))
+    /// # Errors
+    /// Returns reference exhaustion without changing allocation exclusions.
+    pub(super) fn observe(&self) -> Result<AllocationExclusions> {
+        Ok(AllocationExclusions(
+            self.active
+                .as_ref()
+                .map(Shared::try_acquire)
+                .transpose()
+                .map_err(crate::memory::shared_failure)?,
+        ))
     }
     /// Current exclusion, revalidated immediately before effect-bearing mutation preparation.
     pub(super) fn contains(&self, cluster: ClusterAddress) -> bool {
         self.active
             .as_ref()
-            .is_some_and(|claim| claim.contains(cluster))
+            .is_some_and(|claim| claim.get().contains(cluster))
     }
 }
 
@@ -331,14 +342,15 @@ impl TrimSelection {
         }
         let identity = coordinator.trims.next_identity;
         let next_identity = identity.checked_add(1).ok_or(Error::ArithmeticOverflow)?;
-        let claim = Arc::try_new(TrimClaim {
+        let claim = Shared::try_new(TrimClaim {
             mount: self.mount,
             identity,
             ranges: self.ranges,
             bytes: self.bytes,
         })
-        .map_err(|_| Error::OutOfMemory)?;
-        coordinator.trims.active = Some(Arc::clone(&claim));
+        .map_err(crate::memory::shared_failure)?;
+        coordinator.trims.active =
+            Some(claim.try_acquire().map_err(crate::memory::shared_failure)?);
         coordinator.trims.next_identity = next_identity;
         Ok(TrimAdmission::Prepared(PreparedTrim {
             claim,
@@ -350,7 +362,7 @@ impl TrimSelection {
 #[derive(Debug)]
 pub struct PreparedTrim {
     /// Immutable record shared with the coordinator until completion.
-    claim: Arc<TrimClaim>,
+    claim: Shared<TrimClaim>,
     /// Continuation revealed only after completion.
     next: TrimCursor,
 }
@@ -358,10 +370,10 @@ impl PreparedTrim {
     /// Transfers the request while retaining exact completion and release authority.
     pub fn submit(self) -> (TrimRequest, PendingTrim) {
         let pending = PendingTrim {
-            mount: self.claim.mount,
-            identity: self.claim.identity,
+            mount: self.claim.get().mount,
+            identity: self.claim.get().identity,
             next: self.next,
-            bytes: self.claim.bytes,
+            bytes: self.claim.get().bytes,
         };
         (TrimRequest { claim: self.claim }, pending)
     }
@@ -370,16 +382,16 @@ impl PreparedTrim {
 #[derive(Debug)]
 pub struct TrimRequest {
     /// No mutable, cloneable or independently forgeable range carrier is exposed.
-    claim: Arc<TrimClaim>,
+    claim: Shared<TrimClaim>,
 }
 impl TrimRequest {
     /// Complete immutable lower intervals; the request always targets the filesystem device.
     pub fn ranges(&self) -> impl ExactSizeIterator<Item = TrimRange> + '_ {
-        self.claim.ranges.iter().map(|range| range.bytes)
+        self.claim.get().ranges.iter().map(|range| range.bytes)
     }
     /// Physical bytes requested, independent of allocator cluster counts.
     pub fn byte_count(&self) -> u64 {
-        self.claim.bytes
+        self.claim.get().bytes
     }
     /// Returns ownership after lower execution ended, or after proving it was never submitted.
     pub fn completed(self, outcome: TrimIoOutcome) -> TrimCompletion {
@@ -460,13 +472,13 @@ impl PendingTrim {
     ) -> core::result::Result<TrimBatchResult, TrimCompletionMismatch> {
         let claim = &completion.request.claim;
         if self.mount != coordinator.mount
-            || self.mount != claim.mount
-            || self.identity != claim.identity
+            || self.mount != claim.get().mount
+            || self.identity != claim.get().identity
             || coordinator
                 .trims
                 .active
                 .as_ref()
-                .is_none_or(|active| active.identity != self.identity)
+                .is_none_or(|active| active.get().identity != self.identity)
         {
             return Err(TrimCompletionMismatch {
                 reason: Error::ClusterReferenceConflict,

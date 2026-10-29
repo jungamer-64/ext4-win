@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/ext4-core",
+    "crates/ext4-shared",
     "crates/ext4-driver",
     "crates/ext4-security",
     "crates/ext4-control",
@@ -15,6 +16,7 @@ members = [
 exclude = ["fuzz"]
 default-members = [
     "crates/ext4-core",
+    "crates/ext4-shared",
     "crates/ext4-security",
     "crates/ext4-control",
     "tools/production-reachability",

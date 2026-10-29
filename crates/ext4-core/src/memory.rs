@@ -11,6 +11,14 @@ fn allocation_failed(_: alloc::collections::TryReserveError) -> Error {
     Error::OutOfMemory
 }
 
+/// Preserves allocation failure separately from reference-count representability.
+pub(crate) fn shared_failure(error: ext4_shared::Error) -> Error {
+    match error {
+        ext4_shared::Error::AllocationFailed => Error::OutOfMemory,
+        ext4_shared::Error::ReferenceLimit => Error::ArithmeticOverflow,
+    }
+}
+
 /// Moves one value into independently owned heap storage through a fallible allocation boundary.
 /// # Errors
 ///

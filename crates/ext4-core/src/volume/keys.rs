@@ -150,7 +150,7 @@ impl ReservedKeyChange {
                 .map(ClusterReferenceIndex::try_clone)
                 .transpose()?,
             Vec::new(),
-        );
+        )?;
         Ok(PreparedKeyChange {
             claim,
             expected_epoch,

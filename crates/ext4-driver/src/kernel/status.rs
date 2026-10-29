@@ -21,6 +21,12 @@ pub(crate) const STATUS_FILE_LOCK_CONFLICT: NTSTATUS = ntstatus(0xC000_0054);
 /// Driver-local result before NTSTATUS completion mapping.
 pub(crate) type DriverResult<T> = Result<T, DriverError>;
 
+impl From<ext4_shared::Error> for DriverError {
+    fn from(_error: ext4_shared::Error) -> Self {
+        Self::InsufficientResources
+    }
+}
+
 /// Driver failure after IRP decoding and ext4-core execution.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DriverError {

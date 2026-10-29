@@ -1,5 +1,7 @@
 //! Native Windows stream-header ownership boundary.
 
+use ext4_shared::Shared;
+
 pub(crate) use super::storage_admission::SnapshotPhase;
 
 #[cfg(not(test))]
@@ -237,7 +239,7 @@ pub(crate) struct StreamContext {
     /// Payload-free trace capability retained by the driver-lifetime provider owner.
     trace: OperationalTrace,
     /// Sole section admission authority, retained by callbacks and unique mutation permits.
-    sections: crate::memory::DriverShared<SectionSynchronization>,
+    sections: Shared<SectionSynchronization>,
     /// Immutable ownership domain validated by the native boundary.
     runtime: StreamRuntime,
     /// Nonpaged allocation whose leading bytes are the advanced header.

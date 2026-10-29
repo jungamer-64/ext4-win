@@ -1,14 +1,16 @@
 //! Durable UUID-scoped future-mount policy; existing sessions retain their selected value.
+
 use crate::kernel::configuration_registry::{
     ConfigurationDomain, QUERY_HEADER_BYTES, RegistryStore, SaveOutcome, key_text,
 };
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{DriverShared, DriverSharedLease, DriverVec, ShortLock};
+use crate::memory::{DriverVec, ShortLock};
 use ext4_control::{
     POLICY_RECORD_BYTES, POLICY_REPLY_BYTES, PolicyOutcome, PolicyReplacement, PolicySnapshot,
     PolicyState,
 };
 use ext4_core::FilesystemUuid;
+use ext4_shared::Shared;
 
 /// Consistent persistence facts and exclusive worker admission for one UUID.
 #[derive(Debug)]
@@ -27,7 +29,7 @@ struct Entry {
     /// Membership identity.
     uuid: FilesystemUuid,
     /// Retained through all passive work.
-    slot: DriverShared<PolicySlot>,
+    slot: Shared<PolicySlot>,
 }
 /// Mount selection can read known durable policies but cannot persist replacements.
 #[derive(Debug)]
@@ -56,7 +58,7 @@ impl PolicyDirectory {
         if self.entries.iter().any(|entry| entry.uuid == snapshot.uuid) {
             return Err(DriverError::InvalidParameter);
         }
-        let slot = DriverShared::try_new(PolicySlot(ShortLock::new(SlotState {
+        let slot = Shared::try_new(PolicySlot(ShortLock::new(SlotState {
             observation: PolicyState {
                 outcome: if snapshot.generation == 0 {
                     PolicyOutcome::NotSaved
@@ -78,7 +80,7 @@ impl PolicyDirectory {
     /// Acquires a narrow UUID capability, creating defaults if this UUID has not been configured.
     /// # Errors
     /// Returns pool or reference-budget failure.
-    fn binding(&mut self, uuid: FilesystemUuid) -> DriverResult<DriverSharedLease<PolicySlot>> {
+    fn binding(&mut self, uuid: FilesystemUuid) -> DriverResult<Shared<PolicySlot>> {
         if !self.entries.iter().any(|entry| entry.uuid == uuid) {
             self.restore(PolicySnapshot::defaults(uuid))?;
         }
@@ -88,6 +90,7 @@ impl PolicyDirectory {
             .ok_or(DriverError::InternalInvariantViolation)?
             .slot
             .try_acquire()
+            .map_err(Into::into)
     }
 }
 /// Control-device persistence authority; mounts only borrow its selection directory.
@@ -96,7 +99,7 @@ pub(crate) struct PolicyCatalog {
     /// Selection and unique membership authority.
     directory: PolicyDirectory,
     /// Retained kernel-only registry root.
-    registry: Option<DriverShared<RegistryStore>>,
+    registry: Option<Shared<RegistryStore>>,
 }
 /// Captured policy command owning its validated input.
 #[derive(Debug)]
@@ -169,7 +172,7 @@ impl PolicyCatalog {
             }
             index = index.checked_add(1).ok_or(DriverError::InvalidBufferSize)?;
         }
-        catalog.registry = Some(DriverShared::try_new(registry)?);
+        catalog.registry = Some(Shared::try_new(registry)?);
         Ok(catalog)
     }
     /// Completes all allocation, output admission and CAS checks before a persistence effect.
@@ -246,7 +249,7 @@ impl PolicyCatalog {
 #[derive(Debug)]
 struct Reservation {
     /// Scope is exactly one UUID and one worker lifetime.
-    binding: DriverSharedLease<PolicySlot>,
+    binding: Shared<PolicySlot>,
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
@@ -265,7 +268,7 @@ enum WorkKind {
 #[derive(Debug)]
 pub(crate) struct PolicyWork {
     /// Root retained through native completion.
-    registry: DriverSharedLease<RegistryStore>,
+    registry: Shared<RegistryStore>,
     /// Exclusive UUID update authority.
     reservation: Reservation,
     /// Known state before the effect; retained for failed or uncertain acknowledgement.
@@ -388,7 +391,7 @@ mod tests {
     fn selection_is_fixed_and_uncertainty_blocks_new_sessions() -> DriverResult<()> {
         let uuid = FilesystemUuid::from_bytes([5; 16]);
         let mut catalog = PolicyCatalog::empty();
-        catalog.registry = Some(DriverShared::try_new(RegistryStore {})?);
+        catalog.registry = Some(Shared::try_new(RegistryStore {})?);
         let selected = catalog.directory.select(uuid)?;
         let binding = catalog.directory.binding(uuid)?;
         let readonly = PolicySnapshot {
@@ -450,7 +453,7 @@ mod tests {
     fn output_admission_and_worker_failure_preserve_durable_selection() -> DriverResult<()> {
         let uuid = FilesystemUuid::from_bytes([8; 16]);
         let mut catalog = PolicyCatalog::empty();
-        catalog.registry = Some(DriverShared::try_new(RegistryStore {})?);
+        catalog.registry = Some(Shared::try_new(RegistryStore {})?);
         let replacement = PolicyReplacement::new(
             0,
             uuid,

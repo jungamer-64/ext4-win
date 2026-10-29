@@ -1,5 +1,7 @@
 //! Kernel CNG provider and operation-owned cryptographic objects.
 
+use ext4_shared::Shared;
+
 use core::ffi::c_void;
 use core::ptr::NonNull;
 
@@ -8,7 +10,7 @@ use wdk_sys::{NT_SUCCESS, NTSTATUS, STATUS_INSUFFICIENT_RESOURCES};
 use zeroize::Zeroize;
 
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory::{DriverShared, DriverSharedLease, DriverVec};
+use crate::memory::DriverVec;
 
 /// NUL-terminated UTF-16 CNG identifier for the kernel XTS-AES provider.
 static XTS_AES_ALGORITHM: [u16; 8] = [88, 84, 83, 45, 65, 69, 83, 0];
@@ -335,15 +337,15 @@ impl HashProvider {
 #[derive(Debug)]
 pub(crate) struct CngProvider {
     /// AES-256-XTS contents provider.
-    xts: DriverShared<SymmetricProvider>,
+    xts: Shared<SymmetricProvider>,
     /// AES-256 ECB primitive used to implement Linux-compatible CBC-CS3.
-    aes_ecb: DriverShared<SymmetricProvider>,
+    aes_ecb: Shared<SymmetricProvider>,
     /// HKDF-SHA512 key derivation provider.
-    hkdf: DriverShared<SymmetricProvider>,
+    hkdf: Shared<SymmetricProvider>,
     /// SHA-256 provider.
-    sha256: DriverShared<HashProvider>,
+    sha256: Shared<HashProvider>,
     /// SHA-512 provider.
-    sha512: DriverShared<HashProvider>,
+    sha512: Shared<HashProvider>,
 }
 
 impl CngProvider {
@@ -353,17 +355,17 @@ impl CngProvider {
     /// Returns an error when a provider is unavailable, reports unexpected geometry, or CNG runs
     /// out of resources during mount construction.
     pub(crate) fn try_open() -> DriverResult<Self> {
-        let xts = DriverShared::try_new(SymmetricProvider::open_aes(&XTS_AES_ALGORITHM)?)?;
+        let xts = Shared::try_new(SymmetricProvider::open_aes(&XTS_AES_ALGORITHM)?)?;
         let mut aes_ecb = SymmetricProvider::open_aes(&AES_ALGORITHM)?;
         set_wide_property(
             &mut aes_ecb.algorithm,
             &CHAINING_MODE_PROPERTY,
             &CHAINING_MODE_ECB,
         )?;
-        let aes_ecb = DriverShared::try_new(aes_ecb)?;
-        let hkdf = DriverShared::try_new(SymmetricProvider::open(&HKDF_ALGORITHM)?)?;
-        let sha256 = DriverShared::try_new(HashProvider::open(&SHA256_ALGORITHM, 32)?)?;
-        let sha512 = DriverShared::try_new(HashProvider::open(&SHA512_ALGORITHM, 64)?)?;
+        let aes_ecb = Shared::try_new(aes_ecb)?;
+        let hkdf = Shared::try_new(SymmetricProvider::open(&HKDF_ALGORITHM)?)?;
+        let sha256 = Shared::try_new(HashProvider::open(&SHA256_ALGORITHM, 32)?)?;
+        let sha512 = Shared::try_new(HashProvider::open(&SHA512_ALGORITHM, 64)?)?;
         Ok(Self {
             xts,
             aes_ecb,
@@ -409,7 +411,7 @@ struct ReusableHash {
     /// Hash object bytes retained at one allocation address until `BCryptDestroyHash`.
     object: DriverVec<u8>,
     /// Drops after native hash destruction and backing-buffer release, including rollback.
-    provider: DriverSharedLease<HashProvider>,
+    provider: Shared<HashProvider>,
 }
 
 impl ReusableHash {
@@ -422,7 +424,7 @@ impl ReusableHash {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn try_new(provider: DriverSharedLease<HashProvider>) -> DriverResult<Self> {
+    fn try_new(provider: Shared<HashProvider>) -> DriverResult<Self> {
         let mut object = DriverVec::try_repeated_copy(0_u8, provider.get().object_bytes)?;
         let object_bytes =
             u32::try_from(object.len()).map_err(|_| DriverError::InvalidBufferSize)?;
@@ -565,11 +567,11 @@ impl Drop for GeneratedKey<'_> {
 #[derive(Debug)]
 pub(crate) struct CngOperation {
     /// Independent lifetime ownership for XTS key generation.
-    xts: DriverSharedLease<SymmetricProvider>,
+    xts: Shared<SymmetricProvider>,
     /// Independent lifetime ownership for CBC-CS3 key generation.
-    aes_ecb: DriverSharedLease<SymmetricProvider>,
+    aes_ecb: Shared<SymmetricProvider>,
     /// Independent lifetime ownership for HKDF key generation.
-    hkdf: DriverSharedLease<SymmetricProvider>,
+    hkdf: Shared<SymmetricProvider>,
     /// Reusable SHA-256 object.
     sha256: ReusableHash,
     /// Reusable SHA-512 object.

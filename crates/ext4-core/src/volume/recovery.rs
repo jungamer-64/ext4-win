@@ -108,10 +108,7 @@ impl RecoveryOverlay {
     /// # Errors
     /// Returns arithmetic overflow or logical recovery-budget exhaustion.
     fn require_budget(&self, payload: usize, index_capacity: usize) -> Result<()> {
-        // Charge the retained shared allocation, including its two reference counters.
-        let shared_bytes = size_of::<Self>()
-            .checked_add(size_of::<[usize; 2]>())
-            .ok_or(Error::ArithmeticOverflow)?;
+        let shared_bytes = ext4_shared::Shared::<Self>::allocation_size();
         let charged = index_capacity
             .checked_mul(size_of::<RecoveryImage>())
             .and_then(|index| index.checked_add(payload))

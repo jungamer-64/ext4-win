@@ -39,9 +39,17 @@ pub(crate) fn verify_portable(repository_root: &Path) -> TaskResult<()> {
     run_checked(
         cargo_command(
             repository_root,
-            &["doc", "--locked", "-p", "windows-host", "--no-deps"],
+            &[
+                "doc",
+                "--locked",
+                "-p",
+                "windows-host",
+                "-p",
+                "ext4-shared",
+                "--no-deps",
+            ],
         ),
-        "host boundary rustdoc gate",
+        "shared ownership and host boundary rustdoc gate",
     )?;
     #[cfg(windows)]
     run_checked(

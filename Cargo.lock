@@ -297,6 +297,7 @@ dependencies = [
 name = "ext4-core"
 version = "0.1.0"
 dependencies = [
+ "ext4-shared",
  "ext4-unicode-gen",
  "hkdf",
  "sha2",
@@ -325,6 +326,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4-shared"
+version = "0.1.0"
+
+[[package]]
 name = "ext4-unicode-gen"
 version = "0.1.0"
 dependencies = [
@@ -349,6 +354,7 @@ dependencies = [
  "ext4-control",
  "ext4-core",
  "ext4-security",
+ "ext4-shared",
  "wdk-alloc",
  "wdk-build",
  "wdk-sys",

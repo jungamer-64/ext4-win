@@ -4,11 +4,12 @@
 //! to the surviving link, including existing handles. Native callbacks never access this table.
 //! Pending removal survives zero handle references until cleanup establishes its outcome.
 
+use ext4_shared::Shared;
+
 use super::{
     DriverError, DriverResult, DriverVec, FileCleanupDisposition, FileDeleteTarget,
     KernelWideInconsistency, OpenedLocation, PendingFileDeletion,
 };
-use crate::memory::{DriverShared, DriverSharedLease};
 use core::{
     cell::{Cell, Ref, RefCell, RefMut},
     ptr::NonNull,
@@ -17,7 +18,7 @@ use core::{
 /// One inode's selected links, allocated on its first namespace handle.
 pub(super) struct OpenedLocations {
     /// Slot ownership survives its final handle while deletion is still pending.
-    table: Option<DriverShared<RefCell<LinkTable>>>,
+    table: Option<Shared<RefCell<LinkTable>>>,
 }
 /// Slots are reused only after references and deletion obligations retire.
 #[derive(Debug)]
@@ -280,7 +281,7 @@ impl OpenedLocations {
         location: OpenedLocation,
     ) -> DriverResult<OpenedLocationLease> {
         if self.table.is_none() {
-            self.table = Some(DriverShared::try_new(RefCell::new(LinkTable {
+            self.table = Some(Shared::try_new(RefCell::new(LinkTable {
                 slots: DriverVec::new(),
             }))?);
         }
@@ -408,7 +409,7 @@ impl OpenedLocations {
 #[derive(Debug)]
 struct LinkLease {
     /// Registry allocation retained through this slot's final reference.
-    table: DriverSharedLease<RefCell<LinkTable>>,
+    table: Shared<RefCell<LinkTable>>,
     /// Private, stable slot index.
     reference: SlotReference,
 }
@@ -437,7 +438,7 @@ impl LinkLease {
     }
     /// # Errors
     /// Returns reference exhaustion without changing ownership.
-    fn retain(table: DriverSharedLease<RefCell<LinkTable>>, index: usize) -> DriverResult<Self> {
+    fn retain(table: Shared<RefCell<LinkTable>>, index: usize) -> DriverResult<Self> {
         borrow_mut(table.get()).retain(index)?;
         Ok(Self {
             table,

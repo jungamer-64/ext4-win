@@ -14,7 +14,7 @@ compile the driver or require WDK.
 
 | Command | Host requirements | What it establishes |
 | --- | --- | --- |
-| `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, runs the portable tests and Clippy, and documents the host boundary. |
+| `cargo xtask verify-portable` | Windows, Linux, or macOS | Checks formatting and all portable targets, runs the portable tests and Clippy, and documents the shared ownership and host boundaries. |
 | `cargo xtask verify-windows-host` | Elevated Windows host | Exercises native Windows ETW and token/privilege contracts without installing a driver. |
 | `cargo xtask verify-driver` | Windows with MSVC, WDK, and Clang configured | Checks, tests, lints, and documents the kernel-driver crate and its native boundaries. |
 | `cargo xtask verify-fuzz-replay` | Host with the repository-pinned cargo-fuzz installed | Discovers every declared fuzz target and replays its tracked corpus once under the bounded fuzz harness. |
