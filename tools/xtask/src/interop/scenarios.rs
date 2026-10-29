@@ -3982,6 +3982,22 @@ fn generate_external_journal_fixture(
             &format!("external filesystem format for {}", fixture.name),
         )?;
 
+        // Journal discovery uses the UUID. Keep its serialized device hint independent of
+        // the host's allocated loop number, including every backup superblock.
+        let canonical_device = case_root.join("journal-device.commands");
+        fs::write(
+            &canonical_device,
+            "set_super_value journal_dev 1792\nclose -a\n",
+        )?;
+        let canonical_device_path = linux.tool_path(&canonical_device)?;
+        let mut canonicalize =
+            linux.command_with_environment("debugfs", "E2FSPROGS_FAKE_TIME", &fake_time);
+        canonicalize.args(["-w", "-f", &canonical_device_path, &loops.filesystem]);
+        run_checked(
+            canonicalize,
+            "external journal device-hint canonicalization",
+        )?;
+
         let free_block = debugfs_first_free_block(linux, &loops.filesystem)?;
         if free_block != fixture.replay_block {
             return Err(io::Error::other(format!(

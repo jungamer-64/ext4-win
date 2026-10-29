@@ -1,7 +1,10 @@
 use crate::{
     TaskResult,
     development::{verify_driver, verify_portable},
-    interop::{verify_htree_interop, verify_journal_interop, verify_ro_interop},
+    interop::{
+        verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop,
+        verify_ro_interop,
+    },
     process::{
         cargo_command, combine_verification_and_cleanup, create_task_directory,
         remove_task_directory, require_file, run_checked, run_checked_output, sha256_bytes,
@@ -308,6 +311,7 @@ pub(crate) fn build_verified_production_bundle(
 ) -> TaskResult<VerifiedProductionBundle> {
     verify_portable(repository_root)?;
     verify_driver(repository_root)?;
+    verify_journal_fixture_provenance(repository_root)?;
     verify_journal_interop(repository_root)?;
     verify_htree_interop(repository_root)?;
     verify_ro_interop(repository_root)?;
