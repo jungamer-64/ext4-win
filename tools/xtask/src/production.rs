@@ -97,6 +97,37 @@ impl ArtifactIdentity {
 struct SourceSnapshot([u8; 32]);
 
 impl SourceSnapshot {
+    /// Binds completed verification work to the source digest observed before its first gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns snapshot or verification failures, or rejects source changes during verification.
+    /// The caller must recheck the returned digest before publishing later build artifacts.
+    fn verify<T>(
+        repository_root: &Path,
+        verification: impl FnOnce() -> TaskResult<T>,
+    ) -> TaskResult<(Self, T)> {
+        let snapshot = source_snapshot(repository_root)?;
+        let result = verification()?;
+        snapshot.require_unchanged(repository_root)?;
+        Ok((snapshot, result))
+    }
+
+    /// Requires later build or publication work to retain this verification's source identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns snapshot failures or rejects any source digest different from this observation.
+    fn require_unchanged(&self, repository_root: &Path) -> TaskResult<()> {
+        if *self != source_snapshot(repository_root)? {
+            return Err(io::Error::other(
+                "source inputs changed while the production artifact gate was running",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     /// Formats the exact source digest recorded in a production manifest.
     ///
     /// # Errors
@@ -309,12 +340,6 @@ pub(crate) fn verify_production_driver(repository_root: &Path) -> TaskResult<()>
 pub(crate) fn build_verified_production_bundle(
     repository_root: &Path,
 ) -> TaskResult<VerifiedProductionBundle> {
-    verify_portable(repository_root)?;
-    verify_driver(repository_root)?;
-    verify_journal_fixture_provenance(repository_root)?;
-    verify_journal_interop(repository_root)?;
-    verify_htree_interop(repository_root)?;
-    verify_ro_interop(repository_root)?;
     if !cfg!(target_os = "windows") {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -323,7 +348,14 @@ pub(crate) fn build_verified_production_bundle(
         .into());
     }
 
-    let source_before = source_snapshot(repository_root)?;
+    let (source_before, ()) = SourceSnapshot::verify(repository_root, || {
+        verify_portable(repository_root)?;
+        verify_driver(repository_root)?;
+        verify_journal_fixture_provenance(repository_root)?;
+        verify_journal_interop(repository_root)?;
+        verify_htree_interop(repository_root)?;
+        verify_ro_interop(repository_root)
+    })?;
     let identity = ArtifactIdentity::create(repository_root)?;
     build_production_driver(repository_root, &identity)?;
     let artifacts = locate_production_artifacts(repository_root, &identity)?;
@@ -376,13 +408,7 @@ pub(crate) fn build_verified_production_bundle(
         }
     };
     let publication = (|| -> TaskResult<PathBuf> {
-        let source_after = source_snapshot(repository_root)?;
-        if source_before != source_after {
-            return Err(io::Error::other(
-                "source inputs changed while the production artifact gate was running",
-            )
-            .into());
-        }
+        source_before.require_unchanged(repository_root)?;
         write_production_manifest(
             repository_root,
             &snapshot_directory,
@@ -1247,6 +1273,52 @@ fn hash_source_record(hasher: &mut Sha256, relative_path: &str, contents: Option
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Verification and later publication reject source changes inside their observation window.
+    ///
+    /// # Errors
+    ///
+    /// Returns fixture setup, source identity, contract violation, or mandatory cleanup failures.
+    #[test]
+    fn verification_snapshot_brackets_gate_work_and_publication() -> TaskResult<()> {
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()?;
+        let directory = create_task_directory(&repository_root, "source-snapshot-test")?;
+        let verification = (|| -> TaskResult<()> {
+            let mut initialize = Command::new("git");
+            initialize.current_dir(&directory).args(["init", "--quiet"]);
+            run_checked(initialize, "source snapshot fixture initialization")?;
+            let input = directory.join("Cargo.toml");
+            fs::write(&input, b"initial input")?;
+            let (snapshot, value) = SourceSnapshot::verify(&directory, || Ok(7))?;
+            if value != 7 || snapshot != source_snapshot(&directory)? {
+                return Err(
+                    io::Error::other("unchanged verification lost its source identity").into(),
+                );
+            }
+
+            let changed = SourceSnapshot::verify(&directory, || {
+                fs::write(&input, b"changed during verification")?;
+                Ok(())
+            });
+            if changed.is_ok() || fs::read(&input)? != b"changed during verification" {
+                return Err(
+                    io::Error::other("source change inside verification was accepted").into(),
+                );
+            }
+            if snapshot.require_unchanged(&directory).is_ok() {
+                return Err(
+                    io::Error::other("publication accepted a different source identity").into(),
+                );
+            }
+            let (current, ()) = SourceSnapshot::verify(&directory, || Ok(()))?;
+            current.require_unchanged(&directory)?;
+            Ok(())
+        })();
+        let cleanup = remove_task_directory(&repository_root, &directory, "source-snapshot-test");
+        combine_verification_and_cleanup(verification, cleanup)
+    }
 
     /// Artifact discovery requires all linker/package outputs and exactly one current-identity IR.
     ///
