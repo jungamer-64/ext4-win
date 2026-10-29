@@ -1,6 +1,7 @@
 //! Block-device boundary and strongly typed byte/block positions.
 
 use crate::error::{Error, Result};
+use core::num::NonZeroU32;
 
 /// Total byte length of a backing block device.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -64,7 +65,7 @@ impl BlockAddress {
 
 /// Validated ext4 block size.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct BlockSize(u32);
+pub struct BlockSize(NonZeroU32);
 
 impl BlockSize {
     /// Creates a supported ext4 block size from `s_log_block_size`.

@@ -9,6 +9,7 @@ use crate::disk_format::inode::{
 };
 use crate::error::{Error, Result};
 use crate::memory;
+use core::num::NonZeroU32;
 
 // ext4 superblock and feature-policy constants. Feature masks stay here so the
 // mount boundary is the only place where unsupported on-disk formats enter.
@@ -327,7 +328,7 @@ impl ClusterCount {
 
 /// Validated ext4 allocation cluster size in bytes.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct ClusterSize(u32);
+pub struct ClusterSize(NonZeroU32);
 
 impl ClusterSize {
     /// Creates a cluster size from validated superblock geometry.
