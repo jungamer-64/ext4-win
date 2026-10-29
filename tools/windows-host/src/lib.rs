@@ -4,7 +4,7 @@
 //! dropping an owner is a fallback and never establishes a successful live validation.
 
 #![deny(unsafe_code)]
-#![cfg_attr(windows, feature(allocator_api))]
+#![cfg_attr(windows, feature(allocator_ext))]
 
 extern crate alloc;
 

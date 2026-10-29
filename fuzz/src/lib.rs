@@ -1,6 +1,6 @@
 //! Bounded deterministic storage harnesses for ext4 mount and journal recovery fuzzing.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 use ext4_core::{
     CompletedStorageTransfer, DeviceLength, Error, ExternalJournalProbeOperation,

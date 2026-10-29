@@ -229,64 +229,6 @@ fn parse_resize_pointer_block(bytes: &[u8]) -> Result<Vec<BlockAddress>> {
     Ok(blocks)
 }
 
-#[cfg(test)]
-mod tests {
-    use alloc::vec;
-
-    use super::{parse_resize_pointer_block, reserve_bitmap_padding};
-    use crate::disk::block::BlockAddress;
-    use crate::disk::endian::{DiskOffset, put_le_u32};
-    use crate::error::Error;
-
-    /// # Panics
-    /// Fails if bitmap padding changes populated bits or leaves storage-tail bits available.
-    #[test]
-    fn allocation_bitmap_padding_preserves_populated_bits() {
-        for (populated, expected) in [
-            (0, [0xff, 0xff]),
-            (3, [0xfd, 0xff]),
-            (8, [0xa5, 0xff]),
-            (16, [0xa5, 0x5a]),
-        ] {
-            let mut bytes = [0xa5, 0x5a];
-            assert_eq!(reserve_bitmap_padding(&mut bytes, populated), Ok(()));
-            assert_eq!(bytes, expected);
-        }
-        let mut bytes = [0xa5, 0x5a];
-        assert_eq!(
-            reserve_bitmap_padding(&mut bytes, 17),
-            Err(Error::InvalidSuperblock)
-        );
-        assert_eq!(bytes, [0xa5, 0x5a]);
-        assert_eq!(reserve_bitmap_padding(&mut [], 0), Ok(()));
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn resize_pointer_block_keeps_only_nonzero_addresses() {
-        let mut bytes = [0_u8; 12];
-        assert_eq!(put_le_u32(&mut bytes, DiskOffset::new(4), 17_432), Ok(()));
-        assert_eq!(put_le_u32(&mut bytes, DiskOffset::new(8), 65_537), Ok(()));
-        assert_eq!(
-            parse_resize_pointer_block(&bytes),
-            Ok(vec![BlockAddress::new(17_432), BlockAddress::new(65_537)])
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics when assertions or fixed test fixture assumptions fail.
-    #[test]
-    fn resize_pointer_block_rejects_partial_pointer_tail() {
-        assert_eq!(
-            parse_resize_pointer_block(&[0_u8; 5]),
-            Err(Error::UnsupportedBlockMap)
-        );
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// Staged reference-count delta for one allocation cluster.
 pub(super) struct ClusterReferenceDelta {
@@ -617,4 +559,62 @@ pub(super) fn round_up_div(value: u64, divisor: u64) -> Result<u64> {
     adjusted
         .checked_div(divisor)
         .ok_or(Error::ArithmeticOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+
+    use super::{parse_resize_pointer_block, reserve_bitmap_padding};
+    use crate::disk::block::BlockAddress;
+    use crate::disk::endian::{DiskOffset, put_le_u32};
+    use crate::error::Error;
+
+    /// # Panics
+    /// Fails if bitmap padding changes populated bits or leaves storage-tail bits available.
+    #[test]
+    fn allocation_bitmap_padding_preserves_populated_bits() {
+        for (populated, expected) in [
+            (0, [0xff, 0xff]),
+            (3, [0xfd, 0xff]),
+            (8, [0xa5, 0xff]),
+            (16, [0xa5, 0x5a]),
+        ] {
+            let mut bytes = [0xa5, 0x5a];
+            assert_eq!(reserve_bitmap_padding(&mut bytes, populated), Ok(()));
+            assert_eq!(bytes, expected);
+        }
+        let mut bytes = [0xa5, 0x5a];
+        assert_eq!(
+            reserve_bitmap_padding(&mut bytes, 17),
+            Err(Error::InvalidSuperblock)
+        );
+        assert_eq!(bytes, [0xa5, 0x5a]);
+        assert_eq!(reserve_bitmap_padding(&mut [], 0), Ok(()));
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn resize_pointer_block_keeps_only_nonzero_addresses() {
+        let mut bytes = [0_u8; 12];
+        assert_eq!(put_le_u32(&mut bytes, DiskOffset::new(4), 17_432), Ok(()));
+        assert_eq!(put_le_u32(&mut bytes, DiskOffset::new(8), 65_537), Ok(()));
+        assert_eq!(
+            parse_resize_pointer_block(&bytes),
+            Ok(vec![BlockAddress::new(17_432), BlockAddress::new(65_537)])
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics when assertions or fixed test fixture assumptions fail.
+    #[test]
+    fn resize_pointer_block_rejects_partial_pointer_tail() {
+        assert_eq!(
+            parse_resize_pointer_block(&[0_u8; 5]),
+            Err(Error::UnsupportedBlockMap)
+        );
+    }
 }

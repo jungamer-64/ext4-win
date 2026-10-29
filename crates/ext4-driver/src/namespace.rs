@@ -187,6 +187,49 @@ impl<'name> WindowsNameLookup<'name> {
     }
 }
 
+/// Unique parent relation resolved from the same committed directory graph as the caller.
+#[derive(Debug)]
+pub(crate) struct DirectoryParent {
+    /// Parent directory selected by the child's dot-dot relation.
+    pub(crate) directory: DirectoryNodeId,
+    /// Exact Windows-representable spelling linking parent to child.
+    pub(crate) name: WindowsName,
+}
+
+/// Resolves a non-root directory's unique containing link.
+/// # Errors
+/// Rejects malformed/ambiguous parent relations, unavailable names, or storage/allocation failure.
+pub(crate) fn directory_parent(
+    read: &mut impl CommittedReadPass,
+    directory: DirectoryNodeId,
+) -> DriverResult<DirectoryParent> {
+    let parent = match read.lookup_child(directory, &Ext4Name::new(b"..")?)? {
+        ChildLookup::Found(child) => match *child.node() {
+            ext4_core::NodeId::Directory(parent) if parent != directory => parent,
+            _ => return Err(ext4_core::Error::InvalidDirectoryEntry.into()),
+        },
+        ChildLookup::NotFound => return Err(ext4_core::Error::InvalidDirectoryEntry.into()),
+    };
+    let mut reader = DirectoryReader::new(parent, DirectoryScanCursor::start());
+    let mut name = None;
+    while let Some(scanned) = read.next_directory_entry(&mut reader)? {
+        let entry = scanned.into_entry();
+        if entry.name().bytes() == b"." || entry.name().bytes() == b".." {
+            continue;
+        }
+        if *entry.node() == ext4_core::NodeId::Directory(directory) {
+            if name.is_some() {
+                return Err(ext4_core::Error::InvalidDirectoryEntry.into());
+            }
+            name = Some(WindowsName::from_ext4(entry.name())?);
+        }
+    }
+    Ok(DirectoryParent {
+        directory: parent,
+        name: name.ok_or(ext4_core::Error::InvalidDirectoryEntry)?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::WindowsName;
@@ -247,47 +290,4 @@ mod tests {
             assert!(name.to_ext4().is_err());
         }
     }
-}
-
-/// Unique parent relation resolved from the same committed directory graph as the caller.
-#[derive(Debug)]
-pub(crate) struct DirectoryParent {
-    /// Parent directory selected by the child's dot-dot relation.
-    pub(crate) directory: DirectoryNodeId,
-    /// Exact Windows-representable spelling linking parent to child.
-    pub(crate) name: WindowsName,
-}
-
-/// Resolves a non-root directory's unique containing link.
-/// # Errors
-/// Rejects malformed/ambiguous parent relations, unavailable names, or storage/allocation failure.
-pub(crate) fn directory_parent(
-    read: &mut impl CommittedReadPass,
-    directory: DirectoryNodeId,
-) -> DriverResult<DirectoryParent> {
-    let parent = match read.lookup_child(directory, &Ext4Name::new(b"..")?)? {
-        ChildLookup::Found(child) => match *child.node() {
-            ext4_core::NodeId::Directory(parent) if parent != directory => parent,
-            _ => return Err(ext4_core::Error::InvalidDirectoryEntry.into()),
-        },
-        ChildLookup::NotFound => return Err(ext4_core::Error::InvalidDirectoryEntry.into()),
-    };
-    let mut reader = DirectoryReader::new(parent, DirectoryScanCursor::start());
-    let mut name = None;
-    while let Some(scanned) = read.next_directory_entry(&mut reader)? {
-        let entry = scanned.into_entry();
-        if entry.name().bytes() == b"." || entry.name().bytes() == b".." {
-            continue;
-        }
-        if *entry.node() == ext4_core::NodeId::Directory(directory) {
-            if name.is_some() {
-                return Err(ext4_core::Error::InvalidDirectoryEntry.into());
-            }
-            name = Some(WindowsName::from_ext4(entry.name())?);
-        }
-    }
-    Ok(DirectoryParent {
-        directory: parent,
-        name: name.ok_or(ext4_core::Error::InvalidDirectoryEntry)?,
-    })
 }

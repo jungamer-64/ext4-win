@@ -1,6 +1,6 @@
 //! Concurrent read and mutation contracts over independently generated ext4 journal fixtures.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 

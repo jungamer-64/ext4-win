@@ -993,55 +993,6 @@ unsafe fn check_create_privileges(
     granted
 }
 
-#[cfg(test)]
-mod privilege_tests {
-    use super::{CreateDisposition, CreatePrivilegeAccess};
-
-    /// # Panics
-    /// Fails if privilege planning grants unrequested rights or treats a create-only disposition as an open.
-    #[test]
-    fn privilege_rights_follow_disposition_and_explicit_requests() {
-        for disposition in [
-            CreateDisposition::Supersede,
-            CreateDisposition::Create,
-            CreateDisposition::Overwrite,
-        ] {
-            assert_eq!(
-                CreatePrivilegeAccess::for_request(disposition, 1),
-                CreatePrivilegeAccess {
-                    backup: 0,
-                    restore: 0
-                }
-            );
-        }
-        for disposition in [
-            CreateDisposition::Open,
-            CreateDisposition::OpenIf,
-            CreateDisposition::OverwriteIf,
-        ] {
-            assert_eq!(
-                CreatePrivilegeAccess::for_request(disposition, 1),
-                CreatePrivilegeAccess {
-                    backup: 1,
-                    restore: 0
-                }
-            );
-        }
-        assert_eq!(
-            CreatePrivilegeAccess::for_request(CreateDisposition::Create, 0x90000),
-            CreatePrivilegeAccess {
-                backup: 0,
-                restore: 0x90000
-            }
-        );
-        let maximum =
-            CreatePrivilegeAccess::for_request(CreateDisposition::Open, wdk_sys::MAXIMUM_ALLOWED);
-        assert_eq!(maximum.backup, 0x11200A9);
-        assert_eq!(maximum.restore, 0x11F0116);
-        assert_eq!(maximum.backup | maximum.restore, 0x11F01BF);
-    }
-}
-
 /// Expands maximum rights only for a trusted kernel-mode bypass.
 const fn trusted_kernel_access(raw: wdk_sys::ACCESS_MASK) -> wdk_sys::ACCESS_MASK {
     let mapped = map_file_generic_access(raw);
@@ -1508,3 +1459,52 @@ const IGNORED_CREATE_HINT_OPTIONS: wdk_sys::ULONG = wdk_sys::FILE_SEQUENTIAL_ONL
 const ACCEPTED_CREATE_OPTIONS: wdk_sys::ULONG = DOMAIN_CREATE_OPTIONS | IGNORED_CREATE_HINT_OPTIONS;
 /// WDK share-access bits accepted by create/open.
 pub(super) const FILE_SHARE_ACCESS_MASK: wdk_sys::USHORT = 0x0007;
+
+#[cfg(test)]
+mod privilege_tests {
+    use super::{CreateDisposition, CreatePrivilegeAccess};
+
+    /// # Panics
+    /// Fails if privilege planning grants unrequested rights or treats a create-only disposition as an open.
+    #[test]
+    fn privilege_rights_follow_disposition_and_explicit_requests() {
+        for disposition in [
+            CreateDisposition::Supersede,
+            CreateDisposition::Create,
+            CreateDisposition::Overwrite,
+        ] {
+            assert_eq!(
+                CreatePrivilegeAccess::for_request(disposition, 1),
+                CreatePrivilegeAccess {
+                    backup: 0,
+                    restore: 0
+                }
+            );
+        }
+        for disposition in [
+            CreateDisposition::Open,
+            CreateDisposition::OpenIf,
+            CreateDisposition::OverwriteIf,
+        ] {
+            assert_eq!(
+                CreatePrivilegeAccess::for_request(disposition, 1),
+                CreatePrivilegeAccess {
+                    backup: 1,
+                    restore: 0
+                }
+            );
+        }
+        assert_eq!(
+            CreatePrivilegeAccess::for_request(CreateDisposition::Create, 0x90000),
+            CreatePrivilegeAccess {
+                backup: 0,
+                restore: 0x90000
+            }
+        );
+        let maximum =
+            CreatePrivilegeAccess::for_request(CreateDisposition::Open, wdk_sys::MAXIMUM_ALLOWED);
+        assert_eq!(maximum.backup, 0x11200A9);
+        assert_eq!(maximum.restore, 0x11F0116);
+        assert_eq!(maximum.backup | maximum.restore, 0x11F01BF);
+    }
+}

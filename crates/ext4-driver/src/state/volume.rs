@@ -54,30 +54,6 @@ impl VolumeControlPlane {
     }
 }
 
-#[cfg(test)]
-mod query_removal_tests {
-    use super::{DriverError, MountedVolumeState, VolumeControlPlane};
-
-    /// # Panics
-    /// Panics if a retained direct FILE_OBJECT or terminal lifecycle can enter reversible removal.
-    #[test]
-    fn query_removal_requires_an_unlocked_volume_without_direct_file_objects() {
-        let mut control = VolumeControlPlane::mounted();
-        assert_eq!(control.authorize_query_removal(), Ok(()));
-        control.volume_file_objects = 1;
-        assert_eq!(
-            control.authorize_query_removal(),
-            Err(DriverError::DeviceBusy)
-        );
-        control.volume_file_objects = 0;
-        control.state = MountedVolumeState::ShutdownComplete { lock_owner: None };
-        assert_eq!(
-            control.authorize_query_removal(),
-            Err(DriverError::DeviceBusy)
-        );
-    }
-}
-
 /// Mounted-volume state serialized by the device actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MountedVolumeState {
@@ -2047,5 +2023,29 @@ impl MountedVolumeAccess<'_> {
             volume: owner,
             node,
         })
+    }
+}
+
+#[cfg(test)]
+mod query_removal_tests {
+    use super::{DriverError, MountedVolumeState, VolumeControlPlane};
+
+    /// # Panics
+    /// Panics if a retained direct FILE_OBJECT or terminal lifecycle can enter reversible removal.
+    #[test]
+    fn query_removal_requires_an_unlocked_volume_without_direct_file_objects() {
+        let mut control = VolumeControlPlane::mounted();
+        assert_eq!(control.authorize_query_removal(), Ok(()));
+        control.volume_file_objects = 1;
+        assert_eq!(
+            control.authorize_query_removal(),
+            Err(DriverError::DeviceBusy)
+        );
+        control.volume_file_objects = 0;
+        control.state = MountedVolumeState::ShutdownComplete { lock_owner: None };
+        assert_eq!(
+            control.authorize_query_removal(),
+            Err(DriverError::DeviceBusy)
+        );
     }
 }

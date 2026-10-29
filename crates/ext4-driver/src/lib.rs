@@ -1,6 +1,6 @@
 //! Native Windows kernel entry point for the ext4 file system driver.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(try_reserve_kind)]
 #![feature(vec_push_within_capacity)]
 #![deny(unsafe_code)]

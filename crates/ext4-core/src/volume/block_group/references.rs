@@ -13,121 +13,6 @@ pub(in crate::volume) struct ClusterReferenceIndex {
     runs: Vec<ReferenceRun>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// # Errors
-    /// Propagates range construction, allocation and successor preparation failures.
-    /// # Panics
-    /// Fails if count boundaries, coalescing or immutable epoch semantics change.
-    #[test]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "fixture failures propagate while assertions compare independent counts"
-    )]
-    fn ownership_boundaries_and_epoch_deltas_match_dense_counts() -> Result<()> {
-        let mut index = ClusterReferenceIndex::new();
-        let mut expected = [0_u32; 32];
-        for (start, end, count) in [(2, 9, 1), (8, 12, 2), (12, 20, 2), (25, 28, 4)] {
-            index.append_owned_range(
-                ClusterAddress::new(start),
-                ClusterAddress::new(end),
-                count,
-            )?;
-            for slot in expected
-                .iter_mut()
-                .take(usize::try_from(end).map_err(|_| Error::ArithmeticOverflow)?)
-                .skip(usize::try_from(start).map_err(|_| Error::ArithmeticOverflow)?)
-            {
-                *slot += count;
-            }
-        }
-        for changes in [
-            [(19, -2), (2, -1), (9, 1), (0, 1)],
-            [(8, -3), (20, 2), (19, 2), (31, 1)],
-            [(0, -1), (9, -1), (8, 2), (2, 1)],
-        ] {
-            let previous = index.try_clone()?;
-            let deltas = changes.map(|(cluster, delta)| ClusterReferenceDelta {
-                cluster: ClusterAddress::new(cluster),
-                delta,
-            });
-            let successor = index.with_deltas(&deltas)?;
-            assert_eq!(index, previous);
-            for (cluster, delta) in changes {
-                let slot = expected
-                    .get_mut(usize::try_from(cluster).map_err(|_| Error::ArithmeticOverflow)?)
-                    .ok_or(Error::InvalidClusterGeometry)?;
-                *slot = slot
-                    .checked_add_signed(delta)
-                    .ok_or(Error::ArithmeticOverflow)?;
-            }
-            for (cluster, expected) in expected.iter().copied().enumerate() {
-                assert_eq!(
-                    successor.count(ClusterAddress::new(
-                        u64::try_from(cluster).map_err(|_| Error::ArithmeticOverflow)?
-                    )),
-                    expected
-                );
-            }
-            index = successor;
-        }
-        Ok(())
-    }
-
-    /// # Errors
-    /// Propagates fixture construction and allocation errors.
-    /// # Panics
-    /// Fails if large contiguous ownership expands with volume size, or errors alter its epoch.
-    #[test]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "assertions verify the space bound and failure atomicity"
-    )]
-    fn contiguous_ownership_stays_bounded_across_split_merge_and_failure() -> Result<()> {
-        let mut index = ClusterReferenceIndex::new();
-        index.append_owned_range(
-            ClusterAddress::new(0),
-            ClusterAddress::new(1_000_000_000),
-            1,
-        )?;
-        let delta = ClusterReferenceDelta {
-            cluster: ClusterAddress::new(500_000_000),
-            delta: 1,
-        };
-        let split = index.with_deltas(&[delta])?;
-        // Ownership storage is bounded by count transitions, independent of interval length.
-        assert_eq!(index.runs.len(), 1);
-        assert_eq!(split.runs.len(), 3);
-        assert_eq!(split.count(delta.cluster), 2);
-        assert_eq!(split.count(ClusterAddress::new(1_000_000_000)), 0);
-        assert_eq!(
-            split.with_deltas(&[ClusterReferenceDelta { delta: -1, ..delta }])?,
-            index
-        );
-        for (changes, error) in [
-            (
-                alloc::vec![ClusterReferenceDelta { delta: -2, ..delta }],
-                Error::ClusterReferenceConflict,
-            ),
-            (
-                alloc::vec![ClusterReferenceDelta {
-                    delta: i32::MAX,
-                    ..delta
-                }],
-                Error::ArithmeticOverflow,
-            ),
-            (alloc::vec![delta, delta], Error::ClusterReferenceConflict),
-        ] {
-            let before = index.try_clone()?;
-            assert_eq!(index.with_deltas(&changes), Err(error));
-            assert_eq!(index, before);
-        }
-        Ok(())
-    }
-}
-
 /// A half-open cluster interval whose members have the same reference count.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ReferenceRun {
@@ -284,5 +169,120 @@ impl ClusterReferenceIndex {
             }
         }
         self.runs.try_push(ReferenceRun { start, end, count })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Errors
+    /// Propagates range construction, allocation and successor preparation failures.
+    /// # Panics
+    /// Fails if count boundaries, coalescing or immutable epoch semantics change.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture failures propagate while assertions compare independent counts"
+    )]
+    fn ownership_boundaries_and_epoch_deltas_match_dense_counts() -> Result<()> {
+        let mut index = ClusterReferenceIndex::new();
+        let mut expected = [0_u32; 32];
+        for (start, end, count) in [(2, 9, 1), (8, 12, 2), (12, 20, 2), (25, 28, 4)] {
+            index.append_owned_range(
+                ClusterAddress::new(start),
+                ClusterAddress::new(end),
+                count,
+            )?;
+            for slot in expected
+                .iter_mut()
+                .take(usize::try_from(end).map_err(|_| Error::ArithmeticOverflow)?)
+                .skip(usize::try_from(start).map_err(|_| Error::ArithmeticOverflow)?)
+            {
+                *slot += count;
+            }
+        }
+        for changes in [
+            [(19, -2), (2, -1), (9, 1), (0, 1)],
+            [(8, -3), (20, 2), (19, 2), (31, 1)],
+            [(0, -1), (9, -1), (8, 2), (2, 1)],
+        ] {
+            let previous = index.try_clone()?;
+            let deltas = changes.map(|(cluster, delta)| ClusterReferenceDelta {
+                cluster: ClusterAddress::new(cluster),
+                delta,
+            });
+            let successor = index.with_deltas(&deltas)?;
+            assert_eq!(index, previous);
+            for (cluster, delta) in changes {
+                let slot = expected
+                    .get_mut(usize::try_from(cluster).map_err(|_| Error::ArithmeticOverflow)?)
+                    .ok_or(Error::InvalidClusterGeometry)?;
+                *slot = slot
+                    .checked_add_signed(delta)
+                    .ok_or(Error::ArithmeticOverflow)?;
+            }
+            for (cluster, expected) in expected.iter().copied().enumerate() {
+                assert_eq!(
+                    successor.count(ClusterAddress::new(
+                        u64::try_from(cluster).map_err(|_| Error::ArithmeticOverflow)?
+                    )),
+                    expected
+                );
+            }
+            index = successor;
+        }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Propagates fixture construction and allocation errors.
+    /// # Panics
+    /// Fails if large contiguous ownership expands with volume size, or errors alter its epoch.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify the space bound and failure atomicity"
+    )]
+    fn contiguous_ownership_stays_bounded_across_split_merge_and_failure() -> Result<()> {
+        let mut index = ClusterReferenceIndex::new();
+        index.append_owned_range(
+            ClusterAddress::new(0),
+            ClusterAddress::new(1_000_000_000),
+            1,
+        )?;
+        let delta = ClusterReferenceDelta {
+            cluster: ClusterAddress::new(500_000_000),
+            delta: 1,
+        };
+        let split = index.with_deltas(&[delta])?;
+        // Ownership storage is bounded by count transitions, independent of interval length.
+        assert_eq!(index.runs.len(), 1);
+        assert_eq!(split.runs.len(), 3);
+        assert_eq!(split.count(delta.cluster), 2);
+        assert_eq!(split.count(ClusterAddress::new(1_000_000_000)), 0);
+        assert_eq!(
+            split.with_deltas(&[ClusterReferenceDelta { delta: -1, ..delta }])?,
+            index
+        );
+        for (changes, error) in [
+            (
+                alloc::vec![ClusterReferenceDelta { delta: -2, ..delta }],
+                Error::ClusterReferenceConflict,
+            ),
+            (
+                alloc::vec![ClusterReferenceDelta {
+                    delta: i32::MAX,
+                    ..delta
+                }],
+                Error::ArithmeticOverflow,
+            ),
+            (alloc::vec![delta, delta], Error::ClusterReferenceConflict),
+        ] {
+            let before = index.try_clone()?;
+            assert_eq!(index.with_deltas(&changes), Err(error));
+            assert_eq!(index, before);
+        }
+        Ok(())
     }
 }

@@ -165,7 +165,7 @@ fn execute(arguments: Vec<String>) -> io::Result<Value> {
                     return Err(invalid("truncated UTF-16 log"));
                 }
                 let (bytes, big_endian) = if encoding == "utf-16" {
-                    match bytes.as_slice().split_at_checked(2) {
+                    match bytes.split_at_checked(2) {
                         Some(([0xff, 0xfe], tail)) => (tail, false),
                         Some(([0xfe, 0xff], tail)) => (tail, true),
                         _ => return Err(invalid("UTF-16 log requires a byte-order mark")),

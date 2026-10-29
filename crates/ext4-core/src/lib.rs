@@ -6,7 +6,7 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 #![feature(vec_push_within_capacity)]
 
 extern crate alloc;

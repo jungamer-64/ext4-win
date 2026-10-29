@@ -112,57 +112,6 @@ pub(crate) enum MdlCompletion {
     Write,
 }
 
-#[cfg(test)]
-mod mdl_tests {
-    use super::*;
-
-    /// # Panics
-    /// Fails if independent WDK control-code values select another operation or transfer method.
-    #[test]
-    fn standard_cluster_and_health_codes_match_the_windows_abi() {
-        for (code, expected) in [
-            (0x0009_0030, FsControlCode::MarkVolumeDirty),
-            (0x0009_0074, FsControlCode::MoveFile),
-            (0x0009_0078, FsControlCode::IsVolumeDirty),
-            (0x0009_00fc, FsControlCode::MarkHandle),
-            (0x0009_0194, FsControlCode::SetZeroOnDeallocation),
-        ] {
-            assert_eq!(FsControlCode::from_raw(code), Ok(expected));
-        }
-        assert_eq!(
-            FsControlCode::from_raw(0x0009_007b),
-            Err(DriverError::NotSupported)
-        );
-    }
-
-    /// # Panics
-    ///
-    /// Panics if DPC changes the protocol or completion is decoded as page acquisition.
-    #[test]
-    fn windows_minor_bits_select_acquisition_and_consuming_completion() {
-        assert_eq!(MdlAction::decode(0, false), Ok(None));
-        assert_eq!(MdlAction::decode(1, true), Ok(None));
-        assert_eq!(MdlAction::decode(2, false), Ok(Some(MdlAction::Read)));
-        assert_eq!(MdlAction::decode(3, true), Ok(Some(MdlAction::Write)));
-        assert_eq!(
-            MdlAction::decode(4, false),
-            Ok(Some(MdlAction::ReadComplete))
-        );
-        assert_eq!(
-            MdlAction::decode(6, true),
-            Ok(Some(MdlAction::WriteComplete))
-        );
-        assert_eq!(
-            MdlAction::decode(7, false),
-            Ok(Some(MdlAction::ReadComplete))
-        );
-        assert_eq!(
-            MdlAction::decode(8, true),
-            Err(DriverError::InvalidParameter)
-        );
-    }
-}
-
 impl MdlAction {
     /// Decodes the Windows read/write minor-function bit contract.
     /// # Errors
@@ -732,5 +681,56 @@ impl DirectoryInformationClass {
             }
             _ => Err(DriverError::InvalidInfoClass),
         }
+    }
+}
+
+#[cfg(test)]
+mod mdl_tests {
+    use super::*;
+
+    /// # Panics
+    /// Fails if independent WDK control-code values select another operation or transfer method.
+    #[test]
+    fn standard_cluster_and_health_codes_match_the_windows_abi() {
+        for (code, expected) in [
+            (0x0009_0030, FsControlCode::MarkVolumeDirty),
+            (0x0009_0074, FsControlCode::MoveFile),
+            (0x0009_0078, FsControlCode::IsVolumeDirty),
+            (0x0009_00fc, FsControlCode::MarkHandle),
+            (0x0009_0194, FsControlCode::SetZeroOnDeallocation),
+        ] {
+            assert_eq!(FsControlCode::from_raw(code), Ok(expected));
+        }
+        assert_eq!(
+            FsControlCode::from_raw(0x0009_007b),
+            Err(DriverError::NotSupported)
+        );
+    }
+
+    /// # Panics
+    ///
+    /// Panics if DPC changes the protocol or completion is decoded as page acquisition.
+    #[test]
+    fn windows_minor_bits_select_acquisition_and_consuming_completion() {
+        assert_eq!(MdlAction::decode(0, false), Ok(None));
+        assert_eq!(MdlAction::decode(1, true), Ok(None));
+        assert_eq!(MdlAction::decode(2, false), Ok(Some(MdlAction::Read)));
+        assert_eq!(MdlAction::decode(3, true), Ok(Some(MdlAction::Write)));
+        assert_eq!(
+            MdlAction::decode(4, false),
+            Ok(Some(MdlAction::ReadComplete))
+        );
+        assert_eq!(
+            MdlAction::decode(6, true),
+            Ok(Some(MdlAction::WriteComplete))
+        );
+        assert_eq!(
+            MdlAction::decode(7, false),
+            Ok(Some(MdlAction::ReadComplete))
+        );
+        assert_eq!(
+            MdlAction::decode(8, true),
+            Err(DriverError::InvalidParameter)
+        );
     }
 }

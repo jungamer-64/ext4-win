@@ -224,61 +224,6 @@ impl ScannedDirectoryEntry {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// # Errors
-    /// Returns malformed independent display framing or query routing failure.
-    /// # Panics
-    /// Fails if an unkeyed route trusts a stale hint when the complete ciphertext is available.
-    #[test]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "literal ciphertext and independently calculated format hash observe routing authority"
-    )]
-    fn complete_keyless_identity_uses_the_current_unkeyed_profile() -> Result<()> {
-        use crate::disk_format::{
-            dir::DirectoryIndexHash,
-            directory_hash::DirectoryHashScheme,
-            name::NameSemantics,
-            superblock::{DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion},
-        };
-        let name = crate::protection::fscrypt::FscryptNoKeyName::from_display(
-            b"_fscrypt_AAAAAAAAAAAwMTIzNDU2Nzg5QUJDREVG",
-        )?
-        .ok_or(Error::InvalidName)?;
-        assert_eq!(name.hash().major, 0);
-        let scheme = DirectoryHashScheme::from_metadata(
-            DirectoryHashSeed::from_words([0; 4]),
-            DirectoryHashVersion::Legacy,
-            DirectoryHashSignedness::Signed,
-        );
-        assert_eq!(
-            DirectoryLookup::NoKey(&name).major(
-                DirectoryIndexHash::Computed(scheme),
-                NameSemantics::Bytewise
-            )?,
-            0xf4ca76fc
-        );
-        Ok(())
-    }
-
-    /// # Panics
-    ///
-    /// Panics when explicit ordinal seeks truncate the live 64-bit cursor domain.
-    #[test]
-    fn scan_cursor_preserves_ordinals_beyond_windows_file_index() {
-        let mut cursor = DirectoryScanCursor::start();
-        let ordinal = u64::from(u32::MAX) + 1;
-        cursor.seek_ordinal(ordinal);
-        assert_eq!(cursor.ordinal(), ordinal);
-        assert_eq!(cursor.position, DirectoryScanPosition::Ordinal(ordinal));
-        cursor.restart();
-        assert_eq!(cursor, DirectoryScanCursor::start());
-    }
-}
-
 /// Owned query preparation keeps derived keys local while traversal borrows only their narrow capability.
 #[derive(Debug)]
 pub(super) enum PreparedDirectoryLookup<'name> {
@@ -448,5 +393,60 @@ impl DirectoryLookup<'_> {
             }
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// # Errors
+    /// Returns malformed independent display framing or query routing failure.
+    /// # Panics
+    /// Fails if an unkeyed route trusts a stale hint when the complete ciphertext is available.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "literal ciphertext and independently calculated format hash observe routing authority"
+    )]
+    fn complete_keyless_identity_uses_the_current_unkeyed_profile() -> Result<()> {
+        use crate::disk_format::{
+            dir::DirectoryIndexHash,
+            directory_hash::DirectoryHashScheme,
+            name::NameSemantics,
+            superblock::{DirectoryHashSeed, DirectoryHashSignedness, DirectoryHashVersion},
+        };
+        let name = crate::protection::fscrypt::FscryptNoKeyName::from_display(
+            b"_fscrypt_AAAAAAAAAAAwMTIzNDU2Nzg5QUJDREVG",
+        )?
+        .ok_or(Error::InvalidName)?;
+        assert_eq!(name.hash().major, 0);
+        let scheme = DirectoryHashScheme::from_metadata(
+            DirectoryHashSeed::from_words([0; 4]),
+            DirectoryHashVersion::Legacy,
+            DirectoryHashSignedness::Signed,
+        );
+        assert_eq!(
+            DirectoryLookup::NoKey(&name).major(
+                DirectoryIndexHash::Computed(scheme),
+                NameSemantics::Bytewise
+            )?,
+            0xf4ca76fc
+        );
+        Ok(())
+    }
+
+    /// # Panics
+    ///
+    /// Panics when explicit ordinal seeks truncate the live 64-bit cursor domain.
+    #[test]
+    fn scan_cursor_preserves_ordinals_beyond_windows_file_index() {
+        let mut cursor = DirectoryScanCursor::start();
+        let ordinal = u64::from(u32::MAX) + 1;
+        cursor.seek_ordinal(ordinal);
+        assert_eq!(cursor.ordinal(), ordinal);
+        assert_eq!(cursor.position, DirectoryScanPosition::Ordinal(ordinal));
+        cursor.restart();
+        assert_eq!(cursor, DirectoryScanCursor::start());
     }
 }

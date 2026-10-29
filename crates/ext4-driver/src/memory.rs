@@ -1,12 +1,17 @@
 //! Fallible allocation helpers for the Windows driver boundary.
 
 use alloc::{
-    alloc::{AllocError, Allocator, Global},
+    alloc::Global,
     boxed::Box,
     collections::{TryReserveError, TryReserveErrorKind},
     vec::Vec,
 };
-use core::{alloc::Layout, fmt, marker::PhantomData, ptr::NonNull};
+use core::{
+    alloc::{AllocError, Allocator, Layout},
+    fmt,
+    marker::PhantomData,
+    ptr::NonNull,
+};
 
 use crate::kernel::status::{DriverError, DriverResult};
 use zeroize::Zeroize;
@@ -618,8 +623,8 @@ pub(crate) fn boxed_zeroed_bytes(length: usize) -> DriverResult<Box<[u8]>> {
 
 #[cfg(test)]
 mod tests {
-    use alloc::alloc::{AllocError, Allocator, Global};
-    use core::alloc::Layout;
+    use alloc::alloc::Global;
+    use core::alloc::{AllocError, Allocator, Layout};
     use core::cell::Cell;
     use core::ptr::NonNull;
     use core::sync::atomic::{AtomicUsize, Ordering};

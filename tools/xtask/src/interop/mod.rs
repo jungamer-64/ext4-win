@@ -238,22 +238,6 @@ fn require_e2fsprogs_version(actual: &str, expected: &str) -> TaskResult<()> {
     }
 }
 
-#[cfg(test)]
-mod environment_tests {
-    use super::require_e2fsprogs_version;
-
-    /// The environment contract accepts only the exact manifest release token.
-    ///
-    /// # Panics
-    ///
-    /// Panics if exact equality is rejected or release drift is accepted.
-    #[test]
-    fn e2fsprogs_release_must_match_manifest_exactly() {
-        assert!(require_e2fsprogs_version("1.47.2", "1.47.2").is_ok());
-        assert!(require_e2fsprogs_version("1.47.0", "1.47.2").is_err());
-    }
-}
-
 /// Host-side storage behavior required by the production core state machines.
 trait HostStorage {
     /// Returns the selected device length.
@@ -2172,4 +2156,20 @@ fn read_directory_request(
     };
     complete_core_clean_close(&mut storage, &profile, &coordinator)?;
     Ok((names, cursor))
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::require_e2fsprogs_version;
+
+    /// The environment contract accepts only the exact manifest release token.
+    ///
+    /// # Panics
+    ///
+    /// Panics if exact equality is rejected or release drift is accepted.
+    #[test]
+    fn e2fsprogs_release_must_match_manifest_exactly() {
+        assert!(require_e2fsprogs_version("1.47.2", "1.47.2").is_ok());
+        assert!(require_e2fsprogs_version("1.47.0", "1.47.2").is_err());
+    }
 }

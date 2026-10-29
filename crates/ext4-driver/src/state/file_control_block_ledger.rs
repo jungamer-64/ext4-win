@@ -253,142 +253,6 @@ impl FcbRegistry {
     }
 }
 
-#[cfg(test)]
-mod index_tests {
-    use super::*;
-
-    /// # Errors
-    /// Returns fixture allocation or native stream initialization failures.
-    /// # Panics
-    /// Fails if retired owners hide a reused inode or regain its current binding during release.
-    #[test]
-    #[expect(
-        clippy::panic_in_result_fn,
-        reason = "assertions observe current allocation identity independently from native lifetime"
-    )]
-    fn inode_reuse_preserves_retired_streams_until_their_own_release() -> DriverResult<()> {
-        let volume_stream = StreamContext::try_new_volume(
-            StreamSizes::EMPTY,
-            OperationalTrace::host_test(),
-            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
-        )?;
-        let ledger = FileControlBlockLedger::try_new()?;
-        let node = NodeId::Directory(DirectoryNodeId::ROOT);
-        let allocate = || {
-            ledger.staged_file_control_block(
-                NonNull::dangling(),
-                &volume_stream,
-                StagedNodeStreamMetadata {
-                    node,
-                    sizes: StreamSizes::EMPTY,
-                },
-                OperationalTrace::host_test(),
-            )
-        };
-        let mut table = FcbRegistry::new();
-        let first = allocate()?;
-        let first_pointer = NonNull::from(first.as_ref().get_ref());
-        table
-            .try_push_owned(first)
-            .map_err(|failure| failure.into_parts().0)?;
-        assert_eq!(table.current_node(first_pointer), Ok(node));
-        table.retire_inode(node.inode());
-        assert_eq!(table.node_index(node), None);
-        assert_eq!(table.pointer_index(first_pointer), Some(0));
-        assert_eq!(
-            table.current_node(first_pointer),
-            Err(DriverError::FileClosed)
-        );
-
-        let second = allocate()?;
-        let second_pointer = NonNull::from(second.as_ref().get_ref());
-        table
-            .try_push_owned(second)
-            .map_err(|failure| failure.into_parts().0)?;
-        assert_eq!(
-            find_file_control_block_in_table(&table, node),
-            Some(second_pointer)
-        );
-        assert_eq!(
-            table.current_node(first_pointer),
-            Err(DriverError::FileClosed)
-        );
-        assert_eq!(table.current_node(second_pointer), Ok(node));
-        table.retire_inode(node.inode());
-
-        let third = allocate()?;
-        let third_pointer = NonNull::from(third.as_ref().get_ref());
-        table
-            .try_push_owned(third)
-            .map_err(|failure| failure.into_parts().0)?;
-        assert_eq!(
-            find_file_control_block_in_table(&table, node),
-            Some(third_pointer)
-        );
-        drop(table.swap_remove(0));
-        assert_eq!(table.pointer_index(first_pointer), None);
-        assert_eq!(table.pointer_index(third_pointer), Some(0));
-        assert_eq!(
-            find_file_control_block_in_table(&table, node),
-            Some(third_pointer)
-        );
-
-        drop(table.swap_remove(0));
-        assert_eq!(table.pointer_index(third_pointer), None);
-        assert_eq!(table.pointer_index(second_pointer), Some(0));
-        assert_eq!(table.node_index(node), None);
-        assert_eq!(
-            table.current_node(second_pointer),
-            Err(DriverError::FileClosed)
-        );
-        drop(table.swap_remove(0));
-        assert!(table.is_empty());
-        Ok(())
-    }
-
-    /// # Panics
-    /// Panics if growth, cluster deletion or address reuse loses another resident owner.
-    #[test]
-    fn indexed_membership_survives_growth_deletion_and_reuse() {
-        let result = (|| -> DriverResult<()> {
-            let mut index = FcbIndex::new();
-            for owner in 0_usize..8192 {
-                index.reserve(
-                    owner
-                        .checked_add(1)
-                        .ok_or(DriverError::InsufficientResources)?,
-                )?;
-                index.set(
-                    u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?,
-                    owner,
-                );
-            }
-            for owner in (0_usize..8192).step_by(2) {
-                index.remove(u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?);
-            }
-            for owner in 0_usize..8192 {
-                let key = u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?;
-                assert_eq!(
-                    index.owner(key),
-                    if owner % 2 == 0 { None } else { Some(owner) }
-                );
-                if owner % 2 == 0 {
-                    index.set(key, 8192);
-                }
-            }
-            for owner in 0_usize..8192 {
-                let key = u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?;
-                assert_eq!(
-                    index.owner(key),
-                    Some(if owner % 2 == 0 { 8192 } else { owner })
-                );
-            }
-            Ok(())
-        })();
-        assert_eq!(result, Ok(()));
-    }
-}
-
 /// Admission condition for the retained-stream snapshot.
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum StreamCacheSnapshotPurpose {
@@ -3681,4 +3545,140 @@ fn ledger_file_control_block_open_state(
     NonNull::new(fcb.open_state.get()).unwrap_or_else(|| {
         KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck()
     })
+}
+
+#[cfg(test)]
+mod index_tests {
+    use super::*;
+
+    /// # Errors
+    /// Returns fixture allocation or native stream initialization failures.
+    /// # Panics
+    /// Fails if retired owners hide a reused inode or regain its current binding during release.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions observe current allocation identity independently from native lifetime"
+    )]
+    fn inode_reuse_preserves_retired_streams_until_their_own_release() -> DriverResult<()> {
+        let volume_stream = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
+        let ledger = FileControlBlockLedger::try_new()?;
+        let node = NodeId::Directory(DirectoryNodeId::ROOT);
+        let allocate = || {
+            ledger.staged_file_control_block(
+                NonNull::dangling(),
+                &volume_stream,
+                StagedNodeStreamMetadata {
+                    node,
+                    sizes: StreamSizes::EMPTY,
+                },
+                OperationalTrace::host_test(),
+            )
+        };
+        let mut table = FcbRegistry::new();
+        let first = allocate()?;
+        let first_pointer = NonNull::from(first.as_ref().get_ref());
+        table
+            .try_push_owned(first)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert_eq!(table.current_node(first_pointer), Ok(node));
+        table.retire_inode(node.inode());
+        assert_eq!(table.node_index(node), None);
+        assert_eq!(table.pointer_index(first_pointer), Some(0));
+        assert_eq!(
+            table.current_node(first_pointer),
+            Err(DriverError::FileClosed)
+        );
+
+        let second = allocate()?;
+        let second_pointer = NonNull::from(second.as_ref().get_ref());
+        table
+            .try_push_owned(second)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert_eq!(
+            find_file_control_block_in_table(&table, node),
+            Some(second_pointer)
+        );
+        assert_eq!(
+            table.current_node(first_pointer),
+            Err(DriverError::FileClosed)
+        );
+        assert_eq!(table.current_node(second_pointer), Ok(node));
+        table.retire_inode(node.inode());
+
+        let third = allocate()?;
+        let third_pointer = NonNull::from(third.as_ref().get_ref());
+        table
+            .try_push_owned(third)
+            .map_err(|failure| failure.into_parts().0)?;
+        assert_eq!(
+            find_file_control_block_in_table(&table, node),
+            Some(third_pointer)
+        );
+        drop(table.swap_remove(0));
+        assert_eq!(table.pointer_index(first_pointer), None);
+        assert_eq!(table.pointer_index(third_pointer), Some(0));
+        assert_eq!(
+            find_file_control_block_in_table(&table, node),
+            Some(third_pointer)
+        );
+
+        drop(table.swap_remove(0));
+        assert_eq!(table.pointer_index(third_pointer), None);
+        assert_eq!(table.pointer_index(second_pointer), Some(0));
+        assert_eq!(table.node_index(node), None);
+        assert_eq!(
+            table.current_node(second_pointer),
+            Err(DriverError::FileClosed)
+        );
+        drop(table.swap_remove(0));
+        assert!(table.is_empty());
+        Ok(())
+    }
+
+    /// # Panics
+    /// Panics if growth, cluster deletion or address reuse loses another resident owner.
+    #[test]
+    fn indexed_membership_survives_growth_deletion_and_reuse() {
+        let result = (|| -> DriverResult<()> {
+            let mut index = FcbIndex::new();
+            for owner in 0_usize..8192 {
+                index.reserve(
+                    owner
+                        .checked_add(1)
+                        .ok_or(DriverError::InsufficientResources)?,
+                )?;
+                index.set(
+                    u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?,
+                    owner,
+                );
+            }
+            for owner in (0_usize..8192).step_by(2) {
+                index.remove(u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?);
+            }
+            for owner in 0_usize..8192 {
+                let key = u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?;
+                assert_eq!(
+                    index.owner(key),
+                    if owner % 2 == 0 { None } else { Some(owner) }
+                );
+                if owner % 2 == 0 {
+                    index.set(key, 8192);
+                }
+            }
+            for owner in 0_usize..8192 {
+                let key = u64::try_from(owner).map_err(|_| DriverError::InsufficientResources)?;
+                assert_eq!(
+                    index.owner(key),
+                    Some(if owner % 2 == 0 { 8192 } else { owner })
+                );
+            }
+            Ok(())
+        })();
+        assert_eq!(result, Ok(()));
+    }
 }

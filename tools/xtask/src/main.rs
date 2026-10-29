@@ -1,6 +1,6 @@
 //! Host-side development and production verification workflows for ext4-win.
 
-#![feature(allocator_api)]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 
