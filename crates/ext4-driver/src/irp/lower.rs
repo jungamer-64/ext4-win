@@ -1423,60 +1423,46 @@ fn prepare_private_irp(
     stack.FileObject = core::ptr::null_mut();
     match operation {
         LowerOperation::Read | LowerOperation::VerifyRead => {
-            stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
-                Length: transfer_length,
-                __bindgen_padding_0: 0,
-                Key: 0,
-                Flags: 0,
-                ByteOffset: starting_offset,
+            let parameters = unsafe {
+                // SAFETY: The entire private stack was zero-initialized; this selects the read arm.
+                &mut stack.Parameters.Read
             };
+            parameters.Length = transfer_length;
+            parameters.ByteOffset = starting_offset;
         }
         LowerOperation::Write | LowerOperation::MountWrite => {
-            stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
-                Length: transfer_length,
-                __bindgen_padding_0: 0,
-                Key: 0,
-                Flags: 0,
-                ByteOffset: starting_offset,
+            let parameters = unsafe {
+                // SAFETY: This exclusive private stack selects the initialized write representation.
+                &mut stack.Parameters.Write
             };
-        }
-        LowerOperation::Trim => {
-            stack.Parameters.DeviceIoControl =
-                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
-                    OutputBufferLength: 0,
-                    __bindgen_padding_0: 0,
-                    InputBufferLength: transfer_length,
-                    __bindgen_padding_1: 0,
-                    IoControlCode: 0x002d_9404, // IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES, buffered write access.
-                    Type3InputBuffer: core::ptr::null_mut(),
-                };
+            parameters.Length = transfer_length;
+            parameters.ByteOffset = starting_offset;
         }
         LowerOperation::Flush => {}
-        LowerOperation::QueryWriteAccess | LowerOperation::SnapshotHold => {
-            stack.Parameters.DeviceIoControl =
-                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
-                    OutputBufferLength: 0,
-                    __bindgen_padding_0: 0,
-                    InputBufferLength: 0,
-                    __bindgen_padding_1: 0,
-                    IoControlCode: if operation == LowerOperation::SnapshotHold {
-                        crate::irp::IOCTL_VOLSNAP_FLUSH_AND_HOLD_WRITES
-                    } else {
-                        0x0007_0024
-                    },
-                    Type3InputBuffer: core::ptr::null_mut(),
-                };
-        }
-        LowerOperation::QueryLength => {
-            stack.Parameters.DeviceIoControl =
-                wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
-                    OutputBufferLength: transfer_length,
-                    __bindgen_padding_0: 0,
-                    InputBufferLength: 0,
-                    __bindgen_padding_1: 0,
-                    IoControlCode: IOCTL_DISK_GET_LENGTH_INFO,
-                    Type3InputBuffer: core::ptr::null_mut(),
-                };
+        LowerOperation::Trim
+        | LowerOperation::QueryWriteAccess
+        | LowerOperation::SnapshotHold
+        | LowerOperation::QueryLength => {
+            let parameters = unsafe {
+                // SAFETY: The zero-initialized private stack selects its device-control arm.
+                &mut stack.Parameters.DeviceIoControl
+            };
+            parameters.OutputBufferLength = if operation == LowerOperation::QueryLength {
+                transfer_length
+            } else {
+                0
+            };
+            parameters.InputBufferLength = if operation == LowerOperation::Trim {
+                transfer_length
+            } else {
+                0
+            };
+            parameters.IoControlCode = match operation {
+                LowerOperation::Trim => 0x002d_9404, // IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES.
+                LowerOperation::SnapshotHold => crate::irp::IOCTL_VOLSNAP_FLUSH_AND_HOLD_WRITES,
+                LowerOperation::QueryLength => IOCTL_DISK_GET_LENGTH_INFO,
+                _ => 0x0007_0024, // IOCTL_DISK_IS_WRITABLE.
+            };
         }
     }
     if operation.transfers_bytes() {

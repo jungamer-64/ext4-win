@@ -375,11 +375,11 @@ fn rename_replace_flag_decode_boundary_selects_replace_collision() {
     };
     stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
         Length: u32::try_from(input.len()).unwrap_or(u32::MAX),
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation,
         FileObject: core::ptr::null_mut(),
         __bindgen_anon_1:
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        ..Default::default()
     };
 
     let mut irp = wdk_sys::IRP::default();

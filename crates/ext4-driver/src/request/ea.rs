@@ -1106,11 +1106,10 @@ mod tests {
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(*security_context),
             Options: 1 << 24,
-            __bindgen_padding_0: [0; 2],
             FileAttributes: 0,
             ShareAccess: 0,
-            __bindgen_padding_1: 0,
             EaLength: ea_length,
+            ..Default::default()
         };
         irp.AssociatedIrp.SystemBuffer = system_buffer;
         irp.Tail

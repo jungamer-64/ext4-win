@@ -1263,11 +1263,10 @@ fn oplock_control_accepts_the_exact_directory_stream() {
     };
     stack.Parameters.FileSystemControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
         OutputBufferLength: 0,
-        __bindgen_padding_0: 0,
         InputBufferLength: 0,
-        __bindgen_padding_1: 0,
         FsControlCode: 0x0009_0240,
         Type3InputBuffer: core::ptr::null_mut(),
+        ..Default::default()
     };
     let mut irp = wdk_sys::IRP::default();
     irp.Tail

@@ -2355,8 +2355,8 @@ mod tests {
             Length: 128,
             FileName: core::ptr::null_mut(),
             FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation,
-            __bindgen_padding_0: 0,
             FileIndex: 0,
+            ..Default::default()
         };
         let target = unsafe {
             // SAFETY: Local fixture allocations and their buffers outlive every request use.
@@ -2572,10 +2572,10 @@ mod tests {
         };
         stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
             Length: u32::try_from(output.len()).unwrap_or_default(),
-            __bindgen_padding_0: 0,
             Key: 41,
             Flags: 0,
             ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 8192 },
+            ..Default::default()
         };
         let irp_address = &raw mut irp;
         let stack_address = &raw mut stack;
@@ -2597,10 +2597,10 @@ mod tests {
                     // SAFETY: Only this test accesses the stack between capture and sealed reads.
                     read.write(wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
                         Length: 1,
-                        __bindgen_padding_0: 0,
                         Key: 0,
                         Flags: 0,
                         ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                        ..Default::default()
                     });
                 }
                 unsafe {
@@ -2651,10 +2651,10 @@ mod tests {
         };
         stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
             Length: u32::try_from(input.len()).unwrap_or_default(),
-            __bindgen_padding_0: 0,
             Key: 73,
             Flags: 0,
             ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 16_384 },
+            ..Default::default()
         };
         let irp_address = &raw mut irp;
         let stack_address = &raw mut stack;
@@ -2676,10 +2676,10 @@ mod tests {
                     // SAFETY: Only this test accesses the stack between capture and sealed reads.
                     write.write(wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
                         Length: 1,
-                        __bindgen_padding_0: 0,
                         Key: 0,
                         Flags: 0,
                         ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                        ..Default::default()
                     });
                 }
                 unsafe {
@@ -2764,10 +2764,10 @@ mod tests {
             };
             stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
                 Length: u32::try_from(input.len()).unwrap_or_default(),
-                __bindgen_padding_0: 0,
                 Key: 0,
                 Flags: 0,
                 ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                ..Default::default()
             };
             let target = unsafe {
                 // SAFETY: Local fixture allocations and their buffers outlive every request use.
@@ -2822,10 +2822,10 @@ mod tests {
             };
             stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
                 Length: length,
-                __bindgen_padding_0: 0,
                 Key: 0,
                 Flags: 0,
                 ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: 0 },
+                ..Default::default()
             };
             let target = unsafe {
                 // SAFETY: Local fixture allocations and their buffers outlive every request use.

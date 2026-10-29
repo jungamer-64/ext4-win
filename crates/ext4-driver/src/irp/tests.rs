@@ -538,11 +538,10 @@ fn buffered_control_keeps_input_initialization_and_output_capacity_distinct()
     };
     stack.Parameters.DeviceIoControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
         OutputBufferLength: 13,
-        __bindgen_padding_0: 0,
         InputBufferLength: 4,
-        __bindgen_padding_1: 0,
         IoControlCode: ext4_security::QUERY_IDENTITY_IOCTL,
         Type3InputBuffer: core::ptr::null_mut(),
+        ..Default::default()
     };
     let mut irp = wdk_sys::IRP::default();
     irp.AssociatedIrp.SystemBuffer = storage.as_mut_ptr().cast();
@@ -705,8 +704,8 @@ fn all_information_publication_preserves_upstream_fields() {
     stack.FileObject = core::ptr::from_mut(&mut file_object);
     stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
         Length: 120,
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileAllInformation,
+        ..Default::default()
     };
     let mut irp = wdk_sys::IRP::default();
     irp.AssociatedIrp.SystemBuffer = output.as_mut_ptr().cast();
@@ -739,8 +738,8 @@ fn all_information_publication_preserves_upstream_fields() {
     assert_eq!(output, previous);
     stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
         Length: 103,
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileAllInformation,
+        ..Default::default()
     };
     assert_eq!(
         current_stack_fixture(&mut stack)
@@ -1244,11 +1243,10 @@ fn file_system_control_stack_decodes_supported_user_control() {
     };
     stack.Parameters.FileSystemControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
         OutputBufferLength: 128,
-        __bindgen_padding_0: 0,
         InputBufferLength: 32,
-        __bindgen_padding_1: 0,
         FsControlCode: 589_992,
         Type3InputBuffer: core::ptr::null_mut(),
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1282,11 +1280,10 @@ fn file_system_control_stack_rejects_unsupported_control_before_handler() {
     };
     stack.Parameters.FileSystemControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_15 {
         OutputBufferLength: 128,
-        __bindgen_padding_0: 0,
         InputBufferLength: 32,
-        __bindgen_padding_1: 0,
         FsControlCode: 0xFFFF_FFFF,
         Type3InputBuffer: core::ptr::null_mut(),
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1313,11 +1310,10 @@ fn device_control_stack_preserves_payload_shape_and_control_code() {
     };
     stack.Parameters.DeviceIoControl = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_17 {
         OutputBufferLength: 0,
-        __bindgen_padding_0: 0,
         InputBufferLength: 0,
-        __bindgen_padding_1: 0,
         IoControlCode: crate::lifecycle_control::PREPARE_UNLOAD_IOCTL,
         Type3InputBuffer: core::ptr::null_mut(),
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1504,12 +1500,11 @@ fn create_stack_preserves_access_share_options_and_ea_length() {
             | wdk_sys::FILE_WRITE_THROUGH
             | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT
             | wdk_sys::FILE_OPEN_FOR_BACKUP_INTENT,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0x20,
         ShareAccess: u16::try_from(wdk_sys::FILE_SHARE_READ | wdk_sys::FILE_SHARE_WRITE)
             .unwrap_or(u16::MAX),
-        __bindgen_padding_1: 0,
         EaLength: 48,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1585,11 +1580,10 @@ fn create_stack_rejects_unimplemented_special_flag_protocols() {
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
             Options: FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT,
-            __bindgen_padding_0: [0; 2],
             FileAttributes: 0,
             ShareAccess: 0,
-            __bindgen_padding_1: 0,
             EaLength: 0,
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -1685,11 +1679,10 @@ fn create_stack_rejects_directory_destructive_dispositions() {
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
             Options: (disposition << CREATE_DISPOSITION_SHIFT) | wdk_sys::FILE_DIRECTORY_FILE,
-            __bindgen_padding_0: [0; 2],
             FileAttributes: 0,
             ShareAccess: 0,
-            __bindgen_padding_1: 0,
             EaLength: 0,
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -1730,11 +1723,10 @@ fn create_parameters_separate_handle_access_from_operation_access() {
         stack.Parameters.Create = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_1 {
             SecurityContext: core::ptr::addr_of_mut!(security_context),
             Options: disposition << CREATE_DISPOSITION_SHIFT,
-            __bindgen_padding_0: [0; 2],
             FileAttributes: 0,
             ShareAccess: 0,
-            __bindgen_padding_1: 0,
             EaLength: 0,
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -1769,11 +1761,10 @@ fn create_stack_rejects_delete_on_close_without_delete_access() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_DELETE_ON_CLOSE,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1799,11 +1790,10 @@ fn create_stack_decodes_authorized_delete_on_close() {
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_DIRECTORY_FILE
             | wdk_sys::FILE_DELETE_ON_CLOSE,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1835,11 +1825,10 @@ fn create_stack_decodes_no_intermediate_buffering() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1891,11 +1880,10 @@ fn create_stack_decodes_open_reparse_point() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_OPEN_REPARSE_POINT,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1924,11 +1912,10 @@ fn create_stack_decodes_file_reference_name_interpretation() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_OPEN_BY_FILE_ID,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1960,11 +1947,10 @@ fn create_stack_decodes_alertable_synchronous_io() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -1996,11 +1982,10 @@ fn create_stack_rejects_synchronous_io_without_synchronize_access() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2032,11 +2017,10 @@ fn create_stack_rejects_conflicting_synchronous_io_modes() {
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_SYNCHRONOUS_IO_ALERT
             | wdk_sys::FILE_SYNCHRONOUS_IO_NONALERT,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2064,11 +2048,10 @@ fn create_stack_rejects_unsupported_options_before_handler() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_CREATE_TREE_CONNECTION,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2104,8 +2087,8 @@ fn query_ea_stack_decodes_name_selection_length_and_emission() {
         Length: 128,
         EaList: ea_list.as_ptr().cast(),
         EaListLength: 24,
-        __bindgen_padding_0: 0,
         EaIndex: 3,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2149,8 +2132,8 @@ fn query_ea_stack_decodes_index_selection() {
         Length: 128,
         EaList: core::ptr::null_mut(),
         EaListLength: 0,
-        __bindgen_padding_0: 0,
         EaIndex: 3,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2188,8 +2171,8 @@ fn query_ea_stack_distinguishes_restart_from_current_cursor() {
             Length: 128,
             EaList: core::ptr::null_mut(),
             EaListLength: 0,
-            __bindgen_padding_0: 0,
             EaIndex: 0,
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -2253,8 +2236,8 @@ fn query_security_stack_preserves_file_object_information_and_length() {
     stack.Parameters.QuerySecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_18 {
         SecurityInformation: wdk_sys::OWNER_SECURITY_INFORMATION
             | wdk_sys::DACL_SECURITY_INFORMATION,
-        __bindgen_padding_0: 0,
         Length: 256,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2290,8 +2273,8 @@ fn query_security_stack_rejects_sacl_at_decode() {
     stack.FileObject = file_object.as_ptr();
     stack.Parameters.QuerySecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_18 {
         SecurityInformation: wdk_sys::SACL_SECURITY_INFORMATION,
-        __bindgen_padding_0: 0,
         Length: 256,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2320,8 +2303,8 @@ fn query_security_stack_rejects_unsupported_bits_at_decode() {
     stack.FileObject = file_object.as_ptr();
     stack.Parameters.QuerySecurity = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_18 {
         SecurityInformation: LABEL_SECURITY_INFORMATION,
-        __bindgen_padding_0: 0,
         Length: 256,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2345,8 +2328,8 @@ fn set_volume_stack_preserves_length_and_class() {
     let mut stack = wdk_sys::IO_STACK_LOCATION::default();
     stack.Parameters.SetVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_14 {
         Length: 24,
-        __bindgen_padding_0: 0,
         FsInformationClass: wdk_sys::_FSINFOCLASS::FileFsLabelInformation,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2379,8 +2362,8 @@ fn query_volume_stack_decodes_supported_information_class() {
         let mut stack = wdk_sys::IO_STACK_LOCATION::default();
         stack.Parameters.QueryVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_13 {
             Length: 128,
-            __bindgen_padding_0: 0,
             FsInformationClass: raw,
+            ..Default::default()
         };
         let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
@@ -2403,8 +2386,8 @@ fn volume_information_stack_rejects_unsupported_class_before_handler() {
     let mut stack = wdk_sys::IO_STACK_LOCATION::default();
     stack.Parameters.QueryVolume = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_13 {
         Length: 128,
-        __bindgen_padding_0: 0,
         FsInformationClass: 0x7FFF_FFFF,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2485,12 +2468,12 @@ fn read_stack_decodes_absolute_and_current_positions() {
         };
         stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
             Length: 4096,
-            __bindgen_padding_0: 0,
             Key: 17,
             Flags: 0,
             ByteOffset: wdk_sys::LARGE_INTEGER {
                 QuadPart: raw_offset,
             },
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -2522,12 +2505,12 @@ fn read_stack_rejects_end_of_file_and_unknown_negative_positions() {
         };
         stack.Parameters.Read = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_4 {
             Length: 1,
-            __bindgen_padding_0: 0,
             Key: 0,
             Flags: 0,
             ByteOffset: wdk_sys::LARGE_INTEGER {
                 QuadPart: raw_offset,
             },
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -2571,12 +2554,12 @@ fn write_stack_decodes_absolute_current_and_end_positions() {
         };
         stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
             Length: 2048,
-            __bindgen_padding_0: 0,
             Key: 23,
             Flags: 0,
             ByteOffset: wdk_sys::LARGE_INTEGER {
                 QuadPart: raw_offset,
             },
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -2604,10 +2587,10 @@ fn write_stack_rejects_unknown_negative_position() {
     };
     stack.Parameters.Write = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_5 {
         Length: 1,
-        __bindgen_padding_0: 0,
         Key: 0,
         Flags: 0,
         ByteOffset: wdk_sys::LARGE_INTEGER { QuadPart: -3 },
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2810,11 +2793,10 @@ fn create_stack_accepts_no_intermediate_append_access() {
         SecurityContext: core::ptr::addr_of_mut!(security_context),
         Options: (FILE_OPEN_DISPOSITION << CREATE_DISPOSITION_SHIFT)
             | wdk_sys::FILE_NO_INTERMEDIATE_BUFFERING,
-        __bindgen_padding_0: [0; 2],
         FileAttributes: 0,
         ShareAccess: 0,
-        __bindgen_padding_1: 0,
         EaLength: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2847,11 +2829,11 @@ fn set_file_stack_decodes_position_information() {
     stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
         Length: u32::try_from(core::mem::size_of::<wdk_sys::FILE_POSITION_INFORMATION>())
             .unwrap_or(u32::MAX),
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FilePositionInformation,
         FileObject: core::ptr::null_mut(),
         __bindgen_anon_1:
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2880,8 +2862,8 @@ fn query_file_stack_preserves_file_object_length_and_class() {
     stack.FileObject = file_object.as_ptr();
     stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
         Length: 64,
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -2944,8 +2926,8 @@ fn query_file_stack_decodes_name_attribute_tag_and_link_classes() {
             Parameters: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1 {
                 QueryFile: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
                     Length: 64,
-                    __bindgen_padding_0: 0,
                     FileInformationClass: raw_class,
+                    ..Default::default()
                 },
             },
             ..wdk_sys::IO_STACK_LOCATION::default()
@@ -2978,11 +2960,11 @@ fn set_file_stack_preserves_file_object_length_and_class() {
     stack.FileObject = file_object.as_ptr();
     stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
         Length: 40,
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileBasicInformation,
         FileObject: core::ptr::null_mut(),
         __bindgen_anon_1:
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -3043,11 +3025,12 @@ fn set_file_stack_retains_eof_protocol_and_namespace_parent() {
             ..wdk_sys::IO_STACK_LOCATION::default()
         };
         stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
-            Length: 40, __bindgen_padding_0: 0, FileInformationClass: class, FileObject: core::ptr::null_mut(),
+            Length: 40, FileInformationClass: class, FileObject: core::ptr::null_mut(),
             __bindgen_anon_1: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1 {
                 __bindgen_anon_1: wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1__bindgen_ty_1 { ReplaceIfExists: 0, AdvanceOnly: advance },
             },
-        };
+        ..Default::default()
+    };
         let current = current_stack_fixture(&mut stack);
         assert!(current.is_ok());
         if let Ok(current) = current {
@@ -3063,11 +3046,11 @@ fn set_file_stack_retains_eof_protocol_and_namespace_parent() {
     };
     stack.Parameters.SetFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10 {
         Length: 40,
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation,
         FileObject: core::ptr::from_mut(&mut parent),
         __bindgen_anon_1:
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_10__bindgen_ty_1::default(),
+        ..Default::default()
     };
     let current = current_stack_fixture(&mut stack);
     assert!(current.is_ok());
@@ -3099,8 +3082,8 @@ fn file_information_stack_rejects_unsupported_class_before_handler() {
     stack.FileObject = file_object.as_ptr();
     stack.Parameters.QueryFile = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_9 {
         Length: 64,
-        __bindgen_padding_0: 0,
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileRenameInformation,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -3136,8 +3119,8 @@ fn query_directory_stack_decodes_restart_pattern_length_class_and_emission() {
         Length: 128,
         FileName: file_name.as_ptr(),
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation,
-        __bindgen_padding_0: 0,
         FileIndex: 3,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -3178,8 +3161,8 @@ fn query_directory_stack_decodes_names_class() {
         Length: 128,
         FileName: core::ptr::null_mut(),
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileNamesInformation,
-        __bindgen_padding_0: 0,
         FileIndex: 0,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -3220,8 +3203,8 @@ fn query_directory_search_expression_does_not_select_cursor_position() {
                         FileName: file_name,
                         FileInformationClass:
                             wdk_sys::_FILE_INFORMATION_CLASS::FileNamesInformation,
-                        __bindgen_padding_0: 0,
                         FileIndex: 37,
+                        ..Default::default()
                     };
                 assert_eq!(
                     current_stack_fixture(&mut stack)?
@@ -3275,8 +3258,8 @@ fn query_directory_stack_decodes_identity_classes() {
             Length: 128,
             FileName: core::ptr::null_mut(),
             FileInformationClass: raw,
-            __bindgen_padding_0: 0,
             FileIndex: 0,
+            ..Default::default()
         };
 
         let current = current_stack_fixture(&mut stack);
@@ -3307,8 +3290,8 @@ fn query_directory_stack_decodes_index_cursor() {
         Length: 128,
         FileName: core::ptr::null_mut(),
         FileInformationClass: wdk_sys::_FILE_INFORMATION_CLASS::FileDirectoryInformation,
-        __bindgen_padding_0: 0,
         FileIndex: 3,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -3348,8 +3331,8 @@ fn notify_directory_stack_decodes_filter_and_scope() {
     };
     stack.Parameters.NotifyDirectory = wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_7 {
         Length: 512,
-        __bindgen_padding_0: 0,
         CompletionFilter: completion_filter,
+        ..Default::default()
     };
 
     let current = current_stack_fixture(&mut stack);
@@ -3426,10 +3409,9 @@ fn notify_directory_ex_stack_preserves_minor_and_information_class() {
         stack.Parameters.NotifyDirectoryEx =
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_8 {
                 Length: 512,
-                __bindgen_padding_0: 0,
                 CompletionFilter: wdk_sys::FILE_NOTIFY_CHANGE_FILE_NAME,
-                __bindgen_padding_1: 0,
                 DirectoryNotifyInformationClass: raw,
+                ..Default::default()
             };
 
         let current = current_stack_fixture(&mut stack);
@@ -3459,8 +3441,8 @@ fn notify_directory_stack_rejects_empty_and_unknown_filters() {
         stack.Parameters.NotifyDirectory =
             wdk_sys::_IO_STACK_LOCATION__bindgen_ty_1__bindgen_ty_7 {
                 Length: 0,
-                __bindgen_padding_0: 0,
                 CompletionFilter: completion_filter,
+                ..Default::default()
             };
 
         let current = current_stack_fixture(&mut stack);
