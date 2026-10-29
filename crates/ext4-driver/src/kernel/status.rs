@@ -310,7 +310,9 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::ReadOnlyFilesystem => wdk_sys::STATUS_MEDIA_WRITE_PROTECTED,
         Error::InvalidRecoveryMemoryLimit => STATUS_INVALID_PARAMETER,
         Error::RecoveryMemoryLimitExceeded => wdk_sys::STATUS_QUOTA_EXCEEDED,
-        Error::OutOfMemory | Error::MountIdentityExhausted => STATUS_INSUFFICIENT_RESOURCES,
+        Error::OutOfMemory | Error::ReferenceLimitExceeded | Error::MountIdentityExhausted => {
+            STATUS_INSUFFICIENT_RESOURCES
+        }
         Error::OperationCancelled => STATUS_CANCELLED,
         Error::OperationSuspended => STATUS_INTERNAL_ERROR,
         Error::ReadConflict => wdk_sys::STATUS_RETRY,
@@ -439,6 +441,10 @@ mod tests {
         );
         assert_eq!(
             DriverError::from(Error::MountIdentityExhausted).ntstatus(),
+            wdk_sys::STATUS_INSUFFICIENT_RESOURCES
+        );
+        assert_eq!(
+            DriverError::from(Error::ReferenceLimitExceeded).ntstatus(),
             wdk_sys::STATUS_INSUFFICIENT_RESOURCES
         );
         assert_eq!(

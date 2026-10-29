@@ -128,6 +128,8 @@ pub enum Error {
     VerityMismatch,
     /// Memory allocation failed before the requested operation could complete.
     OutOfMemory,
+    /// An additional owning reference cannot be retained; existing owners remain valid.
+    ReferenceLimitExceeded,
     /// This loaded core image cannot issue another distinct mount identity; existing mounts remain valid.
     MountIdentityExhausted,
     /// The scheduler canceled an operation before its durability guard consumed cancellation.
@@ -208,6 +210,7 @@ impl fmt::Display for Error {
             Self::InvalidVerityMetadata => "invalid ext4 verity metadata",
             Self::VerityMismatch => "ext4 verity verification failed",
             Self::OutOfMemory => "memory allocation failed",
+            Self::ReferenceLimitExceeded => "shared reference capacity exhausted",
             Self::MountIdentityExhausted => "mount identity space exhausted",
             Self::OperationCancelled => "filesystem operation was canceled",
             Self::OperationSuspended => "filesystem operation is awaiting storage completion",

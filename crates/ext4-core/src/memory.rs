@@ -15,7 +15,7 @@ fn allocation_failed(_: alloc::collections::TryReserveError) -> Error {
 pub(crate) fn shared_failure(error: ext4_shared::Error) -> Error {
     match error {
         ext4_shared::Error::AllocationFailed => Error::OutOfMemory,
-        ext4_shared::Error::ReferenceLimit => Error::ArithmeticOverflow,
+        ext4_shared::Error::ReferenceLimit => Error::ReferenceLimitExceeded,
     }
 }
 
