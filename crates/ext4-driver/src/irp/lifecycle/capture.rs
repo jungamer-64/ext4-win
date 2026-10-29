@@ -1895,7 +1895,7 @@ mod tests {
     /// # Errors
     /// Returns fixture identity/capture failure before queued ownership exists.
     /// # Panics
-    /// Fails if requestor-supplied tuples enter raw verification or verification loses release capacity.
+    /// Fails if requestor-supplied tuples enter raw verification or snapshot exclusion blocks it.
     #[test]
     #[expect(
         unsafe_code,
@@ -1945,7 +1945,24 @@ mod tests {
                     assert!(
                         matches!(&captured.context, QueueContextOwnership::Captured(context) if matches!(context.prepared, PreparedRequest::VerifyVolume(_)))
                     );
-                    let _status = captured.reject(DriverError::InsufficientResources);
+                    let device = captured.target.device;
+                    let irp = captured.publish();
+                    let mut owned = unsafe {
+                        // SAFETY: Queue publication transferred this fixture's unique IRP;
+                        // its original stack, VPB and devices remain live through completion.
+                        super::super::OwnedIrp::from_queued_raw(device, irp)
+                    };
+                    for phase in [
+                        crate::kernel::stream::SnapshotPhase::Open,
+                        crate::kernel::stream::SnapshotPhase::Draining,
+                        crate::kernel::stream::SnapshotPhase::Frozen,
+                    ] {
+                        assert!(
+                            !crate::request::operation::snapshot_should_wait(&mut owned, phase),
+                            "kernel verification must resume frozen lower I/O during {phase:?}"
+                        );
+                    }
+                    let _status = owned.prepare_result(Ok(IrpCompletion::EMPTY)).notify();
                 }
                 Err(status) => assert_eq!(status, expected),
             }

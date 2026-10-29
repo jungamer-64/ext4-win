@@ -6,15 +6,18 @@ use crate::kernel::stream::{SnapshotLease, SnapshotPhase};
 use crate::memory::DriverVec;
 use crate::state::StreamCacheLease;
 
-/// Keeps oplock responses and mandatory handle releases available while old mutations drain.
+/// Keeps oplock responses, media verification and mandatory handle releases available.
 /// Paging is admitted only during writeback; new changes retain their captured IRPs until thaw.
+/// Kernel verification resumes lower commands that may retain snapshot exclusion themselves.
 pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, phase: SnapshotPhase) -> bool {
     if phase == SnapshotPhase::Open {
         return false;
     }
     let execution = owned.execution_class();
     match owned.actor_request() {
-        ActorRequest::Cleanup | ActorRequest::Close => false,
+        ActorRequest::Cleanup
+        | ActorRequest::Close
+        | ActorRequest::Captured(PreparedRequest::VerifyVolume(_)) => false,
         ActorRequest::Captured(PreparedRequest::LockControl) => {
             execution != ExecutionClass::Release
         }
