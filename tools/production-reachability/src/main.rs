@@ -25,8 +25,11 @@ const DURABLE_PUBLISH_ROOT: &str = "<ext4win::state::volume::MountedVolumeAccess
 /// Required active top-level IRP cancellation callback.
 const ACTIVE_CANCEL_CALLBACK: &str = "ext4win::irp::cancel::active_irp_cancelled";
 
-/// Required fixed-slot storage retry timer callback.
-const STORAGE_RETRY_CALLBACK: &str = "ext4win::irp::reactor::storage_retry_timer_dpc";
+/// Required per-operation retry and observation timer callback.
+const OPERATION_TIMER_CALLBACK: &str = "ext4win::irp::reactor::operation_timer_dpc";
+
+/// Required delayed-close and ownership timer callback.
+const ACTOR_TIMER_CALLBACK: &str = "ext4win::irp::reactor::actor_timer_dpc";
 
 /// Prefix retained in both the audited LLVM IR and linked PE image.
 const ARTIFACT_ID_MARKER: &str = "EXT4WIN_ARTIFACT_ID=";
@@ -45,7 +48,8 @@ const ARTIFACT_ID_SYMBOL: &str = "EXT4WIN_PRODUCTION_ARTIFACT_ID";
 /// transport helpers may be inlined into the required recognition/query entry points.
 const REQUIRED_LINKED_SYMBOLS: &[(&str, &str)] = &[
     ("active cancellation callback", "active_irp_cancelled"),
-    ("storage retry timer callback", "storage_retry_timer_dpc"),
+    ("operation timer callback", "operation_timer_dpc"),
+    ("actor timer callback", "actor_timer_dpc"),
     ("lower completion routine", "lower_request_completed"),
     ("durable publication boundary", "publish_durable"),
     ("completion registration import", "IoSetCompletionRoutineEx"),
@@ -1579,7 +1583,7 @@ impl IrModule {
     }
 
     /// Rejects allocation and blocking waits reachable from lower completion, active cancel, or
-    /// retry-timer callbacks.
+    /// reactor timer callbacks.
     ///
     /// # Errors
     ///
@@ -1592,7 +1596,11 @@ impl IrModule {
                 is_nonallocating_callback(&function.display).then_some(symbol.clone())
             })
             .collect();
-        for required in [ACTIVE_CANCEL_CALLBACK, STORAGE_RETRY_CALLBACK] {
+        for required in [
+            ACTIVE_CANCEL_CALLBACK,
+            OPERATION_TIMER_CALLBACK,
+            ACTOR_TIMER_CALLBACK,
+        ] {
             if self
                 .functions
                 .values()
@@ -2120,8 +2128,9 @@ fn is_publication_allocation_sink(symbol: &str, display: &str) -> bool {
 /// Selects callbacks whose IRQL contract permits neither allocation nor blocking.
 fn is_nonallocating_callback(display: &str) -> bool {
     display.starts_with("ext4win::irp::lower::lower_request_completed::<")
-        || display == "ext4win::irp::cancel::active_irp_cancelled"
-        || display == "ext4win::irp::reactor::storage_retry_timer_dpc"
+        || display == ACTIVE_CANCEL_CALLBACK
+        || display == OPERATION_TIMER_CALLBACK
+        || display == ACTOR_TIMER_CALLBACK
 }
 
 /// Recognizes allocation, CNG construction, and blocking wait calls forbidden in callbacks.
@@ -2359,8 +2368,10 @@ mod tests {
              define internal i32 @complete(ptr %device, ptr %irp, ptr %context) {{\n  {completion_return}\n}}\n\
              ; ext4win::irp::cancel::active_irp_cancelled\n\
              define internal void @active_cancel(ptr %device, ptr %irp) {{\n  ret void\n}}\n\
-             ; ext4win::irp::reactor::storage_retry_timer_dpc\n\
-             define internal void @retry_timer(ptr %dpc, ptr %context, ptr %arg1, ptr %arg2) {{\n  ret void\n}}\n\
+             ; ext4win::irp::reactor::operation_timer_dpc\n\
+             define internal void @operation_timer(ptr %dpc, ptr %context, ptr %arg1, ptr %arg2) {{\n  ret void\n}}\n\
+             ; ext4win::irp::reactor::actor_timer_dpc\n\
+             define internal void @actor_timer(ptr %dpc, ptr %context, ptr %arg1, ptr %arg2) {{\n  ret void\n}}\n\
              ; <ext4win::state::volume::MountedVolumeAccess>::publish_durable\n\
              define internal void @publish() {{\n{publish_body}\n  ret void\n}}\n\
              declare i32 @IoSetCompletionRoutineEx(ptr, ptr, ptr, ptr, i8, i8, i8)\n\
@@ -2445,7 +2456,8 @@ mod tests {
              0001:00001000 DriverEntry {driver_entry:016x} f ext4win.o\n\
              0002:00000000 EXT4WIN_PRODUCTION_ARTIFACT_ID {artifact_identity:016x} f ext4win.o\n\
              active_irp_cancelled\n\
-             storage_retry_timer_dpc\n\
+             operation_timer_dpc\n\
+             actor_timer_dpc\n\
              lower_request_completed\n\
              publish_durable\n\
              IoSetCompletionRoutineEx\n\
@@ -3053,6 +3065,80 @@ mod tests {
                 .any(|violation| violation.category == "callback allocation/blocking"),
             "allocation through a resolved indirect callback target was accepted",
         )
+    }
+
+    /// Both reactor timer callbacks are mandatory allocation-free, nonblocking release roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a timer is omitted from either artifact or its reachable work escapes
+    /// the callback audit.
+    #[test]
+    fn reactor_timer_callbacks_are_artifact_checked() -> Result<(), GateError> {
+        let fixture =
+            release_contract_fixture(successful_lower_submission(), "ret i32 -1073741802", "");
+        let map = link_map_fixture(1, 0x0001_8000_0000, 0x0001_8000_1000, 0x0001_8000_2000);
+        require(
+            IrModule::parse(&fixture)?
+                .analyze_release()?
+                .violations
+                .is_empty(),
+            "valid reactor timer callbacks were rejected",
+        )?;
+        LinkMap::parse(&map)?;
+        for (display, symbol) in [
+            (
+                "ext4win::irp::reactor::operation_timer_dpc",
+                "operation_timer",
+            ),
+            ("ext4win::irp::reactor::actor_timer_dpc", "actor_timer"),
+        ] {
+            let missing = fixture.replace(display, "fixture::unrelated_callback");
+            let report = IrModule::parse(&missing)?.analyze_release()?;
+            require(
+                report.violations.iter().any(|violation| {
+                    violation.category == "callback protocol"
+                        && violation.path.iter().any(|step| step.contains(display))
+                }),
+                "missing reactor timer callback was accepted in IR",
+            )?;
+            require(
+                LinkMap::parse(&map.replace(&format!("{symbol}_dpc"), "")).is_err(),
+                "missing reactor timer callback was accepted in the link map",
+            )?;
+            for (call, declaration) in [
+                (
+                    "%allocation = call ptr @ExAllocatePool2(i64 64, i64 32, i32 1)",
+                    "",
+                ),
+                (
+                    "call void @KeWaitForSingleObject()",
+                    "declare void @KeWaitForSingleObject()\n",
+                ),
+            ] {
+                let callback = format!(
+                    "define internal void @{symbol}(ptr %dpc, ptr %context, ptr %arg1, ptr %arg2) {{\n  ret void\n}}"
+                );
+                let mut forbidden = fixture.replace(
+                    &callback,
+                    &callback.replace("  ret void", "  call void @timer_work()\n  ret void"),
+                );
+                forbidden.push_str(&format!(
+                    "; fixture::timer_work\n\
+                     define internal void @timer_work() {{\n  {call}\n  ret void\n}}\n\
+                     {declaration}"
+                ));
+                let report = IrModule::parse(&forbidden)?.analyze_release()?;
+                require(
+                    report.violations.iter().any(|violation| {
+                        violation.category == "callback allocation/blocking"
+                            && violation.path.first().is_some_and(|root| root == display)
+                    }),
+                    "reactor timer callback reached forbidden work without rejection",
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Release audits must not disappear when an unrelated allocator import is absent.
