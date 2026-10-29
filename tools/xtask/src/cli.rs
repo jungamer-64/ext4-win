@@ -5,7 +5,7 @@ use crate::{
     },
     driver_load::{
         check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload,
-        verify_hosted_driver_load,
+        resolve_driver_store_image, verify_hosted_driver_load,
     },
     interop::{
         verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop,
@@ -52,6 +52,8 @@ enum Task {
     CleanupDriverLoadSession,
     /// Sends one secured retirement request from a separately supervised requester.
     PrepareDriverUnload,
+    /// Resolves an OEM package image in an isolated read-only SetupAPI requester.
+    ResolveDriverStoreImage,
     /// Performs read-only validation of a dedicated live-driver host.
     CheckLiveDriverHost,
     /// Builds a verified bundle and exercises it only against a new disposable VHDX.
@@ -93,6 +95,8 @@ impl Task {
             Some(Self::CleanupDriverLoadSession)
         } else if argument == "prepare-driver-unload" {
             Some(Self::PrepareDriverUnload)
+        } else if argument == "resolve-driver-store-image" {
+            Some(Self::ResolveDriverStoreImage)
         } else if argument == "check-live-driver-host" {
             Some(Self::CheckLiveDriverHost)
         } else if argument == "verify-live-vhdx" {
@@ -144,6 +148,10 @@ fn execute() -> TaskResult<()> {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             prepare_driver_unload(&repository_root, session_id)
         }
+        Task::ResolveDriverStoreImage => {
+            let oem = task_argument.as_deref().ok_or_else(usage_error)?;
+            resolve_driver_store_image(oem)
+        }
         Task::CleanupLiveVhdxSession => {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             cleanup_live_vhdx_session(&repository_root, session_id)
@@ -190,6 +198,9 @@ fn execute() -> TaskResult<()> {
                 | Task::PrepareDriverUnload => {
                     Err(io::Error::other("cleanup task lost its required argument").into())
                 }
+                Task::ResolveDriverStoreImage => {
+                    Err(io::Error::other("package mapping lost its required OEM argument").into())
+                }
             }
         }
     }
@@ -199,7 +210,7 @@ fn execute() -> TaskResult<()> {
 fn usage_error() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
-        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|check-live-driver-host|verify-live-vhdx|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
+        "usage: cargo xtask <verify-portable|verify-windows-host|verify-driver|verify-fuzz-replay|fuzz|verify-journal-interop|verify-ro-interop|verify-htree-interop|verify-journal-fixture-provenance|verify-production-driver|check-hosted-driver-host|verify-hosted-driver-load|cleanup-driver-load-session SESSION_ID|prepare-driver-unload SESSION_ID|resolve-driver-store-image OEM_INF|check-live-driver-host|verify-live-vhdx|benchmark-multi-file|cleanup-live-vhdx-session SESSION_ID>",
     )
 }
 
@@ -263,6 +274,10 @@ mod tests {
         assert_eq!(
             Task::parse(OsStr::new("prepare-driver-unload")),
             Some(Task::PrepareDriverUnload)
+        );
+        assert_eq!(
+            Task::parse(OsStr::new("resolve-driver-store-image")),
+            Some(Task::ResolveDriverStoreImage)
         );
         assert_eq!(
             Task::parse(OsStr::new("check-live-driver-host")),

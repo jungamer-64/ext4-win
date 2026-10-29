@@ -141,11 +141,20 @@ fn packages(directory: &Path) -> TaskResult<Vec<Package>> {
     command
         .args(["/enum-drivers", "/files", "/format", "xml", "/output-file"])
         .arg(&inventory);
-    run_checked(command, "structured DriverStore inventory")?;
+    println!("DriverStore inventory: querying PnPUtil");
+    let output = windows::checked_outcome(
+        windows::bounded(command, Duration::from_secs(60))?,
+        "structured DriverStore inventory",
+    )?;
+    print!("{}", String::from_utf8_lossy(&output));
     let literal = windows::literal(inventory.as_os_str())?;
-    let records = windows::management(&format!(
-        "[xml]$xml=[IO.File]::ReadAllText({literal}); @($xml.PnpUtil.Driver | ForEach-Object {{ [pscustomobject]@{{ oem=[string]$_.DriverName; original=[string]$_.OriginalName; provider=[string]$_.ProviderName; files=@($_.Files.File | ForEach-Object {{ [string]$_.Name }}) }} }})"
-    ))?;
+    println!("DriverStore inventory: decoding XML");
+    let records = windows::management(
+        &format!(
+            "[xml]$xml=[IO.File]::ReadAllText({literal}); @($xml.PnpUtil.Driver | ForEach-Object {{ [pscustomobject]@{{ oem=[string]$_.DriverName; original=[string]$_.OriginalName; provider=[string]$_.ProviderName; files=@($_.Files.File | ForEach-Object {{ [string]$_.Name }}) }} }})"
+        ),
+        Duration::from_secs(60),
+    )?;
     let mut records: Vec<Package> = windows::observations(records)?;
     records.retain(|package| {
         package.original.eq_ignore_ascii_case("ext4win.inf")
@@ -164,9 +173,37 @@ fn packages(directory: &Path) -> TaskResult<Vec<Package>> {
             )
             .into());
         }
-        windows_host::driver_store_image(&package.oem)?;
     }
     Ok(records)
+}
+
+/// Resolves only an OEM package's native mapping in a separately supervised process.
+/// SetupAPI can block independently of SCM state. A missing result retains the session's
+/// existing install/cleanup intent; it grants no package or service-control authority.
+/// # Errors
+/// Returns process, native mapping, one-minute timeout or result-decoding failures.
+fn observed_driver_store_image(oem: &str) -> TaskResult<PathBuf> {
+    println!("DriverStore mapping: resolving {oem}");
+    let mut command = Command::new(std::env::current_exe()?);
+    command.arg("resolve-driver-store-image").arg(oem);
+    let output = windows::checked_outcome(
+        windows::bounded(command, Duration::from_secs(60))?,
+        "SetupAPI DriverStore mapping",
+    )?;
+    Ok(serde_json::from_slice(&output)?)
+}
+
+/// Executes the read-only native mapping worker and emits its path as one JSON value.
+/// The supervisor owns the deadline; this process never installs, starts or removes a driver.
+/// # Errors
+/// Returns invalid OEM input, native mapping or output-serialization failures.
+pub(crate) fn resolve_driver_store_image(oem: &OsStr) -> TaskResult<()> {
+    let oem = oem.to_str().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "OEM INF name is not Unicode")
+    })?;
+    let image = windows_host::driver_store_image(oem)?;
+    serde_json::to_writer(io::stdout().lock(), &image)?;
+    Ok(())
 }
 
 /// Reads exact-thumbprint membership in the two machine stores without a PowerShell provider.
@@ -206,9 +243,12 @@ foreach ($name in @('Root', 'TrustedPublisher')) {
 /// Returns Authenticode extraction or management-boundary failures.
 fn signer(bundle: &BundleIdentity, require_trust: bool) -> TaskResult<String> {
     let path = windows::literal(bundle.directory.join("ext4win.sys").as_os_str())?;
-    let observation = windows::management(&format!(
-        "$certificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new([Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile({path})); try {{ $thumbprint=$certificate.Thumbprint; {CERTIFICATE_STORE_OBSERVATION} }} finally {{ $certificate.Dispose() }}"
-    ))?;
+    let observation = windows::management(
+        &format!(
+            "$certificate=[Security.Cryptography.X509Certificates.X509Certificate2]::new([Security.Cryptography.X509Certificates.X509Certificate]::CreateFromSignedFile({path})); try {{ $thumbprint=$certificate.Thumbprint; {CERTIFICATE_STORE_OBSERVATION} }} finally {{ $certificate.Dispose() }}"
+        ),
+        Duration::from_secs(60),
+    )?;
     let thumbprint = observation
         .get("thumbprint")
         .and_then(serde_json::Value::as_str)
@@ -514,7 +554,7 @@ fn bind_installed(session: &mut Session<DriverState>) -> TaskResult<()> {
         return Err(io::Error::other("installation did not select exactly one package").into());
     };
     export(package, session.directory(), &session.state().bundle.sys)?;
-    let image = windows_host::driver_store_image(&package.oem)?;
+    let image = observed_driver_store_image(&package.oem)?;
     let installed = InstalledPackage {
         oem: package.oem.clone(),
         image,
@@ -640,10 +680,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
             }
         };
         if observed.oem != package.oem
-            || !same_local_path(
-                &windows_host::driver_store_image(&observed.oem)?,
-                &package.image,
-            )
+            || !same_local_path(&observed_driver_store_image(&observed.oem)?, &package.image)
         {
             return Err(io::Error::other("remaining OEM package identity changed").into());
         }
@@ -849,6 +886,7 @@ mod tests {
                      root=$root.Certificates.Find('FindByThumbprint', $thumbprint, $false).Count; \
                      publishers=$publishers.Certificates.Find('FindByThumbprint', $thumbprint, $false).Count } \
              } finally { $root.Dispose(); $publishers.Dispose() }",
+            Duration::from_secs(60),
         )?;
         let thumbprint = reference
             .get("thumbprint")
@@ -864,13 +902,16 @@ mod tests {
             ("0000000000000000000000000000000000000000", &absent),
         ] {
             let literal = windows::literal(OsStr::new(thumbprint))?;
-            let observation = windows::management(&format!(
-                "Get-Command ConvertTo-Json | Out-Null; \
+            let observation = windows::management(
+                &format!(
+                    "Get-Command ConvertTo-Json | Out-Null; \
                  Remove-PSDrive Cert -ErrorAction SilentlyContinue; \
                  $PSModuleAutoLoadingPreference='None'; \
                  if (Get-PSDrive Cert -ErrorAction SilentlyContinue) {{ throw 'Cert drive still present' }}; \
                  $thumbprint={literal}; {CERTIFICATE_STORE_OBSERVATION}"
-            ))?;
+                ),
+                Duration::from_secs(60),
+            )?;
             assert_eq!(&observation, expected);
         }
         Ok(())

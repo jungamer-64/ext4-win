@@ -42,20 +42,14 @@ pub(crate) fn observations<T: serde::de::DeserializeOwned>(value: Value) -> Task
 /// Runs one management API expression and normalizes its external representation to JSON.
 /// Empty pipeline output is represented by JSON null, independently of PowerShell's serializer.
 /// # Errors
-/// Returns process, nonzero status, output encoding, or JSON errors.
-pub(crate) fn management(expression: &str) -> TaskResult<Value> {
+/// Returns process, nonzero status, output encoding, or JSON errors. Exceeding the caller's
+/// deadline returns `TimedOut`; external effects still require the owner's reconciliation.
+pub(crate) fn management(expression: &str, timeout: Duration) -> TaskResult<Value> {
     let mut command = Command::new("powershell.exe");
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
         .arg(format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $value = & {{ {expression} }}; if ($null -eq $value) {{ 'null' }} else {{ ConvertTo-Json -InputObject $value -Depth 12 -Compress }}"));
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(io::Error::other(format!(
-            "Windows management API failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-        .into());
-    }
-    Ok(serde_json::from_slice(&output.stdout)?)
+    let output = checked_outcome(bounded(command, timeout)?, "Windows management API")?;
+    Ok(serde_json::from_slice(&output)?)
 }
 /// Executes a bounded command with captured output, preserving accepted-operation uncertainty.
 #[derive(Debug)]
@@ -222,12 +216,27 @@ mod tests {
             ),
             ("@(1,2)", serde_json::json!([1, 2])),
         ] {
-            assert_eq!(management(expression)?, expected);
+            assert_eq!(management(expression, Duration::from_secs(60))?, expected);
         }
-        assert!(observations::<u32>(management("@()")?)?.is_empty());
-        assert_eq!(observations::<u32>(management("1")?)?, vec![1]);
-        assert_eq!(observations::<u32>(management("@(1,2)")?)?, vec![1, 2]);
-        assert!(management("throw 'observation failed'").is_err());
+        assert!(observations::<u32>(management("@()", Duration::from_secs(60))?)?.is_empty());
+        assert_eq!(
+            observations::<u32>(management("1", Duration::from_secs(60))?)?,
+            vec![1]
+        );
+        assert_eq!(
+            observations::<u32>(management("@(1,2)", Duration::from_secs(60))?)?,
+            vec![1, 2]
+        );
+        assert!(management("throw 'observation failed'", Duration::from_secs(60)).is_err());
+        let started = Instant::now();
+        let failure = management("Start-Sleep -Seconds 30; $true", Duration::from_secs(2))
+            .err()
+            .ok_or_else(|| io::Error::other("blocked management request unexpectedly completed"))?;
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(
+            failure.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::TimedOut)
+        );
         Ok(())
     }
 

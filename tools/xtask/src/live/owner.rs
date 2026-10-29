@@ -311,6 +311,7 @@ pub(crate) fn check_live_driver_host(root: &Path) -> TaskResult<()> {
     driver_load::check_hosted_driver_host(root)?;
     windows::management(
         "@('New-VHD','Get-VHD','Mount-VHD','Dismount-VHD','Get-Disk','Set-Disk','Initialize-Disk','New-Partition','verifier.exe','mountvol.exe','fsutil.exe') | ForEach-Object { Get-Command $_ -ErrorAction Stop | Out-Null }; $true",
+        Duration::from_secs(60),
     )?;
     wsl_words(&["--status"])?;
     wsl_words(&["--exec", "mke2fs", "-V"])?;
@@ -330,7 +331,10 @@ fn attachment(session: &mut Session<LiveState>, attach: bool) -> TaskResult<()> 
     let command = if attach { "Mount-VHD" } else { "Dismount-VHD" };
     let path = windows::literal(vhdx(session).as_os_str())?;
     session.publish(Phase::Intent(operation))?;
-    windows::management(&format!("{command} -Path {path} | Out-Null; $true"))?;
+    windows::management(
+        &format!("{command} -Path {path} | Out-Null; $true"),
+        Duration::from_secs(60),
+    )?;
     session.publish(Phase::Observed(operation))
 }
 /// Creates a new fixed-size VHDX, records disk identity and independently captures its Linux data GPT extent.
@@ -343,9 +347,10 @@ fn create_storage(session: &mut Session<LiveState>, workload: LiveWorkload) -> T
         LiveWorkload::Assurance => 268_435_456_u64,
         LiveWorkload::RandomIo => 2_147_483_648,
     };
-    windows::management(&format!(
-        "New-VHD -Path {path} -Fixed -SizeBytes {bytes} | Out-Null; $true"
-    ))?;
+    windows::management(
+        &format!("New-VHD -Path {path} -Fixed -SizeBytes {bytes} | Out-Null; $true"),
+        Duration::from_secs(300),
+    )?;
     session.publish(Phase::Observed(Operation::CreateVhdx))?;
     attachment(session, true)?;
     let disk = storage::disk(&vhdx(session))?
@@ -355,10 +360,13 @@ fn create_storage(session: &mut Session<LiveState>, workload: LiveWorkload) -> T
     };
     session.publish(Phase::Observed(Operation::AttachWindows))?;
     session.publish(Phase::Intent(Operation::Partition))?;
-    windows::management(&format!(
-        "Set-Disk -Number {} -IsOffline $false; Set-Disk -Number {} -IsReadOnly $false; Initialize-Disk -Number {} -PartitionStyle GPT | Out-Null; New-Partition -DiskNumber {} -UseMaximumSize -GptType '{{0FC63DAF-8483-4772-8E79-3D69D8477DE4}}' | Out-Null; $true",
-        disk.number, disk.number, disk.number, disk.number
-    ))?;
+    windows::management(
+        &format!(
+            "Set-Disk -Number {} -IsOffline $false; Set-Disk -Number {} -IsReadOnly $false; Initialize-Disk -Number {} -PartitionStyle GPT | Out-Null; New-Partition -DiskNumber {} -UseMaximumSize -GptType '{{0FC63DAF-8483-4772-8E79-3D69D8477DE4}}' | Out-Null; $true",
+            disk.number, disk.number, disk.number, disk.number
+        ),
+        Duration::from_secs(120),
+    )?;
     let partition = storage::constructed_partition(&disk)?;
     session.state_mut().storage = StorageIdentity::Partition {
         unique: disk.unique,
@@ -916,9 +924,12 @@ fn disk_availability(
         DiskAvailability::Online => ("$false", Operation::OnlineDisk),
     };
     session.publish(Phase::Intent(operation))?;
-    let observed = windows::management(&format!(
-        "$vhd=Get-VHD -Path {path}; if (-not $vhd.Attached) {{ throw 'session VHDX is detached' }}; $disk=Get-Disk -Number $vhd.DiskNumber; if ($disk.UniqueId -ne {unique}) {{ throw 'session disk identity changed' }}; $disk | Set-Disk -IsOffline {offline}; (Get-Disk -Number $vhd.DiskNumber).IsOffline -eq {offline}"
-    ))?;
+    let observed = windows::management(
+        &format!(
+            "$vhd=Get-VHD -Path {path}; if (-not $vhd.Attached) {{ throw 'session VHDX is detached' }}; $disk=Get-Disk -Number $vhd.DiskNumber; if ($disk.UniqueId -ne {unique}) {{ throw 'session disk identity changed' }}; $disk | Set-Disk -IsOffline {offline}; (Get-Disk -Number $vhd.DiskNumber).IsOffline -eq {offline}"
+        ),
+        Duration::from_secs(60),
+    )?;
     if observed != serde_json::Value::Bool(true) {
         return Err(io::Error::other("disk availability transition was not observed").into());
     }

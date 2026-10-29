@@ -1,5 +1,6 @@
 //! Native disk/GPT observations and exact disposable-partition discovery admission.
 use crate::{TaskResult, windows};
+use core::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::{
     io,
@@ -68,9 +69,12 @@ pub(crate) fn disk(vhdx: &Path) -> TaskResult<Option<Disk>> {
         return Ok(None);
     }
     let path = windows::literal(vhdx.as_os_str())?;
-    let observation = windows::management(&format!(
-        "$vhd=Get-VHD -Path {path}; if ($vhd.Attached) {{ @(Get-Disk -Number $vhd.DiskNumber | ForEach-Object {{ [pscustomobject]@{{ number=[uint32]$_.Number; unique=[string]$_.UniqueId; offline=[bool]$_.IsOffline }} }}) }} else {{ @() }}"
-    ))?;
+    let observation = windows::management(
+        &format!(
+            "$vhd=Get-VHD -Path {path}; if ($vhd.Attached) {{ @(Get-Disk -Number $vhd.DiskNumber | ForEach-Object {{ [pscustomobject]@{{ number=[uint32]$_.Number; unique=[string]$_.UniqueId; offline=[bool]$_.IsOffline }} }}) }} else {{ @() }}"
+        ),
+        Duration::from_secs(60),
+    )?;
     let observations: Vec<Disk> = windows::observations(observation)?;
     if observations.len() > 1
         || observations
@@ -89,6 +93,7 @@ pub(crate) fn disk(vhdx: &Path) -> TaskResult<Option<Disk>> {
 fn partitions() -> TaskResult<Vec<(u32, Partition)>> {
     let observation = windows::management(
         "@(Get-Partition | Where-Object GptType | ForEach-Object { [pscustomobject]@{ disk=[uint32]$_.DiskNumber; number=[uint32]$_.PartitionNumber; id=[string]$_.Guid; kind=[string]$_.GptType; offset=[uint64]$_.Offset; length=[uint64]$_.Size } })",
+        Duration::from_secs(60),
     )?;
     let observations: Vec<PartitionObservation> = windows::observations(observation)?;
     observations

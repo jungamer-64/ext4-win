@@ -3,8 +3,8 @@
 mod owner;
 #[cfg(windows)]
 pub(crate) use owner::{
-    check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload, restart_session,
-    start_session, verify_hosted_driver_load,
+    check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload,
+    resolve_driver_store_image, restart_session, start_session, verify_hosted_driver_load,
 };
 
 #[cfg(not(windows))]
@@ -43,4 +43,16 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, _id: &OsStr) -> TaskResul
 #[cfg(not(windows))]
 pub(crate) fn prepare_driver_unload(root: &Path, _id: &OsStr) -> TaskResult<()> {
     check_hosted_driver_host(root)
+}
+
+/// Rejects native package mapping on a portable host.
+/// # Errors
+/// Always returns Unsupported on non-Windows hosts.
+#[cfg(not(windows))]
+pub(crate) fn resolve_driver_store_image(_oem: &OsStr) -> TaskResult<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "DriverStore mapping requires Windows",
+    )
+    .into())
 }
