@@ -15,7 +15,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 #[cfg(not(test))]
-use ext4_core::{ByteOffset, Error};
+use ext4_core::ByteOffset;
 use wdk_sys::{IRP_MJ_DEVICE_CONTROL, IRP_MJ_FLUSH_BUFFERS, IRP_MJ_READ, IRP_MJ_WRITE, NTSTATUS};
 #[cfg(not(test))]
 use wdk_sys::{LARGE_INTEGER, PIRP};
@@ -1046,6 +1046,15 @@ impl<O> LowerSubmissionError<O> {
     }
 }
 
+/// Classifies native registration failure before the lower driver can observe the request.
+/// Completion-registration pool exhaustion is independent from backing-device reliability.
+fn completion_registration_error(status: NTSTATUS) -> DriverError {
+    match status {
+        wdk_sys::STATUS_INSUFFICIENT_RESOURCES => DriverError::InsufficientResources,
+        _ => DriverError::Core(ext4_core::Error::DeviceIo),
+    }
+}
+
 /// Envelope payload retained intact until every fallible IRP construction step succeeds.
 #[cfg(not(test))]
 struct UnregisteredEnvelope<O, R: LowerCompletionRoute<O>> {
@@ -1241,7 +1250,7 @@ impl<O: Send + 'static, R: LowerCompletionRoute<O>> PreparedLowerIrp<O, R> {
             )
         };
         if status < wdk_sys::STATUS_SUCCESS {
-            return Err(self.reject_unsubmitted(DriverError::from(Error::DeviceIo)));
+            return Err(self.reject_unsubmitted(completion_registration_error(status)));
         }
 
         observe(self.physical_io);
@@ -1639,6 +1648,7 @@ mod tests {
         LowerCompletionClaim, LowerCompletionEnvelope, LowerCompletionRoute, LowerOperation,
         LowerSubmissionError, LowerTransferMethod, PublishedLowerRequest,
         STATUS_MORE_PROCESSING_REQUIRED, claim_completion_during_cancel, claim_lower_completion,
+        completion_registration_error,
     };
 
     /// Concrete test route proving completion publication needs no function pointer.
@@ -1942,60 +1952,55 @@ mod tests {
         }
     }
 
+    /// # Errors
+    /// Returns allocation, rundown acquisition, or envelope construction failure.
     /// # Panics
-    ///
-    /// Panics if pre-submit failures lose the operation or publish the envelope.
+    /// Panics if registration exhaustion changes classification, loses ownership, or publishes.
     #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "setup failures propagate while assertions check unsubmitted ownership and failure classification"
+    )]
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn unsubmitted_failures_preserve_operation_ownership() {
-        let Ok(rundown) = CompletionRundown::try_new() else {
-            return;
-        };
-        let Ok(Some(lease)) = rundown.acquire() else {
-            return;
-        };
-        let Ok(transfer) = AlignedTransferBuffer::try_zeroed(0, 1) else {
-            return;
-        };
+    fn unsubmitted_failures_preserve_operation_ownership() -> Result<(), DriverError> {
+        let rundown = CompletionRundown::try_new()?;
+        let lease = rundown
+            .acquire()?
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let transfer = AlignedTransferBuffer::try_zeroed(0, 1)?;
         assert!(transfer.as_void_ptr().is_null());
         let mut inbox: Option<NonNull<TestEnvelope>> = None;
         let destination = TestCompletionRoute {
             inbox: NonNull::from(&mut inbox),
         };
-        let Ok(envelope) = memory::boxed_try_with(move || {
+        let envelope = memory::boxed_try_with(move || {
             Ok(LowerCompletionEnvelope::new(
                 41_u64,
                 transfer,
                 destination,
                 lease,
             ))
-        }) else {
-            return;
+        })?;
+        let registration = LowerSubmissionError {
+            error: completion_registration_error(wdk_sys::STATUS_INSUFFICIENT_RESOURCES),
+            suspended: LowerCompletionEnvelope::reclaim_unsubmitted(
+                super::NativeAllocation::from_box(envelope),
+            ),
         };
-        assert_eq!(
-            LowerCompletionEnvelope::reclaim_unsubmitted(super::NativeAllocation::from_box(
-                envelope
-            )),
-            41
-        );
+        let (error, suspended) = registration.into_parts();
+        assert_eq!((error, suspended), (DriverError::InsufficientResources, 41));
+        assert_eq!(error.ntstatus(), wdk_sys::STATUS_INSUFFICIENT_RESOURCES);
         assert!(inbox.is_none());
 
         let build = LowerBuildError::from_unsubmitted(DriverError::InvalidParameter, 42_u64);
         assert_eq!(build.into_parts(), (DriverError::InvalidParameter, 42));
-        let registration = LowerSubmissionError {
-            error: DriverError::InsufficientResources,
-            suspended: 43_u64,
-        };
-        assert_eq!(
-            registration.into_parts(),
-            (DriverError::InsufficientResources, 43)
-        );
         unsafe {
             // SAFETY: Reclaim released the envelope's sole lease.
             rundown.close_and_wait();
         }
+        Ok(())
     }
 }
