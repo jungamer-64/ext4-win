@@ -523,7 +523,7 @@ pub struct CommittedEpoch {
     /// Durable journal payloads not yet copied to home blocks.
     pub(super) overlay: Vec<JournalBlock>,
     /// Immutable virtual recovery bytes; absent for writable mounts.
-    recovery: Option<alloc::sync::Arc<super::recovery::RecoveryOverlay>>,
+    recovery: Option<ext4_shared::Shared<super::recovery::RecoveryOverlay>>,
 }
 
 impl CommittedEpoch {
@@ -576,8 +576,8 @@ impl CommittedEpoch {
         fscrypt_keys: FscryptKeySet,
         clusters: Option<ClusterReferenceIndex>,
         overlay: Vec<JournalBlock>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Ok(Self {
             mount: current.mount,
             access: current.access,
             sequence,
@@ -585,8 +585,8 @@ impl CommittedEpoch {
             fscrypt_keys,
             clusters,
             overlay,
-            recovery: current.recovery.as_ref().map(alloc::sync::Arc::clone),
-        }
+            recovery: current.recovery.as_ref().map(|overlay| overlay.try_acquire().map_err(crate::memory::shared_failure)).transpose()?,
+        })
     }
 
     /// This epoch's monotonic identity.

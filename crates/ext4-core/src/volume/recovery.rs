@@ -43,9 +43,9 @@ impl RecoveryOverlay {
     /// Seals replay storage before it becomes a shared, immutable read source.
     /// # Errors
     /// Returns budget exhaustion or physical allocation failure before mount publication.
-    pub(super) fn seal(self) -> Result<alloc::sync::Arc<Self>> {
+    pub(super) fn seal(self) -> Result<ext4_shared::Shared<Self>> {
         self.require_budget(self.payload_bytes, self.images.capacity())?;
-        alloc::sync::Arc::try_new(self).map_err(|_| Error::OutOfMemory)
+        ext4_shared::Shared::try_new(self).map_err(memory::shared_failure)
     }
 
     /// Admits the complete successor before replacing any accepted replay image.
