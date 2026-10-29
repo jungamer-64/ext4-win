@@ -1497,8 +1497,7 @@ impl IrModule {
         self.audit_durable_publication(violations)
     }
 
-    /// Requires every release monomorphization that registers lower completion to call the lower
-    /// driver in the immediate registration-success block of the same sealed boundary.
+    /// Requires exactly one lower call on every defined returning registration-success path.
     fn audit_lower_submission(&self, violations: &mut Vec<Violation>) {
         let mut registration_sites = 0_usize;
         for function in self.functions.values() {
@@ -1528,7 +1527,7 @@ impl IrModule {
                     category: "lower submission protocol",
                     path: vec![
                         function.display.clone(),
-                        "IoSetCompletionRoutineEx success must flow directly to one IofCallDriver"
+                        "IoSetCompletionRoutineEx success must reach exactly one IofCallDriver"
                             .to_owned(),
                     ],
                 });
@@ -2152,7 +2151,7 @@ fn instruction_calls(instruction: &str, target: &str) -> bool {
         .is_some_and(|callee| callee == target)
 }
 
-/// Verifies the fail/success typestate shape emitted by the sealed lower-registration boundary.
+/// Selects the status-checked success branch and audits its complete submission control flow.
 fn registration_success_calls_driver(body: &[String], registration: usize) -> bool {
     let Some(registration_instruction) = body.get(registration) else {
         return false;
@@ -2178,30 +2177,93 @@ fn registration_success_calls_driver(body: &[String], registration: usize) -> bo
     let Some((_failure, success)) = conditional_branch_targets(branch, comparison_result) else {
         return false;
     };
-    let Some(success_label) = body
+    let labels: BTreeMap<&str, usize> = body
         .iter()
         .enumerate()
-        .skip(registration.saturating_add(3))
-        .find_map(|(index, instruction)| {
-            (basic_block_label(instruction) == Some(success)).then_some(index)
+        .filter_map(|(index, instruction)| {
+            basic_block_label(instruction).map(|label| (label, index))
         })
-    else {
+        .collect();
+    let Some(success_label) = labels.get(success).copied() else {
         return false;
     };
-
-    let mut submissions = 0_usize;
-    for instruction in body.iter().skip(success_label.saturating_add(1)) {
-        if basic_block_label(instruction).is_some() {
+    let mut work = vec![(success_label, 0_u8, false)];
+    let mut active = BTreeSet::new();
+    let mut finished = BTreeSet::new();
+    let mut returned = false;
+    while let Some((index, submissions, leaving)) = work.pop() {
+        let state = (index, submissions);
+        if leaving {
+            active.remove(&state);
+            finished.insert(state);
+            continue;
+        }
+        if finished.contains(&state) {
+            continue;
+        }
+        // A cycle can indefinitely retain a successfully registered request without submitting
+        // or completing the handoff, even when a different branch eventually calls the driver.
+        if !active.insert(state) {
             return false;
         }
+        let Some(instruction) = body.get(index) else {
+            return false;
+        };
+        work.push((index, submissions, true));
+        let mut submissions = submissions;
         if instruction_calls(instruction, "IofCallDriver") {
             submissions = submissions.saturating_add(1);
         }
-        if is_terminator_instruction(instruction) {
-            return submissions == 1;
+        if submissions > 1 {
+            return false;
+        }
+        if instruction.starts_with("ret ") {
+            if submissions != 1 {
+                return false;
+            }
+            returned = true;
+        } else if instruction == "unreachable" {
+            // LLVM marks invalid enum representations and other undefined continuations here.
+            // These have no defined successor; they cannot supply the required returning path.
+        } else if instruction.starts_with("br ") || instruction.starts_with("switch ") {
+            let Some(targets) = submission_branch_targets(body, index, &labels) else {
+                return false;
+            };
+            for target in targets {
+                work.push((target, submissions, false));
+            }
+        } else if is_terminator_instruction(instruction) {
+            return false;
+        } else {
+            work.push((index.saturating_add(1), submissions, false));
         }
     }
-    false
+    returned
+}
+
+/// Resolves every explicit branch or switch successor; unmodeled labels fail closed.
+fn submission_branch_targets(
+    body: &[String],
+    index: usize,
+    labels: &BTreeMap<&str, usize>,
+) -> Option<Vec<usize>> {
+    let first = body.get(index)?;
+    let instruction = if first.starts_with("switch ") {
+        let tail = body.get(index..)?;
+        let end = tail.iter().position(|line| line.contains(']'))?;
+        tail.get(..=end)?.join(" ")
+    } else {
+        first.clone()
+    };
+    let targets: Option<Vec<usize>> = instruction
+        .split("label %")
+        .skip(1)
+        .map(|target| {
+            let label = target.split([',', ']', ' ', '\t']).next()?;
+            labels.get(label).copied()
+        })
+        .collect();
+    targets.filter(|targets| !targets.is_empty())
 }
 
 /// Extracts an SSA assignment name, including its leading percent sign.
@@ -2232,8 +2294,11 @@ fn basic_block_label(instruction: &str) -> Option<&str> {
     (!label.is_empty() && !label.chars().any(char::is_whitespace)).then_some(label)
 }
 
-/// Recognizes control-flow terminators that end the immediate registration-success block.
+/// Recognizes terminators, including instructions assigning their result to an SSA value.
 fn is_terminator_instruction(instruction: &str) -> bool {
+    let instruction = instruction
+        .split_once('=')
+        .map_or(instruction, |(_, value)| value.trim());
     [
         "ret ",
         "br ",
@@ -3034,6 +3099,60 @@ mod tests {
                 .any(|violation| violation.category == "callback allocation/blocking"),
             "private IRP allocation from a completion callback was accepted",
         )
+    }
+
+    /// Success may branch through accounting work, but cannot bypass or indefinitely defer submission.
+    /// # Errors
+    /// Returns an error if the control-flow audit accepts a broken handoff or rejects a complete one.
+    #[test]
+    fn lower_submission_audits_all_success_paths() -> Result<(), GateError> {
+        for (flow, accepted) in [
+            (
+                "  br i1 true, label %account, label %submit\n\
+                 account:\n  call void @account_io()\n  br label %submit\n\
+                 submit:\n",
+                true,
+            ),
+            (
+                "  switch i32 0, label %invalid [\n\
+                   i32 0, label %account\n\
+                   i32 1, label %submit\n  ]\n\
+                 invalid:\n  unreachable\n\
+                 account:\n  call void @account_io()\n  br label %submit\n\
+                 submit:\n",
+                true,
+            ),
+            (
+                "  br i1 true, label %wait, label %submit\n\
+                 wait:\n  br label %wait\n\
+                 submit:\n",
+                false,
+            ),
+            ("  br label %missing\nsubmit:\n", false),
+            (
+                "  %result = invoke i32 @invoke_account() to label %submit unwind label %exit\n\
+                 exit:\n  ret void\n\
+                 submit:\n",
+                false,
+            ),
+        ] {
+            let body = successful_lower_submission().replace(
+                "registration_succeeded:\n",
+                &format!("registration_succeeded:\n{flow}"),
+            );
+            let mut fixture = release_contract_fixture(&body, "ret i32 -1073741802", "");
+            fixture.push_str("declare void @account_io()\ndeclare i32 @invoke_account()\n");
+            let report = IrModule::parse(&fixture)?.analyze_release()?;
+            require(
+                report
+                    .violations
+                    .iter()
+                    .all(|violation| violation.category != "lower submission protocol")
+                    == accepted,
+                "registration-success control flow produced the wrong handoff verdict",
+            )?;
+        }
+        Ok(())
     }
 
     /// Callback auditing must conservatively follow every resolved indirect target.
