@@ -9,12 +9,11 @@
     (FsRtlIsNtstatusExpected((NTSTATUS)GetExceptionCode())                     \
          ? EXCEPTION_EXECUTE_HANDLER                                           \
          : EXCEPTION_CONTINUE_SEARCH)
-#include "cache_mdl.h"
 #include "cache_close.h"
 #include "data_protection.h"
 #include "section_deletion.h"
 #include "directory_notification.h"
-#include "fsrtl_completion.h"
+#include "notification_access.h"
 #include "paging_file.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
@@ -573,7 +572,7 @@ ext4win_stream_oplock_fsctrl(
     wdk_sys_acquire_resource_exclusive(&stream->MainResource, TRUE);
     FsRtlIncrementLockRequestsInProgress(stream->ByteRangeLocks);
     __try {
-        status = ext4win_oplock_fsctrl(
+        status = wdk_sys_oplock_fsctrl(
             &stream->Header.Oplock,
             irp,
             open_count,
@@ -617,7 +616,7 @@ ext4win_stream_check_oplock(
     }
     *admitted = TRUE;
     __try {
-        status = ext4win_check_oplock(
+        status = wdk_sys_check_oplock(
             &stream->Header.Oplock,
             irp,
             flags,
@@ -653,7 +652,7 @@ ext4win_stream_cleanup_oplock(_In_ PVOID stream_header, _Inout_ PIRP irp, _In_ U
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
     wdk_sys_acquire_resource_shared(&stream->MainResource, TRUE);
     __try {
-        status = ext4win_check_oplock(&stream->Header.Oplock, irp, flags, NULL, NULL, NULL);
+        status = wdk_sys_check_oplock(&stream->Header.Oplock, irp, flags, NULL, NULL, NULL);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { status = GetExceptionCode(); }
     wdk_sys_release_resource(&stream->MainResource);
@@ -682,7 +681,7 @@ ext4win_stream_backout_atomic_oplock(
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_OPLOCK_CHECK);
     wdk_sys_acquire_resource_shared(&stream->MainResource, TRUE);
     __try {
-        status = ext4win_check_oplock(
+        status = wdk_sys_check_oplock(
             &stream->Header.Oplock,
             irp,
             OPLOCK_FLAG_BACK_OUT_ATOMIC_OPLOCK,
@@ -1562,7 +1561,7 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
 
     stream->Signature = 0;
     stream->Owner = NULL;
-    ext4win_uninitialize_oplock(&stream->Header.Oplock);
+    wdk_sys_uninitialize_oplock(&stream->Header.Oplock);
     wdk_sys_teardown_fcb_header(&stream->Header);
 
     storage_status = STATUS_SUCCESS;

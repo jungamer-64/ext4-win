@@ -289,9 +289,9 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native directory notification allocation exception contract",
         ),
         (
-            "fsrtl-completion",
-            "fsrtl_completion.tests.c",
-            "native FsRtl completion reentry and SEH restoration contract",
+            "notification-access",
+            "notification_access.tests.c",
+            "native requestor subject locking and traversal authorization contract",
         ),
     ] {
         let directory = crate::process::create_task_directory(root, name)?;
@@ -345,9 +345,9 @@ fn verify_cache_manager(root: &Path) -> TaskResult<()> {
             "native deletion mapping admission and retained cache residency contract",
         ),
         (
-            "cache-mdl",
-            "cache_mdl.tests.c",
-            "native MDL ownership contract",
+            "cache-close",
+            "cache_close.tests.c",
+            "native cache close writeback and residency contract",
         ),
         (
             "cache-initialization",

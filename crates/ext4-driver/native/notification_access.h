@@ -27,3 +27,10 @@ BOOLEAN NTAPI ext4win_notification_check_traverse(PSECURITY_SUBJECT_CONTEXT subj
     return allowed;
 }
 
+
+VOID NTAPI ext4win_notify_register(PNOTIFY_SYNC sync, PLIST_ENTRY list, PVOID context,
+    PSTRING directory, ULONG filter, BOOLEAN subtree, PIRP irp, PSECURITY_SUBJECT_CONTEXT subject)
+{
+    wdk_sys_notify_change_directory(sync, list, context, directory, subtree, FALSE, filter, irp,
+        subject == NULL ? NULL : ext4win_notify_traverse, subject);
+}

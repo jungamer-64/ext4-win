@@ -22,13 +22,12 @@ unsafe extern "system" {
     pub(crate) fn ext4win_file_set_flags(file: wdk_sys::PFILE_OBJECT, flags: wdk_sys::ULONG);
 }
 
-// The WDK copy has an external shared-memory contract and is not a compiler memcpy intrinsic.
-// Host tests execute the corresponding user-mode implementation of that same platform contract.
-#[cfg_attr(not(test), link(name = "volatileaccessk", kind = "static"))]
-#[cfg_attr(test, link(name = "volatileaccessu", kind = "static"))]
+// Host tests execute the user-mode implementation of the WDK shared-memory copy contract.
+#[cfg(test)]
+#[link(name = "volatileaccessu", kind = "static")]
 #[expect(
     unsafe_code,
-    reason = "the platform copy binding must link the library matching the kernel or host execution domain"
+    reason = "host execution of the WDK copy binding requires its user-mode static library"
 )]
 unsafe extern "C" {}
 
@@ -322,37 +321,11 @@ unsafe extern "system" {
         subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
     );
 
-    /// Reports a borrowed name synchronously under a saved/restored completion marker.
-    /// The sync/list must be initialized and pinned for this call.
-    pub(crate) fn ext4win_notify_report(
-        sync: wdk_sys::PNOTIFY_SYNC,
-        list: *mut wdk_sys::LIST_ENTRY,
-        target: wdk_sys::PSTRING,
-        name_offset: u16,
-        filter: u32,
-        action: u32,
-        traversal: *const core::ffi::c_void,
-    );
-
     /// Checks one aligned descriptor against the callback's already-locked captured subject.
     pub(crate) fn ext4win_notification_check_traverse(
         subject: *mut wdk_sys::SECURITY_SUBJECT_CONTEXT,
         descriptor: wdk_sys::PSECURITY_DESCRIPTOR,
     ) -> u8;
-
-    /// Completes watches for a live CCB context under a saved/restored completion marker.
-    /// The sync/list must remain initialized and pinned through completion.
-    pub(crate) fn ext4win_notify_cleanup(
-        sync: wdk_sys::PNOTIFY_SYNC,
-        list: *mut wdk_sys::LIST_ENTRY,
-        context: wdk_sys::PVOID,
-    );
-
-    /// Drains the initialized, pinned watch list under a saved/restored completion marker.
-    pub(crate) fn ext4win_notify_cleanup_all(
-        sync: wdk_sys::PNOTIFY_SYNC,
-        list: *mut wdk_sys::LIST_ENTRY,
-    );
 
     /// Copies effective user/primary-group SIDs while retaining and locking the captured subject.
     pub(crate) fn ext4win_creator_sids(
@@ -399,24 +372,6 @@ unsafe extern "system" {
 
     /// Projects an activated paging map into the native advanced-header flags.
     pub(crate) fn ext4win_stream_mark_paging_file(header: *mut core::ffi::c_void);
-
-    /// Locks a bounded writable requestor prefix as an opaque owning native target.
-    pub(crate) fn ext4win_capture_requestor_output(
-        output_out: *mut wdk_sys::PVOID,
-        requestor_buffer: wdk_sys::PVOID,
-        capacity: wdk_sys::ULONG,
-        requestor_mode: wdk_sys::KPROCESSOR_MODE,
-    ) -> wdk_sys::NTSTATUS;
-
-    /// Copies owned bytes into a captured query target, then consumes and unlocks the target.
-    pub(crate) fn ext4win_copy_requestor_output(
-        output: wdk_sys::PVOID,
-        owned_source: *const core::ffi::c_void,
-        source_length: wdk_sys::ULONG,
-    ) -> wdk_sys::NTSTATUS;
-
-    /// Releases an unconsumed locked requestor output.
-    pub(crate) fn ext4win_release_requestor_output(output: wdk_sys::PVOID);
 
     /// Copies an I/O Manager-captured descriptor into owned, aligned memory and validates it.
     pub(crate) fn ext4win_capture_io_manager_security_descriptor(

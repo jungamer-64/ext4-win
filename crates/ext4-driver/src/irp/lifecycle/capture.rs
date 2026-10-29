@@ -1661,23 +1661,15 @@ enum RequestorOutputState {
     /// Size probe owns no native pages.
     Empty,
     /// Native owner of locked pages and their system mapping.
-    Pending(NonNull<c_void>),
+    Pending(wdk::file_system::LockedRequestorOutput),
     /// Publication has released the native owner.
     Consumed,
 }
 
-#[expect(
-    unsafe_code,
-    reason = "the opaque native owner retains locked pages until consuming publication or Drop"
-)]
-// SAFETY: The unique output never forms a Rust reference to requestor memory. Its native MDL
-// owns page residency independently of the requestor thread, and every terminal path releases it.
-unsafe impl Send for CapturedRequestorOutput {}
-
 impl CapturedRequestorOutput {
     /// Locks only the supplied writable prefix before queue insertion.
     /// # Errors
-    /// Returns a native page-lock failure or invalid-parameter for empty/excess capacity.
+    /// Returns a native page-lock failure or invalid-parameter for excess capacity.
     #[cfg_attr(
         not(test),
         expect(
@@ -1701,21 +1693,16 @@ impl CapturedRequestorOutput {
                 // SAFETY: Dispatch retains the live IRP through queue-time capture.
                 (*target.irp.as_ptr()).UserBuffer
             };
-            let mut native = core::ptr::null_mut();
-            let status = unsafe {
-                // SAFETY: Capacity was bounded by the request decoder. C probes and locks exactly
-                // that writable prefix in requestor context and transfers an opaque owner.
-                ffi::ext4win_capture_requestor_output(
-                    core::ptr::addr_of_mut!(native),
+            let native = unsafe {
+                // SAFETY: Dispatch retains original-process access to the bounded requestor
+                // output. No Rust references alias this buffer before terminal publication.
+                wdk::file_system::LockedRequestorOutput::capture(
                     user_buffer,
                     length,
                     target.requestor_mode(),
                 )
-            };
-            ensure_native_success(status)?;
-            let native = NonNull::new(native).ok_or_else(|| {
-                IrpCompletion::from_error(DriverError::InternalInvariantViolation)
-            })?;
+            }
+            .map_err(IrpCompletion::from_native_failure)?;
             Ok(Self {
                 capacity,
                 state: RequestorOutputState::Pending(native),
@@ -1749,19 +1736,16 @@ impl CapturedRequestorOutput {
         }
         #[cfg(not(test))]
         {
-            let length = wdk_sys::ULONG::try_from(source.len())
-                .map_err(|_| DriverError::InternalInvariantViolation)?;
             let RequestorOutputState::Pending(native) =
                 core::mem::replace(&mut self.state, RequestorOutputState::Consumed)
             else {
                 return Err(DriverError::InternalInvariantViolation);
             };
             let status = unsafe {
-                // SAFETY: Source is owned initialized memory disjoint from the opaque requestor
-                // mapping; the unique native target is consumed, including on failure.
-                ffi::ext4win_copy_requestor_output(native.as_ptr(), source.as_ptr().cast(), length)
+                // SAFETY: The passive owner publishes disjoint driver bytes exactly once.
+                native.copy_from(source)
             };
-            if status < STATUS_SUCCESS {
+            if status.is_err() {
                 return Err(DriverError::InternalInvariantViolation);
             }
             Ok(())
@@ -1769,25 +1753,6 @@ impl CapturedRequestorOutput {
         #[cfg(test)]
         {
             Err(DriverError::InvalidDeviceRequest)
-        }
-    }
-}
-
-impl Drop for CapturedRequestorOutput {
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "Drop owns and releases the sole unpublished native page target"
-        )
-    )]
-    fn drop(&mut self) {
-        #[cfg(not(test))]
-        if let RequestorOutputState::Pending(native) = &self.state {
-            unsafe {
-                // SAFETY: This target has never been consumed; Drop releases it exactly once.
-                ffi::ext4win_release_requestor_output(native.as_ptr());
-            }
         }
     }
 }

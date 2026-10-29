@@ -374,14 +374,16 @@ impl DirectoryChangeNotifier {
                 unsafe {
                     // SAFETY: This runs after the namespace transaction commits
                     // at PASSIVE_LEVEL. FsRtl consumes the event synchronously.
-                    ffi::ext4win_notify_report(
+                    wdk_sys::file_system::notify_report_change(
                         sync,
                         list_head,
                         core::ptr::from_mut(&mut full_target_name).cast(),
                         target.name_offset_bytes,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
                         change.completion_filter,
                         change.action.as_ulong(),
-                        core::ptr::from_ref(&traversal).cast(),
+                        core::ptr::from_ref(&traversal).cast_mut().cast(),
                     );
                 }
             });
@@ -428,7 +430,7 @@ impl DirectoryChangeNotifier {
             unsafe {
                 // SAFETY: The CCB pointer uniquely identifies the FILE_OBJECT
                 // being cleaned up and stays alive until its later close IRP.
-                ffi::ext4win_notify_cleanup(sync, list_head, context.as_ptr());
+                wdk_sys::file_system::notify_cleanup(sync, list_head, context.as_ptr());
             }
         }
         #[cfg(test)]
@@ -463,7 +465,7 @@ impl DirectoryChangeNotifier {
             };
             unsafe {
                 // SAFETY: No actor-owned registration can race this volume-wide withdrawal.
-                ffi::ext4win_notify_cleanup_all(sync, list_head);
+                wdk_sys::file_system::notify_cleanup_all(sync, list_head);
             }
         }
     }

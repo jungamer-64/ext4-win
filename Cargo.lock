@@ -864,7 +864,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 [[package]]
 name = "wdk"
 version = "0.5.0"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f#f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=cf7e633585294c06fd1e7b383e3c438c16e8168d#cf7e633585294c06fd1e7b383e3c438c16e8168d"
 dependencies = [
  "cfg-if",
  "tracing",
@@ -876,7 +876,7 @@ dependencies = [
 [[package]]
 name = "wdk-alloc"
 version = "0.4.2"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f#f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=cf7e633585294c06fd1e7b383e3c438c16e8168d#cf7e633585294c06fd1e7b383e3c438c16e8168d"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -887,7 +887,7 @@ dependencies = [
 [[package]]
 name = "wdk-build"
 version = "0.6.0"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f#f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=cf7e633585294c06fd1e7b383e3c438c16e8168d#cf7e633585294c06fd1e7b383e3c438c16e8168d"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -910,7 +910,7 @@ dependencies = [
 [[package]]
 name = "wdk-macros"
 version = "0.5.2"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f#f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=cf7e633585294c06fd1e7b383e3c438c16e8168d#cf7e633585294c06fd1e7b383e3c438c16e8168d"
 dependencies = [
  "cfg-if",
  "fs4",
@@ -926,7 +926,7 @@ dependencies = [
 [[package]]
 name = "wdk-sys"
 version = "0.5.2"
-source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f#f622b94e37aec3d16ee5bfaffa51e0dcb421cd2f"
+source = "git+https://github.com/jungamer-64/windows-drivers-rs?rev=cf7e633585294c06fd1e7b383e3c438c16e8168d#cf7e633585294c06fd1e7b383e3c438c16e8168d"
 dependencies = [
  "anyhow",
  "bindgen",

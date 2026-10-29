@@ -1642,7 +1642,7 @@ impl StreamContext {
                 let status = match request.action() {
                     crate::irp::MdlTransfer::Read => unsafe {
                         // SAFETY: Current-EOF selection holds MainResource; C owns partial read-chain cleanup.
-                        ext4win_cc_read_mdl(
+                        wdk_sys::file_system::cc_read_mdl(
                             _file_object.as_ptr(),
                             offset,
                             length,
@@ -1652,7 +1652,7 @@ impl StreamContext {
                     },
                     crate::irp::MdlTransfer::Write => unsafe {
                         // SAFETY: Current-EOF selection holds MainResource; C owns partial write-chain abort.
-                        ext4win_cc_prepare_mdl_write(
+                        wdk_sys::file_system::cc_prepare_mdl_write(
                             _file_object.as_ptr(),
                             offset,
                             length,
@@ -1662,7 +1662,7 @@ impl StreamContext {
                     },
                 };
                 cache_status(status)?;
-                Ok(information)
+                usize::try_from(information).map_err(|_| DriverError::InternalInvariantViolation)
             }
         }
         #[cfg(test)]
@@ -2318,20 +2318,6 @@ unsafe extern "system" {
     fn ext4win_prepare_mdl_completion(
         queue: *const c_void,
         file: wdk_sys::PFILE_OBJECT,
-    ) -> NTSTATUS;
-    fn ext4win_cc_read_mdl(
-        file: wdk_sys::PFILE_OBJECT,
-        offset: i64,
-        length: u32,
-        chain: *mut wdk_sys::PMDL,
-        information: *mut usize,
-    ) -> NTSTATUS;
-    fn ext4win_cc_prepare_mdl_write(
-        file: wdk_sys::PFILE_OBJECT,
-        offset: i64,
-        length: u32,
-        chain: *mut wdk_sys::PMDL,
-        information: *mut usize,
     ) -> NTSTATUS;
     fn ext4win_stream_create(
         kind: wdk_sys::ULONG,

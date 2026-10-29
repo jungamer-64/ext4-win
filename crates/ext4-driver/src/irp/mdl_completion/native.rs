@@ -338,18 +338,6 @@ unsafe impl Send for MdlCompletionQueue {}
 // SAFETY: Every shared mutation uses the same spin lock; final destruction requires all cycles to retire.
 unsafe impl Sync for MdlCompletionQueue {}
 
-#[expect(
-    unsafe_code,
-    reason = "native code only consumes Cc chains under the required SEH boundary"
-)]
-unsafe extern "system" {
-    fn ext4win_cc_complete_mdl_write(
-        file: PFILE_OBJECT,
-        offset: i64,
-        chain: wdk_sys::PMDL,
-    ) -> NTSTATUS;
-}
-
 /// Consumes a queued notification's chain once, after selecting its native release operation.
 /// # Safety
 /// The worker exclusively retains irp and its initialized completion stack at PASSIVE_LEVEL.
@@ -396,7 +384,7 @@ unsafe fn complete_mdl_notification(irp: &KernelIrp, action: MdlCompletion) -> N
             };
             unsafe {
                 // SAFETY: Native SEH consumes or aborts this uniquely owned chain on every result.
-                ext4win_cc_complete_mdl_write(file, offset, chain)
+                wdk_sys::file_system::cc_complete_mdl_write(file, offset, chain)
             }
         }
     };
