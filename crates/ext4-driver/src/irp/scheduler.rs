@@ -27,7 +27,7 @@ pub(crate) enum ExecutionClass {
 }
 
 impl ExecutionClass {
-    /// Each class owns disjoint execution and notification slots.
+    /// Disjoint execution slots also determine each class's independent notification budget.
     pub(crate) const fn slots(self) -> core::ops::Range<usize> {
         match self {
             Self::Ordinary => 0..OWNERSHIP_SLOTS.start,

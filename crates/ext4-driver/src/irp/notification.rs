@@ -6,22 +6,23 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use super::{
-    lifecycle::KernelIrp,
-    lower::{CompletionRundown, CompletionRundownLease},
-};
+#[cfg(not(test))]
+use super::lifecycle::KernelIrp;
+use super::lower::{CompletionRundown, CompletionRundownLease};
+#[cfg(not(test))]
+use crate::kernel::ffi;
+#[cfg(not(test))]
 use crate::kernel::volume_event::VolumeNotification;
 use crate::{
     kernel::{
         fatal::KernelWideInconsistency,
-        ffi,
         status::{DriverError, DriverResult},
     },
     memory::KernelVec,
     state::KernelDevice,
 };
 
-/// Fixed notification capacity, reserved before request admission and never grown afterward.
+/// Fixed per-class notification capacity, independent of scheduler slot identities.
 pub(super) struct NotificationPool {
     /// Final-address slots; acquisition cannot move or extend this allocation.
     slots: KernelVec<NotificationSlot>,
@@ -49,6 +50,7 @@ impl NotificationPool {
             }
         }
         let pool = Self { slots };
+        #[cfg(not(test))]
         for slot in pool.slots.iter() {
             slot.initialize_callback();
         }
@@ -71,8 +73,8 @@ impl NotificationPool {
         let lease = rundown
             .acquire()?
             .ok_or(DriverError::InvalidDeviceRequest)?;
-        for (index, slot) in self.slots.iter().enumerate() {
-            if !class.slots().contains(&index) {
+        for slot in self.slots.iter() {
+            if slot.class != class {
                 continue;
             }
             if slot
@@ -95,7 +97,10 @@ impl NotificationPool {
 
 /// One work item reused only after the previous callback has finished all slot access.
 struct NotificationSlot {
+    /// Immutable reservation class; callback storage is selected from this same constructor input.
+    class: super::scheduler::ExecutionClass,
     /// Actor wake destination retained by stored or callback-owned rundown.
+    #[cfg(not(test))]
     reactor: NonNull<super::reactor::CompletionReactor>,
     /// Native callback storage whose queue matches the request's progress responsibility.
     callback: NotificationCallback,
@@ -104,10 +109,18 @@ struct NotificationSlot {
     /// Destination lifetime retained even while the reactor has no active operation for this IRP.
     rundown: UnsafeCell<Option<CompletionRundownLease>>,
     /// Terminal notification installed once immediately before queue publication.
+    #[cfg(not(test))]
     job: UnsafeCell<Option<NotificationJob>>,
 }
 
 /// Paging completion is DISPATCH_LEVEL-safe and independent of blocking native cache workers.
+#[cfg_attr(
+    test,
+    expect(
+        dead_code,
+        reason = "host reservation tests select callback classes without invoking native work items or DPCs"
+    )
+)]
 enum NotificationCallback {
     /// Ordinary and terminal handle notifications may call PASSIVE_LEVEL native routines.
     Worker(NonNull<wdk_sys::_IO_WORKITEM>),
@@ -116,6 +129,7 @@ enum NotificationCallback {
 }
 
 /// Mutually exclusive terminal ownership selected before the actor releases its slot.
+#[cfg(not(test))]
 enum NotificationJob {
     /// A committed volume transition must notify outside the actor before IRP completion.
     Volume(KernelIrp, wdk_sys::NTSTATUS, VolumeNotification),
@@ -131,35 +145,47 @@ impl NotificationSlot {
     /// Allocates the native work item while device initialization owns rollback.
     /// # Errors
     /// Returns insufficient resources if the I/O Manager cannot allocate a work item.
-    #[expect(
-        unsafe_code,
-        reason = "the initializing device remains alive through pool construction and destruction"
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the initializing device remains alive through pool construction and destruction"
+        )
     )]
     fn try_new(
         device: KernelDevice,
         reactor: NonNull<super::reactor::CompletionReactor>,
         class: super::scheduler::ExecutionClass,
     ) -> DriverResult<Self> {
+        #[cfg(test)]
+        let _native_identities = (device, reactor);
         let callback = if class == super::scheduler::ExecutionClass::Paging {
             NotificationCallback::Paging(UnsafeCell::new(wdk_sys::KDPC::default()))
         } else {
+            #[cfg(not(test))]
             let work_item = unsafe {
                 // SAFETY: Initialization retains this live device; no callback is published.
                 ffi::IoAllocateWorkItem(device.as_ptr())
             };
-            NotificationCallback::Worker(
-                NonNull::new(work_item).ok_or(DriverError::InsufficientResources)?,
-            )
+            #[cfg(not(test))]
+            let work_item = NonNull::new(work_item).ok_or(DriverError::InsufficientResources)?;
+            #[cfg(test)]
+            let work_item = NonNull::dangling();
+            NotificationCallback::Worker(work_item)
         };
         Ok(Self {
+            class,
+            #[cfg(not(test))]
             reactor,
             callback,
             occupied: AtomicBool::new(false),
             rundown: UnsafeCell::new(None),
+            #[cfg(not(test))]
             job: UnsafeCell::new(None),
         })
     }
     /// Initializes resident DPC identity only after all slots occupy their final allocation.
+    #[cfg(not(test))]
     #[expect(
         unsafe_code,
         reason = "pool construction retains exclusive final-address DPC initialization authority"
@@ -179,14 +205,18 @@ impl NotificationSlot {
 }
 
 impl Drop for NotificationSlot {
-    #[expect(
-        unsafe_code,
-        reason = "reactor teardown joins dispatch and drains notification rundown before destroying work items"
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "reactor teardown joins dispatch and drains notification rundown before destroying work items"
+        )
     )]
     fn drop(&mut self) {
         if self.occupied.load(Ordering::Acquire) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
+        #[cfg(not(test))]
         if let NotificationCallback::Worker(work_item) = &self.callback {
             unsafe {
                 // SAFETY: Rollback or completed rundown proves the work item is not queued.
@@ -199,11 +229,13 @@ impl Drop for NotificationSlot {
 
 /// Unique reserved terminal worker retained across FsRtl byte-range lock waiting.
 #[derive(Debug)]
+#[cfg(not(test))]
 pub(crate) struct FileLockCompletion {
     /// The permit's lease retains the notification pool through synchronous or delayed completion.
     permit: NotificationPermit,
 }
 
+#[cfg(not(test))]
 impl FileLockCompletion {
     /// Transfers this reservation to the exact consuming FsRtl request.
     /// # Safety
@@ -236,6 +268,7 @@ impl FileLockCompletion {
 /// `context` must be the context consumed from FileLockCompletion for this exact IRP. FsRtl must
 /// have ended its cancellation/wait ownership and may invoke this completion exactly once.
 #[unsafe(no_mangle)]
+#[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "the native lock completion returns unique IRP and notification-slot ownership"
@@ -292,6 +325,7 @@ pub(super) struct NotificationPermit {
 // SAFETY: Only the unique permit may access slot payloads. Moving it transfers that authority.
 unsafe impl Send for NotificationPermit {}
 
+#[cfg(not(test))]
 impl NotificationPermit {
     /// Uses the request's reserved PASSIVE_LEVEL worker for an advisory committed-volume event.
     fn queue_volume(self, irp: KernelIrp, status: wdk_sys::NTSTATUS, event: VolumeNotification) {
@@ -381,6 +415,7 @@ impl Drop for NotificationPermit {
     unsafe_code,
     reason = "native callback entry owns all reserved payloads until atomic slot release"
 )]
+#[cfg(not(test))]
 unsafe fn take_notification(context: wdk_sys::PVOID) -> (NotificationJob, CompletionRundownLease) {
     let permit = NotificationPermit {
         slot: NonNull::new(context.cast()).unwrap_or_else(|| {
@@ -418,6 +453,7 @@ unsafe fn take_notification(context: wdk_sys::PVOID) -> (NotificationJob, Comple
     unsafe_code,
     reason = "the I/O Manager transfers the queued permit to this PASSIVE_LEVEL callback"
 )]
+#[cfg(not(test))]
 unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_sys::PVOID) {
     let (job, lease) = unsafe {
         // SAFETY: Work queue entry receives the unique published notification slot.
@@ -442,6 +478,7 @@ unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_s
 
 /// Routing distinguishes actor ownership from a never-started queue rejection.
 #[derive(Debug)]
+#[cfg(not(test))]
 pub(super) enum IrpNotification {
     /// Upper completion must run outside the actor's state transition.
     Worker(NotificationPermit),
@@ -450,6 +487,7 @@ pub(super) enum IrpNotification {
     /// Actor-originated cancellation retains an IRP backlog until a worker can consume it.
     Deferred(NonNull<super::reactor::CompletionReactor>),
 }
+#[cfg(not(test))]
 impl IrpNotification {
     /// Volume transitions always own a reserved ordinary worker; dispatch rejections cannot
     /// publish transitions and paging requests never carry volume events.
@@ -515,6 +553,7 @@ impl IrpNotification {
     unsafe_code,
     reason = "the DPC owns a status-prepared paging IRP and resident notification slot"
 )]
+#[cfg(not(test))]
 unsafe extern "C" fn notify_paging(
     _dpc: *mut wdk_sys::KDPC,
     context: wdk_sys::PVOID,
@@ -530,4 +569,76 @@ unsafe extern "C" fn notify_paging(
     };
     let _status = irp.finish_completion(status);
     drop(lease);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::irp::scheduler::{ExecutionClass, MAX_OPERATIONS};
+
+    /// # Errors
+    /// Returns fixture or pool allocation failure before any native callback is queued.
+    /// # Panics
+    /// Fails if one class consumes another's capacity or uses the wrong completion context.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the local device survives pool destruction and reserved slots retain their rundown leases"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible fixture setup surrounds assertions of independent completion capacity"
+    )]
+    fn notification_classes_reserve_complete_budgets_and_reuse_released_capacity()
+    -> DriverResult<()> {
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let device = unsafe {
+            // SAFETY: The fixture retains this initialized device through pool destruction.
+            KernelDevice::from_raw(&raw mut device)
+        }
+        .ok_or(DriverError::InternalInvariantViolation)?;
+        // Host construction does not initialize or queue native callbacks.
+        let pool = NotificationPool::try_new(device, NonNull::dangling())?;
+        let rundown = CompletionRundown::try_new()?;
+        let mut held = KernelVec::try_with_capacity(MAX_OPERATIONS)?;
+        let classes = [
+            ExecutionClass::Ordinary,
+            ExecutionClass::Release,
+            ExecutionClass::Paging,
+            ExecutionClass::Finalization,
+        ];
+        for class in classes {
+            for _ in class.slots() {
+                let permit = pool.reserve(&rundown, class)?;
+                let slot = unsafe {
+                    // SAFETY: This unique permit and rundown lease retain the reserved slot.
+                    permit.slot.as_ref()
+                };
+                assert_eq!(
+                    matches!(slot.callback, NotificationCallback::Paging(_)),
+                    class == ExecutionClass::Paging
+                );
+                held.push_reserved_owned(permit)
+                    .map_err(|failure| failure.into_parts().0)?;
+            }
+            assert!(matches!(
+                pool.reserve(&rundown, class),
+                Err(DriverError::DeviceBusy)
+            ));
+        }
+        drop(held);
+        for class in classes {
+            let permit = pool.reserve(&rundown, class)?;
+            drop(permit);
+        }
+        unsafe {
+            // SAFETY: Every permit has released its lease and no callback was queued.
+            rundown.close_and_wait();
+        }
+        assert!(matches!(
+            pool.reserve(&rundown, ExecutionClass::Finalization),
+            Err(DriverError::InvalidDeviceRequest)
+        ));
+        Ok(())
+    }
 }
