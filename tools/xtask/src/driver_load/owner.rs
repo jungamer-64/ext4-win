@@ -760,6 +760,18 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
 mod tests {
     use super::*;
 
+    /// Exercises the production observation path against the platform's own XML report.
+    /// # Errors
+    /// Returns native inventory, decoding or mandatory fixture-directory cleanup failures.
+    #[test]
+    fn native_inventory_contract() -> TaskResult<()> {
+        let root = crate::process::repository_root()?;
+        let directory = crate::process::create_task_directory(&root, "driver-inventory")?;
+        let operation = packages(&directory).map(|_observed_packages| ());
+        let cleanup = crate::process::remove_task_directory(&root, &directory, "driver-inventory");
+        combine_verification_and_cleanup(operation, cleanup)
+    }
+
     /// Package binding uses the machine DriverStore path and preserves exact recovery spelling.
     /// # Errors
     /// Returns missing machine-root or service-path resolution failures.
