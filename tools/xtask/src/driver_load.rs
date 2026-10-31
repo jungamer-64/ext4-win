@@ -1,4 +1,6 @@
 //! DriverStore and SCM lifecycle ownership; a failed requester never establishes rollback.
+#[cfg(any(windows, test))]
+mod inventory;
 #[cfg(windows)]
 mod owner;
 #[cfg(windows)]

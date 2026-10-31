@@ -1,4 +1,5 @@
 //! One typed owner for production package identity, install intent, SCM and cleanup authority.
+use super::inventory::Package;
 use crate::{
     TaskResult,
     process::{combine_verification_and_cleanup, run_checked, run_checked_output, sha256_file},
@@ -75,19 +76,6 @@ struct ControlContract {
     /// Payload-free prepare-unload request code.
     ioctl: u32,
 }
-/// Inventory record normalized from the external PnPUtil XML representation.
-#[derive(Debug, Deserialize)]
-struct Package {
-    /// Published package INF.
-    oem: String,
-    /// Original INF identity.
-    original: String,
-    /// Package provider identity.
-    provider: String,
-    /// Files reported by structured inventory.
-    files: Vec<String>,
-}
-
 /// Parses the checked-in lifecycle contract once at its native boundary.
 /// # Errors
 /// Returns malformed records or unsupported lifecycle control fields.
@@ -147,34 +135,8 @@ fn packages(directory: &Path) -> TaskResult<Vec<Package>> {
         "structured DriverStore inventory",
     )?;
     print!("{}", String::from_utf8_lossy(&output));
-    let literal = windows::literal(inventory.as_os_str())?;
     println!("DriverStore inventory: decoding XML");
-    let records = windows::management(
-        &format!(
-            "[xml]$xml=[IO.File]::ReadAllText({literal}); @($xml.PnpUtil.Driver | ForEach-Object {{ [pscustomobject]@{{ oem=[string]$_.DriverName; original=[string]$_.OriginalName; provider=[string]$_.ProviderName; files=@($_.Files.File | ForEach-Object {{ [string]$_.Name }}) }} }})"
-        ),
-        Duration::from_secs(60),
-    )?;
-    let mut records: Vec<Package> = windows::observations(records)?;
-    records.retain(|package| {
-        package.original.eq_ignore_ascii_case("ext4win.inf")
-            && package.provider.eq_ignore_ascii_case("ext4-win")
-    });
-    for package in &records {
-        if package
-            .files
-            .iter()
-            .filter(|file| file.eq_ignore_ascii_case("ext4win.sys"))
-            .count()
-            != 1
-        {
-            return Err(io::Error::other(
-                "structured DriverStore inventory does not identify exactly one SYS",
-            )
-            .into());
-        }
-    }
-    Ok(records)
+    super::inventory::packages(&fs::read(&inventory)?)
 }
 
 /// Resolves only an OEM package's native mapping in a separately supervised process.
