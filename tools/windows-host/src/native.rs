@@ -2074,11 +2074,8 @@ mod tests {
         completed(operation, cleanup)?;
         // Equal encoded lengths cannot make a different cursor identity acceptable.
         let name = "entry-000002";
-        let mut record = vec![0_u8; 12];
-        record
-            .get_mut(8..12)
-            .ok_or_else(|| io::Error::other("short name header"))?
-            .copy_from_slice(&24_u32.to_le_bytes());
+        let mut record = vec![0_u8; 8];
+        record.extend_from_slice(&24_u32.to_le_bytes());
         for unit in name.encode_utf16() {
             record.extend_from_slice(&unit.to_le_bytes());
         }
