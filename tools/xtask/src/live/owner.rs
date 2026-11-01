@@ -2,7 +2,7 @@
 use crate::{
     TaskResult, driver_load, fixture,
     process::{combine_verification_and_cleanup, run_checked, run_checked_output},
-    production::{VerifiedProductionBundle, build_verified_production_bundle},
+    production::build_verified_production_bundle,
     session::{Operation, Phase, Session, SessionId},
     storage::{self, DisposablePartition, Partition},
     windows,
@@ -25,7 +25,7 @@ use std::{
 mod benchmark;
 
 /// Storage and workload selected before the disposable session acquires resources.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 enum LiveWorkload {
     /// Existing filesystem and driver assurance scenario.
     Assurance,
@@ -48,10 +48,14 @@ enum WslAttachment {
 /// Delegated driver lifecycle stage, separate from volume state and Driver Verifier admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum DriverStage {
-    /// Driver startup has not been requested.
-    Unstarted,
-    /// Nested session establishment/start outcome may be unknown.
-    Requested,
+    /// No nested driver installation has been requested.
+    Absent,
+    /// Installation may have been accepted; exact package admission remains incomplete.
+    Installing,
+    /// Exact package/service identity was admitted and the service was observed stopped.
+    Installed,
+    /// Initial SCM start may have been accepted.
+    Starting,
     /// SCM Running and exact installed package identity were observed.
     Running,
     /// Nested cleanup completed.
@@ -61,6 +65,8 @@ enum DriverStage {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LiveState {
+    /// Workload selected before storage construction and retained across activation.
+    workload: LiveWorkload,
     /// GPT and volume identity cannot exist independently of their owning disk.
     storage: StorageIdentity,
     /// Independent WSL attachment progress.
@@ -843,7 +849,7 @@ fn exercise_identity_update(session: &mut Session<LiveState>, path: &Path) -> Ta
 /// Returns missing partition authority, changed mounted identity or native dismount failures.
 fn dismount_filesystem(session: &mut Session<LiveState>) -> TaskResult<()> {
     if session.state().partition().is_none() {
-        if !matches!(session.state().driver, DriverStage::Unstarted) {
+        if !matches!(session.state().driver, DriverStage::Absent) {
             return Err(
                 io::Error::other("driver or volume publication lacks partition identity").into(),
             );
@@ -970,18 +976,12 @@ fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> 
 /// Executes startup discovery, native I/O and reattachment while the same driver remains loaded.
 /// # Errors
 /// Returns load, Verifier, discovery, filesystem, hot-attach or required detachment failures.
-fn exercise_driver(
-    root: &Path,
-    bundle: &VerifiedProductionBundle,
-    session: &mut Session<LiveState>,
-    workload: LiveWorkload,
-) -> TaskResult<()> {
-    attachment(session, true)?;
+fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<()> {
     let scope = scope(session)?;
     storage::validate(&scope)?;
-    session.state_mut().driver = DriverStage::Requested;
+    session.state_mut().driver = DriverStage::Starting;
     session.publish(Phase::Intent(Operation::StartDriver))?;
-    driver_load::start_session(root, bundle, session.id().clone(), Some(&scope))?;
+    let artifact = driver_load::start_session(root, session.id(), Some(&scope))?;
     session.state_mut().driver = DriverStage::Running;
     session.publish(Phase::Observed(Operation::StartDriver))?;
     session.publish(Phase::Intent(Operation::ActivateVerifier))?;
@@ -1004,12 +1004,12 @@ fn exercise_driver(
     let mount = mount_namespace(session)?;
     configure_identity(session)?;
     let payload = exercise_io(session, &mount)?;
-    if matches!(workload, LiveWorkload::RandomIo) {
+    if matches!(session.state().workload, LiveWorkload::RandomIo) {
         session.publish(Phase::Intent(Operation::FilesystemIo))?;
         benchmark::run(
             &mount.join("live-ci/random-io"),
             &session.directory().join("random-io.json"),
-            bundle.artifact_id(),
+            &artifact,
         )?;
         session.publish(Phase::Observed(Operation::FilesystemIo))?;
     }
@@ -1135,7 +1135,7 @@ pub(crate) fn cleanup_live_vhdx_session(root: &Path, id: &OsStr) -> TaskResult<(
     let id = SessionId::parse(id)?;
     let mut session: Session<LiveState> = Session::load(root, "live-vhdx-sessions", &id)?;
     if (session.state().wsl != WslAttachment::Detached
-        || session.state().driver != DriverStage::Unstarted)
+        || session.state().driver != DriverStage::Absent)
         && session.state().partition().is_none()
     {
         return Err(io::Error::other("invalid recorded live identity relationship").into());
@@ -1143,45 +1143,88 @@ pub(crate) fn cleanup_live_vhdx_session(root: &Path, id: &OsStr) -> TaskResult<(
     cleanup(root, &mut session)
 }
 
-/// Builds one signed bundle and requires live validation, storage/driver cleanup and ETW completion.
-/// # Errors
-/// Returns any build, live operation, identity, trace or mandatory cleanup failure.
-pub(crate) fn verify_live_vhdx(root: &Path) -> TaskResult<()> {
-    run_live_session(root, LiveWorkload::Assurance)
-}
-
 /// Measures an exact signed artifact on independently populated disposable storage.
 /// # Errors
 /// Returns build, workload, integrity or mandatory joined cleanup failures.
 pub(crate) fn benchmark_multi_file(root: &Path) -> TaskResult<()> {
-    run_live_session(root, LiveWorkload::RandomIo)
+    let id = SessionId::create(root)?;
+    prepare_session(root, LiveWorkload::RandomIo, id.clone())?;
+    verify_live_vhdx(root, OsStr::new(id.as_str()))
 }
 
-/// Owns the complete joined storage, driver and trace session for one workload.
+/// Creates disposable storage and an identity-bound stopped installation for later activation.
 /// # Errors
-/// Returns preflight, build, live operations or mandatory cleanup failures.
-fn run_live_session(root: &Path, workload: LiveWorkload) -> TaskResult<()> {
+/// Returns preflight, build, storage or installation failures, preserving cleanup failures.
+fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskResult<()> {
     check_live_driver_host(root)?;
     let helper = fixture::executable(root)?;
     let bundle = build_verified_production_bundle(root)?;
-    let id = SessionId::create(root)?;
     println!("live VHDX session: {}", id.as_str());
     let state = LiveState {
+        workload,
         storage: StorageIdentity::Unobserved,
         wsl: WslAttachment::Detached,
-        driver: DriverStage::Unstarted,
+        driver: DriverStage::Absent,
         identity: None,
     };
     let mut session = Session::create(root, "live-vhdx-sessions", id, state)?;
-    let trace = windows_host::TraceSession::start(
-        &root.join("crates/ext4-driver/operational-trace-v1.txt"),
-        &root.join("target/live-driver-trace"),
-    )?;
     let operation = (|| {
         create_storage(&mut session, workload)?;
         format_storage(&mut session, &helper, workload)?;
-        exercise_driver(root, &bundle, &mut session, workload)
+        attachment(&mut session, true)?;
+        let scope = scope(&session)?;
+        storage::validate(&scope)?;
+        session.state_mut().driver = DriverStage::Installing;
+        session.publish(Phase::Intent(Operation::InstallPackage))?;
+        driver_load::install_session(root, &bundle, session.id().clone(), Some(&scope))?;
+        session.state_mut().driver = DriverStage::Installed;
+        session.publish(Phase::Observed(Operation::InstallPackage))
     })();
+    if operation.is_err() {
+        let cleanup = cleanup_live_vhdx_session(root, OsStr::new(session.id().as_str()));
+        return combine_verification_and_cleanup(operation, cleanup);
+    }
+    println!(
+        "live VHDX preparation: PASS; activation pending for {}",
+        session.id().as_str()
+    );
+    Ok(())
+}
+
+/// Prepares one caller-named session without issuing a driver-start request.
+/// Successful preparation transfers finalization responsibility to verification or explicit cleanup.
+/// # Errors
+/// Returns malformed identity, build, storage, installation or mandatory cleanup failures.
+pub(crate) fn prepare_live_vhdx(root: &Path, id: &OsStr) -> TaskResult<()> {
+    prepare_session(root, LiveWorkload::Assurance, SessionId::parse(id)?)
+}
+
+/// Consumes a prepared session through live validation, cleanup and joined ETW completion.
+/// # Errors
+/// Returns incomplete/consumed preparation, stale identity/source, live or cleanup failures.
+pub(crate) fn verify_live_vhdx(root: &Path, id: &OsStr) -> TaskResult<()> {
+    windows_host::require_administrator()?;
+    let id = SessionId::parse(id)?;
+    let mut session: Session<LiveState> = Session::load(root, "live-vhdx-sessions", &id)?;
+    if session.state().driver != DriverStage::Installed
+        || session.phase() != Phase::Observed(Operation::InstallPackage)
+    {
+        return Err(io::Error::other(
+            "live activation requires completed preparation; reconcile any interrupted activation",
+        )
+        .into());
+    }
+    let trace = match windows_host::TraceSession::start(
+        &root.join("crates/ext4-driver/operational-trace-v1.txt"),
+        &root.join("target/live-driver-trace"),
+    ) {
+        Ok(trace) => trace,
+        Err(error) => {
+            let cleanup = cleanup_live_vhdx_session(root, OsStr::new(session.id().as_str()));
+            return combine_verification_and_cleanup(Err(error.into()), cleanup);
+        }
+    };
+    let operation = exercise_driver(root, &mut session);
     let resources = cleanup_live_vhdx_session(root, OsStr::new(session.id().as_str()));
     let operation = combine_verification_and_cleanup(operation, resources);
     let completion = trace.finish().map(|_| ()).map_err(Into::into);
@@ -1226,13 +1269,14 @@ mod tests {
                     "sessions",
                     id.clone(),
                     LiveState {
+                        workload: LiveWorkload::Assurance,
                         storage: StorageIdentity::Partition {
                             unique: "fixture-disk".into(),
                             partition: partition.clone(),
                             volume: None,
                         },
                         wsl: WslAttachment::Requested,
-                        driver: DriverStage::Unstarted,
+                        driver: DriverStage::Absent,
                         identity: None,
                     },
                 )?;
@@ -1309,6 +1353,7 @@ mod tests {
             length: 1,
         };
         let mut state = LiveState {
+            workload: LiveWorkload::Assurance,
             storage: StorageIdentity::Partition {
                 unique: "fixture-disk".into(),
                 partition: partition.clone(),

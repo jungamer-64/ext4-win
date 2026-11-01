@@ -419,6 +419,104 @@ fn scm(session: &mut Session<DriverState>, operation: Operation, command: &str) 
     Ok(())
 }
 
+/// Installs and binds one verified package while requiring its service to remain stopped.
+/// The durable session retains cleanup responsibility after this function returns.
+/// # Errors
+/// Returns preflight, source drift, installation, mapping, hash or stopped-state failures.
+/// An interrupted installation requires reconciliation, not an automatic repeat.
+pub(crate) fn install_session(
+    root: &Path,
+    bundle: &VerifiedProductionBundle,
+    id: SessionId,
+    scope: Option<&crate::storage::DisposablePartition>,
+) -> TaskResult<()> {
+    host_contract(root)?;
+    crate::storage::assert_scope(scope)?;
+    let identity = BundleIdentity::from_verified(bundle);
+    identity.source.require_unchanged(root)?;
+    identity.revalidate(root)?;
+    let signer = signer(&identity, true)?;
+    println!("certificate LocalMachine\\Root thumbprint: {signer}");
+    println!("certificate LocalMachine\\TrustedPublisher thumbprint: {signer}");
+    let state = DriverState {
+        bundle: identity,
+        signer,
+        package: PackageState::Absent,
+        service: ServiceIdentity::Unobserved,
+        control: control(root)?,
+    };
+    let mut session = Session::create(root, "driver-load-sessions", id, state)?;
+    session.state_mut().package = PackageState::Installing;
+    session.publish(Phase::Intent(Operation::InstallPackage))?;
+    let mut command = Command::new("pnputil.exe");
+    command
+        .args(["/add-driver"])
+        .arg(session.state().bundle.directory.join("ext4win.inf"))
+        .arg("/install");
+    run_checked(command, "ext4win package installation")?;
+    bind_installed(&mut session)?;
+    bind_service(&mut session, true)?;
+    if windows_host::service_state("ext4win")? != Some(1) {
+        return Err(io::Error::other("package preparation requires a Stopped service").into());
+    }
+    println!("prepared service state: Stopped");
+    session.publish(Phase::Observed(Operation::InstallPackage))
+}
+
+/// Admits activation only from a completed, independently bound installation.
+/// # Errors
+/// Returns incomplete, consumed or inconsistent preparation records.
+fn prepared_identity(session: &Session<DriverState>) -> TaskResult<(&InstalledPackage, &str)> {
+    if session.phase() != Phase::Observed(Operation::InstallPackage) {
+        return Err(io::Error::other(
+            "activation requires completed installation; reconcile any prior start intent",
+        )
+        .into());
+    }
+    match (&session.state().package, &session.state().service) {
+        (PackageState::Installed(package), ServiceIdentity::Bound { raw }) => Ok((package, raw)),
+        _ => Err(io::Error::other("activation lacks bound package/service identity").into()),
+    }
+}
+
+/// Revalidates a stopped installation before consuming its one initial-start permission.
+/// Returns the started artifact identity for evidence and benchmark attribution.
+/// # Errors
+/// Returns stale source, changed package/signer/service/scope, prior start intent or SCM failures.
+/// Failure after start intent requires cleanup; it never restores initial-start permission.
+pub(crate) fn start_session(
+    root: &Path,
+    id: &SessionId,
+    scope: Option<&crate::storage::DisposablePartition>,
+) -> TaskResult<String> {
+    let mut session = recovered(root, id)?;
+    let (package, raw) = prepared_identity(&session)?;
+    session.state().bundle.source.require_unchanged(root)?;
+    if signer(&session.state().bundle, true)? != session.state().signer {
+        return Err(io::Error::other("prepared signer changed").into());
+    }
+    crate::storage::assert_scope(scope)?;
+    service_identity(package, raw, &session.state().bundle.sys, true)?;
+    if windows_host::service_state("ext4win")? != Some(1) {
+        return Err(io::Error::other(
+            "initial activation requires the bound service to be Stopped",
+        )
+        .into());
+    }
+    scm(&mut session, Operation::StartDriver, "start")?;
+    wait_state(4, Duration::from_secs(15))?;
+    let PackageState::Installed(package) = &session.state().package else {
+        return Err(io::Error::other("driver start lost package authority").into());
+    };
+    let ServiceIdentity::Bound { raw } = &session.state().service else {
+        return Err(io::Error::other("driver start lacks bound service identity").into());
+    };
+    service_identity(package, raw, &session.state().bundle.sys, true)?;
+    println!("service state: Running");
+    session.publish(Phase::Observed(Operation::StartDriver))?;
+    Ok(session.state().bundle.artifact.clone())
+}
+
 /// Restarts the bound installed service after its disposable volumes have drained.
 /// # Errors
 /// Returns identity mismatch, an unresolved prior lifecycle state, retirement, stop or start failure.
@@ -691,7 +789,8 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
     run_checked(shutdown, "production WSL oracle shutdown")?;
     let id = SessionId::create(root)?;
     println!("driver-load session: {}", id.as_str());
-    let operation = start_session(root, &bundle, id.clone(), None);
+    let operation = install_session(root, &bundle, id.clone(), None)
+        .and_then(|()| start_session(root, &id, None).map(|_artifact| ()));
     let cleanup = if root
         .join("target/driver-load-sessions")
         .join(id.as_str())
@@ -709,6 +808,53 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Initial activation permission survives preparation reload, but not committed start intent.
+    /// # Errors
+    /// Returns fixture, record decoding, publication or mandatory fixture cleanup failures.
+    /// # Panics
+    /// Fails if incomplete or consumed records admit initial activation.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify persisted activation boundaries without issuing native lifecycle effects"
+    )]
+    fn initial_activation_consumes_prepared_session() -> TaskResult<()> {
+        let root = crate::process::repository_root()?;
+        let directory = crate::process::create_task_directory(&root, "activation-contract")?;
+        let operation = (|| -> TaskResult<()> {
+            let state = serde_json::from_value(serde_json::json!({
+                "bundle": {
+                    "source": alloc::vec![0_u8; 32],
+                    "directory": "target/verified-production/0123456789abcdef0123456789abcdef",
+                    "artifact": "0123456789abcdef0123456789abcdef",
+                    "sys": "A".repeat(64), "cat": "B".repeat(64), "inf": "C".repeat(64)
+                },
+                "signer": "fixture-signer",
+                "package": {"Installed": {"oem": "oem12.inf", "image": "C:/fixture/ext4win.sys"}},
+                "service": {"Bound": {"raw": "C:/fixture/ext4win.sys"}},
+                "control": {"path": "\\\\.\\Ext4Win", "ioctl": 0}
+            }))?;
+            let id = SessionId::create(&directory)?;
+            let mut session = Session::create(&directory, "sessions", id.clone(), state)?;
+            assert!(prepared_identity(&session).is_err());
+            session.publish(Phase::Observed(Operation::InstallPackage))?;
+            let mut resumed: Session<DriverState> = Session::load(&directory, "sessions", &id)?;
+            let (package, raw) = prepared_identity(&resumed)?;
+            assert_eq!(package.oem, "oem12.inf");
+            assert_eq!(raw, "C:/fixture/ext4win.sys");
+            resumed.publish(Phase::Intent(Operation::StartDriver))?;
+            let consumed = Session::load(&directory, "sessions", &id)?;
+            assert!(prepared_identity(&consumed).is_err());
+            resumed.state_mut().package = PackageState::Installing;
+            resumed.publish(Phase::Observed(Operation::InstallPackage))?;
+            assert!(prepared_identity(&resumed).is_err());
+            Ok(())
+        })();
+        let cleanup =
+            crate::process::remove_task_directory(&root, &directory, "activation-contract");
+        combine_verification_and_cleanup(operation, cleanup)
+    }
 
     /// Exercises the production observation path against the platform's own XML report.
     /// # Errors

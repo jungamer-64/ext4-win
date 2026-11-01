@@ -28,7 +28,8 @@ compile the driver or require WDK.
 | `cargo xtask verify-hosted-driver-load` | A host that passes the hosted preflight and trusts the production signer in LocalMachine Root and Trusted Publishers | Builds one verified production bundle, installs that exact package, completes demand-start driver initialization, and requires service/package cleanup. |
 | `cargo xtask cleanup-driver-load-session <session-id>` | Elevated Windows host | Reconciles an interrupted service/package session only after its durable bundle, signer, and package identities match. |
 | `cargo xtask check-live-driver-host` | Dedicated host that passes the hosted preflight and also provides Hyper-V PowerShell, WSL/e2fsprogs, and Driver Verifier | Performs the read-only preflight for disposable live VHDX validation. |
-| `cargo xtask verify-live-vhdx` | A host that passes the live preflight | Builds a verified bundle and exercises it only against a newly created disposable VHDX. |
+| `cargo xtask prepare-live-vhdx <session-id>` | A host that passes the live preflight; a fresh 32-digit lowercase hexadecimal session ID | Builds one verified bundle, creates disposable ext4 storage and binds its installed service in the stopped state. |
+| `cargo xtask verify-live-vhdx <session-id>` | The same host with a successfully prepared session and unchanged source inputs | Revalidates the exact prepared installation, activates it and exercises startup discovery, native I/O and remount before required cleanup. |
 | `cargo xtask benchmark-multi-file` | A host that passes the live preflight | Measures native random reads and writes on independently populated disposable storage, retaining artifact-bound latency and flush evidence. |
 | `cargo xtask cleanup-live-vhdx-session <session-id>` | Dedicated elevated Windows host | Reconciles an interrupted session and removes only resources whose recorded identities still match. |
 
@@ -319,6 +320,14 @@ workspace components and are not published separately. Production bundles carry
 the project's original license texts from the repository root.
 
 ## Live-driver validation and recovery
+
+Successful preparation retains the attached VHDX and stopped installation until verification or
+explicit session cleanup completes. It does not establish kernel execution. Initial activation
+consumes the prepared session's permission before SCM start; an interrupted start requires
+reconciliation rather than repeating initial activation. Artifact bytes, signer trust, service
+configuration, storage scope and the production verification's source identity are revalidated
+before start. Cleanup remains possible after source changes. CI archives the prepared package and
+session evidence before entering the kernel activation step.
 
 `verify-hosted-driver-load` installs the verified bundle and checks that the
 DriverStore and service images match its SHA-256, then requires demand-start

@@ -5,7 +5,7 @@ mod inventory;
 mod owner;
 #[cfg(windows)]
 pub(crate) use owner::{
-    check_hosted_driver_host, cleanup_driver_load_session, prepare_driver_unload,
+    check_hosted_driver_host, cleanup_driver_load_session, install_session, prepare_driver_unload,
     resolve_driver_store_image, restart_session, start_session, verify_hosted_driver_load,
 };
 

@@ -13,7 +13,7 @@ use crate::{
 };
 use alloc::collections::{BTreeMap, BTreeSet};
 use core::fmt::Write as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     env,
@@ -93,8 +93,8 @@ impl ArtifactIdentity {
 }
 
 /// Digest of all version-controlled and untracked source inputs to a production build.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SourceSnapshot([u8; 32]);
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SourceSnapshot([u8; 32]);
 
 impl SourceSnapshot {
     /// Binds completed verification work to the source digest observed before its first gate.
@@ -118,7 +118,7 @@ impl SourceSnapshot {
     /// # Errors
     ///
     /// Returns snapshot failures or rejects any source digest different from this observation.
-    fn require_unchanged(&self, repository_root: &Path) -> TaskResult<()> {
+    pub(crate) fn require_unchanged(&self, repository_root: &Path) -> TaskResult<()> {
         if *self != source_snapshot(repository_root)? {
             return Err(io::Error::other(
                 "source inputs changed while the production artifact gate was running",
@@ -250,6 +250,9 @@ struct LicenseDependencyKind {
 /// Atomically published production bundle whose manifest and artifacts passed the release gate.
 #[derive(Debug)]
 pub(crate) struct VerifiedProductionBundle {
+    /// Source identity retained across the native installation/activation boundary.
+    #[cfg(windows)]
+    pub(crate) source: SourceSnapshot,
     /// Exact atomically published bundle directory.
     directory: PathBuf,
     /// Build-generated identity embedded in the signed driver and directory name.
@@ -431,6 +434,8 @@ pub(crate) fn build_verified_production_bundle(
     };
 
     let bundle = VerifiedProductionBundle {
+        #[cfg(windows)]
+        source: source_before,
         directory: bundle_directory,
         artifact_id: identity.as_str().to_owned(),
         driver_hash: sealed.driver_hash,
@@ -1292,6 +1297,8 @@ mod tests {
             let input = directory.join("Cargo.toml");
             fs::write(&input, b"initial input")?;
             let (snapshot, value) = SourceSnapshot::verify(&directory, || Ok(7))?;
+            let snapshot: SourceSnapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot)?)?;
+            snapshot.require_unchanged(&directory)?;
             if value != 7 || snapshot != source_snapshot(&directory)? {
                 return Err(
                     io::Error::other("unchanged verification lost its source identity").into(),
@@ -1508,6 +1515,7 @@ mod tests {
     #[cfg(windows)]
     fn verified_bundle_recovery_identity() {
         let bundle = VerifiedProductionBundle {
+            source: SourceSnapshot([7; 32]),
             directory: PathBuf::from("bundle with spaces/0123456789abcdef0123456789abcdef"),
             artifact_id: "0123456789abcdef0123456789abcdef".to_owned(),
             driver_hash: "A".repeat(64),
@@ -1520,6 +1528,7 @@ mod tests {
         assert_eq!(identity.sys, bundle.driver_hash);
         assert_eq!(identity.cat, bundle.catalog_hash);
         assert_eq!(identity.inf, bundle.inf_hash);
+        assert_eq!(identity.source, bundle.source);
     }
 
     /// Artifact identities satisfy the build-script boundary without using the sentinel.

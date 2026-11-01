@@ -287,6 +287,8 @@ impl<T: Serialize + DeserializeOwned> Session<T> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct BundleIdentity {
+    /// Production verification's source identity; cleanup may outlive source freshness.
+    pub(crate) source: crate::production::SourceSnapshot,
     /// Published bundle directory.
     pub(crate) directory: PathBuf,
     /// Production artifact identity, independent of host session identity.
@@ -302,6 +304,7 @@ impl BundleIdentity {
     /// Copies the authoritative production gate result without reparsing a second manifest.
     pub(crate) fn from_verified(bundle: &crate::production::VerifiedProductionBundle) -> Self {
         Self {
+            source: bundle.source,
             directory: bundle.as_path().to_path_buf(),
             artifact: bundle.artifact_id().into(),
             sys: bundle.driver_hash().into(),

@@ -784,6 +784,38 @@ jobs:
             throw "Live driver preflight failed with exit code $LASTEXITCODE"
           }
 
+      - name: Prepare stopped driver and disposable ext4 storage
+        timeout-minutes: 120
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $sessionId = [Guid]::NewGuid().ToString("N")
+          "LIVE_VHDX_SESSION=$sessionId" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          New-Item -ItemType Directory -Path target -Force | Out-Null
+          Start-Transcript -Path target/live-preparation-ci.log
+          try {
+            cargo xtask prepare-live-vhdx $sessionId
+            if ($LASTEXITCODE -ne 0) {
+              throw "Live ext4 preparation failed with exit code $LASTEXITCODE"
+            }
+          }
+          finally {
+            Stop-Transcript
+          }
+
+      - name: Upload evidence before kernel activation
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ext4-win-preactivation-evidence
+          path: |
+            target/live-preparation-ci.log
+            target/verified-production/**
+            target/live-vhdx-sessions/**/*.json
+            target/driver-load-sessions/**
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Verify loaded driver ext4 read-write and remount
         id: live_io
         timeout-minutes: 150
@@ -794,7 +826,7 @@ jobs:
           New-Item -ItemType Directory -Path target -Force | Out-Null
           Start-Transcript -Path target/live-vhdx-ci.log
           try {
-            cargo xtask verify-live-vhdx
+            cargo xtask verify-live-vhdx $env:LIVE_VHDX_SESSION
             if ($LASTEXITCODE -ne 0) {
               throw "Live ext4 read-write verification failed with exit code $LASTEXITCODE"
             }
