@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed={STREAM_CONTEXT_SOURCE}");
     println!("cargo:rerun-if-changed=native/cache_initialization.h");
     println!("cargo:rerun-if-changed=native/fast_io_transfer.h");
+    println!("cargo:rerun-if-changed=native/fast_io_lock.h");
     println!("cargo:rerun-if-changed=native/file_lock_completion.h");
     println!("cargo:rerun-if-changed=native/paging_file.h");
     println!("cargo:rerun-if-changed=native/directory_notification.h");
