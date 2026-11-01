@@ -817,7 +817,7 @@ fn verify_data_cuts(linux: LinuxEnvironment, root: &Path, baseline: &Path) -> Ta
     let dumped = root.join("recovered.bin");
     for cut in cuts.iter().copied() {
         fs::copy(baseline, &image)?;
-        require_stopped_effect(
+        let commit = require_stopped_effect(
             "journaled file data",
             cut,
             overwrite_until_boundary(&image, Some(cut))?,
@@ -829,7 +829,9 @@ fn verify_data_cuts(linux: LinuxEnvironment, root: &Path, baseline: &Path) -> Ta
             &format!("dump /payload \"{}\"", linux.tool_path(&dumped)?),
         )?;
         let bytes = fs::read(&dumped)?;
-        if bytes != [0x11; 8192] && bytes != [0x22; 8192] {
+        if bytes == [0x11; 8192] {
+            commit.require_endpoint(MutationEndpoint::Old)?;
+        } else if bytes != [0x22; 8192] {
             return Err(
                 io::Error::other("journaled file recovered a mixed data transaction").into(),
             );

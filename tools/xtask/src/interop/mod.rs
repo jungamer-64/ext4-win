@@ -367,6 +367,36 @@ enum PendingPersistence {
     Complete,
 }
 
+/// Recovery obligations established by this mutation's completed journal barrier.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationCommit {
+    /// No successful commit barrier has been observed; either atomic endpoint is permitted.
+    Pending,
+    /// The commit barrier succeeded, so recovery must retain the new endpoint.
+    Durable,
+}
+
+/// Independently observed atomic endpoint after crash recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationEndpoint {
+    /// Complete predecessor state.
+    Old,
+    /// Complete successor state.
+    New,
+}
+
+impl MutationCommit {
+    /// Checks atomicity without allowing a durable successor to disappear.
+    /// # Errors
+    /// Rejects the predecessor endpoint after a successful commit barrier.
+    fn require_endpoint(self, endpoint: MutationEndpoint) -> TaskResult<()> {
+        if self == Self::Durable && endpoint == MutationEndpoint::Old {
+            return Err(io::Error::other("crash recovery lost a durable mutation").into());
+        }
+        Ok(())
+    }
+}
+
 /// Progress of one production workflow stopped only after a selected write or flush effect.
 #[derive(Debug, Eq, PartialEq)]
 struct EffectBoundaryRun {
@@ -376,6 +406,8 @@ struct EffectBoundaryRun {
     completed: bool,
     /// Exact ordered effect shapes observed before termination.
     effects: Vec<StorageEffect>,
+    /// Recovery obligation at the selected physical persistence boundary.
+    commit: MutationCommit,
 }
 
 /// Counts production durability effects and withholds the completion that crosses a selected
@@ -388,6 +420,8 @@ struct EffectBoundaryController {
     completed_effects: usize,
     /// Ordered effect trace used to enumerate every subsequent crash run.
     effects: Vec<StorageEffect>,
+    /// Becomes durable only at the mutation's journal commit flush.
+    commit: MutationCommit,
 }
 
 impl EffectBoundaryController {
@@ -404,15 +438,15 @@ impl EffectBoundaryController {
             cut,
             completed_effects: 0,
             effects: Vec::new(),
+            commit: MutationCommit::Pending,
         })
     }
 
     /// Executes one request and returns no completion when its durable effect is the selected
     /// simulated-crash boundary.
     ///
-    /// A write cut persists the selected 512-byte prefix plus earlier writes on that device. A
-    /// flush cut persists only the selected device. The remount must therefore accept both the
-    /// old and new semantic state without relying on volatile operation state.
+    /// A cut chooses pending-write persistence independently of submission order on both devices.
+    /// Successful flushes always retain all earlier writes on their target device.
     ///
     /// # Errors
     ///
@@ -446,29 +480,42 @@ impl EffectBoundaryController {
                 let cut = self
                     .cut
                     .ok_or_else(|| io::Error::other("selected effect cut disappeared"))?;
-                match (effect, cut.write_prefix) {
-                    (StorageEffect::Write { target, bytes }, Some(prefix)) => {
-                        if prefix > bytes || prefix % 512 != 0 {
-                            return Err(io::Error::other(
-                                "write crash prefix is outside a 512-byte sector boundary",
-                            )
-                            .into());
-                        }
-                        storage.materialize_write_prefix(target, prefix)?;
-                    }
-                    (StorageEffect::Flush { .. }, None) => storage.materialize_durable()?,
-                    (StorageEffect::Write { .. }, None)
-                    | (StorageEffect::Flush { .. }, Some(_)) => {
-                        return Err(io::Error::other(
-                            "effect cut persistence does not match its request kind",
-                        )
-                        .into());
-                    }
-                }
+                storage.materialize(cut.persistence)?;
                 return Ok(None);
             }
         }
         Ok(Some(completion))
+    }
+
+    /// Observes the exact journal flush that establishes this mutation's durability.
+    /// A crash after the flush effect retains the obligation even without its acknowledgement.
+    /// # Errors
+    /// Rejects a non-journal barrier, I/O failure or invalid completion identity.
+    fn complete_commit(
+        &mut self,
+        storage: &mut CrashStorageAdapter,
+        (request, pending): (
+            ext4_core::StorageRequest,
+            ext4_core::PendingStorageTransfer<ext4_core::DurableMutation>,
+        ),
+    ) -> TaskResult<Option<ext4_core::DurableMutation>> {
+        let journal_target = if storage.external_journal.is_some() {
+            ext4_core::StorageTarget::ExternalJournal
+        } else {
+            ext4_core::StorageTarget::Filesystem
+        };
+        if !matches!(&request, ext4_core::StorageRequest::Flush { target } if *target == journal_target)
+        {
+            return Err(
+                io::Error::other("commit durability requires its journal device flush").into(),
+            );
+        }
+        let completion = self.complete(storage, request)?;
+        self.commit = MutationCommit::Durable;
+        completion
+            .map(|completion| pending.complete(completion).map_err(core_task_error))
+            .transpose()
+            .map_err(Into::into)
     }
 
     /// Reports a simulated crash after the selected completion.
@@ -477,6 +524,7 @@ impl EffectBoundaryController {
             completed_effects: self.completed_effects,
             completed: false,
             effects: self.effects,
+            commit: self.commit,
         }
     }
 
@@ -486,6 +534,7 @@ impl EffectBoundaryController {
             completed_effects: self.completed_effects,
             completed: true,
             effects: self.effects,
+            commit: self.commit,
         }
     }
 }
@@ -620,27 +669,59 @@ impl CrashDeviceImage {
         Ok(())
     }
 
-    /// Replaces the caller-visible image with durable bytes and an optional pending-write prefix.
+    /// Materializes one device from its checkpoint and the selected pending-write outcome.
     /// # Errors
-    ///
-    /// Returns an error for invalid ranges or host image I/O failure.
-    fn materialize(&mut self, write_prefix: Option<usize>) -> TaskResult<()> {
-        let durable_len = u64::try_from(self.durable.len())?;
-        self.volatile.set_len(durable_len)?;
+    /// Returns an invalid pending-write selection, non-sector prefix or host I/O failure.
+    fn materialize(
+        &mut self,
+        target: ext4_core::StorageTarget,
+        persistence: CrashPersistence,
+    ) -> TaskResult<()> {
+        let (selected, others) = match persistence {
+            CrashPersistence::DurableOnly => (None, PendingPersistence::Lost),
+            CrashPersistence::Write {
+                target: selected_target,
+                from_end,
+                prefix,
+                others,
+            } => {
+                let selected = if selected_target == target {
+                    let write =
+                        self.pending.iter().rev().nth(from_end).ok_or_else(|| {
+                            io::Error::other("crash selection has no pending write")
+                        })?;
+                    if prefix > write.bytes.len() || prefix % 512 != 0 {
+                        return Err(
+                            io::Error::other("crash prefix is not a bounded sector range").into(),
+                        );
+                    }
+                    Some((from_end, prefix))
+                } else {
+                    None
+                };
+                (selected, others)
+            }
+        };
+        self.volatile.set_len(u64::try_from(self.durable.len())?)?;
         self.volatile.seek(io::SeekFrom::Start(0))?;
         self.volatile.write_all(&self.durable)?;
-        if let Some(prefix) = write_prefix {
-            let Some((selected, prior)) = self.pending.split_last() else {
-                return Err(io::Error::other("write cut has no pending device write").into());
+        for (index, write) in self.pending.iter().enumerate() {
+            let from_end = self
+                .pending
+                .len()
+                .checked_sub(index)
+                .and_then(|value| value.checked_sub(1))
+                .ok_or_else(|| io::Error::other("pending-write coordinate overflow"))?;
+            let length = match selected {
+                Some((selected, prefix)) if selected == from_end => prefix,
+                _ if others == PendingPersistence::Complete => write.bytes.len(),
+                _ => 0,
             };
-            for write in prior {
-                write_host_range(&mut self.volatile, write.offset, &write.bytes)?;
-            }
-            let bytes = selected
+            let bytes = write
                 .bytes
-                .get(..prefix)
-                .ok_or_else(|| io::Error::other("write cut prefix exceeds its payload"))?;
-            write_host_range(&mut self.volatile, selected.offset, bytes)?;
+                .get(..length)
+                .ok_or_else(|| io::Error::other("pending-write prefix exceeds payload"))?;
+            write_host_range(&mut self.volatile, write.offset, bytes)?;
         }
         self.volatile.sync_all()?;
         Ok(())
@@ -701,41 +782,17 @@ impl CrashStorageAdapter {
         }
     }
 
-    /// Materializes only durable bytes for both independently flushed devices.
+    /// Applies one crash outcome to both independently durable devices.
     /// # Errors
-    ///
-    /// Returns an error when either caller-visible image cannot be replaced and synchronized.
-    fn materialize_durable(&mut self) -> TaskResult<()> {
-        self.filesystem.materialize(None)?;
-        if let Some(journal) = self.external_journal.as_mut() {
-            journal.materialize(None)?;
+    /// Returns an unavailable selected device, invalid prefix or host materialization failure.
+    fn materialize(&mut self, persistence: CrashPersistence) -> TaskResult<()> {
+        if let CrashPersistence::Write { target, .. } = persistence {
+            self.target(target)?;
         }
-        Ok(())
-    }
-
-    /// Materializes a sector prefix on one device while losing all volatile writes on the other.
-    /// # Errors
-    ///
-    /// Returns an error when the selected pending write or host image range is invalid.
-    fn materialize_write_prefix(
-        &mut self,
-        target: ext4_core::StorageTarget,
-        prefix: usize,
-    ) -> TaskResult<()> {
-        match target {
-            ext4_core::StorageTarget::Filesystem => {
-                self.filesystem.materialize(Some(prefix))?;
-                if let Some(journal) = self.external_journal.as_mut() {
-                    journal.materialize(None)?;
-                }
-            }
-            ext4_core::StorageTarget::ExternalJournal => {
-                self.filesystem.materialize(None)?;
-                self.external_journal
-                    .as_mut()
-                    .ok_or_else(|| io::Error::other("unexpected external-journal write cut"))?
-                    .materialize(Some(prefix))?;
-            }
+        self.filesystem
+            .materialize(ext4_core::StorageTarget::Filesystem, persistence)?;
+        if let Some(journal) = self.external_journal.as_mut() {
+            journal.materialize(ext4_core::StorageTarget::ExternalJournal, persistence)?;
         }
         Ok(())
     }
@@ -997,7 +1054,7 @@ fn run_internal_mount_until_boundary(
             }
             ext4_core::MountTransition::Complete(result) => {
                 result.map_err(core_task_error)?;
-                storage.materialize_durable()?;
+                storage.materialize(CrashPersistence::DurableOnly)?;
                 return Ok(controller.completed());
             }
         }
@@ -1100,7 +1157,7 @@ fn run_external_mount_until_boundary(
             }
             ext4_core::MountTransition::Complete(result) => {
                 result.map_err(core_task_error)?;
-                storage.materialize_durable()?;
+                storage.materialize(CrashPersistence::DurableOnly)?;
                 return Ok(controller.completed());
             }
         }
@@ -1133,7 +1190,7 @@ fn run_external_clean_close_until_boundary(
             }
             ext4_core::CleanCloseTransition::Complete(result) => {
                 result.map_err(core_task_error)?;
-                storage.materialize_durable()?;
+                storage.materialize(CrashPersistence::DurableOnly)?;
                 return Ok(controller.completed());
             }
         }
@@ -1178,9 +1235,7 @@ fn run_prepared_mutation_until_boundary(
     else {
         return Ok(controller.stopped());
     };
-    let Some(durable) =
-        complete_boundary_transfer(storage, &mut controller, commit_durability.submit())?
-    else {
+    let Some(durable) = controller.complete_commit(storage, commit_durability.submit())? else {
         return Ok(controller.stopped());
     };
     let published = durable
@@ -1223,7 +1278,7 @@ fn run_prepared_mutation_until_boundary(
     let _checkpointed_epoch = publication
         .publish(coordinator)
         .map_err(|(error, _publication)| core_task_error(error))?;
-    storage.materialize_durable()?;
+    storage.materialize(CrashPersistence::DurableOnly)?;
     Ok(controller.completed())
 }
 
@@ -1441,7 +1496,7 @@ where
 
 /// Resolves and fully preallocates one volume-label commit from an owned completed mount.
 ///
-/// This is the shared semantic boundary used by ordinary interoperability and the exhaustive
+/// This is the shared semantic boundary used by ordinary interoperability and the bounded
 /// crash matrix; neither path substitutes a test-only commit constructor.
 ///
 /// # Errors

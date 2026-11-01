@@ -451,6 +451,8 @@ struct HtreeFaultOracleCase {
     label: String,
     /// Recovered and cleanly closed filesystem image.
     image: PathBuf,
+    /// Endpoint obligation established before this crash.
+    commit: MutationCommit,
 }
 
 /// Exercises every sector/flush crash cut of a transaction that converts and splits a directory.
@@ -502,9 +504,13 @@ fn verify_htree_fault_matrix(linux: LinuxEnvironment, temporary_root: &Path) -> 
             let image = matrix_root.join(format!("{label}.img"));
             fs::copy(&baseline, &image)?;
             let run = run_internal_htree_mutation_until_boundary(&image, Some(cut))?;
-            require_stopped_effect("HTree commit/checkpoint", cut, run)?;
+            let commit = require_stopped_effect("HTree commit/checkpoint", cut, run)?;
             drive_core_mount_and_clean_close(&image)?;
-            cases.push(HtreeFaultOracleCase { label, image });
+            cases.push(HtreeFaultOracleCase {
+                label,
+                image,
+                commit,
+            });
         }
         verify_htree_fault_oracle_batch(linux, &cases)?;
         for case in cases {
@@ -544,7 +550,12 @@ fn htree_fault_names() -> TaskResult<Vec<ext4_core::Ext4Name>> {
 ///
 /// Returns an error when black-box directory inspection fails, the transaction is partially
 /// visible, or the complete new endpoint is not represented as a readable HTree.
-fn verify_htree_fault_endpoint(listing: &str, tree_dump: &str, label: &str) -> TaskResult<()> {
+fn verify_htree_fault_endpoint(
+    listing: &str,
+    tree_dump: &str,
+    commit: MutationCommit,
+    label: &str,
+) -> TaskResult<()> {
     let names = htree_fault_names()?;
     let present = names
         .iter()
@@ -554,7 +565,7 @@ fn verify_htree_fault_endpoint(listing: &str, tree_dump: &str, label: &str) -> T
         })
         .count();
     match present {
-        0 => Ok(()),
+        0 => commit.require_endpoint(MutationEndpoint::Old),
         HTREE_FAULT_ENTRY_COUNT if tree_dump.contains("Root node dump") => Ok(()),
         HTREE_FAULT_ENTRY_COUNT => Err(io::Error::other(format!(
             "{label} exposes the new namespace without a readable HTree root"
@@ -610,7 +621,7 @@ done
             delimited_oracle_section(&output, &listing_marker, &tree_marker, &case.label)?;
         let tree_dump = delimited_oracle_section(&output, &tree_marker, &fsck_marker, &case.label)?;
         let _fsck = delimited_oracle_section(&output, &fsck_marker, &end_marker, &case.label)?;
-        verify_htree_fault_endpoint(listing, tree_dump, &case.label)?;
+        verify_htree_fault_endpoint(listing, tree_dump, case.commit, &case.label)?;
     }
     Ok(())
 }
@@ -2029,18 +2040,20 @@ fn debugfs_path_exists(linux: LinuxEnvironment, image: &Path, path: &str) -> Tas
 ///
 /// Returns an error when old/new namespace states are mixed or the selected endpoint's content,
 /// link count, or xattr value differs.
-fn debugfs_require_external_old_or_new(
+fn verify_external_mutation_endpoint(
     linux: LinuxEnvironment,
     case_root: &Path,
     image: &Path,
     old_content: &[u8],
     new_content: &[u8],
+    commit: MutationCommit,
     label: &str,
 ) -> TaskResult<()> {
     let old_exists = debugfs_path_exists(linux, image, "/external-old.bin")?;
     let new_exists = debugfs_path_exists(linux, image, "/external-new.bin")?;
     match (old_exists, new_exists) {
         (true, false) => {
+            commit.require_endpoint(MutationEndpoint::Old)?;
             let endpoint = format!("{label}-old");
             debugfs_require_file(
                 linux,
@@ -2061,6 +2074,7 @@ fn debugfs_require_external_old_or_new(
             )
         }
         (false, true) => {
+            commit.require_endpoint(MutationEndpoint::New)?;
             let endpoint = format!("{label}-new");
             debugfs_require_file(
                 linux,
@@ -3390,14 +3404,15 @@ fn verify_external_journal_fault_matrix(
             &appended,
             Some(cut),
         )?;
-        require_stopped_effect("commit/checkpoint", cut, run)?;
+        let commit = require_stopped_effect("commit/checkpoint", cut, run)?;
         drive_external_core_mount_and_clean_close(&filesystem, &journal)?;
-        debugfs_require_external_old_or_new(
+        verify_external_mutation_endpoint(
             linux,
             &matrix_root,
             &filesystem,
             &old_content,
             &new_content,
+            commit,
             &stem,
         )?;
         verify_primary_recovery_marker(&filesystem, false)?;
@@ -3489,62 +3504,91 @@ fn require_completed_effect_probe(
     Ok(run.effects)
 }
 
-/// Enumerates every permitted crash persistence outcome for one exact production trace.
-///
-/// Each write contributes an unpersisted case, every 512-byte prefix, and the full write. Each
-/// flush contributes one target-local durable cut.
-///
+/// Enumerates bounded sector-prefix and independent pending-write persistence cases.
+/// Each write is tested in isolation and with all other pending writes retained. A flush
+/// always retains its target; pending writes on the other device are still independently
+/// selectable. This matrix does not enumerate the exponential set of all write subsets.
 /// # Errors
-///
-/// Returns an error when a production write is empty or is not composed of atomic sectors.
+/// Returns a non-sector write or effect-coordinate overflow.
 fn enumerate_effect_cuts(effects: &[StorageEffect]) -> TaskResult<Vec<EffectCut>> {
     let mut cuts = Vec::new();
+    let mut pending = Vec::new();
     for (index, observed) in effects.iter().copied().enumerate() {
-        let effect_number = index
+        let effect = index
             .checked_add(1)
             .ok_or_else(|| io::Error::other("effect index overflow"))?;
-        match observed {
-            StorageEffect::Write { bytes, .. } => {
+        cuts.push(EffectCut {
+            effect,
+            persistence: CrashPersistence::DurableOnly,
+        });
+        let candidates = match observed {
+            StorageEffect::Write { target, bytes } => {
                 if bytes == 0 || bytes % 512 != 0 {
-                    return Err(io::Error::other(format!(
-                        "effect {effect_number} write length {bytes} is not a positive sector multiple"
-                    ))
-                    .into());
+                    return Err(
+                        io::Error::other("crash write is not a positive sector multiple").into(),
+                    );
                 }
-                for prefix in (0..=bytes).step_by(512) {
+                pending.push((target, bytes));
+                vec![(target, 0, bytes)]
+            }
+            StorageEffect::Flush { target } => {
+                pending.retain(|(device, _)| *device != target);
+                pending
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(from_end, (target, bytes))| (*target, from_end, *bytes))
+                    .collect()
+            }
+        };
+        for (target, from_end, bytes) in candidates {
+            for prefix in (0..=bytes).step_by(512) {
+                for others in [PendingPersistence::Lost, PendingPersistence::Complete] {
+                    if (others == PendingPersistence::Lost && prefix == 0)
+                        || (others == PendingPersistence::Complete && pending.len() == 1)
+                    {
+                        continue;
+                    }
                     cuts.push(EffectCut {
-                        effect: effect_number,
-                        write_prefix: Some(prefix),
+                        effect,
+                        persistence: CrashPersistence::Write {
+                            target,
+                            from_end,
+                            prefix,
+                            others,
+                        },
                     });
                 }
             }
-            StorageEffect::Flush { .. } => cuts.push(EffectCut {
-                effect: effect_number,
-                write_prefix: None,
-            }),
         }
     }
     Ok(cuts)
 }
 
-/// Produces a filesystem-safe identity for one sector-prefix or target-local-flush cut.
+/// Produces one filesystem-safe identity for the stop point and physical persistence choice.
 fn effect_cut_stem(cut: EffectCut) -> String {
-    match cut.write_prefix {
-        Some(prefix) => format!("{:03}-write-{prefix:08}", cut.effect),
-        None => format!("{:03}-flush", cut.effect),
+    match cut.persistence {
+        CrashPersistence::DurableOnly => format!("{:03}-durable", cut.effect),
+        CrashPersistence::Write {
+            target,
+            from_end,
+            prefix,
+            others,
+        } => format!(
+            "{:03}-{target:?}-{from_end}-{prefix:08}-{others:?}",
+            cut.effect
+        ),
     }
 }
 
-/// Requires one exact simulated-crash boundary to have been reached.
-///
+/// Requires the exact simulated stop point and retains its recovery obligation.
 /// # Errors
-///
-/// Returns an error when the workflow terminated or stopped after a different effect count.
+/// Returns premature completion or a different storage-effect count.
 fn require_stopped_effect(
     label: &str,
     expected: EffectCut,
     run: EffectBoundaryRun,
-) -> TaskResult<()> {
+) -> TaskResult<MutationCommit> {
     if run.completed
         || run.completed_effects != expected.effect
         || run.effects.len() != expected.effect
@@ -3558,25 +3602,8 @@ fn require_stopped_effect(
         ))
         .into());
     }
-    let observed = run
-        .effects
-        .last()
-        .copied()
-        .ok_or_else(|| io::Error::other("stopped effect trace is empty"))?;
-    match (observed, expected.write_prefix) {
-        (StorageEffect::Write { bytes, .. }, Some(prefix)) if prefix <= bytes => {}
-        (StorageEffect::Flush { .. }, None) => {}
-        _ => {
-            return Err(io::Error::other(format!(
-                "{label} boundary {} does not match its observed request",
-                effect_cut_stem(expected)
-            ))
-            .into());
-        }
-    }
-    Ok(())
+    Ok(run.commit)
 }
-
 /// Requires an interrupted recovery write to equal a sector-prefix transition from old to new.
 ///
 /// The dirty journal remains authoritative until replayed home blocks and the journal-clean marker
@@ -4563,62 +4590,153 @@ mod tests {
         assert_eq!(serialized.ok().as_deref(), Some("4-6,9,11-12"));
         assert!(comma_separated_blocks(&[]).is_err());
     }
-    /// Write effects expand to every atomic-sector prefix while flushes remain target-local cuts.
-    ///
+    /// # Errors
+    /// Returns a rejected sector-aligned effect trace.
     /// # Panics
-    ///
-    /// Panics if sector-prefix enumeration skips an endpoint or accepts a non-sector write.
+    /// Fails if reordered persistence or device-local flush survival is omitted from the matrix.
     #[test]
-    fn fault_matrix_enumerates_atomic_write_prefixes_and_flushes() {
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions verify independent crash persistence cases"
+    )]
+    fn fault_matrix_covers_sector_prefixes_and_reordered_writes() -> TaskResult<()> {
+        use ext4_core::StorageTarget::{ExternalJournal, Filesystem};
         let effects = [
             StorageEffect::Write {
-                target: ext4_core::StorageTarget::Filesystem,
+                target: Filesystem,
+                bytes: 512,
+            },
+            StorageEffect::Write {
+                target: Filesystem,
                 bytes: 1024,
             },
             StorageEffect::Flush {
-                target: ext4_core::StorageTarget::ExternalJournal,
+                target: ExternalJournal,
             },
+            StorageEffect::Flush { target: Filesystem },
         ];
-        let cuts = enumerate_effect_cuts(&effects);
-        assert!(cuts.is_ok(), "sector-aligned effects must enumerate");
-        assert_eq!(
-            cuts.ok(),
-            Some(vec![
-                EffectCut {
-                    effect: 1,
-                    write_prefix: Some(0),
-                },
-                EffectCut {
-                    effect: 1,
-                    write_prefix: Some(512),
-                },
-                EffectCut {
-                    effect: 1,
-                    write_prefix: Some(1024),
-                },
-                EffectCut {
+        let cuts = enumerate_effect_cuts(&effects)?;
+        for prefix in [512, 1024] {
+            for others in [PendingPersistence::Lost, PendingPersistence::Complete] {
+                assert!(cuts.contains(&EffectCut {
                     effect: 2,
-                    write_prefix: None,
-                },
-            ])
-        );
-        assert_eq!(
-            effect_cut_stem(EffectCut {
-                effect: 2,
-                write_prefix: None,
-            }),
-            "002-flush"
-        );
+                    persistence: CrashPersistence::Write {
+                        target: Filesystem,
+                        from_end: 0,
+                        prefix,
+                        others,
+                    }
+                }));
+            }
+        }
+        assert!(cuts.contains(&EffectCut {
+            effect: 3,
+            persistence: CrashPersistence::Write {
+                target: Filesystem,
+                from_end: 1,
+                prefix: 512,
+                others: PendingPersistence::Lost,
+            }
+        }));
+        assert_eq!(cuts.iter().filter(|cut| cut.effect == 4).count(), 1);
         assert!(
             enumerate_effect_cuts(&[StorageEffect::Write {
-                target: ext4_core::StorageTarget::Filesystem,
-                bytes: 513,
+                target: Filesystem,
+                bytes: 513
             }])
             .is_err()
         );
+        Ok(())
     }
-    /// A journal flush cannot make filesystem writes durable, and a filesystem write cut retains
-    /// earlier ordered writes while dropping the selected write's unpersisted suffix.
+    /// # Errors
+    /// Returns fixture, production mutation, recovery or task-directory finalization failures.
+    /// # Panics
+    /// Fails if a persisted commit can be acknowledged as the predecessor after recovery.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare production barrier outcomes with raw recovered labels"
+    )]
+    fn commit_flush_crashes_require_the_durable_successor() -> TaskResult<()> {
+        let root = crate::process::repository_root()?;
+        let directory = create_task_directory(&root, "commit-crash-contract")?;
+        let operation = (|| -> TaskResult<()> {
+            let fixtures = journal_fixture_directory(&root);
+            let filesystem = directory.join("filesystem.img");
+            let journal = directory.join("journal.img");
+            let execute = |cut| -> TaskResult<EffectBoundaryRun> {
+                fs::copy(
+                    fixtures.join("external-4k-v3-64.filesystem.img"),
+                    &filesystem,
+                )?;
+                fs::copy(fixtures.join("external-4k-v3-64.journal.img"), &journal)?;
+                let mut storage = CrashStorageAdapter::open_external(&filesystem, &journal)?;
+                let completed = mount_external_core(&mut storage)?;
+                let (prepared, mut coordinator, ticket) =
+                    prepare_volume_label_commit(&mut storage, completed, b"durable-cut")?;
+                run_prepared_mutation_until_boundary(
+                    &mut storage,
+                    &mut coordinator,
+                    ticket,
+                    prepared,
+                    cut,
+                )
+            };
+            let probe = execute(None)?;
+            let barriers: Vec<_> = probe
+                .effects
+                .iter()
+                .enumerate()
+                .filter_map(|(index, effect)| {
+                    matches!(
+                        effect,
+                        StorageEffect::Flush {
+                            target: ext4_core::StorageTarget::ExternalJournal
+                        }
+                    )
+                    .then(|| index.checked_add(1))
+                    .flatten()
+                })
+                .collect();
+            let payload_barrier = *barriers
+                .first()
+                .ok_or_else(|| io::Error::other("missing payload barrier"))?;
+            let commit_barrier = *barriers
+                .get(1)
+                .ok_or_else(|| io::Error::other("missing commit barrier"))?;
+            let before = execute(Some(EffectCut {
+                effect: payload_barrier,
+                persistence: CrashPersistence::DurableOnly,
+            }))?;
+            assert_eq!(before.commit, MutationCommit::Pending);
+            before.commit.require_endpoint(MutationEndpoint::Old)?;
+            for effect in [
+                commit_barrier,
+                commit_barrier
+                    .checked_add(1)
+                    .ok_or_else(|| io::Error::other("cut overflow"))?,
+            ] {
+                let cut = EffectCut {
+                    effect,
+                    persistence: CrashPersistence::DurableOnly,
+                };
+                let commit = require_stopped_effect("commit flush", cut, execute(Some(cut))?)?;
+                assert_eq!(commit, MutationCommit::Durable);
+                assert!(commit.require_endpoint(MutationEndpoint::Old).is_err());
+                commit.require_endpoint(MutationEndpoint::New)?;
+                drive_external_core_mount_and_clean_close(&filesystem, &journal)?;
+                verify_volume_label(&filesystem, b"durable-cut")?;
+            }
+            Ok(())
+        })();
+        combine_verification_and_cleanup(
+            operation,
+            remove_task_directory(&root, &directory, "commit-crash-contract"),
+        )
+    }
+
+    /// A journal flush cannot make filesystem writes durable. A later filesystem write can survive
+    /// while an earlier completed write on that same device is lost.
     ///
     /// # Panics
     ///
@@ -4635,7 +4753,7 @@ mod tests {
             std::process::id()
         ));
         let result = (|| -> TaskResult<()> {
-            fs::write(&filesystem, [0xA1_u8; 1024])?;
+            fs::write(&filesystem, [0xA1_u8; 1536])?;
             fs::write(&journal, [0xB2_u8; 1024])?;
             let mut storage = CrashStorageAdapter::open_external(&filesystem, &journal)?;
             storage.write_all(ext4_core::StorageTarget::Filesystem, 0, &[0xC3_u8; 512])?;
@@ -4645,16 +4763,56 @@ mod tests {
                 &[0xD4_u8; 512],
             )?;
             storage.flush(ext4_core::StorageTarget::ExternalJournal)?;
-            storage.write_all(ext4_core::StorageTarget::Filesystem, 512, &[0xE5_u8; 512])?;
-            storage.materialize_write_prefix(ext4_core::StorageTarget::Filesystem, 0)?;
-            drop(storage);
+            storage.write_all(ext4_core::StorageTarget::Filesystem, 512, &[0xE5_u8; 1024])?;
+            storage.write_all(
+                ext4_core::StorageTarget::ExternalJournal,
+                512,
+                &[0xF6_u8; 512],
+            )?;
+            storage.materialize(CrashPersistence::Write {
+                target: ext4_core::StorageTarget::Filesystem,
+                from_end: 0,
+                prefix: 512,
+                others: PendingPersistence::Lost,
+            })?;
 
             let filesystem_bytes = fs::read(&filesystem)?;
             let journal_bytes = fs::read(&journal)?;
-            assert_eq!(filesystem_bytes.get(..512), Some([0xC3_u8; 512].as_slice()));
-            assert_eq!(filesystem_bytes.get(512..), Some([0xA1_u8; 512].as_slice()));
+            assert_eq!(filesystem_bytes.get(..512), Some([0xA1_u8; 512].as_slice()));
+            assert_eq!(
+                filesystem_bytes.get(512..1024),
+                Some([0xE5_u8; 512].as_slice())
+            );
+            assert_eq!(
+                filesystem_bytes.get(1024..),
+                Some([0xA1_u8; 512].as_slice())
+            );
             assert_eq!(journal_bytes.get(..512), Some([0xD4_u8; 512].as_slice()));
             assert_eq!(journal_bytes.get(512..), Some([0xB2_u8; 512].as_slice()));
+            storage.materialize(CrashPersistence::Write {
+                target: ext4_core::StorageTarget::Filesystem,
+                from_end: 1,
+                prefix: 0,
+                others: PendingPersistence::Complete,
+            })?;
+            let filesystem_bytes = fs::read(&filesystem)?;
+            let journal_bytes = fs::read(&journal)?;
+            assert_eq!(filesystem_bytes.get(..512), Some([0xA1_u8; 512].as_slice()));
+            assert_eq!(
+                filesystem_bytes.get(512..),
+                Some([0xE5_u8; 1024].as_slice())
+            );
+            assert_eq!(journal_bytes.get(512..), Some([0xF6_u8; 512].as_slice()));
+            assert!(
+                storage
+                    .materialize(CrashPersistence::Write {
+                        target: ext4_core::StorageTarget::Filesystem,
+                        from_end: 0,
+                        prefix: 1,
+                        others: PendingPersistence::Lost
+                    })
+                    .is_err()
+            );
             Ok(())
         })();
         let filesystem_cleanup = fs::remove_file(&filesystem);

@@ -276,15 +276,19 @@ and [orphan recovery cases](tools/xtask/src/interop/scenarios/orphan.rs).
 
 External-journal crash recovery is accepted only when `e2fsck -f` is clean and
 the observable namespace, content, links, xattrs, and allocation state are
-wholly old or wholly new. Interrupted orphan recovery must checkpoint tracker
+wholly old or wholly new before commit durability. After the commit's journal
+flush succeeds, recovery must retain the complete new state, including when
+the flush acknowledgement is lost. Interrupted orphan recovery must checkpoint tracker
 cleanup before remount publication; clean close must leave an `e2fsck`-clean
 allocation and namespace endpoint.
 
 The crash model assumes atomic 512-byte sectors. Writes may be absent, may
-persist at a sector-aligned prefix, or may persist completely. Successful
-flushes preserve prior write ordering and make durable only the target device,
-so an external journal and its filesystem image have independent volatile and
-durable states.
+persist at a sector-aligned prefix, or may persist completely. Unflushed write
+completion does not impose persistence order. The bounded matrix tests each
+write prefix both in isolation and with the other pending writes retained;
+it does not enumerate all pending-write subsets. Successful flushes make all
+earlier writes durable only on the target device. Pending writes on the other
+device remain independently selectable after that flush.
 
 Volume feature, geometry, and journal acceptance are determined by
 [core mount validation](crates/ext4-core/src/volume/mount.rs).
