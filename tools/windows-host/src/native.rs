@@ -925,27 +925,39 @@ pub fn volume_at_mount(path: &Path) -> io::Result<String> {
 }
 
 /// Verifies allocation reservation without EOF growth, release, and allocation below written EOF.
-/// The supplied fixture must be an empty regular file.
+/// The supplied fixture must be an empty regular file. Its non-data storage charge can remain
+/// after data allocation is released; each release must return to that same observed charge.
 /// # Errors
 /// Returns native allocation/write/query/flush failures, contract disagreement, or close failure.
 pub fn verify_allocation_control(path: &Path) -> io::Result<()> {
     let file = FileHandle::open(path, 0x4000_0080, 0)?;
     let result = (|| {
+        set_file_allocation(&file, 0)?;
+        let standard = file_information_query(&file, 5, 24, 0)?;
+        let baseline = i64::from_le_bytes(field(&standard, 0)?);
+        if baseline < 0 || i64::from_le_bytes(field(&standard, 8)?) != 0 {
+            return Err(io::Error::other(
+                "allocation fixture is not an empty regular file",
+            ));
+        }
         for bound in [32_768, 0] {
             set_file_allocation(&file, bound)?;
             let standard = file_information_query(&file, 5, 24, 0)?;
             let allocation = i64::from_le_bytes(field(&standard, 0)?);
             let eof = i64::from_le_bytes(field(&standard, 8)?);
-            if eof != 0 || allocation < bound || (bound == 0 && allocation != 0) {
-                return Err(io::Error::other(
-                    "allocation reservation changed EOF or failed to resize",
-                ));
+            let minimum = baseline
+                .checked_add(bound)
+                .ok_or_else(|| io::Error::other("allocation fixture charge overflow"))?;
+            if eof != 0 || allocation < minimum || (bound == 0 && allocation != baseline) {
+                return Err(io::Error::other(format!(
+                    "allocation reservation changed EOF or failed to resize: bound={bound}, baseline={baseline}, allocation={allocation}, EOF={eof}",
+                )));
             }
         }
         write_and_flush_byte(&file)?;
         set_file_allocation(&file, 0)?;
         let standard = file_information_query(&file, 5, 24, 0)?;
-        if i64::from_le_bytes(field(&standard, 0)?) != 0
+        if i64::from_le_bytes(field(&standard, 0)?) != baseline
             || i64::from_le_bytes(field(&standard, 8)?) != 0
         {
             return Err(io::Error::other(

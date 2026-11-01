@@ -22,6 +22,66 @@ mod session;
 mod trim;
 
 /// # Errors
+/// Returns fixture, allocation, xattr, or commit failure.
+/// # Panics
+/// Fails if allocation changes EOF or releasing data allocation changes inode attributes.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare committed allocation and EOF after independent mutations"
+)]
+fn allocation_reservation_and_release_preserve_empty_file_attributes() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let id = fixture.a;
+    fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.truncate_file(file, FileSize::from_bytes(0))?;
+        let node = pass.node(NodeId::File(id))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"allocation-metadata")?,
+            XattrValue::new(&[0x5a; 256])?,
+        )
+    })?;
+    let baseline = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    let metadata_allocation = baseline.allocation_size().bytes();
+    assert!(metadata_allocation > 0);
+    for bound in [32_768, 0] {
+        fixture.mutate(|pass| {
+            let file = pass.file(id)?;
+            pass.set_file_allocation(file, FileAllocationSize::from_bytes(bound))
+        })?;
+        let metadata = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+        assert_eq!(metadata.size().bytes(), 0);
+        assert_eq!(
+            metadata.allocation_size().bytes(),
+            metadata_allocation + bound
+        );
+    }
+    fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.write_file_range(file, FileOffset::ZERO, b"x")?;
+        pass.truncate_file(file, FileSize::from_bytes(0))?;
+        pass.set_file_allocation(file, FileAllocationSize::from_bytes(0))
+    })?;
+    fixture.remount()?;
+    let metadata = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    assert_eq!(metadata.size().bytes(), 0);
+    assert_eq!(metadata.allocation_size().bytes(), metadata_allocation);
+    let attribute = fixture.read(|pass| {
+        pass.read_xattr(
+            NodeId::File(id),
+            &XattrName::new(XattrNamespace::User, b"allocation-metadata")?,
+        )
+    })?;
+    assert_eq!(
+        attribute.as_ref().map(XattrValue::bytes),
+        Some([0x5a; 256].as_slice())
+    );
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture encoding, mounting, allocation or recovery failure.
 /// # Panics
 /// Fails if allocation consumes reserved blocks, a rejected pass writes, or frees stay unavailable.
