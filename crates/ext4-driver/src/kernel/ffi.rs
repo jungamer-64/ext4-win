@@ -4,9 +4,13 @@ pub(crate) use wdk_sys::ntddk::RtlCopyVolatileMemory;
 
 #[expect(
     unsafe_code,
-    reason = "the native boundary owns concurrent access to the OS FILE_OBJECT flag word"
+    reason = "the native boundary owns concurrent access to OS object flag words"
 )]
 unsafe extern "system" {
+    /// Observes the shared native flag word without borrowing DEVICE_OBJECT storage.
+    /// # Safety
+    /// `device` must remain a live DEVICE_OBJECT throughout this native atomic load.
+    pub(crate) fn ext4win_device_flags(device: wdk_sys::PDEVICE_OBJECT) -> wdk_sys::ULONG;
     /// Accounts issued physical bytes before private IRP ownership moves to the lower stack.
     /// # Safety
     /// The live private IRP must contain its initialized next stack location.

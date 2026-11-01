@@ -14,8 +14,8 @@ pub(crate) struct KernelDevice {
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
 // SAFETY: WDM device objects are I/O Manager-owned, nonpaged objects that may be dispatched on any
-// processor. This boundary exposes only stable identity and immutable device properties; teardown
-// contracts require every reactor operation and lower completion to drain before deletion.
+// processor. This boundary exposes stable identity, immutable properties and native atomic flag
+// observations; teardown requires every reactor operation and lower completion to drain before deletion.
 unsafe impl Send for KernelDevice {}
 #[expect(
     unsafe_code,
@@ -41,6 +41,19 @@ impl KernelDevice {
     /// Returns the raw WDK device pointer for FFI calls.
     pub(crate) fn as_ptr(self) -> PDEVICE_OBJECT {
         self.device.as_ptr().cast()
+    }
+
+    /// Observes the shared flag word independently of its native lifecycle updates.
+    #[expect(
+        unsafe_code,
+        reason = "the retaining operation encloses the native atomic device flag load"
+    )]
+    pub(crate) fn flags(self) -> wdk_sys::ULONG {
+        unsafe {
+            // SAFETY: The identity's retaining operation keeps the device live. Native code
+            // atomically reads only Flags, without creating a Rust reference to OS storage.
+            ffi::ext4win_device_flags(self.as_ptr())
+        }
     }
 
     /// Copies the extension address without borrowing the externally mutable device object.

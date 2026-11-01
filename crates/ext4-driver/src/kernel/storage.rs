@@ -199,10 +199,7 @@ impl LowerStorageDevice {
             // scalar read leaves independently mutable native queue and lifecycle fields alone.
             (*device.as_ptr()).AlignmentRequirement
         };
-        let flags = unsafe {
-            // SAFETY: Mounted lower-device admission retains its established transfer flags.
-            (*device.as_ptr()).Flags
-        };
+        let flags = device.flags();
         let sector_size = device.transfer_sector_size()?;
         let alignment_mask =
             usize::try_from(alignment_requirement).map_err(|_| DriverError::InvalidParameter)?;
@@ -1452,6 +1449,85 @@ mod tests {
         _owner: Box<wdk_sys::DEVICE_OBJECT>,
         _lower: Box<wdk_sys::DEVICE_OBJECT>,
         devices: MountedStorageRoute,
+    }
+
+    /// Retains immutable geometry and one externally updated native flag word.
+    struct SharedFlagDevice {
+        /// Scoped workers access Flags atomically; every other field remains immutable.
+        device: core::cell::UnsafeCell<wdk_sys::DEVICE_OBJECT>,
+    }
+
+    #[expect(
+        unsafe_code,
+        reason = "the fixture shares only atomic flag access and immutable geometry until scoped workers join"
+    )]
+    // SAFETY: Initialization precedes sharing. Only Flags is modified, through native/atomic
+    // operations; no Rust reference borrows the DEVICE_OBJECT while workers run.
+    unsafe impl Sync for SharedFlagDevice {}
+
+    impl SharedFlagDevice {
+        /// Returns storage retained until all scoped atomic accesses have ended.
+        fn as_ptr(&self) -> *mut wdk_sys::DEVICE_OBJECT {
+            self.device.get()
+        }
+    }
+
+    /// # Errors
+    /// Returns invalid transfer geometry or failure of the joined lifecycle-update worker.
+    /// # Panics
+    /// Fails if mutable native lifecycle bits affect the captured lower transfer constraints.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the scoped fixture retains native storage while production C reads race only with atomic lifecycle updates"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "geometry and join failures propagate while assertions check concurrent native observations"
+    )]
+    fn transfer_capture_tolerates_concurrent_native_lifecycle_updates() -> Result<(), DriverError> {
+        use core::sync::atomic::{AtomicU32, Ordering};
+
+        let stable = wdk_sys::DO_DIRECT_IO | wdk_sys::DO_POWER_PAGABLE;
+        let shared = SharedFlagDevice {
+            device: core::cell::UnsafeCell::new(wdk_sys::DEVICE_OBJECT {
+                Flags: stable,
+                SectorSize: 512,
+                AlignmentRequirement: wdk_sys::FILE_512_BYTE_ALIGNMENT,
+                ..wdk_sys::DEVICE_OBJECT::default()
+            }),
+        };
+        // SAFETY: The cell retains initialized native storage through all scoped worker joins.
+        let device = unsafe { KernelDevice::from_raw(shared.as_ptr()) }
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| -> Result<(), DriverError> {
+            let lifecycle = scope.spawn(|| {
+                // SAFETY: The cell remains live; only this naturally aligned scalar is modified.
+                let flags = unsafe { core::ptr::addr_of_mut!((*shared.as_ptr()).Flags) };
+                // SAFETY: Native observation and this writer both access only the same ULONG
+                // atomically. Geometry is immutable and no whole-object reference exists.
+                let flags = unsafe { AtomicU32::from_ptr(flags) };
+                start.wait();
+                for _ in 0..16_384 {
+                    flags.fetch_or(wdk_sys::DO_VERIFY_VOLUME, Ordering::Relaxed);
+                    flags.fetch_and(!wdk_sys::DO_VERIFY_VOLUME, Ordering::Relaxed);
+                }
+            });
+            start.wait();
+            for _ in 0..16_384 {
+                let captured =
+                    LowerStorageDevice::from_device(device, DeviceLength::from_bytes(4096))?;
+                assert_eq!(captured.transfer_method, super::LowerTransferMethod::Direct);
+                assert_eq!(captured.buffer_alignment, 512);
+                assert_eq!(captured.sector_size.as_u32(), 512);
+            }
+            lifecycle
+                .join()
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            assert_eq!(device.flags(), stable);
+            Ok(())
+        })
     }
 
     #[expect(

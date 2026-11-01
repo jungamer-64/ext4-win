@@ -209,6 +209,11 @@ pub(crate) fn verify_driver(repository_root: &Path) -> TaskResult<()> {
 fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
     for (name, source, contract) in [
         (
+            "device-object-flags",
+            "device_object_flags.tests.c",
+            "native atomic device flag observation without lifecycle mutation",
+        ),
+        (
             "disk-accounting",
             "disk_accounting.tests.c",
             "issued physical bytes and original-requestor direct I/O accounting",
