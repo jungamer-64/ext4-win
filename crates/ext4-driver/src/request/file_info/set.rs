@@ -494,11 +494,13 @@ pub(super) fn set_file_information(
         }
         SetFilePlan::Allocation { file, size } => {
             let current = regular_file_size(mutation, file)?;
-            if size.bytes() < current.bytes() {
-                set_regular_file_size(mutation, file, FileSize::from_bytes(size.bytes()))?;
+            let change =
+                AllocationChange::new(size, current, operations.volume_geometry().cluster_size())?;
+            if change.eof < current {
+                set_regular_file_size(mutation, file, change.eof)?;
             }
             let file = mutation.file(file)?;
-            mutation.set_file_allocation(file, size)?;
+            mutation.set_file_allocation(file, change.allocation)?;
         }
         SetFilePlan::Disposition {
             fcb,
@@ -564,6 +566,37 @@ pub(super) fn set_file_information(
         }
     }
     Ok(SetFileResolution::Mutation(SetFilePublication::None))
+}
+
+/// Windows allocation requests select a cluster-rounded reservation and may shrink EOF only to
+/// that rounded boundary. The signed byte domain is checked before either change is staged.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AllocationChange {
+    /// Physical allocation bound in mounted allocation-cluster units.
+    allocation: FileAllocationSize,
+    /// EOF preserved unless the rounded allocation cannot contain it.
+    eof: FileSize,
+}
+
+impl AllocationChange {
+    /// Resolves the Windows allocation and EOF effects together before mutation.
+    /// # Errors
+    /// Rejects a rounded bound outside Windows' signed file-offset domain.
+    fn new(
+        requested: FileAllocationSize,
+        current: FileSize,
+        cluster: ext4_core::ClusterSize,
+    ) -> DriverResult<Self> {
+        let rounded = requested
+            .bytes()
+            .checked_next_multiple_of(u64::from(cluster.bytes()))
+            .filter(|bound| i64::try_from(*bound).is_ok())
+            .ok_or(DriverError::InvalidParameter)?;
+        Ok(Self {
+            allocation: FileAllocationSize::from_bytes(rounded),
+            eof: FileSize::from_bytes(current.bytes().min(rounded)),
+        })
+    }
 }
 
 /// Binds a preallocated rename successor to the selected link retained by the pending request.

@@ -1,5 +1,44 @@
 use super::*;
 
+/// # Errors
+/// Returns invalid fixture geometry or allocation-bound conversion failures.
+/// # Panics
+/// Fails if a Windows allocation request truncates below its rounded bound or extends EOF.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fallible geometry setup precedes independent Windows allocation vectors"
+)]
+fn allocation_requests_round_before_selecting_eof() -> DriverResult<()> {
+    for (cluster, requested, current, allocation, eof) in [
+        (4096, 5999, 6000, 8192, 6000),
+        (4096, 4095, 6000, 4096, 4096),
+        (4096, 8192, 6000, 8192, 6000),
+        (4096, 0, 6000, 0, 0),
+        (65536, 4096, 6000, 65536, 6000),
+    ] {
+        let change = AllocationChange::new(
+            FileAllocationSize::from_bytes(requested),
+            FileSize::from_bytes(current),
+            ext4_core::ClusterSize::new(cluster)?,
+        )?;
+        assert_eq!(change.allocation.bytes(), allocation);
+        assert_eq!(change.eof.bytes(), eof);
+    }
+    let cluster = ext4_core::ClusterSize::new(4096)?;
+    for requested in [i64::MAX.unsigned_abs(), u64::MAX] {
+        assert_eq!(
+            AllocationChange::new(
+                FileAllocationSize::from_bytes(requested),
+                FileSize::from_bytes(6000),
+                cluster,
+            ),
+            Err(DriverError::InvalidParameter)
+        );
+    }
+    Ok(())
+}
+
 /// Explicit VDL assignment cannot reduce initialization or expose bytes beyond EOF.
 /// # Panics
 /// Fails if an assignment changes the initialized bound or bypasses initial-open privilege.
