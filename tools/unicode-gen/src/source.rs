@@ -8,6 +8,7 @@
 use crate::{GenerationResult, UNICODE_VERSION};
 use alloc::{collections::BTreeMap, vec::Vec};
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 use std::{
     fs, io,
@@ -161,14 +162,27 @@ fn download(url: &str) -> GenerationResult<Vec<u8>> {
     Ok(output.stdout)
 }
 
+/// Reserves a process-local identity independently of the host clock's resolution.
+/// # Errors
+/// Returns clock failure or exhaustion of the process's temporary-name sequence.
+fn temporary_name() -> GenerationResult<String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let sequence = NEXT
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map_err(|_| io::Error::other("Unicode temporary-name sequence exhausted"))?;
+    let instant = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    Ok(format!("{}-{instant}-{sequence}", process::id()))
+}
+
 /// Publishes a complete cache entry without replacing an existing entry from another writer.
 /// # Errors
 /// Returns staging, publication, conflicting-entry or cleanup failure. Interrupted staging files
 /// have no authority and are never read as cache entries.
 fn publish(cache: &Path, path: &Path, source: &str) -> GenerationResult<()> {
     fs::create_dir_all(cache)?;
-    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let staged = cache.join(format!(".{}-{nonce}.tmp", process::id()));
+    let staged = cache.join(format!(".{}.tmp", temporary_name()?));
     let mut file = fs::File::create_new(&staged)?;
     let publication = (|| -> GenerationResult<()> {
         file.write_all(source.as_bytes())?;
@@ -221,8 +235,7 @@ mod tests {
     /// # Errors
     /// Returns clock or directory creation failure.
     fn cache_directory() -> GenerationResult<PathBuf> {
-        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-        let path = env::temp_dir().join(format!("ext4-ucd-test-{}-{nonce}", process::id()));
+        let path = env::temp_dir().join(format!("ext4-ucd-test-{}", temporary_name()?));
         fs::create_dir(&path)?;
         Ok(path)
     }
@@ -295,6 +308,49 @@ mod tests {
             );
             publish(&cache, &cache.join("input.txt"), "abc")?;
             assert!(publish(&cache, &cache.join("input.txt"), "conflict").is_err());
+            assert_eq!(fs::read(cache.join("input.txt"))?, b"abc");
+            assert_eq!(fs::read_dir(&cache)?.count(), 1);
+            Ok(())
+        })();
+        finish_cache_operation(result, fs::remove_dir_all(cache))
+    }
+
+    /// Concurrent identical writers publish one complete entry and consume their staging files.
+    /// # Errors
+    /// Returns fixture, worker, publication or mandatory cleanup failures.
+    /// # Panics
+    /// Fails if concurrent publication changes authenticated bytes or leaves staging files.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions inspect the shared cache after joining all fallible publishers"
+    )]
+    fn concurrent_publication_preserves_one_complete_entry() -> GenerationResult<()> {
+        let cache = cache_directory()?;
+        let result = (|| -> GenerationResult<()> {
+            let barrier = std::sync::Barrier::new(8);
+            std::thread::scope(|scope| -> io::Result<()> {
+                let workers: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            barrier.wait();
+                            publish(&cache, &cache.join("input.txt"), "abc")
+                                .map_err(|error| io::Error::other(error.to_string()))
+                        })
+                    })
+                    .collect();
+                let mut failure = None;
+                for worker in workers {
+                    let result = worker
+                        .join()
+                        .map_err(|_| io::Error::other("cache publisher panicked"))
+                        .and_then(core::convert::identity);
+                    if let Err(error) = result {
+                        failure.get_or_insert(error);
+                    }
+                }
+                failure.map_or(Ok(()), Err)
+            })?;
             assert_eq!(fs::read(cache.join("input.txt"))?, b"abc");
             assert_eq!(fs::read_dir(&cache)?.count(), 1);
             Ok(())
