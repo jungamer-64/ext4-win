@@ -31,6 +31,8 @@ const SUPERBLOCK_CHECKSUM_OFFSET: usize = 1020;
 const RESERVED_GDT_BLOCKS_OFFSET: usize = 206;
 /// Magic value stored in `s_magic`.
 const EXT4_SUPER_MAGIC: u16 = 0xEF53;
+/// Creator OS selecting the Linux interpretation of OS-dependent inode fields.
+const EXT4_OS_LINUX: u32 = 0;
 
 /// Recognition only: an ext-family filesystem or a standalone journal device.
 ///
@@ -1678,7 +1680,7 @@ impl FeatureSet {
     }
 }
 
-/// Superblock whose structural fields and mount policy are validated.
+/// Superblock whose Linux inode layout, structural fields and mount policy are validated.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Superblock {
     /// On-disk health flags; observation does not imply cleanup permission.
@@ -1928,7 +1930,8 @@ impl Superblock {
     /// # Errors
     ///
     /// Returns an error when the payload is truncated, has invalid magic or dirty state, fails the
-    /// feature policy, contains invalid geometry, or carries an invalid checksum/journal/hash field.
+    /// feature policy, selects an unsupported inode layout, contains invalid geometry, or carries
+    /// an invalid checksum/journal/hash field.
     fn parse_with_policy(
         raw: &[u8],
         validate_features: fn(u32, u32, u32) -> Result<FeatureSet>,
@@ -1944,6 +1947,11 @@ impl Superblock {
         // Feature fields and dynamic inode geometry are defined by revision one.
         if le_u32(raw, disk_offset(76))? != 1 {
             return Err(Error::UnsupportedWriteFeature);
+        }
+        // Inode checksums, high block counts and high xattr pointers interpret i_osd2 using
+        // the Linux layout. Read-only traversal and checksum rescue require that layout too.
+        if le_u32(raw, disk_offset(72))? != EXT4_OS_LINUX {
+            return Err(Error::UnsupportedCreatorOs);
         }
         let state = le_u16(raw, disk_offset(58))?;
         if access == crate::MediaAccess::ReadWrite && state & EXT4_VALID_FS == 0 {

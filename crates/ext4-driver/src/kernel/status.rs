@@ -322,6 +322,7 @@ const fn core_error_status(error: Error) -> NTSTATUS {
         Error::MediaChanged => wdk_sys::STATUS_WRONG_VOLUME,
         Error::VerityMismatch => STATUS_IO_DEVICE_ERROR,
         Error::UnsupportedBlockSize
+        | Error::UnsupportedCreatorOs
         | Error::UnsupportedIncompatFeature
         | Error::UnsupportedReadOnlyFeature
         | Error::UnsupportedWriteFeature
@@ -449,6 +450,10 @@ mod tests {
         );
         assert_eq!(
             DriverError::from(Error::UnsupportedDirectoryHash).ntstatus(),
+            STATUS_NOT_SUPPORTED
+        );
+        assert_eq!(
+            DriverError::from(Error::UnsupportedCreatorOs).ntstatus(),
             STATUS_NOT_SUPPORTED
         );
         assert_eq!(

@@ -40,6 +40,8 @@ pub enum Error {
     DirtyVolume,
     /// The ext4 block size is outside the v1 supported range.
     UnsupportedBlockSize,
+    /// The filesystem creator selects an unsupported OS-dependent inode layout.
+    UnsupportedCreatorOs,
     /// The superblock advertises an incompatible feature.
     UnsupportedIncompatFeature,
     /// The superblock advertises a read-only-compatible feature v1 does not validate.
@@ -164,6 +166,7 @@ impl fmt::Display for Error {
             Self::InvalidMagic => "invalid ext4 superblock magic",
             Self::DirtyVolume => "ext4 volume is not clean",
             Self::UnsupportedBlockSize => "unsupported ext4 block size",
+            Self::UnsupportedCreatorOs => "unsupported ext4 creator OS inode layout",
             Self::UnsupportedIncompatFeature => "unsupported ext4 incompat feature",
             Self::UnsupportedReadOnlyFeature => "unsupported ext4 read-only feature",
             Self::InvalidSuperblock => "invalid ext4 superblock",

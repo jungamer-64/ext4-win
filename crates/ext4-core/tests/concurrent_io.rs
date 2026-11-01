@@ -6179,6 +6179,76 @@ fn mount_rejects_unsupported_format_selectors_before_storage_effects() -> Result
 }
 
 /// # Errors
+/// Returns a malformed fixture range.
+/// # Panics
+/// Fails if an unsupported inode layout reaches mount publication or media effects.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions observe layout rejection across distinct mount and checksum-rescue protocols"
+)]
+fn mount_requires_linux_inode_layout_before_recovery() -> Result<()> {
+    for (creator_os, access, checksum_damage) in [
+        (1_u32, MountAccess::ReadWrite, 0_u32),
+        (u32::MAX, MountAccess::ReadWrite, 0),
+        (
+            1,
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Replay,
+            },
+            0,
+        ),
+        (
+            1,
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::NoLoad,
+            },
+            0,
+        ),
+        (1, MountAccess::ReadWrite, 1),
+        (
+            1,
+            MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::Memory {
+                    limit: RecoveryMemoryLimit::DEFAULT,
+                },
+            },
+            1,
+        ),
+    ] {
+        let mut disk = Disk::fixture();
+        // s_creator_os is a format selector independent of feature masks and checksum validity.
+        for (target, byte) in disk
+            .filesystem
+            .iter_mut()
+            .skip(1096)
+            .zip(creator_os.to_le_bytes())
+        {
+            *target = byte;
+        }
+        let checksum = fixture_crc32c(
+            u32::MAX,
+            disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+        ) ^ checksum_damage;
+        for (target, byte) in disk
+            .filesystem
+            .iter_mut()
+            .skip(2044)
+            .zip(checksum.to_le_bytes())
+        {
+            *target = byte;
+        }
+        assert_eq!(
+            disk.mount(access).err(),
+            Some(Error::UnsupportedCreatorOs),
+            "creator_os={creator_os}, access={access:?}, checksum_damage={checksum_damage}"
+        );
+        assert_eq!(disk.storage_effects, 0);
+    }
+    Ok(())
+}
+
+/// # Errors
 /// Returns ext4 fixture, mutation, storage or allocation failures.
 /// # Panics
 /// Fails if opaque user values change inode-read or payload-write eligibility.
