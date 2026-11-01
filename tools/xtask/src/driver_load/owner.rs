@@ -419,63 +419,6 @@ fn scm(session: &mut Session<DriverState>, operation: Operation, command: &str) 
     Ok(())
 }
 
-/// Starts the exact production-gate bundle and returns its durable session identity.
-/// # Errors
-/// Returns preflight, production identity, installation, start or verification failures.
-/// A partially established session remains recoverable by its printed identity.
-pub(crate) fn start_session(
-    root: &Path,
-    bundle: &VerifiedProductionBundle,
-    id: SessionId,
-    scope: Option<&crate::storage::DisposablePartition>,
-) -> TaskResult<()> {
-    host_contract(root)?;
-    crate::storage::assert_scope(scope)?;
-    let identity = BundleIdentity::from_verified(bundle);
-    identity.revalidate(root)?;
-    let signer = signer(&identity, true)?;
-    println!("certificate LocalMachine\\Root thumbprint: {signer}");
-    println!("certificate LocalMachine\\TrustedPublisher thumbprint: {signer}");
-    let state = DriverState {
-        bundle: identity,
-        signer,
-        package: PackageState::Absent,
-        service: ServiceIdentity::Unobserved,
-        control: control(root)?,
-    };
-    let mut session = Session::create(root, "driver-load-sessions", id, state)?;
-    session.state_mut().package = PackageState::Installing;
-    session.publish(Phase::Intent(Operation::InstallPackage))?;
-    let mut command = Command::new("pnputil.exe");
-    command
-        .args(["/add-driver"])
-        .arg(session.state().bundle.directory.join("ext4win.inf"))
-        .arg("/install");
-    run_checked(command, "ext4win package installation")?;
-    eprintln!("package installation returned; observing SCM state before package binding");
-    // This observation does not bind service identity or grant lifecycle authority. The
-    // package/path/hash acquisition below remains authoritative even if this query fails.
-    match windows_host::service_state("ext4win") {
-        Ok(state) => eprintln!("post-install SCM state: {state:?} (1=Stopped, 4=Running)"),
-        Err(error) => eprintln!("post-install SCM observation failed: {error}"),
-    }
-    bind_installed(&mut session)?;
-    session.publish(Phase::Observed(Operation::InstallPackage))?;
-    bind_service(&mut session, true)?;
-    scm(&mut session, Operation::StartDriver, "start")?;
-    wait_state(4, Duration::from_secs(15))?;
-    let PackageState::Installed(package) = &session.state().package else {
-        return Err(io::Error::other("driver start lost package authority").into());
-    };
-    let ServiceIdentity::Bound { raw } = &session.state().service else {
-        return Err(io::Error::other("driver start lacks bound service identity").into());
-    };
-    service_identity(package, raw, &session.state().bundle.sys, true)?;
-    println!("service state: Running");
-    session.publish(Phase::Observed(Operation::StartDriver))?;
-    Ok(())
-}
-
 /// Restarts the bound installed service after its disposable volumes have drained.
 /// # Errors
 /// Returns identity mismatch, an unresolved prior lifecycle state, retirement, stop or start failure.
