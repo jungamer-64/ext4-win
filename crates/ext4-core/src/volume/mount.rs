@@ -1990,6 +1990,14 @@ pub enum MountTransition {
     Complete(core::result::Result<Box<CompletedMount>, MountFailure>),
 }
 
+/// Internal progress returns to the executor before another phase runs. In particular,
+/// journal admission and ownership completion must not nest metadata execution on the stack.
+#[derive(Debug)]
+enum MountStep {
+    Continue(Box<MountOperation>),
+    Yield(MountTransition),
+}
+
 /// Completion-driven journaled mount operation.
 #[derive(Debug)]
 pub struct MountOperation {
@@ -2397,7 +2405,7 @@ impl MountOperation {
         mut self: Box<Self>,
         authority: PendingMountOwnership,
         transition: super::MmpTransition,
-    ) -> MountTransition {
+    ) -> MountStep {
         match transition {
             super::MmpTransition::SubmitLower { request, suspended } => {
                 if !matches!(request, crate::StorageRequest::Read { .. }) {
@@ -2446,7 +2454,7 @@ impl MountOperation {
                     },
                     _ => return self.fail(Error::DeviceIo),
                 };
-                self.drive()
+                MountStep::Continue(self)
             }
             super::MmpTransition::Complete(Err(failure)) => self.fail(failure.reason),
         }
@@ -2568,37 +2576,15 @@ impl MountOperation {
     }
 
     /// Routes private replay through its bounded overlay and transfers admitted physical requests.
-    fn drive(mut self: Box<Self>) -> MountTransition {
-        let ownership = core::mem::replace(&mut self.ownership, MountOwnership::Unprotected);
-        match ownership {
-            MountOwnership::Held(lease) => {
-                if let Err(error) = lease.authorize(self.now) {
-                    return self.fail(error);
-                }
-                if lease.renewal_due(self.now) {
-                    let now = self.now;
-                    let (pending, operation) = match lease.renew(now) {
-                        Ok(update) => update,
-                        Err(error) => return self.fail(error),
-                    };
-                    let operation = match memory::try_box(operation) {
-                        Ok(operation) => operation,
-                        Err(error) => return self.fail(error),
-                    };
-                    return self.accept_ownership(
-                        PendingMountOwnership::Renewal(pending),
-                        operation.advance(super::MmpEvent::Start, now),
-                    );
-                }
-                self.ownership = MountOwnership::Held(lease);
-            }
-            ownership @ (MountOwnership::Unprotected | MountOwnership::ReadyToClaim(_)) => {
-                self.ownership = ownership;
-            }
-            _ => return self.fail(Error::DeviceIo),
-        }
+    fn drive(mut step: MountStep) -> MountTransition {
         loop {
-            let transition = self.drive_step();
+            let transition = match step {
+                MountStep::Continue(operation) => {
+                    step = operation.drive_step();
+                    continue;
+                }
+                MountStep::Yield(transition) => transition,
+            };
             let MountTransition::SubmitLower {
                 mut request,
                 mut suspended,
@@ -2640,12 +2626,41 @@ impl MountOperation {
             if let Err(error) = suspended.accept_completion(completion) {
                 return suspended.fail(error);
             }
-            self = suspended;
+            step = MountStep::Continue(suspended);
         }
     }
 
     /// Advances internal phases until an owned effect or terminal result is ready.
-    fn drive_step(mut self: Box<Self>) -> MountTransition {
+    fn drive_step(mut self: Box<Self>) -> MountStep {
+        let ownership = core::mem::replace(&mut self.ownership, MountOwnership::Unprotected);
+        match ownership {
+            MountOwnership::Held(lease) => {
+                if let Err(error) = lease.authorize(self.now) {
+                    return self.fail(error);
+                }
+                if lease.renewal_due(self.now) {
+                    let now = self.now;
+                    let (pending, operation) = match lease.renew(now) {
+                        Ok(update) => update,
+                        Err(error) => return self.fail(error),
+                    };
+                    let operation = match memory::try_box(operation) {
+                        Ok(operation) => operation,
+                        Err(error) => return self.fail(error),
+                    };
+                    return self.accept_ownership(
+                        PendingMountOwnership::Renewal(pending),
+                        operation.advance(super::MmpEvent::Start, now),
+                    );
+                }
+                self.ownership = MountOwnership::Held(lease);
+            }
+            ownership @ (MountOwnership::Unprotected | MountOwnership::ReadyToClaim(_)) => {
+                self.ownership = ownership;
+            }
+            _ => return self.fail(Error::DeviceIo),
+        }
+
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
                 MountState::FinishingReadOnly(mut completed) => {
@@ -3279,7 +3294,7 @@ impl MountOperation {
         primary: ResolvedPrimary,
         journal: Journal<LoadedJournal>,
         journal_target: StorageTarget,
-    ) -> MountTransition {
+    ) -> MountStep {
         if matches!(
             self.access,
             super::MountAccess::ReadOnly {
@@ -3300,7 +3315,7 @@ impl MountOperation {
                 journal: None,
                 journal_target: None,
             });
-            return self.drive();
+            return MountStep::Continue(self);
         }
         if matches!(self.ownership, MountOwnership::ReadyToClaim(_)) {
             if matches!(primary, ResolvedPrimary::Valid(_)) {
@@ -3320,12 +3335,12 @@ impl MountOperation {
             },
             Err(error) => return self.fail(error),
         };
-        self.drive()
+        MountStep::Continue(self)
     }
 
     /// Acquires physical ownership only from a checksum-authenticated primary identity.
     /// Private replay observations are discarded; physical recovery is read afresh under the lease.
-    fn claim_ownership(mut self: Box<Self>) -> MountTransition {
+    fn claim_ownership(mut self: Box<Self>) -> MountStep {
         self.recovery = None;
         let MountOwnership::ReadyToClaim(owner) =
             core::mem::replace(&mut self.ownership, MountOwnership::Unprotected)
