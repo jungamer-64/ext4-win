@@ -22,6 +22,144 @@ mod session;
 mod trim;
 
 /// # Errors
+/// Propagates fixture, boundary-size mutation, commit, remount or inode encoding failure.
+/// # Panics
+/// Fails if persisted EOF exceeds ext4 limits or rejected requests issue storage effects.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare committed inode bytes and physical effects with independent size limits"
+)]
+fn inode_size_limits_survive_commit_and_guard_mount_admission() -> Result<()> {
+    for (huge_file, maximum) in [(false, 2_199_023_251_456_u64), (true, 17_592_186_040_320)] {
+        let mut disk = Disk::fixture();
+        let flags = fixture_u32(&disk.filesystem, 1124)?;
+        let flags = if huge_file { flags | 8 } else { flags & !8 };
+        for (target, byte) in disk
+            .filesystem
+            .iter_mut()
+            .skip(1124)
+            .zip(flags.to_le_bytes())
+        {
+            *target = byte;
+        }
+        let checksum = fixture_crc32c(
+            u32::MAX,
+            disk.filesystem.get(1024..2044).ok_or(Error::DeviceRange)?,
+        );
+        for (target, byte) in disk
+            .filesystem
+            .iter_mut()
+            .skip(2044)
+            .zip(checksum.to_le_bytes())
+        {
+            *target = byte;
+        }
+        let mut fixture = Fixture::from_disk(disk)?;
+        let id = fixture.a;
+        let last = FileOffset::from_bytes(maximum - 1);
+        fixture.mutate(|pass| {
+            let file = pass.file(id)?;
+            pass.extend_file(file, FileSize::from_bytes(maximum))?;
+            pass.write_file_range(file, last, b"x")
+        })?;
+        fixture.remount()?;
+        let node = NodeId::File(id);
+        let metadata = fixture.read(|pass| pass.load_node_metadata(node))?;
+        assert_eq!(metadata.size().bytes(), maximum);
+        let offset = fixture_inode_offset(&fixture.disk, node)?;
+        assert_eq!(
+            u64::from(fixture_u32(&fixture.disk.filesystem, offset + 4)?)
+                | (u64::from(fixture_u32(&fixture.disk.filesystem, offset + 108)?) << 32),
+            maximum
+        );
+        let mut byte = [0];
+        assert_eq!(
+            fixture.read(|pass| pass.read_file(id, last, &mut byte))?,
+            ReadBytes::from_usize(1)
+        );
+        assert_eq!(byte, *b"x");
+        let outside = maximum + 1;
+        let effects = fixture.disk.storage_effects;
+        assert_eq!(
+            fixture.mutate(|pass| {
+                let file = pass.file(id)?;
+                pass.extend_file(file, FileSize::from_bytes(outside))
+            }),
+            Err(Error::InvalidWriteRange)
+        );
+        assert_eq!(
+            fixture.mutate(|pass| {
+                let file = pass.file(id)?;
+                pass.write_file_range(file, FileOffset::from_bytes(maximum), b"x")
+            }),
+            Err(Error::InvalidWriteRange)
+        );
+        assert_eq!(
+            fixture.mutate(|pass| {
+                let file = pass.file(id)?;
+                pass.reserve_file_allocation(file, FileAllocationSize::from_bytes(outside))
+            }),
+            Err(Error::InvalidWriteRange)
+        );
+        assert_eq!(
+            fixture.mutate(|pass| {
+                let file = pass.file(id)?;
+                pass.set_file_allocation(file, FileAllocationSize::from_bytes(outside))
+            }),
+            Err(Error::InvalidWriteRange)
+        );
+        assert_eq!(fixture.disk.storage_effects, effects);
+
+        for (position, value) in [
+            (
+                offset + 4,
+                u32::try_from(outside & u64::from(u32::MAX))
+                    .map_err(|_| Error::ArithmeticOverflow)?,
+            ),
+            (
+                offset + 108,
+                u32::try_from(outside >> 32).map_err(|_| Error::ArithmeticOverflow)?,
+            ),
+        ] {
+            for (target, byte) in fixture
+                .disk
+                .filesystem
+                .iter_mut()
+                .skip(position)
+                .zip(value.to_le_bytes())
+            {
+                *target = byte;
+            }
+        }
+        let inode_flags = fixture_u32(&fixture.disk.filesystem, offset + 32)?;
+        fixture.disk.encode_inode(node, inode_flags, None)?;
+        fixture.disk.storage_effects = 0;
+        assert_eq!(
+            fixture.disk.mount(MountAccess::ReadWrite).err(),
+            Some(Error::InvalidInode)
+        );
+        assert_eq!(fixture.disk.storage_effects, 0);
+        let (profile, epoch, coordinator, _) = fixture
+            .disk
+            .mount(MountAccess::ReadOnly {
+                recovery: ReadOnlyRecovery::NoLoad,
+            })?
+            .into_parts();
+        fixture.profile = profile;
+        fixture.epoch = epoch;
+        fixture.coordinator = coordinator;
+        fixture.cache = MetadataCache::try_new(&fixture.epoch)?;
+        assert_eq!(
+            fixture.read(|pass| pass.load_node_metadata(node)).err(),
+            Some(Error::InvalidInode)
+        );
+        assert_eq!(fixture.disk.storage_effects, 0);
+    }
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture, allocation, xattr, or commit failure.
 /// # Panics
 /// Fails if allocation changes EOF or releasing data allocation changes inode attributes.

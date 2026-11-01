@@ -54,8 +54,8 @@ const INODE_ROOT_ENTRY_CAPACITY: usize = 4;
 const EXTENT_TAIL_SIZE: usize = 4;
 /// ext4 extent trees are bounded; deeper trees are rejected before recursion.
 pub(crate) const MAX_EXTENT_DEPTH: u16 = 5;
-/// Exclusive end of the 32-bit logical block domain.
-const LOGICAL_BLOCK_EXCLUSIVE_END: u64 = 1_u64 << 32;
+/// Exclusive end of ext4 payload blocks; the final u32 value is reserved as a sentinel.
+pub(crate) const LOGICAL_BLOCK_EXCLUSIVE_END: u64 = 0xffff_ffff;
 
 /// Builds an extent-tree field offset.
 const fn disk_offset(offset: usize) -> DiskOffset {
@@ -318,7 +318,7 @@ impl Extent {
         self.initialization
     }
 
-    /// Returns the exclusive logical end, including the one-past-`u32::MAX` boundary.
+    /// Returns the exclusive logical end for range validation.
     #[must_use]
     pub(crate) fn end_logical(self) -> u64 {
         self.logical_start
@@ -1392,6 +1392,39 @@ mod tests {
     };
     use crate::disk_format::inode::InodeId;
     use crate::error::Error;
+
+    /// # Errors
+    /// Returns fixed extent-vector decoding or allocation failure.
+    /// # Panics
+    /// Fails if an extent can allocate the reserved final logical-block value.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions validate independent extent bytes and the mutation constructor boundary"
+    )]
+    fn extent_ranges_end_before_reserved_logical_block() -> crate::Result<()> {
+        let mut raw = [0xfe, 0xff, 0xff, 0xff, 1, 0, 0, 0, 17, 0, 0, 0];
+        let last = super::parse_extent(&raw, 0)?;
+        assert_eq!(last.end_logical(), 0xffff_ffff);
+        assert!(
+            super::MutableExtentTree::from_extents(crate::memory::copied_slice(&[last])?).is_ok()
+        );
+        let outside = super::Extent::initialized(
+            last.logical_start(),
+            ExtentLength::new(2)?,
+            last.physical_start(),
+        );
+        assert!(matches!(
+            super::MutableExtentTree::from_extents(crate::memory::copied_slice(&[outside])?),
+            Err(Error::InvalidExtentTree)
+        ));
+        crate::disk::endian::put_le_u16(&mut raw, super::disk_offset(4), 2)?;
+        assert!(matches!(
+            super::parse_extent(&raw, 0),
+            Err(Error::InvalidExtentTree)
+        ));
+        Ok(())
+    }
 
     /// # Panics
     ///

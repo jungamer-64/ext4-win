@@ -348,9 +348,21 @@ impl InodeDataEncoding {
         self.directory_links
     }
 
-    /// Returns the largest byte size addressable by the extent logical-block field.
+    /// Maximum block-aligned EOF under the extent and inode block-count domains.
+    /// The sector-count limit also bounds sparse EOF without the huge-file feature.
     pub(crate) fn maximum_file_size(self) -> FileSize {
-        FileSize::from_bytes((1_u64 << 32).saturating_mul(u64::from(self.block_size.bytes())))
+        let block_bytes = u64::from(self.block_size.bytes());
+        let blocks = match self.block_count {
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "BlockSize retains a nonzero byte width and the sector-capacity product is constant"
+            )]
+            InodeBlockCountEncoding::LegacySectors => {
+                (LEGACY_I_BLOCKS_LIMIT * SECTOR_BYTES) / block_bytes
+            }
+            InodeBlockCountEncoding::HugeFile => super::extent::LOGICAL_BLOCK_EXCLUSIVE_END,
+        };
+        FileSize::from_bytes(blocks.saturating_mul(block_bytes))
     }
 
     /// Validates and splits a file size for inode serialization.
@@ -2332,7 +2344,7 @@ mod tests {
     ///
     /// Panics when assertions or fixed test fixture assumptions fail.
     #[test]
-    fn large_file_encoding_accepts_full_extent_domain() {
+    fn large_file_size_fields_round_trip() {
         let encoding = inode_data_encoding();
         assert!(encoding.is_ok());
         let Ok(encoding) = encoding else {
@@ -2351,13 +2363,66 @@ mod tests {
             encoding.decode_size(InodeKind::File, encoded.low(), encoded.high()),
             Ok(above_four_gib)
         );
+    }
 
-        let maximum = encoding.maximum_file_size();
-        assert!(encoding.encode_file_size(maximum).is_ok());
-        assert_eq!(
-            encoding.encode_file_size(FileSize::from_bytes(maximum.bytes() + 1)),
-            Err(Error::InvalidWriteRange)
-        );
+    /// # Errors
+    /// Returns unsupported block geometry or fixed-vector field conversion failure.
+    /// # Panics
+    /// Fails if file or large-directory codecs accept sizes outside the ext4 limits.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "assertions compare both size codecs with independent byte-limit vectors"
+    )]
+    fn inode_size_limits_follow_block_and_sector_domains() -> Result<()> {
+        for (log, extent_max, sector_max) in [
+            (0, 4_398_046_510_080_u64, 2_199_023_254_528_u64),
+            (2, 17_592_186_040_320, 2_199_023_251_456),
+            (6, 281_474_976_645_120, 2_199_023_190_016),
+        ] {
+            for (block_count, maximum) in [
+                (InodeBlockCountEncoding::HugeFile, extent_max),
+                (InodeBlockCountEncoding::LegacySectors, sector_max),
+            ] {
+                let encoding = InodeDataEncoding {
+                    block_count,
+                    block_size: BlockSize::from_superblock_log(log)?,
+                    ..inode_data_encoding()?
+                };
+                assert_eq!(encoding.maximum_file_size().bytes(), maximum);
+                for bytes in [maximum - 1, maximum] {
+                    let file = encoding.encode_file_size(FileSize::from_bytes(bytes))?;
+                    let directory =
+                        encoding.encode_directory_size(DirectorySize::from_bytes(bytes))?;
+                    assert_eq!(directory, file);
+                    for kind in [InodeKind::File, InodeKind::Directory] {
+                        assert_eq!(
+                            encoding.decode_size(kind, file.low(), file.high())?,
+                            FileSize::from_bytes(bytes)
+                        );
+                    }
+                }
+                let outside = maximum + 1;
+                assert_eq!(
+                    encoding.encode_file_size(FileSize::from_bytes(outside)),
+                    Err(Error::InvalidWriteRange)
+                );
+                assert_eq!(
+                    encoding.encode_directory_size(DirectorySize::from_bytes(outside)),
+                    Err(Error::InvalidWriteRange)
+                );
+                let low = u32::try_from(outside & u64::from(u32::MAX))
+                    .map_err(|_| Error::ArithmeticOverflow)?;
+                let high = u32::try_from(outside >> 32).map_err(|_| Error::ArithmeticOverflow)?;
+                for kind in [InodeKind::File, InodeKind::Directory] {
+                    assert_eq!(
+                        encoding.decode_size(kind, low, high),
+                        Err(Error::InvalidInode)
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// # Panics

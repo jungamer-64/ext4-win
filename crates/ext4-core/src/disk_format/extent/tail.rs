@@ -403,9 +403,7 @@ impl ExtentAllocationCursor {
             let depth = le_u16(bytes, disk_offset(6))?;
             if depth == 0 {
                 let extent = parse_extent(bytes, entry_offset(index)?)?;
-                if extent.logical_start().as_u64() < self.previous_end
-                    || extent.end_logical() > u64::from(u32::MAX).saturating_add(1)
-                {
+                if extent.logical_start().as_u64() < self.previous_end {
                     return Err(Error::InvalidExtentTree);
                 }
                 self.previous_end = extent.end_logical();
@@ -826,7 +824,7 @@ impl ExtentMappingCursor {
             },
             None,
             0,
-            1_u64 << 32,
+            LOGICAL_BLOCK_EXCLUSIVE_END,
         )?;
         let mut path = Vec::new();
         path.try_push(root)?;
@@ -841,7 +839,11 @@ impl ExtentMappingCursor {
     /// Returns malformed ancestor intervals, checksum, allocation, or backing-read failures.
     pub(crate) fn allocation_end(&mut self, reader: &mut impl ExtentNodeReader) -> Result<u64> {
         let _rightmost = self.map_run(
-            LogicalBlock::try_from(u64::from(u32::MAX))?,
+            LogicalBlock::try_from(
+                LOGICAL_BLOCK_EXCLUSIVE_END
+                    .checked_sub(1)
+                    .ok_or(Error::InvalidExtentTree)?,
+            )?,
             NonZeroU64::MIN,
             reader,
         )?;
