@@ -556,14 +556,17 @@ fn verify_htree_fault_endpoint(
     commit: MutationCommit,
     label: &str,
 ) -> TaskResult<()> {
+    let observed = debugfs_directory_names(listing)?;
     let names = htree_fault_names()?;
     let present = names
         .iter()
-        .filter(|name| {
-            let marker = format!("/{}/", String::from_utf8_lossy(name.bytes()));
-            listing.contains(&marker)
-        })
+        .filter(|name| observed.contains(String::from_utf8_lossy(name.bytes()).as_ref()))
         .count();
+    let baseline = BTreeSet::from([".".to_owned(), "..".to_owned(), "lost+found".to_owned()]);
+    if !baseline.is_subset(&observed) || observed.len().checked_sub(baseline.len()) != Some(present)
+    {
+        return Err(io::Error::other(format!("{label} has an unexpected root namespace")).into());
+    }
     match present {
         0 => commit.require_endpoint(MutationEndpoint::Old),
         HTREE_FAULT_ENTRY_COUNT if tree_dump.contains("Root node dump") => Ok(()),
@@ -576,6 +579,49 @@ fn verify_htree_fault_endpoint(
         ))
         .into()),
     }
+}
+
+/// Parses complete C-locale `ls -p` records, rejecting partial listings and command diagnostics.
+/// Dot entries establish that a directory was actually read; a banner alone proves no absence.
+/// # Errors
+/// Returns unknown output, malformed metadata, duplicate names or missing dot records.
+fn debugfs_directory_names(output: &str) -> TaskResult<BTreeSet<String>> {
+    let mut names = BTreeSet::new();
+    let mut banner = false;
+    for line in output.lines().filter(|line| !line.is_empty()) {
+        if line.starts_with("debugfs ") && !banner {
+            banner = true;
+            continue;
+        }
+        let fields: Vec<_> = line.split('/').collect();
+        let ["", inode, mode, uid, gid, name, size, ""] = fields.as_slice() else {
+            return Err(
+                io::Error::other(format!("invalid debugfs directory observation: {line}")).into(),
+            );
+        };
+        let inode = inode.parse::<u32>()?;
+        let mode = u16::from_str_radix(mode, 8)?;
+        uid.parse::<i32>()?;
+        gid.parse::<i32>()?;
+        if !size.is_empty() {
+            size.parse::<u64>()?;
+        }
+        if inode == 0 {
+            continue;
+        }
+        if name.is_empty()
+            || (matches!(*name, "." | "..") && mode & 0xf000 != 0x4000)
+            || !names.insert((*name).to_owned())
+        {
+            return Err(io::Error::other("invalid or repeated live directory name").into());
+        }
+    }
+    if !banner || !names.contains(".") || !names.contains("..") {
+        return Err(
+            io::Error::other("debugfs did not establish a complete directory listing").into(),
+        );
+    }
+    Ok(names)
 }
 
 /// Runs namespace inspection and read-only fsck for a bounded set of recovered images in one
@@ -605,7 +651,7 @@ for image do
     i=$((i + 1))
 done
 "#;
-    let mut command = linux.command("sh");
+    let mut command = linux.command_with_environment("sh", "LC_ALL", "C");
     command.args(["-c", script, "ext4win-htree-oracle"]);
     for case in cases {
         command.arg(linux.tool_path(&case.image)?);
@@ -2017,8 +2063,7 @@ fn debugfs_require_file(
 ///
 /// Returns an error when debugfs fails or reports an existing inode.
 fn debugfs_require_absent(linux: LinuxEnvironment, image: &Path, path: &str) -> TaskResult<()> {
-    let stat = debugfs_request_output(linux, image, &format!("stat {path}"))?;
-    if stat.contains("Inode:") {
+    if debugfs_path_exists(linux, image, path)? {
         Err(io::Error::other(format!("debugfs unexpectedly resolved {path}")).into())
     } else {
         Ok(())
@@ -2031,7 +2076,41 @@ fn debugfs_require_absent(linux: LinuxEnvironment, image: &Path, path: &str) -> 
 ///
 /// Returns an error when debugfs cannot inspect the image.
 fn debugfs_path_exists(linux: LinuxEnvironment, image: &Path, path: &str) -> TaskResult<bool> {
-    Ok(debugfs_request_output(linux, image, &format!("stat {path}"))?.contains("Inode:"))
+    let image_path = linux.tool_path(image)?;
+    let mut command = linux.command_with_environment("debugfs", "LC_ALL", "C");
+    command.args(["-R", &format!("stat \"{path}\""), &image_path]);
+    let output = run_checked_output(command, "debugfs namespace observation")?;
+    debugfs_stat_exists(path, &output.stdout, &output.stderr)
+}
+
+/// Recognizes a completed inode observation or the requested path's explicit missing result.
+/// # Errors
+/// Rejects silent, partial, conflicting and unrecognized oracle observations.
+fn debugfs_stat_exists(path: &str, stdout: &[u8], stderr: &[u8]) -> TaskResult<bool> {
+    let mut diagnostics = core::str::from_utf8(stderr)?.lines();
+    if !diagnostics
+        .next()
+        .is_some_and(|line| line.starts_with("debugfs "))
+    {
+        return Err(io::Error::other("debugfs namespace observation has no banner").into());
+    }
+    let diagnostic = diagnostics.next();
+    if diagnostics.next().is_some() {
+        return Err(io::Error::other("debugfs namespace observation has extra diagnostics").into());
+    }
+    if stdout.is_empty()
+        && diagnostic == Some(format!("{path}: File not found by ext2_lookup").as_str())
+    {
+        return Ok(false);
+    }
+    let stat = core::str::from_utf8(stdout)?;
+    if diagnostic.is_none()
+        && stat.starts_with("Inode:")
+        && debugfs_stat_count(stat, "Inode:")? != 0
+    {
+        return Ok(true);
+    }
+    Err(io::Error::other("debugfs did not establish inode presence or absence").into())
 }
 
 /// Requires an external-journal recovery result to be one complete namespace/data/xattr endpoint.
@@ -4484,6 +4563,74 @@ mod tests {
                 .into());
             }
         }
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns a rejected complete oracle observation.
+    /// # Panics
+    /// Fails if a command failure can establish namespace absence or an atomic predecessor.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "independent oracle transcripts distinguish completed observations from failures"
+    )]
+    fn namespace_oracles_require_complete_observations() -> TaskResult<()> {
+        let banner = "debugfs 1.47.2 (1-Jan-2025)\n";
+        let listing = format!(
+            "{banner}/2/040755/0/0/.//\n/2/040755/0/0/..//\n/11/040700/0/0/lost+found//\n/0/000000/0/0//0/\n\n"
+        );
+        verify_htree_fault_endpoint(&listing, "", MutationCommit::Pending, "old")?;
+        assert!(
+            verify_htree_fault_endpoint(&listing, "", MutationCommit::Durable, "lost").is_err()
+        );
+        let mut new_listing = listing.clone();
+        for (index, name) in htree_fault_names()?.iter().enumerate() {
+            writeln!(
+                &mut new_listing,
+                "/{}/100644/0/0/{}/0/",
+                index
+                    .checked_add(12)
+                    .ok_or_else(|| io::Error::other("inode overflow"))?,
+                core::str::from_utf8(name.bytes())?
+            )?;
+        }
+        verify_htree_fault_endpoint(
+            &new_listing,
+            "Root node dump",
+            MutationCommit::Durable,
+            "new",
+        )?;
+        for invalid in [
+            String::new(),
+            banner.to_owned(),
+            format!("{banner}ls: Input/output error\n"),
+            format!("{listing}ls: Inode checksum does not match inode\n"),
+            format!("{listing}/2/040755/0/0/.//\n"),
+            format!("{banner}/2/040755/0/0/.//\n"),
+            format!("{listing}/12/100644/0/0/truncated"),
+        ] {
+            assert!(
+                verify_htree_fault_endpoint(&invalid, "", MutationCommit::Pending, "invalid")
+                    .is_err()
+            );
+        }
+        let missing = format!("{banner}/gone: File not found by ext2_lookup\n");
+        assert!(!debugfs_stat_exists("/gone", b"", missing.as_bytes())?);
+        assert!(debugfs_stat_exists(
+            "/present",
+            b"Inode: 12 Type: regular\n",
+            banner.as_bytes()
+        )?);
+        for diagnostics in [
+            banner.to_owned(),
+            format!("{banner}/gone: Input/output error\n"),
+            format!("{missing}extra error\n"),
+        ] {
+            assert!(debugfs_stat_exists("/gone", b"", diagnostics.as_bytes()).is_err());
+        }
+        assert!(debugfs_stat_exists("/different", b"", missing.as_bytes()).is_err());
+        assert!(debugfs_stat_exists("/gone", b"Inode: 12\n", missing.as_bytes()).is_err());
         Ok(())
     }
 
