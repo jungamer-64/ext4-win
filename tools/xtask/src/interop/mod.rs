@@ -336,8 +336,35 @@ enum StorageEffect {
 struct EffectCut {
     /// One-based effect index.
     effect: usize,
-    /// Persisted byte prefix for a write, or `None` for a completed flush.
-    write_prefix: Option<usize>,
+    /// Volatile bytes selected independently of request completion order.
+    persistence: CrashPersistence,
+}
+
+/// Crash persistence of writes not covered by a successful device-local flush.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CrashPersistence {
+    /// Lose every unflushed write on both devices.
+    DurableOnly,
+    /// Persist a prefix of one pending write without imposing order on the other writes.
+    Write {
+        /// Device containing the selected pending write.
+        target: ext4_core::StorageTarget,
+        /// Zero selects the newest pending write on this device.
+        from_end: usize,
+        /// Sector-aligned bytes retained from the selected write.
+        prefix: usize,
+        /// Persistence of every other unflushed write, including the other device.
+        others: PendingPersistence,
+    },
+}
+
+/// Independent persistence choice for unselected pending writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingPersistence {
+    /// None of their bytes survive.
+    Lost,
+    /// All of their bytes survive.
+    Complete,
 }
 
 /// Progress of one production workflow stopped only after a selected write or flush effect.
