@@ -2098,8 +2098,9 @@ fn debugfs_stat_exists(path: &str, stdout: &[u8], stderr: &[u8]) -> TaskResult<b
     if diagnostics.next().is_some() {
         return Err(io::Error::other("debugfs namespace observation has extra diagnostics").into());
     }
+    // The error/detail separator remains at the end when the diagnostic has no detail.
     if stdout.is_empty()
-        && diagnostic == Some(format!("{path}: File not found by ext2_lookup").as_str())
+        && diagnostic == Some(format!("{path}: File not found by ext2_lookup ").as_str())
     {
         return Ok(false);
     }
@@ -4615,7 +4616,7 @@ mod tests {
                     .is_err()
             );
         }
-        let missing = format!("{banner}/gone: File not found by ext2_lookup\n");
+        let missing = format!("{banner}/gone: File not found by ext2_lookup \n");
         assert!(!debugfs_stat_exists("/gone", b"", missing.as_bytes())?);
         assert!(debugfs_stat_exists(
             "/present",
