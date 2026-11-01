@@ -335,6 +335,10 @@ initialization and complete service/package cleanup. This establishes package
 and configured-image identity and successful initialization, not a hash of
 kernel memory or filesystem I/O behavior.
 
+The verification workflow defaults to full live I/O. Its manual `load` scenario runs the
+initialization gate without disposable storage and retains operational ETW evidence; a successful
+initialization-only run does not establish volume discovery, mount or filesystem I/O behavior.
+
 `verify-live-vhdx` additionally requires persisted Windows readback after flush,
 dismount, and VHDX reattachment with the same loaded driver. Runtime Driver
 Verifier evidence must identify active checks and the loaded driver before and

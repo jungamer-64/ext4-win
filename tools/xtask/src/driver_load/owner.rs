@@ -778,9 +778,9 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
     Ok(())
 }
 
-/// Builds one bundle, loads exactly it and requires complete lifecycle finalization.
+/// Builds one bundle, loads exactly it and joins cleanup and real-time ETW observation.
 /// # Errors
-/// Returns host/build/load failures while preserving mandatory cleanup failures.
+/// Returns host/build/load/trace failures while preserving mandatory completion failures.
 pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
     check_hosted_driver_host(root)?;
     let bundle = build_verified_production_bundle(root)?;
@@ -789,6 +789,10 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
     run_checked(shutdown, "production WSL oracle shutdown")?;
     let id = SessionId::create(root)?;
     println!("driver-load session: {}", id.as_str());
+    let trace = windows_host::TraceSession::start(
+        &root.join("crates/ext4-driver/operational-trace-v1.txt"),
+        &root.join("target/live-driver-trace"),
+    )?;
     let operation = install_session(root, &bundle, id.clone(), None)
         .and_then(|()| start_session(root, &id, None).map(|_artifact| ()));
     let cleanup = if root
@@ -800,7 +804,9 @@ pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
     } else {
         Ok(())
     };
-    combine_verification_and_cleanup(operation, cleanup)?;
+    let operation = combine_verification_and_cleanup(operation, cleanup);
+    let completion = trace.finish().map(|_events| ()).map_err(Into::into);
+    combine_verification_and_cleanup(operation, completion)?;
     println!("hosted kernel-load smoke assurance: PASS");
     Ok(())
 }
