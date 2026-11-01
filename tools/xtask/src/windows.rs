@@ -87,11 +87,13 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .stdin(Stdio::null());
+    eprintln!("requester spawn: {:?}", command.get_program());
     let mut owner = Requester(Some(command.spawn()?));
     let child = owner
         .0
         .as_mut()
         .ok_or_else(|| io::Error::other("requester missing"))?;
+    eprintln!("requester {}: started; deadline {timeout:?}", child.id());
     let mut stdout = child
         .stdout
         .take()
@@ -104,6 +106,7 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
         let start = Instant::now();
+        let mut reported = start;
         let status = loop {
             drain(&mut stdout, &mut stdout_bytes)?;
             drain(&mut stderr, &mut stderr_bytes)?;
@@ -111,6 +114,10 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
                 break Some(status);
             }
             if start.elapsed() >= timeout {
+                eprintln!(
+                    "requester {}: deadline reached; requesting termination",
+                    child.id()
+                );
                 match child.kill() {
                     Ok(()) => break None,
                     Err(error) => {
@@ -121,17 +128,34 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
                     }
                 }
             }
+            if reported.elapsed() >= Duration::from_secs(5) {
+                eprintln!(
+                    "requester {}: pending after {:?}",
+                    child.id(),
+                    start.elapsed()
+                );
+                reported = Instant::now();
+            }
             thread::sleep(Duration::from_millis(20));
         };
         drain(&mut stdout, &mut stdout_bytes)?;
         drain(&mut stderr, &mut stderr_bytes)?;
         if status.is_none() {
+            eprintln!(
+                "requester {}: termination requested; external outcome uncertain",
+                child.id()
+            );
             Ok(CommandOutcome::Uncertain {
                 requester: child.id(),
                 stdout: stdout_bytes,
                 stderr: stderr_bytes,
             })
         } else {
+            eprintln!(
+                "requester {}: exited after {:?}: {status:?}",
+                child.id(),
+                start.elapsed()
+            );
             Ok(CommandOutcome::Exited(Output {
                 status: status.ok_or_else(|| io::Error::other("requester status missing"))?,
                 stdout: stdout_bytes,

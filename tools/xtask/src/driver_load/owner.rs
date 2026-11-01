@@ -452,6 +452,13 @@ pub(crate) fn start_session(
         .arg(session.state().bundle.directory.join("ext4win.inf"))
         .arg("/install");
     run_checked(command, "ext4win package installation")?;
+    eprintln!("package installation returned; observing SCM state before package binding");
+    // This observation does not bind service identity or grant lifecycle authority. The
+    // package/path/hash acquisition below remains authoritative even if this query fails.
+    match windows_host::service_state("ext4win") {
+        Ok(state) => eprintln!("post-install SCM state: {state:?} (1=Stopped, 4=Running)"),
+        Err(error) => eprintln!("post-install SCM observation failed: {error}"),
+    }
     bind_installed(&mut session)?;
     session.publish(Phase::Observed(Operation::InstallPackage))?;
     bind_service(&mut session, true)?;
