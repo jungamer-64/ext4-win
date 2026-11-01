@@ -1994,7 +1994,9 @@ pub enum MountTransition {
 /// journal admission and ownership completion must not nest metadata execution on the stack.
 #[derive(Debug)]
 enum MountStep {
+    /// Sole operation owner returned to the iterative executor.
     Continue(Box<MountOperation>),
+    /// External effect or terminal result; ownership effects bypass private replay.
     Yield(MountTransition),
 }
 
@@ -2341,7 +2343,7 @@ impl MountOperation {
         self.external_access = device_access;
         self.filesystem = StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
         self.state = MountState::Resolving;
-        self.drive()
+        Self::drive(MountStep::Continue(self))
     }
 
     /// Consumes one concrete event and runs until the next lower request or terminal result.
@@ -2362,10 +2364,10 @@ impl MountOperation {
                     super::OperationEvent::CancelRequested => super::MmpEvent::Cancel,
                     _ => return self.fail(Error::DeviceIo),
                 };
-                return self.accept_ownership(
+                return Self::drive(self.accept_ownership(
                     PendingMountOwnership::Observation,
                     operation.advance(event, now),
-                );
+                ));
             }
             MountOwnership::Pending {
                 operation,
@@ -2379,7 +2381,9 @@ impl MountOperation {
                     super::OperationEvent::CancelRequested => super::MmpEvent::Cancel,
                     _ => return self.fail(Error::DeviceIo),
                 };
-                return self.accept_ownership(authority, operation.advance(event, now));
+                return Self::drive(
+                    self.accept_ownership(authority, operation.advance(event, now)),
+                );
             }
             ownership => self.ownership = ownership,
         }
@@ -2397,7 +2401,7 @@ impl MountOperation {
         if let Err(error) = accepted {
             return self.fail(error);
         }
-        self.drive()
+        Self::drive(MountStep::Continue(self))
     }
 
     /// Ownership effects bypass the recovery overlay and every metadata transcript.
@@ -2415,20 +2419,20 @@ impl MountOperation {
                     operation: suspended,
                     authority,
                 };
-                MountTransition::SubmitOwnership {
+                MountStep::Yield(MountTransition::SubmitOwnership {
                     request,
                     suspended: self,
-                }
+                })
             }
             super::MmpTransition::Wait { seconds, suspended } => {
                 self.ownership = MountOwnership::Pending {
                     operation: suspended,
                     authority,
                 };
-                MountTransition::WaitForTimer {
+                MountStep::Yield(MountTransition::WaitForTimer {
                     seconds,
                     suspended: self,
-                }
+                })
             }
             super::MmpTransition::Complete(Ok(completion)) => {
                 if self.media_outcome == MountMediaOutcome::OutcomeUnknown {
@@ -2450,13 +2454,15 @@ impl MountOperation {
                         super::MmpCompletion::Renewed(renewal),
                     ) => match pending.complete(renewal, self.now) {
                         Ok(lease) => MountOwnership::Held(lease),
-                        Err((error, _renewal)) => return self.fail(error),
+                        Err((error, _renewal)) => return MountStep::Yield(self.fail(error)),
                     },
-                    _ => return self.fail(Error::DeviceIo),
+                    _ => return MountStep::Yield(self.fail(Error::DeviceIo)),
                 };
                 MountStep::Continue(self)
             }
-            super::MmpTransition::Complete(Err(failure)) => self.fail(failure.reason),
+            super::MmpTransition::Complete(Err(failure)) => {
+                MountStep::Yield(self.fail(failure.reason))
+            }
         }
     }
 
@@ -2636,17 +2642,17 @@ impl MountOperation {
         match ownership {
             MountOwnership::Held(lease) => {
                 if let Err(error) = lease.authorize(self.now) {
-                    return self.fail(error);
+                    return MountStep::Yield(self.fail(error));
                 }
                 if lease.renewal_due(self.now) {
                     let now = self.now;
                     let (pending, operation) = match lease.renew(now) {
                         Ok(update) => update,
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     };
                     let operation = match memory::try_box(operation) {
                         Ok(operation) => operation,
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     };
                     return self.accept_ownership(
                         PendingMountOwnership::Renewal(pending),
@@ -2658,7 +2664,7 @@ impl MountOperation {
             ownership @ (MountOwnership::Unprotected | MountOwnership::ReadyToClaim(_)) => {
                 self.ownership = ownership;
             }
-            _ => return self.fail(Error::DeviceIo),
+            _ => return MountStep::Yield(self.fail(Error::DeviceIo)),
         }
 
         loop {
@@ -2709,7 +2715,7 @@ impl MountOperation {
                             self.state = MountState::FinishingReadOnly(completed);
                             return self.submit_pending_read();
                         }
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     }
                 }
                 MountState::ReadOnlyWrites {
@@ -2721,16 +2727,18 @@ impl MountOperation {
                             completed,
                             pending: suspended,
                         };
-                        return MountTransition::SubmitLower {
+                        return MountStep::Yield(MountTransition::SubmitLower {
                             request,
                             suspended: self,
-                        };
+                        });
                     }
                     StorageRequestSequenceStep::Finished(()) => {
                         self.state = MountState::Published(completed)
                     }
                 },
-                MountState::ReadOnlyPending { .. } => return self.fail(Error::DeviceIo),
+                MountState::ReadOnlyPending { .. } => {
+                    return MountStep::Yield(self.fail(Error::DeviceIo));
+                }
                 MountState::Resolving => match self.resolve_journal() {
                     Ok(JournalResolution::Unloaded(superblock)) => {
                         self.state = MountState::ScanningOrphans(MountPublicationSeed {
@@ -2752,7 +2760,7 @@ impl MountOperation {
                     }) => {
                         if let Some(external) = &self.external {
                             if external.requirement != requirement {
-                                return self.fail(Error::UnsupportedJournal);
+                                return MountStep::Yield(self.fail(Error::UnsupportedJournal));
                             }
                             let operation =
                                 match memory::try_box(ExternalJournalProbeOperation::new(
@@ -2760,29 +2768,29 @@ impl MountOperation {
                                     external.device_length,
                                 )) {
                                     Ok(operation) => operation,
-                                    Err(error) => return self.fail(error),
+                                    Err(error) => return MountStep::Yield(self.fail(error)),
                                 };
                             self.state = MountState::LoadingExternal { primary, operation };
                         } else {
                             self.state = MountState::AwaitingExternal { requirement };
-                            return MountTransition::DiscoverExternalJournal {
+                            return MountStep::Yield(MountTransition::DiscoverExternalJournal {
                                 requirement,
                                 suspended: self,
-                            };
+                            });
                         }
                     }
                     Err(Error::OperationSuspended) => {
                         self.state = MountState::Resolving;
                         return self.submit_pending_read();
                     }
-                    Err(error) => return self.fail(error),
+                    Err(error) => return MountStep::Yield(self.fail(error)),
                 },
                 MountState::AwaitingExternal { requirement } => {
                     self.state = MountState::AwaitingExternal { requirement };
-                    return MountTransition::DiscoverExternalJournal {
+                    return MountStep::Yield(MountTransition::DiscoverExternalJournal {
                         requirement,
                         suspended: self,
-                    };
+                    });
                 }
                 MountState::LoadingExternal { primary, operation } => {
                     match operation.advance_loaded(super::OperationEvent::Admitted) {
@@ -2791,10 +2799,10 @@ impl MountOperation {
                                 primary,
                                 operation: suspended,
                             };
-                            return MountTransition::SubmitLower {
+                            return MountStep::Yield(MountTransition::SubmitLower {
                                 request,
                                 suspended: self,
-                            };
+                            });
                         }
                         ExternalJournalLoadTransition::Complete(Ok(
                             ExternalJournalLoad::Match(journal),
@@ -2808,10 +2816,10 @@ impl MountOperation {
                         ExternalJournalLoadTransition::Complete(Ok(
                             ExternalJournalLoad::Mismatch,
                         )) => {
-                            return self.fail(Error::UnsupportedJournal);
+                            return MountStep::Yield(self.fail(Error::UnsupportedJournal));
                         }
                         ExternalJournalLoadTransition::Complete(Err(error)) => {
-                            return self.fail(error);
+                            return MountStep::Yield(self.fail(error));
                         }
                     }
                 }
@@ -2826,10 +2834,10 @@ impl MountOperation {
                             journal_target,
                             operation,
                         };
-                        return MountTransition::SubmitLower {
+                        return MountStep::Yield(MountTransition::SubmitLower {
                             request,
                             suspended: self,
-                        };
+                        });
                     }
                     Ok(None) => match (*operation).into_recovered() {
                         Ok(completion) => {
@@ -2843,9 +2851,9 @@ impl MountOperation {
                                 journal_target,
                             };
                         }
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     },
-                    Err(error) => return self.fail(error),
+                    Err(error) => return MountStep::Yield(self.fail(error)),
                 },
                 MountState::VerifyingReplayedPrimary {
                     completion,
@@ -2860,7 +2868,7 @@ impl MountOperation {
                             if superblock.mmp() != self.mmp_parameters
                                 || superblock.uuid() != self.primary_uuid
                             {
-                                return self.fail(Error::MmpCorrupt);
+                                return MountStep::Yield(self.fail(Error::MmpCorrupt));
                             }
                             if matches!(self.ownership, MountOwnership::ReadyToClaim(_)) {
                                 return self.claim_ownership();
@@ -2884,7 +2892,7 @@ impl MountOperation {
                                         {
                                             Ok(operation) => operation,
                                             Err(error) => {
-                                                return self.fail(error);
+                                                return MountStep::Yield(self.fail(error));
                                             }
                                         };
                                     MountState::PreparingDeltas {
@@ -2895,7 +2903,7 @@ impl MountOperation {
                             };
                         }
                         Ok(PrimarySuperblockRead::ChecksumInvalid(_)) => {
-                            return self.fail(Error::ChecksumMismatch);
+                            return MountStep::Yield(self.fail(Error::ChecksumMismatch));
                         }
                         Err(Error::OperationSuspended) => {
                             self.state = MountState::VerifyingReplayedPrimary {
@@ -2904,7 +2912,7 @@ impl MountOperation {
                             };
                             return self.submit_pending_read();
                         }
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     }
                 }
                 MountState::PreparingDeltas {
@@ -2912,7 +2920,7 @@ impl MountOperation {
                     journal_target,
                 } => {
                     let Some(keys) = self.fscrypt_keys.as_ref() else {
-                        return self.fail(Error::DeviceIo);
+                        return MountStep::Yield(self.fail(Error::DeviceIo));
                     };
                     match operation.next_request(keys) {
                         Ok(Some(request)) => {
@@ -2920,10 +2928,10 @@ impl MountOperation {
                                 operation,
                                 journal_target,
                             };
-                            return MountTransition::SubmitLower {
+                            return MountStep::Yield(MountTransition::SubmitLower {
                                 request,
                                 suspended: self,
-                            };
+                            });
                         }
                         Ok(None) => match (*operation).into_sequence() {
                             Ok(sequence) => {
@@ -2932,9 +2940,9 @@ impl MountOperation {
                                     journal_target,
                                 }
                             }
-                            Err(error) => return self.fail(error),
+                            Err(error) => return MountStep::Yield(self.fail(error)),
                         },
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     }
                 }
                 MountState::DeltaWrites {
@@ -2946,10 +2954,10 @@ impl MountOperation {
                             pending: suspended,
                             journal_target,
                         };
-                        return MountTransition::SubmitLower {
+                        return MountStep::Yield(MountTransition::SubmitLower {
                             request,
                             suspended: self,
-                        };
+                        });
                     }
                     StorageRequestSequenceStep::Finished(journal) => {
                         self.filesystem = StorageTranscript::new(
@@ -2963,13 +2971,13 @@ impl MountOperation {
                     }
                 },
                 MountState::DeltaWritePending { .. } => {
-                    return self.fail(Error::DeviceIo);
+                    return MountStep::Yield(self.fail(Error::DeviceIo));
                 }
                 MountState::ScanningOrphans(publication) => {
                     let result = {
                         let device = OperationDevice::new(&mut self.filesystem);
                         let Some(keys) = self.fscrypt_keys.as_ref() else {
-                            return self.fail(Error::DeviceIo);
+                            return MountStep::Yield(self.fail(Error::DeviceIo));
                         };
                         let mut volume =
                             EpochReadView::mounting(device, publication.superblock, keys);
@@ -2993,7 +3001,7 @@ impl MountOperation {
                                     publication.superblock.block_size(),
                                 )
                             {
-                                return self.fail(error);
+                                return MountStep::Yield(self.fail(error));
                             }
                             if self.access.media_access() == super::MediaAccess::ReadOnly
                                 && orphans.is_empty()
@@ -3007,7 +3015,7 @@ impl MountOperation {
                             }
                             let index = match memory::try_box(AllocationIndexBuild::new()) {
                                 Ok(index) => index,
-                                Err(error) => return self.fail(error),
+                                Err(error) => return MountStep::Yield(self.fail(error)),
                             };
                             self.state = MountState::Indexing(ValidatedMountSeed {
                                 publication,
@@ -3019,7 +3027,7 @@ impl MountOperation {
                             self.state = MountState::ScanningOrphans(publication);
                             return self.submit_pending_read();
                         }
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     }
                 }
                 MountState::Indexing(mut validated) => {
@@ -3040,7 +3048,7 @@ impl MountOperation {
                             self.state = MountState::Indexing(validated);
                             return self.submit_pending_read();
                         }
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     }
                 }
                 MountState::PreparingMarker(indexed) => {
@@ -3073,12 +3081,12 @@ impl MountOperation {
                                 {
                                     marked
                                 }
-                                Ok(_) => return self.fail(Error::MmpCorrupt),
-                                Err(error) => return self.fail(error),
+                                Ok(_) => return MountStep::Yield(self.fail(Error::MmpCorrupt)),
+                                Err(error) => return MountStep::Yield(self.fail(error)),
                             };
                             let sequence = if matches!(self.access, super::MountAccess::ReadWrite) {
                                 let Some(journal) = &indexed.publication.journal else {
-                                    return self.fail(Error::JournalCorrupt);
+                                    return MountStep::Yield(self.fail(Error::JournalCorrupt));
                                 };
                                 let mut device = OperationDevice::new(&mut self.filesystem);
                                 match prepare_session_checkpoint(
@@ -3093,14 +3101,14 @@ impl MountOperation {
                                         self.state = MountState::PreparingMarker(indexed);
                                         return self.submit_pending_read();
                                     }
-                                    Err(error) => return self.fail(error),
+                                    Err(error) => return MountStep::Yield(self.fail(error)),
                                 }
                             } else {
                                 None
                             };
                             let keys = match self.fscrypt_keys.take() {
                                 Some(keys) => keys,
-                                None => return self.fail(Error::DeviceIo),
+                                None => return MountStep::Yield(self.fail(Error::DeviceIo)),
                             };
                             let epoch = CommittedEpoch::initial(
                                 marked,
@@ -3126,7 +3134,7 @@ impl MountOperation {
                             };
                             let completed = match memory::try_box(completed) {
                                 Ok(completed) => completed,
-                                Err(error) => return self.fail(error),
+                                Err(error) => return MountStep::Yield(self.fail(error)),
                             };
                             let completed = UnpublishedMount {
                                 completed,
@@ -3144,7 +3152,7 @@ impl MountOperation {
                             self.state = MountState::PreparingMarker(indexed);
                             return self.submit_pending_read();
                         }
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     }
                 }
                 MountState::SessionWrites {
@@ -3156,10 +3164,10 @@ impl MountOperation {
                             completed,
                             pending: suspended,
                         };
-                        return MountTransition::SubmitLower {
+                        return MountStep::Yield(MountTransition::SubmitLower {
                             request,
                             suspended: self,
-                        };
+                        });
                     }
                     StorageRequestSequenceStep::Finished(journal) => {
                         completed.completed.coordinator.journal = PublicationState::Ready {
@@ -3178,7 +3186,7 @@ impl MountOperation {
                     }
                 },
                 MountState::SessionPending { .. } => {
-                    return self.fail(Error::DeviceIo);
+                    return MountStep::Yield(self.fail(Error::DeviceIo));
                 }
                 MountState::RecoveringOrphans(mut mount) => {
                     let Some(target) = mount.orphans.current() else {
@@ -3204,14 +3212,14 @@ impl MountOperation {
                         let PublicationState::Ready { journal, .. } =
                             &mount.completed.coordinator.journal
                         else {
-                            return self.fail(Error::JournalCorrupt);
+                            return MountStep::Yield(self.fail(Error::JournalCorrupt));
                         };
                         prepare_orphan_batch(view, target, journal.as_ref())
                     };
                     match result {
                         Ok((sequence, progress)) => {
                             if let Err(error) = mount.orphans.prepare_advance(inode, progress) {
-                                return self.fail(error);
+                                return MountStep::Yield(self.fail(error));
                             }
                             self.state = MountState::OrphanWrites { mount, sequence };
                         }
@@ -3219,7 +3227,7 @@ impl MountOperation {
                             self.state = MountState::RecoveringOrphans(mount);
                             return self.submit_pending_read();
                         }
-                        Err(error) => return self.fail(error),
+                        Err(error) => return MountStep::Yield(self.fail(error)),
                     }
                 }
                 MountState::OrphanWrites {
@@ -3231,10 +3239,10 @@ impl MountOperation {
                             mount,
                             pending: suspended,
                         };
-                        return MountTransition::SubmitLower {
+                        return MountStep::Yield(MountTransition::SubmitLower {
                             request,
                             suspended: self,
-                        };
+                        });
                     }
                     StorageRequestSequenceStep::Finished(completion) => {
                         mount.completed.epoch.superblock = completion.superblock;
@@ -3256,7 +3264,7 @@ impl MountOperation {
                     }
                 },
                 MountState::OrphanWritePending { .. } => {
-                    return self.fail(Error::DeviceIo);
+                    return MountStep::Yield(self.fail(Error::DeviceIo));
                 }
                 MountState::Published(mut completed) => {
                     if self.access.media_access() == super::MediaAccess::ReadOnly {
@@ -3264,7 +3272,7 @@ impl MountOperation {
                         let PublicationState::Ready { journal, .. } =
                             &mut completed.coordinator.journal
                         else {
-                            return self.fail(Error::JournalCorrupt);
+                            return MountStep::Yield(self.fail(Error::JournalCorrupt));
                         };
                         *journal = None;
                     }
@@ -3274,15 +3282,15 @@ impl MountOperation {
                     ) {
                         MountOwnership::Held(lease) => Some(lease),
                         MountOwnership::Unprotected => None,
-                        _ => return self.fail(Error::DeviceIo),
+                        _ => return MountStep::Yield(self.fail(Error::DeviceIo)),
                     };
                     if let Some(recovery) = self.recovery.take() {
                         completed.epoch.recovery = match recovery.seal() {
                             Ok(recovery) => Some(recovery),
-                            Err(error) => return self.fail(error),
+                            Err(error) => return MountStep::Yield(self.fail(error)),
                         };
                     }
-                    return MountTransition::Complete(Ok(completed));
+                    return MountStep::Yield(MountTransition::Complete(Ok(completed)));
                 }
             }
         }
@@ -3308,7 +3316,7 @@ impl MountOperation {
             if superblock.recovery_state()
                 == crate::disk_format::superblock::RecoveryState::NeedsRecovery
             {
-                return self.fail(Error::ReadOnlyFilesystem);
+                return MountStep::Yield(self.fail(Error::ReadOnlyFilesystem));
             }
             self.state = MountState::ScanningOrphans(MountPublicationSeed {
                 superblock,
@@ -3333,7 +3341,7 @@ impl MountOperation {
                 journal_target,
                 operation,
             },
-            Err(error) => return self.fail(error),
+            Err(error) => return MountStep::Yield(self.fail(error)),
         };
         MountStep::Continue(self)
     }
@@ -3345,17 +3353,17 @@ impl MountOperation {
         let MountOwnership::ReadyToClaim(owner) =
             core::mem::replace(&mut self.ownership, MountOwnership::Unprotected)
         else {
-            return self.fail(Error::DeviceIo);
+            return MountStep::Yield(self.fail(Error::DeviceIo));
         };
         let Some(parameters) = self.mmp_parameters else {
-            return self.fail(Error::MmpCorrupt);
+            return MountStep::Yield(self.fail(Error::MmpCorrupt));
         };
         let operation =
             match super::MmpOperation::acquire(parameters, owner, super::MediaAccess::ReadWrite)
                 .and_then(memory::try_box)
             {
                 Ok(operation) => operation,
-                Err(error) => return self.fail(error),
+                Err(error) => return MountStep::Yield(self.fail(error)),
             };
         self.filesystem = StorageTranscript::new(StorageTarget::Filesystem, self.filesystem.len());
         self.state = MountState::Resolving;
@@ -3431,13 +3439,13 @@ impl MountOperation {
     }
 
     /// Moves the current restartable metadata read into lower ownership.
-    fn submit_pending_read(mut self: Box<Self>) -> MountTransition {
+    fn submit_pending_read(mut self: Box<Self>) -> MountStep {
         match self.filesystem.take_pending_request() {
-            Ok(request) => MountTransition::SubmitLower {
+            Ok(request) => MountStep::Yield(MountTransition::SubmitLower {
                 request,
                 suspended: self,
-            },
-            Err(error) => self.fail(error),
+            }),
+            Err(error) => MountStep::Yield(self.fail(error)),
         }
     }
 }

@@ -1540,8 +1540,53 @@ impl IrModule {
     fn audit_release_contracts(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
         self.audit_lower_submission(violations);
         self.audit_lower_completion_returns(violations);
+        self.audit_mount_stack(violations)?;
         self.audit_nonallocating_callbacks(violations)?;
         self.audit_durable_publication(violations)
+    }
+
+    /// Mount phases must return to their executor rather than accumulate kernel stack frames.
+    /// This checks direct recursion in emitted code; unrelated library recursion and indirect
+    /// callback reachability do not imply recursive mount execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-IR error if a direct call names a missing function.
+    fn audit_mount_stack(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
+        for (root, function) in &self.functions {
+            if !function
+                .display
+                .starts_with("<ext4_core::volume::mount::MountOperation>::")
+            {
+                continue;
+            }
+            if violations.len() >= MAX_REPORTED_VIOLATIONS {
+                break;
+            }
+            let mut predecessors = BTreeMap::from([(root.clone(), None)]);
+            let mut queue = VecDeque::from([root.clone()]);
+            'search: while let Some(caller) = queue.pop_front() {
+                let node = self.functions.get(&caller).ok_or_else(|| {
+                    GateError::InvalidIr(format!("mount stack audit function {caller} is absent"))
+                })?;
+                for callee in &node.direct_calls {
+                    if callee == root {
+                        let mut path = display_path(&caller, &predecessors, &self.functions)?;
+                        path.push(function.display.clone());
+                        violations.push(Violation {
+                            category: "recursive mount execution",
+                            path,
+                        });
+                        break 'search;
+                    }
+                    if !predecessors.contains_key(callee) {
+                        predecessors.insert(callee.clone(), Some(caller.clone()));
+                        queue.push_back(callee.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Requires exactly one lower call on every defined returning registration-success path.
@@ -2891,6 +2936,70 @@ mod tests {
         require(
             PeImage::parse(&pe_fixture(false)?).is_err(),
             "PE without certificate table was accepted",
+        )
+    }
+
+    /// Emitted mount execution cannot reenter itself directly, through another phase, or an alias.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a recursive fixture is accepted or its cycle cannot be reconstructed.
+    #[test]
+    fn mount_stack_rejects_recursive_execution() -> Result<(), GateError> {
+        for (target, helpers) in [
+            ("mount", ""),
+            (
+                "phase",
+                "define internal void @phase() {\n  call void @mount()\n  ret void\n}\n",
+            ),
+            (
+                "alias",
+                "@alias = internal alias void (), ptr @phase\n\
+                 define internal void @phase() {\n  call void @mount()\n  ret void\n}\n",
+            ),
+        ] {
+            let fixture = format!(
+                "define void @DriverEntry() {{\n  call void @mount()\n  ret void\n}}\n\
+                 ; <ext4_core::volume::mount::MountOperation>::advance\n\
+                 define internal void @mount() {{\n  call void @{target}()\n  ret void\n}}\n\
+                 {helpers}"
+            );
+            let module = IrModule::parse(&fixture)?;
+            let mut violations = Vec::new();
+            module.audit_mount_stack(&mut violations)?;
+            require(
+                violations.len() == 1
+                    && violations.first().is_some_and(|violation| {
+                        violation.category == "recursive mount execution"
+                            && violation.path.len() >= 2
+                            && violation.path.first() == violation.path.last()
+                    }),
+                "mount recursion did not report its complete cycle",
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Internal control-flow loops and recursive callees do not nest mount execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if iteration or independent library recursion is rejected.
+    #[test]
+    fn mount_stack_accepts_iteration_and_library_recursion() -> Result<(), GateError> {
+        let module = IrModule::parse(
+            "define void @DriverEntry() {\n  call void @mount()\n  ret void\n}\n\
+             ; <ext4_core::volume::mount::MountOperation>::advance\n\
+             define internal void @mount() {\n  br label %step\n\
+             step:\n  call void @library()\n  br i1 true, label %step, label %done\n\
+             done:\n  ret void\n}\n\
+             define internal void @library() {\n  call void @library()\n  ret void\n}\n",
+        )?;
+        let mut violations = Vec::new();
+        module.audit_mount_stack(&mut violations)?;
+        require(
+            violations.is_empty(),
+            "nonrecursive mount execution was rejected",
         )
     }
 
