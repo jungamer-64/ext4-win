@@ -284,6 +284,11 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native FsRtl file-lock completion delegation contract",
         ),
         (
+            "oplock-control",
+            "oplock_control.tests.c",
+            "native shared oplock byte-lock observation and exclusive open-count contract",
+        ),
+        (
             "paging-file",
             "paging_file.tests.c",
             "native fixed paging map, allocation-free original IRP delegation, and kernel mapping ownership contract",

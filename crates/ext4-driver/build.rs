@@ -63,6 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=native/fast_io_transfer.h");
     println!("cargo:rerun-if-changed=native/fast_io_lock.h");
     println!("cargo:rerun-if-changed=native/file_lock_completion.h");
+    println!("cargo:rerun-if-changed=native/oplock_control.h");
     println!("cargo:rerun-if-changed=native/paging_file.h");
     println!("cargo:rerun-if-changed=native/directory_notification.h");
     println!("cargo:rerun-if-changed=native/notification_access.h");
