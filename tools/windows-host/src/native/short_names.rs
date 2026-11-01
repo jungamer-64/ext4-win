@@ -4,7 +4,7 @@ use super::{
     FileHandle, NamespaceAccess, completed, directory_query, field, file_information_query,
     identity, remove_namespace_link, single_name,
 };
-use std::{io, path::Path};
+use std::{ffi::OsStr, io, path::Path};
 use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES};
 
 /// Exercises alias opens, collision selection, wildcard matching, hard links and name tunneling.
@@ -82,7 +82,7 @@ fn lifecycle(directory: &Path) -> io::Result<()> {
         }
         let file = FileHandle::open(directory, 0x0010_0001, FILE_FLAG_BACKUP_SEMANTICS)?;
         let query = directory_query(&file, Some(&first_alias), 512, true, false, 0)
-            .and_then(|record| single_name(&record, first_name));
+            .and_then(|record| single_name(&record, OsStr::new(first_name)));
         completed(query, file.close())?;
         std::fs::hard_link(first, hardlink)?;
         let hard_alias = alternate_name(hardlink)?;

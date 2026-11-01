@@ -1887,7 +1887,19 @@ fn directory_query(
 /// Requires exactly one complete native file-name record.
 /// # Errors
 /// Returns a record-layout or name mismatch.
-fn single_name(bytes: &[u8], expected: &str) -> io::Result<()> {
+fn single_name(bytes: &[u8], expected: &OsStr) -> io::Result<()> {
+    if directory_name(bytes)? != expected {
+        return Err(io::Error::other(
+            "single FILE_NAMES_INFORMATION name mismatch",
+        ));
+    }
+    Ok(())
+}
+
+/// Decodes one complete native name record without treating record length as cursor identity.
+/// # Errors
+/// Returns malformed offsets, counted UTF-16 length or incomplete record storage.
+fn directory_name(bytes: &[u8]) -> io::Result<OsString> {
     let name_bytes = u32::from_le_bytes(field(bytes, 8)?);
     let payload = bytes
         .get(12..)
@@ -1903,13 +1915,12 @@ fn single_name(bytes: &[u8], expected: &str) -> io::Result<()> {
         .collect::<io::Result<_>>()?;
     if u32::from_le_bytes(field(bytes, 0)?) != 0
         || usize::try_from(name_bytes).map_err(io::Error::other)? != payload.len()
-        || decode(&units) != expected
     {
         return Err(io::Error::other(
             "single FILE_NAMES_INFORMATION record mismatch",
         ));
     }
-    Ok(())
+    Ok(OsString::from_wide(&units))
 }
 /// Exercises FILE_NAMES_INFORMATION retry, pattern capture, restart and alignment on a fixture.
 /// # Errors
@@ -1923,12 +1934,12 @@ pub fn verify_directory(directory: &Path) -> io::Result<()> {
         }
         single_name(
             &directory_query(&file, Some("ignored-later-expression"), 256, true, false, 0)?,
-            "entry-000000",
+            OsStr::new("entry-000000"),
         )?;
         directory_query(&file, None, 256, true, false, 0x8000_0006)?;
         single_name(
             &directory_query(&file, None, 256, true, true, 0)?,
-            "entry-000000",
+            OsStr::new("entry-000000"),
         )
     })();
     completed(result, file.close())?;
@@ -1952,13 +1963,27 @@ pub fn verify_directory(directory: &Path) -> io::Result<()> {
                 "small-buffer record alignment or final link mismatch",
             ));
         }
-        if !directory_query(&file, None, 16, true, false, 0)?.is_empty() {
-            return Err(io::Error::other("later short buffer consumed a name"));
-        }
-        if directory_query(&file, None, 256, true, false, 0)?.len() != 36 {
-            return Err(io::Error::other("retry did not return one complete name"));
-        }
-        Ok(())
+        let reference = FileHandle::open(directory, 0x0010_0001, FILE_FLAG_BACKUP_SEMANTICS)?;
+        let compared = (|| {
+            let initial = directory_query(&reference, Some("entry-*"), 76, false, false, 0)?;
+            if initial != bytes {
+                return Err(io::Error::other(
+                    "independent directory cursors started at different entries",
+                ));
+            }
+            let expected =
+                directory_name(&directory_query(&reference, None, 256, true, false, 0)?)?;
+            if !directory_query(&file, None, 16, true, false, 0)?.is_empty() {
+                return Err(io::Error::other(
+                    "later short buffer returned an incomplete name",
+                ));
+            }
+            single_name(
+                &directory_query(&file, None, 256, true, false, 0)?,
+                &expected,
+            )
+        })();
+        completed(compared, reference.close())
     })();
     completed(result, file.close())
 }
@@ -1990,6 +2015,78 @@ pub fn secure_random(output: &mut [u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// # Errors
+    /// Returns fixture, native cursor observation or explicit namespace cleanup failures.
+    /// # Panics
+    /// Fails if a short native query consumes the next equal-length directory name.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "the actual native directory harness is checked on a disposable independent filesystem fixture"
+    )]
+    fn native_directory_retry_preserves_the_next_name() -> io::Result<()> {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(io::Error::other)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("ext4win-directory-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&root)?;
+        let paths: Vec<_> = (0..4)
+            .map(|index| root.join(format!("entry-{index:06}")))
+            .collect();
+        let operation = (|| {
+            for path in &paths {
+                std::fs::write(path, [])?;
+            }
+            let reference = FileHandle::open(&root, 0x0010_0001, FILE_FLAG_BACKUP_SEMANTICS)?;
+            let observed = (|| {
+                let file = FileHandle::open(&root, 0x0010_0001, FILE_FLAG_BACKUP_SEMANTICS)?;
+                let result = (|| {
+                    let expected = directory_name(&directory_query(
+                        &reference,
+                        Some("entry-*"),
+                        256,
+                        true,
+                        false,
+                        0,
+                    )?)?;
+                    directory_query(&file, Some("entry-*"), 16, true, false, 0x8000_0005)?;
+                    single_name(
+                        &directory_query(&file, None, 256, true, false, 0)?,
+                        &expected,
+                    )
+                })();
+                completed(result, file.close())
+            })();
+            completed(observed, reference.close())
+        })();
+        let cleanup = (|| {
+            for path in &paths {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            std::fs::remove_dir(&root)
+        })();
+        completed(operation, cleanup)?;
+        // Equal encoded lengths cannot make a different cursor identity acceptable.
+        let name = "entry-000002";
+        let mut record = vec![0_u8; 12];
+        record
+            .get_mut(8..12)
+            .ok_or_else(|| io::Error::other("short name header"))?
+            .copy_from_slice(&24_u32.to_le_bytes());
+        for unit in name.encode_utf16() {
+            record.extend_from_slice(&unit.to_le_bytes());
+        }
+        single_name(&record, OsStr::new(name))?;
+        assert!(single_name(&record, OsStr::new("entry-000003")).is_err());
+        Ok(())
+    }
+
     /// # Errors
     /// Returns native alias acquisition, namespace observation or mandatory withdrawal failures.
     /// # Panics
