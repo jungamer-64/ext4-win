@@ -1585,9 +1585,13 @@ fn flush_file(file: &FileHandle) -> io::Result<()> {
 /// # Errors
 /// Returns opening, native metadata, identity or explicit release failures.
 pub fn verify_metadata(path: &Path, relative_name: &str, eof: u64) -> io::Result<()> {
-    let first = FileHandle::open(path, 0x80, 0)?;
+    let first = FileHandle::open(path, 0x80, 0).inspect_err(|error| {
+        eprintln!("file metadata: attribute-handle open failed: {error}");
+    })?;
     let result = (|| {
-        let second = FileHandle::open(path, 0, 0)?;
+        let second = FileHandle::open(path, 0, 0).inspect_err(|error| {
+            eprintln!("file metadata: zero-access open failed: {error}");
+        })?;
         let mut label = [0_u16; 261];
         let mut filesystem = [0_u16; 261];
         let mut serial = 0;
@@ -1616,16 +1620,25 @@ pub fn verify_metadata(path: &Path, relative_name: &str, eof: u64) -> io::Result
         } else {
             Ok(())
         };
+        let result = result.inspect_err(|error| {
+            eprintln!("file metadata: zero-access volume identity query failed: {error}");
+        });
         completed(result, second.close())?;
-        let [logical, _, _, effective, ..] = sector_information(&first)?;
+        let [logical, _, _, effective, ..] = sector_information(&first).inspect_err(|error| {
+            eprintln!("file metadata: sector information query failed: {error}");
+        })?;
         if logical != effective {
             return Err(io::Error::other(
                 "filesystem effective sector differs from its transfer unit",
             ));
         }
-        let data = FileHandle::open(path, 0x8000_0000, 0)?;
+        let data = FileHandle::open(path, 0x8000_0000, 0).inspect_err(|error| {
+            eprintln!("file metadata: data-handle open failed: {error}");
+        })?;
         completed(
-            verify_file_information(&data, relative_name, eof),
+            verify_file_information(&data, relative_name, eof).inspect_err(|error| {
+                eprintln!("file metadata: file information query failed: {error}");
+            }),
             data.close(),
         )
     })();

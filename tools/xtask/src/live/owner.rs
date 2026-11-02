@@ -638,6 +638,7 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
     )?;
     println!("live filesystem I/O: verify file metadata");
     windows_host::verify_metadata(&alpha, "\\live-ci\\alpha.bin", 8_192)?;
+    println!("live filesystem I/O: query created-file security");
     let descriptor = windows_host::file_security(&alpha)?;
     let expected = ext4_core::Ext4Security::new(
         ext4_core::Ext4Owner::new(
@@ -660,7 +661,9 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         )
         .into());
     }
+    println!("live filesystem I/O: set created-file DACL");
     windows_host::set_file_dacl(&alpha, &descriptor)?;
+    println!("live filesystem I/O: query security round trip");
     if windows_host::file_security(&alpha)? != descriptor {
         return Err(
             io::Error::other("native security descriptor round trip changed metadata").into(),
