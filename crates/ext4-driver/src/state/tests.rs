@@ -2109,7 +2109,7 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
     )?;
     let mut ledger = FileControlBlockLedger::try_new()?;
     let (absent_mutation, absent_stream) =
-        ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
+        ledger.acquire_node_oplock_mutation(NodeId::Directory(DirectoryNodeId::ROOT))?;
     assert!(absent_stream.is_none());
     assert!(!ledger.is_empty());
     let stream = super::StagedNodeStreamMetadata {
@@ -2132,7 +2132,8 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
     drop(absent_mutation);
     assert!(ledger.oplock_grant_available(fcb_pointer));
 
-    let (mutation, lease) = ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
+    let (mutation, lease) =
+        ledger.acquire_node_oplock_mutation(NodeId::Directory(DirectoryNodeId::ROOT))?;
     let lease = lease.ok_or(DriverError::InternalInvariantViolation)?;
     assert!(lease.identifies(fcb_pointer));
     assert!(!ledger.oplock_grant_available(fcb_pointer));
@@ -2142,6 +2143,79 @@ fn parent_oplock_mutation_spans_zero_fcb_residency() -> Result<(), DriverError> 
     assert!(!ledger.is_empty());
     drop(mutation);
     assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+/// Returns ledger or exclusion allocation failure.
+/// # Panics
+/// Fails if a completed break outlives its exclusion or atomic establishment bypasses another owner.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "construction propagates errors; assertions verify grant ownership"
+)]
+fn checked_create_break_retains_its_exact_grant_exclusion() -> Result<(), DriverError> {
+    use crate::irp::{CreateSharingCheck, OplockCreatePolicy};
+    use crate::request::create::CreateOplockPlan;
+    let ledger = FileControlBlockLedger::try_new()?;
+    let node = NodeId::Directory(DirectoryNodeId::ROOT);
+    let plan = CreateOplockPlan {
+        node,
+        policy: OplockCreatePolicy::CompleteIfOplocked,
+        sharing: CreateSharingCheck::Conflict,
+    };
+    let (exclusion, stream) = ledger.acquire_node_oplock_mutation(node)?;
+    assert!(stream.is_none());
+    let checked = plan.checked(wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS, exclusion)?;
+    assert!(!ledger.is_empty());
+    assert!(checked.permits_atomic_establishment());
+    let (other, _) = ledger.acquire_node_oplock_mutation(node)?;
+    assert!(!checked.permits_atomic_establishment());
+    drop(other);
+    assert!(checked.permits_atomic_establishment());
+    drop(checked);
+    assert!(ledger.is_empty());
+    Ok(())
+}
+
+/// # Errors
+/// Returns ledger or exclusion allocation failure.
+/// # Panics
+/// Fails if cancellation or an invalid completion leaves a preflight exclusion active.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "construction propagates errors; assertions verify failure consumption"
+)]
+fn rejected_create_break_releases_preflight_authority() -> Result<(), DriverError> {
+    use crate::irp::{CreateSharingCheck, OplockCreatePolicy};
+    use crate::request::create::CreateOplockPlan;
+    let ledger = FileControlBlockLedger::try_new()?;
+    let node = NodeId::Directory(DirectoryNodeId::ROOT);
+    for (status, expected) in [
+        (
+            wdk_sys::STATUS_CANCELLED,
+            DriverError::OplockFailure(wdk_sys::STATUS_CANCELLED),
+        ),
+        (
+            wdk_sys::STATUS_PENDING,
+            DriverError::InternalInvariantViolation,
+        ),
+        (
+            wdk_sys::STATUS_OPLOCK_BREAK_IN_PROGRESS,
+            DriverError::InternalInvariantViolation,
+        ),
+    ] {
+        let plan = CreateOplockPlan {
+            node,
+            policy: OplockCreatePolicy::Ordinary,
+            sharing: CreateSharingCheck::Conflict,
+        };
+        let (exclusion, _) = ledger.acquire_node_oplock_mutation(node)?;
+        assert_eq!(plan.checked(status, exclusion).err(), Some(expected));
+        assert!(ledger.is_empty());
+    }
     Ok(())
 }
 

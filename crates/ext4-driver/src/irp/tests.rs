@@ -1124,6 +1124,34 @@ fn failed_create_completion_never_publishes_auxiliary_buffer() {
 }
 
 /// # Panics
+/// Fails if failed share admission loses the nonblocking break effect in the native status block.
+#[test]
+fn failed_create_sharing_preserves_break_underway_information() {
+    let mut device_object = wdk_sys::DEVICE_OBJECT::default();
+    let device = kernel_device_fixture(&mut device_object);
+    assert!(device.is_some());
+    let Some(device) = device else {
+        return;
+    };
+    let mut irp = wdk_sys::IRP::default();
+    let owned = owned_irp_fixture(device, &mut irp);
+    assert!(owned.is_some());
+    if let Some(owned) = owned {
+        assert_eq!(
+            owned
+                .prepare_create_result(Err(DriverError::ShareAccessConflictDuringOplockBreak))
+                .notify(),
+            wdk_sys::STATUS_SHARING_VIOLATION
+        );
+    }
+    assert_eq!(irp_status(&irp), wdk_sys::STATUS_SHARING_VIOLATION);
+    assert_eq!(
+        irp.IoStatus.Information,
+        wdk_sys::ULONG_PTR::from(wdk_sys::FILE_OPBATCH_BREAK_UNDERWAY)
+    );
+}
+
+/// # Panics
 ///
 /// Panics when assertions or fixed test fixture assumptions fail.
 #[test]

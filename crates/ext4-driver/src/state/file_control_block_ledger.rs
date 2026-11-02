@@ -333,9 +333,29 @@ pub(crate) struct OplockMutationLease {
 }
 
 impl OplockMutationLease {
-    /// Whether this grant exclusion covers the directory whose enumeration will change.
-    pub(crate) fn covers_parent(&self, parent: DirectoryNodeId) -> bool {
-        self.node == NodeId::Directory(parent)
+    /// Whether this operation is the sole mutation that can authorize an atomic create grant.
+    #[expect(
+        unsafe_code,
+        reason = "the live lease retains its owning mounted ledger"
+    )]
+    pub(crate) fn is_exclusive(&self) -> bool {
+        let owner = unsafe {
+            // SAFETY: This lease's mounted operation retains the ledger through release.
+            self.owner.as_ref()
+        };
+        let _guard = owner.lock.acquire();
+        let mutations = unsafe {
+            // SAFETY: The ledger resource protects the node reservation registry.
+            &*owner.oplock_mutations.get()
+        };
+        mutations
+            .iter()
+            .any(|entry| entry.node == self.node && entry.count == NonZeroU32::MIN)
+    }
+
+    /// Whether this grant exclusion covers the exact stream being checked or mutated.
+    pub(crate) fn covers_node(&self, node: NodeId) -> bool {
+        self.node == node
     }
 }
 
@@ -2798,26 +2818,24 @@ impl FileControlBlockLedger {
         ))
     }
 
-    /// Reserves a parent-directory node against new grants and retains its resident stream, if any.
+    /// Reserves a node against new grants and retains its resident stream, if any.
     /// # Errors
     ///
     /// Returns a finite reservation or deferred-lease failure without leaving a reservation active.
-    /// An absent stream still returns mutation authority because a new parent FCB can become
-    /// resident before the namespace mutation publishes.
+    /// The reservation also covers an absent stream that can become resident before publication.
     #[expect(
         unsafe_code,
         reason = "the ledger resource serializes node lookup and deferred-lease acquisition"
     )]
-    pub(super) fn acquire_parent_oplock_mutation(
+    pub(super) fn acquire_node_oplock_mutation(
         &self,
-        parent: DirectoryNodeId,
+        node: NodeId,
     ) -> DriverResult<(OplockMutationLease, Option<OplockStreamLease>)> {
         let _guard = self.lock.acquire();
         let table = unsafe {
             // SAFETY: The executive resource serializes table lookup and lifetime mutation.
             &*self.table.get()
         };
-        let node = NodeId::Directory(parent);
         let resident = find_file_control_block_in_table(table, node);
         let prepared_lifetime = if let Some(fcb) = resident {
             let state = ledger_file_control_block_open_state(table, fcb);
@@ -2855,6 +2873,36 @@ impl FileControlBlockLedger {
         Ok((OplockMutationLease { owner, node }, stream))
     }
 
+    /// Observes sharing without recording a claim or treating conflict as terminal admission.
+    /// # Errors
+    /// Returns the current native sharing conflict, leaving both accounting domains unchanged.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource encloses retained-node lookup and native share observation"
+    )]
+    pub(super) fn check_existing_create_sharing(
+        &self,
+        node: NodeId,
+        file: KernelFileObject,
+        access: ExistingOperationAccess,
+        sharing: ShareAccess,
+    ) -> DriverResult<()> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource serializes table membership and open-state mutation.
+            &*self.table.get()
+        };
+        let Some(fcb) = find_file_control_block_in_table(table, node) else {
+            return Ok(());
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        let state = unsafe {
+            // SAFETY: Exact membership and exclusive resource ownership retain this mutable state.
+            state.as_mut()
+        };
+        state.shares.check_operation(file, access, sharing)
+    }
+
     /// Acquires one oplock lease for an exact provisional create claim.
     /// # Errors
     ///
@@ -2888,56 +2936,6 @@ impl FileControlBlockLedger {
                 fcb,
             },
         })
-    }
-
-    /// Acquires a grant barrier and check lease for an exact provisional create claim.
-    /// # Errors
-    ///
-    /// Returns an ownership or finite-counter failure before FsRtl observes the create IRP.
-    #[expect(
-        unsafe_code,
-        reason = "the ledger resource serializes exact provisional FCB pair acquisition"
-    )]
-    pub(super) fn acquire_claimed_oplock_mutation(
-        &self,
-        fcb: NonNull<FileControlBlock>,
-    ) -> DriverResult<(OplockMutationLease, OplockStreamLease)> {
-        let _guard = self.lock.acquire();
-        let table = unsafe {
-            // SAFETY: The executive resource serializes table lookup and lifetime mutation.
-            &*self.table.get()
-        };
-        if !table.pointer_index(fcb).is_some() {
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        let node = unsafe {
-            // SAFETY: Exact table membership is established while the ledger resource is held.
-            fcb.as_ref().node()
-        };
-        let mut state = ledger_file_control_block_open_state(table, fcb);
-        let lifetime = unsafe {
-            // SAFETY: Exact table membership is established while the ledger resource is held.
-            state.as_ref()
-        }
-        .lifetime
-        .with_additional_deferred_lease()?;
-        let mutations = unsafe {
-            // SAFETY: The same ledger resource serializes the node reservation registry.
-            &mut *self.oplock_mutations.get()
-        };
-        begin_oplock_mutation(mutations, node)?;
-        unsafe {
-            // SAFETY: No fallible work remains after the reservation is published.
-            state.as_mut()
-        }
-        .lifetime = lifetime;
-        let owner = NonNull::from(self);
-        Ok((
-            OplockMutationLease { owner, node },
-            OplockStreamLease {
-                retained: DeferredStreamLease { owner, fcb },
-            },
-        ))
     }
 
     /// Reports whether the exact table-owned stream currently permits a new oplock grant.

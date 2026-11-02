@@ -85,7 +85,11 @@ impl DirectoryChange {
                 Some(DirectoryNotificationStep::Direct { parent, .. }) => *parent,
                 _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
             })
-            .find(|parent| !exclusions.iter().any(|held| held.covers_parent(*parent)))
+            .find(|parent| {
+                !exclusions
+                    .iter()
+                    .any(|held| held.covers_node(NodeId::Directory(*parent)))
+            })
     }
 
     /// Captures cache data before mutation; publication remains tied to this durable event.
@@ -823,7 +827,8 @@ mod tests {
             DirectoryChange::uncovered_parent(changes.as_slice(), &[]),
             Some(DirectoryNodeId::ROOT)
         );
-        let (exclusion, stream) = ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
+        let (exclusion, stream) =
+            ledger.acquire_node_oplock_mutation(NodeId::Directory(DirectoryNodeId::ROOT))?;
         assert!(stream.is_none());
         let exclusions = [exclusion];
         assert_eq!(

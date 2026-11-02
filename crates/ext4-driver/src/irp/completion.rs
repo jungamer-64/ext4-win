@@ -105,6 +105,9 @@ impl IrpCompletion {
                 DriverError::InvalidEaBuffer { offset } => InformationLength {
                     bytes: offset.into(),
                 },
+                DriverError::ShareAccessConflictDuringOplockBreak => InformationLength {
+                    bytes: wdk_sys::FILE_OPBATCH_BREAK_UNDERWAY.into(),
+                },
                 _ => InformationLength::ZERO,
             },
         }

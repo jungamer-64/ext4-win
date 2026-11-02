@@ -1571,7 +1571,10 @@ impl OwnedIrp {
                     wdk_sys::ULONG_PTR::from(wdk_sys::IO_REPARSE_TAG_SYMLINK),
                 )
             }
-            Err(error) => (error.ntstatus(), 0),
+            Err(error) => {
+                let completion = IrpCompletion::from_error(error);
+                (completion.status(), completion.information().as_ulong_ptr())
+            }
         };
         target.irp.write_status_and_information(status, information);
         PreparedIrpCompletion {

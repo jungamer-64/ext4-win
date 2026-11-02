@@ -3991,8 +3991,13 @@ enum OplockResume {
         /// Resolver that has not yet observed an event.
         resolve: MutationResolveOperation,
     },
-    /// An existing-node create restarts resolution and revalidates its provisional claim.
-    RestartExistingCreate,
+    /// Reobserves the target and sharing before constructing an existing-node share claim.
+    RestartExistingCreate {
+        /// Native check inputs retained until completion.
+        plan: crate::request::create::CreateOplockPlan,
+        /// Grant exclusion transfers into the checked result only after success.
+        exclusion: crate::state::OplockMutationLease,
+    },
     /// Final cleanup restarts against a fresh epoch after the parent-directory break completes.
     RestartCleanupDeletion {
         /// Exact parent authorized by the completed removal check.
@@ -4314,6 +4319,8 @@ struct MutationRequestOperation {
     crypto: CngOperation,
     /// Target-stream grant barrier retained from pre-break admission through mutation publication.
     oplock_mutation: Option<crate::state::OplockMutationLease>,
+    /// Native break result revalidated against the resolved stream and current sharing.
+    create_oplock: Option<crate::request::create::CheckedCreateOplock>,
     /// Cleanup deletion plan retained across resolve suspension.
     cleanup_deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
     /// Parent-directory removal authority retained for the current cleanup deletion target.
@@ -4369,6 +4376,8 @@ struct DriverResolveState<'a> {
     cleanup_parent_oplock: &'a [CleanupParentOplockAuthority],
     /// Exact authorized parent plan for create or set-information namespace mutation.
     namespace_oplocks: Option<NamespaceOplockPlan>,
+    /// Completed pre-share create oplock inputs, independent from share admission.
+    create_oplock: Option<&'a crate::request::create::CheckedCreateOplock>,
     /// Disposition deletion plan retained across its native preflight.
     disposition_deletion: &'a mut Option<crate::request::file_info::PendingDispositionDeletion>,
     /// Exact successful deletion gate retained for revalidation.
@@ -4411,13 +4420,8 @@ enum DriverResolveDisposition {
         /// Exact regular-file inode bound to that FCB.
         node: ext4_core::NodeId,
     },
-    /// An existing-node create must visit its stream oplock package before attachment.
-    CheckOplock {
-        /// Exact FCB retained by the provisional create claim.
-        fcb: core::ptr::NonNull<crate::state::FileControlBlock>,
-        /// Normalized create oplock behavior.
-        policy: crate::irp::OplockCreatePolicy,
-    },
+    /// An authorized existing-node create must check oplocks before share admission.
+    CheckOplock(crate::request::create::CreateOplockPlan),
     /// An existing-node create must synchronously establish its encoded atomic oplock.
     ReserveOplock {
         /// Exact FCB retained by the provisional create claim.
@@ -4638,6 +4642,7 @@ impl MutationRequestOperation {
                     request,
                     crypto,
                     oplock_mutation,
+                    create_oplock: None,
                     cleanup_deletion: None,
                     cleanup_parent_oplock: crate::memory::DriverVec::new(),
                     namespace_oplocks: None,
@@ -4758,6 +4763,7 @@ impl MutationRequestOperation {
         }
         drop(publication);
         drop(self.pending_existing_create.take());
+        drop(self.create_oplock.take());
         match (continuation, result) {
             (_, Err(error)) | (CreateAbortContinuation::Complete(error), Ok(())) => {
                 self.finish_error(owned, error)
@@ -4883,9 +4889,12 @@ impl MutationRequestOperation {
                     owned.request(),
                     operations,
                     mutation,
-                    state.pending_existing_create,
-                    state.write_open,
-                    state.namespace_oplocks,
+                    crate::request::create::CreateContinuation {
+                        pending_existing: state.pending_existing_create,
+                        prepared_write_open: state.write_open,
+                        namespace_oplocks: state.namespace_oplocks,
+                        checked_oplock: state.create_oplock,
+                    },
                     crate::identity::CreationContext {
                         mapping: &mapping.get().map,
                         creator: *creator,
@@ -4897,8 +4906,8 @@ impl MutationRequestOperation {
                     crate::request::create::CreateResolution::PrepareWriteOpen { fcb, node } => {
                         Ok(DriverResolveDisposition::PrepareWriteOpen { fcb, node })
                     }
-                    crate::request::create::CreateResolution::CheckOplock { fcb, policy } => {
-                        Ok(DriverResolveDisposition::CheckOplock { fcb, policy })
+                    crate::request::create::CreateResolution::CheckOplock(plan) => {
+                        Ok(DriverResolveDisposition::CheckOplock(plan))
                     }
                     crate::request::create::CreateResolution::ReserveOplock { fcb, open_count } => {
                         Ok(DriverResolveDisposition::ReserveOplock { fcb, open_count })
@@ -5227,7 +5236,7 @@ impl MutationRequestOperation {
                 );
             }
             let (mutation, stream) = match access
-                .acquire_parent_oplock_mutation(requirement.parent())
+                .acquire_node_oplock_mutation(ext4_core::NodeId::Directory(requirement.parent()))
             {
                 Ok(pair) => pair,
                 Err(error) => return MutationStep::Transition(self.complete_error(owned, error)),
@@ -5331,6 +5340,7 @@ impl MutationRequestOperation {
                     cleanup_deletion: &mut self.cleanup_deletion,
                     cleanup_parent_oplock: self.cleanup_parent_oplock.as_slice(),
                     namespace_oplocks: self.namespace_oplocks.as_ref().map(|held| held.plan),
+                    create_oplock: self.create_oplock.as_ref(),
                     disposition_deletion: &mut self.disposition_deletion,
                     prepared_deletion: deletion.as_ref(),
                     pending_existing_create: &mut self.pending_existing_create,
@@ -5373,7 +5383,8 @@ impl MutationRequestOperation {
                             self.complete_error(owned, DriverError::InternalInvariantViolation),
                         );
                     }
-                    let (mutation, stream) = match operations.acquire_parent_oplock_mutation(parent)
+                    let (mutation, stream) = match operations
+                        .acquire_node_oplock_mutation(ext4_core::NodeId::Directory(parent))
                     {
                         Ok(pair) => pair,
                         Err(error) => {
@@ -5421,13 +5432,14 @@ impl MutationRequestOperation {
                     }
                     drop(self.namespace_oplocks.take());
                     let first = plan.first();
-                    let (mutation, stream) =
-                        match operations.acquire_parent_oplock_mutation(first.parent()) {
-                            Ok(pair) => pair,
-                            Err(error) => {
-                                return MutationStep::Transition(self.complete_error(owned, error));
-                            }
-                        };
+                    let (mutation, stream) = match operations
+                        .acquire_node_oplock_mutation(ext4_core::NodeId::Directory(first.parent()))
+                    {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
+                    };
                     let pending = PendingNamespaceOplocks {
                         plan,
                         first: mutation,
@@ -5541,37 +5553,40 @@ impl MutationRequestOperation {
                         suspended: self,
                     });
                 }
-                Ok(DriverResolveDisposition::CheckOplock { fcb, policy }) => {
+                Ok(DriverResolveDisposition::CheckOplock(plan)) => {
                     drop(pass);
                     if size_changes.is_some()
                         || deletion.is_some()
-                        || self.pending_existing_create.is_none()
+                        || self.pending_existing_create.is_some()
                         || self.write_open.is_some()
                     {
                         return MutationStep::Transition(
                             self.complete_error(owned, DriverError::InternalInvariantViolation),
                         );
                     }
-                    if self.oplock_mutation.is_some() {
-                        return MutationStep::Transition(
-                            self.complete_error(owned, DriverError::InternalInvariantViolation),
-                        );
-                    }
-                    let (mutation, stream) = match operations.acquire_claimed_oplock_mutation(fcb) {
-                        Ok(admission) => admission,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
+                    drop(self.create_oplock.take());
+                    let (mutation, stream) =
+                        match operations.acquire_node_oplock_mutation(plan.node) {
+                            Ok(admission) => admission,
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
+                        };
+                    let Some(stream) = stream else {
+                        self.create_oplock = match plan.checked(wdk_sys::STATUS_SUCCESS, mutation) {
+                            Ok(checked) => Some(checked),
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
+                        };
+                        return self.restart_resolution(owned, None, None, operations);
                     };
-                    let check = match OplockCheck::create(stream, policy) {
-                        Ok(check) => check,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    };
-                    self.oplock_mutation = Some(mutation);
+                    let check = OplockCheck::create(stream, plan.policy, plan.sharing);
                     self.state = MutationOperationState::OplockDelegated {
-                        resume: OplockResume::RestartExistingCreate,
+                        resume: OplockResume::RestartExistingCreate {
+                            plan,
+                            exclusion: mutation,
+                        },
                     };
                     return MutationStep::Transition(OperationTransition::CheckOplock {
                         check,
@@ -5590,7 +5605,11 @@ impl MutationRequestOperation {
                             self.complete_error(owned, DriverError::InternalInvariantViolation),
                         );
                     }
-                    if !operations.oplock_grant_available(fcb) {
+                    if !self
+                        .create_oplock
+                        .as_ref()
+                        .is_some_and(|checked| checked.permits_atomic_establishment())
+                    {
                         return MutationStep::Transition(
                             self.complete_error(owned, DriverError::OplockNotGranted),
                         );
@@ -5623,7 +5642,7 @@ impl MutationRequestOperation {
                         self.metadata_oplocks.as_slice(),
                     ) {
                         let (mutation, stream) = match operations
-                            .acquire_parent_oplock_mutation(parent)
+                            .acquire_node_oplock_mutation(ext4_core::NodeId::Directory(parent))
                         {
                             Ok(pair) => pair,
                             Err(error) => {
@@ -6479,17 +6498,16 @@ impl MutationRequestOperation {
                             access,
                         )
                     }
-                    OplockResume::RestartExistingCreate => {
+                    OplockResume::RestartExistingCreate { plan, exclusion } => {
                         if let Some(error) = oplock_error {
                             return MutationStep::Transition(self.complete_error(owned, error));
                         }
-                        let result = self
-                            .pending_existing_create
-                            .as_mut()
-                            .ok_or(DriverError::InternalInvariantViolation)
-                            .and_then(|pending| pending.accept_oplock_status(status));
+                        let result = plan.checked(status, exclusion);
                         match result {
-                            Ok(()) => self.restart_resolution(owned, None, None, access),
+                            Ok(checked) => {
+                                self.create_oplock = Some(checked);
+                                self.restart_resolution(owned, None, None, access)
+                            }
                             Err(error) => {
                                 MutationStep::Transition(self.complete_error(owned, error))
                             }
@@ -7183,6 +7201,7 @@ impl PreparedPublication for MutationRequestOperation {
                 drop(size_changes);
                 drop(deletion);
                 drop(self.oplock_mutation.take());
+                drop(self.create_oplock.take());
                 while self.cleanup_parent_oplock.pop().is_some() {}
                 drop(self.namespace_oplocks.take());
                 while self.metadata_oplocks.pop().is_some() {}

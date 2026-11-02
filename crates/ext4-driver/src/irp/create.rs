@@ -1072,6 +1072,15 @@ pub(crate) enum CreateDisposition {
     Supersede,
 }
 
+/// Current sharing observation used only to select the create oplock break protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CreateSharingCheck {
+    /// The eventual share claim still requires independent admission.
+    Compatible,
+    /// A handle-caching oplock must be allowed to release conflicting opens.
+    Conflict,
+}
+
 impl CreateDisposition {
     /// Decodes the disposition stored in Create.Options.
     /// # Errors

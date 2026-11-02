@@ -172,6 +172,8 @@ pub(crate) enum DriverError {
     NotADirectory,
     /// WDK share-access validation rejected this open.
     ShareAccessConflict,
+    /// Sharing still conflicts after a create's requested nonblocking oplock break began.
+    ShareAccessConflictDuringOplockBreak,
     /// A byte-range lock held by another requestor blocks this I/O range.
     FileLockConflict,
     /// The requested create-time oplock reservation cannot be granted.
@@ -254,7 +256,9 @@ impl DriverError {
             Self::NotSameDevice => ntstatus(0xC000_00D4),
             Self::FileIsDirectory => ntstatus(0xC000_00BA),
             Self::NotADirectory => ntstatus(0xC000_0103),
-            Self::ShareAccessConflict => ntstatus(0xC000_0043),
+            Self::ShareAccessConflict | Self::ShareAccessConflictDuringOplockBreak => {
+                ntstatus(0xC000_0043)
+            }
             Self::FileLockConflict => STATUS_FILE_LOCK_CONFLICT,
             Self::OplockNotGranted => ntstatus(0xC000_00E2),
             Self::TooManyOpenReferences => STATUS_INSUFFICIENT_RESOURCES,

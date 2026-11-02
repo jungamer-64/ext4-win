@@ -1237,19 +1237,34 @@ impl MountedVolumeAccess<'_> {
             .acquire_oplock_mutation(file_object, NonNull::from(self.volume))
     }
 
-    /// Reserves one parent-directory node and retains its resident stream for an FsRtl check.
+    /// Reserves one node and retains its resident stream for an FsRtl check.
     /// # Errors
     ///
     /// Returns a finite reservation or deferred-lease failure before any FsRtl call. The optional
-    /// check lease is absent only when no parent FCB is currently resident; the node reservation
+    /// check lease is absent only when no FCB is currently resident; the node reservation
     /// remains active in either case.
-    pub(crate) fn acquire_parent_oplock_mutation(
+    pub(crate) fn acquire_node_oplock_mutation(
         &self,
-        parent: ext4_core::DirectoryNodeId,
+        node: NodeId,
     ) -> DriverResult<(OplockMutationLease, Option<OplockStreamLease>)> {
         self.volume
             .file_control_blocks
-            .acquire_parent_oplock_mutation(parent)
+            .acquire_node_oplock_mutation(node)
+    }
+
+    /// Probes existing opens before choosing the create oplock protocol; no share claim is made.
+    /// # Errors
+    /// Returns the current sharing conflict for protocol selection.
+    pub(crate) fn check_existing_create_sharing(
+        &self,
+        node: NodeId,
+        file: KernelFileObject,
+        access: crate::irp::ExistingOperationAccess,
+        sharing: crate::irp::ShareAccess,
+    ) -> DriverResult<()> {
+        self.volume
+            .file_control_blocks
+            .check_existing_create_sharing(node, file, access, sharing)
     }
 
     /// Retains the exact stream already owned by a provisional create claim.
@@ -1263,19 +1278,6 @@ impl MountedVolumeAccess<'_> {
         self.volume
             .file_control_blocks
             .acquire_claimed_oplock_stream_lease(fcb)
-    }
-
-    /// Acquires the mutation grant barrier and check lease for a provisional create claim.
-    /// # Errors
-    ///
-    /// Returns an ownership or finite-counter failure before the break check begins.
-    pub(crate) fn acquire_claimed_oplock_mutation(
-        &self,
-        fcb: NonNull<FileControlBlock>,
-    ) -> DriverResult<(OplockMutationLease, OplockStreamLease)> {
-        self.volume
-            .file_control_blocks
-            .acquire_claimed_oplock_mutation(fcb)
     }
 
     /// Reports whether the exact stream currently permits a new oplock grant.

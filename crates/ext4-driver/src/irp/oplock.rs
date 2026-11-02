@@ -24,7 +24,7 @@ use super::reactor::CompletionOperation;
 use super::reactor::CompletionReactor;
 #[cfg(not(test))]
 use super::scheduler::SlotId;
-use super::{CreateDeletion, OplockCreatePolicy};
+use super::{CreateDeletion, CreateSharingCheck, OplockCreatePolicy};
 #[cfg(not(test))]
 use crate::kernel::fatal::KernelWideInconsistency;
 #[cfg(not(test))]
@@ -159,21 +159,15 @@ impl OplockCheck {
     }
 
     /// Builds the break check selected by an existing-stream create request.
-    /// # Errors
-    ///
-    /// Returns not-supported for policies that require the separate atomic reservation protocol.
     pub(crate) fn create(
         stream: OplockStreamLease,
         policy: OplockCreatePolicy,
-    ) -> Result<Self, DriverError> {
-        let flags = match policy {
-            OplockCreatePolicy::Ordinary => 0,
-            OplockCreatePolicy::CompleteIfOplocked => wdk_sys::OPLOCK_FLAG_COMPLETE_IF_OPLOCKED,
-            OplockCreatePolicy::RequireUnbrokenOplock | OplockCreatePolicy::ReserveFilter => {
-                return Err(DriverError::NotSupported);
-            }
-        };
-        Ok(Self { stream, flags })
+        sharing: CreateSharingCheck,
+    ) -> Self {
+        Self {
+            stream,
+            flags: create_oplock_flags(policy, sharing),
+        }
     }
 
     /// Invokes the native SEH boundary with a stable completion envelope.
@@ -199,6 +193,19 @@ impl OplockCheck {
                 .check_oplock(irp, self.flags, continuation)
         }
     }
+}
+
+/// Sharing is an observation for break selection, never proof that a later open is admissible.
+fn create_oplock_flags(policy: OplockCreatePolicy, sharing: CreateSharingCheck) -> u32 {
+    let completion = match policy {
+        OplockCreatePolicy::CompleteIfOplocked => wdk_sys::OPLOCK_FLAG_COMPLETE_IF_OPLOCKED,
+        _ => 0,
+    };
+    completion
+        | match sharing {
+            CreateSharingCheck::Compatible => 0,
+            CreateSharingCheck::Conflict => wdk_sys::OPLOCK_FLAG_BREAKING_FOR_SHARING_VIOLATION,
+        }
 }
 
 /// Cleanup releases handle byte locks and its oplock outside the actor, retaining IRP ownership.
@@ -924,6 +931,31 @@ mod tests {
     use crate::irp::CreateDeletion;
     use crate::kernel::status::DriverError;
     use ext4_core::DirectoryNodeId;
+
+    /// # Panics
+    /// Fails if a sharing conflict cannot request handle-cache release or nonblocking status is lost.
+    #[test]
+    fn create_break_flags_preserve_sharing_and_completion_semantics() {
+        use crate::irp::{CreateSharingCheck, OplockCreatePolicy};
+        assert_eq!(
+            super::create_oplock_flags(
+                OplockCreatePolicy::Ordinary,
+                CreateSharingCheck::Compatible
+            ),
+            0
+        );
+        assert_eq!(
+            super::create_oplock_flags(OplockCreatePolicy::Ordinary, CreateSharingCheck::Conflict),
+            0x80
+        );
+        assert_eq!(
+            super::create_oplock_flags(
+                OplockCreatePolicy::CompleteIfOplocked,
+                CreateSharingCheck::Conflict
+            ),
+            0x81
+        );
+    }
 
     /// # Panics
     ///
