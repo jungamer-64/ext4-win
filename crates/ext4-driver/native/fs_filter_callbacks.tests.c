@@ -23,11 +23,13 @@
 #define NT_SUCCESS(status) ((status) >= 0)
 #define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS 1
 #define GetExceptionCode() ((NTSTATUS)__exception_code())
+#define FSRTL_FSP_TOP_LEVEL_IRP 1
 
 typedef int NTSTATUS;
 typedef int BOOLEAN;
 typedef void VOID;
 typedef void *PVOID;
+typedef void *PIRP;
 typedef struct { unsigned held; } ERESOURCE, *PERESOURCE;
 typedef struct { PVOID FsContext; } FILE_OBJECT, *PFILE_OBJECT;
 typedef struct { unsigned unused; } DRIVER_OBJECT, *PDRIVER_OBJECT;
@@ -73,6 +75,7 @@ static BOOLEAN paging_available = TRUE;
 static NTSTATUS registration_status;
 static unsigned breaks, projections;
 static NTSTATUS break_status;
+static PIRP top_level, expected_top_level;
 __declspec(dllimport) void __stdcall RaiseException(unsigned, unsigned, unsigned, const unsigned long long *);
 
 static void RtlZeroMemory(PVOID memory, unsigned long long size)
@@ -149,11 +152,14 @@ static void ext4win_trace_status(PEXT4WIN_STREAM_CONTEXT object, unsigned event,
     assert(status == STATUS_SUCCESS || status == STATUS_CANT_WAIT);
 }
 
+static PIRP IoGetTopLevelIrp(void) { return top_level; }
+static void IoSetTopLevelIrp(PIRP value) { top_level = value; }
 static NTSTATUS FsRtlCheckOplockForFsFilterCallback(unsigned *oplock, PVOID input, unsigned flags)
 {
     PFS_FILTER_CALLBACK_DATA data = input;
     assert(oplock == &stream.Header.Oplock && stream.MainResource.held == 1);
     assert(flags == OPLOCK_FLAG_IGNORE_OPLOCK_KEYS);
+    assert(top_level == (expected_top_level == NULL ? (PIRP)FSRTL_FSP_TOP_LEVEL_IRP : expected_top_level));
     assert(data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection);
     assert(data->Parameters.AcquireForSectionSynchronization.PageProtection &
         (PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
@@ -175,6 +181,7 @@ static void invoke(PFS_FILTER_CALLBACK callback, PFS_FILTER_CALLBACK_DATA data,
     PVOID context = data;
     assert(callback != NULL);
     assert(callback(data, supply_context ? &context : NULL) == expected);
+    assert(top_level == expected_top_level);
     if (supply_context) { assert(context == NULL); }
 }
 
@@ -286,6 +293,7 @@ int main(void)
     assert(registered.PostReleaseForModifiedPageWriter == NULL);
     assert(registered.PostAcquireForCcFlush == NULL && registered.PostReleaseForCcFlush == NULL);
     exercise_callbacks(FALSE);
+    top_level = expected_top_level = (PIRP)0x44;
     exercise_callbacks(TRUE);
     registration_status = STATUS_INVALID_PARAMETER;
     assert(ext4win_register_section_callbacks(&driver) == registration_status);

@@ -30,9 +30,14 @@ ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
         ((data->Parameters.AcquireForSectionSynchronization.PageProtection &
             (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0)) {
         NTSTATUS status;
+        PIRP previous = IoGetTopLevelIrp();
+        if (previous == NULL) { IoSetTopLevelIrp((PIRP)FSRTL_FSP_TOP_LEVEL_IRP); }
         __try {
-            status = FsRtlCheckOplockForFsFilterCallback(&stream->Header.Oplock, data,
-                OPLOCK_FLAG_IGNORE_OPLOCK_KEYS);
+            __try {
+                status = FsRtlCheckOplockForFsFilterCallback(&stream->Header.Oplock, data,
+                    OPLOCK_FLAG_IGNORE_OPLOCK_KEYS);
+            }
+            __finally { IoSetTopLevelIrp(previous); }
         }
         __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
             status = GetExceptionCode();
