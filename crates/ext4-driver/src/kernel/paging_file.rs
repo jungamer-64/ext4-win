@@ -33,6 +33,13 @@ pub(crate) struct PagingFileReservation {
     /// Shared Rust lifecycle retained by the constructing FCB lease.
     state: NonNull<PagingFile>,
     /// Address-stable native FCB retained independently by the constructing owner.
+    #[cfg_attr(
+        test,
+        expect(
+            dead_code,
+            reason = "only native activation publishes sizes and flags through the retained header"
+        )
+    )]
     header: NonNull<c_void>,
     /// Initial admission or immutable-prefix extension.
     claim: PagingFileClaim,
@@ -63,7 +70,6 @@ impl PagingFileReservation {
     /// Initial setup must own the unpublished first-open claim and exclude native residency.
     /// # Errors
     /// Rejects competing setup or retirement before acquiring rollback ownership.
-    #[cfg(not(test))]
     #[expect(
         unsafe_code,
         reason = "the caller retains the FCB owner through the returned raw-pointer reservation"
@@ -142,23 +148,15 @@ impl PagingFileReservation {
 }
 
 impl Drop for PagingFileReservation {
-    #[cfg_attr(
-        not(test),
-        expect(
-            unsafe_code,
-            reason = "the enclosing deferred FCB lease remains alive until this reservation has released native admission"
-        )
+    #[expect(
+        unsafe_code,
+        reason = "the enclosing deferred FCB lease remains alive until this reservation has released native admission"
     )]
     fn drop(&mut self) {
         if self.phase == PagingReservationPhase::Reserved {
-            #[cfg(not(test))]
             unsafe {
                 // SAFETY: The deferred FCB lease retains the shared Rust lifecycle through rollback.
                 self.state.as_ref().abort(self.claim);
-            }
-            #[cfg(test)]
-            {
-                let _identity = (self.header, self.state);
             }
         }
     }

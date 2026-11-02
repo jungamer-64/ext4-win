@@ -475,6 +475,11 @@ impl AdmittedOperation {
 /// Multiple request, mount, and checkpoint state machines implement this boundary. The boxed
 /// receiver is an owned continuation, not a `Future`; the reactor never probes it for readiness.
 pub(crate) trait CompletionOperation: fmt::Debug + Send + 'static {
+    /// Names the retained authority required at each physical submission, including retries.
+    #[cfg(not(test))]
+    fn storage_submission_source(&self) -> crate::state::StorageSubmissionSource {
+        crate::state::StorageSubmissionSource::Filesystem
+    }
     /// Consumes this operation and its one concrete event into exactly one scheduler action.
     fn advance(
         self: Box<Self>,
@@ -598,6 +603,11 @@ pub(crate) trait ControlDeviceOperation: fmt::Debug + Send + 'static {
 
 /// Operation payload valid only for a mounted-volume device.
 pub(crate) trait MountedVolumeOperation: fmt::Debug + Send + 'static {
+    /// Ext4 operations use session ownership; direct-volume operations retain their raw owner.
+    #[cfg(not(test))]
+    fn storage_submission_source(&self) -> crate::state::StorageSubmissionSource {
+        crate::state::StorageSubmissionSource::Filesystem
+    }
     /// Consumes one event inside the sole lifetime-bound mounted access scope.
     fn advance_mounted(
         self: Box<Self>,
@@ -1225,11 +1235,12 @@ impl ReactorTarget {
     #[cfg(not(test))]
     fn acquire_storage_submission(
         &mut self,
+        authority: crate::state::StorageSubmissionSource,
     ) -> DriverResult<Option<crate::kernel::stream::StorageSubmissionLease>> {
         match self {
             Self::ControlDevice(_) => Ok(None),
             Self::MountedVolume(binding) => binding
-                .with_access(|access| access.acquire_storage_submission())
+                .with_access(|access| access.authorize_storage_submission(authority))
                 .map(Some),
         }
     }
@@ -4396,7 +4407,9 @@ impl CompletionReactor {
         &self,
         operation: &dyn CompletionOperation,
     ) -> DriverResult<Option<crate::kernel::stream::StorageSubmissionLease>> {
-        let permit = self.with_target(ReactorTarget::acquire_storage_submission)?;
+        let permit = self.with_target(|target| {
+            target.acquire_storage_submission(operation.storage_submission_source())
+        })?;
         if let Some(deadline) = operation.lower_deadline() {
             let now = ext4_core::MmpTime::new(crate::kernel::time::monotonic_millis(), 0);
             if deadline.remaining_millis(now) == 0 {
@@ -4732,8 +4745,13 @@ impl CompletionReactor {
                     );
                 }
                 Ok(StorageCommandStep::Failed(failed)) => {
+                    // Raw volume I/O cannot verify or recover an ended ext4 session, and a
+                    // failed physical operation returns its outcome without automatic replay.
                     let policy = if failed.suspended().cancellation == EffectCancellation::Ownership
-                    {
+                        || matches!(
+                            failed.suspended().operation.storage_submission_source(),
+                            crate::state::StorageSubmissionSource::RawVolume { .. }
+                        ) {
                         StorageRetryPolicy::Never
                     } else {
                         StorageRetryPolicy::Classified

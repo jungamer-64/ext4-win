@@ -484,10 +484,22 @@ impl VolumeRuntime {
     ///
     /// Returns an error when mutations are no longer authorized or ticket allocation overflows.
     pub(crate) fn admit_mutation(&mut self) -> DriverResult<(u64, MutationActivityLease)> {
-        self.require_media_write()?;
+        self.authorize_ownership()?;
+        self.authorize_media_write()?;
         self.admit_key_change()
     }
 
+    /// Checks media policy and reliability without granting ext4-session ownership.
+    /// Raw writes use this only after the mounted lifecycle grants the exact lock owner.
+    /// # Errors
+    /// Returns write protection or the authoritative write-reliability failure.
+    pub(crate) fn authorize_media_write(&self) -> DriverResult<()> {
+        self.failure.authorize_mutation()?;
+        match self.profile.access() {
+            ext4_core::MediaAccess::ReadWrite => Ok(()),
+            ext4_core::MediaAccess::ReadOnly => Err(ext4_core::Error::ReadOnlyFilesystem.into()),
+        }
+    }
 
     /// Admits mount-local key publication without granting any media write authority.
     /// # Errors

@@ -70,11 +70,17 @@ pub(crate) fn set(
 )]
 pub(crate) fn notify_change_directory(
     mut owned: OwnedIrp,
+    access: &MountedVolumeAccess<'_>,
 ) -> crate::irp::reactor::OperationTransition {
     let registration = owned.request().with_active(|active| {
+        let owner = active.current_stack()?.file_object()?.address();
         DirectoryNotificationRequest::decode(active).and_then(|mut request| {
-            let registration = request.registration()?;
             let volume = request.opened_directory().volume();
+            if !access.owns_volume(volume) {
+                return Err(DriverError::InvalidDeviceRequest);
+            }
+            access.authorize_handle(owner)?;
+            let registration = request.registration()?;
             let vcb = unsafe {
                 // SAFETY: OpenedDirectory was decoded from this active pending IRP.
                 volume.as_ref()

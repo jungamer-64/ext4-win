@@ -456,7 +456,7 @@ impl DirectoryChangeNotifier {
             let _context = context;
         }
     }
-    /// Completes all pending directory watches when storage is removed. The notifier remains
+    /// Completes all pending directory watches when filesystem admission terminates. The notifier remains
     /// initialized so later per-handle cleanup is idempotent and final teardown can join it.
     #[cfg_attr(
         not(test),
@@ -465,7 +465,6 @@ impl DirectoryChangeNotifier {
             reason = "the pinned VCB retains FsRtl synchronization while the sole actor withdraws its watches"
         )
     )]
-    #[cfg(not(test))]
     pub(super) fn cleanup_all(&self) {
         #[cfg(not(test))]
         {

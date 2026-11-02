@@ -61,6 +61,10 @@ fn record_cache_coherency_failure(error: DriverError, access: &mut MountedVolume
 macro_rules! impl_mounted_operation_adapter {
     ($operation:ty) => {
         impl CompletionOperation for $operation {
+            #[cfg(not(test))]
+            fn storage_submission_source(&self) -> crate::state::StorageSubmissionSource {
+                MountedVolumeOperation::storage_submission_source(self)
+            }
             fn advance(
                 self: Box<Self>,
                 event: CompletionEvent,
@@ -1692,6 +1696,22 @@ impl RawVolumeOperation {
 }
 
 impl MountedVolumeOperation for RawVolumeOperation {
+    #[cfg(not(test))]
+    fn storage_submission_source(&self) -> crate::state::StorageSubmissionSource {
+        match self.state {
+            RawVolumeOperationState::Transferring { target, .. }
+            | RawVolumeOperationState::Flushing { target, .. } => {
+                crate::state::StorageSubmissionSource::RawVolume {
+                    target,
+                    kind: self.kind,
+                }
+            }
+            _ => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        }
+    }
     fn advance_mounted(
         mut self: Box<Self>,
         event: CompletionEvent,
@@ -2139,7 +2159,7 @@ impl MountedVolumeOperation for NotificationOperation {
     fn advance_mounted(
         mut self: Box<Self>,
         event: CompletionEvent,
-        _access: &mut MountedVolumeAccess<'_>,
+        access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         let event = event.into_core();
         let state = core::mem::replace(&mut self.state, NotificationOperationState::Terminal);
@@ -2148,7 +2168,9 @@ impl MountedVolumeOperation for NotificationOperation {
                 .bugcheck();
         };
         match event {
-            OperationEvent::Admitted => crate::request::file_info::notify_change_directory(owned),
+            OperationEvent::Admitted => {
+                crate::request::file_info::notify_change_directory(owned, access)
+            }
             OperationEvent::CancelRequested => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::from(Error::OperationCancelled))),
             ),
@@ -3280,6 +3302,26 @@ impl OplockContinuation for FlushRequestOperation {
 }
 
 impl MountedVolumeOperation for FlushRequestOperation {
+    #[cfg(not(test))]
+    fn storage_submission_source(&self) -> crate::state::StorageSubmissionSource {
+        match self.state {
+            FlushOperationState::InFlight {
+                scope: crate::state::VolumeFlushScope::RawDevice(target),
+                ..
+            } => crate::state::StorageSubmissionSource::RawVolume {
+                target,
+                kind: RawVolumeOperationKind::Write,
+            },
+            FlushOperationState::InFlight {
+                scope: crate::state::VolumeFlushScope::Filesystem,
+                ..
+            } => crate::state::StorageSubmissionSource::Filesystem,
+            _ => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        }
+    }
     fn advance_mounted(
         mut self: Box<Self>,
         event: CompletionEvent,

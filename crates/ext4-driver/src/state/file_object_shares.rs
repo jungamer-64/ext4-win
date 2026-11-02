@@ -220,6 +220,61 @@ mod tests {
         Ok(())
     }
 
+    /// # Errors
+    /// Returns allocation or paging-reservation admission failure.
+    /// # Panics
+    /// Fails if an unpublished paging reservation admits dismount, or aborted setup leaves it busy.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the isolated ledger and FILE_OBJECT outlive the paging reservation"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible setup surrounds dismount-admission assertions"
+    )]
+    fn paging_setup_excludes_dismount_until_its_reservation_is_aborted() -> DriverResult<()> {
+        let stream = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
+        let mut ledger = FileControlBlockLedger::try_new()?;
+        let fcb = ledger.staged_file_control_block(
+            NonNull::dangling(),
+            &stream,
+            StagedNodeStreamMetadata {
+                node: NodeId::Directory(DirectoryNodeId::ROOT),
+                sizes: StreamSizes::EMPTY,
+            },
+            OperationalTrace::host_test(),
+        )?;
+        let pointer = NonNull::from(fcb.as_ref().get_ref());
+        ledger
+            .table
+            .get_mut()
+            .try_push_owned(fcb)
+            .map_err(|failure| failure.into_parts().0)?;
+        let mut file = FILE_OBJECT::default();
+        // SAFETY: This local FILE_OBJECT outlives the sole reservation.
+        let file = unsafe { KernelFileObject::from_raw(&raw mut file) }
+            .ok_or(DriverError::InvalidParameter)?;
+        assert_eq!(ledger.authorize_dismount(), Ok(()));
+        let fcb = unsafe {
+            // SAFETY: The isolated ledger retains this unpublished stream through reservation drop.
+            pointer.as_ref()
+        };
+        let reservation = unsafe {
+            // SAFETY: This fixture owns first-open setup and retains both the FCB and FILE_OBJECT.
+            fcb.stream_context.reserve_paging_file(file, false)
+        }?;
+        assert_eq!(ledger.authorize_dismount(), Err(DriverError::DeviceBusy));
+        drop(reservation);
+        assert_eq!(ledger.authorize_dismount(), Ok(()));
+        ledger.close(pointer);
+        Ok(())
+    }
+
     /// # Panics
     /// Panics if admission capacity depends on the native subset count or can overflow.
     #[test]

@@ -416,3 +416,208 @@ fn revocation_is_independent_of_reliability_and_rejects_late_completions() {
     assert!(matches!(ownership.next_action(now), Ok(None)));
     assert_eq!(ownership.wakeup(), None);
 }
+
+/// # Errors
+/// Returns fixture mount, native geometry or runtime allocation failure.
+#[expect(
+    unsafe_code,
+    reason = "the caller retains the native device until the binding is dropped"
+)]
+fn binding(
+    disk: &mut Device,
+    native: &mut wdk_sys::DEVICE_OBJECT,
+) -> crate::kernel::status::DriverResult<crate::state::MountedVolumeBinding> {
+    use crate::kernel::storage::{LowerStorageDevice, MountedStorage};
+    // SAFETY: The caller retains this native fixture until all mounted state is released.
+    let device = unsafe { crate::state::KernelDevice::from_raw(core::ptr::from_mut(native)) }
+        .ok_or(DriverError::InvalidParameter)?;
+    let lower = LowerStorageDevice::from_device(
+        device,
+        DeviceLength::from_bytes(
+            u64::try_from(disk.filesystem.len()).map_err(|_| DriverError::InvalidParameter)?,
+        ),
+    )?;
+    let mut catalog = crate::identity::IdentityCatalog::empty();
+    crate::state::MountedVolumeBinding::from_completed_mount(
+        disk.mount()?,
+        MountedStorage::primary(device, lower),
+        crate::kernel::operational_trace::OperationalTrace::host_test(),
+        catalog.directory_mut(),
+    )
+}
+
+/// # Errors
+/// Returns independent mount-fixture or close-preparation failure.
+/// # Panics
+/// Fails if a real writeback failure reopens the session or preserves paging admission.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the local FILE_OBJECT outlives its mounted close preparation"
+)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fallible setup precedes terminal writeback assertions"
+)]
+fn unreliable_writeback_terminates_close_preparation() -> crate::kernel::status::DriverResult<()> {
+    let mut disk = Device::fixture()?;
+    let mut native = wdk_sys::DEVICE_OBJECT {
+        SectorSize: 512,
+        Flags: wdk_sys::DO_DIRECT_IO,
+        ..wdk_sys::DEVICE_OBJECT::default()
+    };
+    let mut binding = binding(&mut disk, &mut native)?;
+    let mut file = wdk_sys::FILE_OBJECT::default();
+    // SAFETY: The local FILE_OBJECT remains live until the preparation is consumed.
+    let owner = unsafe { crate::state::KernelFileObject::from_raw(&raw mut file) }
+        .ok_or(DriverError::InvalidParameter)?;
+    binding.with_access(|access| {
+        let preparation =
+            access.prepare_volume_close(crate::state::VolumeCloseTarget::Dismount(owner))?;
+        access.record_cache_writeback_failure(wdk_sys::STATUS_IO_DEVICE_ERROR);
+        access.fail_volume_close_preparation(
+            preparation,
+            DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_DEVICE_ERROR),
+        );
+        assert_eq!(access.ensure_mounted(), Err(DriverError::VolumeDismounted));
+        assert_eq!(
+            access.storage_access().authorize_paging(),
+            Err(DriverError::VolumeDismounted)
+        );
+        Ok(())
+    })
+}
+
+/// Decodes the same direct-volume identity that an original IRP retains through submission.
+/// # Errors
+/// Returns invalid fixture contexts or native IRP decoding failure.
+#[expect(
+    unsafe_code,
+    reason = "the test retains its binding, FILE_OBJECT and CCB until every captured identity is consumed"
+)]
+fn raw_target(
+    binding: &mut crate::state::MountedVolumeBinding,
+    file: &mut wdk_sys::FILE_OBJECT,
+    handle: &mut crate::state::OpenedVolumeHandle,
+) -> crate::kernel::status::DriverResult<crate::state::RawVolumeTarget> {
+    let volume = binding.with_access(|access| access.file_object_owner());
+    // SAFETY: The binding retains its pinned VCB throughout this fixture.
+    let stream = unsafe { &volume.as_ref().stream_context };
+    file.FsContext = stream.header().as_ptr();
+    file.FsContext2 = core::ptr::from_mut(handle).cast();
+    file.SectionObjectPointer = stream.section_objects()?.as_ptr();
+    file.Flags |= wdk_sys::FO_VOLUME_OPEN;
+    let mut device = wdk_sys::DEVICE_OBJECT::default();
+    let mut stack = wdk_sys::IO_STACK_LOCATION {
+        FileObject: core::ptr::from_mut(file),
+        ..wdk_sys::IO_STACK_LOCATION::default()
+    };
+    let mut irp = wdk_sys::IRP::default();
+    irp.Tail
+        .Overlay
+        .__bindgen_anon_2
+        .__bindgen_anon_1
+        .CurrentStackLocation = &raw mut stack;
+    let mut received = unsafe {
+        // SAFETY: All IRP and stack storage outlives this synchronous decode.
+        crate::irp::ReceivedIrp::decode(&raw mut device, &raw mut irp)
+    }?;
+    received.with_active(|active| {
+        Ok(
+            crate::state::OpenedVolume::decode(active.current_stack()?.file_object()?)?
+                .raw_target(),
+        )
+    })
+}
+
+/// # Errors
+/// Returns independent fixture, close-protocol or raw-submission failure.
+/// # Panics
+/// Fails if ended ext4 ownership blocks a retained raw owner, or unlock preserves its authority.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fallible fixture and protocol execution surround authority assertions"
+)]
+fn dismount_retains_raw_submissions_without_restoring_filesystem_ownership()
+-> crate::kernel::status::DriverResult<()> {
+    use crate::state::{
+        MountedVolumeState, OpenedVolumeHandle, RawVolumeAccess, RawVolumeOperationKind,
+        StorageSubmissionSource, VolumeFlushScope,
+    };
+    let mut disk = Device::fixture()?;
+    let mut native = wdk_sys::DEVICE_OBJECT {
+        SectorSize: 512,
+        Flags: wdk_sys::DO_DIRECT_IO,
+        ..wdk_sys::DEVICE_OBJECT::default()
+    };
+    let mut binding = binding(&mut disk, &mut native)?;
+    let mut file = wdk_sys::FILE_OBJECT::default();
+    let mut handle = OpenedVolumeHandle::new(RawVolumeAccess::ReadWrite);
+    let target = raw_target(&mut binding, &mut file, &mut handle)?;
+    // This fixture begins with the exclusive raw lock already held.
+    binding.actor.volume_control.state = MountedVolumeState::Locked {
+        owner: target.owner(),
+    };
+    let (transition, mut close) = binding.with_access(|access| {
+        let preparation = access
+            .prepare_volume_close(crate::state::VolumeCloseTarget::Dismount(target.owner()))?;
+        access.fail_volume_close_preparation(
+            preparation,
+            DriverError::CacheManagerFailure(wdk_sys::STATUS_USER_MAPPED_FILE),
+        );
+        assert_eq!(access.authorize_handle(target.owner()), Ok(()));
+        let preparation = access
+            .prepare_volume_close(crate::state::VolumeCloseTarget::Dismount(target.owner()))?;
+        assert!(access.prepare_close_writeback(&preparation)?.is_empty());
+        let transition = access.seal_volume_close(preparation)?;
+        let close = Box::try_new(CleanCloseOperation::new(access.mounted_profile()))
+            .map_err(|_| DriverError::InsufficientResources)?;
+        Ok::<_, DriverError>((
+            transition,
+            access.start_clean_close(close, ext4_core::Ext4Timestamp::from_seconds(900)),
+        ))
+    })?;
+    let durability = loop {
+        close = match close {
+            CleanCloseTransition::SubmitLower { request, suspended } => {
+                drop(binding.with_access(|access| {
+                    access.authorize_storage_submission(StorageSubmissionSource::Filesystem)
+                })?);
+                suspended.advance(OperationEvent::StorageCompleted(disk.complete(request)?))
+            }
+            CleanCloseTransition::Complete(result) => break result?,
+        };
+    };
+    binding.with_access(|access| access.request_mmp_close(durability))?;
+    binding.with_access(|access| {
+        let _durability = access.finish_mmp_close()?;
+        access.publish_volume_state_transition(transition)?;
+        assert!(matches!(
+            access.authorize_storage_submission(StorageSubmissionSource::Filesystem),
+            Err(DriverError::FileClosed)
+        ));
+        for kind in [RawVolumeOperationKind::Read, RawVolumeOperationKind::Write] {
+            drop(
+                access.authorize_storage_submission(StorageSubmissionSource::RawVolume {
+                    target,
+                    kind,
+                })?,
+            );
+        }
+        assert!(matches!(
+            access.volume_flush_scope(target)?,
+            VolumeFlushScope::RawDevice(_)
+        ));
+        access.unlock_volume(target.owner())?;
+        assert!(matches!(
+            access.authorize_storage_submission(StorageSubmissionSource::RawVolume {
+                target,
+                kind: RawVolumeOperationKind::Write,
+            }),
+            Err(DriverError::AccessDenied)
+        ));
+        Ok::<_, DriverError>(())
+    })?;
+    Ok(())
+}

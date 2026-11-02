@@ -29,7 +29,7 @@ impl MediaState {
     }
 }
 
-/// Filesystem admission while a terminal close drains writeback.
+/// Reversible writeback exclusion followed by terminal paging sealing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(super) enum ClosePhase {
@@ -95,7 +95,7 @@ pub(super) struct StorageAdmission {
     pub(super) reliability: IoReliabilityObservation,
     /// Monotonic media revocation.
     media: AtomicU8,
-    /// One-way filesystem close admission.
+    /// Reversible writeback exclusion followed by terminal filesystem sealing.
     close: AtomicU8,
     /// Independent reversible create exclusion.
     query: AtomicU8,
@@ -247,7 +247,7 @@ impl StorageAdmission {
         self.key_removal.store(false, Ordering::Release);
     }
 
-    /// Claims close writeback exactly once without restoring revoked media.
+    /// Claims the sole writeback exclusion without restoring revoked media.
     pub(super) fn begin_close(&self) -> bool {
         self.media() == MediaState::Present
             && self
@@ -265,6 +265,18 @@ impl StorageAdmission {
     pub(super) fn seal_close(&self) {
         self.close
             .store(ClosePhase::Sealed.raw(), Ordering::Release);
+    }
+
+    /// Only unsealed cache preparation can restore ordinary admission.
+    pub(super) fn abort_close(&self) -> bool {
+        self.close
+            .compare_exchange(
+                ClosePhase::Writeback.raw(),
+                ClosePhase::Open.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Claims the sole reversible preparation.

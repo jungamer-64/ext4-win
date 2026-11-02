@@ -546,7 +546,7 @@ impl VolumeStorageAccess {
         }
     }
 
-    /// Claims the one-way writeback phase.
+    /// Claims reversible cache writeback before terminal paging sealing.
     /// # Errors
     /// Returns media revocation or repeated terminal close rejection.
     pub(crate) fn begin_close_writeback(self) -> DriverResult<()> {
@@ -561,6 +561,14 @@ impl VolumeStorageAccess {
     /// Seals new paging while owner-driven lower flush retains its independent media capability.
     pub(crate) fn seal_close_writeback(self) {
         self.state().seal_close();
+    }
+
+    /// Consumes only unsealed writeback exclusion, preserving independent admission gates.
+    pub(crate) fn abort_close_writeback(self) {
+        if !self.state().abort_close() {
+            crate::kernel::fatal::KernelWideInconsistency::mounted_volume_state_corruption()
+                .bugcheck();
+        }
     }
 
     /// Paging is admitted through writeback and rejected after sealing.
@@ -888,15 +896,10 @@ impl StreamContext {
             {
                 return Err(DriverError::InvalidParameter);
             }
-            let state = self.paging_state().ok_or(DriverError::InvalidParameter)?;
-            // SAFETY: The caller's deferred FCB lease retains state and header through consumption.
-            unsafe { PagingFileReservation::acquire(state, self.header, file, extension) }
         }
-        #[cfg(test)]
-        {
-            let _inputs = (file, extension);
-            Err(DriverError::NotSupported)
-        }
+        let state = self.paging_state().ok_or(DriverError::InvalidParameter)?;
+        // SAFETY: The caller's deferred FCB lease retains state and header through consumption.
+        unsafe { PagingFileReservation::acquire(state, self.header(), file, extension) }
     }
 
     /// Returns the acknowledged direct-I/O prefix, independently of logical EOF.
@@ -2681,6 +2684,10 @@ mod tests {
         storage.begin_close_writeback()?;
         assert_eq!(storage.authorize_create(), Err(DriverError::AccessDenied));
         assert_eq!(storage.authorize_paging(), Ok(()));
+        storage.abort_close_writeback();
+        assert_eq!(storage.authorize_create(), Ok(()));
+        assert_eq!(storage.authorize_paging(), Ok(()));
+        storage.begin_close_writeback()?;
         storage.seal_close_writeback();
         assert_eq!(
             storage.authorize_paging(),

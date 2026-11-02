@@ -447,15 +447,22 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         return;
     };
 
-    let closing = MountedVolumeState::Locked { owner }.begin_dismount(owner);
+    let preparation = MountedVolumeState::Locked { owner }.prepare_dismount(owner);
     assert_eq!(
-        closing,
-        Ok(MountedVolumeState::Closing {
+        preparation,
+        Ok(MountedVolumeState::PreparingClose {
             terminal: CleanCloseTerminal::Dismount,
             lock_owner: Some(owner)
         })
     );
-    let Ok(closing) = closing else {
+    let Ok(preparation) = preparation else {
+        return;
+    };
+    assert_eq!(
+        preparation.abort_close(CleanCloseTerminal::Dismount),
+        Some(MountedVolumeState::Locked { owner })
+    );
+    let Some(closing) = preparation.seal_close(CleanCloseTerminal::Dismount) else {
         return;
     };
     assert_eq!(closing.ensure_mounted(), Ok(()));
@@ -484,7 +491,7 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         Err(DriverError::VolumeDismounted)
     );
     assert_eq!(
-        dismounted.begin_dismount(owner),
+        dismounted.prepare_dismount(owner),
         Err(DriverError::VolumeDismounted)
     );
     assert_eq!(dismounted.unlock(competing), Err(DriverError::NotLocked));

@@ -1986,6 +1986,26 @@ impl FileControlBlockLedger {
         self.prepare_stream_cache_snapshot(StreamCacheSnapshotPurpose::VolumeLock)
     }
 
+    /// Paging-file setup, active use and retirement exclude forced filesystem dismount.
+    /// The actor checks again after earlier mutation work drains, before cache writeback.
+    /// # Errors
+    /// Returns device busy while Memory Manager can retain a paging-file mapping.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger resource retains every FCB while its shared paging lifecycle is observed"
+    )]
+    pub(super) fn authorize_dismount(&self) -> DriverResult<()> {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger resource retains the table and each FCB until this observation ends.
+            &*self.table.get()
+        };
+        if table.iter().any(|fcb| fcb.is_paging_file()) {
+            return Err(DriverError::DeviceBusy);
+        }
+        Ok(())
+    }
+
     /// Retains every resident stream, including active handles, through volume cache writeback.
     /// # Errors
     /// Returns snapshot allocation or deferred-lease capacity failure.
