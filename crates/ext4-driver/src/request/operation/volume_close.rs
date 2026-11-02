@@ -131,6 +131,9 @@ impl VolumeCloseOperation {
         error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        access
+            .operational_trace()
+            .record_status(OperationalPath::VolumeClose, error.ntstatus());
         record_cache_coherency_failure(error, access);
         access.fail_volume_close_preparation(preparation, error);
         OperationTransition::Complete(owned.prepare_result(Err(error)))
@@ -143,6 +146,9 @@ impl VolumeCloseOperation {
         error: DriverError,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
+        access
+            .operational_trace()
+            .record_status(OperationalPath::VolumeClose, error.ntstatus());
         record_cache_coherency_failure(error, access);
         access.fail_volume_state_transition(transition, error);
         OperationTransition::Complete(owned.prepare_result(Err(error)))
@@ -172,6 +178,9 @@ impl VolumeCloseOperation {
             let transition = match access.seal_volume_close(preparation) {
                 Ok(transition) => transition,
                 Err(error) => {
+                    access
+                        .operational_trace()
+                        .record_status(OperationalPath::VolumeClose, error.ntstatus());
                     return OperationTransition::Complete(owned.prepare_result(Err(error)));
                 }
             };
@@ -209,6 +218,9 @@ impl VolumeCloseOperation {
                 }
             }
             CleanCloseTransition::Complete(Ok(durability)) => {
+                access
+                    .operational_trace()
+                    .record_status(OperationalPath::VolumeCloseDurability, STATUS_SUCCESS);
                 if let Err(error) = access.request_mmp_close(durability) {
                     return Self::fail(owned, transition, error, access);
                 }
@@ -248,9 +260,16 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                 CloseState::Ready { owned, close },
                 CompletionEvent::Core(OperationEvent::Admitted),
             ) => {
+                let trace = access.operational_trace();
+                trace.record(
+                    OperationalPath::VolumeClose,
+                    STATUS_SUCCESS,
+                    OperationalOutcome::Selected,
+                );
                 let preparation = match access.prepare_volume_close(self.target) {
                     Ok(preparation) => preparation,
                     Err(error) => {
+                        trace.record_status(OperationalPath::VolumeClose, error.ntstatus());
                         return OperationTransition::Complete(owned.prepare_result(Err(error)));
                     }
                 };
@@ -326,6 +345,11 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     Ok(now) => now,
                     Err(error) => return Self::fail(owned, transition, error, access),
                 };
+                access.operational_trace().record(
+                    OperationalPath::VolumeCloseDurability,
+                    STATUS_SUCCESS,
+                    OperationalOutcome::Selected,
+                );
                 let close = access.start_clean_close(close, now);
                 self.drive(owned, transition, close, access)
             }
@@ -359,6 +383,9 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     MountedVolumeDevice::unregister_shutdown_notification(self.device);
                     MountedVolumeDevice::complete_dismount(self.device);
                 }
+                access
+                    .operational_trace()
+                    .record_result(OperationalPath::VolumeClose, &result);
                 let dismounted =
                     result.is_ok() && self.target.terminal() == CleanCloseTerminal::Dismount;
                 let mut completion = owned.prepare_result(result.map(|()| IrpCompletion::EMPTY));

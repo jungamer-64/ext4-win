@@ -81,6 +81,10 @@ pub(crate) enum OperationalPath {
     VpbRetirement,
     /// DriverUnload reached its final provider-unregister boundary; no later event is guaranteed.
     DriverUnload,
+    /// Terminal filesystem close from reversible preparation through state publication.
+    VolumeClose,
+    /// Clean-marker durability after paging and admitted mutation drain.
+    VolumeCloseDurability,
 }
 
 impl OperationalPath {
@@ -113,6 +117,8 @@ impl OperationalPath {
             Self::VolumeRetirement => contract::TRACE_EVENT_VOLUME_RETIREMENT,
             Self::VpbRetirement => contract::TRACE_EVENT_VPB_RETIREMENT,
             Self::DriverUnload => contract::TRACE_EVENT_DRIVER_UNLOAD,
+            Self::VolumeClose => contract::TRACE_EVENT_VOLUME_CLOSE,
+            Self::VolumeCloseDurability => contract::TRACE_EVENT_VOLUME_CLOSE_DURABILITY,
         }
     }
 }
@@ -389,6 +395,8 @@ mod tests {
             OperationalPath::VolumeRetirement,
             OperationalPath::VpbRetirement,
             OperationalPath::DriverUnload,
+            OperationalPath::VolumeClose,
+            OperationalPath::VolumeCloseDurability,
         ];
         for (index, event) in events.iter().enumerate() {
             assert_ne!(event.event_id(), 0);

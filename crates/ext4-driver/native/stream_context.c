@@ -840,7 +840,11 @@ ext4win_stream_cache_close_writeback(_In_ PVOID stream_header)
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
     NTSTATUS status = STATUS_SUCCESS;
     if (stream == NULL) { return STATUS_INVALID_PARAMETER; }
-    if (!ext4win_stream_storage_available(stream)) { return STATUS_DEVICE_REMOVED; }
+    ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHE_CLOSE_WRITEBACK);
+    if (!ext4win_stream_storage_available(stream)) {
+        ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHE_CLOSE_WRITEBACK, STATUS_DEVICE_REMOVED);
+        return STATUS_DEVICE_REMOVED;
+    }
     (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
     __try {
         if (!ext4win_stream_storage_available(stream)) { status = STATUS_DEVICE_REMOVED; }
@@ -850,6 +854,7 @@ ext4win_stream_cache_close_writeback(_In_ PVOID stream_header)
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) { status = GetExceptionCode(); }
     wdk_sys_release_resource(&stream->MainResource);
+    ext4win_trace_status(stream, EXT4WIN_TRACE_EVENT_CACHE_CLOSE_WRITEBACK, status);
     return status;
 }
 
