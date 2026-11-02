@@ -11,7 +11,13 @@ NTSTATUS ext4win_notify_volume_mount(_In_ PDEVICE_OBJECT device)
     __try {
         file = IoCreateStreamFileObjectLite(NULL, device);
         if (file == NULL) { status = STATUS_INSUFFICIENT_RESOURCES; }
-        else { status = FsRtlNotifyVolumeEvent(file, FSRTL_VOLUME_MOUNT); }
+        else {
+            /* The pending mount IRP retains this device's original VPB through delivery.
+             * Stream creation already acquired its reference but leaves the association unset.
+             * Attach it before notification or release so I/O Manager destruction balances it. */
+            file->Vpb = device->Vpb;
+            status = FsRtlNotifyVolumeEvent(file, FSRTL_VOLUME_MOUNT);
+        }
     }
     __except (FsRtlIsNtstatusExpected(GetExceptionCode())
         ? EXCEPTION_EXECUTE_HANDLER : EXCEPTION_CONTINUE_SEARCH) {
