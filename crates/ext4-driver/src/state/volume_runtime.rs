@@ -488,20 +488,6 @@ impl VolumeRuntime {
         self.admit_key_change()
     }
 
-    /// Requires the session's fixed media authority independently of runtime health.
-    /// # Errors
-    /// Returns write protection for a read-only mount.
-    pub(crate) fn require_media_write(&self) -> DriverResult<()> {
-        self.authorize_ownership()?;
-        self.failure.authorize_mutation()?;
-        self.authorize_ownership()?;
-        match self.profile.access() {
-            ext4_core::MediaAccess::ReadWrite => Ok(()),
-            ext4_core::MediaAccess::ReadOnly => {
-                Err(DriverError::from(ext4_core::Error::ReadOnlyFilesystem))
-            }
-        }
-    }
 
     /// Admits mount-local key publication without granting any media write authority.
     /// # Errors

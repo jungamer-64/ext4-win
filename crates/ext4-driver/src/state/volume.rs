@@ -737,19 +737,6 @@ impl MountedVolumeAccess<'_> {
         }
     }
 
-    /// Retains one same-thread lower-submission permit through IoCallDriver's return.
-    /// # Errors
-    ///
-    /// Returns revoked MMP ownership or device removal before another lower transfer can start.
-    #[cfg(not(test))]
-    pub(crate) fn acquire_storage_submission(
-        &mut self,
-    ) -> DriverResult<crate::kernel::stream::StorageSubmissionLease> {
-        self.runtime.require_media_ownership()?;
-        let permit = self.storage_access().acquire_submission()?;
-        self.runtime.require_media_ownership()?;
-        Ok(permit)
-    }
 
     /// Reconciles the dispatch-published revocation on the sole actor. Surprise removal retains
     /// the device even without handles until final REMOVE arrives. Existing sections and lower
@@ -1064,30 +1051,6 @@ impl MountedVolumeAccess<'_> {
         Ok(())
     }
 
-    /// Closes ordinary/native cache admission while preserving paging writeback until sealing.
-    /// The returned transition has one completion owner and cannot reopen the volume on failure.
-    /// # Errors
-    /// Returns lifecycle, storage or durability failure before the one-way transition.
-    pub(crate) fn begin_volume_close(
-        &mut self,
-        terminal: CleanCloseTerminal,
-        owner: Option<KernelFileObject>,
-    ) -> DriverResult<PreparedVolumeStateTransition> {
-        self.authorize_storage()?;
-        self.authorize_durability()?;
-        let state = match terminal {
-            CleanCloseTerminal::Dismount => self
-                .volume_control
-                .state
-                .begin_dismount(owner.ok_or(DriverError::InvalidParameter)?)?,
-            CleanCloseTerminal::Shutdown => self.volume_control.state.begin_shutdown()?,
-        };
-        self.storage_access().begin_close_writeback()?;
-        self.volume_control.state = state;
-        Ok(PreparedVolumeStateTransition {
-            kind: PreparedVolumeStateTransitionKind::CleanClose { terminal },
-        })
-    }
 
     /// Captures every resident inode stream after admission has excluded new cache owners.
     /// # Errors
@@ -1096,10 +1059,6 @@ impl MountedVolumeAccess<'_> {
         self.volume.file_control_blocks.prepare_cache_writeback()
     }
 
-    /// Revokes new paging mutations before waiting for admitted writeback to drain.
-    pub(crate) fn seal_close_writeback(&self) {
-        self.storage_access().seal_close_writeback();
-    }
 
     /// Publishes one previously validated lifecycle transition after its barrier succeeds.
     /// # Errors
