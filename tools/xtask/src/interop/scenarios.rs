@@ -2378,6 +2378,9 @@ fn verify_linux_generated_journal_case(
     run_checked(mke2fs, &format!("mke2fs for {}", case.name()))?;
 
     let journal_block_sequence = debugfs_block_sequence(linux, &image_tool_path, "blocks <8>")?;
+    if journal_block_sequence.is_empty() {
+        return Err(io::Error::other("internal journal has no allocated blocks").into());
+    }
     let journal_blocks = journal_block_sequence
         .iter()
         .copied()
@@ -2511,29 +2514,39 @@ fn primary_recovery_marker(image: &Path) -> TaskResult<bool> {
 ///
 /// # Errors
 ///
-/// Returns an error when debugfs fails, emits non-UTF-8 output, or no numeric block is found.
+/// Returns an error when debugfs fails, reports a diagnostic, or emits malformed block numbers.
+/// Empty files can have no allocated blocks; callers enforce any required allocation bound.
 fn debugfs_block_sequence(
     linux: LinuxEnvironment,
     image: &str,
     request: &str,
 ) -> TaskResult<Vec<u64>> {
-    let mut command = linux.command("debugfs");
+    let mut command = linux.command_with_environment("debugfs", "LC_ALL", "C");
     command.args(["-R", request, image]);
-    let output = run_checked_output(command, "debugfs journal block query")?;
-    let stdout = String::from_utf8(output.stdout)?;
-    let blocks = stdout
-        .split_ascii_whitespace()
-        .filter_map(|token| token.parse::<u64>().ok())
-        .collect::<Vec<_>>();
-    if blocks.is_empty() {
-        Err(io::Error::other(format!(
-            "debugfs returned no journal blocks: {}",
-            stdout.trim()
+    let output = run_checked_output(command, "debugfs block query")?;
+    decode_debugfs_block_sequence(&output.stdout, &output.stderr)
+}
+
+/// An empty block list is an allocation observation only after a diagnostic-free query.
+/// # Errors
+/// Rejects missing startup evidence, tool diagnostics, non-UTF-8 output, and nonnumeric tokens.
+fn decode_debugfs_block_sequence(stdout: &[u8], stderr: &[u8]) -> TaskResult<Vec<u64>> {
+    let diagnostic_text = core::str::from_utf8(stderr)?;
+    let mut diagnostics = diagnostic_text.lines();
+    if !diagnostics
+        .next()
+        .is_some_and(|line| line.starts_with("debugfs "))
+        || diagnostics.next().is_some()
+    {
+        return Err(io::Error::other(format!(
+            "debugfs block query did not complete without diagnostics: {diagnostic_text}"
         ))
-        .into())
-    } else {
-        Ok(blocks)
+        .into());
     }
+    core::str::from_utf8(stdout)?
+        .split_ascii_whitespace()
+        .map(|token| token.parse::<u64>().map_err(Into::into))
+        .collect()
 }
 
 /// Returns one payload count that crosses exactly one descriptor-capacity boundary.
@@ -4542,6 +4555,48 @@ fn verify_locked_directory_enumeration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// # Errors
+    /// Returns a rejected independent block-list transcript.
+    /// # Panics
+    /// Fails if valid empty allocation or ordered physical blocks cannot be observed.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "independent transcripts verify allocation observations rather than parser setup"
+    )]
+    fn block_queries_preserve_empty_and_ordered_allocation() -> TaskResult<()> {
+        let banner = b"debugfs 1.47.2 (1-Jan-2025)\n";
+        assert!(decode_debugfs_block_sequence(b"\n", banner)?.is_empty());
+        assert_eq!(
+            decode_debugfs_block_sequence(b"123 456 124 \n", banner)?,
+            vec![123, 456, 124]
+        );
+        Ok(())
+    }
+
+    /// # Panics
+    /// Fails if failed lookups, partial output, or unrepresentable block numbers establish allocation.
+    #[test]
+    fn block_queries_reject_incomplete_observations() {
+        let banner = b"debugfs 1.47.2 (1-Jan-2025)\n";
+        for (stdout, stderr) in [
+            (b"".as_slice(), b"".as_slice()),
+            (
+                b"\n",
+                b"debugfs 1.47.2 (1-Jan-2025)\n/file: File not found by ext2_lookup \n",
+            ),
+            (
+                b"123\n",
+                b"debugfs 1.47.2 (1-Jan-2025)\nblocks: Input/output error\n",
+            ),
+            (b"123 invalid 456\n", banner.as_slice()),
+            (b"18446744073709551616\n", banner),
+            (b"\xff", banner),
+        ] {
+            assert!(decode_debugfs_block_sequence(stdout, stderr).is_err());
+        }
+    }
 
     /// An empty listing or a failed read cannot substitute for an explicit missing-key result.
     ///
