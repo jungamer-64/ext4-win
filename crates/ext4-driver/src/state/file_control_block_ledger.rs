@@ -332,6 +332,13 @@ pub(crate) struct OplockMutationLease {
     node: NodeId,
 }
 
+impl OplockMutationLease {
+    /// Whether this grant exclusion covers the directory whose enumeration will change.
+    pub(crate) fn covers_parent(&self, parent: DirectoryNodeId) -> bool {
+        self.node == NodeId::Directory(parent)
+    }
+}
+
 impl OplockStreamLease {
     /// Reports whether this lease retains the exact provisional create claim's FCB.
     pub(crate) fn identifies(&self, fcb: NonNull<FileControlBlock>) -> bool {

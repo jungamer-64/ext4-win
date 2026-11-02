@@ -3982,6 +3982,8 @@ enum CheckpointIoPhase {
 /// Resolver continuation selected after an FsRtl oplock conflict boundary returns the IRP.
 #[derive(Debug)]
 enum OplockResume {
+    /// Rebuild actual metadata changes after checking one affected parent directory.
+    RestartMetadataMutation,
     /// An ordinary handle mutation continues the exact resolver that preceded its break check.
     ContinueResolution {
         /// Immutable epoch retained through a possible oplock wait.
@@ -4318,6 +4320,8 @@ struct MutationRequestOperation {
     cleanup_parent_oplock: crate::memory::DriverVec<CleanupParentOplockAuthority>,
     /// Parent-directory authority retained for create or set-information namespace mutation.
     namespace_oplocks: Option<NamespaceOplockAuthority>,
+    /// Checked parent exclusions for actual metadata changes, retained through publication.
+    metadata_oplocks: crate::memory::DriverVec<crate::state::OplockMutationLease>,
     /// Fully allocated disposition state retained while its native preflight runs.
     disposition_deletion: Option<crate::request::file_info::PendingDispositionDeletion>,
     /// Fully allocated existing-node create retained while its native write-open check runs.
@@ -4637,6 +4641,7 @@ impl MutationRequestOperation {
                     cleanup_deletion: None,
                     cleanup_parent_oplock: crate::memory::DriverVec::new(),
                     namespace_oplocks: None,
+                    metadata_oplocks: crate::memory::DriverVec::new(),
                     disposition_deletion: None,
                     pending_existing_create: None,
                     write_open: None,
@@ -5613,6 +5618,37 @@ impl MutationRequestOperation {
                     return self.restart_resolution(owned, None, None, operations);
                 }
                 Ok(DriverResolveDisposition::Mutation(prepared)) => {
+                    while let Some(parent) = crate::state::DirectoryChange::uncovered_parent(
+                        prepared.changes.as_slice(),
+                        self.metadata_oplocks.as_slice(),
+                    ) {
+                        let (mutation, stream) = match operations
+                            .acquire_parent_oplock_mutation(parent)
+                        {
+                            Ok(pair) => pair,
+                            Err(error) => {
+                                return MutationStep::Transition(self.complete_error(owned, error));
+                            }
+                        };
+                        if let Err(error) = self.metadata_oplocks.try_push_owned(mutation) {
+                            return MutationStep::Transition(
+                                self.complete_error(owned, error.into_parts().0),
+                            );
+                        }
+                        if let Some(stream) = stream {
+                            drop(pass);
+                            drop(size_changes);
+                            drop(deletion);
+                            self.state = MutationOperationState::OplockDelegated {
+                                resume: OplockResume::RestartMetadataMutation,
+                            };
+                            return MutationStep::Transition(OperationTransition::CheckOplock {
+                                check: OplockCheck::parent_change(stream),
+                                owned,
+                                suspended: self,
+                            });
+                        }
+                    }
                     let claim_valid = match &prepared.effect {
                         PendingDriverEffect::PagingStep(_) => self.paging.is_some(),
                         PendingDriverEffect::ExistingCreate => {
@@ -6417,6 +6453,12 @@ impl MutationRequestOperation {
                     }
                 };
                 match resume {
+                    OplockResume::RestartMetadataMutation => {
+                        if let Some(error) = oplock_error {
+                            return MutationStep::Transition(self.complete_error(owned, error));
+                        }
+                        self.restart_resolution(owned, None, None, access)
+                    }
                     OplockResume::ContinueResolution { epoch, resolve } => {
                         if let Some(error) = oplock_error {
                             if self.request.kind() != MutationRequestKind::CleanupDeletion {
@@ -7143,6 +7185,7 @@ impl PreparedPublication for MutationRequestOperation {
                 drop(self.oplock_mutation.take());
                 while self.cleanup_parent_oplock.pop().is_some() {}
                 drop(self.namespace_oplocks.take());
+                while self.metadata_oplocks.pop().is_some() {}
                 if let PreparedMutationRequest::Verity(preparation) = &mut self.request {
                     drop(core::mem::replace(
                         preparation,

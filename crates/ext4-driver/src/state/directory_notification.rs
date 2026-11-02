@@ -74,6 +74,20 @@ pub(crate) struct DirectoryChange {
 }
 
 impl DirectoryChange {
+    /// Selects an enumeration change whose parent still needs a checked grant exclusion.
+    pub(crate) fn uncovered_parent(
+        changes: &[Self],
+        exclusions: &[OplockMutationLease],
+    ) -> Option<DirectoryNodeId> {
+        changes
+            .iter()
+            .map(|change| match change.path.steps.as_slice().first() {
+                Some(DirectoryNotificationStep::Direct { parent, .. }) => *parent,
+                _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+            })
+            .find(|parent| !exclusions.iter().any(|held| held.covers_parent(*parent)))
+    }
+
     /// Captures cache data before mutation; publication remains tied to this durable event.
     /// # Errors
     /// Returns namespace metadata, encoding or allocation failures before staging writes.
@@ -593,7 +607,12 @@ struct DirectoryNotificationPath {
 #[derive(Debug)]
 enum DirectoryNotificationStep {
     /// No traversal beyond the directory whose open handle owns the watch.
-    Direct(DirectoryNotificationTarget),
+    Direct {
+        /// Identity from which the immutable direct-child name projection derives.
+        parent: DirectoryNodeId,
+        /// Synthetic path rooted at this exact parent.
+        target: DirectoryNotificationTarget,
+    },
     /// Reaching the change from this enclosing anchor crosses another directory.
     Crossed {
         /// Synthetic name for this exact watched-directory identity.
@@ -607,7 +626,7 @@ impl DirectoryNotificationStep {
     /// Borrows the anchored name without granting traversal authority.
     fn target(&self) -> &DirectoryNotificationTarget {
         match self {
-            Self::Direct(target) | Self::Crossed { target, .. } => target,
+            Self::Direct { target, .. } | Self::Crossed { target, .. } => target,
         }
     }
 }
@@ -631,9 +650,13 @@ impl DirectoryNotificationPath {
         let mut visited = DriverVec::new();
         let mut steps = DriverVec::new();
         steps
-            .try_push_owned(DirectoryNotificationStep::Direct(
-                DirectoryNotificationTarget::from_components(parent, components.as_slice())?,
-            ))
+            .try_push_owned(DirectoryNotificationStep::Direct {
+                parent,
+                target: DirectoryNotificationTarget::from_components(
+                    parent,
+                    components.as_slice(),
+                )?,
+            })
             .map_err(|error| error.into_parts().0)?;
         while parent != DirectoryNodeId::ROOT {
             if visited.as_slice().contains(&parent) {
@@ -685,7 +708,7 @@ impl NotificationTraversal<'_> {
     /// Every crossed directory must grant traversal to the same captured subject.
     fn permits(&self, mut check: impl FnMut(&ext4_security::Descriptor) -> bool) -> bool {
         self.steps.iter().all(|step| match step {
-            DirectoryNotificationStep::Direct(_) => true,
+            DirectoryNotificationStep::Direct { .. } => true,
             DirectoryNotificationStep::Crossed { descriptor, .. } => check(descriptor),
         })
     }
@@ -764,6 +787,57 @@ pub(super) const DIRECTORY_NOTIFICATION_DIRECTORY_UNITS: usize = 5;
 mod tests {
     use super::*;
 
+    /// # Errors
+    /// Returns fixture name, event allocation or parent reservation failure.
+    /// # Panics
+    /// Fails if committed metadata can bypass its parent or duplicate links require another break.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "construction propagates errors; assertions verify parent admission"
+    )]
+    fn metadata_events_require_parent_exclusion_until_publication() -> DriverResult<()> {
+        let ledger = FileControlBlockLedger::try_new()?;
+        let mut changes = DriverVec::new();
+        for name in [97, 98] {
+            let mut steps = DriverVec::new();
+            steps
+                .try_push_owned(DirectoryNotificationStep::Direct {
+                    parent: DirectoryNodeId::ROOT,
+                    target: DirectoryNotificationTarget::from_components(
+                        DirectoryNodeId::ROOT,
+                        &[WindowsName::from_utf16(&[name])?],
+                    )?,
+                })
+                .map_err(|error| error.into_parts().0)?;
+            changes
+                .try_push_owned(DirectoryChange {
+                    path: DirectoryNotificationPath { steps },
+                    tunnel: None,
+                    completion_filter: wdk_sys::FILE_NOTIFY_CHANGE_LAST_WRITE,
+                    action: DirectoryChangeAction::Modified,
+                })
+                .map_err(|error| error.into_parts().0)?;
+        }
+        assert_eq!(
+            DirectoryChange::uncovered_parent(changes.as_slice(), &[]),
+            Some(DirectoryNodeId::ROOT)
+        );
+        let (exclusion, stream) = ledger.acquire_parent_oplock_mutation(DirectoryNodeId::ROOT)?;
+        assert!(stream.is_none());
+        let exclusions = [exclusion];
+        assert_eq!(
+            DirectoryChange::uncovered_parent(changes.as_slice(), &exclusions),
+            None
+        );
+        drop(exclusions);
+        assert_eq!(
+            DirectoryChange::uncovered_parent(changes.as_slice(), &[]),
+            Some(DirectoryNodeId::ROOT)
+        );
+        Ok(())
+    }
+
     /// Produces distinct valid native policy images for independent traversal decisions.
     /// # Errors
     /// Returns fixture permission or native descriptor construction failure.
@@ -795,9 +869,13 @@ mod tests {
         let name = WindowsName::from_utf16(&[102])?;
         let mut steps = DriverVec::new();
         steps
-            .try_push_owned(DirectoryNotificationStep::Direct(
-                DirectoryNotificationTarget::from_components(DirectoryNodeId::ROOT, &[name])?,
-            ))
+            .try_push_owned(DirectoryNotificationStep::Direct {
+                parent: DirectoryNodeId::ROOT,
+                target: DirectoryNotificationTarget::from_components(
+                    DirectoryNodeId::ROOT,
+                    &[name],
+                )?,
+            })
             .map_err(|error| error.into_parts().0)?;
         for mode in [0o700, 0o711] {
             steps
