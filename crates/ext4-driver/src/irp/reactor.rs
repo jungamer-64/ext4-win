@@ -16,7 +16,7 @@ use wdk_sys::{PIO_CSQ, STATUS_SUCCESS};
 use crate::kernel::ffi;
 use crate::kernel::{
     fatal::KernelWideInconsistency,
-    operational_trace::OperationalTrace,
+    operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace},
     status::{DriverError, DriverResult},
 };
 use crate::memory::InPlaceInitialization;
@@ -2696,6 +2696,11 @@ impl CompletionReactor {
             // SAFETY: Device teardown retains the stable extension through this method.
             reactor_address.as_ref()
         };
+        reactor.trace.record(
+            OperationalPath::ReactorRetirement,
+            wdk_sys::STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         reactor.begin_drain();
         loop {
             let irp = reactor.remove_next_irp(None);
@@ -2795,6 +2800,11 @@ impl CompletionReactor {
         reactor
             .thread_handle
             .store(core::ptr::null_mut(), Ordering::Release);
+        reactor.trace.record(
+            OperationalPath::ReactorRetirement,
+            wdk_sys::STATUS_SUCCESS,
+            OperationalOutcome::Completed,
+        );
     }
 
     /// Destroys a reactor after its quiesce transition and returns its target authority.

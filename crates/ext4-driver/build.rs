@@ -250,7 +250,7 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
 /// Returns an input or I/O error when the checked-in schema is incomplete, duplicated, malformed,
 /// or cannot be written to Cargo's output directory.
 fn write_operational_trace_contract() -> Result<(), io::Error> {
-    const EVENT_RECORDS: [(&str, &str); 29] = [
+    const EVENT_RECORDS: [(&str, &str); 35] = [
         ("event_cached_read", "CACHED_READ"),
         ("event_cached_write", "CACHED_WRITE"),
         ("event_cache_flush", "CACHE_FLUSH"),
@@ -280,6 +280,12 @@ fn write_operational_trace_contract() -> Result<(), io::Error> {
         ("event_discovery_geometry", "DISCOVERY_GEOMETRY"),
         ("event_discovery_read", "DISCOVERY_READ"),
         ("event_discovery_announcement", "DISCOVERY_ANNOUNCEMENT"),
+        ("event_reactor_retirement", "REACTOR_RETIREMENT"),
+        ("event_volume_handles_drain", "VOLUME_HANDLES_DRAIN"),
+        ("event_volume_streams_drain", "VOLUME_STREAMS_DRAIN"),
+        ("event_volume_retirement", "VOLUME_RETIREMENT"),
+        ("event_vpb_retirement", "VPB_RETIREMENT"),
+        ("event_driver_unload", "DRIVER_UNLOAD"),
     ];
     const OUTCOME_RECORDS: [(&str, &str); 5] = [
         ("outcome_selected", "SELECTED"),
@@ -335,6 +341,12 @@ fn write_operational_trace_contract() -> Result<(), io::Error> {
                     | "CONTROL_DEVICE_CREATION"
                     | "REACTOR_INITIALIZATION"
                     | "FILESYSTEM_REGISTRATION"
+                    | "REACTOR_RETIREMENT"
+                    | "VOLUME_HANDLES_DRAIN"
+                    | "VOLUME_STREAMS_DRAIN"
+                    | "VOLUME_RETIREMENT"
+                    | "VPB_RETIREMENT"
+                    | "DRIVER_UNLOAD"
             )
         {
             rust_projection.push_str(&format!(

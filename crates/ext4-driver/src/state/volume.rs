@@ -1,6 +1,7 @@
 //! Mounted-volume lifecycle, handle admission, and durable mutation coordination.
 
 use super::*;
+use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath};
 
 #[derive(Debug)]
 /// Shared mounted-volume stream owner at a pinned heap address.
@@ -976,10 +977,37 @@ impl MountedVolumeAccess<'_> {
         }
         let namespace_empty = self.volume.file_control_blocks.is_empty();
         let control = &mut self.volume_control;
+        if control.state.permits_retirement() {
+            // Terminal observations distinguish retained FILE_OBJECTs from cache/worker streams.
+            // They carry no identity or count and grant no retirement authority.
+            for (path, drained) in [
+                (
+                    OperationalPath::VolumeHandlesDrain,
+                    control.volume_file_objects == 0,
+                ),
+                (OperationalPath::VolumeStreamsDrain, namespace_empty),
+            ] {
+                self.volume.trace.record_status(
+                    path,
+                    if drained {
+                        STATUS_SUCCESS
+                    } else {
+                        wdk_sys::STATUS_PENDING
+                    },
+                );
+            }
+        }
         let (state, retirement) = control
             .state
             .retire_if_unreferenced(namespace_empty, control.volume_file_objects);
         control.state = state;
+        if retirement == VolumeRetirement::Start {
+            self.volume.trace.record(
+                OperationalPath::VolumeRetirement,
+                STATUS_SUCCESS,
+                OperationalOutcome::Selected,
+            );
+        }
         retirement
     }
 

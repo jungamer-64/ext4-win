@@ -69,6 +69,18 @@ pub(crate) enum OperationalPath {
     RawWrite,
     /// Raw write-through lower-device flush.
     RawFlush,
+    /// Actor join and completion rundown after one device's dispatch admission has closed.
+    ReactorRetirement,
+    /// Terminal volume retirement's direct FILE_OBJECT drain observation.
+    VolumeHandlesDrain,
+    /// Terminal volume retirement's namespace stream drain observation.
+    VolumeStreamsDrain,
+    /// Mounted-device retirement from admission through release of extension-owned resources.
+    VolumeRetirement,
+    /// Original VPB reference drain and deallocation after the reactor has joined.
+    VpbRetirement,
+    /// DriverUnload reached its final provider-unregister boundary; no later event is guaranteed.
+    DriverUnload,
 }
 
 impl OperationalPath {
@@ -95,6 +107,12 @@ impl OperationalPath {
             Self::RawRead => contract::TRACE_EVENT_RAW_READ,
             Self::RawWrite => contract::TRACE_EVENT_RAW_WRITE,
             Self::RawFlush => contract::TRACE_EVENT_RAW_FLUSH,
+            Self::ReactorRetirement => contract::TRACE_EVENT_REACTOR_RETIREMENT,
+            Self::VolumeHandlesDrain => contract::TRACE_EVENT_VOLUME_HANDLES_DRAIN,
+            Self::VolumeStreamsDrain => contract::TRACE_EVENT_VOLUME_STREAMS_DRAIN,
+            Self::VolumeRetirement => contract::TRACE_EVENT_VOLUME_RETIREMENT,
+            Self::VpbRetirement => contract::TRACE_EVENT_VPB_RETIREMENT,
+            Self::DriverUnload => contract::TRACE_EVENT_DRIVER_UNLOAD,
         }
     }
 }
@@ -281,6 +299,11 @@ pub(crate) fn unregister_published() {
     let handle = PUBLISHED_OPERATIONAL_TRACE.swap(0, Ordering::AcqRel);
     let handle = NonZeroU64::new(handle)
         .unwrap_or_else(|| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
+    OperationalTrace { handle }.record(
+        OperationalPath::DriverUnload,
+        STATUS_SUCCESS,
+        OperationalOutcome::Selected,
+    );
     unregister(handle);
 }
 
@@ -345,6 +368,12 @@ mod tests {
             OperationalPath::RawRead,
             OperationalPath::RawWrite,
             OperationalPath::RawFlush,
+            OperationalPath::ReactorRetirement,
+            OperationalPath::VolumeHandlesDrain,
+            OperationalPath::VolumeStreamsDrain,
+            OperationalPath::VolumeRetirement,
+            OperationalPath::VpbRetirement,
+            OperationalPath::DriverUnload,
         ];
         for (index, event) in events.iter().enumerate() {
             assert_ne!(event.event_id(), 0);

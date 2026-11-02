@@ -1,6 +1,7 @@
 //! Mounted-volume device construction, VPB publication, and device retirement.
 
 use super::*;
+use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath};
 
 /// Windows volume serial number derived from the ext4 filesystem UUID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -552,11 +553,17 @@ impl MountedVolumeDevice {
         let ReactorTarget::MountedVolume(binding) = target else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
+        let trace = binding.volume().trace;
         Self::unregister_shutdown_notification(device);
         let publication = unsafe {
             // SAFETY: Mount initialized this owner; joined retirement uniquely consumes its slot.
             extension.vpb.get().cast::<MountedVpb>().read()
         };
+        trace.record(
+            OperationalPath::VpbRetirement,
+            STATUS_SUCCESS,
+            OperationalOutcome::Selected,
+        );
         let retirement = publication.begin_retirement();
         #[cfg(test)]
         drop(retirement.try_finish().unwrap_or_else(|_| {
@@ -565,13 +572,23 @@ impl MountedVolumeDevice {
         #[cfg(not(test))]
         {
             let mut retirement = retirement;
+            let mut reported_pending = false;
             loop {
                 retirement = match retirement.try_finish() {
                     Ok(released) => {
                         drop(released);
                         break;
                     }
-                    Err(retained) => retained,
+                    Err(retained) => {
+                        if !reported_pending {
+                            trace.record_status(
+                                OperationalPath::VpbRetirement,
+                                wdk_sys::STATUS_PENDING,
+                            );
+                            reported_pending = true;
+                        }
+                        retained
+                    }
                 };
                 {
                     let mut interval = LARGE_INTEGER { QuadPart: -100_000 };
@@ -590,7 +607,17 @@ impl MountedVolumeDevice {
                 }
             }
         }
+        trace.record(
+            OperationalPath::VpbRetirement,
+            STATUS_SUCCESS,
+            OperationalOutcome::Completed,
+        );
         drop(binding);
+        trace.record(
+            OperationalPath::VolumeRetirement,
+            STATUS_SUCCESS,
+            OperationalOutcome::Completed,
+        );
     }
 
     /// Queues the preallocated work item that retires this device after its actor returns.

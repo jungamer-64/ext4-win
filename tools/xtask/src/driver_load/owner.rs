@@ -391,13 +391,14 @@ fn service_identity(
 fn wait_state(expected: u32, timeout: Duration) -> TaskResult<()> {
     let start = Instant::now();
     loop {
-        if windows_host::service_state("ext4win")? == Some(expected) {
+        let observed = windows_host::service_state("ext4win")?;
+        if observed == Some(expected) {
             return Ok(());
         }
         if start.elapsed() >= timeout {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "SCM terminal state was not observed; outcome uncertain",
+                format!("SCM terminal state was not observed: expected={expected}, observed={observed:?}; outcome uncertain"),
             )
             .into());
         }
