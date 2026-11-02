@@ -44,11 +44,20 @@ static void wdk_sys_release_resource(PERESOURCE resource)
 }
 static NTSTATUS flush_status;
 static unsigned flush_calls;
+static unsigned purge_calls;
+static void CcFlushCache(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *offset,
+    ULONG length, IO_STATUS_BLOCK *status)
+{
+    assert(offset == NULL && length == 0);
+    flush_calls++;
+    status->Status = flush_status;
+    if (NT_SUCCESS(flush_status)) { sections->dirty = 0; }
+}
 static void CcCoherencyFlushAndPurgeCache(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *offset,
     ULONG length, IO_STATUS_BLOCK *status, ULONG flags)
 {
     assert(offset == NULL && length == 0 && flags == 0);
-    flush_calls++;
+    purge_calls++;
     status->Status = flush_status;
     if (flush_status == STATUS_SUCCESS) { sections->dirty = 0; }
 }
@@ -66,7 +75,7 @@ int main(void)
         SECTION_OBJECT_POINTERS sections = { .dirty = 1, .mapped = 0 };
         flush_status = STATUS_SUCCESS;
         assert(ext4win_cache_close_writeback(&sections) == STATUS_SUCCESS);
-        assert(flush_calls == 1 && sections.dirty == 0);
+        assert(purge_calls == 1 && sections.dirty == 0);
         sections.dirty = 1;
         sections.mapped = 1;
         assert(ext4win_cache_close_writeback(&sections) == STATUS_USER_MAPPED_FILE);
@@ -76,6 +85,23 @@ int main(void)
         assert(ext4win_cache_close_writeback(&sections) == STATUS_USER_MAPPED_FILE);
         flush_status = STATUS_UNSUCCESSFUL;
         assert(ext4win_cache_close_writeback(&sections) == STATUS_UNSUCCESSFUL);
+    }
+    {
+        SECTION_OBJECT_POINTERS streams[] = {
+            { .dirty = 1, .mapped = 1 },
+            { .dirty = 1, .mapped = 0 }
+        };
+        unsigned purges_before = purge_calls;
+        flush_status = STATUS_SUCCESS;
+        for (unsigned index = 0; index < 2; index++) {
+            assert(ext4win_cache_flush(&streams[index]) == STATUS_SUCCESS);
+            assert(streams[index].dirty == 0);
+        }
+        assert(streams[0].mapped == 1 && flush_calls == 2 && purge_calls == purges_before);
+        flush_status = STATUS_UNSUCCESSFUL;
+        streams[0].dirty = 1;
+        assert(ext4win_cache_flush(&streams[0]) == STATUS_UNSUCCESSFUL);
+        assert(streams[0].dirty == 1 && streams[0].mapped == 1);
     }
     {
         SECTION_OBJECT_POINTERS sections = {0};

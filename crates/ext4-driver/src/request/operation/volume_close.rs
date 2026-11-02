@@ -164,6 +164,10 @@ impl VolumeCloseOperation {
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         if let Some(stream) = streams.pop() {
+            let work = match self.target.terminal() {
+                CleanCloseTerminal::Dismount => crate::irp::PassiveWork::CloseWriteback { stream },
+                CleanCloseTerminal::Shutdown => crate::irp::PassiveWork::flush(stream),
+            };
             self.state = CloseState::Writeback {
                 owned,
                 preparation,
@@ -171,7 +175,7 @@ impl VolumeCloseOperation {
                 close,
             };
             OperationTransition::SubmitPassiveWork {
-                work: crate::irp::PassiveWork::CloseWriteback { stream },
+                work,
                 suspended: self,
             }
         } else {
@@ -318,13 +322,18 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     streams,
                     close,
                 },
-                CompletionEvent::PassiveCompleted(
-                    crate::irp::PassiveWorkCompletion::CloseWriteback(result),
-                ),
-            ) => match result {
-                Ok(()) => self.writeback(owned, preparation, streams, close, access),
-                Err(error) => Self::fail_preparation(owned, preparation, error, access),
-            },
+                CompletionEvent::PassiveCompleted(completion),
+            ) => {
+                let result = match (self.target.terminal(), completion) {
+                    (CleanCloseTerminal::Dismount, crate::irp::PassiveWorkCompletion::CloseWriteback(result))
+                    | (CleanCloseTerminal::Shutdown, crate::irp::PassiveWorkCompletion::Flush(result)) => result,
+                    _ => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
+                };
+                match result {
+                    Ok(()) => self.writeback(owned, preparation, streams, close, access),
+                    Err(error) => Self::fail_preparation(owned, preparation, error, access),
+                }
+            }
             (
                 CloseState::Sealed {
                     owned,

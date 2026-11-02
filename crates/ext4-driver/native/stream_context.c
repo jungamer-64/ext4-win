@@ -797,20 +797,14 @@ NTAPI
 ext4win_stream_cache_flush(_In_ PVOID stream_header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(stream_header);
-    IO_STATUS_BLOCK io_status;
     NTSTATUS status;
 
     if (stream == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
     if (!ext4win_stream_storage_available(stream)) { return STATUS_DEVICE_REMOVED; }
-    if (stream->SectionObjects.SharedCacheMap == NULL) {
-        return STATUS_SUCCESS;
-    }
     ext4win_trace_selected(stream, EXT4WIN_TRACE_EVENT_CACHE_FLUSH);
 
-    io_status.Status = STATUS_SUCCESS;
-    io_status.Information = 0;
     status = STATUS_SUCCESS;
     /* Drain cached transfers admitted before volume snapshot exclusion, then flush their data. */
     (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
@@ -819,8 +813,7 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
         return STATUS_DEVICE_REMOVED;
     }
     __try {
-        CcFlushCache(&stream->SectionObjects, NULL, 0, &io_status);
-        status = io_status.Status;
+        status = ext4win_cache_flush(&stream->SectionObjects);
     }
     __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
         status = GetExceptionCode();

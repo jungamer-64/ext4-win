@@ -1,5 +1,18 @@
 #pragma once
 
+/* A durability flush retains mapped sections and private cache maps. Shutdown must not
+ * require mappings to disappear before dirty file data can reach lower storage. */
+_Must_inspect_result_
+static NTSTATUS
+ext4win_cache_flush(PSECTION_OBJECT_POINTERS sections)
+{
+    IO_STATUS_BLOCK status;
+    status.Status = STATUS_SUCCESS;
+    status.Information = 0;
+    CcFlushCache(sections, NULL, 0, &status);
+    return status.Status;
+}
+
 /* Reactor completion and lease release must never wait for a Cc/MM resource owner.
  * Contention cannot prove absence: retain the stream and let delayed close recheck it. */
 _Must_inspect_result_
