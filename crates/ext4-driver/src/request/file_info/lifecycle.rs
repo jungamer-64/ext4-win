@@ -54,6 +54,7 @@ pub(crate) fn cleanup(
     let plan = request.with_active(|active| begin_cleanup_file_object(active, operations))?;
     Ok(match plan {
         CleanupPlan::Complete => CleanupResolution::Complete(IrpCompletion::EMPTY),
+        CleanupPlan::ReleaseAllocation => CleanupResolution::ReleaseAllocation,
         CleanupPlan::Delete(plan) => CleanupResolution::Delete(plan),
     })
 }
@@ -63,6 +64,8 @@ pub(crate) fn cleanup(
 pub(crate) enum CleanupResolution {
     /// Cleanup released every handle-owned resource without a namespace mutation.
     Complete(IrpCompletion),
+    /// Last active cleanup must release unused Windows allocation through a journal mutation.
+    ReleaseAllocation,
     /// Cleanup owns ready link deletions that require a journaled namespace result.
     Delete(PendingCleanupDeletion),
 }
@@ -84,10 +87,15 @@ pub(crate) struct PreparedCleanupPublication {
     links: DriverVec<CleanupLinkPublication>,
     /// Only the final remaining inode link can wait for active file-id handles.
     deferred: Option<NonNull<FileDeleteTarget>>,
+    /// An allocation release in the same commit clears the stream's reservation obligation.
+    allocation_released: bool,
 }
 impl PreparedCleanupPublication {
     /// Publishes the atomic namespace result and every prepared notification without allocation.
     pub(crate) fn publish(self, operations: &mut MountedVolumeAccess<'_>) -> IrpCompletion {
+        if self.allocation_released {
+            publish_cleanup_allocation(self.fcb);
+        }
         for link in self.links {
             operations.complete_file_delete(self.fcb, link.target);
             operations.report_directory_change(link.notification);
@@ -126,6 +134,8 @@ pub(crate) fn close(
 enum CleanupPlan {
     /// No namespace deletion became ready.
     Complete,
+    /// The inode stream's final active handle owns an outstanding allocation reservation.
+    ReleaseAllocation,
     /// Cleanup must finalize the claimed namespace links.
     Delete(PendingCleanupDeletion),
 }
@@ -263,7 +273,13 @@ fn cleanup_opened_node(
     opened_file.finish_cleanup();
     file_object.mark_cleanup_complete();
     match cleanup {
-        FileCleanupDisposition::Retained => CleanupPlan::Complete,
+        FileCleanupDisposition::Retained => {
+            if opened_file.file_control_block().allocation_release_needed() {
+                CleanupPlan::ReleaseAllocation
+            } else {
+                CleanupPlan::Complete
+            }
+        }
         FileCleanupDisposition::Delete(target) => CleanupPlan::Delete(PendingCleanupDeletion {
             fcb,
             node,
@@ -288,6 +304,7 @@ pub(crate) fn stage_cleanup_deletion(
     operations: &MountedVolumeAccess<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
 ) -> DriverResult<Option<PreparedCleanupPublication>> {
+    let allocation_released = stage_stream_allocation_release(plan.fcb, mutation)?;
     let identity = operations.identity_snapshot()?;
     let mut links = DriverVec::try_with_capacity(
         plan.additional
@@ -340,7 +357,7 @@ pub(crate) fn stage_cleanup_deletion(
             })
             .map_err(|failure| failure.into_parts().0)?;
     }
-    if links.is_empty() {
+    if links.is_empty() && !allocation_released {
         for target in plan.targets() {
             operations.defer_file_delete(plan.fcb, target);
         }
@@ -351,7 +368,81 @@ pub(crate) fn stage_cleanup_deletion(
         fcb: plan.fcb,
         links,
         deferred,
+        allocation_released,
     }))
+}
+
+/// Releases only a committed Windows reservation after the stream's active handles are gone.
+/// Replays observe both reservation and active count again, so a concurrent open postpones release.
+/// # Errors
+/// Returns native request decoding or ext4 allocation-release failure before publication.
+pub(crate) fn release_cleanup_allocation(
+    mut request: PendingIrpLease<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<bool> {
+    let fcb = request.with_active(|active| {
+        let file = active.current_stack()?.file_object()?;
+        Ok::<_, DriverError>(OpenedObject::decode(file)?.file_control_block_address())
+    })?;
+    stage_stream_allocation_release(fcb, mutation)
+}
+
+/// A retained cleanup IRP pins the FCB through resolution and any later commit.
+/// # Errors
+/// Returns file selection, protected mutation, or ext4 allocation-release failures.
+#[expect(
+    unsafe_code,
+    reason = "cleanup retains the exact FCB through resolution and commit"
+)]
+fn stage_stream_allocation_release(
+    fcb: NonNull<FileControlBlock>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+) -> DriverResult<bool> {
+    let fcb = unsafe {
+        // SAFETY: The cleanup FILE_OBJECT retains its stream throughout this resolve pass.
+        fcb.as_ref()
+    };
+    if !fcb.allocation_release_needed() {
+        return Ok(false);
+    }
+    let NodeId::File(file) = fcb.node() else {
+        return Err(DriverError::InternalInvariantViolation);
+    };
+    let file = mutation.file(file)?;
+    if mutation.trim_file_allocation(file)? {
+        Ok(true)
+    } else {
+        // No allocation effect needs a commit; the current epoch already has no payload tail.
+        fcb.publish_allocation_reservation(false);
+        Ok(false)
+    }
+}
+
+/// Consumes the committed reservation obligation without retaining any independent allocation fact.
+pub(crate) fn publish_allocation_release(mut request: PendingIrpLease<'_>) {
+    request
+        .with_active(|active| {
+            let file = active.current_stack()?.file_object()?;
+            publish_cleanup_allocation(OpenedObject::decode(file)?.file_control_block_address());
+            Ok::<_, DriverError>(())
+        })
+        .unwrap_or_else(|_| {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck()
+        });
+}
+
+/// The retained stream's allocation-release commit consumed this obligation.
+#[expect(
+    unsafe_code,
+    reason = "the completing cleanup FILE_OBJECT retains the FCB through publication"
+)]
+fn publish_cleanup_allocation(fcb: NonNull<FileControlBlock>) {
+    let fcb = unsafe {
+        // SAFETY: Original cleanup ownership retains this FCB until publication returns.
+        fcb.as_ref()
+    };
+    fcb.publish_allocation_reservation(false);
 }
 
 /// Removes one direct-volume share claim during its cleanup barrier.

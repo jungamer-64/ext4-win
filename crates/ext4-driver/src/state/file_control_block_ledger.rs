@@ -3114,6 +3114,48 @@ impl FileControlBlockLedger {
         release_oplock_mutation(mutations, node);
     }
 
+    /// Publishes only the reservation obligation; ext4 remains authoritative for allocation ranges.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger guard serializes the retained FCB reservation fact"
+    )]
+    pub(super) fn set_allocation_reservation(
+        &self,
+        fcb: NonNull<FileControlBlock>,
+        reserved: bool,
+    ) {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger guard retains and serializes its owning registry.
+            &*self.table.get()
+        };
+        let mut state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: Membership and exclusive state access were established under the guard.
+            state.as_mut()
+        }
+        .allocation_reserved = reserved;
+    }
+
+    /// Checks last-handle and reservation state together under their single owning resource.
+    #[expect(
+        unsafe_code,
+        reason = "the ledger guard serializes reservation and active-handle observations"
+    )]
+    pub(super) fn allocation_release_needed(&self, fcb: NonNull<FileControlBlock>) -> bool {
+        let _guard = self.lock.acquire();
+        let table = unsafe {
+            // SAFETY: The ledger guard retains and serializes its owning registry.
+            &*self.table.get()
+        };
+        let state = ledger_file_control_block_open_state(table, fcb);
+        unsafe {
+            // SAFETY: The registry owns this state throughout the guarded observation.
+            state.as_ref()
+        }
+        .allocation_release_needed()
+    }
+
     /// Returns the current user-handle count for one table-owned FCB.
     #[expect(
         unsafe_code,

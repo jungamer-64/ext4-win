@@ -47,6 +47,31 @@ impl fmt::Debug for FileControlBlock {
 }
 
 impl FileControlBlock {
+    /// Publishes the Windows reservation obligation after its matching allocation commit.
+    #[expect(
+        unsafe_code,
+        reason = "the live FCB retains its ledger through this serialized reservation publication"
+    )]
+    pub(crate) fn publish_allocation_reservation(&self, reserved: bool) {
+        let owner = unsafe {
+            // SAFETY: This live FCB is retained by its FILE_OBJECT or publication owner.
+            self.owner.as_ref()
+        };
+        owner.set_allocation_reservation(NonNull::from(self), reserved);
+    }
+
+    /// Observes whether final active cleanup must reconcile a Windows allocation reservation.
+    #[expect(
+        unsafe_code,
+        reason = "the cleanup FILE_OBJECT retains the FCB and its ledger"
+    )]
+    pub(crate) fn allocation_release_needed(&self) -> bool {
+        let owner = unsafe {
+            // SAFETY: Cleanup retains this FCB until the original IRP completes.
+            self.owner.as_ref()
+        };
+        owner.allocation_release_needed(NonNull::from(self))
+    }
     /// Updates a native scan-section observation without taking the ledger or stream resources.
     /// # Errors
     /// Returns an unmatched release or section-reference budget exhaustion.
@@ -544,6 +569,9 @@ impl DurablePublicationOutcome {
 
 /// Mutable FCB lifecycle state owned exclusively by `FileControlBlockLedger`.
 pub(super) struct FileControlBlockOpenState {
+    /// A committed Windows allocation request requires reconciliation on final active cleanup.
+    /// Foreign ext4 preallocation has no Windows lifetime obligation.
+    pub(super) allocation_reserved: bool,
     /// Raw payload initialization retained independently of ext4 unwritten visibility beyond EOF.
     pub(super) paging_storage: Option<ext4_core::ContiguousFileStorage>,
     /// Handle-owned protection is mutually exclusive with a retained physical relocation.
@@ -560,6 +588,7 @@ impl FileControlBlockOpenState {
     /// Creates empty share accounting for the first FILE_OBJECT reference.
     pub(super) const fn new() -> Self {
         Self {
+            allocation_reserved: false,
             paging_storage: None,
             cluster_mobility: ClusterMobility::Movable,
             shares: FileObjectShares::new(),
@@ -569,6 +598,13 @@ impl FileControlBlockOpenState {
             },
             locations: OpenedLocations::new(),
         }
+    }
+
+    /// Paging-file storage belongs to the Memory Manager's fixed-map lifetime.
+    pub(super) fn allocation_release_needed(&self) -> bool {
+        self.allocation_reserved
+            && self.paging_storage.is_none()
+            && self.shares.active_handle_count() == 0
     }
 
     /// Validates operation access and admits the returned FILE_OBJECT atomically.

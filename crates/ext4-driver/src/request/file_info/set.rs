@@ -164,6 +164,8 @@ pub(crate) enum SetFileResolution {
 pub(crate) enum SetFilePublication {
     /// No driver-visible state changes after commit.
     None,
+    /// Reservation lifetime owned by the originating stream after this commit.
+    ReserveAllocation,
     /// Handle-local automatic timestamp policy paired with committed basic metadata.
     Timestamps(HandleTimestampPolicy),
     /// Ordered namespace notifications for a committed hard-link mutation.
@@ -248,6 +250,7 @@ impl SetFilePublication {
     ) {
         match self {
             Self::None => {}
+            Self::ReserveAllocation => publish_allocation_reservation(&mut request),
             Self::Timestamps(policy) => publish_timestamp_policy(&mut request, policy),
             Self::HardLink {
                 location,
@@ -267,6 +270,22 @@ impl SetFilePublication {
             }
         }
     }
+}
+
+/// Resolves the retained FILE_OBJECT only at publication, after allocation has committed.
+fn publish_allocation_reservation(request: &mut PendingIrpLease<'_>) {
+    request
+        .with_active(|active| {
+            let file = active.current_stack()?.file_object()?;
+            OpenedObject::decode(file)?
+                .file_control_block()
+                .publish_allocation_reservation(true);
+            Ok::<_, DriverError>(())
+        })
+        .unwrap_or_else(|_| {
+            crate::kernel::fatal::KernelWideInconsistency::file_object_context_corruption()
+                .bugcheck()
+        });
 }
 
 /// Publishes to the retained request's CCB without creating an independently usable pointer.
@@ -501,6 +520,9 @@ pub(super) fn set_file_information(
             }
             let file = mutation.file(file)?;
             mutation.set_file_allocation(file, change.allocation)?;
+            return Ok(SetFileResolution::Mutation(
+                SetFilePublication::ReserveAllocation,
+            ));
         }
         SetFilePlan::Disposition {
             fcb,

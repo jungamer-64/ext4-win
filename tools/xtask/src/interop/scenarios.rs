@@ -1284,6 +1284,23 @@ fn verify_regular_mutation_profile(
     drive_internal_core_mutation(image, |pass| {
         let (_, id) = mutation_root_file(pass, &source)?;
         let file = pass.file(id)?;
+        if !pass.trim_file_allocation(file)? {
+            return Err(ext4_core::Error::InvalidWriteRange);
+        }
+        Ok(())
+    })?;
+    if !debugfs_block_sequence(linux, &linux.tool_path(image)?, "blocks /source.bin")?.is_empty() {
+        return Err(io::Error::other("unused payload allocation survived release").into());
+    }
+    verify_internal_e2fsck_clean(linux, image, "released unused allocation")?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(id)?;
+        pass.reserve_file_allocation(file, ext4_core::FileAllocationSize::from_bytes(8192))
+    })?;
+    drive_internal_core_mutation(image, |pass| {
+        let (_, id) = mutation_root_file(pass, &source)?;
+        let file = pass.file(id)?;
         pass.extend_file(file, ext4_core::FileSize::from_bytes(8192))
     })?;
     debugfs_require_file(

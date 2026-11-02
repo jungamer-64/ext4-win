@@ -1,4 +1,4 @@
-//! Handle finalization precedes optional journaled namespace deletion. Storage removal or
+//! Handle finalization precedes optional journaled allocation release and namespace deletion. Storage removal or
 //! journal failure cannot suppress share, lock, notification, or private-cache-map release.
 
 use super::*;
@@ -173,34 +173,48 @@ impl CleanupOperation {
                 let result = self.failure.map_or(Ok(completion), Err);
                 self.finish(owned.prepare_result(result))
             }
+            Ok(crate::request::file_info::CleanupResolution::ReleaseAllocation) => {
+                self.mutate(owned, None, access)
+            }
             Ok(crate::request::file_info::CleanupResolution::Delete(deletion)) => {
-                if let Err(error) = access.authorize_durability() {
-                    drop(deletion);
-                    return self.finish(owned.prepare_result(Err(error)));
-                }
-                match MutationRequestOperation::try_new(
-                    owned,
-                    MutationRequestKind::CleanupDeletion,
-                    access,
-                ) {
-                    Ok(mut operation) => {
-                        operation.cleanup_deletion = Some(deletion);
-                        operation.cleanup_deferred_error = self.failure;
-                        operation.oplock_mutation = self.mutation.take();
-                        self.reset();
-                        OperationTransition::ContinueAfterFinalization {
-                            reusable: self,
-                            next: operation,
-                        }
-                    }
-                    Err(failure) => {
-                        drop(deletion);
-                        let (error, owned) = failure.into_parts();
-                        self.finish(owned.prepare_result(Err(error)))
-                    }
-                }
+                self.mutate(owned, Some(deletion), access)
             }
             Err(error) => self.finish(owned.prepare_result(Err(error))),
+        }
+    }
+
+    /// A released handle retains completion ownership until its allocation or link mutation ends.
+    fn mutate(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        deletion: Option<crate::request::file_info::PendingCleanupDeletion>,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        if let Err(error) = access.authorize_durability() {
+            drop(deletion);
+            return self.finish(owned.prepare_result(Err(error)));
+        }
+        let kind = if deletion.is_some() {
+            MutationRequestKind::CleanupDeletion
+        } else {
+            MutationRequestKind::ReleaseAllocation
+        };
+        match MutationRequestOperation::try_new(owned, kind, access) {
+            Ok(mut operation) => {
+                operation.cleanup_deletion = deletion;
+                operation.cleanup_deferred_error = self.failure;
+                operation.oplock_mutation = self.mutation.take();
+                self.reset();
+                OperationTransition::ContinueAfterFinalization {
+                    reusable: self,
+                    next: operation,
+                }
+            }
+            Err(failure) => {
+                drop(deletion);
+                let (error, owned) = failure.into_parts();
+                self.finish(owned.prepare_result(Err(error)))
+            }
         }
     }
 }

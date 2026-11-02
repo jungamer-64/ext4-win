@@ -139,6 +139,23 @@ impl fmt::Debug for FileObjectShares {
 mod tests {
     use super::*;
 
+    /// # Panics
+    /// Fails if foreign preallocation is claimed or a reservation is released before final cleanup.
+    #[test]
+    fn windows_allocation_obligation_waits_for_every_active_handle() {
+        let mut state = FileControlBlockOpenState::new();
+        assert!(!state.allocation_release_needed());
+        state.allocation_reserved = true;
+        for active in [2, 1] {
+            state.shares.active_handles = active;
+            assert!(!state.allocation_release_needed());
+        }
+        state.shares.active_handles = 0;
+        assert!(state.allocation_release_needed());
+        state.allocation_reserved = false;
+        assert!(!state.allocation_release_needed());
+    }
+
     /// # Errors
     /// Returns stream-header, ledger or retained-cache-lease allocation failure.
     /// # Panics

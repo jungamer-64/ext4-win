@@ -3481,6 +3481,8 @@ unsafe impl Send for FlushRequestOperation {}
 /// Mutation request semantics selected entirely from captured queue metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MutationRequestKind {
+    /// Final active cleanup releases an outstanding Windows allocation reservation.
+    ReleaseAllocation,
     /// Original-thread privileged persistent filesystem-check request.
     MarkVolumeDirty,
     /// Exact physical-cluster movement with an original-context target object reference.
@@ -3518,6 +3520,8 @@ pub(crate) enum MutationRequestKind {
 /// Mutation request after any paging stream lifetime authority has been captured.
 #[derive(Debug)]
 enum PreparedMutationRequest {
+    /// Cleanup retains the original FILE_OBJECT after mandatory resource release.
+    ReleaseAllocation,
     /// SeManageVolumePrivilege is sealed in the corresponding captured queue metadata.
     MarkVolumeDirty,
     /// Data remains frozen while the physical map is copied and atomically replaced.
@@ -3582,6 +3586,7 @@ impl PreparedMutationRequest {
         access: &MountedVolumeAccess<'_>,
     ) -> DriverResult<Self> {
         match kind {
+            MutationRequestKind::ReleaseAllocation => Ok(Self::ReleaseAllocation),
             MutationRequestKind::MoveFile => {
                 crate::request::cluster_control::RelocationRequest::prepare(owned.request(), access)
                     .map(Self::Relocation)
@@ -3654,6 +3659,7 @@ impl PreparedMutationRequest {
     /// Returns the captured request class without exposing the stream lease.
     const fn kind(&self) -> MutationRequestKind {
         match self {
+            Self::ReleaseAllocation => MutationRequestKind::ReleaseAllocation,
             Self::Relocation(_) => MutationRequestKind::MoveFile,
             Self::MarkVolumeDirty => MutationRequestKind::MarkVolumeDirty,
             Self::ZeroOnDeallocation => MutationRequestKind::SetZeroOnDeallocation,
@@ -3689,6 +3695,8 @@ enum TopLevelCompletion {
 /// Driver-visible values produced by one successful mutation resolve pass.
 #[derive(Debug)]
 enum PendingDriverEffect {
+    /// Final cleanup committed release of its unused allocation reservation.
+    ReleaseAllocation,
     /// One initialized prefix awaits its matching home checkpoint before setup can continue.
     PagingStep(ext4_core::ContiguousFileStorage),
     /// Create must acquire its FCB/share claim before the first write.
@@ -3738,6 +3746,7 @@ impl PreparedDriverPublication {
         match &self.effect {
             PreparedDriverEffect::Create(publication) => publication.oplock_reservation_target(),
             PreparedDriverEffect::PagingStep(_)
+            | PreparedDriverEffect::ReleaseAllocation
             | PreparedDriverEffect::ExistingCreate
             | PreparedDriverEffect::Write(_)
             | PreparedDriverEffect::SetFile(_)
@@ -3765,6 +3774,7 @@ impl PreparedDriverPublication {
         match &mut self.effect {
             PreparedDriverEffect::Create(publication) => publication.abort(owned),
             PreparedDriverEffect::PagingStep(_)
+            | PreparedDriverEffect::ReleaseAllocation
             | PreparedDriverEffect::ExistingCreate
             | PreparedDriverEffect::Write(_)
             | PreparedDriverEffect::SetFile(_)
@@ -3778,6 +3788,8 @@ impl PreparedDriverPublication {
 /// Operation-specific state prepared before any irreversible lower write.
 #[derive(Debug)]
 enum PreparedDriverEffect {
+    /// Clears only the reservation obligation consumed by this durable cleanup.
+    ReleaseAllocation,
     /// Provisional initialized prefix; its setup owner consumes it after home checkpointing.
     PagingStep(ext4_core::ContiguousFileStorage),
     /// Fully claimed create handle state.
@@ -3816,6 +3828,7 @@ impl PendingDriverPublication {
         operations: &MountedVolumeAccess<'_>,
     ) -> DriverResult<PreparedDriverPublication> {
         let effect = match self.effect {
+            PendingDriverEffect::ReleaseAllocation => PreparedDriverEffect::ReleaseAllocation,
             PendingDriverEffect::PagingStep(storage) => PreparedDriverEffect::PagingStep(storage),
             PendingDriverEffect::Create(publication) => {
                 let publication = (*publication).prepare(operations)?;
@@ -3847,6 +3860,10 @@ impl PreparedDriverEffect {
         existing: impl FnOnce(&mut crate::state::MountedVolumeAccess<'_>) -> CreateCompletion,
     ) -> TopLevelCompletion {
         match self {
+            Self::ReleaseAllocation => {
+                crate::request::file_info::publish_allocation_release(request);
+                TopLevelCompletion::Normal(IrpCompletion::EMPTY)
+            }
             Self::PagingStep(_) => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
@@ -4508,6 +4525,7 @@ impl MutationRequestOperation {
             | PreparedMutationRequest::SetReparsePoint
             | PreparedMutationRequest::DeleteReparsePoint => true,
             PreparedMutationRequest::SetVolumeInformation
+            | PreparedMutationRequest::ReleaseAllocation
             | PreparedMutationRequest::CleanupDeletion => false,
         };
         if !requires_check {
@@ -4815,6 +4833,18 @@ impl MutationRequestOperation {
             _ => None,
         };
         let result: DriverResult<DriverResolveDisposition> = match request {
+            PreparedMutationRequest::ReleaseAllocation => {
+                if crate::request::file_info::release_cleanup_allocation(owned.request(), mutation)?
+                {
+                    Ok(DriverResolveDisposition::Mutation(
+                        PendingDriverPublication::new(PendingDriverEffect::ReleaseAllocation),
+                    ))
+                } else {
+                    Ok(DriverResolveDisposition::Complete(
+                        TopLevelCompletion::Normal(IrpCompletion::EMPTY),
+                    ))
+                }
+            }
             PreparedMutationRequest::MarkVolumeDirty => {
                 let completion =
                     crate::request::volume_health::mark(owned.request(), operations, mutation)?;

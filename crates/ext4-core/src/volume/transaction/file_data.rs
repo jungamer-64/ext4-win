@@ -353,6 +353,48 @@ impl MutationResolvePass<'_, '_, '_> {
         })
     }
 
+    /// Releases unused payload allocation beyond the allocation cluster containing EOF.
+    /// Visible bytes, sparse holes, security and timestamps are preserved. Verity's post-EOF
+    /// metadata is not unused payload; inline files have no external payload reservation.
+    /// Returns whether any allocation was released.
+    /// # Errors
+    /// Returns protected mutation, allocation-accounting, or extent staging failures.
+    pub fn trim_file_allocation(&mut self, file: TransactionFile) -> Result<bool> {
+        self.edit(|pass| {
+            let mut raw_inode = pass.mutation.raw_inode_for_policy(file.inode())?;
+            let inode = raw_inode.parse()?;
+            if inode.protection().is_verity()
+                || matches!(inode.storage(), InodeStorage::InlineData(_))
+            {
+                return Ok(false);
+            }
+            let cluster = u64::from(pass.mutation.volume.superblock.cluster_size().bytes());
+            let bound = inode
+                .size()
+                .bytes()
+                .checked_next_multiple_of(cluster)
+                .ok_or(Error::ArithmeticOverflow)?;
+            let block_size = u64::from(pass.mutation.volume.superblock.block_size().bytes());
+            let keep_blocks = bound
+                .checked_div(block_size)
+                .ok_or(Error::InvalidSuperblock)?;
+            let mut tree = pass.mutation.mutable_extent_tree(&inode)?;
+            if !tree
+                .extents()
+                .iter()
+                .any(|extent| extent.end_logical() > keep_blocks)
+            {
+                return Ok(false);
+            }
+            pass.require_file_data_mutation(&inode)?;
+            let index = pass.mutation.ensure_inode_update(file.inode())?;
+            pass.retain_file_allocation(&mut tree, FileAllocationSize::from_bytes(bound))?;
+            pass.mutation.stage_extent_tree(&mut raw_inode, tree)?;
+            pass.mutation.replace_live_inode(index, raw_inode)?;
+            Ok(true)
+        })
+    }
+
     /// Releases extent tails beyond a block-rounded byte bound, preserving initialization state.
     /// # Errors
     /// Returns extent arithmetic, allocation-accounting, or fallible tree-copy failures.

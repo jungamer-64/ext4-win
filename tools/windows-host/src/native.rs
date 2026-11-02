@@ -924,7 +924,7 @@ pub fn volume_at_mount(path: &Path) -> io::Result<String> {
         .map_err(|_| io::Error::other("invalid volume name"))
 }
 
-/// Verifies allocation reservation without EOF growth, release, and allocation below written EOF.
+/// Verifies allocation reservation, cluster-rounded shrink and last-handle release.
 /// The supplied fixture must be an empty regular file. Its non-data storage charge can remain
 /// after data allocation is released; each release must return to that same observed charge.
 /// # Errors
@@ -954,7 +954,15 @@ pub fn verify_allocation_control(path: &Path) -> io::Result<()> {
                 )));
             }
         }
-        write_and_flush_byte(&file)?;
+        std::fs::write(path, [0x5a; 6000])?;
+        set_file_allocation(&file, 5999)?;
+        let standard = file_information_query(&file, 5, 24, 0)?;
+        if i64::from_le_bytes(field(&standard, 8)?) != 6000 || std::fs::read(path)? != [0x5a; 6000]
+        {
+            return Err(io::Error::other(
+                "allocation rounding truncated visible file data",
+            ));
+        }
         set_file_allocation(&file, 0)?;
         let standard = file_information_query(&file, 5, 24, 0)?;
         if i64::from_le_bytes(field(&standard, 0)?) != baseline
@@ -966,7 +974,53 @@ pub fn verify_allocation_control(path: &Path) -> io::Result<()> {
         }
         Ok(())
     })();
-    completed(result, file.close())
+    completed(result, file.close())?;
+    verify_allocation_lifetime(path)
+}
+
+/// Two FILE_OBJECTs share one reservation; only the final cleanup releases its unused tail.
+/// # Errors
+/// Returns native allocation, query, close failures or disagreement with last-handle lifetime.
+fn verify_allocation_lifetime(path: &Path) -> io::Result<()> {
+    let first = FileHandle::open(path, 0x4000_0080, 0)?;
+    let peer = FileHandle::open(path, FILE_READ_ATTRIBUTES, 0)?;
+    let result = (|| {
+        set_file_allocation(&first, 0)?;
+        let baseline = file_information_query(&first, 5, 24, 0)?;
+        let baseline = i64::from_le_bytes(field(&baseline, 0)?);
+        set_file_allocation(&first, 32_768)?;
+        Ok(baseline)
+    })();
+    let baseline = match completed(result, first.close()) {
+        Ok(baseline) => baseline,
+        Err(error) => return completed(Err(error), peer.close()),
+    };
+    let held = (|| {
+        let standard = file_information_query(&peer, 5, 24, 0)?;
+        let minimum = baseline
+            .checked_add(32_768)
+            .ok_or_else(|| io::Error::other("allocation fixture charge overflow"))?;
+        if i64::from_le_bytes(field(&standard, 0)?) < minimum {
+            return Err(io::Error::other(
+                "allocation was released while a peer handle remained active",
+            ));
+        }
+        Ok(())
+    })();
+    completed(held, peer.close())?;
+    let reopened = FileHandle::open(path, FILE_READ_ATTRIBUTES, 0)?;
+    let observed = (|| {
+        let standard = file_information_query(&reopened, 5, 24, 0)?;
+        if i64::from_le_bytes(field(&standard, 0)?) != baseline
+            || i64::from_le_bytes(field(&standard, 8)?) != 0
+        {
+            return Err(io::Error::other(
+                "final cleanup retained unused file allocation",
+            ));
+        }
+        Ok(())
+    })();
+    completed(observed, reopened.close())
 }
 
 /// Native create dispositions and Rust file-reset contracts.

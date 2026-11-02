@@ -220,6 +220,142 @@ fn allocation_reservation_and_release_preserve_empty_file_attributes() -> Result
 }
 
 /// # Errors
+/// Returns reservation, release, metadata or persisted payload observation failures.
+/// # Panics
+/// Fails if releasing unused allocation changes EOF, timestamps, attributes or visible bytes.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "assertions compare persisted ext4 observations before and after allocation release"
+)]
+fn allocation_tail_release_preserves_payload_and_metadata() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let id = fixture.a;
+    let baseline = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    let bound = u64::from(fixture.epoch.geometry().cluster_size().bytes()) * 8;
+    fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.reserve_file_allocation(file, FileAllocationSize::from_bytes(bound))
+    })?;
+    let reserved = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    assert!(reserved.allocation_size() > baseline.allocation_size());
+    assert!(fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.trim_file_allocation(file)
+    })?);
+    fixture.remount()?;
+    let released = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    assert_eq!(released.size(), reserved.size());
+    assert_eq!(released.allocation_size(), baseline.allocation_size());
+    assert_eq!(released.times(), reserved.times());
+    assert_eq!(released.security(), reserved.security());
+    let mut payload = [0xff; 1];
+    fixture.read(|pass| pass.read_file(id, FileOffset::ZERO, &mut payload))?;
+    assert_eq!(payload, [b'a']);
+    fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.truncate_file(file, FileSize::from_bytes(0))?;
+        let node = pass.node(NodeId::File(id))?;
+        pass.set_xattr(
+            node,
+            XattrName::new(XattrNamespace::User, b"tail-metadata")?,
+            XattrValue::new(&[0x5a; 256])?,
+        )?;
+        pass.reserve_file_allocation(file, FileAllocationSize::from_bytes(bound))
+    })?;
+    let before = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    assert!(fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.trim_file_allocation(file)
+    })?);
+    fixture.remount()?;
+    let empty = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    assert_eq!(empty.size().bytes(), 0);
+    assert!(empty.allocation_size().bytes() > 0);
+    assert!(empty.allocation_size() < before.allocation_size());
+    let attribute = fixture.read(|pass| {
+        pass.read_xattr(
+            NodeId::File(id),
+            &XattrName::new(XattrNamespace::User, b"tail-metadata")?,
+        )
+    })?;
+    assert_eq!(
+        attribute.as_ref().map(XattrValue::bytes),
+        Some([0x5a; 256].as_slice())
+    );
+    Ok(())
+}
+
+/// # Errors
+/// Returns sparse write, trim or remount failure.
+/// # Panics
+/// Fails if allocation cleanup fills sparse holes or modifies an unreserved data map.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "independent EOF, allocation and payload observations protect sparse cleanup"
+)]
+fn allocation_tail_release_keeps_sparse_holes() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let id = fixture.a;
+    let offset = u64::from(fixture.epoch.geometry().cluster_size().bytes()) * 2;
+    fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.write_file_range(file, FileOffset::from_bytes(offset), b"Z")
+    })?;
+    let before = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    let other = fixture.b;
+    assert!(!fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        let changed = pass.trim_file_allocation(file)?;
+        // A transaction may combine a no-op trim with a mutation of another inode.
+        let other = pass.file(other)?;
+        pass.write_file_range(other, FileOffset::ZERO, b"B")?;
+        Ok(changed)
+    })?);
+    fixture.remount()?;
+    let after = fixture.read(|pass| pass.load_node_metadata(NodeId::File(id)))?;
+    assert_eq!(before, after);
+    let mut payload = [0xff; 1];
+    fixture.read(|pass| pass.read_file(id, FileOffset::from_bytes(offset / 2), &mut payload))?;
+    assert_eq!(payload, [0]);
+    Ok(())
+}
+
+/// # Errors
+/// Returns fixture reservation, independent inode encoding or remount failure.
+/// # Panics
+/// Fails if reclaiming an immutable file's allocation changes persistent storage.
+#[test]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "independent inode flags and device effects verify the rejected allocation release"
+)]
+fn protected_allocation_tail_release_has_no_storage_effect() -> Result<()> {
+    let mut fixture = Fixture::new()?;
+    let id = fixture.a;
+    fixture.mutate(|pass| {
+        let file = pass.file(id)?;
+        pass.reserve_file_allocation(file, FileAllocationSize::from_bytes(32_768))
+    })?;
+    // Independently encode EXT4_EXTENTS_FL | EXT4_IMMUTABLE_FL.
+    fixture
+        .disk
+        .encode_inode(NodeId::File(id), 0x0008_0010, None)?;
+    fixture.remount()?;
+    let before = fixture.disk.storage_effects;
+    assert_eq!(
+        fixture.mutate(|pass| {
+            let file = pass.file(id)?;
+            pass.trim_file_allocation(file)
+        }),
+        Err(Error::UnsupportedInodeMutation)
+    );
+    assert_eq!(fixture.disk.storage_effects, before);
+    Ok(())
+}
+
+/// # Errors
 /// Returns fixture encoding, mounting, allocation or recovery failure.
 /// # Panics
 /// Fails if allocation consumes reserved blocks, a rejected pass writes, or frees stay unavailable.
@@ -2816,6 +2952,7 @@ fn verity_covers_staged_ordered_and_journaled_file_images() -> Result<()> {
             pass.write_file_range(target, FileOffset::from_bytes(1), b"XYZ")?;
             pass.reserve_file_allocation(target, FileAllocationSize::from_bytes(12_288))?;
             pass.enable_verity(target, &enable)?;
+            assert!(!pass.trim_file_allocation(target)?);
             let root = pass.directory(DirectoryNodeId::ROOT)?;
             let created = pass.create_file(
                 root,
@@ -2826,6 +2963,7 @@ fn verity_covers_staged_ordered_and_journaled_file_images() -> Result<()> {
             pass.write_file_range(created, FileOffset::from_bytes(8192), b"created")?;
             pass.extend_file(created, FileSize::from_bytes(16_384))?;
             pass.enable_verity(created, &enable)?;
+            assert!(!pass.trim_file_allocation(created)?);
             Ok(created.id())
         })?;
         let mut output = [0; 4];

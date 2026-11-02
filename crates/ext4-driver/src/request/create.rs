@@ -1546,6 +1546,8 @@ impl PendingExistingCreateOpen {
                 Some(deletion)
             }
         });
+        let allocation_reserved = self.policy.file_mode == crate::irp::CreateFileMode::Ordinary
+            && matches!(&self.intent, ExistingCreateIntent::Reset { metadata, .. } if metadata.allocation > 0);
         let (fcb, file_object) = self.claim.consume();
         publish_node_stream_raw(
             file_object,
@@ -1553,6 +1555,9 @@ impl PendingExistingCreateOpen {
             self.handle,
             self.policy.file_object_flags(),
         );
+        if allocation_reserved {
+            publish_create_allocation(fcb);
+        }
         if let Some(deletion) = deletion {
             operations.set_file_delete_pending(fcb, deletion);
         }
@@ -2147,6 +2152,9 @@ fn create_missing_node(
     let file_object =
         request.with_file_object(|file_object| Ok(file_object.kernel_file_object()))?;
     Ok(PendingCreatePublication {
+        allocation_reserved: matches!(node, NodeId::File(_))
+            && parameters.file_mode() == crate::irp::CreateFileMode::Ordinary
+            && request.owner.metadata.allocation > 0,
         paging_target,
         creation,
         staged_stream,
@@ -2507,6 +2515,8 @@ fn path_components(units: &[u16]) -> DriverResult<DriverVec<CreatePathComponent>
 /// Driver publication seed built during a restartable mutation resolve pass.
 #[derive(Debug)]
 pub(crate) struct PendingCreatePublication {
+    /// Windows allocation has a last-active-handle release obligation.
+    allocation_reserved: bool,
     /// A paging create initializes this bound after the namespace transaction checkpoints.
     paging_target: Option<ext4_core::FileSize>,
     /// Staged child identity and stable VCB/FCB-ledger capability.
@@ -2539,6 +2549,7 @@ impl PendingCreatePublication {
         operations: &MountedVolumeAccess<'_>,
     ) -> DriverResult<PreparedCreatePublication> {
         let Self {
+            allocation_reserved,
             paging_target,
             creation,
             staged_stream,
@@ -2571,6 +2582,7 @@ impl PendingCreatePublication {
             None
         };
         Ok(PreparedCreatePublication {
+            allocation_reserved,
             paging,
             claim,
             oplock: NewCreateOplockState::from_policy(
@@ -2588,6 +2600,8 @@ impl PendingCreatePublication {
 /// Fully prepared post-commit create publication.
 #[derive(Debug)]
 pub(crate) struct PreparedCreatePublication {
+    /// Reservation obligation published only with durable FILE_OBJECT attachment.
+    allocation_reserved: bool,
     /// Setup owns allocation until the fully initialized map can attach its FILE_OBJECT.
     paging: Option<super::paging_file::PagingInitialization>,
     /// Rollback-owning FCB/share claim consumed only by durable attachment.
@@ -2644,6 +2658,7 @@ impl PreparedCreatePublication {
     pub(crate) fn publish(mut self, operations: &mut MountedVolumeAccess<'_>) -> CreateCompletion {
         self.oplock.publish();
         let Self {
+            allocation_reserved,
             paging: _,
             claim,
             oplock: _,
@@ -2662,6 +2677,9 @@ impl PreparedCreatePublication {
         });
         let (fcb, file_object) = claim.consume();
         publish_node_stream_raw(file_object, fcb, handle, flags);
+        if allocation_reserved {
+            publish_create_allocation(fcb);
+        }
         if let Some(pending) = pending_deletion {
             operations.set_file_delete_pending(fcb, pending);
         }
@@ -2670,6 +2688,19 @@ impl PreparedCreatePublication {
         }
         CreateCompletion::Handle(CreateAction::Created)
     }
+}
+
+/// The prepared claim or attached FILE_OBJECT retains this exact stream through publication.
+#[expect(
+    unsafe_code,
+    reason = "create publication consumes a live FCB claim only after durable commit"
+)]
+fn publish_create_allocation(fcb: NonNull<FileControlBlock>) {
+    let fcb = unsafe {
+        // SAFETY: The attached FILE_OBJECT retains the claim's FCB at this publication boundary.
+        fcb.as_ref()
+    };
+    fcb.publish_allocation_reservation(true);
 }
 
 /// FCB reference and share claim that rolls back unless durable publication consumes it.
