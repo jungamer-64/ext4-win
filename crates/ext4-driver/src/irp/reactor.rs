@@ -1381,6 +1381,10 @@ pub(crate) struct CompletionReactor {
     /// Preallocated private-cache-map work storage for the finalization execution lane.
     #[cfg(not(test))]
     finalization_work: UnsafeCell<Option<Box<PassiveWorkEnvelope>>>,
+    /// One-shot journal-handle close storage, allocated before mounted-device publication.
+    /// Aborted preparations retain it; terminal close consumes it without post-durability allocation.
+    #[cfg(not(test))]
+    journal_close_work: UnsafeCell<Option<Box<PassiveWorkEnvelope>>>,
     /// Auto-reset event signaled only when a concrete event is published.
     wake_event: UnsafeCell<wdk_sys::KEVENT>,
     /// Bitset of retry timer events published by DPC callbacks.
@@ -1560,6 +1564,27 @@ impl CompletionReactor {
                 .acquire()?
                 .ok_or(DriverError::InvalidDeviceRequest)?,
         )?;
+        #[cfg(not(test))]
+        let mut target = target;
+        #[cfg(not(test))]
+        let journal_close_work = match &mut target {
+            ReactorTarget::MountedVolume(binding) => binding.with_access(|access| {
+                if access.mounted_profile().journal_target()
+                    == Some(ext4_core::StorageTarget::ExternalJournal)
+                {
+                    PassiveWorkEnvelope::prepare_request(
+                        device,
+                        completion_rundown
+                            .acquire()?
+                            .ok_or(DriverError::InvalidDeviceRequest)?,
+                    )
+                    .map(Some)
+                } else {
+                    Ok(None)
+                }
+            })?,
+            ReactorTarget::ControlDevice(_) => None,
+        };
         // Complete fallible preparation before moving resource owners into raw fields. Every
         // remaining field constructor is infallible; native setup below is guarded as one value.
         let destination = unsafe {
@@ -1612,6 +1637,16 @@ impl CompletionReactor {
             // SAFETY: The projected destination is initialized once before reactor publication.
             destination.write(UnsafeCell::new(Some(finalization_work)));
         };
+        #[cfg(not(test))]
+        let destination = unsafe {
+            // SAFETY: Mount initialization exclusively owns this disjoint field's storage.
+            core::ptr::addr_of_mut!((*reactor).journal_close_work)
+        };
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This disjoint field is initialized once before any actor or device observer.
+            destination.write(UnsafeCell::new(journal_close_work));
+        }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
             core::ptr::addr_of_mut!((*reactor).csq)
@@ -1912,6 +1947,8 @@ impl CompletionReactor {
             finalization: _,
             #[cfg(not(test))]
                 finalization_work: _,
+            #[cfg(not(test))]
+                journal_close_work: _,
             wake_event: _,
             timer_ready: _,
             delayed_close_ready: _,
@@ -2770,6 +2807,11 @@ impl CompletionReactor {
         unsafe {
             // SAFETY: Actor join proves no request or native callback owns the finalization reserve.
             drop((&mut *reactor.finalization_work.get()).take());
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: Actor join proves the journal close worker is dormant or already reclaimed.
+            drop((&mut *reactor.journal_close_work.get()).take());
         }
         unsafe {
             // SAFETY: The thread is joined and every completion can still reach this empty inbox.
@@ -3915,6 +3957,21 @@ impl CompletionReactor {
         let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
+        if matches!(work, crate::irp::PassiveWork::CloseExternalJournal(_)) {
+            let prepared = unsafe {
+                // SAFETY: Only the actor's unique terminal close may consume this mount-time reserve.
+                (&mut *self.journal_close_work.get()).take()
+            }
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            });
+            let prepared = prepared.bind(NonNull::from(self), identity, work, suspended);
+            if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            }
+            PassiveWorkEnvelope::queue(prepared);
+            return;
+        }
         if ExecutionClass::Finalization.slots().contains(&index) {
             let reserve = unsafe {
                 // SAFETY: The sole finalization slot and actor own this preallocated worker reserve.
