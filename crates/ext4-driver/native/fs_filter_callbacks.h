@@ -23,6 +23,26 @@ ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
         wdk_sys_release_resource(&stream->MainResource);
         return STATUS_FILE_LOCK_CONFLICT;
     }
+    /* Writable sections revoke cached views before MM can publish the mapping.
+     * The callback-specific FsRtl operation never waits for an acknowledgment.
+     * MainResource excludes concurrent grants through this transition. */
+    if ((data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection) &&
+        ((data->Parameters.AcquireForSectionSynchronization.PageProtection &
+            (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0)) {
+        NTSTATUS status;
+        __try {
+            status = FsRtlCheckOplockForFsFilterCallback(&stream->Header.Oplock, data,
+                OPLOCK_FLAG_IGNORE_OPLOCK_KEYS);
+        }
+        __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
+            status = GetExceptionCode();
+        }
+        ext4win_stream_refresh_fast_io_projection(stream);
+        if (!NT_SUCCESS(status)) {
+            wdk_sys_release_resource(&stream->MainResource);
+            return status;
+        }
+    }
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }
 

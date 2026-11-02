@@ -16,6 +16,13 @@
 #define EXT4WIN_TRACE_EVENT_MAPPED_WRITE 1
 #define SyncTypeOther 0
 #define SyncTypeCreateSection 1
+#define PAGE_READWRITE 4
+#define PAGE_EXECUTE_READWRITE 64
+#define PAGE_WRITECOPY 8
+#define OPLOCK_FLAG_IGNORE_OPLOCK_KEYS 8
+#define NT_SUCCESS(status) ((status) >= 0)
+#define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS 1
+#define GetExceptionCode() ((NTSTATUS)__exception_code())
 
 typedef int NTSTATUS;
 typedef int BOOLEAN;
@@ -54,6 +61,7 @@ typedef struct {
 typedef struct {
     ERESOURCE MainResource, PagingIoResource;
     const VOID *SectionState;
+    struct { unsigned Oplock; } Header;
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 
 static EXT4WIN_STREAM_CONTEXT stream;
@@ -63,6 +71,9 @@ static FS_FILTER_CALLBACKS registered;
 static BOOLEAN ordinary_io_available = TRUE;
 static BOOLEAN paging_available = TRUE;
 static NTSTATUS registration_status;
+static unsigned breaks, projections;
+static NTSTATUS break_status;
+__declspec(dllimport) void __stdcall RaiseException(unsigned, unsigned, unsigned, const unsigned long long *);
 
 static void RtlZeroMemory(PVOID memory, unsigned long long size)
 {
@@ -138,6 +149,24 @@ static void ext4win_trace_status(PEXT4WIN_STREAM_CONTEXT object, unsigned event,
     assert(status == STATUS_SUCCESS || status == STATUS_CANT_WAIT);
 }
 
+static NTSTATUS FsRtlCheckOplockForFsFilterCallback(unsigned *oplock, PVOID input, unsigned flags)
+{
+    PFS_FILTER_CALLBACK_DATA data = input;
+    assert(oplock == &stream.Header.Oplock && stream.MainResource.held == 1);
+    assert(flags == OPLOCK_FLAG_IGNORE_OPLOCK_KEYS);
+    assert(data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection);
+    assert(data->Parameters.AcquireForSectionSynchronization.PageProtection &
+        (PAGE_READWRITE | PAGE_EXECUTE_READWRITE));
+    breaks++;
+    if (break_status < 0) { RaiseException((unsigned)break_status, 0, 0, NULL); }
+    return break_status;
+}
+static void ext4win_stream_refresh_fast_io_projection(PEXT4WIN_STREAM_CONTEXT object)
+{
+    assert(object == &stream && stream.MainResource.held == 1);
+    projections++;
+}
+
 #include "fs_filter_callbacks.h"
 
 static void invoke(PFS_FILTER_CALLBACK callback, PFS_FILTER_CALLBACK_DATA data,
@@ -173,6 +202,35 @@ static void exercise_callbacks(BOOLEAN supply_context)
     invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
     ordinary_io_available = TRUE;
+
+    /* Copy-on-write does not modify the backing stream. Each writable mapping
+     * breaks cached views even if it uses the oplock owner's own key. */
+    {
+        unsigned before = breaks;
+        unsigned protections[] = {PAGE_READWRITE, PAGE_EXECUTE_READWRITE, PAGE_WRITECOPY};
+        unsigned index;
+        data.Parameters.AcquireForSectionSynchronization.SyncType = SyncTypeCreateSection;
+        for (index = 0; index < 3; index++) {
+            data.Parameters.AcquireForSectionSynchronization.PageProtection = protections[index];
+            invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
+                STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+            invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
+                STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+        }
+        assert(breaks == before + 2 && projections == breaks);
+        data.Parameters.AcquireForSectionSynchronization.PageProtection = PAGE_READWRITE;
+        break_status = STATUS_FILE_LOCK_CONFLICT;
+        invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context, break_status);
+        assert(stream.MainResource.held == 0 && projections == breaks);
+        break_status = STATUS_SUCCESS;
+        data.Parameters.AcquireForSectionSynchronization.SyncType = SyncTypeOther;
+        before = breaks;
+        invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
+            STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+        invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
+            STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+        assert(breaks == before);
+    }
 
     data.Parameters.AcquireForModifiedPageWriter.ResourceToRelease = &paging_resource;
     invoke(registered.PreAcquireForModifiedPageWriter, &data, supply_context,
