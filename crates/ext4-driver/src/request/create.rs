@@ -1413,21 +1413,6 @@ impl PendingExistingCreateOpen {
         })
     }
 
-    /// Returns the exact resident stream and policy that must be checked before publication.
-    fn oplock_check_target(
-        &self,
-    ) -> Option<(NonNull<FileControlBlock>, crate::irp::OplockCreatePolicy)> {
-        match &self.oplock {
-            ExistingCreateOplockState::Check(policy) => {
-                Some((self.claim.file_control_block(), *policy))
-            }
-            ExistingCreateOplockState::Ready
-            | ExistingCreateOplockState::BreakInProgress
-            | ExistingCreateOplockState::Reserve(_)
-            | ExistingCreateOplockState::Reserved(_) => None,
-        }
-    }
-
     /// Returns the exact stream and admitted count whose create IRP must reserve an atomic oplock.
     fn oplock_reservation_target(&self) -> Option<(NonNull<FileControlBlock>, NonZeroU32)> {
         match &self.oplock {
@@ -1439,14 +1424,6 @@ impl PendingExistingCreateOpen {
             | ExistingCreateOplockState::Check(_)
             | ExistingCreateOplockState::Reserved(_) => None,
         }
-    }
-
-    /// Seals the exact success status returned by the delegated create conflict check.
-    /// # Errors
-    ///
-    /// Returns the matching oplock or protocol error without consuming the provisional claim.
-    pub(crate) fn accept_oplock_status(&mut self, status: wdk_sys::NTSTATUS) -> DriverResult<()> {
-        self.oplock.accept(status)
     }
 
     /// Seals one reservation returned for this exact provisional FCB claim.
