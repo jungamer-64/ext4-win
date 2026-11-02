@@ -21,6 +21,20 @@ use crate::kernel::status::{DriverError, DriverResult, STATUS_RETRY};
 use crate::memory;
 use crate::state::{KernelDevice, TransferSectorSize};
 
+#[cfg(not(test))]
+use crate::kernel::ffi::ZwClose as close_journal_handle;
+#[cfg(test)]
+#[expect(
+    unsafe_code,
+    reason = "host tests use native Object Manager handles through the user-mode close entry point"
+)]
+#[link(name = "ntdll")]
+unsafe extern "system" {
+    /// Host counterpart of ZwClose for real native handle and sharing tests.
+    #[link_name = "NtClose"]
+    fn close_journal_handle(handle: wdk_sys::HANDLE) -> NTSTATUS;
+}
+
 mod control;
 pub(crate) use control::{DeviceControlCommand, DeviceControlCompletion, DeviceControlKind};
 
@@ -363,13 +377,127 @@ impl MountedStorageRoute {
     }
 }
 
+/// Referenced journal device lifetime, independent of its session's exclusive handle.
+/// Closing the handle permits a successor mount while this reference keeps copied lower
+/// routes valid until all operations and old FILE_OBJECTs have retired.
+#[derive(Debug)]
+pub struct ExternalJournalStorage {
+    /// Present until final filesystem/MMP durability transfers the handle to its close worker.
+    exclusion: Option<ExternalJournalExclusion>,
+    /// Object Manager reference retaining the related device independently of handle cleanup.
+    file_object: NonNull<wdk_sys::FILE_OBJECT>,
+}
+
+impl ExternalJournalStorage {
+    /// Takes the exclusive handle and its independently acquired FILE_OBJECT reference.
+    /// # Safety
+    /// Both inputs must be live, uniquely owned acquisitions for the same journal device.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "mount transfers both successful native acquisitions into separate lifetime owners"
+    )]
+    pub(crate) unsafe fn from_exclusive(
+        handle: wdk_sys::HANDLE,
+        file_object: NonNull<wdk_sys::FILE_OBJECT>,
+    ) -> Self {
+        Self {
+            exclusion: Some(ExternalJournalExclusion {
+                handle: Some(handle),
+            }),
+            file_object,
+        }
+    }
+}
+
+impl Drop for ExternalJournalStorage {
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the unique reference remains until all copied lower routes have retired"
+        )
+    )]
+    fn drop(&mut self) {
+        drop(self.exclusion.take());
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This owner balances exactly one reference acquired at exclusive open.
+            crate::kernel::ffi::ObfDereferenceObject(self.file_object.as_ptr().cast());
+        }
+        #[cfg(test)]
+        let _reference = self.file_object;
+    }
+}
+
+/// Unique share-zero handle authority; it grants no access to the retained journal device.
+#[derive(Debug)]
+pub(crate) struct ExternalJournalExclusion {
+    /// A successful explicit close consumes the handle before fallback destruction.
+    handle: Option<wdk_sys::HANDLE>,
+}
+
+impl ExternalJournalExclusion {
+    /// Releases sharing outside actor ownership. Rejected closes retain the same handle;
+    /// the caller must retain it and must not publish remount permission after failure.
+    /// # Errors
+    /// Returns the exact close failure with reusable handle ownership.
+    #[expect(
+        unsafe_code,
+        reason = "the sole native handle owner closes synchronously at PASSIVE_LEVEL or in its native host oracle"
+    )]
+    pub(crate) fn close(mut self) -> Result<(), (DriverError, Self)> {
+        let status = unsafe {
+            // SAFETY: Only exclusive open constructs this owner; no other path closes its handle.
+            close_journal_handle(self.handle.unwrap_or_else(|| {
+                crate::kernel::fatal::KernelWideInconsistency::mounted_volume_state_corruption()
+                    .bugcheck()
+            }))
+        };
+        if status < wdk_sys::STATUS_SUCCESS {
+            return Err((DriverError::ExternalJournalCloseFailed(status), self));
+        }
+        self.handle = None;
+        Ok(())
+    }
+}
+
+impl Drop for ExternalJournalExclusion {
+    #[expect(
+        unsafe_code,
+        reason = "unpublished mounts and terminal failed-close teardown retain sole fallback handle ownership"
+    )]
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            unsafe {
+                // SAFETY: No caller can observe remount success on this rollback/teardown path.
+                // A rejected native close has no accepted effect; final destruction owns cleanup.
+                let _status = close_journal_handle(handle);
+            }
+        }
+    }
+}
+
+#[expect(
+    unsafe_code,
+    reason = "native references and kernel handles may transfer between passive workers; their owners release them once"
+)]
+// SAFETY: The mount and worker retain separate native acquisitions; neither is thread-affine.
+unsafe impl Send for ExternalJournalStorage {}
+#[expect(
+    unsafe_code,
+    reason = "this unique kernel handle moves from the actor to one passive close worker"
+)]
+// SAFETY: No borrowed device or thread-owned resource accompanies the kernel handle.
+unsafe impl Send for ExternalJournalExclusion {}
+
 /// Non-copy mounted storage lifetime owner.
 #[derive(Debug)]
 pub struct MountedStorage {
     /// Copyable request route borrowed by individual operations.
     route: MountedStorageRoute,
-    /// Exclusive external journal lease, absent for an internal journal.
-    _external_journal: Option<ExternalJournalLease>,
+    /// Journal-device lifetime and any unreleased session exclusion.
+    external_journal: Option<ExternalJournalStorage>,
 }
 
 impl MountedStorage {
@@ -378,21 +506,48 @@ impl MountedStorage {
     pub const fn primary(completion_owner: KernelDevice, filesystem: LowerStorageDevice) -> Self {
         Self {
             route: MountedStorageRoute::new(completion_owner, filesystem, None),
-            _external_journal: None,
+            external_journal: None,
         }
     }
 
-    /// Installs exclusive external-journal ownership into this mount lifetime.
+    /// Installs journal-device lifetime and its initial session exclusion.
     #[must_use]
-    pub fn with_external(self, external: LowerStorageDevice, lease: ExternalJournalLease) -> Self {
+    pub fn with_external(
+        self,
+        external: LowerStorageDevice,
+        storage: ExternalJournalStorage,
+    ) -> Self {
         Self {
             route: MountedStorageRoute::new(
                 self.route.completion_owner,
                 self.route.filesystem,
                 Some(external),
             ),
-            _external_journal: Some(lease),
+            external_journal: Some(storage),
         }
+    }
+
+    /// Transfers only sharing exclusion after filesystem/MMP completion; device references stay live.
+    pub(crate) fn take_external_journal_exclusion(&mut self) -> Option<ExternalJournalExclusion> {
+        self.external_journal
+            .as_mut()
+            .and_then(|journal| journal.exclusion.take())
+    }
+
+    /// Restores the unique handle after a rejected or unsubmitted close, without restoring ext4 I/O.
+    pub(crate) fn retain_external_journal_exclusion(
+        &mut self,
+        exclusion: ExternalJournalExclusion,
+    ) {
+        let journal = self.external_journal.as_mut().unwrap_or_else(|| {
+            crate::kernel::fatal::KernelWideInconsistency::mounted_volume_state_corruption()
+                .bugcheck()
+        });
+        if journal.exclusion.is_some() {
+            crate::kernel::fatal::KernelWideInconsistency::mounted_volume_state_corruption()
+                .bugcheck();
+        }
+        journal.exclusion = Some(exclusion);
     }
 
     /// Returns a copyable route without transferring lifetime ownership.
@@ -1319,6 +1474,130 @@ pub fn failed_unsubmitted_request(request: StorageRequest, error: Error) -> Stor
 
 #[cfg(test)]
 mod tests {
+    #[expect(
+        unsafe_code,
+        reason = "the native handle oracle changes only close protection on its uniquely retained test handle"
+    )]
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        /// Native close-protection control used to observe a rejected close without consuming it.
+        fn SetHandleInformation(handle: wdk_sys::HANDLE, mask: u32, flags: u32) -> i32;
+    }
+
+    /// # Errors
+    /// Returns temporary-file, native fixture or required file-removal failure.
+    /// # Panics
+    /// Fails if rejected closes lose exclusion or a closed journal still prevents a successor open.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "scoped fixtures retain native device storage and own the real user-mode handle"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fallible native setup surrounds sharing and ownership assertions"
+    )]
+    fn journal_close_releases_sharing_while_old_routes_remain_live() -> std::io::Result<()> {
+        use std::os::windows::{fs::OpenOptionsExt as _, io::IntoRawHandle as _};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(std::format!(
+            "ext4-journal-close-{}-{stamp}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(&path)?;
+        let result = (|| {
+            let mut native = wdk_sys::DEVICE_OBJECT {
+                SectorSize: 512,
+                Flags: wdk_sys::DO_DIRECT_IO,
+                ..Default::default()
+            };
+            let mut referenced_file = wdk_sys::FILE_OBJECT::default();
+            // SAFETY: The scoped native device remains allocated until storage and every copied route drop.
+            let device = unsafe { KernelDevice::from_raw(&mut native) }
+                .ok_or_else(|| std::io::Error::other("missing native fixture"))?;
+            let lower =
+                super::LowerStorageDevice::from_device(device, DeviceLength::from_bytes(4096))
+                    .map_err(|error| std::io::Error::other(std::format!("{error:?}")))?;
+            let handle = file.into_raw_handle();
+            let mut storage = super::MountedStorage::primary(device, lower).with_external(
+                lower,
+                super::ExternalJournalStorage {
+                    exclusion: Some(super::ExternalJournalExclusion {
+                        handle: Some(handle),
+                    }),
+                    file_object: core::ptr::NonNull::from(&mut referenced_file),
+                },
+            );
+            let old_route = storage.route();
+            let open_successor = || {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .share_mode(0)
+                    .open(&path)
+            };
+            assert_eq!(
+                open_successor()
+                    .err()
+                    .and_then(|error| error.raw_os_error()),
+                Some(32)
+            );
+            let exclusion = storage
+                .take_external_journal_exclusion()
+                .ok_or_else(|| std::io::Error::other("missing journal exclusion"))?;
+            storage.retain_external_journal_exclusion(exclusion);
+            // SAFETY: Storage still owns this real handle; protection changes do not transfer ownership.
+            assert_ne!(unsafe { SetHandleInformation(handle, 2, 2) }, 0);
+            let exclusion = storage
+                .take_external_journal_exclusion()
+                .ok_or_else(|| std::io::Error::other("missing restored handle"))?;
+            let rejected = exclusion.close();
+            // SAFETY: A protected handle cannot have been consumed by the rejected native close.
+            assert_ne!(unsafe { SetHandleInformation(handle, 2, 0) }, 0);
+            let Err((error, exclusion)) = rejected else {
+                return Err(std::io::Error::other(
+                    "protected close unexpectedly succeeded",
+                ));
+            };
+            assert_eq!(
+                error,
+                DriverError::ExternalJournalCloseFailed(i32::from_ne_bytes(
+                    0xC000_0235_u32.to_ne_bytes()
+                ))
+            );
+            storage.retain_external_journal_exclusion(exclusion);
+            assert_eq!(
+                open_successor()
+                    .err()
+                    .and_then(|error| error.raw_os_error()),
+                Some(32)
+            );
+            let exclusion = storage
+                .take_external_journal_exclusion()
+                .ok_or_else(|| std::io::Error::other("missing retained handle"))?;
+            exclusion
+                .close()
+                .map_err(|(error, _exclusion)| std::io::Error::other(std::format!("{error:?}")))?;
+            assert!(storage.take_external_journal_exclusion().is_none());
+            assert_eq!(storage.route(), old_route);
+            let successor = open_successor()?;
+            drop(successor);
+            drop(storage);
+            Ok(())
+        })();
+        let cleanup = std::fs::remove_file(path);
+        result?;
+        cleanup
+    }
+
     use alloc::boxed::Box;
     use alloc::vec;
 

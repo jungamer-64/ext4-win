@@ -800,13 +800,24 @@ impl VolumeRuntime {
     pub(crate) fn mmp_close_ready(&self) -> DriverResult<bool> {
         self.ownership.close_ready()
     }
-    /// Consumes the combined close acknowledgment only after final physical ownership release.
+    /// Consumes final durability and transfers journal sharing to passive close ownership.
+    /// Copied routes retain their device reference; ext4 I/O remains revoked after this handoff.
     /// # Errors
     /// Rejects premature, duplicate or failed close completion.
-    pub(crate) fn finish_mmp_close(&mut self) -> DriverResult<ext4_core::CleanCloseDurability> {
-        let durability = self.ownership.finish_close()?;
+    pub(crate) fn finish_mmp_close(
+        &mut self,
+    ) -> DriverResult<Option<crate::kernel::storage::ExternalJournalExclusion>> {
+        let _durability = self.ownership.finish_close()?;
         self.publish_reliability();
-        Ok(durability)
+        Ok(self.storage.take_external_journal_exclusion())
+    }
+
+    /// Retains a rejected handle close while the ended filesystem session stays revoked.
+    pub(crate) fn retain_external_journal_exclusion(
+        &mut self,
+        exclusion: crate::kernel::storage::ExternalJournalExclusion,
+    ) {
+        self.storage.retain_external_journal_exclusion(exclusion);
     }
     /// Observes a failed, uncertain or expired physical ownership operation without retrying it.
     pub(crate) fn fail_mmp(&mut self, reason: ext4_core::Error) {

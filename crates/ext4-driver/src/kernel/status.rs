@@ -192,6 +192,8 @@ pub(crate) enum DriverError {
     ExternalJournalAmbiguous,
     /// The uniquely matching journal could not be reopened with share access zero.
     ExternalJournalExclusiveOpenFailed,
+    /// The journal's exclusive handle could not be closed; remount permission remains withheld.
+    ExternalJournalCloseFailed(NTSTATUS),
     /// The volume-interface namespace could not be enumerated or resolved safely.
     ExternalJournalDiscoveryFailed,
     /// Caller selected a valid but unsupported Windows filesystem behavior.
@@ -268,6 +270,7 @@ impl DriverError {
             Self::ExternalJournalNotFound => STATUS_OBJECT_NAME_NOT_FOUND,
             Self::ExternalJournalAmbiguous => STATUS_OBJECT_NAME_COLLISION,
             Self::ExternalJournalExclusiveOpenFailed => ntstatus(0xC000_0043),
+            Self::ExternalJournalCloseFailed(status) => status,
             Self::ExternalJournalDiscoveryFailed => STATUS_IO_DEVICE_ERROR,
             Self::NotSupported => STATUS_NOT_SUPPORTED,
             Self::Core(error) => core_error_status(error),

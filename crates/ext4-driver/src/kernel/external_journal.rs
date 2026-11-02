@@ -6,7 +6,7 @@ use core::ptr::NonNull;
 #[cfg(not(test))]
 use crate::kernel::device_interface::{VolumeInterfaceClass, VolumeInterfaces, unicode_string};
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::kernel::storage::ExternalJournalLease;
+use crate::kernel::storage::ExternalJournalStorage;
 use crate::memory::DriverVec;
 use crate::state::KernelDevice;
 
@@ -174,8 +174,8 @@ unsafe impl Send for SelectedExternalJournal {}
 pub(crate) struct ExclusiveExternalJournal {
     /// Related lower device reached through the exclusively opened file object.
     device: KernelDevice,
-    /// Unique share-zero handle and FILE_OBJECT reference.
-    lease: ExternalJournalLease,
+    /// Session exclusion and independently retained journal-device lifetime.
+    storage: ExternalJournalStorage,
 }
 
 impl ExclusiveExternalJournal {
@@ -213,7 +213,7 @@ impl ExclusiveExternalJournal {
             };
         let status = unsafe {
             // SAFETY: All native structures point to live stack storage for the duration of the
-            // synchronous open. Share access zero establishes the mount-long exclusion contract.
+            // synchronous open. Share access zero excludes competing sessions until clean close.
             crate::kernel::ffi::ZwCreateFile(
                 &raw mut handle,
                 desired_access,
@@ -283,12 +283,12 @@ impl ExclusiveExternalJournal {
                 return Err(DriverError::ExternalJournalExclusiveOpenFailed);
             }
         }
-        let lease = unsafe {
+        let storage = unsafe {
             // SAFETY: The successful open and object-reference calls transferred one ownership of
             // each resource; this is the sole RAII owner from this point forward.
-            ExternalJournalLease::from_exclusive(handle, file_object)
+            ExternalJournalStorage::from_exclusive(handle, file_object)
         };
-        Ok(Self { device, lease })
+        Ok(Self { device, storage })
     }
 
     #[cfg(test)]
@@ -314,9 +314,9 @@ impl ExclusiveExternalJournal {
         self.device
     }
 
-    /// Separates the device identity from mount-long ownership.
-    pub(crate) fn into_parts(self) -> (KernelDevice, ExternalJournalLease) {
-        (self.device, self.lease)
+    /// Transfers the device identity and its session/reference owners into mount preparation.
+    pub(crate) fn into_parts(self) -> (KernelDevice, ExternalJournalStorage) {
+        (self.device, self.storage)
     }
 }
 

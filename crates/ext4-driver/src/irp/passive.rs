@@ -53,6 +53,8 @@ pub(crate) enum PassiveWork {
         /// Narrow native handle authority for this recovery mode.
         access: ext4_core::DeviceWriteAccess,
     },
+    /// Releases the journal's share claim after filesystem and MMP writes have ended.
+    CloseExternalJournal(crate::kernel::storage::ExternalJournalExclusion),
     /// Retained UUID update or reconciliation, owned through worker completion.
     Identity(alloc::boxed::Box<crate::identity::IdentityWork>),
     /// Retained mount-policy save or reconciliation.
@@ -172,6 +174,16 @@ pub(crate) enum PassiveWork {
 /// Exact result returned by one passive native work item.
 #[derive(Debug)]
 pub(crate) enum PassiveWorkCompletion {
+    /// Rejected or unsubmitted close returns its handle; success consumed sharing exclusion.
+    CloseExternalJournal(
+        Result<
+            (),
+            (
+                DriverError,
+                crate::kernel::storage::ExternalJournalExclusion,
+            ),
+        >,
+    ),
     /// Cc transfer/MDL acquisition has not begun; all original work and capture owners remain live.
     MediaVerificationRequired(PassiveWork),
     /// I/O Manager verification completed; original request captures remain with its operation.
@@ -297,7 +309,7 @@ impl PassiveWork {
         authorize: impl FnOnce() -> DriverResult<()>,
     ) -> DriverResult<()> {
         match self {
-            Self::NotifyVolume { .. } => Ok(()),
+            Self::NotifyVolume { .. } | Self::CloseExternalJournal(_) => Ok(()),
             Self::OpenExternalJournal { .. }
             | Self::Identity(_)
             | Self::Policy(_)
@@ -408,6 +420,9 @@ impl PassiveWork {
     /// Executes the sole native call selected before the actor suspended.
     pub(super) fn execute(self) -> PassiveWorkCompletion {
         match self {
+            Self::CloseExternalJournal(exclusion) => {
+                PassiveWorkCompletion::CloseExternalJournal(exclusion.close())
+            }
             Self::NotifyVolume { owned, file, event } => {
                 crate::kernel::volume_event::VolumeNotification::new(file, event).deliver();
                 PassiveWorkCompletion::NotifyVolume {
@@ -548,6 +563,9 @@ impl PassiveWork {
     /// Preserves the selected operation kind when worker preparation fails before queueing.
     pub(super) fn failed(self, error: DriverError) -> PassiveWorkCompletion {
         match self {
+            Self::CloseExternalJournal(exclusion) => {
+                PassiveWorkCompletion::CloseExternalJournal(Err((error, exclusion)))
+            }
             Self::NotifyVolume { owned, .. } => PassiveWorkCompletion::NotifyVolume {
                 owned,
                 result: Err(error),
@@ -597,6 +615,7 @@ impl PassiveWork {
         match self {
             work @ (Self::Read { .. }
             | Self::NotifyVolume { .. }
+            | Self::CloseExternalJournal(_)
             | Self::Write { .. }
             | Self::Mdl { .. }
             | Self::Uninitialize { .. }) => super::reactor::CompletionEvent::PassiveCompleted(

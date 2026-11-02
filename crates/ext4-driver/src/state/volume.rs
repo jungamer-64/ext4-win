@@ -2094,11 +2094,20 @@ impl MountedVolumeAccess<'_> {
         self.authorize_storage()?;
         self.runtime.mmp_close_ready()
     }
-    /// Consumes combined filesystem and ownership durability before the native close publication.
+    /// Transfers journal sharing after combined filesystem and ownership durability.
     /// # Errors
     /// Rejects a premature or repeated acknowledgment.
-    pub(crate) fn finish_mmp_close(&mut self) -> DriverResult<ext4_core::CleanCloseDurability> {
+    pub(crate) fn finish_mmp_close(
+        &mut self,
+    ) -> DriverResult<Option<crate::kernel::storage::ExternalJournalExclusion>> {
         self.runtime.finish_mmp_close()
+    }
+    /// Keeps exclusion after a failed close without reauthorizing filesystem I/O.
+    pub(crate) fn retain_external_journal_exclusion(
+        &mut self,
+        exclusion: crate::kernel::storage::ExternalJournalExclusion,
+    ) {
+        self.runtime.retain_external_journal_exclusion(exclusion);
     }
     /// Irreversibly retires the session while retaining all outstanding completion owners.
     pub(crate) fn fail_mmp(&mut self, reason: ext4_core::Error) {

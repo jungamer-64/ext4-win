@@ -60,6 +60,11 @@ enum CloseState {
         owned: OwnedIrp,
         transition: PreparedVolumeStateTransition,
     },
+    /// Filesystem writes ended; a passive worker must release journal sharing before remount.
+    ReleasingJournal {
+        owned: OwnedIrp,
+        transition: PreparedVolumeStateTransition,
+    },
     /// Completion or failure consumed the request and its publication authority.
     Terminal,
 }
@@ -124,6 +129,32 @@ pub(crate) fn volume_close(
 }
 
 impl VolumeCloseOperation {
+    /// Remount routing becomes visible only after every session exclusion has been released.
+    fn publish(
+        self: Box<Self>,
+        owned: OwnedIrp,
+        transition: PreparedVolumeStateTransition,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        let result = access.publish_volume_state_transition(transition);
+        if result.is_ok() && self.target.terminal() == CleanCloseTerminal::Dismount {
+            MountedVolumeDevice::publish_dismount(self.device);
+            MountedVolumeDevice::unregister_shutdown_notification(self.device);
+            MountedVolumeDevice::complete_dismount(self.device);
+        }
+        access
+            .operational_trace()
+            .record_result(OperationalPath::VolumeClose, &result);
+        let mut completion = owned.prepare_result(result.map(|()| IrpCompletion::EMPTY));
+        if result.is_ok()
+            && let VolumeCloseTarget::Dismount(owner) = self.target
+        {
+            completion = completion
+                .with_volume_event(owner, crate::kernel::volume_event::VolumeEvent::Dismount);
+        }
+        OperationTransition::Complete(completion)
+    }
+
     /// Only a still-authorized session may reopen after cache preparation fails.
     fn fail_preparation(
         owned: OwnedIrp,
@@ -382,30 +413,32 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                         access,
                     );
                 }
-                let _durability = match access.finish_mmp_close() {
-                    Ok(durability) => durability,
+                let exclusion = match access.finish_mmp_close() {
+                    Ok(exclusion) => exclusion,
                     Err(error) => return Self::fail(owned, transition, error, access),
                 };
-                let result = access.publish_volume_state_transition(transition);
-                if result.is_ok() && self.target.terminal() == CleanCloseTerminal::Dismount {
-                    MountedVolumeDevice::publish_dismount(self.device);
-                    MountedVolumeDevice::unregister_shutdown_notification(self.device);
-                    MountedVolumeDevice::complete_dismount(self.device);
+                if let Some(exclusion) = exclusion {
+                    self.state = CloseState::ReleasingJournal { owned, transition };
+                    OperationTransition::SubmitPassiveWork {
+                        work: crate::irp::PassiveWork::CloseExternalJournal(exclusion),
+                        suspended: self,
+                    }
+                } else {
+                    self.publish(owned, transition, access)
                 }
-                access
-                    .operational_trace()
-                    .record_result(OperationalPath::VolumeClose, &result);
-                let dismounted =
-                    result.is_ok() && self.target.terminal() == CleanCloseTerminal::Dismount;
-                let mut completion = owned.prepare_result(result.map(|()| IrpCompletion::EMPTY));
-                if dismounted && let VolumeCloseTarget::Dismount(owner) = self.target {
-                    completion = completion.with_volume_event(
-                        owner,
-                        crate::kernel::volume_event::VolumeEvent::Dismount,
-                    );
-                }
-                OperationTransition::Complete(completion)
             }
+            (
+                CloseState::ReleasingJournal { owned, transition },
+                CompletionEvent::PassiveCompleted(
+                    crate::irp::PassiveWorkCompletion::CloseExternalJournal(result),
+                ),
+            ) => match result {
+                Ok(()) => self.publish(owned, transition, access),
+                Err((error, exclusion)) => {
+                    access.retain_external_journal_exclusion(exclusion);
+                    Self::fail(owned, transition, error, access)
+                }
+            },
             (
                 CloseState::Draining {
                     owned, preparation, ..

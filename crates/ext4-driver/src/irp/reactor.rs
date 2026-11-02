@@ -6398,6 +6398,9 @@ mod tests {
                     return;
                 };
                 match completion {
+                    crate::irp::PassiveWorkCompletion::CloseExternalJournal(result) => {
+                        drop(result);
+                    }
                     crate::irp::PassiveWorkCompletion::VerifyVolume(result) => {
                         let _result = result;
                     }

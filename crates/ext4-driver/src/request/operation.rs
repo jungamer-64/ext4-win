@@ -32,7 +32,7 @@ use crate::kernel::ffi;
 use crate::kernel::operational_trace::{OperationalOutcome, OperationalPath, OperationalTrace};
 use crate::kernel::status::{DriverError, DriverResult, STATUS_FILE_LOCK_CONFLICT, STATUS_RETRY};
 use crate::kernel::storage::{
-    ExternalJournalLease, LowerStorageDevice, MountedStorage, MountedStorageRoute,
+    ExternalJournalStorage, LowerStorageDevice, MountedStorage, MountedStorageRoute,
     StorageFailureClass,
 };
 use crate::memory;
@@ -279,7 +279,7 @@ struct ExclusiveExternalProbeContext {
     /// Lower route with an already validated device length.
     external: LowerStorageDevice,
     /// Unique share-zero handle and referenced FILE_OBJECT.
-    lease: ExternalJournalLease,
+    lease: ExternalJournalStorage,
 }
 
 /// Mount admission driven entirely by private-IRP completion events.
