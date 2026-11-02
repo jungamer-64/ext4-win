@@ -77,6 +77,15 @@ pub(crate) fn query(
     request.output.copy_from_owned(descriptor.bytes())?;
     IrpCompletion::from_usize(required)
 }
+/// Whether setting a representable descriptor produced metadata requiring commit.
+#[derive(Debug)]
+pub(crate) enum SetSecurityOutcome {
+    /// The selected fields already describe the committed inode; no journal write is needed.
+    Unchanged,
+    /// The replacement has been staged and requires durable publication before success.
+    Staged,
+}
+
 /// Mutates owner/mode only when selected fields are representable by the shared projection.
 /// # Errors
 /// Rejects arbitrary Windows ACLs and propagates metadata/journal failures.
@@ -84,7 +93,7 @@ pub(crate) fn set(
     request: PendingIrpLease<'_>,
     mutation: &mut DriverMutationPass<'_, '_, '_>,
     map: &IdentityMap,
-) -> DriverResult<IrpCompletion> {
+) -> DriverResult<SetSecurityOutcome> {
     let request = SetSecurityRequest::decode(request)?;
     let current = mutation.load_access(request.node)?;
     let security = Descriptor::decode(
@@ -93,11 +102,12 @@ pub(crate) fn set(
         Components::new(request.selection.required_information())?,
         &current,
     )?;
-    if security != current.security() {
-        let node = mutation.node(request.node)?;
-        mutation.set_posix_security(node, security)?;
+    if security == current.security() {
+        return Ok(SetSecurityOutcome::Unchanged);
     }
-    Ok(IrpCompletion::EMPTY)
+    let node = mutation.node(request.node)?;
+    mutation.set_posix_security(node, security)?;
+    Ok(SetSecurityOutcome::Staged)
 }
 /// Decoded query-security request.
 struct QuerySecurityRequest<'a> {

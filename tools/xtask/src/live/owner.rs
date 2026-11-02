@@ -661,13 +661,15 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         )
         .into());
     }
-    println!("live filesystem I/O: set created-file DACL");
-    windows_host::set_file_dacl(&alpha, &descriptor)?;
-    println!("live filesystem I/O: query security round trip");
-    if windows_host::file_security(&alpha)? != descriptor {
-        return Err(
-            io::Error::other("native security descriptor round trip changed metadata").into(),
-        );
+    for attempt in 1..=2 {
+        println!("live filesystem I/O: set unchanged created-file DACL ({attempt})");
+        windows_host::set_file_dacl(&alpha, &descriptor)?;
+        println!("live filesystem I/O: query security round trip ({attempt})");
+        if windows_host::file_security(&alpha)? != descriptor {
+            return Err(
+                io::Error::other("native security descriptor round trip changed metadata").into(),
+            );
+        }
     }
     println!("live filesystem I/O: read back payload");
     if fs::read(&alpha)? != payload {

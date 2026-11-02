@@ -4972,11 +4972,19 @@ impl MutationRequestOperation {
                 ))
             }
             PreparedMutationRequest::Security(mapping) => {
-                let completion =
-                    crate::request::security::set(owned.request(), mutation, &mapping.get().map)?;
-                Ok(DriverResolveDisposition::Mutation(
-                    PendingDriverPublication::new(PendingDriverEffect::Normal(completion)),
-                ))
+                match crate::request::security::set(owned.request(), mutation, &mapping.get().map)?
+                {
+                    crate::request::security::SetSecurityOutcome::Unchanged => {
+                        Ok(DriverResolveDisposition::Complete(
+                            TopLevelCompletion::Normal(IrpCompletion::EMPTY),
+                        ))
+                    }
+                    crate::request::security::SetSecurityOutcome::Staged => Ok(
+                        DriverResolveDisposition::Mutation(PendingDriverPublication::new(
+                            PendingDriverEffect::Normal(IrpCompletion::EMPTY),
+                        )),
+                    ),
+                }
             }
             PreparedMutationRequest::DirectoryCasefold { directory, state } => {
                 let mut request = owned.request();
