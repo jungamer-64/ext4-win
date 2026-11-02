@@ -35,6 +35,7 @@ event_volume_streams_drain=32
 event_volume_retirement=33
 event_vpb_retirement=34
 event_driver_unload=35
+sample_vpb_references=36
 outcome_selected=1
 outcome_completed=2
 outcome_fallback=3

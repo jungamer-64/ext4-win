@@ -23,3 +23,11 @@ ext4win_trace_write(
     _In_ USHORT event_id,
     _In_ NTSTATUS status,
     _In_ ULONG outcome);
+
+/* Reference samples contain exactly one ULONG, independently of status/outcome events. */
+_IRQL_requires_max_(HIGH_LEVEL)
+VOID
+NTAPI
+ext4win_trace_vpb_references(
+    _In_ REGHANDLE registration_handle,
+    _In_ ULONG references);

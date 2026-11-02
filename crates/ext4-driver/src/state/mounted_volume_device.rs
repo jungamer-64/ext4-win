@@ -573,13 +573,18 @@ impl MountedVolumeDevice {
         {
             let mut retirement = retirement;
             let mut reported_pending = false;
+            let mut reported_references = None;
             loop {
                 retirement = match retirement.try_finish() {
                     Ok(released) => {
                         drop(released);
                         break;
                     }
-                    Err(retained) => {
+                    Err((retained, references)) => {
+                        if reported_references != Some(references) {
+                            trace.record_vpb_references(references);
+                            reported_references = Some(references);
+                        }
                         if !reported_pending {
                             trace.record_status(
                                 OperationalPath::VpbRetirement,
@@ -1127,15 +1132,16 @@ struct RetiringVpb {
 impl RetiringVpb {
     /// Releases the mount reference only when it is the last native reference.
     /// # Errors
-    /// Returns the reusable owner while native references remain. No association or reference is
-    /// consumed in that case; successful completion transfers sole native deallocation authority.
-    fn try_finish(self) -> Result<PoolVpb, Self> {
+    /// Returns the reusable owner and the lock-observed reference count while native references
+    /// remain. No association or reference is consumed in that case; the count is an observation,
+    /// not a reservation. Success transfers sole native deallocation authority.
+    fn try_finish(self) -> Result<PoolVpb, (Self, u32)> {
         let released = VpbSpinLock::with_mounted(self.device, |vpb| {
             if vpb.ReferenceCount != 1 {
                 if vpb.ReferenceCount == 0 {
                     KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
                 }
-                return None;
+                return Err(vpb.ReferenceCount);
             }
             vpb.ReferenceCount = 0;
             vpb.Flags &= !vpb_flag(wdk_sys::VPB_MOUNTED | wdk_sys::VPB_LOCKED | wdk_sys::VPB_DIRECT_WRITES_ALLOWED);
@@ -1148,9 +1154,9 @@ impl RetiringVpb {
                 // SAFETY: No FILE_OBJECT or in-flight native create retains this original VPB.
                 (*self.device.as_ptr()).Vpb = core::ptr::null_mut();
             }
-            Some(PoolVpb { allocation: NonNull::from(vpb) })
+            Ok(PoolVpb { allocation: NonNull::from(vpb) })
         }).unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
-        released.ok_or(self)
+        released.map_err(|references| (self, references))
     }
 }
 
@@ -1703,11 +1709,12 @@ mod tests {
             PoolVpb::try_new()?,
         )?;
         let successor = fixture.real.Vpb;
-        let retirement = publication
+        let (retirement, references) = publication
             .begin_retirement()
             .try_finish()
             .err()
             .ok_or(DriverError::InternalInvariantViolation)?;
+        assert_eq!(references, 3);
         fixture.original(|vpb| vpb.ReferenceCount -= 2)?;
         let released = retirement
             .try_finish()

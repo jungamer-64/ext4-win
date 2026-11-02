@@ -151,6 +151,20 @@ pub(crate) struct OperationalTrace {
 }
 
 impl OperationalTrace {
+    /// Samples one native VPB count without file identities or kernel addresses.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the provider capability writes only the lock-observed scalar reference count"
+    )]
+    pub(crate) fn record_vpb_references(self, references: u32) {
+        unsafe {
+            // SAFETY: The driver-lifetime registration retains this handle; the native writer
+            // emits the schema-defined count alone and retains no Rust storage.
+            ext4win_trace_vpb_references(self.handle.get(), references);
+        }
+    }
+
     /// Returns the scalar registration identity for native stream construction.
     #[cfg(not(test))]
     pub(super) const fn handle(self) -> u64 {
@@ -339,6 +353,7 @@ unsafe extern "system" {
     fn ext4win_trace_register(registration_handle_out: *mut u64) -> NTSTATUS;
     fn ext4win_trace_unregister(registration_handle: u64) -> NTSTATUS;
     fn ext4win_trace_write(registration_handle: u64, event_id: u16, status: NTSTATUS, outcome: u32);
+    fn ext4win_trace_vpb_references(registration_handle: u64, references: u32);
 }
 
 #[cfg(test)]

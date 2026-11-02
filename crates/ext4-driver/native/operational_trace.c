@@ -57,3 +57,22 @@ ext4win_trace_write(
     EventDataDescCreate(&data[1], &outcome, sizeof(outcome));
     (VOID)EtwWrite(registration_handle, &descriptor, NULL, RTL_NUMBER_OF(data), data);
 }
+
+_IRQL_requires_max_(HIGH_LEVEL)
+VOID
+NTAPI
+ext4win_trace_vpb_references(
+    _In_ REGHANDLE registration_handle,
+    _In_ ULONG references)
+{
+    EVENT_DESCRIPTOR descriptor;
+    EVENT_DATA_DESCRIPTOR data;
+    if (registration_handle == (REGHANDLE)0) { return; }
+    RtlZeroMemory(&descriptor, sizeof(descriptor));
+    descriptor.Id = EXT4WIN_TRACE_EVENT_VPB_REFERENCES;
+    descriptor.Level = EXT4WIN_OPERATIONAL_TRACE_LEVEL;
+    descriptor.Keyword = EXT4WIN_OPERATIONAL_TRACE_KEYWORD;
+    if (!EtwEventEnabled(registration_handle, &descriptor)) { return; }
+    EventDataDescCreate(&data, &references, sizeof(references));
+    (VOID)EtwWrite(registration_handle, &descriptor, NULL, 1, &data);
+}

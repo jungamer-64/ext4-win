@@ -25,6 +25,58 @@ pub struct TraceEvent {
     /// Contract outcome name.
     pub outcome: String,
 }
+
+/// Status/outcome observations and native reference samples have distinct payload layouts.
+#[derive(Debug, Eq, PartialEq)]
+enum TraceRecord {
+    /// One completed decode of an operational path.
+    Operation(TraceEvent),
+    /// Native VPB reference count, without a filesystem identity or address.
+    VpbReferences(u32),
+}
+
+/// Schema-selected layout, established before native trace consumption begins.
+#[derive(Debug)]
+enum TraceKind {
+    /// The named path carries status and outcome scalars.
+    Operation(String),
+    /// A reference sample carries one count scalar.
+    VpbReferences,
+}
+
+/// Decodes the fixed scalar layout selected by the current schema record kind.
+/// # Errors
+/// Rejects truncated/extra payload bytes and unknown operation outcomes.
+fn decode_record(
+    kind: &TraceKind,
+    bytes: &[u8],
+    outcomes: &BTreeMap<u32, String>,
+) -> io::Result<TraceRecord> {
+    match kind {
+        TraceKind::VpbReferences => {
+            let bytes = bytes
+                .try_into()
+                .map_err(|_| io::Error::other("ETW reference sample length mismatch"))?;
+            Ok(TraceRecord::VpbReferences(u32::from_le_bytes(bytes)))
+        }
+        TraceKind::Operation(event) => {
+            if bytes.len() != 8 {
+                return Err(io::Error::other("ETW scalar payload length mismatch"));
+            }
+            let status = u32::from_le_bytes(super::field(bytes, 0)?);
+            let outcome = u32::from_le_bytes(super::field(bytes, 4)?);
+            let outcome = outcomes
+                .get(&outcome)
+                .ok_or_else(|| io::Error::other("unknown trace outcome"))?
+                .clone();
+            Ok(TraceRecord::Operation(TraceEvent {
+                event: event.clone(),
+                status,
+                outcome,
+            }))
+        }
+    }
+}
 /// Bounded recent-event projection and first consumer failure; ETL remains the trace artifact.
 #[derive(Debug, Default)]
 struct Records {
@@ -37,8 +89,8 @@ struct Records {
 struct Context {
     /// Selected provider identity.
     provider: GUID,
-    /// Schema event names keyed by native ID.
-    events: BTreeMap<u16, String>,
+    /// Schema-selected layouts keyed by native ID.
+    events: BTreeMap<u16, TraceKind>,
     /// Schema outcome names keyed by native value.
     outcomes: BTreeMap<u32, String>,
     /// Consumer-owned output projection.
@@ -163,15 +215,21 @@ impl TraceSession {
         let mut events = BTreeMap::new();
         let mut outcomes = BTreeMap::new();
         for (key, value) in &records {
-            if let Some(name) = key.strip_prefix("event_")
-                && events
-                    .insert(
-                        value.parse::<u16>().map_err(io::Error::other)?,
-                        name.to_owned(),
-                    )
-                    .is_some()
-            {
-                return Err(io::Error::other("duplicate trace event ID"));
+            let kind = if let Some(name) = key.strip_prefix("event_") {
+                Some(TraceKind::Operation(name.to_owned()))
+            } else if let Some(name) = key.strip_prefix("sample_") {
+                match name {
+                    "vpb_references" => Some(TraceKind::VpbReferences),
+                    _ => return Err(io::Error::other("unsupported trace sample")),
+                }
+            } else {
+                None
+            };
+            if let Some(kind) = kind {
+                let id = value.parse::<u16>().map_err(io::Error::other)?;
+                if events.insert(id, kind).is_some() {
+                    return Err(io::Error::other("duplicate trace event ID"));
+                }
             }
             if let Some(name) = key.strip_prefix("outcome_")
                 && outcomes
@@ -350,7 +408,7 @@ impl Drop for TraceSession {
     }
 }
 
-/// Copies exactly the schema's two scalar fields while Windows owns the event record.
+/// Decodes the schema-selected scalar payload while Windows owns the event record.
 /// # Safety
 /// ETW must supply a live EVENT_RECORD with the registered Context pointer retained by the
 /// owner/worker Arc and readable UserData for UserDataLength bytes for this callback only.
@@ -377,35 +435,27 @@ unsafe extern "system" fn event(record: *mut EVENT_RECORD) {
     {
         return;
     }
-    let result = (|| -> io::Result<TraceEvent> {
-        if record.UserDataLength != 8 || record.UserData.is_null() {
+    let result = (|| -> io::Result<TraceRecord> {
+        if !matches!(record.UserDataLength, 4 | 8) || record.UserData.is_null() {
             return Err(io::Error::other("ETW scalar payload length mismatch"));
         }
         let bytes = unsafe {
-            // SAFETY: the callback contract provides eight readable payload bytes for this callback; they are copied immediately.
-            ptr::read_unaligned(record.UserData.cast::<[u8; 8]>())
+            // SAFETY: ETW retains the non-null payload for its declared bounded byte length
+            // throughout this callback. Decoding copies scalars without retaining this view.
+            core::slice::from_raw_parts(
+                record.UserData.cast::<u8>(),
+                usize::from(record.UserDataLength),
+            )
         };
-        let status = u32::from_le_bytes(super::field(&bytes, 0)?);
-        let outcome = u32::from_le_bytes(super::field(&bytes, 4)?);
         let event = context
             .events
             .get(&record.EventHeader.EventDescriptor.Id)
-            .ok_or_else(|| io::Error::other("unknown trace event ID"))?
-            .clone();
-        let outcome = context
-            .outcomes
-            .get(&outcome)
-            .ok_or_else(|| io::Error::other("unknown trace outcome"))?
-            .clone();
-        Ok(TraceEvent {
-            event,
-            status,
-            outcome,
-        })
+            .ok_or_else(|| io::Error::other("unknown trace event ID"))?;
+        decode_record(event, bytes, &context.outcomes)
     })();
     if let Ok(mut records) = context.records.lock() {
         match result {
-            Ok(event) => {
+            Ok(TraceRecord::Operation(event)) => {
                 use std::io::Write as _;
                 if let Err(error) = writeln!(
                     io::stdout().lock(),
@@ -421,6 +471,14 @@ unsafe extern "system" fn event(record: *mut EVENT_RECORD) {
                 }
                 records.recent.push_back(event);
             }
+            Ok(TraceRecord::VpbReferences(references)) => {
+                use std::io::Write as _;
+                if let Err(error) =
+                    writeln!(io::stdout().lock(), "kernel vpb_references: {references}")
+                {
+                    records.failure.get_or_insert_with(|| error.to_string());
+                }
+            }
             Err(error) => {
                 records.failure.get_or_insert_with(|| error.to_string());
             }
@@ -433,6 +491,30 @@ mod tests {
     use super::*;
     use core::time::Duration;
     use std::time::Instant;
+
+    /// # Panics
+    /// Fails if reference samples lose count bits or accept another record's layout.
+    #[test]
+    fn reference_samples_are_distinct_from_operation_statuses() {
+        let outcomes = BTreeMap::from([(2, "completed".to_owned())]);
+        for count in [0_u32, 1, 3, u32::MAX] {
+            assert!(matches!(
+                decode_record(&TraceKind::VpbReferences, &count.to_le_bytes(), &outcomes),
+                Ok(TraceRecord::VpbReferences(decoded)) if decoded == count
+            ));
+        }
+        let operation = TraceKind::Operation("vpb_retirement".to_owned());
+        let payload = [0, 0, 0, 0, 2, 0, 0, 0];
+        assert!(matches!(
+            decode_record(&operation, &payload, &outcomes),
+            Ok(TraceRecord::Operation(event))
+                if event.status == 0 && event.outcome == "completed"
+        ));
+        assert!(decode_record(&TraceKind::VpbReferences, &payload, &outcomes).is_err());
+        assert!(decode_record(&TraceKind::VpbReferences, &[1, 2, 3], &outcomes).is_err());
+        assert!(decode_record(&operation, &3_u32.to_le_bytes(), &outcomes).is_err());
+        assert!(decode_record(&operation, &[0; 8], &outcomes).is_err());
+    }
 
     /// Checks writable native string regions through the production control-buffer pointer.
     /// # Errors
@@ -544,21 +626,27 @@ mod tests {
             };
             let result = (|| -> io::Result<()> {
                 win32(status)?;
-                for payload in [[0_u32, 1], [0xc000_000d, 4], [0, 2]] {
+                for (id, payload) in [
+                    (36, &[3_u32][..]),
+                    (18, &[0, 1][..]),
+                    (18, &[0xc000_000d, 4][..]),
+                    (18, &[0, 2][..]),
+                ] {
                     let data = EVENT_DATA_DESCRIPTOR {
                         Ptr: u64::try_from(payload.as_ptr().addr()).map_err(io::Error::other)?,
-                        Size: 8,
+                        Size: u32::try_from(core::mem::size_of_val(payload))
+                            .map_err(io::Error::other)?,
                         ..Default::default()
                     };
                     let descriptor = EVENT_DESCRIPTOR {
-                        Id: 18,
+                        Id: id,
                         Level: 4,
                         Keyword: 1,
                         ..Default::default()
                     };
                     let status = unsafe {
                         // SAFETY: registration is live and the descriptor references exactly
-                        // eight initialized payload bytes retained through synchronous EventWrite.
+                        // the initialized scalar payload retained through synchronous EventWrite.
                         EventWrite(registration, &descriptor, 1, &data)
                     };
                     win32(status)?;
