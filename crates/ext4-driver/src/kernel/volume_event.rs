@@ -11,8 +11,10 @@ pub(crate) enum VolumeEvent {
     LockFailed,
     /// The exclusive handle released its volume lock.
     Unlock,
-    /// A durable logical dismount completed.
+    /// Allows registered users to release handles before dismount cache preparation.
     Dismount,
+    /// An announced dismount attempt did not complete.
+    DismountFailed,
 }
 
 /// The enclosing IRP/worker retains this FILE_OBJECT until delivery returns.
@@ -102,6 +104,7 @@ impl VolumeNotification {
             VolumeEvent::LockFailed => wdk_sys::FSRTL_VOLUME_LOCK_FAILED,
             VolumeEvent::Unlock => wdk_sys::FSRTL_VOLUME_UNLOCK,
             VolumeEvent::Dismount => wdk_sys::FSRTL_VOLUME_DISMOUNT,
+            VolumeEvent::DismountFailed => wdk_sys::FSRTL_VOLUME_DISMOUNT_FAILED,
         };
         #[cfg(not(test))]
         unsafe {
