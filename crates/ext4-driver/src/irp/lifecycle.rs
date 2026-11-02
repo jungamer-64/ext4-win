@@ -1256,13 +1256,13 @@ impl<'a> PendingIrpLease<'a> {
         }
     }
 
-    /// Retains original-thread authorization while resolving an extended rename target.
+    /// Retains original-thread authorization while resolving a namespace replacement.
     /// # Errors
-    /// Returns access denied for a request without captured extended-rename authority.
-    pub(crate) fn rename_subject(
+    /// Returns access denied for a request without a captured namespace subject.
+    pub(crate) fn namespace_subject(
         &self,
     ) -> DriverResult<&crate::kernel::requestor_subject::RequestorSubject> {
-        self.owner.context.rename_subject()
+        self.owner.context.namespace_subject()
     }
 
     /// Borrows the read payload captured before queue insertion.

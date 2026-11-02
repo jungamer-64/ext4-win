@@ -472,43 +472,29 @@ impl<'a> CreateCompletionOwner<'a> {
         })
     }
 
-    /// Authorizes a target-directory open and its target-dependent namespace right.
+    /// Authorizes the containing directory, independently of the observed leaf.
+    /// Replacement authority is checked against the resolved target during set-information;
+    /// a same-inode rename does not delete the destination inode.
     /// # Errors
     ///
-    /// Returns metadata/descriptor errors or native denial for the parent or existing target.
+    /// Returns metadata/descriptor errors or native denial for the parent.
     fn authorize_target_directory(
         mut self,
         directory: DirectoryNodeId,
-        target: TargetDirectoryLeaf,
         requirement: CreateTargetRequirement,
         read: &mut impl CommittedReadPass,
     ) -> DriverResult<AuthorizedCreateCompletionOwner<'a>> {
         let directory_descriptor =
             CreateSecurityDescriptor::for_node(read, NodeId::Directory(directory), self.identity)?;
-        let target_descriptor = match target {
-            TargetDirectoryLeaf::Missing => None,
-            TargetDirectoryLeaf::Existing(node) => Some(CreateSecurityDescriptor::for_node(
-                read,
-                node,
-                self.identity,
-            )?),
-        };
         let requested = self.parameters.desired_access();
         let granted_access = self.with_access_state(|state| {
-            match target_descriptor.as_ref() {
-                Some(descriptor) => {
-                    state.authorize_operation(descriptor.as_native(), wdk_sys::DELETE)?;
+            let required = match requirement {
+                CreateTargetRequirement::Directory => wdk_sys::FILE_ADD_SUBDIRECTORY,
+                CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
+                    wdk_sys::FILE_ADD_FILE
                 }
-                None => {
-                    let required = match requirement {
-                        CreateTargetRequirement::Directory => wdk_sys::FILE_ADD_SUBDIRECTORY,
-                        CreateTargetRequirement::Any | CreateTargetRequirement::NonDirectory => {
-                            wdk_sys::FILE_ADD_FILE
-                        }
-                    };
-                    state.authorize_operation(directory_descriptor.as_native(), required)?;
-                }
-            }
+            };
+            state.authorize_operation(directory_descriptor.as_native(), required)?;
             state.authorize_requested(directory_descriptor.as_native(), requested)
         })?;
         Ok(AuthorizedCreateCompletionOwner {
@@ -640,8 +626,7 @@ fn open_or_create(
                 return Err(DriverError::CannotDelete);
             }
             validate_existing_node_options(NodeId::Directory(directory), requirement)?;
-            let mut owner =
-                owner.authorize_target_directory(directory, target, requirement, mutation)?;
+            let mut owner = owner.authorize_target_directory(directory, requirement, mutation)?;
             if let Some(plan) = existing_oplock_plan(
                 &mut owner,
                 NodeId::Directory(directory),
@@ -801,7 +786,7 @@ enum CreateTargetLookup {
         directory: DirectoryNodeId,
         /// Stable namespace location of that directory.
         location: OpenedLocation,
-        /// Existence and identity of the named target below the parent.
+        /// Existence of the named target below the parent.
         target: TargetDirectoryLeaf,
     },
     /// Name resolution encountered a reparse point that Windows must process.
@@ -813,13 +798,13 @@ enum CreateTargetLookup {
     },
 }
 
-/// Final-component observation retained for `SL_OPEN_TARGET_DIRECTORY` access checks.
+/// Final-component existence reported by `SL_OPEN_TARGET_DIRECTORY`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TargetDirectoryLeaf {
     /// The named final component does not exist.
     Missing,
-    /// The named final component exists with this identity.
-    Existing(NodeId),
+    /// The named final component exists.
+    Existing,
 }
 
 /// Per-handle policy decoded from one create/open request.
@@ -2062,7 +2047,7 @@ fn open_target_directory(
     )?;
     let action = match target {
         TargetDirectoryLeaf::Missing => CreateAction::TargetDoesNotExist,
-        TargetDirectoryLeaf::Existing(_) => CreateAction::TargetExists,
+        TargetDirectoryLeaf::Existing => CreateAction::TargetExists,
     };
     PendingExistingCreateOpen::prepare(
         request,
@@ -2429,7 +2414,7 @@ fn resolve_path(
             return Ok(CreateTargetLookup::ParentDirectory {
                 directory: parent_id,
                 location: parent_location,
-                target: TargetDirectoryLeaf::Existing(child_node),
+                target: TargetDirectoryLeaf::Existing,
             });
         }
         let reparse_point = NodeSymlinkReparsePoint::load(read, child_node)?;

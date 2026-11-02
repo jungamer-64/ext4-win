@@ -88,7 +88,7 @@ impl NotificationSubject {
 /// Native release owns a device-referenced work item when cancellation runs above PASSIVE_LEVEL.
 #[derive(Debug)]
 pub(crate) struct RequestorSubject {
-    /// Unique native context; it exposes only target attribute checks and consuming release.
+    /// Unique native context for bounded namespace checks and consuming release.
     #[cfg(not(test))]
     native: core::ptr::NonNull<core::ffi::c_void>,
 }
@@ -158,6 +158,54 @@ impl RequestorSubject {
             }
         }
         #[cfg(test)]
+        Err(DriverError::NotSupported)
+    }
+}
+
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the retained original subject and immutable descriptors span the synchronous replacement check"
+)]
+impl RequestorSubject {
+    /// Requires deletion authority for the different inode selected for namespace replacement.
+    /// Same-inode link operations do not consume this authority.
+    /// # Errors
+    /// Returns descriptor preparation failure or the captured subject's native denial.
+    pub(crate) fn require_replacement(
+        &self,
+        target: SecurityDescriptorRef<'_>,
+        parent: SecurityDescriptorRef<'_>,
+    ) -> DriverResult<()> {
+        let target = target.prepare(wdk_sys::DELETE)?;
+        let parent = parent.prepare(wdk_sys::FILE_DELETE_CHILD)?;
+        let status = unsafe {
+            // SAFETY: This owner retains the original tokens and both immutable descriptor
+            // owners remain live through the synchronous native check.
+            super::ffi::ext4win_subject_replace(
+                self.native.as_ptr(),
+                target.as_ptr(),
+                parent.as_ptr(),
+            )
+        };
+        if status < 0 {
+            Err(DriverError::SecurityCheckFailed(status))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+impl RequestorSubject {
+    /// Host fixtures cannot grant kernel token authority.
+    /// # Errors
+    /// Always returns not-supported.
+    pub(crate) fn require_replacement(
+        &self,
+        _target: SecurityDescriptorRef<'_>,
+        _parent: SecurityDescriptorRef<'_>,
+    ) -> DriverResult<()> {
         Err(DriverError::NotSupported)
     }
 }

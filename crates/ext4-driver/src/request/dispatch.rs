@@ -846,7 +846,7 @@ pub(crate) fn admit_owned(
             Admission::Mutation(MutationRequestKind::Write)
         }
         ActorRequest::Captured(
-            PreparedRequest::SetInformation | PreparedRequest::RenameInformation(_),
+            PreparedRequest::SetInformation | PreparedRequest::NamespaceInformation(_),
         ) => {
             let admission = owned.request().with_active(|active| {
                 Ok(match active.current_stack()?.set_file()?.operation() {

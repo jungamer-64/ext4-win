@@ -546,9 +546,9 @@ pub(super) fn set_file_information(
             pending.publish(operations);
             return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
         }
-        SetFilePlan::Link { mutation: request } => {
+        SetFilePlan::Link { mutation: link } => {
             let prepared =
-                PreparedHardLinkMutation::prepare(request, operations, mutation, mapping)?;
+                PreparedHardLinkMutation::prepare(link, operations, mutation, &request, mapping)?;
             let oplocks = prepared.oplock_plan();
             if namespace_oplocks != Some(oplocks) {
                 return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
@@ -1322,6 +1322,7 @@ impl PreparedHardLinkMutation {
         request: HardLinkMutation,
         operations: &mut MountedVolumeAccess<'_>,
         read: &mut impl CommittedReadPass,
+        owned: &PendingIrpLease<'_>,
         mapping: &ext4_security::IdentityMap,
     ) -> DriverResult<Self> {
         let HardLinkMutation {
@@ -1341,6 +1342,7 @@ impl PreparedHardLinkMutation {
             &target_name,
             target.target_name(),
             target_collision,
+            owned,
             mapping,
         )?;
         count_effect.validate(source_metadata.links_count)?;
@@ -1431,6 +1433,7 @@ fn prepare_hard_link_destination(
     target_name: &Ext4Name,
     target_windows_name: &WindowsName,
     target_collision: HardLinkTargetCollision,
+    owned: &PendingIrpLease<'_>,
     mapping: &ext4_security::IdentityMap,
 ) -> DriverResult<(
     PreparedNamespaceDestination,
@@ -1472,6 +1475,7 @@ fn prepare_hard_link_destination(
         &OpenedLocation::try_directory_entry(target_parent, target.name())?,
     )?;
     if target_node != source_node {
+        require_namespace_replacement(read, owned, target_node, target_parent, mapping)?;
         operations.ensure_node_replaceable(target_node)?;
     }
     let target_metadata = metadata_from_node(read, target_node)?;
@@ -1517,6 +1521,29 @@ fn prepare_hard_link_destination(
         count_effect,
         changes,
     ))
+}
+
+/// Authorizes replacement against the exact target and parent resolved in this epoch.
+/// The original requestor, rather than an actor worker token, supplies deletion authority.
+/// # Errors
+/// Returns descriptor, captured-subject or native access-check failures before any write is staged.
+fn require_namespace_replacement(
+    read: &mut impl CommittedReadPass,
+    owned: &PendingIrpLease<'_>,
+    target: NodeId,
+    parent: DirectoryNodeId,
+    mapping: &ext4_security::IdentityMap,
+) -> DriverResult<()> {
+    let target =
+        crate::request::security::CreateSecurityDescriptor::for_node(read, target, mapping)?;
+    let parent = crate::request::security::CreateSecurityDescriptor::for_node(
+        read,
+        NodeId::Directory(parent),
+        mapping,
+    )?;
+    owned
+        .namespace_subject()?
+        .require_replacement(target.as_native(), parent.as_native())
 }
 
 /// Returns the archive transition required by a successful file modification.
@@ -1783,6 +1810,7 @@ impl PreparedRenameMutation {
                 if target_collision == RenameTargetPolicy::Reject {
                     return Err(DriverError::ObjectNameCollision);
                 }
+                require_namespace_replacement(read, owned, *child.node(), target_parent, mapping)?;
                 let metadata = metadata_from_node(read, *child.node())?;
                 if rename_target_requires_attribute_access(
                     metadata.kind,
@@ -1795,7 +1823,7 @@ impl PreparedRenameMutation {
                         mapping,
                     )?;
                     owned
-                        .rename_subject()?
+                        .namespace_subject()?
                         .require_write_attributes(descriptor.as_native())?;
                 }
                 operations.ensure_location_openable(

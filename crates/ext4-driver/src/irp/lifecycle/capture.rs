@@ -718,15 +718,15 @@ impl QueueContextOwnership {
         }
     }
 
-    /// Borrows only the original subject captured for an extended rename.
+    /// Borrows only the original subject captured for a namespace mutation.
     /// # Errors
     /// Rejects attempts to obtain target authorization from an ordinary request.
-    pub(super) fn rename_subject(
+    pub(super) fn namespace_subject(
         &self,
     ) -> DriverResult<&crate::kernel::requestor_subject::RequestorSubject> {
         match self {
             Self::Captured(context) => match &context.prepared {
-                PreparedRequest::RenameInformation(subject) => Ok(subject),
+                PreparedRequest::NamespaceInformation(subject) => Ok(subject),
                 _ => Err(DriverError::AccessDenied),
             },
             Self::Cleanup | Self::Close => Err(DriverError::AccessDenied),
@@ -1110,8 +1110,8 @@ pub(crate) enum PreparedRequest {
     QueryInformation,
     /// File information mutation.
     SetInformation,
-    /// Extended rename retains the original requestor for target attribute checks.
-    RenameInformation(crate::kernel::requestor_subject::RequestorSubject),
+    /// Namespace mutations retain the original requestor for replacement checks.
+    NamespaceInformation(crate::kernel::requestor_subject::RequestorSubject),
     /// Volume information query.
     QueryVolumeInformation,
     /// Volume information mutation.
@@ -1257,14 +1257,17 @@ impl PreparedRequest {
             DispatchMajor::SetInformation => {
                 if matches!(
                     stack.set_file().map(|set| set.operation()),
-                    Ok(super::SetFileOperation::RenameEx(_))
+                    Ok(super::SetFileOperation::Rename(_)
+                        | super::SetFileOperation::RenameEx(_)
+                        | super::SetFileOperation::Link(_)
+                        | super::SetFileOperation::LinkEx(_))
                 ) {
                     let subject = crate::kernel::requestor_subject::RequestorSubject::capture(
                         target.device(),
                         target.requestor_mode(),
                     )
                     .map_err(IrpCompletion::from_error)?;
-                    Ok((Self::RenameInformation(subject), generic_key()))
+                    Ok((Self::NamespaceInformation(subject), generic_key()))
                 } else {
                     Ok((Self::SetInformation, generic_key()))
                 }

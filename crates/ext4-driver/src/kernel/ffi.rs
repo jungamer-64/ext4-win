@@ -228,6 +228,12 @@ unsafe extern "system" {
         subject: wdk_sys::PVOID,
         descriptor: wdk_sys::PSECURITY_DESCRIPTOR,
     ) -> wdk_sys::NTSTATUS;
+    /// Checks replacement against the target DELETE or parent FILE_DELETE_CHILD right.
+    pub(crate) fn ext4win_subject_replace(
+        subject: wdk_sys::PVOID,
+        target: wdk_sys::PSECURITY_DESCRIPTOR,
+        parent: wdk_sys::PSECURITY_DESCRIPTOR,
+    ) -> wdk_sys::NTSTATUS;
     /// Creates the named control device with the exact SDDL and setup-class identity supplied by
     /// the generated lifecycle contract.
     pub(crate) fn WdmlibIoCreateDeviceSecure(

@@ -76,7 +76,8 @@ PSECURITY_SUBJECT_CONTEXT ext4win_subject_transfer_notification(PVOID context)
     return &subject->Subject;
 }
 
-NTSTATUS ext4win_subject_write_attributes(PVOID context, PSECURITY_DESCRIPTOR descriptor)
+static NTSTATUS ext4win_subject_check_access(PVOID context, PSECURITY_DESCRIPTOR descriptor,
+    ACCESS_MASK desired)
 {
     PEXT4WIN_REQUESTOR_SUBJECT subject = context;
     PPRIVILEGE_SET privileges = NULL;
@@ -85,11 +86,27 @@ NTSTATUS ext4win_subject_write_attributes(PVOID context, PSECURITY_DESCRIPTOR de
     BOOLEAN allowed;
     PAGED_CODE();
     SeLockSubjectContext(&subject->Subject);
-    allowed = SeAccessCheck(descriptor, &subject->Subject, TRUE, FILE_WRITE_ATTRIBUTES,
+    allowed = SeAccessCheck(descriptor, &subject->Subject, TRUE, desired,
         0, &privileges, IoGetFileObjectGenericMapping(), subject->Mode, &granted, &status);
     SeUnlockSubjectContext(&subject->Subject);
     if (privileges != NULL) { SeFreePrivileges(privileges); }
     return allowed ? STATUS_SUCCESS : status;
+}
+
+NTSTATUS ext4win_subject_write_attributes(PVOID context, PSECURITY_DESCRIPTOR descriptor)
+{
+    return ext4win_subject_check_access(context, descriptor, FILE_WRITE_ATTRIBUTES);
+}
+
+/* Only an ordinary access refusal permits the alternate parent deletion check. */
+NTSTATUS ext4win_subject_replace(PVOID context, PSECURITY_DESCRIPTOR target,
+    PSECURITY_DESCRIPTOR parent)
+{
+    NTSTATUS status = ext4win_subject_check_access(context, target, DELETE);
+    if (status == STATUS_ACCESS_DENIED || status == STATUS_PRIVILEGE_NOT_HELD) {
+        return ext4win_subject_check_access(context, parent, FILE_DELETE_CHILD);
+    }
+    return status;
 }
 
 #endif

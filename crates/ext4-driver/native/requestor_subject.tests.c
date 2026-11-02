@@ -9,12 +9,16 @@
 #define STATUS_INSUFFICIENT_RESOURCES (-2)
 #define STATUS_ACCESS_DENIED (-3)
 #define STATUS_INVALID_PARAMETER (-4)
+#define STATUS_PRIVILEGE_NOT_HELD (-5)
+#define STATUS_IO_DEVICE_ERROR (-6)
 #define KernelMode 0
 #define UserMode 1
 #define SE_CHANGE_NOTIFY_PRIVILEGE 23
 #define FIELD_OFFSET(type, field) offsetof(type, field)
 #define C_ASSERT(condition) _Static_assert(condition, #condition)
 #define FILE_WRITE_ATTRIBUTES 0x100
+#define DELETE 0x10000
+#define FILE_DELETE_CHILD 0x40
 #define TRUE 1
 #define DelayedWorkQueue 0
 #define PAGED_CODE() assert(irql == PASSIVE_LEVEL)
@@ -27,7 +31,7 @@ typedef void *PVOID;
 typedef struct { unsigned token; } SECURITY_SUBJECT_CONTEXT;
 typedef SECURITY_SUBJECT_CONTEXT *PSECURITY_SUBJECT_CONTEXT;
 typedef struct { unsigned identity; } DEVICE_OBJECT, *PDEVICE_OBJECT;
-typedef struct { int allowed; } SECURITY_DESCRIPTOR, *PSECURITY_DESCRIPTOR;
+typedef struct { ACCESS_MASK allowed; NTSTATUS failure; } SECURITY_DESCRIPTOR, *PSECURITY_DESCRIPTOR;
 typedef struct { int used; } PRIVILEGE_SET, *PPRIVILEGE_SET;
 typedef VOID IO_WORKITEM_ROUTINE(PDEVICE_OBJECT, PVOID);
 typedef IO_WORKITEM_ROUTINE *PIO_WORKITEM_ROUTINE;
@@ -38,7 +42,12 @@ static unsigned caller_token;
 static int traversal_privilege;
 static PIO_WORKITEM queued;
 static PRIVILEGE_SET privilege;
-static SECURITY_DESCRIPTOR writable = {1}, denied = {0};
+static SECURITY_DESCRIPTOR writable = {FILE_WRITE_ATTRIBUTES, STATUS_ACCESS_DENIED};
+static SECURITY_DESCRIPTOR denied = {0, STATUS_ACCESS_DENIED};
+static SECURITY_DESCRIPTOR deletable = {DELETE, STATUS_ACCESS_DENIED};
+static SECURITY_DESCRIPTOR parent = {FILE_DELETE_CHILD, STATUS_ACCESS_DENIED};
+static SECURITY_DESCRIPTOR broken = {0, STATUS_IO_DEVICE_ERROR};
+static unsigned checks;
 static int mapping;
 static _Alignas(16) unsigned char pool[256];
 static IO_WORKITEM release_work;
@@ -86,10 +95,12 @@ static BOOLEAN SeAccessCheck(PSECURITY_DESCRIPTOR descriptor, SECURITY_SUBJECT_C
     PVOID generic, KPROCESSOR_MODE mode, ACCESS_MASK *granted, NTSTATUS *status)
 {
     assert(irql == PASSIVE_LEVEL && locks == 1 && locked && subject->token == 77);
-    assert(desired == FILE_WRITE_ATTRIBUTES && previous == 0 && generic == &mapping && mode == 1);
-    *used = &privilege; *granted = descriptor->allowed ? desired : 0;
-    *status = descriptor->allowed ? STATUS_SUCCESS : STATUS_ACCESS_DENIED;
-    return descriptor->allowed;
+    assert((desired == FILE_WRITE_ATTRIBUTES || desired == DELETE || desired == FILE_DELETE_CHILD)
+        && previous == 0 && generic == &mapping && mode == 1);
+    checks++;
+    *used = &privilege; *granted = descriptor->allowed & desired;
+    *status = *granted == desired ? STATUS_SUCCESS : descriptor->failure;
+    return *granted == desired;
 }
 static void SeFreePrivileges(PPRIVILEGE_SET used) { assert(used == &privilege); }
 #include "requestor_subject.h"
@@ -109,6 +120,19 @@ int main(void)
     caller_token = 99; /* The worker's ambient identity must never grant caller rights. */
     assert(ext4win_subject_write_attributes(subject, &writable) == STATUS_SUCCESS);
     assert(ext4win_subject_write_attributes(subject, &denied) == STATUS_ACCESS_DENIED);
+    checks = 0;
+    assert(ext4win_subject_replace(subject, &deletable, &broken) == STATUS_SUCCESS);
+    assert(checks == 1); /* Target permission is sufficient; do not probe an irrelevant parent. */
+    checks = 0;
+    assert(ext4win_subject_replace(subject, &denied, &parent) == STATUS_SUCCESS);
+    assert(checks == 2);
+    assert(ext4win_subject_replace(subject, &denied, &denied) == STATUS_ACCESS_DENIED);
+    checks = 0;
+    assert(ext4win_subject_replace(subject, &broken, &parent) == STATUS_IO_DEVICE_ERROR);
+    assert(checks == 1); /* Execution failure is not a denial and cannot authorize fallback. */
+    denied.failure = STATUS_PRIVILEGE_NOT_HELD;
+    assert(ext4win_subject_replace(subject, &denied, &parent) == STATUS_SUCCESS);
+    denied.failure = STATUS_ACCESS_DENIED;
     ext4win_subject_release(subject);
     assert(subjects == 0 && works == 0 && pools == 0 && locks == 0);
     caller_token = 77;
