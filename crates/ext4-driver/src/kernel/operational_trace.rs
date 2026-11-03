@@ -85,6 +85,10 @@ pub(crate) enum OperationalPath {
     VolumeClose,
     /// Clean-marker durability after paging and admitted mutation drain.
     VolumeCloseDurability,
+    /// Filesystem volume information from admission through bounded output publication.
+    VolumeQuery,
+    /// Passive native sector query against the mounted VPB's retained real device.
+    VolumeSectorQuery,
 }
 
 impl OperationalPath {
@@ -119,6 +123,8 @@ impl OperationalPath {
             Self::DriverUnload => contract::TRACE_EVENT_DRIVER_UNLOAD,
             Self::VolumeClose => contract::TRACE_EVENT_VOLUME_CLOSE,
             Self::VolumeCloseDurability => contract::TRACE_EVENT_VOLUME_CLOSE_DURABILITY,
+            Self::VolumeQuery => contract::TRACE_EVENT_VOLUME_QUERY,
+            Self::VolumeSectorQuery => contract::TRACE_EVENT_VOLUME_SECTOR_QUERY,
         }
     }
 }
@@ -397,6 +403,8 @@ mod tests {
             OperationalPath::DriverUnload,
             OperationalPath::VolumeClose,
             OperationalPath::VolumeCloseDurability,
+            OperationalPath::VolumeQuery,
+            OperationalPath::VolumeSectorQuery,
         ];
         for (index, event) in events.iter().enumerate() {
             assert_ne!(event.event_id(), 0);

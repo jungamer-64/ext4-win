@@ -15,6 +15,7 @@ use crate::{
         PendingIrpLease, QueryVolumeInformationClass, SetVolumeInformationClass,
     },
     kernel::{
+        operational_trace::{OperationalOutcome, OperationalPath},
         status::{DriverError, DriverResult},
         storage::{SectorSizeInformation, StorageFailureClass},
     },
@@ -95,17 +96,29 @@ impl MountedVolumeOperation for VolumeQueryOperation {
             (
                 VolumeQueryState::Ready(mut owned),
                 CompletionEvent::Core(OperationEvent::Admitted),
-            ) => match prepare_query(owned.request(), access) {
-                Ok(VolumeQueryPlan::Complete(completion)) => (owned, Ok(completion)),
-                Ok(VolumeQueryPlan::SectorSize { work, length }) => {
-                    self.state = VolumeQueryState::SectorSize { owned, length };
-                    return OperationTransition::SubmitPassiveWork {
-                        work,
-                        suspended: self,
-                    };
+            ) => {
+                access.operational_trace().record(
+                    OperationalPath::VolumeQuery,
+                    wdk_sys::STATUS_SUCCESS,
+                    OperationalOutcome::Selected,
+                );
+                match prepare_query(owned.request(), access) {
+                    Ok(VolumeQueryPlan::Complete(completion)) => (owned, Ok(completion)),
+                    Ok(VolumeQueryPlan::SectorSize { work, length }) => {
+                        access.operational_trace().record(
+                            OperationalPath::VolumeSectorQuery,
+                            wdk_sys::STATUS_SUCCESS,
+                            OperationalOutcome::Selected,
+                        );
+                        self.state = VolumeQueryState::SectorSize { owned, length };
+                        return OperationTransition::SubmitPassiveWork {
+                            work,
+                            suspended: self,
+                        };
+                    }
+                    Err(error) => (owned, Err(error)),
                 }
-                Err(error) => (owned, Err(error)),
-            },
+            }
             (
                 VolumeQueryState::Ready(owned) | VolumeQueryState::SectorSize { owned, .. },
                 CompletionEvent::Core(OperationEvent::CancelRequested),
@@ -117,6 +130,9 @@ impl MountedVolumeOperation for VolumeQueryOperation {
                 VolumeQueryState::SectorSize { mut owned, length },
                 CompletionEvent::PassiveCompleted(PassiveWorkCompletion::SectorSize(result)),
             ) => {
+                access
+                    .operational_trace()
+                    .record_result(OperationalPath::VolumeSectorQuery, &result);
                 let result = result.and_then(|information| {
                     let mut request = owned.request();
                     super::file_system_control::authorize_path_handle(&mut request, access)?;
@@ -132,6 +148,9 @@ impl MountedVolumeOperation for VolumeQueryOperation {
                     .bugcheck()
             }
         };
+        access
+            .operational_trace()
+            .record_result(OperationalPath::VolumeQuery, &result);
         OperationTransition::Complete(owned.prepare_result(result))
     }
 
