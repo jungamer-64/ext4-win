@@ -36,7 +36,7 @@ enum OwnershipPhase {
     },
     /// Both filesystem close and any required record release completed, awaiting the native close.
     Released(CleanCloseDurability),
-    /// Final close consumed its unique acknowledgment; no media authority remains.
+    /// Finalization consumed media authority; this state alone claims no clean durability.
     Closed,
     /// A new mount and recovery are required; late completions cannot resurrect the session.
     Revoked(Error),
@@ -267,6 +267,12 @@ impl MediaOwnership {
             return Err(Error::ClusterReferenceConflict.into());
         };
         Ok(durability)
+    }
+    /// Explicit abandonment cannot manufacture a clean record-release capability.
+    pub(super) fn abandon(&mut self) {
+        if !matches!(self.0, OwnershipPhase::Revoked(_)) {
+            self.0 = OwnershipPhase::Closed;
+        }
     }
     /// Retires this ownership chain without a clean write, preserving its first terminal reason.
     pub(super) fn revoke(&mut self, reason: Error) {

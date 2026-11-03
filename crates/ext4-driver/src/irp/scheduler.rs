@@ -242,6 +242,8 @@ pub(crate) enum WaitCondition {
     },
     /// Flush waits for every queued or granted commit to become durable.
     VolumeDurability,
+    /// Session termination joins physical mutations, discard and MMP regardless of journal health.
+    SessionDrain,
     /// Clean close waits until journal space is clean.
     JournalClean,
     /// Filesystem close is complete and its independent MMP release must acknowledge next.

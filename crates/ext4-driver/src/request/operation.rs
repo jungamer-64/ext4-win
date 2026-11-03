@@ -1563,6 +1563,8 @@ unsafe impl Send for ReadRequestOperation {}
 enum RawVolumeOperationState {
     /// IRP target and request parameters have not yet been admitted.
     Ready(OwnedIrp),
+    /// Request buffers and completion payload exist before session-close effects begin.
+    Prepared(crate::request::file_info::PreparedRawVolumeTransfer),
     /// One whole-sector read or write is owned by the lower completion envelope.
     Transferring {
         /// Unique top-level completion authority.
@@ -1639,6 +1641,30 @@ impl RawVolumeOperation {
                 let (error, (owned, _kind)) = error.into_parts();
                 Err(AdmitOperationError::new(error, owned))
             }
+        }
+    }
+
+    /// Submits an already allocated transfer after its required session handoff.
+    fn submit_prepared(mut self: Box<Self>, owned: OwnedIrp) -> OperationTransition {
+        let RawVolumeOperationState::Prepared(prepared) =
+            core::mem::replace(&mut self.state, RawVolumeOperationState::Terminal)
+        else {
+            crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                .bugcheck();
+        };
+        let (target, request, publication, write_through) = prepared.into_parts();
+        let expected = StorageRequestIdentity::from_request(&request);
+        self.state = RawVolumeOperationState::Transferring {
+            owned,
+            target,
+            publication,
+            expected,
+            write_through,
+        };
+        OperationTransition::SubmitLower {
+            devices: self.devices,
+            request,
+            suspended: self,
         }
     }
 
@@ -1733,19 +1759,14 @@ impl MountedVolumeOperation for RawVolumeOperation {
                     let Some(prepared) = prepared else {
                         return self.complete(owned, Ok(IrpCompletion::EMPTY));
                     };
-                    let (target, request, publication, write_through) = prepared.into_parts();
-                    let expected = StorageRequestIdentity::from_request(&request);
-                    self.state = RawVolumeOperationState::Transferring {
-                        owned,
-                        target,
-                        publication,
-                        expected,
-                        write_through,
-                    };
-                    OperationTransition::SubmitLower {
-                        devices: self.devices,
-                        request,
-                        suspended: self,
+                    let target = prepared.target();
+                    let close = self.kind == RawVolumeOperationKind::Write
+                        && access.raw_write_requires_close(target.owner());
+                    self.state = RawVolumeOperationState::Prepared(prepared);
+                    if close {
+                        volume_close::before_raw_write(owned, self, target, access)
+                    } else {
+                        self.submit_prepared(owned)
                     }
                 }
                 OperationEvent::CancelRequested => {
@@ -1869,6 +1890,10 @@ impl MountedVolumeOperation for RawVolumeOperation {
                     }
                 }
             }
+            RawVolumeOperationState::Prepared(_) => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
             RawVolumeOperationState::Terminal => OperationTransition::Retired,
         }
     }
@@ -1890,7 +1915,9 @@ impl MountedVolumeOperation for RawVolumeOperation {
                 } => {
                     target.mark_write_uncertain(*completed);
                 }
-                RawVolumeOperationState::Ready(_) | RawVolumeOperationState::Terminal => {
+                RawVolumeOperationState::Ready(_)
+                | RawVolumeOperationState::Prepared(_)
+                | RawVolumeOperationState::Terminal => {
                     access.record_durability_unknown();
                 }
             },

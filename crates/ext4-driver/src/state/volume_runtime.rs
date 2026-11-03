@@ -369,6 +369,29 @@ impl VolumeRuntime {
         self.publish_reliability();
     }
 
+    /// Failed journal state does not imply that a physical request still owns work.
+    pub(crate) fn session_work_drained(&self) -> bool {
+        self.active_mutations.get().load(Ordering::Acquire) == 0
+            && !self.coordinator.has_pending_trim()
+    }
+
+    /// Ends write and renewal authority without clearing recovery or writing a clean MMP record.
+    pub(crate) fn abandon_session(&mut self) {
+        self.coordinator.revoke_media_ownership();
+        self.ownership.abandon();
+        self.publish_reliability();
+    }
+
+    /// The reactor also joins its independent ownership slot before transferring journal sharing.
+    pub(crate) fn finish_abandoned_session(
+        &mut self,
+    ) -> Option<crate::kernel::storage::ExternalJournalExclusion> {
+        if self.ownership.permits_io() || !self.session_work_drained() {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+        }
+        self.storage.take_external_journal_exclusion()
+    }
+
     /// Whether journal space has no granted commit or published overlay awaiting checkpoint.
     #[cfg(not(test))]
     pub(crate) fn publication_is_idle(&self) -> bool {

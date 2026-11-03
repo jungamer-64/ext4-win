@@ -5529,6 +5529,15 @@ impl CompletionReactor {
                 });
                 CompletionEvent::durability_wait(0, readiness)
             }
+            WaitCondition::SessionDrain => {
+                let ownership_drained =
+                    self.with_scheduler(|scheduler| scheduler.ownership_available());
+                let drained = self.with_mounted_access(|access| access.session_work_drained());
+                CompletionEvent::durability_wait(
+                    SESSION_DRAIN_BARRIER,
+                    Ok(ownership_drained && drained),
+                )
+            }
             WaitCondition::JournalClean => {
                 let has_commit_work = self.with_scheduler(|scheduler| scheduler.has_commit_work());
                 let readiness = self.with_mounted_access(|access| {
@@ -5577,6 +5586,9 @@ impl CompletionReactor {
 // SAFETY: Stable device placement and documented spin-lock/reactor-thread disciplines serialize
 // every interior field.
 unsafe impl Sync for CompletionReactor {}
+
+/// Session work has no remaining physical completion owner.
+pub(crate) const SESSION_DRAIN_BARRIER: u64 = 0x5344;
 
 /// Returns the single bit assigned to one validated bounded slot index.
 fn slot_bit(index: usize) -> u64 {

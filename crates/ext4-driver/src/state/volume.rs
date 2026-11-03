@@ -55,106 +55,136 @@ impl VolumeControlPlane {
     }
 }
 
+/// Native routing projection after filesystem session termination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SessionEndRouting {
+    /// A retained handle owns raw access until unlock or cleanup.
+    DirectAccess,
+    /// Failed finalization retains an existing lock without granting media writes.
+    Retain,
+    /// No old direct owner remains; a fresh mount may recover media.
+    Remount,
+}
+
+/// Exclusive direct access retained after the filesystem session ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DismountedAccess {
+    /// No old handle may access media; a fresh mount may recover it.
+    Released,
+    /// The dismounting handle retains direct access until cleanup.
+    Unlocked(KernelFileObject),
+    /// Explicit unlock or cleanup releases both direct access and remount exclusion.
+    Locked(KernelFileObject),
+}
+
+impl DismountedAccess {
+    /// Requires the exact retained direct-volume FILE_OBJECT.
+    /// # Errors
+    /// Returns access denied after release or for another handle.
+    fn authorize(self, owner: KernelFileObject) -> DriverResult<()> {
+        match self {
+            Self::Unlocked(current) | Self::Locked(current) if current == owner => Ok(()),
+            _ => Err(DriverError::AccessDenied),
+        }
+    }
+}
+
 /// Mounted-volume state serialized by the device actor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MountedVolumeState {
     /// Namespace and direct-volume opens are admitted.
     Mounted,
-    /// Namespace admission is closed while one lock request drains durable work.
+    /// Namespace admission is closed while a reversible lock attempt drains.
     Locking {
-        /// Direct-volume FILE_OBJECT that owns this reversible lock attempt.
+        /// FILE_OBJECT owning the lock attempt.
         owner: KernelFileObject,
     },
-    /// Only the FILE_OBJECT that locked the volume may issue ordinary operations.
+    /// The exact lock owner may inspect the live filesystem or begin direct writes.
     Locked {
-        /// Direct-volume FILE_OBJECT that owns the lock.
+        /// FILE_OBJECT owning the clean volume lock.
+        owner: KernelFileObject,
+    },
+    /// The first raw write ended the ext4 session; unlock requires a fresh mount.
+    RawLocked {
+        /// FILE_OBJECT retaining exclusive direct access.
         owner: KernelFileObject,
     },
     /// Ordinary admission is excluded while reversible cache writeback drains.
     PreparingClose {
-        /// Endpoint selected before writeback; no clean marker has been issued.
-        terminal: CleanCloseTerminal,
-        /// Lock authority restored if preparation fails.
+        /// Exact operation selecting the session's terminal state.
+        target: VolumeCloseTarget,
+        /// Independent explicit lock retained through preparation.
         lock_owner: Option<KernelFileObject>,
     },
-    /// Paging is sealed and the non-cancellable recovery-marker protocol owns completion.
+    /// Paging is sealed and the completion owner must finish termination.
     Closing {
-        /// Terminal state selected by the request that began the one-way close.
-        terminal: CleanCloseTerminal,
-        /// Prior volume-lock owner, if any, retained for cleanup semantics.
+        /// Exact target whose prepared authority was consumed by sealing.
+        target: VolumeCloseTarget,
+        /// Independent explicit lock retained through finalization.
         lock_owner: Option<KernelFileObject>,
     },
-    /// Filesystem operations are rejected after a forced logical dismount.
+    /// Filesystem admission is terminal; direct access has its own lifetime.
     Dismounted {
-        /// Prior lock owner allowed to release the lock after dismount.
-        lock_owner: Option<KernelFileObject>,
+        /// Direct access and remount exclusion retained by the dismounting handle.
+        access: DismountedAccess,
     },
     /// System shutdown observed a fully durable clean marker.
     ShutdownComplete {
-        /// Prior volume-lock owner retained only for late cleanup accounting.
+        /// Prior lock retained only for late cleanup accounting.
         lock_owner: Option<KernelFileObject>,
     },
-    /// Terminal close failed; ordinary and paging mutation admission remains revoked.
+    /// Logical termination completed without claiming clean media durability.
     CloseFailed {
-        /// Request whose clean-close sequence failed.
-        terminal: CleanCloseTerminal,
-        /// Retained lock owner until its cleanup or unlock.
+        /// Explicit lock remains excluded until its owner releases it.
         lock_owner: Option<KernelFileObject>,
-        /// Failure observed by the completion owner; no clean durability is claimed.
+        /// Exact failure returned by the termination owner.
         error: DriverError,
     },
-    /// PnP revoked all data authority; only handle release and final removal remain legal.
+    /// PnP revoked data authority; only handle release and removal remain legal.
     StorageRemoved,
-    /// Last FILE_OBJECT closed and the preallocated retirement work item owns teardown.
+    /// The unique retirement worker owns physical teardown.
     Retiring,
 }
 
-/// The admitted requester distinguishes a direct-volume dismount from system shutdown.
+/// An admitted requester selects one terminal state without duplicating its identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VolumeCloseTarget {
-    /// The original IRP retains the exact direct-volume FILE_OBJECT.
+    /// The original IRP retains the dismounting direct-volume FILE_OBJECT.
     Dismount(KernelFileObject),
-    /// The first raw write consumes the locked filesystem session before media access.
+    /// The first raw write consumes a locked ext4 session before lower submission.
     RawWrite(KernelFileObject),
     /// System shutdown carries no user handle authority.
     Shutdown,
 }
 
-/// Retained issuer identity; each physical submission independently revalidates its permission.
+/// Retained issuer identity; each physical submission revalidates its permission.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum StorageSubmissionSource {
     /// The live ext4 session, including its ownership deadline, owns this transfer.
     Filesystem,
-    /// A pending direct-volume IRP retains this handle; its current lock owns the transfer.
-    /// Raw failures cannot invoke ext4 verification or automatic physical replay.
+    /// The original IRP retains direct access; raw failures cannot authorize ext4 replay.
     RawVolume {
-        /// Identity and access retained until the original IRP completes.
+        /// Exact direct-volume handle retained through physical completion.
         target: RawVolumeTarget,
-        /// Flush consumes the same write permission as a raw write.
+        /// Flush consumes the same permission as a raw write.
         kind: RawVolumeOperationKind,
     },
 }
 
 impl MountedVolumeState {
-    /// Closes namespace admission before the lock's durability barrier can suspend.
+    /// Closes namespace admission before a reversible lock attempt suspends.
     /// # Errors
-    ///
-    /// Returns access denied when already locked or volume dismounted after terminal dismount.
+    /// Returns removal, competing exclusion, or terminal dismount.
     pub(super) fn begin_lock(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
             Self::Mounted => Ok(Self::Locking { owner }),
             Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::PreparingClose { .. }
-            | Self::Closing { .. }
-            | Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::VolumeDismounted),
+            _ => Err(DriverError::VolumeDismounted),
         }
     }
 
-    /// Publishes a clean lock only for the FILE_OBJECT that began its barrier.
+    /// Only the matching durability barrier may publish the lock.
     pub(super) fn finish_lock(self, owner: KernelFileObject) -> Option<Self> {
         match self {
             Self::Locking { owner: current } if current == owner => Some(Self::Locked { owner }),
@@ -162,7 +192,7 @@ impl MountedVolumeState {
         }
     }
 
-    /// Reopens namespace admission after an uncommitted lock attempt fails or is cancelled.
+    /// An uncommitted lock attempt may restore ordinary admission.
     pub(super) fn abort_lock(self, owner: KernelFileObject) -> Option<Self> {
         match self {
             Self::Locking { owner: current } if current == owner => Some(Self::Mounted),
@@ -170,241 +200,193 @@ impl MountedVolumeState {
         }
     }
 
-    /// Selects the state reached when one FILE_OBJECT releases its volume lock.
+    /// Releases a lock without reconstructing an ended filesystem session.
     /// # Errors
-    ///
-    /// Returns not locked when `owner` does not own the current lock.
+    /// Returns removal or not-locked for a non-owner.
     pub(super) fn unlock(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
             Self::StorageRemoved => Err(DriverError::DeviceRemoved),
-            Self::Locked {
-                owner: current_owner,
-            } if current_owner == owner => Ok(Self::Mounted),
+            Self::Locked { owner: current } if current == owner => Ok(Self::Mounted),
+            Self::RawLocked { owner: current } if current == owner => Ok(Self::Dismounted {
+                access: DismountedAccess::Released,
+            }),
             Self::Dismounted {
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => Ok(Self::Dismounted { lock_owner: None }),
+                access: DismountedAccess::Locked(current),
+            } if current == owner => Ok(Self::Dismounted {
+                access: DismountedAccess::Released,
+            }),
             Self::PreparingClose {
-                terminal,
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => Ok(Self::PreparingClose {
-                terminal,
+                target,
+                lock_owner: Some(current),
+            } if current == owner => Ok(Self::PreparingClose {
+                target,
                 lock_owner: None,
             }),
             Self::Closing {
-                terminal,
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => Ok(Self::Closing {
-                terminal,
+                target,
+                lock_owner: Some(current),
+            } if current == owner => Ok(Self::Closing {
+                target,
                 lock_owner: None,
             }),
             Self::CloseFailed {
-                terminal,
                 error,
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => Ok(Self::CloseFailed {
-                terminal,
+                lock_owner: Some(current),
+            } if current == owner => Ok(Self::CloseFailed {
                 error,
                 lock_owner: None,
             }),
             Self::ShutdownComplete {
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => Ok(Self::ShutdownComplete { lock_owner: None }),
-            Self::Mounted
-            | Self::Locking { .. }
-            | Self::Locked { .. }
-            | Self::PreparingClose { .. }
-            | Self::Closing { .. }
-            | Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::NotLocked),
+                lock_owner: Some(current),
+            } if current == owner => Ok(Self::ShutdownComplete { lock_owner: None }),
+            _ => Err(DriverError::NotLocked),
         }
     }
 
-    /// Selects reversible preparation for a forced dismount request.
+    /// Selects reversible preparation independently of media health.
     /// # Errors
-    ///
-    /// Returns access denied for another lock owner or volume dismounted after terminal dismount.
-    pub(super) fn prepare_dismount(self, owner: KernelFileObject) -> DriverResult<Self> {
-        match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
-            Self::Mounted => Ok(Self::PreparingClose {
-                terminal: CleanCloseTerminal::Dismount,
-                lock_owner: None,
-            }),
-            Self::Locked {
-                owner: current_owner,
-            } if current_owner == owner => Ok(Self::PreparingClose {
-                terminal: CleanCloseTerminal::Dismount,
-                lock_owner: Some(owner),
-            }),
-            Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::PreparingClose { .. }
-            | Self::Closing { .. }
-            | Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::VolumeDismounted),
-        }
+    /// Returns removal, competing lock exclusion or terminal dismount.
+    pub(super) fn prepare_close(self, target: VolumeCloseTarget) -> DriverResult<Self> {
+        let lock_owner = match (self, target) {
+            (Self::StorageRemoved, _) => return Err(DriverError::DeviceRemoved),
+            (Self::Mounted, VolumeCloseTarget::Dismount(_) | VolumeCloseTarget::Shutdown) => None,
+            (
+                Self::Locked { owner },
+                VolumeCloseTarget::Dismount(current) | VolumeCloseTarget::RawWrite(current),
+            ) if current == owner => Some(owner),
+            (Self::Locked { owner }, VolumeCloseTarget::Shutdown) => Some(owner),
+            (Self::Mounted | Self::Locking { .. } | Self::Locked { .. }, _) => {
+                return Err(DriverError::AccessDenied);
+            }
+            _ => return Err(DriverError::VolumeDismounted),
+        };
+        Ok(Self::PreparingClose { target, lock_owner })
     }
 
-    /// Selects reversible cache preparation for system shutdown.
-    /// # Errors
-    ///
-    /// Returns volume dismounted once any terminal close has already begun.
-    fn prepare_shutdown(self) -> DriverResult<Self> {
+    /// Consumes preparation before paging admission is sealed.
+    pub(super) fn seal_close(self, expected: VolumeCloseTarget) -> Option<Self> {
         match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
-            Self::Mounted => Ok(Self::PreparingClose {
-                terminal: CleanCloseTerminal::Shutdown,
-                lock_owner: None,
-            }),
-            Self::Locked { owner } => Ok(Self::PreparingClose {
-                terminal: CleanCloseTerminal::Shutdown,
-                lock_owner: Some(owner),
-            }),
-            Self::Locking { .. } => Err(DriverError::AccessDenied),
-            Self::PreparingClose { .. }
-            | Self::Closing { .. }
-            | Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::VolumeDismounted),
-        }
-    }
-
-    /// Consumes preparation before any clean-marker effect can be submitted.
-    pub(super) fn seal_close(self, expected: CleanCloseTerminal) -> Option<Self> {
-        match self {
-            Self::PreparingClose {
-                terminal,
-                lock_owner,
-            } if terminal == expected => Some(Self::Closing {
-                terminal,
-                lock_owner,
-            }),
+            Self::PreparingClose { target, lock_owner } if target == expected => {
+                Some(Self::Closing { target, lock_owner })
+            }
             _ => None,
         }
     }
 
-    /// Restores only the lifecycle exclusion owned by an unsealed preparation.
-    pub(super) fn abort_close(self, expected: CleanCloseTerminal) -> Option<Self> {
+    /// Only unsealed preparation can restore the retained live session.
+    pub(super) fn abort_close(self, expected: VolumeCloseTarget) -> Option<Self> {
         match self {
-            Self::PreparingClose {
-                terminal,
-                lock_owner,
-            } if terminal == expected => Some(match lock_owner {
-                Some(owner) => Self::Locked { owner },
-                None => Self::Mounted,
-            }),
+            Self::PreparingClose { target, lock_owner } if target == expected => {
+                Some(match lock_owner {
+                    Some(owner) => Self::Locked { owner },
+                    None => Self::Mounted,
+                })
+            }
             _ => None,
         }
     }
 
-    /// Publishes the selected terminal state only after clean-close durability succeeds.
-    pub(super) fn finish_close(self, expected: CleanCloseTerminal) -> Option<Self> {
-        let Self::Closing {
-            terminal,
-            lock_owner,
-        } = self
-        else {
+    /// Publishes direct access only after the session's clean-close obligations ended.
+    pub(super) fn finish_close(self, expected: VolumeCloseTarget) -> Option<Self> {
+        let Self::Closing { target, lock_owner } = self else {
             return None;
         };
-        if terminal != expected {
+        if target != expected {
             return None;
         }
-        Some(match terminal {
-            CleanCloseTerminal::Dismount => Self::Dismounted { lock_owner },
-            CleanCloseTerminal::Shutdown => Self::ShutdownComplete { lock_owner },
+        Some(match target {
+            VolumeCloseTarget::Dismount(owner) => Self::Dismounted {
+                access: match lock_owner {
+                    Some(current) if current == owner => DismountedAccess::Locked(owner),
+                    None => DismountedAccess::Unlocked(owner),
+                    Some(_) => return None,
+                },
+            },
+            VolumeCloseTarget::RawWrite(owner) if lock_owner == Some(owner) => {
+                Self::RawLocked { owner }
+            }
+            VolumeCloseTarget::RawWrite(_) => return None,
+            VolumeCloseTarget::Shutdown => Self::ShutdownComplete { lock_owner },
         })
     }
 
-    /// Consumes failed close authority without reopening filesystem admission.
+    /// Failure never restores session authority or claims clean durability.
     pub(super) fn fail_close(
         self,
-        expected: CleanCloseTerminal,
+        expected: VolumeCloseTarget,
         error: DriverError,
     ) -> Option<Self> {
         match self {
-            Self::Closing {
-                terminal,
-                lock_owner,
-            } if terminal == expected => Some(Self::CloseFailed {
-                terminal,
-                lock_owner,
-                error,
+            Self::Closing { target, lock_owner } if target == expected => {
+                Some(Self::CloseFailed { lock_owner, error })
+            }
+            _ => None,
+        }
+    }
+
+    /// Explicit dismount can invalidate a session already ended by a raw write.
+    pub(super) fn dismount_raw(self, owner: KernelFileObject) -> Option<Self> {
+        match self {
+            Self::RawLocked { owner: current } if current == owner => Some(Self::Dismounted {
+                access: DismountedAccess::Locked(owner),
             }),
             _ => None,
         }
     }
 
-    /// Applies implicit lock release when the owning FILE_OBJECT is cleaned up.
+    /// Cleanup releases direct access independently of whether an explicit lock existed.
     pub(super) fn cleanup(self, owner: KernelFileObject) -> (Self, VolumeHandleCleanup) {
         match self {
-            Self::StorageRemoved => (self, VolumeHandleCleanup::Released),
             Self::Locking { owner: current } if current == owner => {
                 (Self::Mounted, VolumeHandleCleanup::Released)
             }
-            Self::Locked {
-                owner: current_owner,
-            } if current_owner == owner => (Self::Mounted, VolumeHandleCleanup::Unlocked),
             Self::Dismounted {
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => (
-                Self::Dismounted { lock_owner: None },
-                VolumeHandleCleanup::Unlocked,
-            ),
-            Self::PreparingClose {
-                terminal,
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => (
-                Self::PreparingClose {
-                    terminal,
-                    lock_owner: None,
+                access: DismountedAccess::Unlocked(current),
+            } if current == owner => (
+                Self::Dismounted {
+                    access: DismountedAccess::Released,
                 },
+                VolumeHandleCleanup::DirectAccessReleased,
+            ),
+            Self::Locked { owner: current } | Self::RawLocked { owner: current }
+                if current == owner =>
+            {
+                (
+                    self.unlock(owner).unwrap_or_else(|_| {
+                        KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+                    }),
+                    VolumeHandleCleanup::Unlocked,
+                )
+            }
+            Self::Dismounted {
+                access: DismountedAccess::Locked(current),
+            }
+            | Self::PreparingClose {
+                lock_owner: Some(current),
+                ..
+            }
+            | Self::Closing {
+                lock_owner: Some(current),
+                ..
+            }
+            | Self::CloseFailed {
+                lock_owner: Some(current),
+                ..
+            }
+            | Self::ShutdownComplete {
+                lock_owner: Some(current),
+            } if current == owner => (
+                self.unlock(owner).unwrap_or_else(|_| {
+                    KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+                }),
                 VolumeHandleCleanup::Unlocked,
             ),
-            Self::Closing {
-                terminal,
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => (
-                Self::Closing {
-                    terminal,
-                    lock_owner: None,
-                },
-                VolumeHandleCleanup::Unlocked,
-            ),
-            Self::CloseFailed {
-                terminal,
-                error,
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => (
-                Self::CloseFailed {
-                    terminal,
-                    error,
-                    lock_owner: None,
-                },
-                VolumeHandleCleanup::Unlocked,
-            ),
-            Self::ShutdownComplete {
-                lock_owner: Some(current_owner),
-            } if current_owner == owner => (
-                Self::ShutdownComplete { lock_owner: None },
-                VolumeHandleCleanup::Unlocked,
-            ),
-            Self::Mounted
-            | Self::Locking { .. }
-            | Self::Locked { .. }
-            | Self::PreparingClose { .. }
-            | Self::Closing { .. }
-            | Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. } => (self, VolumeHandleCleanup::Released),
             Self::Retiring => KernelWideInconsistency::mounted_volume_state_corruption().bugcheck(),
+            _ => (self, VolumeHandleCleanup::Released),
         }
     }
 
-    /// Selects the one physical-retirement transition after all FILE_OBJECTs close.
+    /// Selects physical retirement only after every retained FILE_OBJECT and stream ends.
     pub(super) fn retire_if_unreferenced(
         self,
         namespace_empty: bool,
@@ -417,12 +399,14 @@ impl MountedVolumeState {
         }
     }
 
-    /// Logical termination permits teardown; FILE_OBJECT, stream and media lifetimes still gate it.
+    /// A failed close can retire without establishing healthy media authority.
     fn permits_retirement(self) -> bool {
         matches!(
             self,
             Self::StorageRemoved
-                | Self::Dismounted { lock_owner: None }
+                | Self::Dismounted {
+                    access: DismountedAccess::Released
+                }
                 | Self::CloseFailed {
                     lock_owner: None,
                     ..
@@ -430,10 +414,9 @@ impl MountedVolumeState {
         )
     }
 
-    /// Reports whether this volume remains logically mounted.
+    /// Reports whether the filesystem remains logically mounted.
     /// # Errors
-    ///
-    /// Returns volume dismounted after the terminal transition.
+    /// Returns removal or terminal dismount.
     pub(super) fn ensure_mounted(self) -> DriverResult<()> {
         match self {
             Self::StorageRemoved => Err(DriverError::DeviceRemoved),
@@ -442,51 +425,44 @@ impl MountedVolumeState {
             | Self::Locked { .. }
             | Self::PreparingClose { .. }
             | Self::Closing { .. } => Ok(()),
-            Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::VolumeDismounted),
+            _ => Err(DriverError::VolumeDismounted),
         }
     }
 
-    /// Applies create/open admission policy.
+    /// Applies namespace admission independently of media-write permission.
     /// # Errors
-    ///
-    /// Returns access denied while locked or volume dismounted after terminal dismount.
+    /// Returns exclusion, removal or terminal dismount.
     pub(super) fn authorize_create(self) -> DriverResult<()> {
         match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(()),
-            Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::PreparingClose { .. } | Self::Closing { .. } => Err(DriverError::AccessDenied),
-            Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::VolumeDismounted),
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::Locking { .. }
+            | Self::Locked { .. }
+            | Self::PreparingClose { .. }
+            | Self::Closing { .. } => Err(DriverError::AccessDenied),
+            _ => Err(DriverError::VolumeDismounted),
         }
     }
 
-    /// Applies ordinary handle-operation policy.
+    /// Applies ordinary handle admission without granting direct media access.
     /// # Errors
-    ///
-    /// Returns access denied for a competing lock owner or volume dismounted after dismount.
-    pub(super) fn authorize_handle(self, file_object: KernelFileObject) -> DriverResult<()> {
+    /// Returns exclusion, removal or terminal dismount.
+    pub(super) fn authorize_handle(self, owner: KernelFileObject) -> DriverResult<()> {
         match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(()),
-            Self::Locked { owner } if owner == file_object => Ok(()),
-            Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
-            Self::PreparingClose { .. } | Self::Closing { .. } => Err(DriverError::AccessDenied),
-            Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::VolumeDismounted),
+            Self::Locked { owner: current } if current == owner => Ok(()),
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::Locking { .. }
+            | Self::Locked { .. }
+            | Self::PreparingClose { .. }
+            | Self::Closing { .. } => Err(DriverError::AccessDenied),
+            _ => Err(DriverError::VolumeDismounted),
         }
     }
 
-    /// Requires a completed lock owned by the exact direct-volume FILE_OBJECT.
+    /// Requires a completed lock whose ext4 session is still live.
     /// # Errors
-    /// Returns not-locked before the drain completes, after unlock, or for another owner.
+    /// Returns not-locked for another owner or an ended session.
     pub(super) fn authorize_key_removal(self, owner: KernelFileObject) -> DriverResult<()> {
         match self {
             Self::Locked { owner: current } if current == owner => Ok(()),
@@ -494,63 +470,65 @@ impl MountedVolumeState {
         }
     }
 
-    /// Requires the lock/dismount lifecycle authority for one raw data operation.
+    /// Preparation may reserve a locked write before its session termination runs.
     /// # Errors
-    ///
-    /// Returns access denied unless this FILE_OBJECT owns the clean lock, and requires terminal
-    /// logical dismount for writes.
+    /// Returns the same lifecycle exclusion as physical submission for all other requests.
+    fn prepare_raw(
+        self,
+        owner: KernelFileObject,
+        kind: RawVolumeOperationKind,
+    ) -> DriverResult<()> {
+        if matches!(self, Self::Locked { owner: current } if current == owner) {
+            return Ok(());
+        }
+        self.authorize_raw(owner, kind)
+    }
+
+    /// Media writes require an ended session, independently of the handle's data rights.
+    /// # Errors
+    /// Returns removal, lost direct ownership, or terminal retirement.
     pub(super) fn authorize_raw(
         self,
         owner: KernelFileObject,
         kind: RawVolumeOperationKind,
     ) -> DriverResult<()> {
-        match (self, kind) {
-            (Self::StorageRemoved, _) => Err(DriverError::DeviceRemoved),
-            (Self::Locked { owner: current }, RawVolumeOperationKind::Read) if current == owner => {
+        match self {
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::Locked { owner: current }
+                if current == owner && kind == RawVolumeOperationKind::Read =>
+            {
                 Ok(())
             }
-            (
-                Self::Dismounted {
-                    lock_owner: Some(current),
-                },
-                RawVolumeOperationKind::Read | RawVolumeOperationKind::Write,
-            ) if current == owner => Ok(()),
-            (
-                Self::Mounted
-                | Self::Locking { .. }
-                | Self::Locked { .. }
-                | Self::PreparingClose { .. }
-                | Self::Closing { .. }
-                | Self::Dismounted { .. }
-                | Self::ShutdownComplete { .. }
-                | Self::CloseFailed { .. },
-                _,
-            ) => Err(DriverError::AccessDenied),
-            (Self::Retiring, _) => Err(DriverError::VolumeDismounted),
+            Self::RawLocked { owner: current } if current == owner => Ok(()),
+            Self::Dismounted { access } => access.authorize(owner),
+            Self::Retiring => Err(DriverError::VolumeDismounted),
+            _ => Err(DriverError::AccessDenied),
         }
     }
 
-    /// Admits a handle-local raw extent change without granting data authority.
+    /// An ended session cannot participate in ext4 submission or raw flush interpretation.
+    const fn raw_session(self) -> bool {
+        matches!(self, Self::RawLocked { .. } | Self::Dismounted { .. })
+    }
+
+    /// Extent selection changes no data authority.
     /// # Errors
-    ///
-    /// Returns access denied for a competing owner, or volume dismounted once the raw owner is
-    /// no longer retained. The lock owner may expand its bound after logical dismount.
+    /// Returns exclusion, removal or terminal dismount.
     pub(super) fn authorize_raw_extent_change(self, owner: KernelFileObject) -> DriverResult<()> {
         match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Mounted => Ok(()),
-            Self::Locked { owner: current }
-            | Self::Dismounted {
-                lock_owner: Some(current),
-            } if current == owner => Ok(()),
+            Self::Locked { owner: current } | Self::RawLocked { owner: current }
+                if current == owner =>
+            {
+                Ok(())
+            }
+            Self::Dismounted { access } => access.authorize(owner),
+            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
             Self::Locking { .. }
             | Self::Locked { .. }
             | Self::PreparingClose { .. }
             | Self::Closing { .. } => Err(DriverError::AccessDenied),
-            Self::Dismounted { .. }
-            | Self::ShutdownComplete { .. }
-            | Self::CloseFailed { .. }
-            | Self::Retiring => Err(DriverError::VolumeDismounted),
+            _ => Err(DriverError::VolumeDismounted),
         }
     }
 }
@@ -810,10 +788,7 @@ impl MountedVolumeAccess<'_> {
             StorageSubmissionSource::Filesystem => self.runtime.require_media_ownership(),
             StorageSubmissionSource::RawVolume { target, kind } => {
                 self.authorize_raw_volume_io(target, kind)?;
-                if !matches!(
-                    self.volume_control.state,
-                    MountedVolumeState::Dismounted { .. }
-                ) {
+                if !self.volume_control.state.raw_session() {
                     self.runtime.require_media_ownership()?;
                 }
                 Ok(())
@@ -879,6 +854,8 @@ impl MountedVolumeAccess<'_> {
 /// VPB-visible effect produced when a direct-volume handle is cleaned up.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VolumeHandleCleanup {
+    /// Cleanup released direct access acquired without an explicit volume lock.
+    DirectAccessReleased,
     /// Only the direct-volume share claim was released.
     Released,
     /// The cleaned-up FILE_OBJECT also owned the volume lock.
@@ -917,8 +894,8 @@ pub(crate) struct PreparedVolumeStateTransition {
 pub(crate) struct PreparedVolumeClose {
     /// Exact mounted owner retaining the reversible exclusion.
     volume: MountedVolumeRef,
-    /// Endpoint selected while the filesystem still owns its mounted session.
-    terminal: CleanCloseTerminal,
+    /// Exact close target selected while the filesystem still owns its mounted session.
+    target: VolumeCloseTarget,
 }
 
 /// Reversible volume-lock transition paired with every stream cache lease it must drain.
@@ -945,10 +922,10 @@ enum PreparedVolumeStateTransitionKind {
         /// FILE_OBJECT whose lock attempt has already closed namespace admission.
         owner: KernelFileObject,
     },
-    /// Terminal publication authorized only by a completed clean-close protocol.
-    CleanClose {
+    /// Logical session termination; successful raw access additionally requires clean finalization.
+    SessionEnd {
         /// Terminal selected when the current `Closing` state was entered.
-        terminal: CleanCloseTerminal,
+        target: VolumeCloseTarget,
     },
 }
 
@@ -1178,24 +1155,21 @@ impl MountedVolumeAccess<'_> {
 
     /// Excludes ordinary operations while leaving paging and session ownership intact.
     /// # Errors
-    /// Returns storage, health, lifecycle or paging-file exclusion before changing admission.
+    /// Returns storage, lifecycle or paging-file exclusion before changing admission.
     pub(crate) fn prepare_volume_close(
         &mut self,
         target: VolumeCloseTarget,
     ) -> DriverResult<PreparedVolumeClose> {
-        self.authorize_durability()?;
-        let state = match target {
-            VolumeCloseTarget::Dismount(owner) => {
-                self.volume.file_control_blocks.authorize_dismount()?;
-                self.volume_control.state.prepare_dismount(owner)?
-            }
-            VolumeCloseTarget::Shutdown => self.volume_control.state.prepare_shutdown()?,
-        };
+        self.authorize_storage()?;
+        if !matches!(target, VolumeCloseTarget::Shutdown) {
+            self.volume.file_control_blocks.authorize_dismount()?;
+        }
+        let state = self.volume_control.state.prepare_close(target)?;
         self.storage_access().begin_close_writeback()?;
         self.volume_control.state = state;
         Ok(PreparedVolumeClose {
             volume: MountedVolumeRef::new(NonNull::from(self.volume)),
-            terminal: target.terminal(),
+            target,
         })
     }
 
@@ -1207,36 +1181,36 @@ impl MountedVolumeAccess<'_> {
         preparation: &PreparedVolumeClose,
     ) -> DriverResult<DriverVec<StreamCacheLease>> {
         self.require_close_preparation(preparation);
-        if preparation.terminal == CleanCloseTerminal::Dismount {
+        if !matches!(preparation.target, VolumeCloseTarget::Shutdown) {
             self.volume.file_control_blocks.authorize_dismount()?;
         }
         self.prepare_cache_writeback()
     }
 
-    /// A recoverable preparation releases its exclusion; lost session authority terminates it.
-    /// Physical removal owns its separate watch withdrawal and device-retirement protocol.
-    pub(crate) fn fail_volume_close_preparation(
+    /// Healthy preparation can reopen; an unhealthy session returns sealed termination authority.
+    /// Physical removal owns its independent teardown and returns no session continuation.
+    pub(crate) fn abort_or_seal_close(
         &mut self,
         preparation: PreparedVolumeClose,
-        error: DriverError,
-    ) {
+    ) -> Option<PreparedVolumeStateTransition> {
         self.require_close_preparation(&preparation);
         if self.authorize_storage().is_err() {
-            return;
+            return None;
         }
-        let state = self.volume_control.state;
-        let state = if self.runtime.authorize_durability().is_ok() {
-            self.storage_access().abort_close_writeback();
-            state.abort_close(preparation.terminal)
-        } else {
-            self.storage_access().seal_close_writeback();
-            self.volume.directory_change_notifier.cleanup_all();
-            state
-                .seal_close(preparation.terminal)
-                .and_then(|state| state.fail_close(preparation.terminal, error))
+        if self.runtime.authorize_durability().is_err() {
+            return Some(self.seal_volume_close(preparation).unwrap_or_else(|_| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            }));
         }
-        .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
-        self.volume_control.state = state;
+        self.storage_access().abort_close_writeback();
+        self.volume_control.state = self
+            .volume_control
+            .state
+            .abort_close(preparation.target)
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
+        None
     }
 
     /// Consumes reversible preparation before sealing paging and issuing any clean-marker effect.
@@ -1251,15 +1225,15 @@ impl MountedVolumeAccess<'_> {
         self.volume_control.state = self
             .volume_control
             .state
-            .seal_close(preparation.terminal)
+            .seal_close(preparation.target)
             .unwrap_or_else(|| {
                 KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
             });
         self.storage_access().seal_close_writeback();
         Ok(PreparedVolumeStateTransition {
             volume: preparation.volume,
-            kind: PreparedVolumeStateTransitionKind::CleanClose {
-                terminal: preparation.terminal,
+            kind: PreparedVolumeStateTransitionKind::SessionEnd {
+                target: preparation.target,
             },
         })
     }
@@ -1297,8 +1271,8 @@ impl MountedVolumeAccess<'_> {
                     KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
                 });
             }
-            PreparedVolumeStateTransitionKind::CleanClose { terminal } => {
-                control.state = control.state.finish_close(terminal).unwrap_or_else(|| {
+            PreparedVolumeStateTransitionKind::SessionEnd { target } => {
+                control.state = control.state.finish_close(target).unwrap_or_else(|| {
                     KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
                 });
                 self.volume.directory_change_notifier.cleanup_all();
@@ -1323,10 +1297,10 @@ impl MountedVolumeAccess<'_> {
         let control = &mut self.volume_control;
         control.state = match transition.kind {
             PreparedVolumeStateTransitionKind::Lock { owner } => control.state.abort_lock(owner),
-            PreparedVolumeStateTransitionKind::CleanClose { terminal } => {
+            PreparedVolumeStateTransitionKind::SessionEnd { target } => {
                 storage.seal_close_writeback();
                 self.volume.directory_change_notifier.cleanup_all();
-                control.state.fail_close(terminal, error)
+                control.state.fail_close(target, error)
             }
         }
         .unwrap_or_else(|| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
@@ -1587,8 +1561,8 @@ impl MountedVolumeAccess<'_> {
     /// Produces one bounded raw transfer authority from lifecycle, access, and extent state.
     /// # Errors
     ///
-    /// Returns access denied unless the handle owns the clean lock and retained the matching data
-    /// right; writes additionally require completed logical dismount.
+    /// Returns access denied unless the exact retained direct owner has the matching data right;
+    /// media writes require the filesystem session to have ended.
     pub(crate) fn authorize_raw_volume_io(
         &self,
         target: RawVolumeTarget,
@@ -1601,6 +1575,56 @@ impl MountedVolumeAccess<'_> {
         self.volume_control
             .state
             .authorize_raw(target.owner(), kind)?;
+        self.raw_volume_bounds(target, kind)
+    }
+
+    /// Validates a raw request before any session-close or media effect.
+    /// # Errors
+    /// Returns lifecycle, retained data access, media policy or geometry failure.
+    pub(crate) fn prepare_raw_volume_io(
+        &self,
+        target: RawVolumeTarget,
+        kind: RawVolumeOperationKind,
+    ) -> DriverResult<RawVolumeIoPermit> {
+        self.authorize_storage()?;
+        if !self.owns_volume(target.volume()) {
+            return Err(DriverError::InvalidDeviceRequest);
+        }
+        self.volume_control
+            .state
+            .prepare_raw(target.owner(), kind)?;
+        self.raw_volume_bounds(target, kind)
+    }
+
+    /// Selects the required session handoff without granting lower-write permission.
+    pub(crate) fn raw_write_requires_close(&self, owner: KernelFileObject) -> bool {
+        matches!(self.volume_control.state, MountedVolumeState::Locked { owner: current } if current == owner)
+    }
+
+    /// A raw-locked session already completed every filesystem and ownership obligation.
+    pub(crate) fn raw_locked_by(&self, owner: KernelFileObject) -> bool {
+        matches!(self.volume_control.state, MountedVolumeState::RawLocked { owner: current } if current == owner)
+    }
+
+    /// Completes explicit dismount without reusing the journal cursor consumed by a raw write.
+    pub(crate) fn dismount_raw_session(&mut self, owner: KernelFileObject) {
+        self.volume_control.state = self
+            .volume_control
+            .state
+            .dismount_raw(owner)
+            .unwrap_or_else(|| {
+                KernelWideInconsistency::mounted_volume_state_corruption().bugcheck()
+            });
+    }
+
+    /// Reuses immutable geometry and retained handle rights without conflating session authority.
+    /// # Errors
+    /// Returns data-right, write-policy, uncertain-write or coordinate conversion failure.
+    fn raw_volume_bounds(
+        &self,
+        target: RawVolumeTarget,
+        kind: RawVolumeOperationKind,
+    ) -> DriverResult<RawVolumeIoPermit> {
         let (access, extent) = target.authority();
         access.require(kind)?;
         if kind == RawVolumeOperationKind::Write {
@@ -1639,7 +1663,7 @@ impl MountedVolumeAccess<'_> {
             return Err(DriverError::InvalidDeviceRequest);
         }
         let state = self.volume_control.state;
-        if matches!(state, MountedVolumeState::Dismounted { .. }) {
+        if state.raw_session() {
             state.authorize_raw(target.owner(), RawVolumeOperationKind::Read)?;
             target
                 .authority()
@@ -2095,6 +2119,34 @@ impl MountedVolumeAccess<'_> {
     /// Irreversibly retires the session while retaining all outstanding completion owners.
     pub(crate) fn fail_mmp(&mut self, reason: ext4_core::Error) {
         self.runtime.fail_mmp(reason);
+    }
+
+    /// Observes physical session work without requiring clean journal state or live ownership.
+    pub(crate) fn session_work_drained(&self) -> bool {
+        self.runtime.session_work_drained()
+    }
+
+    /// Revokes an unclean session without writing recovery or MMP clean markers.
+    pub(crate) fn abandon_session(&mut self) {
+        self.runtime.abandon_session();
+    }
+
+    /// Transfers journal sharing only after an abandoned session's physical work drained.
+    pub(crate) fn finish_abandoned_session(
+        &mut self,
+    ) -> Option<crate::kernel::storage::ExternalJournalExclusion> {
+        self.runtime.finish_abandoned_session()
+    }
+
+    /// Native remount routing stays excluded while an explicit lock survives a failed close.
+    pub(crate) fn failed_close_retains_lock(&self) -> bool {
+        matches!(
+            self.volume_control.state,
+            MountedVolumeState::CloseFailed {
+                lock_owner: Some(_),
+                ..
+            }
+        )
     }
 
     /// Reports whether no mutation or checkpoint owns journal space.

@@ -3,7 +3,7 @@
 use super::*;
 use crate::memory::DriverVec;
 use crate::state::{
-    CleanCloseTerminal, KernelDevice, KernelFileObject, PreparedVolumeClose, StreamCacheLease,
+    KernelDevice, KernelFileObject, PreparedVolumeClose, SessionEndRouting, StreamCacheLease,
     VolumeCloseTarget,
 };
 
@@ -17,10 +17,15 @@ pub(crate) enum VolumeCloseRequest {
 }
 
 /// The requester identity also records whether the attempt notification was issued.
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum CloseRequester {
     /// Shutdown carries no user-mode dismount notification protocol.
     Shutdown,
+    /// The prepared raw transfer resumes only after filesystem and MMP writes end.
+    RawWrite {
+        target: RawVolumeTarget,
+        resume: Box<RawVolumeOperation>,
+    },
     /// Target validation succeeded, but no attempt notification has been issued.
     DismountUnannounced(KernelFileObject),
     /// Failed completion must pair the issued attempt with DISMOUNT_FAILED.
@@ -29,36 +34,37 @@ enum CloseRequester {
 
 impl CloseRequester {
     /// Projects the admitted requester without granting notification or publication authority.
-    fn target(self) -> VolumeCloseTarget {
+    fn target(&self) -> VolumeCloseTarget {
         match self {
             Self::Shutdown => VolumeCloseTarget::Shutdown,
+            Self::RawWrite { target, .. } => VolumeCloseTarget::RawWrite(target.owner()),
             Self::DismountUnannounced(file) | Self::DismountAnnounced(file) => {
-                VolumeCloseTarget::Dismount(file)
+                VolumeCloseTarget::Dismount(*file)
             }
         }
     }
 
     /// Consumes the worker's completed notification call before cache preparation can proceed.
-    fn announced(self) -> Self {
-        match self {
-            Self::DismountUnannounced(file) => Self::DismountAnnounced(file),
+    fn announced(&mut self) {
+        *self = match self {
+            Self::DismountUnannounced(file) => Self::DismountAnnounced(*file),
             _ => {
                 crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
                     .bugcheck()
             }
-        }
+        };
     }
 
     /// Only an issued attempt has a corresponding failure notification.
     fn failure_notification(
-        self,
+        &self,
     ) -> Option<(KernelFileObject, crate::kernel::volume_event::VolumeEvent)> {
         match self {
             Self::DismountAnnounced(file) => Some((
-                file,
+                *file,
                 crate::kernel::volume_event::VolumeEvent::DismountFailed,
             )),
-            Self::Shutdown | Self::DismountUnannounced(_) => None,
+            Self::Shutdown | Self::RawWrite { .. } | Self::DismountUnannounced(_) => None,
         }
     }
 }
@@ -83,6 +89,8 @@ enum CloseState {
         preparation: PreparedVolumeClose,
         close: Box<CleanCloseOperation>,
     },
+    /// Explicit dismount of a raw-locked session needs notification but no media finalization.
+    AnnouncingRawDismount,
     /// Previously admitted mutations may still publish streams needed by the cache snapshot.
     Draining {
         owned: OwnedIrp,
@@ -113,10 +121,17 @@ enum CloseState {
         owned: OwnedIrp,
         transition: PreparedVolumeStateTransition,
     },
+    /// Failure revokes session authority and joins physical work without clearing recovery.
+    Abandoning {
+        owned: OwnedIrp,
+        transition: PreparedVolumeStateTransition,
+        error: DriverError,
+    },
     /// Filesystem writes ended; a passive worker must release journal sharing before remount.
     ReleasingJournal {
         owned: OwnedIrp,
         transition: PreparedVolumeStateTransition,
+        outcome: DriverResult<()>,
     },
     /// Completion or failure consumed the request and its publication authority.
     Terminal,
@@ -164,6 +179,19 @@ pub(crate) fn volume_close(
             CloseRequester::DismountUnannounced(target.owner())
         }
     };
+    prepare_close(owned, target, device, access)
+        .map(|operation| -> Box<dyn CompletionOperation> { operation })
+}
+
+/// All continuation storage exists before session authority can be consumed.
+/// # Errors
+/// Returns the owned request on allocation failure.
+fn prepare_close(
+    owned: OwnedIrp,
+    target: CloseRequester,
+    device: KernelDevice,
+    access: &MountedVolumeAccess<'_>,
+) -> Result<Box<VolumeCloseOperation>, AdmitOperationError> {
     let profile = access.mounted_profile();
     let close = match memory::boxed_try_with(|| Ok(CleanCloseOperation::new(profile))) {
         Ok(close) => close,
@@ -174,11 +202,37 @@ pub(crate) fn volume_close(
         device,
         state: CloseState::Ready { owned, close },
     })
-    .map(|operation| -> Box<dyn CompletionOperation> { operation })
     .map_err(|failure| {
         let (error, owned) = failure.into_parts();
         AdmitOperationError::new(error, owned)
     })
+}
+
+/// Transfers a fully prepared raw write into session termination before its first lower effect.
+pub(super) fn before_raw_write(
+    mut owned: OwnedIrp,
+    resume: Box<RawVolumeOperation>,
+    target: RawVolumeTarget,
+    access: &mut MountedVolumeAccess<'_>,
+) -> OperationTransition {
+    let device = match owned.request().with_active(|active| Ok(active.device())) {
+        Ok(device) => device,
+        Err(error) => return OperationTransition::Complete(owned.prepare_result(Err(error))),
+    };
+    match prepare_close(
+        owned,
+        CloseRequester::RawWrite { target, resume },
+        device,
+        access,
+    ) {
+        Ok(operation) => {
+            operation.advance_mounted(CompletionEvent::Core(OperationEvent::Admitted), access)
+        }
+        Err(error) => {
+            let (error, owned) = error.into_parts();
+            OperationTransition::Complete(owned.prepare_result(Err(error)))
+        }
+    }
 }
 
 impl VolumeCloseOperation {
@@ -205,33 +259,60 @@ impl VolumeCloseOperation {
             close,
         };
         OperationTransition::Wait {
-            condition: WaitCondition::JournalClean,
+            condition: WaitCondition::SessionDrain,
             suspended: self,
         }
     }
 
-    /// Remount routing becomes visible only after every session exclusion has been released.
+    /// Publishes logical termination after journal sharing has been released.
     fn publish(
         self,
         owned: OwnedIrp,
         transition: PreparedVolumeStateTransition,
+        outcome: DriverResult<()>,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        let result = access.publish_volume_state_transition(transition);
-        if result.is_ok() && self.requester.target().terminal() == CleanCloseTerminal::Dismount {
-            MountedVolumeDevice::publish_dismount(self.device);
+        let target = self.requester.target();
+        let result = match outcome {
+            Ok(()) => access.publish_volume_state_transition(transition),
+            Err(error) => {
+                access.fail_volume_state_transition(transition, error);
+                Err(error)
+            }
+        };
+        if !matches!(target, VolumeCloseTarget::Shutdown) && access.authorize_storage().is_ok() {
+            let routing = if result.is_ok() {
+                SessionEndRouting::DirectAccess
+            } else if access.failed_close_retains_lock() {
+                SessionEndRouting::Retain
+            } else {
+                SessionEndRouting::Remount
+            };
+            MountedVolumeDevice::publish_session_end(self.device, routing);
             MountedVolumeDevice::unregister_shutdown_notification(self.device);
-            MountedVolumeDevice::complete_dismount(self.device);
+            if matches!(target, VolumeCloseTarget::Dismount(_)) {
+                MountedVolumeDevice::complete_dismount(
+                    self.device,
+                    result
+                        .as_ref()
+                        .map_or_else(|error| error.ntstatus(), |()| STATUS_SUCCESS),
+                );
+            }
         }
         access
             .operational_trace()
             .record_result(OperationalPath::VolumeClose, &result);
+        if result.is_ok()
+            && let CloseRequester::RawWrite { resume, .. } = self.requester
+        {
+            return resume.submit_prepared(owned);
+        }
         self.complete(owned, result.map(|()| IrpCompletion::EMPTY))
     }
 
     /// Only a still-authorized session may reopen after cache preparation fails.
     fn fail_preparation(
-        self,
+        self: Box<Self>,
         owned: OwnedIrp,
         preparation: PreparedVolumeClose,
         error: DriverError,
@@ -241,13 +322,15 @@ impl VolumeCloseOperation {
             .operational_trace()
             .record_status(OperationalPath::VolumeClose, error.ntstatus());
         record_cache_coherency_failure(error, access);
-        access.fail_volume_close_preparation(preparation, error);
+        if let Some(transition) = access.abort_or_seal_close(preparation) {
+            return self.fail(owned, transition, error, access);
+        }
         self.complete(owned, Err(error))
     }
 
-    /// Seals admission and preserves the terminal failure without authorizing a clean marker.
+    /// Revokes failed session authority before joining lower writes and journal sharing.
     fn fail(
-        self,
+        mut self: Box<Self>,
         owned: OwnedIrp,
         transition: PreparedVolumeStateTransition,
         error: DriverError,
@@ -257,8 +340,40 @@ impl VolumeCloseOperation {
             .operational_trace()
             .record_status(OperationalPath::VolumeClose, error.ntstatus());
         record_cache_coherency_failure(error, access);
-        access.fail_volume_state_transition(transition, error);
-        self.complete(owned, Err(error))
+        access.abandon_session();
+        self.state = CloseState::Abandoning {
+            owned,
+            transition,
+            error,
+        };
+        OperationTransition::WaitForClosingDrain {
+            condition: WaitCondition::SessionDrain,
+            suspended: self,
+        }
+    }
+
+    /// A journal handle is released at most once, for either clean or unclean termination.
+    fn release_journal(
+        mut self: Box<Self>,
+        owned: OwnedIrp,
+        transition: PreparedVolumeStateTransition,
+        outcome: DriverResult<()>,
+        exclusion: Option<crate::kernel::storage::ExternalJournalExclusion>,
+        access: &mut MountedVolumeAccess<'_>,
+    ) -> OperationTransition {
+        if let Some(exclusion) = exclusion {
+            self.state = CloseState::ReleasingJournal {
+                owned,
+                transition,
+                outcome,
+            };
+            OperationTransition::SubmitPassiveWork {
+                work: crate::irp::PassiveWork::CloseExternalJournal(exclusion),
+                suspended: self,
+            }
+        } else {
+            self.publish(owned, transition, outcome, access)
+        }
     }
 
     /// Runs native cache work outside the actor so synchronous paging requests can complete.
@@ -271,9 +386,11 @@ impl VolumeCloseOperation {
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
         if let Some(stream) = streams.pop() {
-            let work = match self.requester.target().terminal() {
-                CleanCloseTerminal::Dismount => crate::irp::PassiveWork::CloseWriteback { stream },
-                CleanCloseTerminal::Shutdown => crate::irp::PassiveWork::flush(stream),
+            let work = match self.requester.target() {
+                VolumeCloseTarget::Dismount(_) | VolumeCloseTarget::RawWrite(_) => {
+                    crate::irp::PassiveWork::CloseWriteback { stream }
+                }
+                VolumeCloseTarget::Shutdown => crate::irp::PassiveWork::flush(stream),
             };
             self.state = CloseState::Writeback {
                 owned,
@@ -377,6 +494,20 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     STATUS_SUCCESS,
                     OperationalOutcome::Selected,
                 );
+                if let CloseRequester::DismountUnannounced(file) = &self.requester
+                    && access.raw_locked_by(*file)
+                {
+                    let file = *file;
+                    self.state = CloseState::AnnouncingRawDismount;
+                    return OperationTransition::SubmitPassiveWork {
+                        work: crate::irp::PassiveWork::NotifyVolume {
+                            owned,
+                            file,
+                            event: crate::kernel::volume_event::VolumeEvent::Dismount,
+                        },
+                        suspended: self,
+                    };
+                }
                 let preparation = match access.prepare_volume_close(self.requester.target()) {
                     Ok(preparation) => preparation,
                     Err(error) => {
@@ -384,17 +515,48 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                         return self.complete(owned, Err(error));
                     }
                 };
-                match self.requester {
+                match &self.requester {
                     CloseRequester::DismountUnannounced(file) => {
                         self.state = CloseState::Announcing { preparation, close };
                         OperationTransition::SubmitPassiveWork {
-                            work: crate::irp::PassiveWork::NotifyVolume { owned, file, event: crate::kernel::volume_event::VolumeEvent::Dismount },
+                            work: crate::irp::PassiveWork::NotifyVolume { owned, file: *file, event: crate::kernel::volume_event::VolumeEvent::Dismount },
                             suspended: self,
                         }
                     }
-                    CloseRequester::Shutdown => self.drain(owned, preparation, close),
+                    CloseRequester::Shutdown | CloseRequester::RawWrite { .. } => self.drain(owned, preparation, close),
                     CloseRequester::DismountAnnounced(_) => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
                 }
+            }
+            (
+                CloseState::AnnouncingRawDismount,
+                CompletionEvent::PassiveCompleted(
+                    crate::irp::PassiveWorkCompletion::NotifyVolume { owned, result },
+                ),
+            ) => {
+                if let Err(error) = result {
+                    return self.complete(owned, Err(error));
+                }
+                self.requester.announced();
+                let VolumeCloseTarget::Dismount(owner) = self.requester.target() else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                access.dismount_raw_session(owner);
+                MountedVolumeDevice::complete_dismount(self.device, STATUS_SUCCESS);
+                self.complete(owned, Ok(IrpCompletion::EMPTY))
+            }
+            (
+                CloseState::Abandoning {
+                    owned,
+                    transition,
+                    error,
+                },
+                CompletionEvent::BarrierReleased(permit),
+            ) => {
+                if permit.into_identity() != crate::irp::reactor::SESSION_DRAIN_BARRIER {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                }
+                let exclusion = access.finish_abandoned_session();
+                self.release_journal(owned, transition, Err(error), exclusion, access)
             }
             (
                 CloseState::Announcing { preparation, close },
@@ -403,7 +565,7 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                 ),
             ) => match result {
                 Ok(()) => {
-                    self.requester = self.requester.announced();
+                    self.requester.announced();
                     self.drain(owned, preparation, close)
                 }
                 Err(error) => self.fail_preparation(owned, preparation, error, access),
@@ -420,13 +582,20 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                 },
                 CompletionEvent::BarrierReleased(permit),
             ) => {
-                if permit.into_identity() != 1 {
+                if permit.into_identity() != crate::irp::reactor::SESSION_DRAIN_BARRIER {
                     return self.fail_preparation(
                         owned,
                         preparation,
                         DriverError::InternalInvariantViolation,
                         access,
                     );
+                }
+                if let Err(error) = access.authorize_durability() {
+                    let transition = match access.seal_volume_close(preparation) {
+                        Ok(transition) => transition,
+                        Err(error) => return self.complete(owned, Err(error)),
+                    };
+                    return self.fail(owned, transition, error, access);
                 }
                 let streams = match access.prepare_close_writeback(&preparation) {
                     Ok(streams) => streams,
@@ -443,9 +612,9 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                 },
                 CompletionEvent::PassiveCompleted(completion),
             ) => {
-                let result = match (self.requester.target().terminal(), completion) {
-                    (CleanCloseTerminal::Dismount, crate::irp::PassiveWorkCompletion::CloseWriteback(result))
-                    | (CleanCloseTerminal::Shutdown, crate::irp::PassiveWorkCompletion::Flush(result)) => result,
+                let result = match (self.requester.target(), completion) {
+                    (VolumeCloseTarget::Dismount(_) | VolumeCloseTarget::RawWrite(_), crate::irp::PassiveWorkCompletion::CloseWriteback(result))
+                    | (VolumeCloseTarget::Shutdown, crate::irp::PassiveWorkCompletion::Flush(result)) => result,
                     _ => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
                 };
                 match result {
@@ -505,26 +674,28 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                     Ok(exclusion) => exclusion,
                     Err(error) => return self.fail(owned, transition, error, access),
                 };
-                if let Some(exclusion) = exclusion {
-                    self.state = CloseState::ReleasingJournal { owned, transition };
-                    OperationTransition::SubmitPassiveWork {
-                        work: crate::irp::PassiveWork::CloseExternalJournal(exclusion),
-                        suspended: self,
-                    }
-                } else {
-                    self.publish(owned, transition, access)
-                }
+                self.release_journal(owned, transition, Ok(()), exclusion, access)
             }
+
             (
-                CloseState::ReleasingJournal { owned, transition },
+                CloseState::ReleasingJournal {
+                    owned,
+                    transition,
+                    outcome,
+                },
                 CompletionEvent::PassiveCompleted(
                     crate::irp::PassiveWorkCompletion::CloseExternalJournal(result),
                 ),
             ) => match result {
-                Ok(()) => self.publish(owned, transition, access),
+                Ok(()) => self.publish(owned, transition, outcome, access),
                 Err((error, exclusion)) => {
                     access.retain_external_journal_exclusion(exclusion);
-                    self.fail(owned, transition, error, access)
+                    access.fail_volume_state_transition(transition, error);
+                    MountedVolumeDevice::unregister_shutdown_notification(self.device);
+                    if matches!(self.requester.target(), VolumeCloseTarget::Dismount(_)) {
+                        MountedVolumeDevice::complete_dismount(self.device, error.ntstatus());
+                    }
+                    self.complete(owned, Err(error))
                 }
             },
             (

@@ -451,6 +451,11 @@ pub(crate) struct PreparedRawVolumeTransfer {
 }
 
 impl PreparedRawVolumeTransfer {
+    /// Exact direct owner whose immutable transfer inputs were validated.
+    pub(crate) const fn target(&self) -> RawVolumeTarget {
+        self.target
+    }
+
     /// Consumes the prepared transfer into its operation-owned values.
     pub(crate) fn into_parts(
         self,
@@ -568,7 +573,7 @@ pub(crate) fn prepare_raw_volume_transfer(
             file_object.flags() & wdk_sys::FO_WRITE_THROUGH != 0,
         ))
     })?;
-    let permit = access.authorize_raw_volume_io(target, kind)?;
+    let permit = access.prepare_raw_volume_io(target, kind)?;
     let address = match (length, buffer_address) {
         (0, None) => 0,
         (_, Some(address)) => address.as_ptr().addr(),

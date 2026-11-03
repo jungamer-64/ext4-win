@@ -475,8 +475,14 @@ fn unreliable_writeback_terminates_close_preparation() -> crate::kernel::status:
         let preparation =
             access.prepare_volume_close(crate::state::VolumeCloseTarget::Dismount(owner))?;
         access.record_cache_writeback_failure(wdk_sys::STATUS_IO_DEVICE_ERROR);
-        access.fail_volume_close_preparation(
-            preparation,
+        let transition = access
+            .abort_or_seal_close(preparation)
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        access.abandon_session();
+        assert!(access.session_work_drained());
+        drop(access.finish_abandoned_session());
+        access.fail_volume_state_transition(
+            transition,
             DriverError::CacheManagerFailure(wdk_sys::STATUS_IO_DEVICE_ERROR),
         );
         assert_eq!(access.ensure_mounted(), Err(DriverError::VolumeDismounted));
@@ -545,79 +551,170 @@ fn dismount_retains_raw_submissions_without_restoring_filesystem_ownership()
         MountedVolumeState, OpenedVolumeHandle, RawVolumeAccess, RawVolumeOperationKind,
         StorageSubmissionSource, VolumeFlushScope,
     };
-    let mut disk = Device::fixture()?;
-    let mut native = wdk_sys::DEVICE_OBJECT {
-        SectorSize: 512,
-        Flags: wdk_sys::DO_DIRECT_IO,
-        ..wdk_sys::DEVICE_OBJECT::default()
-    };
-    let mut binding = binding(&mut disk, &mut native)?;
-    let mut file = wdk_sys::FILE_OBJECT::default();
-    let mut handle = OpenedVolumeHandle::new(RawVolumeAccess::ReadWrite);
-    let target = raw_target(&mut binding, &mut file, &mut handle)?;
-    // This fixture begins with the exclusive raw lock already held.
-    binding.actor.volume_control.state = MountedVolumeState::Locked {
-        owner: target.owner(),
-    };
-    let (transition, mut close) = binding.with_access(|access| {
-        let preparation = access
-            .prepare_volume_close(crate::state::VolumeCloseTarget::Dismount(target.owner()))?;
-        access.fail_volume_close_preparation(
-            preparation,
-            DriverError::CacheManagerFailure(wdk_sys::STATUS_USER_MAPPED_FILE),
-        );
-        assert_eq!(access.authorize_handle(target.owner()), Ok(()));
-        let preparation = access
-            .prepare_volume_close(crate::state::VolumeCloseTarget::Dismount(target.owner()))?;
-        assert!(access.prepare_close_writeback(&preparation)?.is_empty());
-        let transition = access.seal_volume_close(preparation)?;
-        let close = Box::try_new(CleanCloseOperation::new(access.mounted_profile()))
-            .map_err(|_| DriverError::InsufficientResources)?;
-        Ok::<_, DriverError>((
-            transition,
-            access.start_clean_close(close, ext4_core::Ext4Timestamp::from_seconds(900)),
-        ))
-    })?;
-    let durability = loop {
-        close = match close {
-            CleanCloseTransition::SubmitLower { request, suspended } => {
-                drop(binding.with_access(|access| {
-                    access.authorize_storage_submission(StorageSubmissionSource::Filesystem)
-                })?);
-                suspended.advance(OperationEvent::StorageCompleted(disk.complete(request)?))
-            }
-            CleanCloseTransition::Complete(result) => break result?,
+    for first_raw_write in [false, true] {
+        let mut disk = Device::fixture()?;
+        let mut native = wdk_sys::DEVICE_OBJECT {
+            SectorSize: 512,
+            Flags: wdk_sys::DO_DIRECT_IO,
+            ..wdk_sys::DEVICE_OBJECT::default()
         };
-    };
-    binding.with_access(|access| access.request_mmp_close(durability))?;
-    binding.with_access(|access| {
-        let _durability = access.finish_mmp_close()?;
-        access.publish_volume_state_transition(transition)?;
-        assert!(matches!(
-            access.authorize_storage_submission(StorageSubmissionSource::Filesystem),
-            Err(DriverError::FileClosed)
-        ));
-        for kind in [RawVolumeOperationKind::Read, RawVolumeOperationKind::Write] {
-            drop(
+        let mut binding = binding(&mut disk, &mut native)?;
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        let mut handle = OpenedVolumeHandle::new(RawVolumeAccess::ReadWrite);
+        let target = raw_target(&mut binding, &mut file, &mut handle)?;
+        // This fixture begins with the exclusive raw lock already held.
+        binding.actor.volume_control.state = MountedVolumeState::Locked {
+            owner: target.owner(),
+        };
+        let close_target = if first_raw_write {
+            crate::state::VolumeCloseTarget::RawWrite(target.owner())
+        } else {
+            crate::state::VolumeCloseTarget::Dismount(target.owner())
+        };
+        let (transition, mut close) = binding.with_access(|access| {
+            let preparation = access.prepare_volume_close(close_target)?;
+            assert!(access.abort_or_seal_close(preparation).is_none());
+            assert_eq!(access.authorize_handle(target.owner()), Ok(()));
+            let preparation = access.prepare_volume_close(close_target)?;
+            assert!(access.prepare_close_writeback(&preparation)?.is_empty());
+            let transition = access.seal_volume_close(preparation)?;
+            let close = Box::try_new(CleanCloseOperation::new(access.mounted_profile()))
+                .map_err(|_| DriverError::InsufficientResources)?;
+            Ok::<_, DriverError>((
+                transition,
+                access.start_clean_close(close, ext4_core::Ext4Timestamp::from_seconds(900)),
+            ))
+        })?;
+        let durability = loop {
+            close = match close {
+                CleanCloseTransition::SubmitLower { request, suspended } => {
+                    drop(binding.with_access(|access| {
+                        access.authorize_storage_submission(StorageSubmissionSource::Filesystem)
+                    })?);
+                    suspended.advance(OperationEvent::StorageCompleted(disk.complete(request)?))
+                }
+                CleanCloseTransition::Complete(result) => break result?,
+            };
+        };
+        binding.with_access(|access| access.request_mmp_close(durability))?;
+        binding.with_access(|access| {
+            let _durability = access.finish_mmp_close()?;
+            access.publish_volume_state_transition(transition)?;
+            assert!(matches!(
+                access.authorize_storage_submission(StorageSubmissionSource::Filesystem),
+                Err(DriverError::FileClosed)
+            ));
+            for kind in [RawVolumeOperationKind::Read, RawVolumeOperationKind::Write] {
+                drop(
+                    access.authorize_storage_submission(StorageSubmissionSource::RawVolume {
+                        target,
+                        kind,
+                    })?,
+                );
+            }
+            assert!(matches!(
+                access.volume_flush_scope(target)?,
+                VolumeFlushScope::RawDevice(_)
+            ));
+            if first_raw_write {
+                assert!(access.raw_locked_by(target.owner()));
+                access.dismount_raw_session(target.owner());
+            }
+            access.unlock_volume(target.owner())?;
+            assert!(matches!(
                 access.authorize_storage_submission(StorageSubmissionSource::RawVolume {
                     target,
-                    kind,
-                })?,
-            );
-        }
-        assert!(matches!(
-            access.volume_flush_scope(target)?,
-            VolumeFlushScope::RawDevice(_)
-        ));
-        access.unlock_volume(target.owner())?;
-        assert!(matches!(
-            access.authorize_storage_submission(StorageSubmissionSource::RawVolume {
-                target,
-                kind: RawVolumeOperationKind::Write,
-            }),
-            Err(DriverError::AccessDenied)
-        ));
-        Ok::<_, DriverError>(())
-    })?;
+                    kind: RawVolumeOperationKind::Write,
+                }),
+                Err(DriverError::AccessDenied)
+            ));
+            Ok::<_, DriverError>(())
+        })?;
+    }
     Ok(())
+}
+
+/// # Errors
+/// Returns fixture or lifecycle preparation failure.
+/// # Panics
+/// Fails if unhealthy media cannot terminate, physical work is mistaken for clean state,
+/// or abandonment permits a recovery/MMP write before retirement.
+#[test]
+#[expect(
+    unsafe_code,
+    reason = "the local direct-volume identity outlives its close transition"
+)]
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fallible mount setup surrounds lifecycle and submission assertions"
+)]
+fn unhealthy_sessions_drain_and_retire_without_clean_publication()
+-> crate::kernel::status::DriverResult<()> {
+    use crate::state::{StorageSubmissionSource, VolumeCloseTarget, VolumeRetirement};
+    for lost_ownership in [false, true] {
+        let mut disk = Device::fixture()?;
+        let mut native = wdk_sys::DEVICE_OBJECT {
+            SectorSize: 512,
+            Flags: wdk_sys::DO_DIRECT_IO,
+            ..wdk_sys::DEVICE_OBJECT::default()
+        };
+        let mut binding = binding(&mut disk, &mut native)?;
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        // SAFETY: The stack FILE_OBJECT remains live until the binding finishes its transition.
+        let owner = unsafe { crate::state::KernelFileObject::from_raw(&raw mut file) }
+            .ok_or(DriverError::InvalidParameter)?;
+        let activity = binding.with_access(|access| access.admit_mutation())?.1;
+        binding.with_access(|access| {
+            if lost_ownership {
+                access.fail_mmp(Error::MmpOwnershipLost);
+            } else {
+                access.record_durability_unknown();
+            }
+            assert!(access.authorize_durability().is_err());
+            let preparation = access.prepare_volume_close(VolumeCloseTarget::Dismount(owner))?;
+            let transition = access.seal_volume_close(preparation)?;
+            access.abandon_session();
+            assert!(!access.session_work_drained());
+            drop(activity);
+            assert!(access.session_work_drained());
+            assert!(access.finish_abandoned_session().is_none());
+            access.fail_volume_state_transition(transition, DriverError::VolumeDismounted);
+            assert_eq!(access.ensure_mounted(), Err(DriverError::VolumeDismounted));
+            assert!(
+                access
+                    .authorize_storage_submission(StorageSubmissionSource::Filesystem)
+                    .is_err()
+            );
+            assert_eq!(access.close_node_file_object(), VolumeRetirement::Start);
+            Ok::<_, DriverError>(())
+        })?;
+    }
+    Ok(())
+}
+
+/// # Panics
+/// Fails if a physically completed renewal resurrects abandoned media authority or
+/// authorizes a clean MMP release without filesystem-close durability.
+#[test]
+fn abandonment_joins_renewal_without_releasing_a_clean_record() {
+    let result = (|| -> Result<()> {
+        let mut device = ownership_disk(0xff4d_4d50)?;
+        let (_, _, _, lease) = device.mount()?.into_parts();
+        let lease = lease.ok_or(Error::MmpOwnershipLost)?;
+        device.millis = lease.next_update().monotonic_millis();
+        let mut owner = MediaOwnership::from_mount(Some(lease));
+        let operation = owner.next_action(device.now())?.ok_or(Error::DeviceIo)?;
+        let completion = device.ownership(operation)?;
+        owner.abandon();
+        assert_eq!(owner.authorize(device.now()), Err(DriverError::FileClosed));
+        assert!(owner.complete(completion, device.now()).is_err());
+        assert!(!owner.permits_io());
+        assert!(owner.next_action(device.now())?.is_none());
+        assert_ne!(
+            fixture_u32(&device.filesystem, OWNERSHIP_OFFSET + 4)?,
+            0xff4d_4d50
+        );
+        Ok(())
+    })();
+    assert_eq!(result, Ok(()));
 }

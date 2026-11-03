@@ -15,16 +15,17 @@ use crate::kernel::fatal::KernelWideInconsistency;
 use crate::kernel::status::DriverError;
 
 use super::{
-    CleanCloseTerminal, CleanupStart, CloseReleasePlan, ControlDeviceLifecycle, ControlDevicePhase,
-    DataTransferMode, DeviceExtensionKind, DirectoryPattern, DriverDeviceKind, FileControlBlock,
+    CleanupStart, CloseReleasePlan, ControlDeviceLifecycle, ControlDevicePhase, DataTransferMode,
+    DeviceExtensionKind, DirectoryPattern, DismountedAccess, DriverDeviceKind, FileControlBlock,
     FileControlBlockLedger, FileControlBlockOpenState, FileObjectCloseKind, HandleAdmissionState,
     HandleDeletion, KernelDevice, KernelFileObject, MountedVolumeState, NativeFileByteRange,
     NativeResidencyRecheck, NoIntermediateTransfer, OpenedDirectory, OpenedFileObject,
     OpenedHandle, OpenedLocation, OpenedNodeMode, OpenedObject, OpenedRegularFile,
     OpenedVolumeHandle, RawExtentPolicy, RawVolumeAccess, RawVolumeIoPermit,
     RawVolumeOperationKind, RawWriteOutcome, RetirementAdmission, StreamLifetimeState,
-    TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeControlBlock,
-    VolumeHandleCleanup, VolumeRetirement, select_close_release_plan, shutdown_registration_status,
+    TransferBufferAlignment, TransferSectorSize, UninitializedFileObject, VolumeCloseTarget,
+    VolumeControlBlock, VolumeHandleCleanup, VolumeRetirement, select_close_release_plan,
+    shutdown_registration_status,
 };
 
 /// # Errors
@@ -447,11 +448,12 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         return;
     };
 
-    let preparation = MountedVolumeState::Locked { owner }.prepare_dismount(owner);
+    let preparation =
+        MountedVolumeState::Locked { owner }.prepare_close(VolumeCloseTarget::Dismount(owner));
     assert_eq!(
         preparation,
         Ok(MountedVolumeState::PreparingClose {
-            terminal: CleanCloseTerminal::Dismount,
+            target: VolumeCloseTarget::Dismount(owner),
             lock_owner: Some(owner)
         })
     );
@@ -459,10 +461,10 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         return;
     };
     assert_eq!(
-        preparation.abort_close(CleanCloseTerminal::Dismount),
+        preparation.abort_close(VolumeCloseTarget::Dismount(owner)),
         Some(MountedVolumeState::Locked { owner })
     );
-    let Some(closing) = preparation.seal_close(CleanCloseTerminal::Dismount) else {
+    let Some(closing) = preparation.seal_close(VolumeCloseTarget::Dismount(owner)) else {
         return;
     };
     assert_eq!(closing.ensure_mounted(), Ok(()));
@@ -470,7 +472,7 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         closing.authorize_handle(owner),
         Err(DriverError::AccessDenied)
     );
-    let Some(dismounted) = closing.finish_close(CleanCloseTerminal::Dismount) else {
+    let Some(dismounted) = closing.finish_close(VolumeCloseTarget::Dismount(owner)) else {
         return;
     };
     assert_eq!(
@@ -491,8 +493,60 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         Err(DriverError::VolumeDismounted)
     );
     assert_eq!(
-        dismounted.prepare_dismount(owner),
+        dismounted.prepare_close(VolumeCloseTarget::Dismount(owner)),
         Err(DriverError::VolumeDismounted)
+    );
+    let Some(raw_closing) = (MountedVolumeState::Locked { owner })
+        .prepare_close(VolumeCloseTarget::RawWrite(owner))
+        .ok()
+        .and_then(|state| state.seal_close(VolumeCloseTarget::RawWrite(owner)))
+    else {
+        panic!("raw write preparation failed");
+    };
+    let Some(raw_locked) = raw_closing.finish_close(VolumeCloseTarget::RawWrite(owner)) else {
+        panic!("raw write close failed");
+    };
+    assert_eq!(
+        raw_locked.authorize_raw(owner, RawVolumeOperationKind::Write),
+        Ok(())
+    );
+    assert_eq!(
+        raw_locked.authorize_handle(owner),
+        Err(DriverError::VolumeDismounted)
+    );
+    assert_eq!(raw_locked.dismount_raw(owner), Some(dismounted));
+    assert_eq!(
+        raw_locked.unlock(owner),
+        Ok(MountedVolumeState::Dismounted {
+            access: DismountedAccess::Released
+        })
+    );
+    let Some(unlocked_close) = MountedVolumeState::Mounted
+        .prepare_close(VolumeCloseTarget::Dismount(owner))
+        .ok()
+        .and_then(|state| state.seal_close(VolumeCloseTarget::Dismount(owner)))
+    else {
+        panic!("unlocked close failed");
+    };
+    let Some(unlocked) = unlocked_close.finish_close(VolumeCloseTarget::Dismount(owner)) else {
+        panic!("unlocked dismount failed");
+    };
+    assert_eq!(
+        unlocked.authorize_raw(owner, RawVolumeOperationKind::Write),
+        Ok(())
+    );
+    assert_eq!(
+        unlocked.authorize_raw(competing, RawVolumeOperationKind::Write),
+        Err(DriverError::AccessDenied)
+    );
+    assert_eq!(
+        unlocked.cleanup(owner),
+        (
+            MountedVolumeState::Dismounted {
+                access: DismountedAccess::Released
+            },
+            VolumeHandleCleanup::DirectAccessReleased
+        )
     );
     assert_eq!(dismounted.unlock(competing), Err(DriverError::NotLocked));
     assert_eq!(
@@ -502,7 +556,9 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
     assert_eq!(
         dismounted.cleanup(owner),
         (
-            MountedVolumeState::Dismounted { lock_owner: None },
+            MountedVolumeState::Dismounted {
+                access: DismountedAccess::Released
+            },
             VolumeHandleCleanup::Unlocked
         )
     );
@@ -512,40 +568,38 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
 /// Panics if failed close resurrects admission or prevents unreferenced physical retirement.
 #[test]
 fn failed_volume_close_remains_terminal_and_retires_after_last_reference() {
-    for terminal in [CleanCloseTerminal::Dismount, CleanCloseTerminal::Shutdown] {
-        let closing = MountedVolumeState::Closing {
-            terminal,
-            lock_owner: None,
-        };
-        let failed = closing.fail_close(terminal, DriverError::InsufficientResources);
-        let expected = MountedVolumeState::CloseFailed {
-            terminal,
-            lock_owner: None,
-            error: DriverError::InsufficientResources,
-        };
-        assert_eq!(failed, Some(expected));
-        assert_eq!(
-            expected.ensure_mounted(),
-            Err(DriverError::VolumeDismounted)
-        );
-        assert_eq!(
-            expected.authorize_create(),
-            Err(DriverError::VolumeDismounted)
-        );
-        assert_eq!(expected.finish_close(terminal), None);
-        assert_eq!(
-            expected.retire_if_unreferenced(false, 0),
-            (expected, VolumeRetirement::Retained)
-        );
-        assert_eq!(
-            expected.retire_if_unreferenced(true, 1),
-            (expected, VolumeRetirement::Retained)
-        );
-        assert_eq!(
-            expected.retire_if_unreferenced(true, 0),
-            (MountedVolumeState::Retiring, VolumeRetirement::Start)
-        );
-    }
+    let target = VolumeCloseTarget::Shutdown;
+    let closing = MountedVolumeState::Closing {
+        target,
+        lock_owner: None,
+    };
+    let failed = closing.fail_close(target, DriverError::InsufficientResources);
+    let expected = MountedVolumeState::CloseFailed {
+        lock_owner: None,
+        error: DriverError::InsufficientResources,
+    };
+    assert_eq!(failed, Some(expected));
+    assert_eq!(
+        expected.ensure_mounted(),
+        Err(DriverError::VolumeDismounted)
+    );
+    assert_eq!(
+        expected.authorize_create(),
+        Err(DriverError::VolumeDismounted)
+    );
+    assert_eq!(expected.finish_close(target), None);
+    assert_eq!(
+        expected.retire_if_unreferenced(false, 0),
+        (expected, VolumeRetirement::Retained)
+    );
+    assert_eq!(
+        expected.retire_if_unreferenced(true, 1),
+        (expected, VolumeRetirement::Retained)
+    );
+    assert_eq!(
+        expected.retire_if_unreferenced(true, 0),
+        (MountedVolumeState::Retiring, VolumeRetirement::Start)
+    );
 }
 
 /// # Panics
@@ -553,7 +607,9 @@ fn failed_volume_close_remains_terminal_and_retires_after_last_reference() {
 /// Panics when physical retirement starts before every FILE_OBJECT is gone.
 #[test]
 fn dismounted_volume_retires_only_after_all_file_objects_close() {
-    let dismounted = MountedVolumeState::Dismounted { lock_owner: None };
+    let dismounted = MountedVolumeState::Dismounted {
+        access: DismountedAccess::Released,
+    };
     assert_eq!(
         dismounted.retire_if_unreferenced(false, 0),
         (dismounted, VolumeRetirement::Retained)

@@ -710,10 +710,11 @@ impl MountedVolumeDevice {
         Self::with_vpb(device, |publication| publication.publish_lock(locked));
     }
 
-    /// Withdraws remount routing after durable dismount; a retained raw-volume lock delays the
-    /// replacement until its owner explicitly unlocks or is cleaned up.
-    pub(crate) fn publish_dismount(device: KernelDevice) {
-        Self::with_vpb(device, MountedVpb::publish_dismount);
+    /// Projects ended-session direct access or remount routing after journal sharing ends.
+    pub(crate) fn publish_session_end(device: KernelDevice, routing: SessionEndRouting) {
+        Self::with_vpb(device, |publication| {
+            publication.publish_session_end(routing)
+        });
     }
 
     /// Encloses a publication borrow within the caller's live mounted-device operation.
@@ -833,7 +834,7 @@ impl MountedVolumeDevice {
         }
     }
 
-    /// Notifies FsRtl that this lower storage volume completed a dismount request.
+    /// Reports the exact dismount outcome without equating logical termination and clean durability.
     /// # Errors
     ///
     /// Stops the system if the mounted device has lost its VPB/real-device association.
@@ -841,7 +842,7 @@ impl MountedVolumeDevice {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    pub(crate) fn complete_dismount(device: KernelDevice) {
+    pub(crate) fn complete_dismount(device: KernelDevice, status: wdk_sys::NTSTATUS) {
         let real_device = VpbSpinLock::with_mounted(device, |vpb| unsafe {
             // SAFETY: The locked VPB retains its associated real device during this operation.
             KernelDevice::from_raw(vpb.RealDevice).ok_or(DriverError::InvalidParameter)
@@ -852,10 +853,10 @@ impl MountedVolumeDevice {
         unsafe {
             // SAFETY: The VPB identified this live lower storage device and logical dismount
             // completed successfully before this notification.
-            ffi::FsRtlDismountComplete(real_device.as_ptr(), STATUS_SUCCESS);
+            ffi::FsRtlDismountComplete(real_device.as_ptr(), status);
         }
         #[cfg(test)]
-        let _real_device = real_device;
+        let _native_arguments = (real_device, status);
     }
 }
 
@@ -944,8 +945,8 @@ impl Drop for PoolVpb {
 enum VpbPublication {
     /// The lower device still routes new opens to this mount.
     Mounted(PoolVpb),
-    /// Durable dismount retains raw-write exclusion until its lock owner releases it.
-    LockedDismount(PoolVpb),
+    /// The ended session retains direct-access or failed-lock exclusion until owner release.
+    Excluded(PoolVpb),
     /// The I/O Manager owns a successor; this mount retains only its original VPB reference.
     Withdrawn,
 }
@@ -1018,7 +1019,7 @@ impl MountedVpb {
         })
     }
 
-    /// Publishes the native lock projection; releasing a dismounted lock also publishes remount routing.
+    /// Releases an explicit lock or ended-session direct owner and publishes fresh remount routing.
     #[expect(
         unsafe_code,
         reason = "the global VPB lock serializes this interior state and the corresponding native flags"
@@ -1028,12 +1029,12 @@ impl MountedVpb {
             if locked {
                 vpb.Flags |= vpb_flag(wdk_sys::VPB_LOCKED);
             } else {
-                vpb.Flags &= !vpb_flag(wdk_sys::VPB_LOCKED);
+                vpb.Flags &= !vpb_flag(wdk_sys::VPB_LOCKED | wdk_sys::VPB_DIRECT_WRITES_ALLOWED);
                 let publication = unsafe {
                     // SAFETY: with_mounted holds the global lock, the sole mutation authority.
                     &mut *self.publication.get()
                 };
-                if matches!(publication, VpbPublication::LockedDismount(_)) {
+                if matches!(publication, VpbPublication::Excluded(_)) {
                     Self::withdraw_locked(vpb, publication);
                 }
             }
@@ -1041,12 +1042,12 @@ impl MountedVpb {
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
-    /// Makes the durable endpoint writable by its retained raw owner and admits remount only without a lock.
+    /// Direct access retains routing even without a volume lock; failure grants no media writes.
     #[expect(
         unsafe_code,
-        reason = "the actor's one-way durable dismount publishes replacement ownership under the VPB lock"
+        reason = "the actor projects ended-session routing under the VPB lock"
     )]
-    fn publish_dismount(&self) {
+    fn publish_session_end(&self, routing: SessionEndRouting) {
         VpbSpinLock::with_mounted(self.device, |vpb| {
             let publication = unsafe {
                 // SAFETY: The global lock excludes every access to this interior publication state.
@@ -1057,11 +1058,13 @@ impl MountedVpb {
             else {
                 KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
             };
-            vpb.Flags |= vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED);
-            if vpb.Flags & vpb_flag(wdk_sys::VPB_LOCKED) != 0 {
-                *publication = VpbPublication::LockedDismount(replacement);
+            if routing == SessionEndRouting::DirectAccess {
+                vpb.Flags |= vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED);
             } else {
-                *publication = VpbPublication::Mounted(replacement);
+                vpb.Flags &= !vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED);
+            }
+            *publication = VpbPublication::Excluded(replacement);
+            if routing == SessionEndRouting::Remount {
                 Self::withdraw_locked(vpb, publication);
             }
         })
@@ -1076,7 +1079,7 @@ impl MountedVpb {
     )]
     fn withdraw_locked(vpb: &mut wdk_sys::VPB, publication: &mut VpbPublication) {
         let replacement = match core::mem::replace(publication, VpbPublication::Withdrawn) {
-            VpbPublication::Mounted(replacement) | VpbPublication::LockedDismount(replacement) => {
+            VpbPublication::Mounted(replacement) | VpbPublication::Excluded(replacement) => {
                 replacement
             }
             VpbPublication::Withdrawn => return,
@@ -1424,7 +1427,7 @@ mod tests {
         assert_eq!(association.confirmed(), Ok(()));
         let (stale, query) = MountedVolumeDevice::prepare_storage_verification(device)?;
         drop(query);
-        publication.publish_dismount();
+        publication.publish_session_end(SessionEndRouting::Remount);
         fixture.real.Flags |= wdk_sys::DO_VERIFY_VOLUME;
         assert_eq!(stale.confirmed(), Err(DriverError::WrongVolume));
         assert_eq!(fixture.real.Flags, wdk_sys::DO_VERIFY_VOLUME | 0x4000);
@@ -1632,7 +1635,7 @@ mod tests {
         );
         assert_eq!(mismatched.Vpb, core::ptr::from_mut(&mut foreign));
 
-        publication.publish_dismount();
+        publication.publish_session_end(SessionEndRouting::Remount);
         assert_ne!(fixture.real.Vpb, original);
         assert_eq!(first.Vpb, original);
         assert_eq!(second.Vpb, original);
@@ -1680,7 +1683,7 @@ mod tests {
             Ext4VolumeLabel::new(b"Z")?,
         )?;
         label.publish();
-        publication.publish_dismount();
+        publication.publish_session_end(SessionEndRouting::Remount);
         assert_ne!(fixture.real.Vpb, original);
         fixture.original(|vpb| {
             assert_eq!(vpb.DeviceObject, original_device.as_ptr());
@@ -1745,27 +1748,30 @@ mod tests {
         clippy::panic_in_result_fn,
         reason = "fallible setup and retirement surround lock/remount assertions"
     )]
-    fn dismounted_raw_lock_retains_routing_until_owner_unlocks() -> DriverResult<()> {
-        let mut fixture = VpbFixture::new()?;
-        let publication = fixture.publish()?;
-        let original = fixture.real.Vpb;
-        publication.publish_lock(true);
-        publication.publish_dismount();
-        assert_eq!(fixture.real.Vpb, original);
-        fixture.original(|vpb| {
-            assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_LOCKED), 0);
-            assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED), 0);
-        })?;
-        publication.publish_lock(false);
-        assert_ne!(fixture.real.Vpb, original);
-        fixture.original(|vpb| assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_LOCKED), 0))?;
-        drop(
-            publication
-                .begin_retirement()
-                .try_finish()
-                .map_err(|_| DriverError::DeviceBusy)?,
-        );
-        fixture.finish()
+    fn direct_access_excludes_remount_until_owner_release() -> DriverResult<()> {
+        for locked in [false, true] {
+            let mut fixture = VpbFixture::new()?;
+            let publication = fixture.publish()?;
+            let original = fixture.real.Vpb;
+            publication.publish_lock(locked);
+            publication.publish_session_end(SessionEndRouting::DirectAccess);
+            assert_eq!(fixture.real.Vpb, original);
+            fixture.original(|vpb| {
+                assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_LOCKED) != 0, locked);
+                assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_DIRECT_WRITES_ALLOWED), 0);
+            })?;
+            publication.publish_lock(false);
+            assert_ne!(fixture.real.Vpb, original);
+            fixture.original(|vpb| assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_LOCKED), 0))?;
+            drop(
+                publication
+                    .begin_retirement()
+                    .try_finish()
+                    .map_err(|_| DriverError::DeviceBusy)?,
+            );
+            fixture.finish()?;
+        }
+        Ok(())
     }
 
     /// # Errors
