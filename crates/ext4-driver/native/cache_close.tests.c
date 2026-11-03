@@ -13,6 +13,7 @@
 #define NT_SUCCESS(status) ((status) >= 0)
 
 typedef int NTSTATUS;
+typedef void VOID;
 typedef unsigned char BOOLEAN;
 typedef unsigned ULONG;
 typedef unsigned long long ULONG_PTR;
@@ -53,17 +54,11 @@ static void CcFlushCache(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *offse
     status->Status = flush_status;
     if (NT_SUCCESS(flush_status)) { sections->dirty = 0; }
 }
-static void CcCoherencyFlushAndPurgeCache(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *offset,
-    ULONG length, IO_STATUS_BLOCK *status, ULONG flags)
+static BOOLEAN CcPurgeCacheSection(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *offset,
+    ULONG length, BOOLEAN uninitialize)
 {
-    assert(offset == NULL && length == 0 && flags == 0);
+    assert(offset == NULL && length == 0 && uninitialize == FALSE);
     purge_calls++;
-    status->Status = flush_status;
-    if (flush_status == STATUS_SUCCESS) { sections->dirty = 0; }
-}
-static int MmCanFileBeTruncated(PSECTION_OBJECT_POINTERS sections, LARGE_INTEGER *size)
-{
-    assert(size->QuadPart == 0);
     return !sections->mapped;
 }
 #include "cache_close.h"
@@ -78,13 +73,13 @@ int main(void)
         assert(purge_calls == 1 && sections.dirty == 0);
         sections.dirty = 1;
         sections.mapped = 1;
-        assert(ext4win_cache_close_writeback(&sections) == STATUS_USER_MAPPED_FILE);
+        assert(ext4win_cache_close_writeback(&sections) == STATUS_SUCCESS);
         assert(sections.dirty == 0);
-        sections.mapped = 0;
-        flush_status = STATUS_CACHE_PAGE_LOCKED;
-        assert(ext4win_cache_close_writeback(&sections) == STATUS_USER_MAPPED_FILE);
+        assert(sections.mapped == 1 && purge_calls == 2);
         flush_status = STATUS_UNSUCCESSFUL;
+        sections.dirty = 1;
         assert(ext4win_cache_close_writeback(&sections) == STATUS_UNSUCCESSFUL);
+        assert(sections.dirty == 1 && sections.mapped == 1 && purge_calls == 2);
     }
     {
         SECTION_OBJECT_POINTERS streams[] = {
@@ -97,7 +92,7 @@ int main(void)
             assert(ext4win_cache_flush(&streams[index]) == STATUS_SUCCESS);
             assert(streams[index].dirty == 0);
         }
-        assert(streams[0].mapped == 1 && flush_calls == 2 && purge_calls == purges_before);
+        assert(streams[0].mapped == 1 && flush_calls == 5 && purge_calls == purges_before);
         flush_status = STATUS_UNSUCCESSFUL;
         streams[0].dirty = 1;
         assert(ext4win_cache_flush(&streams[0]) == STATUS_UNSUCCESSFUL);

@@ -823,8 +823,8 @@ ext4win_stream_cache_flush(_In_ PVOID stream_header)
     return status;
 }
 
-/* Native close flush preserves active FILE_OBJECT cache maps. A remaining mapped view or
- * pinned page prevents clean-close publication; cleanup may still release that residency. */
+/* Native close flush preserves active FILE_OBJECT cache maps. Remaining views retain
+ * their residency after logical dismount; subsequent paging admission is sealed. */
 _IRQL_requires_(PASSIVE_LEVEL)
 _Must_inspect_result_
 NTSTATUS NTAPI
