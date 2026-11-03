@@ -109,32 +109,15 @@ pub(super) enum MountedVolumeState {
     Retiring,
 }
 
-/// Terminal publication selected before the volume enters one-way `Closing`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum CleanCloseTerminal {
-    /// Publish logical dismount and begin ordinary mounted-device retirement rules.
-    Dismount,
-    /// Publish shutdown completion without claiming physical device retirement.
-    Shutdown,
-}
-
 /// The admitted requester distinguishes a direct-volume dismount from system shutdown.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum VolumeCloseTarget {
     /// The original IRP retains the exact direct-volume FILE_OBJECT.
     Dismount(KernelFileObject),
+    /// The first raw write consumes the locked filesystem session before media access.
+    RawWrite(KernelFileObject),
     /// System shutdown carries no user handle authority.
     Shutdown,
-}
-
-impl VolumeCloseTarget {
-    /// Endpoint selected by this admitted requester.
-    pub(crate) const fn terminal(self) -> CleanCloseTerminal {
-        match self {
-            Self::Dismount(_) => CleanCloseTerminal::Dismount,
-            Self::Shutdown => CleanCloseTerminal::Shutdown,
-        }
-    }
 }
 
 /// Retained issuer identity; each physical submission independently revalidates its permission.
