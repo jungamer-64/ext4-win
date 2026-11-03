@@ -861,13 +861,19 @@ fn dismount_filesystem(session: &mut Session<LiveState>) -> TaskResult<()> {
         }
         return Ok(());
     }
+    println!("live dismount: validate storage identity");
     let identity = storage::validate(&scope(session)?)?;
+    println!("live dismount: find volume by partition identity");
     let observed = windows_host::find_volume(&identity)?;
     let matched = observed.is_some();
+    println!("live dismount: volume identity matched={matched}");
     let Some(volume) = observed.or_else(|| session.state().volume().map(str::to_owned)) else {
         return Ok(());
     };
-    match windows_host::mount_state(&volume)? {
+    println!("live dismount: query mounted state");
+    let mounted = windows_host::mount_state(&volume)?;
+    println!("live dismount: mounted state={mounted:?}");
+    match mounted {
         windows_host::MountState::Mounted => {
             if !matched {
                 return Err(io::Error::other(
