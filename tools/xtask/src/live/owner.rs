@@ -1029,7 +1029,13 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         .open(mount.join("live-ci/alpha.bin"))?;
     let remount = (|| -> TaskResult<()> {
         dismount_filesystem(session)?;
-        if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
+        println!("live remount: read through a fresh open while the old handle remains");
+        let readback = fs::read(mount.join("live-ci/alpha.bin"));
+        match &readback {
+            Ok(_) => println!("live remount: fresh-open read completed"),
+            Err(error) => println!("live remount: fresh-open read failed: {error}"),
+        }
+        if readback? != payload {
             return Err(io::Error::other(
                 "fresh mount while an old FILE_OBJECT remains lost durable content",
             )
@@ -1037,7 +1043,9 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         }
         Ok(())
     })();
+    println!("live remount: close the retained old handle");
     let released = windows_host::close_file(retained).map_err(Into::into);
+    println!("live remount: old-handle close result={released:?}");
     combine_verification_and_cleanup(remount, released)?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
