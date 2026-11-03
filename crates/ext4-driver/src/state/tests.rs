@@ -424,6 +424,8 @@ fn mounted_volume_lock_policy_is_owned_by_one_file_object() {
     assert_eq!(locked.unlock(owner), Ok(MountedVolumeState::Mounted));
 }
 
+/// # Errors
+/// Returns invalid fixture identity or a missing required lifecycle transition.
 /// # Panics
 ///
 /// Panics when logical dismount can be reversed or loses its retained lock owner.
@@ -432,21 +434,23 @@ fn mounted_volume_lock_policy_is_owned_by_one_file_object() {
     unsafe_code,
     reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
 )]
-fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "fallible lifecycle setup surrounds policy assertions"
+)]
+fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() -> Result<(), DriverError> {
     let mut owner_file = wdk_sys::FILE_OBJECT::default();
     let mut competing_file = wdk_sys::FILE_OBJECT::default();
-    let Some(owner) = (unsafe {
+    let owner = (unsafe {
         // SAFETY: The stack-local owner FILE_OBJECT remains live throughout this test.
         KernelFileObject::from_raw(core::ptr::addr_of_mut!(owner_file))
-    }) else {
-        return;
-    };
-    let Some(competing) = (unsafe {
+    })
+    .ok_or(DriverError::InvalidParameter)?;
+    let competing = (unsafe {
         // SAFETY: The stack-local competing FILE_OBJECT remains live throughout this test.
         KernelFileObject::from_raw(core::ptr::addr_of_mut!(competing_file))
-    }) else {
-        return;
-    };
+    })
+    .ok_or(DriverError::InvalidParameter)?;
 
     let preparation =
         MountedVolumeState::Locked { owner }.prepare_close(VolumeCloseTarget::Dismount(owner));
@@ -457,24 +461,22 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
             lock_owner: Some(owner)
         })
     );
-    let Ok(preparation) = preparation else {
-        return;
-    };
+    let preparation = preparation?;
     assert_eq!(
         preparation.abort_close(VolumeCloseTarget::Dismount(owner)),
         Some(MountedVolumeState::Locked { owner })
     );
-    let Some(closing) = preparation.seal_close(VolumeCloseTarget::Dismount(owner)) else {
-        return;
-    };
+    let closing = preparation
+        .seal_close(VolumeCloseTarget::Dismount(owner))
+        .ok_or(DriverError::InternalInvariantViolation)?;
     assert_eq!(closing.ensure_mounted(), Ok(()));
     assert_eq!(
         closing.authorize_handle(owner),
         Err(DriverError::AccessDenied)
     );
-    let Some(dismounted) = closing.finish_close(VolumeCloseTarget::Dismount(owner)) else {
-        return;
-    };
+    let dismounted = closing
+        .finish_close(VolumeCloseTarget::Dismount(owner))
+        .ok_or(DriverError::InternalInvariantViolation)?;
     assert_eq!(
         closing.authorize_raw(owner, RawVolumeOperationKind::Write),
         Err(DriverError::AccessDenied)
@@ -496,16 +498,13 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
         dismounted.prepare_close(VolumeCloseTarget::Dismount(owner)),
         Err(DriverError::VolumeDismounted)
     );
-    let Some(raw_closing) = (MountedVolumeState::Locked { owner })
-        .prepare_close(VolumeCloseTarget::RawWrite(owner))
-        .ok()
-        .and_then(|state| state.seal_close(VolumeCloseTarget::RawWrite(owner)))
-    else {
-        panic!("raw write preparation failed");
-    };
-    let Some(raw_locked) = raw_closing.finish_close(VolumeCloseTarget::RawWrite(owner)) else {
-        panic!("raw write close failed");
-    };
+    let raw_closing = (MountedVolumeState::Locked { owner })
+        .prepare_close(VolumeCloseTarget::RawWrite(owner))?
+        .seal_close(VolumeCloseTarget::RawWrite(owner))
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    let raw_locked = raw_closing
+        .finish_close(VolumeCloseTarget::RawWrite(owner))
+        .ok_or(DriverError::InternalInvariantViolation)?;
     assert_eq!(
         raw_locked.authorize_raw(owner, RawVolumeOperationKind::Write),
         Ok(())
@@ -521,16 +520,13 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
             access: DismountedAccess::Released
         })
     );
-    let Some(unlocked_close) = MountedVolumeState::Mounted
-        .prepare_close(VolumeCloseTarget::Dismount(owner))
-        .ok()
-        .and_then(|state| state.seal_close(VolumeCloseTarget::Dismount(owner)))
-    else {
-        panic!("unlocked close failed");
-    };
-    let Some(unlocked) = unlocked_close.finish_close(VolumeCloseTarget::Dismount(owner)) else {
-        panic!("unlocked dismount failed");
-    };
+    let unlocked_close = MountedVolumeState::Mounted
+        .prepare_close(VolumeCloseTarget::Dismount(owner))?
+        .seal_close(VolumeCloseTarget::Dismount(owner))
+        .ok_or(DriverError::InternalInvariantViolation)?;
+    let unlocked = unlocked_close
+        .finish_close(VolumeCloseTarget::Dismount(owner))
+        .ok_or(DriverError::InternalInvariantViolation)?;
     assert_eq!(
         unlocked.authorize_raw(owner, RawVolumeOperationKind::Write),
         Ok(())
@@ -562,6 +558,7 @@ fn mounted_volume_dismount_is_terminal_and_cleanup_can_release_lock() {
             VolumeHandleCleanup::Unlocked
         )
     );
+    Ok(())
 }
 
 /// # Panics

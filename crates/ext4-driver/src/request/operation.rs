@@ -1644,6 +1644,17 @@ impl RawVolumeOperation {
         }
     }
 
+    /// Session termination borrows the identity already sealed in the prepared transfer.
+    fn prepared_target(&self) -> RawVolumeTarget {
+        match &self.state {
+            RawVolumeOperationState::Prepared(prepared) => prepared.target(),
+            _ => {
+                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
+            }
+        }
+    }
+
     /// Submits an already allocated transfer after its required session handoff.
     fn submit_prepared(mut self: Box<Self>, owned: OwnedIrp) -> OperationTransition {
         let RawVolumeOperationState::Prepared(prepared) =
@@ -1764,7 +1775,7 @@ impl MountedVolumeOperation for RawVolumeOperation {
                         && access.raw_write_requires_close(target.owner());
                     self.state = RawVolumeOperationState::Prepared(prepared);
                     if close {
-                        volume_close::before_raw_write(owned, self, target, access)
+                        volume_close::before_raw_write(owned, self, access)
                     } else {
                         self.submit_prepared(owned)
                     }

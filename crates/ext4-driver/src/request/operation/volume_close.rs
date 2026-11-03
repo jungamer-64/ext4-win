@@ -22,10 +22,7 @@ enum CloseRequester {
     /// Shutdown carries no user-mode dismount notification protocol.
     Shutdown,
     /// The prepared raw transfer resumes only after filesystem and MMP writes end.
-    RawWrite {
-        target: RawVolumeTarget,
-        resume: Box<RawVolumeOperation>,
-    },
+    RawWrite(Box<RawVolumeOperation>),
     /// Target validation succeeded, but no attempt notification has been issued.
     DismountUnannounced(KernelFileObject),
     /// Failed completion must pair the issued attempt with DISMOUNT_FAILED.
@@ -37,7 +34,7 @@ impl CloseRequester {
     fn target(&self) -> VolumeCloseTarget {
         match self {
             Self::Shutdown => VolumeCloseTarget::Shutdown,
-            Self::RawWrite { target, .. } => VolumeCloseTarget::RawWrite(target.owner()),
+            Self::RawWrite(resume) => VolumeCloseTarget::RawWrite(resume.prepared_target().owner()),
             Self::DismountUnannounced(file) | Self::DismountAnnounced(file) => {
                 VolumeCloseTarget::Dismount(*file)
             }
@@ -64,7 +61,7 @@ impl CloseRequester {
                 *file,
                 crate::kernel::volume_event::VolumeEvent::DismountFailed,
             )),
-            Self::Shutdown | Self::RawWrite { .. } | Self::DismountUnannounced(_) => None,
+            Self::Shutdown | Self::RawWrite(_) | Self::DismountUnannounced(_) => None,
         }
     }
 }
@@ -212,19 +209,13 @@ fn prepare_close(
 pub(super) fn before_raw_write(
     mut owned: OwnedIrp,
     resume: Box<RawVolumeOperation>,
-    target: RawVolumeTarget,
     access: &mut MountedVolumeAccess<'_>,
 ) -> OperationTransition {
     let device = match owned.request().with_active(|active| Ok(active.device())) {
         Ok(device) => device,
         Err(error) => return OperationTransition::Complete(owned.prepare_result(Err(error))),
     };
-    match prepare_close(
-        owned,
-        CloseRequester::RawWrite { target, resume },
-        device,
-        access,
-    ) {
+    match prepare_close(owned, CloseRequester::RawWrite(resume), device, access) {
         Ok(operation) => {
             operation.advance_mounted(CompletionEvent::Core(OperationEvent::Admitted), access)
         }
@@ -303,7 +294,7 @@ impl VolumeCloseOperation {
             .operational_trace()
             .record_result(OperationalPath::VolumeClose, &result);
         if result.is_ok()
-            && let CloseRequester::RawWrite { resume, .. } = self.requester
+            && let CloseRequester::RawWrite(resume) = self.requester
         {
             return resume.submit_prepared(owned);
         }
@@ -523,7 +514,7 @@ impl MountedVolumeOperation for VolumeCloseOperation {
                             suspended: self,
                         }
                     }
-                    CloseRequester::Shutdown | CloseRequester::RawWrite { .. } => self.drain(owned, preparation, close),
+                    CloseRequester::Shutdown | CloseRequester::RawWrite(_) => self.drain(owned, preparation, close),
                     CloseRequester::DismountAnnounced(_) => crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
                 }
             }
