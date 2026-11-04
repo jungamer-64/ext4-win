@@ -22,6 +22,32 @@ const FATAL_BUGCHECK_ALLOWLIST: &[&str] =
 /// Release boundary whose complete reachable graph must remain allocation-free after durability.
 const DURABLE_PUBLISH_ROOT: &str = "<ext4win::state::volume::MountedVolumeAccess>::publish_durable";
 
+/// Mutation phases whose preparation scratch is exclusive within one executor turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MutationExecutionPhase {
+    /// Concrete event integration without mutation preparation.
+    Event,
+    /// Read-only resolution against one retained epoch.
+    Resolve,
+    /// Intent revalidation and publication-resource admission.
+    Reserve,
+    /// Commit serialization under the consumed commit grant.
+    Commit,
+}
+
+impl MutationExecutionPhase {
+    /// Identifies independently framed continuations in the emitted driver.
+    fn from_display(display: &str) -> Option<Self> {
+        match display.strip_prefix("<ext4win::request::operation::MutationRequestOperation>::")? {
+            "advance_event" => Some(Self::Event),
+            "advance_resolution" | "resolve_event" => Some(Self::Resolve),
+            "reserve_mutation" => Some(Self::Reserve),
+            "prepare_commit" => Some(Self::Commit),
+            _ => None,
+        }
+    }
+}
+
 /// Required active top-level IRP cancellation callback.
 const ACTIVE_CANCEL_CALLBACK: &str = "ext4win::irp::cancel::active_irp_cancelled";
 
@@ -1540,23 +1566,33 @@ impl IrModule {
     fn audit_release_contracts(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
         self.audit_lower_submission(violations);
         self.audit_lower_completion_returns(violations);
-        self.audit_mount_stack(violations)?;
+        self.audit_operation_stack(violations)?;
         self.audit_nonallocating_callbacks(violations)?;
         self.audit_durable_publication(violations)
     }
 
-    /// Mount phases must return to their executor rather than accumulate kernel stack frames.
+    /// Operation phases must return to their executor rather than accumulate kernel stack frames.
     /// This checks direct recursion in emitted code; unrelated library recursion and indirect
-    /// callback reachability do not imply recursive mount execution.
+    /// callback reachability do not imply recursive operation execution.
     ///
     /// # Errors
     ///
     /// Returns an invalid-IR error if a direct call names a missing function.
-    fn audit_mount_stack(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
+    fn audit_operation_stack(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
         for (root, function) in &self.functions {
-            if !function
-                .display
-                .starts_with("<ext4_core::volume::mount::MountOperation>::")
+            let display = function.display.as_str();
+            let mutation_phase = MutationExecutionPhase::from_display(display);
+            if !(display.starts_with("<ext4_core::volume::mount::MountOperation>::")
+                || display.starts_with(
+                    "<ext4win::request::operation::directory::DirectoryRequestOperation>::",
+                )
+                || display.starts_with(
+                    "<ext4win::request::operation::directory::DirectoryRequestOperation as ext4win::irp::reactor::MountedVolumeOperation>::",
+                )
+                || display.starts_with(
+                    "<ext4win::request::operation::directory::DirectoryRequestOperation as ext4win::irp::reactor::CompletionOperation>::",
+                )
+                || mutation_phase.is_some())
             {
                 continue;
             }
@@ -1567,14 +1603,33 @@ impl IrModule {
             let mut queue = VecDeque::from([root.clone()]);
             'search: while let Some(caller) = queue.pop_front() {
                 let node = self.functions.get(&caller).ok_or_else(|| {
-                    GateError::InvalidIr(format!("mount stack audit function {caller} is absent"))
+                    GateError::InvalidIr(format!(
+                        "operation stack audit function {caller} is absent"
+                    ))
                 })?;
                 for callee in &node.direct_calls {
                     if callee == root {
                         let mut path = display_path(&caller, &predecessors, &self.functions)?;
                         path.push(function.display.clone());
                         violations.push(Violation {
-                            category: "recursive mount execution",
+                            category: "recursive operation execution",
+                            path,
+                        });
+                        break 'search;
+                    }
+                    if let Some(phase) = mutation_phase
+                        && self.functions.get(callee).is_some_and(|function| {
+                            MutationExecutionPhase::from_display(&function.display)
+                                .is_some_and(|callee_phase| callee_phase != phase)
+                        })
+                    {
+                        let mut path = display_path(&caller, &predecessors, &self.functions)?;
+                        let callee = self.functions.get(callee).ok_or_else(|| {
+                            GateError::InvalidIr("mutation execution phase is absent".into())
+                        })?;
+                        path.push(callee.display.clone());
+                        violations.push(Violation {
+                            category: "nested mutation execution phases",
                             path,
                         });
                         break 'search;
@@ -2939,67 +2994,97 @@ mod tests {
         )
     }
 
-    /// Emitted mount execution cannot reenter itself directly, through another phase, or an alias.
+    /// Emitted operation execution cannot reenter itself directly, through another phase, or an alias.
     ///
     /// # Errors
     ///
     /// Returns an error if a recursive fixture is accepted or its cycle cannot be reconstructed.
     #[test]
-    fn mount_stack_rejects_recursive_execution() -> Result<(), GateError> {
-        for (target, helpers) in [
-            ("mount", ""),
+    fn operation_stack_rejects_recursive_execution() -> Result<(), GateError> {
+        for (display, target, helpers) in [
             (
-                "phase",
-                "define internal void @phase() {\n  call void @mount()\n  ret void\n}\n",
+                "<ext4_core::volume::mount::MountOperation>::advance",
+                "operation",
+                "",
             ),
             (
+                "<ext4win::request::operation::directory::DirectoryRequestOperation as ext4win::irp::reactor::MountedVolumeOperation>::advance_mounted",
+                "phase",
+                "define internal void @phase() {\n  call void @operation()\n  ret void\n}\n",
+            ),
+            (
+                "<ext4win::request::operation::MutationRequestOperation>::prepare_commit",
                 "alias",
                 "@alias = internal alias void (), ptr @phase\n\
-                 define internal void @phase() {\n  call void @mount()\n  ret void\n}\n",
+                 define internal void @phase() {\n  call void @operation()\n  ret void\n}\n",
             ),
         ] {
             let fixture = format!(
-                "define void @DriverEntry() {{\n  call void @mount()\n  ret void\n}}\n\
-                 ; <ext4_core::volume::mount::MountOperation>::advance\n\
-                 define internal void @mount() {{\n  call void @{target}()\n  ret void\n}}\n\
+                "define void @DriverEntry() {{\n  call void @operation()\n  ret void\n}}\n\
+                 ; {display}\n\
+                 define internal void @operation() {{\n  call void @{target}()\n  ret void\n}}\n\
                  {helpers}"
             );
             let module = IrModule::parse(&fixture)?;
             let mut violations = Vec::new();
-            module.audit_mount_stack(&mut violations)?;
+            module.audit_operation_stack(&mut violations)?;
             require(
                 violations.len() == 1
                     && violations.first().is_some_and(|violation| {
-                        violation.category == "recursive mount execution"
+                        violation.category == "recursive operation execution"
                             && violation.path.len() >= 2
                             && violation.path.first() == violation.path.last()
                     }),
-                "mount recursion did not report its complete cycle",
+                "operation recursion did not report its complete cycle",
             )?;
         }
         Ok(())
     }
 
-    /// Internal control-flow loops and recursive callees do not nest mount execution.
+    /// Internal control-flow loops and recursive callees do not nest operation execution.
     ///
     /// # Errors
     ///
     /// Returns an error if iteration or independent library recursion is rejected.
     #[test]
-    fn mount_stack_accepts_iteration_and_library_recursion() -> Result<(), GateError> {
+    fn operation_stack_accepts_iteration_and_library_recursion() -> Result<(), GateError> {
         let module = IrModule::parse(
-            "define void @DriverEntry() {\n  call void @mount()\n  ret void\n}\n\
-             ; <ext4_core::volume::mount::MountOperation>::advance\n\
-             define internal void @mount() {\n  br label %step\n\
+            "define void @DriverEntry() {\n  call void @operation()\n  ret void\n}\n\
+             ; <ext4win::request::operation::MutationRequestOperation>::reserve_mutation\n\
+             define internal void @operation() {\n  br label %step\n\
              step:\n  call void @library()\n  br i1 true, label %step, label %done\n\
              done:\n  ret void\n}\n\
              define internal void @library() {\n  call void @library()\n  ret void\n}\n",
         )?;
         let mut violations = Vec::new();
-        module.audit_mount_stack(&mut violations)?;
+        module.audit_operation_stack(&mut violations)?;
         require(
             violations.is_empty(),
-            "nonrecursive mount execution was rejected",
+            "nonrecursive operation execution was rejected",
+        )
+    }
+
+    /// Acyclic phase nesting still retains both preparation frames beneath commit serialization.
+    /// # Errors
+    /// Returns malformed fixtures or failure to report the crossing between execution phases.
+    #[test]
+    fn mutation_preparation_returns_to_its_executor() -> Result<(), GateError> {
+        let module = IrModule::parse(
+            "define void @DriverEntry() {\n  call void @event()\n  ret void\n}\n\
+             ; <ext4win::request::operation::MutationRequestOperation>::advance_event\n\
+             define internal void @event() {\n  call void @commit()\n  ret void\n}\n\
+             ; <ext4win::request::operation::MutationRequestOperation>::prepare_commit\n\
+             define internal void @commit() {\n  ret void\n}\n",
+        )?;
+        let mut violations = Vec::new();
+        module.audit_operation_stack(&mut violations)?;
+        require(
+            violations.len() == 1
+                && violations.first().is_some_and(|violation| {
+                    violation.category == "nested mutation execution phases"
+                        && violation.path.len() == 2
+                }),
+            "nested mutation preparation was accepted",
         )
     }
 
