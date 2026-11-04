@@ -79,15 +79,15 @@ impl DirectoryRequestOperation {
     /// Reacquires namespace admission after discarding every unpublished record and cursor.
     /// The handle lane retains the directory; fresh dependencies cannot change again inside this
     /// synchronous mounted actor transition.
-    fn restart(mut self: Box<Self>, access: &mut MountedVolumeAccess<'_>) -> OperationTransition {
-        let (query, directory) = match DirectoryQuery::prepare(self.owned.request()) {
-            Ok(prepared) => prepared,
-            Err(error) => return self.fail(error),
-        };
+    ///
+    /// # Errors
+    /// Returns a captured directory-query or handle validation failure before traversal resumes.
+    fn restart(&mut self, access: &mut MountedVolumeAccess<'_>) -> DriverResult<()> {
+        let (query, directory) = DirectoryQuery::prepare(self.owned.request())?;
         let walk = DirectoryReadOperation::new(access.mounted_profile(), directory, query.cursor());
         self.query = query;
         self.phase = DirectoryPhase::Walking(walk);
-        self.advance_mounted(CompletionEvent::Core(OperationEvent::Admitted), access)
+        Ok(())
     }
     /// Drops unpublished packing progress and completes the owned request with its error.
     fn fail(self: Box<Self>, error: DriverError) -> OperationTransition {
@@ -171,9 +171,12 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                         }
                         DirectoryReadTransition::Complete(Err(error)) => {
                             if error == Error::ReadConflict {
-                                return self.restart(access);
+                                if let Err(error) = self.restart(access) {
+                                    return self.fail(error);
+                                }
+                            } else {
+                                return self.fail(error.into());
                             }
-                            return self.fail(error.into());
                         }
                     }
                 }
@@ -254,7 +257,9 @@ impl MountedVolumeOperation for DirectoryRequestOperation {
                             }
                         }
                         ReadTransition::Complete(Err(Error::ReadConflict)) => {
-                            return self.restart(access);
+                            if let Err(error) = self.restart(access) {
+                                return self.fail(error);
+                            }
                         }
                         ReadTransition::Complete(Err(error)) => return self.fail(error.into()),
                     }
