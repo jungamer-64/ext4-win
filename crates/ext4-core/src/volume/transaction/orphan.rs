@@ -22,8 +22,11 @@ pub(in crate::volume) struct OrphanBatchCompletion {
 }
 
 /// Prepares all failure-prone work before a bounded batch issues its first media effect.
+/// This frame stays separate from the mount executor: its metadata mutation scratch must not
+/// enlarge every mount phase's resident kernel stack frame.
 /// # Errors
 /// Returns validation, allocation, capacity, or suspended-I/O errors without writing anything.
+#[inline(never)]
 pub(in crate::volume) fn prepare_orphan_batch(
     volume: EpochReadView<'_, '_>,
     target: &OrphanRecoveryTarget,

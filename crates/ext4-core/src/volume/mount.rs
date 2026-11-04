@@ -1460,8 +1460,11 @@ pub enum CleanCloseTransition {
 /// Prepares a complete primary block while retaining bytes outside the superblock payload.
 /// All log/checkpoint requests are allocated before the first effect; journal replay is the
 /// sole repair authority for a torn home image, including its clocks and checksum.
+/// Keep checkpoint construction out of the executor's frame so journal serialization scratch
+/// is present only while this phase runs.
 /// # Errors
 /// Returns source-read suspension, invalid coordinates, serialization or allocation failure.
+#[inline(never)]
 fn prepare_session_checkpoint(
     device: &mut OperationDevice<'_>,
     raw: &[u8; 1024],
@@ -2636,7 +2639,9 @@ impl MountOperation {
         }
     }
 
-    /// Advances internal phases until an owned effect or terminal result is ready.
+    /// Dispatches phases without merging their metadata scratch into one resident kernel frame.
+    /// Each phase returns before the iterative executor advances another one.
+    #[inline(never)]
     fn drive_step(mut self: Box<Self>) -> MountStep {
         let ownership = core::mem::replace(&mut self.ownership, MountOwnership::Unprotected);
         match ownership {
@@ -2669,54 +2674,8 @@ impl MountOperation {
 
         loop {
             match core::mem::replace(&mut self.state, MountState::Resolving) {
-                MountState::FinishingReadOnly(mut completed) => {
-                    let result = (|| {
-                        let mut device = OperationDevice::new(&mut self.filesystem);
-                        let mut raw = [0_u8; 1024];
-                        device.read_exact_at(ByteOffset::new(1024), &mut raw)?;
-                        let superblock = Superblock::parse_read_only(&raw)?;
-                        let mut view = EpochReadView::mounting(
-                            device,
-                            superblock,
-                            &completed.epoch.fscrypt_keys,
-                        );
-                        if !ValidatedOrphanInventory::observe_file(&mut view)? {
-                            return Err(Error::InvalidOrphanTracking);
-                        }
-                        let mut device = OperationDevice::new(&mut self.filesystem);
-                        let Some(raw) = Superblock::prepare_read_only_completion(
-                            &mut device,
-                            self.now.unix_seconds(),
-                        )?
-                        else {
-                            return Ok(None);
-                        };
-                        let superblock = Superblock::parse_read_only(&raw)?;
-                        let images =
-                            prepare_primary_images(&mut device, &raw, superblock.block_size())?;
-                        let sequence = StorageRequestSequence::home_updates(
-                            images,
-                            superblock.block_size(),
-                            (),
-                        )?;
-                        Ok(Some((superblock, sequence)))
-                    })();
-                    match result {
-                        Ok(Some((superblock, sequence))) => {
-                            completed.epoch.superblock = superblock;
-                            completed.profile.superblock = superblock;
-                            self.state = MountState::ReadOnlyWrites {
-                                completed,
-                                sequence,
-                            };
-                        }
-                        Ok(None) => self.state = MountState::Published(completed),
-                        Err(Error::OperationSuspended) => {
-                            self.state = MountState::FinishingReadOnly(completed);
-                            return self.submit_pending_read();
-                        }
-                        Err(error) => return MountStep::Yield(self.fail(error)),
-                    }
+                MountState::FinishingReadOnly(completed) => {
+                    return self.finish_read_only(completed);
                 }
                 MountState::ReadOnlyWrites {
                     completed,
@@ -2859,91 +2818,13 @@ impl MountOperation {
                     completion,
                     journal_target,
                 } => {
-                    let primary = {
-                        let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                        Superblock::read_for_mount(&mut filesystem, self.access)
-                    };
-                    match primary {
-                        Ok(PrimarySuperblockRead::Valid(superblock)) => {
-                            if superblock.mmp() != self.mmp_parameters
-                                || superblock.uuid() != self.primary_uuid
-                            {
-                                return MountStep::Yield(self.fail(Error::MmpCorrupt));
-                            }
-                            if matches!(self.ownership, MountOwnership::ReadyToClaim(_)) {
-                                return self.claim_ownership();
-                            }
-                            self.state = match completion {
-                                JournalRecoveryCompletion::Clean(journal) => {
-                                    MountState::ScanningOrphans(MountPublicationSeed {
-                                        superblock,
-                                        journal: Some(journal),
-                                        journal_target: Some(journal_target),
-                                    })
-                                }
-                                JournalRecoveryCompletion::Deltas(seed) => {
-                                    let operation =
-                                        match super::fast_commit::DeltaReplayOperation::new(
-                                            self.filesystem.len(),
-                                            superblock,
-                                            seed,
-                                        )
-                                        .and_then(memory::try_box)
-                                        {
-                                            Ok(operation) => operation,
-                                            Err(error) => {
-                                                return MountStep::Yield(self.fail(error));
-                                            }
-                                        };
-                                    MountState::PreparingDeltas {
-                                        operation,
-                                        journal_target,
-                                    }
-                                }
-                            };
-                        }
-                        Ok(PrimarySuperblockRead::ChecksumInvalid(_)) => {
-                            return MountStep::Yield(self.fail(Error::ChecksumMismatch));
-                        }
-                        Err(Error::OperationSuspended) => {
-                            self.state = MountState::VerifyingReplayedPrimary {
-                                completion,
-                                journal_target,
-                            };
-                            return self.submit_pending_read();
-                        }
-                        Err(error) => return MountStep::Yield(self.fail(error)),
-                    }
+                    return self.verify_replayed_primary(completion, journal_target);
                 }
                 MountState::PreparingDeltas {
-                    mut operation,
+                    operation,
                     journal_target,
                 } => {
-                    let Some(keys) = self.fscrypt_keys.as_ref() else {
-                        return MountStep::Yield(self.fail(Error::DeviceIo));
-                    };
-                    match operation.next_request(keys) {
-                        Ok(Some(request)) => {
-                            self.state = MountState::PreparingDeltas {
-                                operation,
-                                journal_target,
-                            };
-                            return MountStep::Yield(MountTransition::SubmitLower {
-                                request,
-                                suspended: self,
-                            });
-                        }
-                        Ok(None) => match (*operation).into_sequence() {
-                            Ok(sequence) => {
-                                self.state = MountState::DeltaWrites {
-                                    sequence,
-                                    journal_target,
-                                }
-                            }
-                            Err(error) => return MountStep::Yield(self.fail(error)),
-                        },
-                        Err(error) => return MountStep::Yield(self.fail(error)),
-                    }
+                    return self.prepare_deltas(operation, journal_target);
                 }
                 MountState::DeltaWrites {
                     sequence,
@@ -2974,186 +2855,13 @@ impl MountOperation {
                     return MountStep::Yield(self.fail(Error::DeviceIo));
                 }
                 MountState::ScanningOrphans(publication) => {
-                    let result = {
-                        let device = OperationDevice::new(&mut self.filesystem);
-                        let Some(keys) = self.fscrypt_keys.as_ref() else {
-                            return MountStep::Yield(self.fail(Error::DeviceIo));
-                        };
-                        let mut volume =
-                            EpochReadView::mounting(device, publication.superblock, keys);
-                        if self.access == super::MountAccess::ReadWrite
-                            || self.recovery.is_some()
-                            || (self.device_access == super::DeviceWriteAccess::Writable
-                                && publication.superblock.permits_orphan_cleanup())
-                        {
-                            ValidatedOrphanInventory::load(&mut volume)
-                        } else {
-                            ValidatedOrphanInventory::observe_file(&mut volume)
-                                .map(|_empty| ValidatedOrphanInventory::empty())
-                        }
-                    };
-                    match result {
-                        Ok(orphans) => {
-                            if !orphans.is_empty()
-                                && let Some(journal) = &publication.journal
-                                && let Err(error) = journal.require_metadata_capacity(
-                                    ORPHAN_METADATA_BUDGET,
-                                    publication.superblock.block_size(),
-                                )
-                            {
-                                return MountStep::Yield(self.fail(error));
-                            }
-                            if self.access.media_access() == super::MediaAccess::ReadOnly
-                                && orphans.is_empty()
-                            {
-                                self.state = MountState::PreparingMarker(IndexedMountSeed {
-                                    publication,
-                                    orphans,
-                                    clusters: None,
-                                });
-                                continue;
-                            }
-                            let index = match memory::try_box(AllocationIndexBuild::new()) {
-                                Ok(index) => index,
-                                Err(error) => return MountStep::Yield(self.fail(error)),
-                            };
-                            self.state = MountState::Indexing(ValidatedMountSeed {
-                                publication,
-                                orphans,
-                                index,
-                            });
-                        }
-                        Err(Error::OperationSuspended) => {
-                            self.state = MountState::ScanningOrphans(publication);
-                            return self.submit_pending_read();
-                        }
-                        Err(error) => return MountStep::Yield(self.fail(error)),
-                    }
+                    return self.scan_orphans(publication);
                 }
-                MountState::Indexing(mut validated) => {
-                    let clusters = validated.index.advance(
-                        &mut self.filesystem,
-                        &validated.publication.superblock,
-                        &validated.orphans,
-                    );
-                    match clusters {
-                        Ok(clusters) => {
-                            self.state = MountState::PreparingMarker(IndexedMountSeed {
-                                publication: validated.publication,
-                                orphans: validated.orphans,
-                                clusters: Some(clusters),
-                            })
-                        }
-                        Err(Error::OperationSuspended) => {
-                            self.state = MountState::Indexing(validated);
-                            return self.submit_pending_read();
-                        }
-                        Err(error) => return MountStep::Yield(self.fail(error)),
-                    }
+                MountState::Indexing(validated) => {
+                    return self.index_allocations(validated);
                 }
                 MountState::PreparingMarker(indexed) => {
-                    let raw = {
-                        let mut filesystem = OperationDevice::new(&mut self.filesystem);
-                        match self.access {
-                            super::MountAccess::ReadWrite => Superblock::prepare_write_session(
-                                &mut filesystem,
-                                WriteSessionState::Active,
-                                self.now.unix_seconds(),
-                            ),
-                            super::MountAccess::ReadOnly { .. } => {
-                                let mut raw = [0_u8; 1024];
-                                filesystem
-                                    .read_exact_at(ByteOffset::new(1024), &mut raw)
-                                    .map(|()| raw)
-                            }
-                        }
-                    };
-                    match raw {
-                        Ok(raw) => {
-                            let marked = match if self.access == super::MountAccess::ReadWrite {
-                                Superblock::parse_read_write(&raw)
-                            } else {
-                                Superblock::parse_read_only(&raw)
-                            } {
-                                Ok(marked)
-                                    if marked.mmp() == self.mmp_parameters
-                                        && marked.uuid() == self.primary_uuid =>
-                                {
-                                    marked
-                                }
-                                Ok(_) => return MountStep::Yield(self.fail(Error::MmpCorrupt)),
-                                Err(error) => return MountStep::Yield(self.fail(error)),
-                            };
-                            let sequence = if matches!(self.access, super::MountAccess::ReadWrite) {
-                                let Some(journal) = &indexed.publication.journal else {
-                                    return MountStep::Yield(self.fail(Error::JournalCorrupt));
-                                };
-                                let mut device = OperationDevice::new(&mut self.filesystem);
-                                match prepare_session_checkpoint(
-                                    &mut device,
-                                    &raw,
-                                    marked.block_size(),
-                                    journal,
-                                    &[],
-                                ) {
-                                    Ok(sequence) => Some(sequence),
-                                    Err(Error::OperationSuspended) => {
-                                        self.state = MountState::PreparingMarker(indexed);
-                                        return self.submit_pending_read();
-                                    }
-                                    Err(error) => return MountStep::Yield(self.fail(error)),
-                                }
-                            } else {
-                                None
-                            };
-                            let keys = match self.fscrypt_keys.take() {
-                                Some(keys) => keys,
-                                None => return MountStep::Yield(self.fail(Error::DeviceIo)),
-                            };
-                            let epoch = CommittedEpoch::initial(
-                                marked,
-                                keys,
-                                indexed.clusters,
-                                self.access,
-                                self.mount,
-                            );
-                            let completed = CompletedMount {
-                                mmp: None,
-                                profile: MountedProfile::new(
-                                    &epoch.mount,
-                                    marked,
-                                    self.filesystem.len(),
-                                    indexed.publication.journal_target,
-                                    self.access.media_access(),
-                                ),
-                                coordinator: MutationCoordinatorState::new(
-                                    indexed.publication.journal,
-                                    &epoch,
-                                ),
-                                epoch,
-                            };
-                            let completed = match memory::try_box(completed) {
-                                Ok(completed) => completed,
-                                Err(error) => return MountStep::Yield(self.fail(error)),
-                            };
-                            let completed = UnpublishedMount {
-                                completed,
-                                orphans: indexed.orphans.into_queue(),
-                            };
-                            self.state = match sequence {
-                                Some(sequence) => MountState::SessionWrites {
-                                    completed,
-                                    sequence,
-                                },
-                                None => MountState::RecoveringOrphans(completed),
-                            };
-                        }
-                        Err(Error::OperationSuspended) => {
-                            self.state = MountState::PreparingMarker(indexed);
-                            return self.submit_pending_read();
-                        }
-                        Err(error) => return MountStep::Yield(self.fail(error)),
-                    }
+                    return self.prepare_marker(indexed);
                 }
                 MountState::SessionWrites {
                     mut completed,
@@ -3188,47 +2896,8 @@ impl MountOperation {
                 MountState::SessionPending { .. } => {
                     return MountStep::Yield(self.fail(Error::DeviceIo));
                 }
-                MountState::RecoveringOrphans(mut mount) => {
-                    let Some(target) = mount.orphans.current() else {
-                        self.state = if matches!(
-                            self.access,
-                            super::MountAccess::ReadOnly {
-                                recovery: super::ReadOnlyRecovery::Replay
-                            }
-                        ) && self.device_access
-                            == super::DeviceWriteAccess::Writable
-                            && mount.completed.profile.journal_target().is_some()
-                        {
-                            MountState::FinishingReadOnly(mount.completed)
-                        } else {
-                            MountState::Published(mount.completed)
-                        };
-                        continue;
-                    };
-                    let inode = target.tracking.inode;
-                    let result = {
-                        let device = OperationDevice::new(&mut self.filesystem);
-                        let view = EpochReadView::committed(device, &mount.completed.epoch);
-                        let PublicationState::Ready { journal, .. } =
-                            &mount.completed.coordinator.journal
-                        else {
-                            return MountStep::Yield(self.fail(Error::JournalCorrupt));
-                        };
-                        prepare_orphan_batch(view, target, journal.as_ref())
-                    };
-                    match result {
-                        Ok((sequence, progress)) => {
-                            if let Err(error) = mount.orphans.prepare_advance(inode, progress) {
-                                return MountStep::Yield(self.fail(error));
-                            }
-                            self.state = MountState::OrphanWrites { mount, sequence };
-                        }
-                        Err(Error::OperationSuspended) => {
-                            self.state = MountState::RecoveringOrphans(mount);
-                            return self.submit_pending_read();
-                        }
-                        Err(error) => return MountStep::Yield(self.fail(error)),
-                    }
+                MountState::RecoveringOrphans(mount) => {
+                    return self.recover_orphans(mount);
                 }
                 MountState::OrphanWrites {
                     mut mount,
@@ -3294,6 +2963,381 @@ impl MountOperation {
                 }
             }
         }
+    }
+
+    /// Prepares the read-only completion images without retaining their scratch in other phases.
+    #[inline(never)]
+    fn finish_read_only(mut self: Box<Self>, mut completed: Box<CompletedMount>) -> MountStep {
+        let result = (|| {
+            let mut device = OperationDevice::new(&mut self.filesystem);
+            let mut raw = [0_u8; 1024];
+            device.read_exact_at(ByteOffset::new(1024), &mut raw)?;
+            let superblock = Superblock::parse_read_only(&raw)?;
+            let mut view =
+                EpochReadView::mounting(device, superblock, &completed.epoch.fscrypt_keys);
+            if !ValidatedOrphanInventory::observe_file(&mut view)? {
+                return Err(Error::InvalidOrphanTracking);
+            }
+            let mut device = OperationDevice::new(&mut self.filesystem);
+            let Some(raw) =
+                Superblock::prepare_read_only_completion(&mut device, self.now.unix_seconds())?
+            else {
+                return Ok(None);
+            };
+            let superblock = Superblock::parse_read_only(&raw)?;
+            let images = prepare_primary_images(&mut device, &raw, superblock.block_size())?;
+            let sequence =
+                StorageRequestSequence::home_updates(images, superblock.block_size(), ())?;
+            Ok(Some((superblock, sequence)))
+        })();
+        match result {
+            Ok(Some((superblock, sequence))) => {
+                completed.epoch.superblock = superblock;
+                completed.profile.superblock = superblock;
+                self.state = MountState::ReadOnlyWrites {
+                    completed,
+                    sequence,
+                };
+            }
+            Ok(None) => self.state = MountState::Published(completed),
+            Err(Error::OperationSuspended) => {
+                self.state = MountState::FinishingReadOnly(completed);
+                return self.submit_pending_read();
+            }
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
+    }
+
+    /// Validates the recovered primary before selecting orphan or delta recovery.
+    #[inline(never)]
+    fn verify_replayed_primary(
+        mut self: Box<Self>,
+        completion: JournalRecoveryCompletion,
+        journal_target: StorageTarget,
+    ) -> MountStep {
+        let primary = {
+            let mut filesystem = OperationDevice::new(&mut self.filesystem);
+            Superblock::read_for_mount(&mut filesystem, self.access)
+        };
+        match primary {
+            Ok(PrimarySuperblockRead::Valid(superblock)) => {
+                if superblock.mmp() != self.mmp_parameters || superblock.uuid() != self.primary_uuid
+                {
+                    return MountStep::Yield(self.fail(Error::MmpCorrupt));
+                }
+                if matches!(self.ownership, MountOwnership::ReadyToClaim(_)) {
+                    return self.claim_ownership();
+                }
+                self.state = match completion {
+                    JournalRecoveryCompletion::Clean(journal) => {
+                        MountState::ScanningOrphans(MountPublicationSeed {
+                            superblock,
+                            journal: Some(journal),
+                            journal_target: Some(journal_target),
+                        })
+                    }
+                    JournalRecoveryCompletion::Deltas(seed) => {
+                        let operation = match super::fast_commit::DeltaReplayOperation::new(
+                            self.filesystem.len(),
+                            superblock,
+                            seed,
+                        )
+                        .and_then(memory::try_box)
+                        {
+                            Ok(operation) => operation,
+                            Err(error) => {
+                                return MountStep::Yield(self.fail(error));
+                            }
+                        };
+                        MountState::PreparingDeltas {
+                            operation,
+                            journal_target,
+                        }
+                    }
+                };
+            }
+            Ok(PrimarySuperblockRead::ChecksumInvalid(_)) => {
+                return MountStep::Yield(self.fail(Error::ChecksumMismatch));
+            }
+            Err(Error::OperationSuspended) => {
+                self.state = MountState::VerifyingReplayedPrimary {
+                    completion,
+                    journal_target,
+                };
+                return self.submit_pending_read();
+            }
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
+    }
+
+    /// Resolves delta recovery with a frame independent of ordinary mount phases.
+    #[inline(never)]
+    fn prepare_deltas(
+        mut self: Box<Self>,
+        mut operation: Box<super::fast_commit::DeltaReplayOperation>,
+        journal_target: StorageTarget,
+    ) -> MountStep {
+        let Some(keys) = self.fscrypt_keys.as_ref() else {
+            return MountStep::Yield(self.fail(Error::DeviceIo));
+        };
+        match operation.next_request(keys) {
+            Ok(Some(request)) => {
+                self.state = MountState::PreparingDeltas {
+                    operation,
+                    journal_target,
+                };
+                return MountStep::Yield(MountTransition::SubmitLower {
+                    request,
+                    suspended: self,
+                });
+            }
+            Ok(None) => match (*operation).into_sequence() {
+                Ok(sequence) => {
+                    self.state = MountState::DeltaWrites {
+                        sequence,
+                        journal_target,
+                    }
+                }
+                Err(error) => return MountStep::Yield(self.fail(error)),
+            },
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
+    }
+
+    /// Validates persistent orphan membership before allocation indexing.
+    #[inline(never)]
+    fn scan_orphans(mut self: Box<Self>, publication: MountPublicationSeed) -> MountStep {
+        let result = {
+            let device = OperationDevice::new(&mut self.filesystem);
+            let Some(keys) = self.fscrypt_keys.as_ref() else {
+                return MountStep::Yield(self.fail(Error::DeviceIo));
+            };
+            let mut volume = EpochReadView::mounting(device, publication.superblock, keys);
+            if self.access == super::MountAccess::ReadWrite
+                || self.recovery.is_some()
+                || (self.device_access == super::DeviceWriteAccess::Writable
+                    && publication.superblock.permits_orphan_cleanup())
+            {
+                ValidatedOrphanInventory::load(&mut volume)
+            } else {
+                ValidatedOrphanInventory::observe_file(&mut volume)
+                    .map(|_empty| ValidatedOrphanInventory::empty())
+            }
+        };
+        match result {
+            Ok(orphans) => {
+                if !orphans.is_empty()
+                    && let Some(journal) = &publication.journal
+                    && let Err(error) = journal.require_metadata_capacity(
+                        ORPHAN_METADATA_BUDGET,
+                        publication.superblock.block_size(),
+                    )
+                {
+                    return MountStep::Yield(self.fail(error));
+                }
+                if self.access.media_access() == super::MediaAccess::ReadOnly && orphans.is_empty()
+                {
+                    self.state = MountState::PreparingMarker(IndexedMountSeed {
+                        publication,
+                        orphans,
+                        clusters: None,
+                    });
+                    return MountStep::Continue(self);
+                }
+                let index = match memory::try_box(AllocationIndexBuild::new()) {
+                    Ok(index) => index,
+                    Err(error) => return MountStep::Yield(self.fail(error)),
+                };
+                self.state = MountState::Indexing(ValidatedMountSeed {
+                    publication,
+                    orphans,
+                    index,
+                });
+            }
+            Err(Error::OperationSuspended) => {
+                self.state = MountState::ScanningOrphans(publication);
+                return self.submit_pending_read();
+            }
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
+    }
+
+    /// Builds allocation ownership from the validated orphan inventory.
+    #[inline(never)]
+    fn index_allocations(mut self: Box<Self>, mut validated: ValidatedMountSeed) -> MountStep {
+        let clusters = validated.index.advance(
+            &mut self.filesystem,
+            &validated.publication.superblock,
+            &validated.orphans,
+        );
+        match clusters {
+            Ok(clusters) => {
+                self.state = MountState::PreparingMarker(IndexedMountSeed {
+                    publication: validated.publication,
+                    orphans: validated.orphans,
+                    clusters: Some(clusters),
+                })
+            }
+            Err(Error::OperationSuspended) => {
+                self.state = MountState::Indexing(validated);
+                return self.submit_pending_read();
+            }
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
+    }
+
+    /// Constructs the session marker and unpublished mount within this phase's stack frame.
+    #[inline(never)]
+    fn prepare_marker(mut self: Box<Self>, indexed: IndexedMountSeed) -> MountStep {
+        let raw = {
+            let mut filesystem = OperationDevice::new(&mut self.filesystem);
+            match self.access {
+                super::MountAccess::ReadWrite => Superblock::prepare_write_session(
+                    &mut filesystem,
+                    WriteSessionState::Active,
+                    self.now.unix_seconds(),
+                ),
+                super::MountAccess::ReadOnly { .. } => {
+                    let mut raw = [0_u8; 1024];
+                    filesystem
+                        .read_exact_at(ByteOffset::new(1024), &mut raw)
+                        .map(|()| raw)
+                }
+            }
+        };
+        match raw {
+            Ok(raw) => {
+                let marked = match if self.access == super::MountAccess::ReadWrite {
+                    Superblock::parse_read_write(&raw)
+                } else {
+                    Superblock::parse_read_only(&raw)
+                } {
+                    Ok(marked)
+                        if marked.mmp() == self.mmp_parameters
+                            && marked.uuid() == self.primary_uuid =>
+                    {
+                        marked
+                    }
+                    Ok(_) => return MountStep::Yield(self.fail(Error::MmpCorrupt)),
+                    Err(error) => return MountStep::Yield(self.fail(error)),
+                };
+                let sequence = if matches!(self.access, super::MountAccess::ReadWrite) {
+                    let Some(journal) = &indexed.publication.journal else {
+                        return MountStep::Yield(self.fail(Error::JournalCorrupt));
+                    };
+                    let mut device = OperationDevice::new(&mut self.filesystem);
+                    match prepare_session_checkpoint(
+                        &mut device,
+                        &raw,
+                        marked.block_size(),
+                        journal,
+                        &[],
+                    ) {
+                        Ok(sequence) => Some(sequence),
+                        Err(Error::OperationSuspended) => {
+                            self.state = MountState::PreparingMarker(indexed);
+                            return self.submit_pending_read();
+                        }
+                        Err(error) => return MountStep::Yield(self.fail(error)),
+                    }
+                } else {
+                    None
+                };
+                let keys = match self.fscrypt_keys.take() {
+                    Some(keys) => keys,
+                    None => return MountStep::Yield(self.fail(Error::DeviceIo)),
+                };
+                let epoch = CommittedEpoch::initial(
+                    marked,
+                    keys,
+                    indexed.clusters,
+                    self.access,
+                    self.mount,
+                );
+                let completed = CompletedMount {
+                    mmp: None,
+                    profile: MountedProfile::new(
+                        &epoch.mount,
+                        marked,
+                        self.filesystem.len(),
+                        indexed.publication.journal_target,
+                        self.access.media_access(),
+                    ),
+                    coordinator: MutationCoordinatorState::new(indexed.publication.journal, &epoch),
+                    epoch,
+                };
+                let completed = match memory::try_box(completed) {
+                    Ok(completed) => completed,
+                    Err(error) => return MountStep::Yield(self.fail(error)),
+                };
+                let completed = UnpublishedMount {
+                    completed,
+                    orphans: indexed.orphans.into_queue(),
+                };
+                self.state = match sequence {
+                    Some(sequence) => MountState::SessionWrites {
+                        completed,
+                        sequence,
+                    },
+                    None => MountState::RecoveringOrphans(completed),
+                };
+            }
+            Err(Error::OperationSuspended) => {
+                self.state = MountState::PreparingMarker(indexed);
+                return self.submit_pending_read();
+            }
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
+    }
+
+    /// Prepares one orphan batch before returning its continuation to the executor.
+    #[inline(never)]
+    fn recover_orphans(mut self: Box<Self>, mut mount: UnpublishedMount) -> MountStep {
+        let Some(target) = mount.orphans.current() else {
+            self.state = if matches!(
+                self.access,
+                super::MountAccess::ReadOnly {
+                    recovery: super::ReadOnlyRecovery::Replay
+                }
+            ) && self.device_access == super::DeviceWriteAccess::Writable
+                && mount.completed.profile.journal_target().is_some()
+            {
+                MountState::FinishingReadOnly(mount.completed)
+            } else {
+                MountState::Published(mount.completed)
+            };
+            return MountStep::Continue(self);
+        };
+        let inode = target.tracking.inode;
+        let result = {
+            let device = OperationDevice::new(&mut self.filesystem);
+            let view = EpochReadView::committed(device, &mount.completed.epoch);
+            let PublicationState::Ready { journal, .. } = &mount.completed.coordinator.journal
+            else {
+                return MountStep::Yield(self.fail(Error::JournalCorrupt));
+            };
+            prepare_orphan_batch(view, target, journal.as_ref())
+        };
+        match result {
+            Ok((sequence, progress)) => {
+                if let Err(error) = mount.orphans.prepare_advance(inode, progress) {
+                    return MountStep::Yield(self.fail(error));
+                }
+                self.state = MountState::OrphanWrites { mount, sequence };
+            }
+            Err(Error::OperationSuspended) => {
+                self.state = MountState::RecoveringOrphans(mount);
+                return self.submit_pending_read();
+            }
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        }
+        MountStep::Continue(self)
     }
 
     /// Drops all preflight cursors before acquiring writable ownership, then reloads under that lease.
@@ -3378,6 +3422,7 @@ impl MountOperation {
     /// # Errors
     ///
     /// Returns an error for invalid primary metadata, journal placement, profile, or suspended I/O.
+    #[inline(never)]
     fn resolve_journal(&mut self) -> Result<JournalResolution> {
         let primary_read = {
             let mut filesystem = OperationDevice::new(&mut self.filesystem);
