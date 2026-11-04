@@ -4528,6 +4528,20 @@ enum DriverResolveDisposition {
 enum MutationStep {
     /// One externally scheduled action or terminal completion.
     Transition(OperationTransition),
+    /// Intent admission after event-dispatch scratch has been released.
+    Reserve {
+        /// Request retaining its resolved mutation and native gates.
+        operation: Box<MutationRequestOperation>,
+        /// Concrete event selecting the intent grant or rejection.
+        event: OperationEvent,
+    },
+    /// Commit serialization after intent-admission and event-dispatch scratch has been released.
+    PrepareCommit {
+        /// Request retaining the reserved mutation and publication slots.
+        operation: Box<MutationRequestOperation>,
+        /// Concrete event selecting the commit grant or rejection.
+        event: OperationEvent,
+    },
     /// One read-only attempt against an exact retained epoch.
     Resolve {
         /// Admitted operation retaining request and publication ownership.
@@ -6694,251 +6708,13 @@ impl MutationRequestOperation {
                     self.complete_error(owned, DriverError::InvalidDeviceRequest),
                 ),
             },
-            MutationOperationState::AwaitingIntent {
-                owned,
-                resolved,
-                publication,
-                size_changes,
-                deletion,
-            } => {
-                let intent =
-                    match event {
-                        OperationEvent::IntentGranted(intent) => intent,
-                        OperationEvent::CancelRequested => {
-                            return MutationStep::Transition(self.complete_error(
-                                owned,
-                                DriverError::from(Error::OperationCancelled),
-                            ));
-                        }
-                        _ => {
-                            return MutationStep::Transition(
-                                self.complete_error(owned, DriverError::InvalidDeviceRequest),
-                            );
-                        }
-                    };
-                let reserved = access.reserve_mutation(resolved, intent);
-                let reserved = match reserved {
-                    Ok(reserved) => reserved,
-                    Err(Error::ClusterReferenceConflict) => {
-                        drop(publication);
-                        return self.restart_resolution(owned, size_changes, deletion, access);
-                    }
-                    Err(error) => {
-                        drop(publication);
-                        return MutationStep::Transition(
-                            self.complete_error(owned, DriverError::from(error)),
-                        );
-                    }
-                };
-                let stream_metadata =
-                    match crate::state::PreparedStreamMetadataPublications::try_new(
-                        reserved.node_metadata_updates(),
-                        access.volume_geometry().cluster_size(),
-                    ) {
-                        Ok(stream_metadata) => stream_metadata,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    };
-                if let (Some(prepared), Some(cleanup)) =
-                    (deletion.as_ref(), self.cleanup_deletion.as_ref())
-                    && prepared.node() != cleanup.node()
-                {
-                    return MutationStep::Transition(
-                        self.complete_error(owned, DriverError::InternalInvariantViolation),
-                    );
-                }
-                if deletion.is_none()
-                    && let Some(cleanup) = self.cleanup_deletion.as_ref()
-                {
-                    let stream = match access
-                        .prepare_stream_deletion(cleanup.file_control_block(), cleanup.node())
-                    {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    };
-                    if let Some(stream) = stream {
-                        drop(stream_metadata);
-                        drop(publication);
-                        drop(reserved);
-                        self.state = MutationOperationState::PreparingDeletion {
-                            owned,
-                            size_changes,
-                        };
-                        return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                            work: crate::irp::PassiveWork::prepare_deletion(
-                                stream,
-                                self.purge_policy,
-                            ),
-                            suspended: self,
-                        });
-                    }
-                }
-                let deletion_node = deletion.as_ref().map(|prepared| prepared.node());
-                let reset_node = if self.paging.is_none() {
-                    self.pending_existing_create
-                        .as_ref()
-                        .and_then(|pending| pending.reset_target().map(|(node, _)| node))
-                } else {
-                    None
-                };
-                let size_changes = match size_changes {
-                    Some(prepared) => {
-                        let matches = match access.prepared_stream_size_changes_match(
-                            &stream_metadata,
-                            &prepared,
-                            deletion_node,
-                            reset_node,
-                        ) {
-                            Ok(matches) => matches,
-                            Err(error) => {
-                                return MutationStep::Transition(self.complete_error(owned, error));
-                            }
-                        };
-                        if matches {
-                            Some(prepared)
-                        } else {
-                            drop(prepared);
-                            None
-                        }
-                    }
-                    None => None,
-                };
-                if size_changes.is_none() {
-                    let mut plan = match access.prepare_stream_size_changes(
-                        &stream_metadata,
-                        deletion_node,
-                        reset_node,
-                    ) {
-                        Ok(plan) => plan,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    };
-                    if let Some(stream) = plan.next() {
-                        drop(stream_metadata);
-                        drop(publication);
-                        drop(reserved);
-                        self.state = MutationOperationState::PreparingSizeChange {
-                            owned,
-                            plan,
-                            deletion,
-                        };
-                        return MutationStep::Transition(OperationTransition::SubmitPassiveWork {
-                            work: crate::irp::PassiveWork::prepare_size_change(
-                                stream,
-                                self.purge_policy,
-                            ),
-                            suspended: self,
-                        });
-                    }
-                    let empty = match plan.into_prepared() {
-                        Ok(empty) => empty,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    };
-                    if empty.is_some() {
-                        return MutationStep::Transition(
-                            self.complete_error(owned, DriverError::InternalInvariantViolation),
-                        );
-                    }
-                }
-                let publication = match publication.prepare(stream_metadata, access) {
-                    Ok(publication) => publication,
-                    Err(error) => {
-                        return MutationStep::Transition(self.complete_error(owned, error));
-                    }
-                };
-                let slots = {
-                    let reservations = access.reserve_epoch_publication();
-                    match reservations {
-                        Ok(slots) => slots,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    }
-                };
-                self.state = MutationOperationState::AwaitingCommit {
-                    owned,
-                    reserved,
-                    publication,
-                    slots,
-                    size_changes,
-                    deletion,
-                };
-                MutationStep::Transition(OperationTransition::RequestCommit {
-                    ticket: self.ticket,
-                    suspended: self,
-                })
+            state @ MutationOperationState::AwaitingIntent { .. } => {
+                self.state = state;
+                MutationStep::Reserve { operation: self, event }
             }
-            MutationOperationState::AwaitingCommit {
-                owned,
-                reserved,
-                publication,
-                slots,
-                size_changes,
-                deletion,
-            } => {
-                let commit =
-                    match event {
-                        OperationEvent::CommitGranted(commit) => commit,
-                        OperationEvent::CancelRequested => {
-                            return MutationStep::Transition(self.complete_error(
-                                owned,
-                                DriverError::from(Error::OperationCancelled),
-                            ));
-                        }
-                        _ => {
-                            return MutationStep::Transition(
-                                self.complete_error(owned, DriverError::InvalidDeviceRequest),
-                            );
-                        }
-                    };
-                let mut publication = publication;
-                if let Some((fcb, open_count)) = publication.oplock_reservation_target() {
-                    if !access.oplock_grant_available(fcb) {
-                        return MutationStep::Transition(
-                            self.complete_error(owned, DriverError::OplockNotGranted),
-                        );
-                    }
-                    let stream = match access.acquire_claimed_oplock_stream_lease(fcb) {
-                        Ok(stream) => stream,
-                        Err(error) => {
-                            return MutationStep::Transition(self.complete_error(owned, error));
-                        }
-                    };
-                    let reservation =
-                        match AtomicOplockReservation::acquire(stream, open_count, &owned) {
-                            Ok(reservation) => reservation,
-                            Err(error) => {
-                                return MutationStep::Transition(self.complete_error(owned, error));
-                            }
-                        };
-                    publication.accept_oplock_reservation(reservation);
-                }
-                let ready: Result<CommitReadyMutation, Error> =
-                    access.prepare_mutation_commit(reserved, commit);
-                let ready = match ready {
-                    Ok(ready) => ready,
-                    Err(error) => {
-                        return MutationStep::Transition(
-                            self.complete_error(owned, DriverError::from(error)),
-                        );
-                    }
-                };
-                let (durable_slot, checkpoint_slot) = slots.into_parts();
-                let context = CommitContext {
-                    owned,
-                    publication,
-                    durable_slot,
-                    checkpoint_slot,
-                    size_changes,
-                    deletion,
-                };
-                MutationStep::Transition(self.drive_ordered(context, ready.start()))
+            state @ MutationOperationState::AwaitingCommit { .. } => {
+                self.state = state;
+                MutationStep::PrepareCommit { operation: self, event }
             }
             MutationOperationState::CommitIo { context, phase } => {
                 MutationStep::Transition(self.advance_commit_io(context, phase, event, access))
