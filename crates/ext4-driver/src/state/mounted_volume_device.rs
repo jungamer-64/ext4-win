@@ -179,8 +179,12 @@ impl MountedVolumeDevice {
         })?
     }
     /// Retains a required I/O Manager verify before ordinary work can inspect a mounted cache.
+    /// Mount notifications can reenter after association publication but before the I/O Manager
+    /// acknowledges completion with VPB_MOUNTED. Identity comes from the current association;
+    /// the actor independently owns filesystem-operation admission.
     /// # Errors
-    /// Returns withdrawn association or removal without issuing native I/O under the VPB lock.
+    /// Returns withdrawn association, removal, or busy when verification requires the mount IRP
+    /// to finish first. No native I/O runs under the VPB lock.
     #[expect(
         unsafe_code,
         reason = "the mounted VPB lock establishes real-device liveness before the worker acquires its own reference"
@@ -189,9 +193,6 @@ impl MountedVolumeDevice {
         device: KernelDevice,
     ) -> DriverResult<Option<crate::kernel::volume_verify::VerificationDevice>> {
         VpbSpinLock::with_mounted(device, |vpb| {
-            if vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED) == 0 {
-                return Err(DriverError::WrongVolume);
-            }
             // SAFETY: The mounted association retains the real device while the global lock is held.
             let real_device = unsafe { KernelDevice::from_raw(vpb.RealDevice) }
                 .ok_or(DriverError::InvalidParameter)?;
@@ -204,6 +205,10 @@ impl MountedVolumeDevice {
                 return Err(DriverError::DeviceRemoved);
             }
             if crate::kernel::volume_verify::required(real_device) {
+                if vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED) == 0 {
+                    // IoVerifyVolume can wait on the same mount that this callback interrupted.
+                    return Err(DriverError::DeviceBusy);
+                }
                 Ok(Some(
                     crate::kernel::volume_verify::VerificationDevice::reference(real_device),
                 ))
@@ -1394,6 +1399,47 @@ impl VpbLabel {
 mod tests {
     use super::*;
     use ext4_core::Ext4VolumeLabel;
+
+    /// A mount notification may query the published volume before mount-IRP acknowledgment.
+    /// # Errors
+    /// Returns fixture publication, verify retention or native retirement failure.
+    /// # Panics
+    /// Fails if acknowledgment timing changes media identity or stale routing admits verification.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "native fixture setup and retirement surround association-admission assertions"
+    )]
+    fn published_mount_admits_reentry_before_io_manager_acknowledgment() -> DriverResult<()> {
+        let mut fixture = VpbFixture::new()?;
+        let publication = fixture.publish()?;
+        let device = fixture.device()?;
+        fixture.original(|vpb| {
+            assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
+        })?;
+        assert!(MountedVolumeDevice::prepare_verify_work(device)?.is_none());
+        fixture.real.Flags |= wdk_sys::DO_VERIFY_VOLUME;
+        assert!(matches!(
+            MountedVolumeDevice::prepare_verify_work(device),
+            Err(DriverError::DeviceBusy)
+        ));
+        fixture.original(|vpb| vpb.Flags |= vpb_flag(wdk_sys::VPB_MOUNTED))?;
+        let retained = MountedVolumeDevice::prepare_verify_work(device)?
+            .ok_or(DriverError::InternalInvariantViolation)?;
+        drop(retained);
+        publication.publish_session_end(SessionEndRouting::Remount);
+        assert!(matches!(
+            MountedVolumeDevice::prepare_verify_work(device),
+            Err(DriverError::WrongVolume)
+        ));
+        drop(
+            publication
+                .begin_retirement()
+                .try_finish()
+                .map_err(|_| DriverError::DeviceBusy)?,
+        );
+        fixture.finish()
+    }
 
     /// # Errors
     /// Returns native fixture allocation/publication or finalization failure.
