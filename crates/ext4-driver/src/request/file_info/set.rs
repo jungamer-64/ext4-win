@@ -304,43 +304,10 @@ fn publish_timestamp_policy(request: &mut PendingIrpLease<'_>, policy: HandleTim
         });
 }
 
-/// Applies one supported set-file-information class.
-///
-/// Namespace decoding owns bounded name records in an independent frame so the shared mutation
-/// dispatcher does not reserve that scratch while executing create or data I/O.
-/// # Errors
-///
-/// Returns an error when the selected set-information class has invalid input or its ext4 metadata
-/// mutation cannot be committed.
+/// Captures the caller's selected operation before filesystem staging begins.
 #[inline(never)]
-pub(super) fn set_file_information(
-    mut request: PendingIrpLease<'_>,
-    operations: &mut MountedVolumeAccess<'_>,
-    mutation: &mut DriverMutationPass<'_, '_, '_>,
-    pending_disposition: &mut Option<PendingDispositionDeletion>,
-    prepared_deletion: Option<&PreparedStreamDeletion>,
-    namespace_oplocks: Option<NamespaceOplockPlan>,
-    mapping: &ext4_security::IdentityMap,
-) -> DriverResult<SetFileResolution> {
-    if let Some(pending) = pending_disposition.as_ref() {
-        pending.validate_request(&mut request)?;
-        let (fcb, node) = pending.stream_target();
-        if !prepared_deletion.is_some_and(|prepared| prepared.authorizes(fcb, node)) {
-            return Err(DriverError::InternalInvariantViolation);
-        }
-        validate_pending_deletion(
-            mutation,
-            node,
-            pending.pending.target_ref(),
-            pending.readonly,
-        )?;
-        let Some(pending) = pending_disposition.take() else {
-            return Err(DriverError::InternalInvariantViolation);
-        };
-        pending.publish(operations);
-        return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
-    }
-    let plan = request.with_active(|active| {
+fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFilePlan> {
+    request.with_active(|active| {
         let current = active.current_stack()?;
         let file_object = current.file_object()?;
         let stack = current.set_file()?;
@@ -479,7 +446,45 @@ pub(super) fn set_file_information(
             },
         };
         Ok::<_, DriverError>(plan)
-    })?;
+    })
+}
+
+/// Applies one supported set-file-information class.
+///
+/// The input decoder releases its scratch before the plan touches the filesystem.
+/// # Errors
+///
+/// Returns an error when the selected set-information class has invalid input or its ext4 metadata
+/// mutation cannot be committed.
+#[inline(never)]
+pub(super) fn set_file_information(
+    mut request: PendingIrpLease<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+    pending_disposition: &mut Option<PendingDispositionDeletion>,
+    prepared_deletion: Option<&PreparedStreamDeletion>,
+    namespace_oplocks: Option<NamespaceOplockPlan>,
+    mapping: &ext4_security::IdentityMap,
+) -> DriverResult<SetFileResolution> {
+    if let Some(pending) = pending_disposition.as_ref() {
+        pending.validate_request(&mut request)?;
+        let (fcb, node) = pending.stream_target();
+        if !prepared_deletion.is_some_and(|prepared| prepared.authorizes(fcb, node)) {
+            return Err(DriverError::InternalInvariantViolation);
+        }
+        validate_pending_deletion(
+            mutation,
+            node,
+            pending.pending.target_ref(),
+            pending.readonly,
+        )?;
+        let Some(pending) = pending_disposition.take() else {
+            return Err(DriverError::InternalInvariantViolation);
+        };
+        pending.publish(operations);
+        return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
+    }
+    let plan = decode_set_file_plan(&mut request)?;
     match plan {
         SetFilePlan::Complete => {
             return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
@@ -570,21 +575,10 @@ pub(super) fn set_file_information(
             {
                 return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
             }
-            let publication = prepared.apply(mutation)?;
-            return Ok(SetFileResolution::Mutation(match publication {
-                PreparedRename::Unchanged => SetFilePublication::None,
-                PreparedRename::Changed {
-                    location,
-                    notifications,
-                } => {
-                    let location =
-                        request_location_publication(&mut request, file_object, location)?;
-                    SetFilePublication::Rename {
-                        location,
-                        notifications,
-                    }
-                }
-            }));
+            return Ok(SetFileStep::StageRename {
+                mutation: prepared,
+                file_object,
+            });
         }
     }
     Ok(SetFileResolution::Mutation(SetFilePublication::None))
@@ -1318,6 +1312,7 @@ impl PreparedHardLinkMutation {
     /// # Errors
     ///
     /// Returns a target-resolution, replacement-policy, link-limit, metadata, or allocation error.
+    #[inline(never)]
     fn prepare(
         request: HardLinkMutation,
         operations: &mut MountedVolumeAccess<'_>,
@@ -1735,9 +1730,11 @@ enum PreparedRenameMutation {
 
 impl PreparedRenameMutation {
     /// Resolves and allocates a rename transcript without staging an ext4 write.
+    /// Path traversal and notification construction release their scratch before namespace edits.
     /// # Errors
     ///
     /// Returns a namespace-resolution, replacement-policy, notification, or allocation error.
+    #[inline(never)]
     fn prepare(
         request: RenameMutation,
         operations: &mut MountedVolumeAccess<'_>,
