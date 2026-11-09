@@ -452,11 +452,20 @@ impl MountRequestOperation {
                 self.query_next_external_candidate(context)
             }
             MountTransition::Complete(Ok(completed)) => {
-                match Self::publish_mount(admission, devices, completed, self.trace, catalog) {
+                self.trace.record(
+                    OperationalPath::MountPublication,
+                    STATUS_SUCCESS,
+                    OperationalOutcome::Selected,
+                );
+                let published =
+                    Self::publish_mount(admission, devices, completed, self.trace, catalog);
+                self.trace
+                    .record_result(OperationalPath::MountPublication, &published);
+                match published {
                     Ok(device) => OperationTransition::Complete(
                         owned
                             .prepare_completion(IrpCompletion::EMPTY)
-                            .with_mount_event(device),
+                            .with_mount_event(device, self.trace),
                     ),
                     Err(error) => Self::complete(owned, Err(error)),
                 }
@@ -702,6 +711,11 @@ impl ControlDeviceOperation for MountRequestOperation {
         match state {
             MountRequestState::QueryLength { owned, admission } => match event {
                 OperationEvent::Admitted => {
+                    self.trace.record(
+                        OperationalPath::MountRequest,
+                        STATUS_SUCCESS,
+                        OperationalOutcome::Selected,
+                    );
                     self.state = MountRequestState::QueryLength { owned, admission };
                     OperationTransition::SubmitDeviceControl {
                         query: crate::kernel::storage::DeviceControlKind::Length,

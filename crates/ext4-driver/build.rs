@@ -250,7 +250,7 @@ fn write_lifecycle_control_contract() -> Result<(), io::Error> {
 /// Returns an input or I/O error when the checked-in schema is incomplete, duplicated, malformed,
 /// or cannot be written to Cargo's output directory.
 fn write_operational_trace_contract() -> Result<(), io::Error> {
-    const EVENT_RECORDS: [(&str, &str); 41] = [
+    const EVENT_RECORDS: [(&str, &str); 45] = [
         ("event_cached_read", "CACHED_READ"),
         ("event_cached_write", "CACHED_WRITE"),
         ("event_cache_flush", "CACHE_FLUSH"),
@@ -292,6 +292,10 @@ fn write_operational_trace_contract() -> Result<(), io::Error> {
         ("event_volume_close_durability", "VOLUME_CLOSE_DURABILITY"),
         ("event_volume_query", "VOLUME_QUERY"),
         ("event_volume_sector_query", "VOLUME_SECTOR_QUERY"),
+        ("event_mount_request", "MOUNT_REQUEST"),
+        ("event_mount_publication", "MOUNT_PUBLICATION"),
+        ("event_mount_completion", "MOUNT_COMPLETION"),
+        ("event_mount_notification", "MOUNT_NOTIFICATION"),
     ];
     const OUTCOME_RECORDS: [(&str, &str); 5] = [
         ("outcome_selected", "SELECTED"),
@@ -333,6 +337,7 @@ fn write_operational_trace_contract() -> Result<(), io::Error> {
         }
         event_values.push(value);
         if record.starts_with("event_discovery_")
+            || record.starts_with("event_mount_")
             || matches!(
                 symbol,
                 "CACHED_READ"

@@ -424,7 +424,7 @@ impl PassiveWork {
                 PassiveWorkCompletion::CloseExternalJournal(exclusion.close())
             }
             Self::NotifyVolume { owned, file, event } => {
-                crate::kernel::volume_event::VolumeNotification::new(file, event).deliver();
+                event.deliver(file);
                 PassiveWorkCompletion::NotifyVolume {
                     owned,
                     result: Ok(()),

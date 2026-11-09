@@ -1809,9 +1809,13 @@ impl PnpSubmission {
 
 impl PreparedIrpCompletion {
     /// Holds the published mounted device through its advisory mount notification.
-    pub(crate) fn with_mount_event(mut self, device: KernelDevice) -> Self {
+    pub(crate) fn with_mount_event(
+        mut self,
+        device: KernelDevice,
+        trace: crate::kernel::operational_trace::OperationalTrace,
+    ) -> Self {
         self.volume_event = Some(crate::kernel::volume_event::VolumeNotification::mounted(
-            device,
+            device, trace,
         ));
         self
     }
@@ -1840,9 +1844,12 @@ impl PreparedIrpCompletion {
         #[cfg(test)]
         {
             if let Some(event) = self.volume_event {
-                event.deliver();
+                event.complete(|| {
+                    let _status = self.irp.finish_completion(self.status);
+                });
+            } else {
+                let _status = self.irp.finish_completion(self.status);
             }
-            let _status = self.irp.finish_completion(self.status);
         }
         self.status
     }

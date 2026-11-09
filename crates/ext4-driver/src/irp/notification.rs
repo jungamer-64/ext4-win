@@ -131,7 +131,7 @@ enum NotificationCallback {
 /// Mutually exclusive terminal ownership selected before the actor releases its slot.
 #[cfg(not(test))]
 enum NotificationJob {
-    /// A committed volume transition must notify outside the actor before IRP completion.
+    /// The volume event owns its ordering relative to IRP completion outside the actor.
     Volume(KernelIrp, wdk_sys::NTSTATUS, VolumeNotification),
     /// Notify upper drivers of a prepared status.
     Complete(KernelIrp, wdk_sys::NTSTATUS),
@@ -462,8 +462,9 @@ unsafe extern "C" fn notify_irp(_device: wdk_sys::PDEVICE_OBJECT, context: wdk_s
     // No slot access follows release; reentrant completion may reuse the same work item.
     match job {
         NotificationJob::Volume(irp, status, event) => {
-            event.deliver();
-            let _status = irp.finish_completion(status);
+            event.complete(|| {
+                let _status = irp.finish_completion(status);
+            });
         }
         NotificationJob::Complete(irp, status) => {
             let _status = irp.finish_completion(status);

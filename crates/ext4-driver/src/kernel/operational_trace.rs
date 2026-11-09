@@ -89,6 +89,14 @@ pub(crate) enum OperationalPath {
     VolumeQuery,
     /// Passive native sector query against the mounted VPB's retained real device.
     VolumeSectorQuery,
+    /// Mount IRP begins storage admission on the control actor.
+    MountRequest,
+    /// Post-recovery publication of the new device and its VPB.
+    MountPublication,
+    /// Native completion of the mount IRP outside the control actor.
+    MountCompletion,
+    /// Independent mount notification from stream acquisition through release.
+    MountNotification,
 }
 
 impl OperationalPath {
@@ -125,6 +133,10 @@ impl OperationalPath {
             Self::VolumeCloseDurability => contract::TRACE_EVENT_VOLUME_CLOSE_DURABILITY,
             Self::VolumeQuery => contract::TRACE_EVENT_VOLUME_QUERY,
             Self::VolumeSectorQuery => contract::TRACE_EVENT_VOLUME_SECTOR_QUERY,
+            Self::MountRequest => contract::TRACE_EVENT_MOUNT_REQUEST,
+            Self::MountPublication => contract::TRACE_EVENT_MOUNT_PUBLICATION,
+            Self::MountCompletion => contract::TRACE_EVENT_MOUNT_COMPLETION,
+            Self::MountNotification => contract::TRACE_EVENT_MOUNT_NOTIFICATION,
         }
     }
 }
@@ -405,6 +417,10 @@ mod tests {
             OperationalPath::VolumeCloseDurability,
             OperationalPath::VolumeQuery,
             OperationalPath::VolumeSectorQuery,
+            OperationalPath::MountRequest,
+            OperationalPath::MountPublication,
+            OperationalPath::MountCompletion,
+            OperationalPath::MountNotification,
         ];
         for (index, event) in events.iter().enumerate() {
             assert_ne!(event.event_id(), 0);

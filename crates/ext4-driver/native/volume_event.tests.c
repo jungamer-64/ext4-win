@@ -5,6 +5,7 @@ __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long
 #define assert(value) do { if (!(value)) { ExitProcess(__LINE__); } } while (0)
 #define _IRQL_requires_(level)
 #define _In_
+#define _Outptr_result_nullonfailure_
 #define PASSIVE_LEVEL 0
 #define EXCEPTION_EXECUTE_HANDLER 1
 #define EXCEPTION_CONTINUE_SEARCH 0
@@ -13,6 +14,7 @@ __declspec(dllimport) void __stdcall RaiseException(unsigned long, unsigned long
 #define FSRTL_VOLUME_MOUNT 1
 
 typedef long NTSTATUS;
+typedef unsigned char KIRQL;
 typedef struct { unsigned references; } VPB, *PVPB;
 typedef struct { PVPB Vpb; } DEVICE_OBJECT, *PDEVICE_OBJECT;
 typedef struct { PVPB Vpb; } FILE_OBJECT, *PFILE_OBJECT;
@@ -22,6 +24,7 @@ static VPB vpb = { 1 };
 static DEVICE_OBJECT device = { &vpb };
 static FILE_OBJECT file;
 static unsigned allocations, notifications, releases, deny, raise_notification;
+static unsigned vpb_locked;
 static NTSTATUS result;
 static int FsRtlIsNtstatusExpected(NTSTATUS status)
 {
@@ -40,6 +43,7 @@ static PFILE_OBJECT IoCreateStreamFileObjectLite(PFILE_OBJECT source, PDEVICE_OB
 }
 static NTSTATUS FsRtlNotifyVolumeEvent(PFILE_OBJECT target, unsigned event)
 {
+    assert(!vpb_locked);
     assert(target == &file && target->Vpb == &vpb && event == FSRTL_VOLUME_MOUNT);
     assert(vpb.references == 2);
     ++notifications;
@@ -48,6 +52,7 @@ static NTSTATUS FsRtlNotifyVolumeEvent(PFILE_OBJECT target, unsigned event)
 }
 static void ObDereferenceObject(PFILE_OBJECT target)
 {
+    assert(!vpb_locked);
     assert(target == &file);
     if (target->Vpb != NULL) {
         assert(target->Vpb == &vpb && vpb.references == 2);
@@ -56,23 +61,52 @@ static void ObDereferenceObject(PFILE_OBJECT target)
     }
     ++releases;
 }
+static void IoAcquireVpbSpinLock(KIRQL *irql)
+{
+    assert(!vpb_locked);
+    vpb_locked = 1;
+    *irql = 0;
+}
+static void IoReleaseVpbSpinLock(KIRQL irql)
+{
+    assert(vpb_locked && irql == 0);
+    vpb_locked = 0;
+}
 #include "volume_event.h"
+
+static NTSTATUS observe_event(void)
+{
+    PFILE_OBJECT prepared = NULL;
+    unsigned before = notifications;
+    unsigned owned = releases;
+    NTSTATUS status = ext4win_prepare_volume_mount_event(&device, &prepared);
+    assert(notifications == before && releases == owned && !vpb_locked);
+    if (status == STATUS_SUCCESS) {
+        assert(prepared == &file && prepared->Vpb == &vpb && vpb.references == 2);
+        status = ext4win_deliver_volume_mount_event(prepared);
+        assert(notifications == before + 1 && releases == owned && vpb.references == 2);
+        ObDereferenceObject(prepared);
+    } else {
+        assert(prepared == NULL && vpb.references == 1);
+    }
+    return status;
+}
 
 int main(void)
 {
-    assert(ext4win_notify_volume_mount(&device) == STATUS_SUCCESS);
+    assert(observe_event() == STATUS_SUCCESS);
     assert(allocations == 1 && notifications == 1 && releases == 1 && vpb.references == 1);
     result = (NTSTATUS)0xc000000d;
-    assert(ext4win_notify_volume_mount(&device) == result);
+    assert(observe_event() == result);
     assert(allocations == 2 && notifications == 2 && releases == 2 && vpb.references == 1);
     raise_notification = 1;
-    assert(ext4win_notify_volume_mount(&device) == result);
+    assert(observe_event() == result);
     assert(allocations == 3 && notifications == 3 && releases == 3 && vpb.references == 1);
     deny = 1;
-    assert(ext4win_notify_volume_mount(&device) == STATUS_INSUFFICIENT_RESOURCES);
+    assert(observe_event() == STATUS_INSUFFICIENT_RESOURCES);
     assert(allocations == 4 && notifications == 3 && releases == 3 && vpb.references == 1);
     deny = 2;
-    assert(ext4win_notify_volume_mount(&device) == STATUS_INSUFFICIENT_RESOURCES);
+    assert(observe_event() == STATUS_INSUFFICIENT_RESOURCES);
     assert(allocations == 5 && notifications == 3 && releases == 3 && vpb.references == 1);
     ExitProcess(0);
 }
