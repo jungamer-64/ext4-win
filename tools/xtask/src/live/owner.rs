@@ -1030,7 +1030,23 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     let remount = (|| -> TaskResult<()> {
         dismount_filesystem(session)?;
         println!("live remount: read through a fresh open while the old handle remains");
-        let readback = fs::read(mount.join("live-ci/alpha.bin"));
+        let path = windows::literal(mount.join("live-ci/alpha.bin").as_os_str())?;
+        let mut requester = Command::new("powershell.exe");
+        requester.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                r"$ErrorActionPreference = 'Stop'
+                  $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+                  $file = [IO.File]::Open({path}, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
+                  try {{
+                      [Console]::Error.WriteLine('fresh open completed')
+                      $file.CopyTo([Console]::OpenStandardOutput())
+                      [Console]::Error.WriteLine('payload read completed')
+                  }} finally {{
+                      $file.Dispose()
+                  }}"
+            ));
+        let readback = windows::bounded(requester, Duration::from_secs(60))
+            .and_then(|outcome| windows::checked_outcome(outcome, "remount readback"));
         match &readback {
             Ok(_) => println!("live remount: fresh-open read completed"),
             Err(error) => println!("live remount: fresh-open read failed: {error}"),
