@@ -2601,6 +2601,14 @@ impl MountOperation {
                     step = operation.drive_step();
                     continue;
                 }
+                MountStep::PrepareDeltas {
+                    mount,
+                    operation,
+                    journal_target,
+                } => {
+                    step = mount.prepare_deltas(operation, journal_target);
+                    continue;
+                }
                 MountStep::Yield(transition) => transition,
             };
             let MountTransition::SubmitLower {
