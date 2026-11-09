@@ -24,7 +24,7 @@ use crate::irp::reactor::{
 use crate::irp::{
     AtomicOplockReservation, CreateCompletion, IrpCompletion, NamespaceOplockPlan,
     NamespaceParentOplock, NamespaceParentOplockEffect, OplockCheck, OplockContinuation, OwnedIrp,
-    PendingIrpLease,
+    PassiveWorkCompletion, PendingIrpLease,
 };
 use crate::kernel::cng::CngOperation;
 use crate::kernel::external_journal::{ExclusiveExternalJournal, ExternalJournalCandidates};
@@ -1298,20 +1298,18 @@ impl ReadRequestOperation {
         OperationTransition::Complete(owned.prepare_result(result))
     }
 
-    /// Acquires fresh read admission after cache or inode dependencies have changed.
-    /// The retained handle/paging stream still owns the same inode, and no file position has been
-    /// published. The new pass can suspend again; committed versions cannot change recursively
-    /// while this actor retains mounted access.
+    /// Discards stale observations while retaining the same handle or paging-stream authority.
+    /// No file position has been published, and committed versions stay stable for this actor turn.
     fn restart_current_read(
-        mut self: Box<Self>,
+        &mut self,
         owned: OwnedIrp,
         access: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
+    ) -> CompletionEvent {
         self.state = ReadOperationState::Running {
             owned,
             read: EpochReadOperation::new(access.mounted_profile()),
         };
-        self.advance_mounted(CompletionEvent::Core(OperationEvent::Admitted), access)
+        CompletionEvent::Core(OperationEvent::Admitted)
     }
 }
 
@@ -1338,84 +1336,69 @@ impl OplockContinuation for ReadRequestOperation {
 impl MountedVolumeOperation for ReadRequestOperation {
     fn advance_mounted(
         mut self: Box<Self>,
-        event: CompletionEvent,
+        mut event: CompletionEvent,
         access: &mut MountedVolumeAccess<'_>,
     ) -> OperationTransition {
-        let state = core::mem::replace(&mut self.state, ReadOperationState::Terminal);
-        let state = match state {
-            ReadOperationState::CheckingOplock { owned, read, check } => {
-                return match event.into_core() {
-                    OperationEvent::Admitted => {
-                        self.state = ReadOperationState::OplockDelegated { read };
-                        OperationTransition::CheckOplock {
-                            check,
-                            owned,
-                            suspended: self,
+        loop {
+            let state = core::mem::replace(&mut self.state, ReadOperationState::Terminal);
+            let (mut owned, read, core_event, cache_prepared) = match (state, event) {
+                (ReadOperationState::CheckingOplock { owned, read, check }, event) => {
+                    return match event.into_core() {
+                        OperationEvent::Admitted => {
+                            self.state = ReadOperationState::OplockDelegated { read };
+                            OperationTransition::CheckOplock {
+                                check,
+                                owned,
+                                suspended: self,
+                            }
                         }
+                        OperationEvent::CancelRequested => {
+                            Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
+                        }
+                        OperationEvent::TimerElapsed
+                        | OperationEvent::StorageCompleted(_)
+                        | OperationEvent::DeviceWriteAccessCompleted(_)
+                        | OperationEvent::DeviceLengthCompleted(_)
+                        | OperationEvent::IntentGranted(_)
+                        | OperationEvent::CommitGranted(_)
+                        | OperationEvent::VisibilityGranted(_)
+                        | OperationEvent::CheckpointGranted(_) => {
+                            Self::complete(owned, Err(DriverError::InternalInvariantViolation))
+                        }
+                    };
+                }
+                (ReadOperationState::OplockReady { owned, read, status }, event) => match event.into_core() {
+                        OperationEvent::Admitted if status >= STATUS_SUCCESS => {
+                            (owned, read, OperationEvent::Admitted, false)
+                        }
+                        OperationEvent::Admitted => {
+                            return Self::complete(owned, Err(DriverError::OplockFailure(status)));
+                        }
+                        OperationEvent::CancelRequested => {
+                            return Self::complete(owned, Err(Error::OperationCancelled.into()));
+                        }
+                        OperationEvent::TimerElapsed
+                        | OperationEvent::StorageCompleted(_)
+                        | OperationEvent::DeviceWriteAccessCompleted(_)
+                        | OperationEvent::DeviceLengthCompleted(_)
+                        | OperationEvent::IntentGranted(_)
+                        | OperationEvent::CommitGranted(_)
+                        | OperationEvent::VisibilityGranted(_)
+                        | OperationEvent::CheckpointGranted(_) => {
+                            return Self::complete(owned, Err(DriverError::InternalInvariantViolation));
+                        }
+                },
+                (
+                    ReadOperationState::Cached { start, requested },
+                    CompletionEvent::PassiveCompleted(PassiveWorkCompletion::Read {
+                        mut owned,
+                        result,
+                    }),
+                ) => {
+                    if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
+                        event = self.restart_current_read(owned, access);
+                        continue;
                     }
-                    OperationEvent::CancelRequested => {
-                        Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
-                    }
-                    OperationEvent::TimerElapsed
-                    | OperationEvent::StorageCompleted(_)
-                    | OperationEvent::DeviceWriteAccessCompleted(_)
-                    | OperationEvent::DeviceLengthCompleted(_)
-                    | OperationEvent::IntentGranted(_)
-                    | OperationEvent::CommitGranted(_)
-                    | OperationEvent::VisibilityGranted(_)
-                    | OperationEvent::CheckpointGranted(_) => {
-                        Self::complete(owned, Err(DriverError::InternalInvariantViolation))
-                    }
-                };
-            }
-            ReadOperationState::OplockReady {
-                owned,
-                read,
-                status,
-            } => {
-                return match event.into_core() {
-                    OperationEvent::Admitted if status >= STATUS_SUCCESS => {
-                        self.state = ReadOperationState::Running { owned, read };
-                        self.advance_mounted(
-                            CompletionEvent::Core(OperationEvent::Admitted),
-                            access,
-                        )
-                    }
-                    OperationEvent::Admitted => {
-                        Self::complete(owned, Err(DriverError::OplockFailure(status)))
-                    }
-                    OperationEvent::CancelRequested => {
-                        Self::complete(owned, Err(DriverError::from(Error::OperationCancelled)))
-                    }
-                    OperationEvent::TimerElapsed
-                    | OperationEvent::StorageCompleted(_)
-                    | OperationEvent::DeviceWriteAccessCompleted(_)
-                    | OperationEvent::DeviceLengthCompleted(_)
-                    | OperationEvent::IntentGranted(_)
-                    | OperationEvent::CommitGranted(_)
-                    | OperationEvent::VisibilityGranted(_)
-                    | OperationEvent::CheckpointGranted(_) => {
-                        Self::complete(owned, Err(DriverError::InternalInvariantViolation))
-                    }
-                };
-            }
-            ReadOperationState::OplockDelegated { .. } => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                    .bugcheck()
-            }
-            state => state,
-        };
-        let (mut owned, read, event, cache_prepared) = match (state, event) {
-            (
-                ReadOperationState::Cached { start, requested },
-                CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Read {
-                    mut owned,
-                    result,
-                }),
-            ) => {
-                if result == Err(DriverError::CacheManagerFailure(STATUS_RETRY)) {
-                    return self.restart_current_read(owned, access);
-                } else {
                     let result = crate::request::file_info::finish_cached_read(
                         owned.request(),
                         start,
@@ -1424,121 +1407,123 @@ impl MountedVolumeOperation for ReadRequestOperation {
                     );
                     return Self::complete(owned, result);
                 }
-            }
-            (
-                ReadOperationState::Purging { owned, read },
-                CompletionEvent::PassiveCompleted(crate::irp::PassiveWorkCompletion::Purge(result)),
-            ) => match result {
-                Ok(()) => (owned, read, OperationEvent::Admitted, true),
-                Err(DriverError::CacheManagerFailure(STATUS_RETRY)) => {
-                    return self.restart_current_read(owned, access);
-                }
-                Err(error) => {
-                    record_cache_coherency_failure(error, access);
-                    return Self::complete(owned, Err(error));
-                }
-            },
-            (ReadOperationState::Running { owned, read }, event) => {
-                (owned, read, event.into_core(), false)
-            }
-            _ => {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                    .bugcheck()
-            }
-        };
-        if !cache_prepared
-            && matches!(event, OperationEvent::Admitted)
-            && matches!(self.request, PreparedReadRequest::Data(_))
-        {
-            let PreparedReadRequest::Data(authority) = &self.request else {
-                crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
-                    .bugcheck()
-            };
-            let plan = match crate::request::file_info::prepare_read_cache_plan(
-                owned.request(),
-                authority,
-                access,
-            ) {
-                Ok(plan) => plan,
-                Err(error) => return Self::complete(owned, Err(error)),
-            };
-            match plan {
-                crate::request::file_info::ReadCachePlan::Cached {
-                    file_object,
-                    offset,
-                    start,
-                    requested,
-                } => {
-                    self.state = ReadOperationState::Cached { start, requested };
-                    return OperationTransition::SubmitPassiveWork {
-                        work: crate::irp::PassiveWork::Read {
-                            file_object,
-                            owned,
-                            offset,
-                            length: requested,
-                        },
-                        suspended: self,
-                    };
-                }
-                crate::request::file_info::ReadCachePlan::PurgeBeforeDirect(work) => {
-                    self.state = ReadOperationState::Purging { owned, read };
-                    return OperationTransition::SubmitPassiveWork {
-                        work,
-                        suspended: self,
-                    };
-                }
-                crate::request::file_info::ReadCachePlan::Direct => {}
-            }
-        }
-        let request = &self.request;
-        let transition = access.with_metadata_cache(|cache, access| {
-            read.run(
-                event,
-                match access.committed_read(cache) {
-                    Ok(context) => context,
-                    Err(error) => return ReadTransition::Complete(Ok(Err(error))),
-                },
-                &mut self.crypto,
-                |pass| match Self::execute_pass(request, &mut owned, access, pass) {
-                    Err(DriverError::Core(Error::OperationSuspended)) => {
-                        Err(Error::OperationSuspended)
+                (
+                    ReadOperationState::Purging { owned, read },
+                    CompletionEvent::PassiveCompleted(PassiveWorkCompletion::Purge(result)),
+                ) => match result {
+                    Ok(()) => (owned, read, OperationEvent::Admitted, true),
+                    Err(DriverError::CacheManagerFailure(STATUS_RETRY)) => {
+                        event = self.restart_current_read(owned, access);
+                        continue;
                     }
-                    result => Ok(result),
+                    Err(error) => {
+                        record_cache_coherency_failure(error, access);
+                        return Self::complete(owned, Err(error));
+                    }
                 },
-            )
-        });
-        match transition {
-            ReadTransition::SubmitLower { request, suspended } => {
-                self.state = ReadOperationState::Running {
-                    owned,
-                    read: suspended,
+                (ReadOperationState::Running { owned, read }, event) => {
+                    (owned, read, event.into_core(), false)
+                }
+                _ => {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                        .bugcheck()
+                }
+            };
+            if !cache_prepared
+                && matches!(core_event, OperationEvent::Admitted)
+                && matches!(self.request, PreparedReadRequest::Data(_))
+            {
+                let PreparedReadRequest::Data(authority) = &self.request else {
+                    crate::kernel::fatal::KernelWideInconsistency::completion_reactor_state_corruption()
+                    .bugcheck()
                 };
-                OperationTransition::SubmitLower {
-                    devices: self.devices,
-                    request,
-                    suspended: self,
+                let plan = match crate::request::file_info::prepare_read_cache_plan(
+                    owned.request(),
+                    authority,
+                    access,
+                ) {
+                    Ok(plan) => plan,
+                    Err(error) => return Self::complete(owned, Err(error)),
+                };
+                match plan {
+                    crate::request::file_info::ReadCachePlan::Cached {
+                        file_object,
+                        offset,
+                        start,
+                        requested,
+                    } => {
+                        self.state = ReadOperationState::Cached { start, requested };
+                        return OperationTransition::SubmitPassiveWork {
+                            work: crate::irp::PassiveWork::Read {
+                                file_object,
+                                owned,
+                                offset,
+                                length: requested,
+                            },
+                            suspended: self,
+                        };
+                    }
+                    crate::request::file_info::ReadCachePlan::PurgeBeforeDirect(work) => {
+                        self.state = ReadOperationState::Purging { owned, read };
+                        return OperationTransition::SubmitPassiveWork {
+                            work,
+                            suspended: self,
+                        };
+                    }
+                    crate::request::file_info::ReadCachePlan::Direct => {}
                 }
             }
-            ReadTransition::Complete(Ok(result)) => {
-                if self.request.is_paging() {
-                    access
-                        .operational_trace()
-                        .record_result(OperationalPath::PagingRead, &result);
+            let request = &self.request;
+            let transition = access.with_metadata_cache(|cache, access| {
+                read.run(
+                    core_event,
+                    match access.committed_read(cache) {
+                        Ok(context) => context,
+                        Err(error) => return ReadTransition::Complete(Ok(Err(error))),
+                    },
+                    &mut self.crypto,
+                    |pass| match Self::execute_pass(request, &mut owned, access, pass) {
+                        Err(DriverError::Core(Error::OperationSuspended)) => {
+                            Err(Error::OperationSuspended)
+                        }
+                        result => Ok(result),
+                    },
+                )
+            });
+            return match transition {
+                ReadTransition::SubmitLower { request, suspended } => {
+                    self.state = ReadOperationState::Running {
+                        owned,
+                        read: suspended,
+                    };
+                    OperationTransition::SubmitLower {
+                        devices: self.devices,
+                        request,
+                        suspended: self,
+                    }
                 }
-                Self::complete(owned, result)
-            }
-            ReadTransition::Complete(Err(error)) => {
-                if error == Error::ReadConflict {
-                    return self.restart_current_read(owned, access);
+                ReadTransition::Complete(Ok(result)) => {
+                    if self.request.is_paging() {
+                        access
+                            .operational_trace()
+                            .record_result(OperationalPath::PagingRead, &result);
+                    }
+                    Self::complete(owned, result)
                 }
-                let result = Err(DriverError::from(error));
-                if self.request.is_paging() {
-                    access
-                        .operational_trace()
-                        .record_result::<IrpCompletion>(OperationalPath::PagingRead, &result);
+                ReadTransition::Complete(Err(error)) => {
+                    if error == Error::ReadConflict {
+                        event = self.restart_current_read(owned, access);
+                        continue;
+                    }
+                    let result = Err(DriverError::from(error));
+                    if self.request.is_paging() {
+                        access
+                            .operational_trace()
+                            .record_result::<IrpCompletion>(OperationalPath::PagingRead, &result);
+                    }
+                    Self::complete(owned, result)
                 }
-                Self::complete(owned, result)
-            }
+            };
         }
     }
 

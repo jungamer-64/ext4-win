@@ -26,8 +26,6 @@ enum MdlState {
         /// Native break outcome that gates subsequent page acquisition.
         status: wdk_sys::NTSTATUS,
     },
-    /// The request has not crossed a Cache Manager effect boundary.
-    Ready(OwnedIrp),
     /// The worker owns the MDL operation; cancellation cannot discard its result or chain.
     Executing {
         /// Completion notifications never publish a user data cursor.
@@ -196,16 +194,13 @@ impl MountedVolumeOperation for MdlOperation {
             (
                 MdlState::Returned { owned, status },
                 CompletionEvent::Core(OperationEvent::Admitted),
+            ) if status < STATUS_SUCCESS => OperationTransition::Complete(
+                owned.prepare_result(Err(DriverError::OplockFailure(status))),
+            ),
+            (
+                MdlState::Returned { mut owned, .. },
+                CompletionEvent::Core(OperationEvent::Admitted),
             ) => {
-                if status < STATUS_SUCCESS {
-                    return OperationTransition::Complete(
-                        owned.prepare_result(Err(DriverError::OplockFailure(status))),
-                    );
-                }
-                self.state = MdlState::Ready(owned);
-                self.advance_mounted(CompletionEvent::Core(OperationEvent::Admitted), access)
-            }
-            (MdlState::Ready(mut owned), CompletionEvent::Core(OperationEvent::Admitted)) => {
                 let (file_object, transfer, cursor) = match self.prepare(&mut owned, access) {
                     Ok(work) => work,
                     Err(error) => {
@@ -220,9 +215,7 @@ impl MountedVolumeOperation for MdlOperation {
                 }
             }
             (
-                MdlState::Ready(owned)
-                | MdlState::Checking { owned, .. }
-                | MdlState::Returned { owned, .. },
+                MdlState::Checking { owned, .. } | MdlState::Returned { owned, .. },
                 CompletionEvent::Core(OperationEvent::CancelRequested),
             ) => OperationTransition::Complete(
                 owned.prepare_result(Err(DriverError::from(Error::OperationCancelled))),
