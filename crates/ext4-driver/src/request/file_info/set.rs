@@ -55,8 +55,21 @@ pub(crate) fn prepare_paging_extension(
     .map(Some)
 }
 
-/// Applies one supported set-file-information class.
+/// Captured set-information input dispatched before entering a filesystem edit.
 enum SetFilePlan {
+    /// Classes handled by the ordinary set-information executor.
+    Ordinary(OrdinarySetFilePlan),
+    /// Commit one fully owned namespace rename.
+    Rename {
+        /// Caller-independent rename domain values.
+        mutation: RenameMutation,
+        /// Stable CCB receiving the new location only after durable commit.
+        file_object: crate::state::KernelFileObject,
+    },
+}
+
+/// Captured inputs for ordinary set-information operations.
+enum OrdinarySetFilePlan {
     /// The request completed entirely while decoding its synchronous control-plane mutation.
     Complete,
     /// Apply timestamps and overlay attributes to one node.
@@ -110,13 +123,6 @@ enum SetFilePlan {
     Link {
         /// Caller-independent hard-link domain values.
         mutation: HardLinkMutation,
-    },
-    /// Commit one fully owned namespace rename.
-    Rename {
-        /// Caller-independent rename domain values.
-        mutation: RenameMutation,
-        /// Stable CCB receiving the new location only after durable commit.
-        file_object: crate::state::KernelFileObject,
     },
 }
 
@@ -305,6 +311,8 @@ fn publish_timestamp_policy(request: &mut PendingIrpLease<'_>, policy: HandleTim
 }
 
 /// Captures the caller's selected operation before filesystem staging begins.
+/// # Errors
+/// Rejects invalid request layout, input, access, or paging-file operation.
 #[inline(never)]
 fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFilePlan> {
     request.with_active(|active| {
@@ -339,16 +347,18 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
                         if storage.initialized_length() != initialized {
                             return Err(DriverError::InternalInvariantViolation);
                         }
-                        return Ok(SetFilePlan::PagingEndOfFile {
-                            file: regular.id(),
-                            size: requested,
-                            initialized: storage,
-                        });
+                        return Ok(SetFilePlan::Ordinary(
+                            OrdinarySetFilePlan::PagingEndOfFile {
+                                file: regular.id(),
+                                size: requested,
+                                initialized: storage,
+                            },
+                        ));
                     }
                     if requested != initialized {
                         return Err(DriverError::NotSupported);
                     }
-                    return Ok(SetFilePlan::Complete);
+                    return Ok(SetFilePlan::Ordinary(OrdinarySetFilePlan::Complete));
                 }
                 SetFileOperation::Basic
                 | SetFileOperation::Position
@@ -365,7 +375,7 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
                 }
                 let info = read_basic_information_input(active, stack.length())?;
                 let times = BasicTimeUpdates::decode(info)?;
-                SetFilePlan::Basic {
+                OrdinarySetFilePlan::Basic {
                     times,
                     policy: opened_file.timestamp_policy(),
                     attributes: info.FileAttributes,
@@ -374,12 +384,12 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
             }
             SetFileOperation::Position => {
                 set_position_information(active, stack, &mut opened_file)?;
-                SetFilePlan::Complete
+                OrdinarySetFilePlan::Complete
             }
             SetFileOperation::Resize => {
                 let end_of_file = read_end_of_file_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
-                SetFilePlan::EndOfFile {
+                OrdinarySetFilePlan::EndOfFile {
                     file: regular_file.id(),
                     size: file_size_from_large_integer(end_of_file)?,
                 }
@@ -390,7 +400,7 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
             SetFileOperation::Allocation => {
                 let allocation_size = read_allocation_size_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
-                SetFilePlan::Allocation {
+                OrdinarySetFilePlan::Allocation {
                     file: regular_file.id(),
                     size: FileAllocationSize::from_bytes(
                         file_size_from_large_integer(allocation_size)?.bytes(),
@@ -406,7 +416,7 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
                 &opened_file,
                 DispositionInputFormat::Extended,
             )?,
-            SetFileOperation::Link(parent) => SetFilePlan::Link {
+            SetFileOperation::Link(parent) => OrdinarySetFilePlan::Link {
                 mutation: HardLinkMutation::decode(
                     active,
                     stack,
@@ -415,7 +425,7 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
                     parent,
                 )?,
             },
-            SetFileOperation::LinkEx(parent) => SetFilePlan::Link {
+            SetFileOperation::LinkEx(parent) => OrdinarySetFilePlan::Link {
                 mutation: HardLinkMutation::decode(
                     active,
                     stack,
@@ -424,34 +434,38 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
                     parent,
                 )?,
             },
-            SetFileOperation::Rename(parent) => SetFilePlan::Rename {
-                mutation: RenameMutation::decode(
-                    active,
-                    stack,
-                    &opened_file,
-                    RenameInformationFormat::ReplaceIfExistsByte,
-                    parent,
-                )?,
-                file_object: opened_file.file_object(),
-            },
-            SetFileOperation::RenameEx(parent) => SetFilePlan::Rename {
-                mutation: RenameMutation::decode(
-                    active,
-                    stack,
-                    &opened_file,
-                    RenameInformationFormat::Flags,
-                    parent,
-                )?,
-                file_object: opened_file.file_object(),
-            },
+            SetFileOperation::Rename(parent) => {
+                return Ok(SetFilePlan::Rename {
+                    mutation: RenameMutation::decode(
+                        active,
+                        stack,
+                        &opened_file,
+                        RenameInformationFormat::ReplaceIfExistsByte,
+                        parent,
+                    )?,
+                    file_object: opened_file.file_object(),
+                });
+            }
+            SetFileOperation::RenameEx(parent) => {
+                return Ok(SetFilePlan::Rename {
+                    mutation: RenameMutation::decode(
+                        active,
+                        stack,
+                        &opened_file,
+                        RenameInformationFormat::Flags,
+                        parent,
+                    )?,
+                    file_object: opened_file.file_object(),
+                });
+            }
         };
-        Ok::<_, DriverError>(plan)
+        Ok(SetFilePlan::Ordinary(plan))
     })
 }
 
 /// Applies one supported set-file-information class.
 ///
-/// The input decoder releases its scratch before the plan touches the filesystem.
+/// Rename resolution releases its scratch before any namespace edits are staged.
 /// # Errors
 ///
 /// Returns an error when the selected set-information class has invalid input or its ext4 metadata
@@ -484,39 +498,80 @@ pub(super) fn set_file_information(
         pending.publish(operations);
         return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
     }
-    let plan = decode_set_file_plan(&mut request)?;
-    match plan {
-        SetFilePlan::Complete => {
-            return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
+    match decode_set_file_plan(&mut request)? {
+        SetFilePlan::Ordinary(plan) => apply_set_file_plan(
+            plan,
+            &mut request,
+            operations,
+            mutation,
+            pending_disposition,
+            namespace_oplocks,
+            mapping,
+        ),
+        SetFilePlan::Rename {
+            mutation: rename,
+            file_object,
+        } => {
+            let Some(prepared) =
+                PreparedRenameMutation::prepare(rename, operations, mutation, &request, mapping)?
+            else {
+                return Ok(SetFileResolution::Mutation(SetFilePublication::None));
+            };
+            if namespace_oplocks != Some(prepared.oplocks) {
+                return Ok(SetFileResolution::CheckNamespaceOplocks(prepared.oplocks));
+            }
+            Ok(SetFileResolution::Mutation(prepared.apply(
+                mutation,
+                &mut request,
+                file_object,
+            )?))
         }
-        SetFilePlan::Basic {
+    }
+}
+
+/// Applies the set-information classes that share the ordinary mutation frame.
+/// # Errors
+/// Returns metadata validation, namespace admission or staging failure.
+#[inline(never)]
+fn apply_set_file_plan(
+    plan: OrdinarySetFilePlan,
+    request: &mut PendingIrpLease<'_>,
+    operations: &mut MountedVolumeAccess<'_>,
+    mutation: &mut DriverMutationPass<'_, '_, '_>,
+    pending_disposition: &mut Option<PendingDispositionDeletion>,
+    namespace_oplocks: Option<NamespaceOplockPlan>,
+    mapping: &ext4_security::IdentityMap,
+) -> DriverResult<SetFileResolution> {
+    let resolution = match plan {
+        OrdinarySetFilePlan::Complete => SetFileResolution::Complete(IrpCompletion::EMPTY),
+        OrdinarySetFilePlan::Basic {
             times,
             policy,
             attributes,
             node,
-        } => {
-            return Ok(
-                match apply_basic_information(times, policy, attributes, node, mutation)? {
-                    BasicMetadataEffect::Unchanged => {
-                        publish_timestamp_policy(&mut request, times.policy(policy));
-                        SetFileResolution::Complete(IrpCompletion::EMPTY)
-                    }
-                    BasicMetadataEffect::Staged => SetFileResolution::Mutation(
-                        SetFilePublication::Timestamps(times.policy(policy)),
-                    ),
-                },
-            );
+        } => match apply_basic_information(times, policy, attributes, node, mutation)? {
+            BasicMetadataEffect::Unchanged => {
+                publish_timestamp_policy(request, times.policy(policy));
+                SetFileResolution::Complete(IrpCompletion::EMPTY)
+            }
+            BasicMetadataEffect::Staged => {
+                SetFileResolution::Mutation(SetFilePublication::Timestamps(times.policy(policy)))
+            }
+        },
+        OrdinarySetFilePlan::EndOfFile { file, size } => {
+            set_regular_file_size(mutation, file, size)?;
+            SetFileResolution::Mutation(SetFilePublication::None)
         }
-        SetFilePlan::EndOfFile { file, size } => set_regular_file_size(mutation, file, size)?,
-        SetFilePlan::PagingEndOfFile {
+        OrdinarySetFilePlan::PagingEndOfFile {
             file,
             size,
             initialized,
         } => {
             let file = mutation.file(file)?;
             mutation.set_contiguous_file_eof(file, size, initialized)?;
+            SetFileResolution::Mutation(SetFilePublication::None)
         }
-        SetFilePlan::Allocation { file, size } => {
+        OrdinarySetFilePlan::Allocation { file, size } => {
             let current = regular_file_size(mutation, file)?;
             let change =
                 AllocationChange::new(size, current, operations.volume_geometry().cluster_size())?;
@@ -525,11 +580,9 @@ pub(super) fn set_file_information(
             }
             let file = mutation.file(file)?;
             mutation.set_file_allocation(file, change.allocation)?;
-            return Ok(SetFileResolution::Mutation(
-                SetFilePublication::ReserveAllocation,
-            ));
+            SetFileResolution::Mutation(SetFilePublication::ReserveAllocation)
         }
-        SetFilePlan::Disposition {
+        OrdinarySetFilePlan::Disposition {
             fcb,
             node,
             pending,
@@ -546,42 +599,28 @@ pub(super) fn set_file_information(
             };
             if matches!(node, NodeId::File(_)) {
                 *pending_disposition = Some(pending);
-                return Ok(SetFileResolution::PrepareDeletion { fcb, node });
+                SetFileResolution::PrepareDeletion { fcb, node }
+            } else {
+                pending.publish(operations);
+                SetFileResolution::Complete(IrpCompletion::EMPTY)
             }
-            pending.publish(operations);
-            return Ok(SetFileResolution::Complete(IrpCompletion::EMPTY));
         }
-        SetFilePlan::Link { mutation: link } => {
+        OrdinarySetFilePlan::Link { mutation: link } => {
             let prepared =
-                PreparedHardLinkMutation::prepare(link, operations, mutation, &request, mapping)?;
+                PreparedHardLinkMutation::prepare(link, operations, mutation, request, mapping)?;
             let oplocks = prepared.oplock_plan();
             if namespace_oplocks != Some(oplocks) {
-                return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
+                SetFileResolution::CheckNamespaceOplocks(oplocks)
+            } else {
+                let (location, changes) = prepared.apply(mutation)?;
+                SetFileResolution::Mutation(SetFilePublication::HardLink {
+                    location,
+                    notifications: changes,
+                })
             }
-            let (location, changes) = prepared.apply(mutation)?;
-            return Ok(SetFileResolution::Mutation(SetFilePublication::HardLink {
-                location,
-                notifications: changes,
-            }));
         }
-        SetFilePlan::Rename {
-            mutation: rename,
-            file_object,
-        } => {
-            let prepared =
-                PreparedRenameMutation::prepare(rename, operations, mutation, &request, mapping)?;
-            if let Some(oplocks) = prepared.oplock_plan()
-                && namespace_oplocks != Some(oplocks)
-            {
-                return Ok(SetFileResolution::CheckNamespaceOplocks(oplocks));
-            }
-            return Ok(SetFileStep::StageRename {
-                mutation: prepared,
-                file_object,
-            });
-        }
-    }
-    Ok(SetFileResolution::Mutation(SetFilePublication::None))
+    };
+    Ok(resolution)
 }
 
 /// Windows allocation requests select a cluster-rounded reservation and may shrink EOF only to
@@ -1046,7 +1085,7 @@ fn disposition_plan(
     stack: SetFileStack,
     opened: &OpenedObject<'_>,
     format: DispositionInputFormat,
-) -> DriverResult<SetFilePlan> {
+) -> DriverResult<OrdinarySetFilePlan> {
     opened.require_delete_access()?;
     let request = match format {
         DispositionInputFormat::Legacy => {
@@ -1071,7 +1110,7 @@ fn disposition_plan(
             {
                 opened.clear_delete_pending();
             }
-            Ok(SetFilePlan::Complete)
+            Ok(OrdinarySetFilePlan::Complete)
         }
         FileDispositionAction::Delete(readonly) => {
             if opened.file_control_block().is_paging_file() {
@@ -1088,7 +1127,7 @@ fn disposition_plan(
                     DeletePendingPublication::AlreadyPublishedByCreate,
                 ),
             };
-            Ok(SetFilePlan::Disposition {
+            Ok(OrdinarySetFilePlan::Disposition {
                 fcb: opened.file_control_block_address(),
                 node: opened.node(),
                 pending,
@@ -1312,7 +1351,6 @@ impl PreparedHardLinkMutation {
     /// # Errors
     ///
     /// Returns a target-resolution, replacement-policy, link-limit, metadata, or allocation error.
-    #[inline(never)]
     fn prepare(
         request: HardLinkMutation,
         operations: &mut MountedVolumeAccess<'_>,
@@ -1682,50 +1720,28 @@ enum RenameLinkPublication {
     },
 }
 
-/// Result of a committed rename with mutually exclusive no-op and changed states.
-enum PreparedRename {
-    /// The transaction preserved the existing handle location and emitted no notifications.
-    Unchanged,
-    /// The committed namespace move requires one handle-location update and exact notifications.
-    Changed {
-        /// New CCB location.
-        location: RenameLinkPublication,
-        /// Namespace notifications derived before commit.
-        notifications: RenameDirectoryNameChanges,
-    },
-}
-
-/// Fully resolved rename staged only after its exact parent oplock plan is authorized.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "the bounded rename plan retains its prepared publication inline without another fallible allocation"
-)]
-enum PreparedRenameMutation {
-    /// Source and target identify the same effective namespace entry.
-    Unchanged,
-    /// Exact source, target, and publication state for a non-no-op rename.
-    Changed {
-        /// Source directory before the rename.
-        source_parent: DirectoryNodeId,
-        /// Exact source spelling retained by the opened handle.
-        source_name: Ext4Name,
-        /// Exact inode whose source link is moved or removed.
-        source_node: NodeId,
-        /// Destination directory resolved in the current epoch.
-        target_parent: DirectoryNodeId,
-        /// Exact destination spelling.
-        target_name: Ext4Name,
-        /// Exact occupied entry selected for replacement, or a verified vacant destination.
-        destination: RenameNamespaceAction,
-        /// Parent-directory oplock effects derived from the resolved target state.
-        oplocks: NamespaceOplockPlan,
-        /// New handle location published only after durable commit.
-        location: OpenedLocation,
-        /// Fully allocated post-commit notification sequence.
-        notifications: RenameDirectoryNameChanges,
-        /// Advisory destination metadata retained until the same mutation can apply it.
-        tunneled: Option<crate::kernel::name_tunnel::TunneledName>,
-    },
+/// Resolved operands for a rename that changes the namespace.
+struct PreparedRenameMutation {
+    /// Source directory before the rename.
+    source_parent: DirectoryNodeId,
+    /// Exact source spelling retained by the opened handle.
+    source_name: Ext4Name,
+    /// Exact inode whose source link is moved or removed.
+    source_node: NodeId,
+    /// Destination directory resolved in the current epoch.
+    target_parent: DirectoryNodeId,
+    /// Exact destination spelling.
+    target_name: Ext4Name,
+    /// Exact occupied entry selected for replacement, or a verified vacant destination.
+    destination: RenameNamespaceAction,
+    /// Parent-directory oplock effects derived from the resolved target state.
+    oplocks: NamespaceOplockPlan,
+    /// New handle location published only after durable commit.
+    location: OpenedLocation,
+    /// Fully allocated post-commit notification sequence.
+    notifications: RenameDirectoryNameChanges,
+    /// Advisory destination metadata retained until the same mutation can apply it.
+    tunneled: Option<crate::kernel::name_tunnel::TunneledName>,
 }
 
 impl PreparedRenameMutation {
@@ -1741,7 +1757,7 @@ impl PreparedRenameMutation {
         read: &mut impl CommittedReadPass,
         owned: &PendingIrpLease<'_>,
         mapping: &ext4_security::IdentityMap,
-    ) -> DriverResult<Self> {
+    ) -> DriverResult<Option<Self>> {
         let RenameMutation {
             source_parent,
             source_name,
@@ -1754,7 +1770,7 @@ impl PreparedRenameMutation {
         operations.ensure_directory_openable(source_parent)?;
         operations.ensure_directory_openable(target_parent)?;
         if source_parent == target_parent && source_name == target_name {
-            return Ok(Self::Unchanged);
+            return Ok(None);
         }
         let parent = read.load_directory(target_parent)?;
         let target = crate::namespace::lookup_child(
@@ -1906,7 +1922,7 @@ impl PreparedRenameMutation {
         } else {
             None
         };
-        Ok(Self::Changed {
+        Ok(Some(Self {
             source_parent,
             source_name,
             source_node,
@@ -1920,23 +1936,21 @@ impl PreparedRenameMutation {
             },
             notifications,
             tunneled,
-        })
-    }
-
-    /// Exact parent-directory authority needed by a non-no-op rename.
-    const fn oplock_plan(&self) -> Option<NamespaceOplockPlan> {
-        match self {
-            Self::Unchanged => None,
-            Self::Changed { oplocks, .. } => Some(*oplocks),
-        }
+        }))
     }
 
     /// Stages the authorized rename and returns its allocation-free publication state.
     /// # Errors
     ///
     /// Returns an error when the epoch state changed or the ext4 transaction cannot stage writes.
-    fn apply(self, mutation: &mut DriverMutationPass<'_, '_, '_>) -> DriverResult<PreparedRename> {
-        let Self::Changed {
+    #[inline(never)]
+    fn apply(
+        self,
+        mutation: &mut DriverMutationPass<'_, '_, '_>,
+        request: &mut PendingIrpLease<'_>,
+        file_object: crate::state::KernelFileObject,
+    ) -> DriverResult<SetFilePublication> {
+        let Self {
             source_parent,
             source_name,
             source_node,
@@ -1947,10 +1961,7 @@ impl PreparedRenameMutation {
             notifications,
             tunneled,
             ..
-        } = self
-        else {
-            return Ok(PreparedRename::Unchanged);
-        };
+        } = self;
         let target_parent_id = target_parent;
         let alias = crate::short_name::prepare(
             mutation,
@@ -2015,8 +2026,8 @@ impl PreparedRenameMutation {
                 ),
             )?;
         }
-        Ok(PreparedRename::Changed {
-            location,
+        Ok(SetFilePublication::Rename {
+            location: request_location_publication(request, file_object, location)?,
             notifications,
         })
     }
