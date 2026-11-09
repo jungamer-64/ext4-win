@@ -22,9 +22,17 @@ const FATAL_BUGCHECK_ALLOWLIST: &[&str] =
 /// Release boundary whose complete reachable graph must remain allocation-free after durability.
 const DURABLE_PUBLISH_ROOT: &str = "<ext4win::state::volume::MountedVolumeAccess>::publish_durable";
 
-/// Mutation phases whose preparation scratch is exclusive within one executor turn.
+/// Operation phases whose preparation scratch is exclusive within one executor turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum MutationExecutionPhase {
+enum OperationStackPhase {
+    /// Mount ownership and state selection before replay preparation.
+    MountDispatch,
+    /// Private Fast Commit replay preparation.
+    MountDeltaReplay,
+    /// Resolves names and publication for a rename.
+    RenameResolve,
+    /// Stages a resolved rename after parent-directory oplock admission.
+    RenameEdit,
     /// Concrete event integration without mutation preparation.
     Event,
     /// Read-only resolution against one retained epoch.
@@ -35,15 +43,46 @@ enum MutationExecutionPhase {
     Commit,
 }
 
-impl MutationExecutionPhase {
+impl OperationStackPhase {
     /// Identifies independently framed continuations in the emitted driver.
     fn from_display(display: &str) -> Option<Self> {
+        if let Some(method) =
+            display.strip_prefix("<ext4win::request::file_info::set::PreparedRenameMutation>::")
+        {
+            return match method.split("::").next()? {
+                "prepare" => Some(Self::RenameResolve),
+                "apply" => Some(Self::RenameEdit),
+                _ => None,
+            };
+        }
+        if let Some(method) = display.strip_prefix("<ext4_core::volume::mount::MountOperation>::") {
+            return match method {
+                "drive_step" => Some(Self::MountDispatch),
+                "prepare_deltas" => Some(Self::MountDeltaReplay),
+                _ => None,
+            };
+        }
         match display.strip_prefix("<ext4win::request::operation::MutationRequestOperation>::")? {
             "advance_event" => Some(Self::Event),
             "advance_resolution" | "resolve_event" => Some(Self::Resolve),
             "reserve_mutation" => Some(Self::Reserve),
             "prepare_commit" => Some(Self::Commit),
             _ => None,
+        }
+    }
+
+    /// Sibling phases of one executor cannot keep each other's frames live.
+    fn conflicts_with(self, callee: Self) -> bool {
+        match (self, callee) {
+            (Self::MountDispatch, Self::MountDeltaReplay)
+            | (Self::MountDeltaReplay, Self::MountDispatch)
+            | (Self::RenameResolve, Self::RenameEdit)
+            | (Self::RenameEdit, Self::RenameResolve) => true,
+            (
+                Self::Event | Self::Resolve | Self::Reserve | Self::Commit,
+                Self::Event | Self::Resolve | Self::Reserve | Self::Commit,
+            ) => self != callee,
+            _ => false,
         }
     }
 }
@@ -1581,18 +1620,21 @@ impl IrModule {
     fn audit_operation_stack(&self, violations: &mut Vec<Violation>) -> GateResult<()> {
         for (root, function) in &self.functions {
             let display = function.display.as_str();
-            let mutation_phase = MutationExecutionPhase::from_display(display);
-            if !(display.starts_with("<ext4_core::volume::mount::MountOperation>::")
-                || display.starts_with(
-                    "<ext4win::request::operation::directory::DirectoryRequestOperation>::",
+            let phase = OperationStackPhase::from_display(display);
+            let owner = display
+                .strip_prefix('<')
+                .and_then(|display| display.split_once(">::"))
+                .map(|(owner, _)| owner.split_once(" as ").map_or(owner, |(owner, _)| owner));
+            if phase.is_none()
+                && !matches!(
+                    owner,
+                    Some(
+                        "ext4_core::volume::mount::MountOperation"
+                            | "ext4win::request::operation::directory::DirectoryRequestOperation"
+                            | "ext4win::request::operation::ReadRequestOperation"
+                            | "ext4win::request::operation::mdl::MdlOperation"
+                    )
                 )
-                || display.starts_with(
-                    "<ext4win::request::operation::directory::DirectoryRequestOperation as ext4win::irp::reactor::MountedVolumeOperation>::",
-                )
-                || display.starts_with(
-                    "<ext4win::request::operation::directory::DirectoryRequestOperation as ext4win::irp::reactor::CompletionOperation>::",
-                )
-                || mutation_phase.is_some())
             {
                 continue;
             }
@@ -1617,19 +1659,15 @@ impl IrModule {
                         });
                         break 'search;
                     }
-                    if let Some(phase) = mutation_phase
-                        && self.functions.get(callee).is_some_and(|function| {
-                            MutationExecutionPhase::from_display(&function.display)
-                                .is_some_and(|callee_phase| callee_phase != phase)
-                        })
+                    if let Some(phase) = phase
+                        && let Some(callee) = self.functions.get(callee)
+                        && OperationStackPhase::from_display(&callee.display)
+                            .is_some_and(|callee_phase| phase.conflicts_with(callee_phase))
                     {
                         let mut path = display_path(&caller, &predecessors, &self.functions)?;
-                        let callee = self.functions.get(callee).ok_or_else(|| {
-                            GateError::InvalidIr("mutation execution phase is absent".into())
-                        })?;
                         path.push(callee.display.clone());
                         violations.push(Violation {
-                            category: "nested mutation execution phases",
+                            category: "nested operation execution phases",
                             path,
                         });
                         break 'search;
@@ -3013,6 +3051,16 @@ mod tests {
                 "define internal void @phase() {\n  call void @operation()\n  ret void\n}\n",
             ),
             (
+                "<ext4win::request::operation::ReadRequestOperation as ext4win::irp::reactor::MountedVolumeOperation>::advance_mounted",
+                "phase",
+                "define internal void @phase() {\n  call void @operation()\n  ret void\n}\n",
+            ),
+            (
+                "<ext4win::request::operation::mdl::MdlOperation as ext4win::irp::reactor::MountedVolumeOperation>::advance_mounted",
+                "operation",
+                "",
+            ),
+            (
                 "<ext4win::request::operation::MutationRequestOperation>::prepare_commit",
                 "alias",
                 "@alias = internal alias void (), ptr @phase\n\
@@ -3064,28 +3112,44 @@ mod tests {
         )
     }
 
-    /// Acyclic phase nesting still retains both preparation frames beneath commit serialization.
+    /// Acyclic phase nesting still retains both preparation frames.
     /// # Errors
     /// Returns malformed fixtures or failure to report the crossing between execution phases.
     #[test]
-    fn mutation_preparation_returns_to_its_executor() -> Result<(), GateError> {
-        let module = IrModule::parse(
-            "define void @DriverEntry() {\n  call void @event()\n  ret void\n}\n\
-             ; <ext4win::request::operation::MutationRequestOperation>::advance_event\n\
-             define internal void @event() {\n  call void @commit()\n  ret void\n}\n\
-             ; <ext4win::request::operation::MutationRequestOperation>::prepare_commit\n\
-             define internal void @commit() {\n  ret void\n}\n",
-        )?;
-        let mut violations = Vec::new();
-        module.audit_operation_stack(&mut violations)?;
-        require(
-            violations.len() == 1
-                && violations.first().is_some_and(|violation| {
-                    violation.category == "nested mutation execution phases"
-                        && violation.path.len() == 2
-                }),
-            "nested mutation preparation was accepted",
-        )
+    fn preparation_returns_to_its_executor() -> Result<(), GateError> {
+        for (dispatch, prepare) in [
+            (
+                "<ext4win::request::operation::MutationRequestOperation>::advance_event",
+                "<ext4win::request::operation::MutationRequestOperation>::prepare_commit",
+            ),
+            (
+                "<ext4_core::volume::mount::MountOperation>::drive_step",
+                "<ext4_core::volume::mount::MountOperation>::prepare_deltas",
+            ),
+            (
+                "<ext4win::request::file_info::set::PreparedRenameMutation>::prepare::<pass>",
+                "<ext4win::request::file_info::set::PreparedRenameMutation>::apply",
+            ),
+        ] {
+            let module = IrModule::parse(&format!(
+                "define void @DriverEntry() {{\n  call void @dispatch()\n  ret void\n}}\n\
+                 ; {dispatch}\n\
+                 define internal void @dispatch() {{\n  call void @prepare()\n  ret void\n}}\n\
+                 ; {prepare}\n\
+                 define internal void @prepare() {{\n  ret void\n}}\n",
+            ))?;
+            let mut violations = Vec::new();
+            module.audit_operation_stack(&mut violations)?;
+            require(
+                violations.len() == 1
+                    && violations.first().is_some_and(|violation| {
+                        violation.category == "nested operation execution phases"
+                            && violation.path == [dispatch, prepare]
+                    }),
+                "nested operation preparation was accepted",
+            )?;
+        }
+        Ok(())
     }
 
     /// Unreachable language-item sinks must not fail the production graph.
