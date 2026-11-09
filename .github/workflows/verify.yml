@@ -166,11 +166,17 @@ jobs:
 
           Write-Host "Installing Windows SDK 28000..."
 
+          # SDK setup appends MSI package names to the log path, which can
+          # exceed the path limit with WinGet's default log directory.
+          $logDirectory = New-Item -ItemType Directory -Path target -Force
+          $sdkLog = Join-Path $logDirectory.FullName "sdk.log"
+
           winget install `
             --id Microsoft.WindowsSDK.10.0.28000 `
             --exact `
             --source winget `
             --silent `
+            --log $sdkLog `
             --accept-package-agreements `
             --accept-source-agreements
 
@@ -905,6 +911,7 @@ jobs:
         with:
           name: ${{ inputs.driver_scenario == 'load' && 'ext4-win-kernel-load-evidence' || 'ext4-win-live-vhdx-evidence' }}
           path: |
+            target/sdk*.log
             target/driver-load-ci.log
             target/live-vhdx-ci.log
             target/live-driver-trace/*.etl
@@ -934,7 +941,7 @@ jobs:
             Select-Object FullName, Length
 
       - name: Upload verified production bundle
-        if: always()
+        if: always() && (success() || hashFiles('target/verified-production/**') != '')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ext4-win-verified-production-wdk-${{ env.EXT4WIN_WDK_VERSION }}
