@@ -1999,6 +1999,15 @@ pub enum MountTransition {
 enum MountStep {
     /// Sole operation owner returned to the iterative executor.
     Continue(Box<MountOperation>),
+    /// Replay preparation runs after the mount state dispatcher releases its scratch frame.
+    PrepareDeltas {
+        /// Sole mount owner while replay advances.
+        mount: Box<MountOperation>,
+        /// Private replay state for the next pass.
+        operation: Box<super::fast_commit::DeltaReplayOperation>,
+        /// Device receiving the eventual journal checkpoint.
+        journal_target: StorageTarget,
+    },
     /// External effect or terminal result; ownership effects bypass private replay.
     Yield(MountTransition),
 }
@@ -2824,7 +2833,11 @@ impl MountOperation {
                     operation,
                     journal_target,
                 } => {
-                    return self.prepare_deltas(operation, journal_target);
+                    return MountStep::PrepareDeltas {
+                        mount: self,
+                        operation,
+                        journal_target,
+                    };
                 }
                 MountState::DeltaWrites {
                     sequence,
