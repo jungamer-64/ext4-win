@@ -29,6 +29,8 @@ enum OperationStackPhase {
     MountDispatch,
     /// Private Fast Commit replay preparation.
     MountDeltaReplay,
+    /// Preparation of the initial write-session checkpoint and mount state.
+    MountMarker,
     /// Resolves names and publication for a rename.
     RenameResolve,
     /// Stages a resolved rename after parent-directory oplock admission.
@@ -59,6 +61,7 @@ impl OperationStackPhase {
             return match method {
                 "drive_step" => Some(Self::MountDispatch),
                 "prepare_deltas" => Some(Self::MountDeltaReplay),
+                "prepare_marker" => Some(Self::MountMarker),
                 _ => None,
             };
         }
@@ -74,10 +77,13 @@ impl OperationStackPhase {
     /// Sibling phases of one executor cannot keep each other's frames live.
     fn conflicts_with(self, callee: Self) -> bool {
         match (self, callee) {
-            (Self::MountDispatch, Self::MountDeltaReplay)
-            | (Self::MountDeltaReplay, Self::MountDispatch)
-            | (Self::RenameResolve, Self::RenameEdit)
-            | (Self::RenameEdit, Self::RenameResolve) => true,
+            (Self::RenameResolve, Self::RenameEdit) | (Self::RenameEdit, Self::RenameResolve) => {
+                true
+            }
+            (
+                Self::MountDispatch | Self::MountDeltaReplay | Self::MountMarker,
+                Self::MountDispatch | Self::MountDeltaReplay | Self::MountMarker,
+            ) => self != callee,
             (
                 Self::Event | Self::Resolve | Self::Reserve | Self::Commit,
                 Self::Event | Self::Resolve | Self::Reserve | Self::Commit,
@@ -3125,6 +3131,10 @@ mod tests {
             (
                 "<ext4_core::volume::mount::MountOperation>::drive_step",
                 "<ext4_core::volume::mount::MountOperation>::prepare_deltas",
+            ),
+            (
+                "<ext4_core::volume::mount::MountOperation>::drive_step",
+                "<ext4_core::volume::mount::MountOperation>::prepare_marker",
             ),
             (
                 "<ext4win::request::file_info::set::PreparedRenameMutation>::prepare::<pass>",

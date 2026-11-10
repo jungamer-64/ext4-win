@@ -2008,6 +2008,13 @@ enum MountStep {
         /// Device receiving the eventual journal checkpoint.
         journal_target: StorageTarget,
     },
+    /// Session checkpoint preparation runs after the dispatcher releases its scratch frame.
+    PrepareMarker {
+        /// Sole mount owner while the marker is prepared.
+        mount: Box<MountOperation>,
+        /// Indexed metadata and journal authority for the next pass.
+        indexed: Box<IndexedMountSeed>,
+    },
     /// External effect or terminal result; ownership effects bypass private replay.
     Yield(MountTransition),
 }
@@ -2152,7 +2159,7 @@ enum MountState {
     /// Build allocation ownership with validated admission for zero-link orphans.
     Indexing(ValidatedMountSeed),
     /// Prepare the marker image and all publication allocations before its first write.
-    PreparingMarker(IndexedMountSeed),
+    PreparingMarker(Box<IndexedMountSeed>),
     /// The complete session image is journaled and checkpointed before publication.
     SessionWrites {
         /// Fully allocated mounted state, still private.
@@ -2214,8 +2221,10 @@ struct ValidatedMountSeed {
 struct IndexedMountSeed {
     /// Tracker ownership retained through marker durability.
     orphans: ValidatedOrphanInventory,
-    /// Recovery and journal placement facts.
-    publication: MountPublicationSeed,
+    /// Admitted journal for checkpointing and mutation.
+    journal: Option<Journal<CleanJournal>>,
+    /// Device containing the admitted journal.
+    journal_target: Option<StorageTarget>,
     /// Fully validated committed allocation ownership.
     clusters: Option<ClusterReferenceIndex>,
 }
@@ -2609,6 +2618,10 @@ impl MountOperation {
                     step = mount.prepare_deltas(operation, journal_target);
                     continue;
                 }
+                MountStep::PrepareMarker { mount, indexed } => {
+                    step = mount.prepare_marker(indexed);
+                    continue;
+                }
                 MountStep::Yield(transition) => transition,
             };
             let MountTransition::SubmitLower {
@@ -2882,7 +2895,10 @@ impl MountOperation {
                     return self.index_allocations(validated);
                 }
                 MountState::PreparingMarker(indexed) => {
-                    return self.prepare_marker(indexed);
+                    return MountStep::PrepareMarker {
+                        mount: self,
+                        indexed,
+                    };
                 }
                 MountState::SessionWrites {
                     mut completed,
@@ -3161,12 +3177,7 @@ impl MountOperation {
                 }
                 if self.access.media_access() == super::MediaAccess::ReadOnly && orphans.is_empty()
                 {
-                    self.state = MountState::PreparingMarker(IndexedMountSeed {
-                        publication,
-                        orphans,
-                        clusters: None,
-                    });
-                    return MountStep::Continue(self);
+                    return self.begin_marker_preparation(publication, orphans, None);
                 }
                 let index = match memory::try_box(AllocationIndexBuild::new()) {
                     Ok(index) => index,
@@ -3196,25 +3207,43 @@ impl MountOperation {
             &validated.orphans,
         );
         match clusters {
-            Ok(clusters) => {
-                self.state = MountState::PreparingMarker(IndexedMountSeed {
-                    publication: validated.publication,
-                    orphans: validated.orphans,
-                    clusters: Some(clusters),
-                })
-            }
+            Ok(clusters) => self.begin_marker_preparation(
+                validated.publication,
+                validated.orphans,
+                Some(clusters),
+            ),
             Err(Error::OperationSuspended) => {
                 self.state = MountState::Indexing(validated);
-                return self.submit_pending_read();
+                self.submit_pending_read()
             }
-            Err(error) => return MountStep::Yield(self.fail(error)),
+            Err(error) => MountStep::Yield(self.fail(error)),
         }
+    }
+
+    /// Retains only the inputs needed after indexing. The preparation and any read suspension
+    /// transfer this same allocation so the executor's continuation stays small.
+    fn begin_marker_preparation(
+        mut self: Box<Self>,
+        publication: MountPublicationSeed,
+        orphans: ValidatedOrphanInventory,
+        clusters: Option<ClusterReferenceIndex>,
+    ) -> MountStep {
+        let indexed = match memory::try_box(IndexedMountSeed {
+            orphans,
+            journal: publication.journal,
+            journal_target: publication.journal_target,
+            clusters,
+        }) {
+            Ok(indexed) => indexed,
+            Err(error) => return MountStep::Yield(self.fail(error)),
+        };
+        self.state = MountState::PreparingMarker(indexed);
         MountStep::Continue(self)
     }
 
     /// Constructs the session marker and unpublished mount within this phase's stack frame.
     #[inline(never)]
-    fn prepare_marker(mut self: Box<Self>, indexed: IndexedMountSeed) -> MountStep {
+    fn prepare_marker(mut self: Box<Self>, indexed: Box<IndexedMountSeed>) -> MountStep {
         let raw = {
             let mut filesystem = OperationDevice::new(&mut self.filesystem);
             match self.access {
@@ -3248,7 +3277,7 @@ impl MountOperation {
                     Err(error) => return MountStep::Yield(self.fail(error)),
                 };
                 let sequence = if matches!(self.access, super::MountAccess::ReadWrite) {
-                    let Some(journal) = &indexed.publication.journal else {
+                    let Some(journal) = &indexed.journal else {
                         return MountStep::Yield(self.fail(Error::JournalCorrupt));
                     };
                     let mut device = OperationDevice::new(&mut self.filesystem);
@@ -3273,23 +3302,24 @@ impl MountOperation {
                     Some(keys) => keys,
                     None => return MountStep::Yield(self.fail(Error::DeviceIo)),
                 };
-                let epoch = CommittedEpoch::initial(
-                    marked,
-                    keys,
-                    indexed.clusters,
-                    self.access,
-                    self.mount,
-                );
+                let IndexedMountSeed {
+                    orphans,
+                    journal,
+                    journal_target,
+                    clusters,
+                } = *indexed;
+                let epoch =
+                    CommittedEpoch::initial(marked, keys, clusters, self.access, self.mount);
                 let completed = CompletedMount {
                     mmp: None,
                     profile: MountedProfile::new(
                         &epoch.mount,
                         marked,
                         self.filesystem.len(),
-                        indexed.publication.journal_target,
+                        journal_target,
                         self.access.media_access(),
                     ),
-                    coordinator: MutationCoordinatorState::new(indexed.publication.journal, &epoch),
+                    coordinator: MutationCoordinatorState::new(journal, &epoch),
                     epoch,
                 };
                 let completed = match memory::try_box(completed) {
@@ -3298,7 +3328,7 @@ impl MountOperation {
                 };
                 let completed = UnpublishedMount {
                     completed,
-                    orphans: indexed.orphans.into_queue(),
+                    orphans: orphans.into_queue(),
                 };
                 self.state = match sequence {
                     Some(sequence) => MountState::SessionWrites {
