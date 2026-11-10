@@ -16,7 +16,7 @@ use std::{
     io::{self, Write},
     os::windows::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     thread,
     time::Instant,
 };
@@ -1033,16 +1033,20 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         let path = windows::literal(mount.join("live-ci/alpha.bin").as_os_str())?;
         let mut requester = Command::new("powershell.exe");
         requester.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .stderr(Stdio::inherit())
             .arg(format!(
                 r"$ErrorActionPreference = 'Stop'
                   $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
+                  [Console]::Error.WriteLine('live remount requester: opening file')
                   $file = [IO.File]::Open({path}, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
                   try {{
-                      [Console]::Error.WriteLine('fresh open completed')
+                      [Console]::Error.WriteLine('live remount requester: fresh open completed')
                       $file.CopyTo([Console]::OpenStandardOutput())
-                      [Console]::Error.WriteLine('payload read completed')
+                      [Console]::Error.WriteLine('live remount requester: payload read completed')
                   }} finally {{
+                      [Console]::Error.WriteLine('live remount requester: closing fresh handle')
                       $file.Dispose()
+                      [Console]::Error.WriteLine('live remount requester: fresh handle closed')
                   }}"
             ));
         let readback = windows::bounded(requester, Duration::from_secs(60))

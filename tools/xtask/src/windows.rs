@@ -47,6 +47,7 @@ pub(crate) fn observations<T: serde::de::DeserializeOwned>(value: Value) -> Task
 pub(crate) fn management(expression: &str, timeout: Duration) -> TaskResult<Value> {
     let mut command = Command::new("powershell.exe");
     command.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .stderr(Stdio::piped())
         .arg(format!("$ErrorActionPreference='Stop'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $value = & {{ {expression} }}; if ($null -eq $value) {{ 'null' }} else {{ ConvertTo-Json -InputObject $value -Depth 12 -Compress }}"));
     let output = checked_outcome(bounded(command, timeout)?, "Windows management API")?;
     Ok(serde_json::from_slice(&output)?)
@@ -60,9 +61,9 @@ pub(crate) enum CommandOutcome {
     Uncertain {
         /// Native process identity for subsequent observation; external effects require reconciliation.
         requester: u32,
-        /// Captured stdout/stderr before requester termination.
+        /// Captured stdout before requester termination.
         stdout: Vec<u8>,
-        /// Captured stderr.
+        /// Captured stderr if the caller requested a pipe.
         stderr: Vec<u8>,
     },
 }
@@ -80,13 +81,12 @@ impl Drop for Requester {
     }
 }
 /// Runs and observes the user-mode requester separately from the external effect it requests.
+/// The caller selects stderr routing. An inherited stream reports progress independently of
+/// requester completion, while a pipe retains diagnostics with the command outcome.
 /// # Errors
 /// Returns spawn, pipe, observation, termination or capture failures.
 pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<CommandOutcome> {
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(Stdio::null());
+    command.stdout(Stdio::piped()).stdin(Stdio::null());
     eprintln!("requester spawn: {:?}", command.get_program());
     let mut owner = Requester(Some(command.spawn()?));
     let child = owner
@@ -98,10 +98,7 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("requester stdout absent"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| io::Error::other("requester stderr absent"))?;
+    let mut stderr = child.stderr.take();
     let capture = (|| -> TaskResult<CommandOutcome> {
         let mut stdout_bytes = Vec::new();
         let mut stderr_bytes = Vec::new();
@@ -109,7 +106,9 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
         let mut reported = start;
         let status = loop {
             drain(&mut stdout, &mut stdout_bytes)?;
-            drain(&mut stderr, &mut stderr_bytes)?;
+            if let Some(stderr) = &mut stderr {
+                drain(stderr, &mut stderr_bytes)?;
+            }
             if let Some(status) = child.try_wait()? {
                 break Some(status);
             }
@@ -139,7 +138,9 @@ pub(crate) fn bounded(mut command: Command, timeout: Duration) -> TaskResult<Com
             thread::sleep(Duration::from_millis(20));
         };
         drain(&mut stdout, &mut stdout_bytes)?;
-        drain(&mut stderr, &mut stderr_bytes)?;
+        if let Some(stderr) = &mut stderr {
+            drain(stderr, &mut stderr_bytes)?;
+        }
         if status.is_none() {
             eprintln!(
                 "requester {}: termination requested; external outcome uncertain",
@@ -276,20 +277,24 @@ mod tests {
     )]
     fn requester_completion_contract() -> TaskResult<()> {
         let mut command = Command::new("cmd.exe");
-        command.args(["/d", "/c", "echo stdout & echo stderr 1>&2 & exit /b 7"]);
+        command
+            .args(["/d", "/c", "echo stdout & echo stderr 1>&2 & exit /b 7"])
+            .stderr(Stdio::piped());
         let outcome = bounded(command, Duration::from_secs(10))?;
         assert!(
             matches!(&outcome, CommandOutcome::Exited(output) if output.status.code() == Some(7) && !output.stdout.is_empty() && !output.stderr.is_empty())
         );
         assert!(checked_outcome(outcome, "expected error").is_err());
         let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoLogo",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "[Console]::WriteLine('accepted'); Start-Sleep -Seconds 30",
-        ]);
+        command
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::WriteLine('accepted'); Start-Sleep -Seconds 30",
+            ])
+            .stderr(Stdio::piped());
         let started = Instant::now();
         let outcome = bounded(command, Duration::from_secs(2))?;
         assert!(started.elapsed() < Duration::from_secs(10));
@@ -301,6 +306,16 @@ mod tests {
             failure.downcast_ref::<io::Error>().map(io::Error::kind),
             Some(io::ErrorKind::TimedOut)
         );
+        let mut command = Command::new("cmd.exe");
+        command
+            .args(["/d", "/c", "echo payload& echo requester progress 1>&2"])
+            .stderr(Stdio::inherit());
+        let outcome = bounded(command, Duration::from_secs(10))?;
+        assert!(matches!(
+            outcome,
+            CommandOutcome::Exited(output)
+                if output.status.success() && output.stdout == b"payload\r\n" && output.stderr.is_empty()
+        ));
         assert_eq!(
             literal(OsStr::new("C:\\name's space"))?,
             "'C:\\name''s space'"
