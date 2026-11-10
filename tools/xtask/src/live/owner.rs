@@ -1056,6 +1056,12 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         .open(mount.join("live-ci/alpha.bin"))?;
     let remount = (|| -> TaskResult<()> {
         dismount_filesystem(session)?;
+        // Temporary isolation probe: separates post-dismount retirement failures from the fresh
+        // open that triggers remount. Remove once a hosted run attributes the runner loss.
+        for elapsed in (10..=60).step_by(10) {
+            thread::sleep(Duration::from_secs(10));
+            println!("live remount: post-dismount quiescence {elapsed}s");
+        }
         println!("live remount: read through a fresh open while the old handle remains");
         let mut requester = Command::new(env::current_exe()?);
         requester
