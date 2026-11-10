@@ -11,6 +11,7 @@ use alloc::collections::BTreeSet;
 use core::time::Duration;
 use serde::{Deserialize, Serialize};
 use std::{
+    env,
     ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Write},
@@ -984,6 +985,32 @@ fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> 
     Ok(())
 }
 
+/// Command used to invoke the remount requester in a separate process.
+pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
+
+/// Performs the fresh file open in a supervised process so a pending kernel request cannot
+/// block the live session owner. Progress goes to stderr and stdout carries only payload bytes.
+/// # Errors
+/// Returns native open, read, output, or explicit close errors.
+pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
+    eprintln!("live remount requester: opening file");
+    let mut file = fs::File::open(path)?;
+    eprintln!("live remount requester: fresh open completed");
+    let readback = (|| -> TaskResult<()> {
+        let mut output = io::stdout().lock();
+        io::copy(&mut file, &mut output)?;
+        output.flush()?;
+        eprintln!("live remount requester: payload read completed");
+        Ok(())
+    })();
+    eprintln!("live remount requester: closing fresh handle");
+    let closed = windows_host::close_file(file).map_err(Into::into);
+    if closed.is_ok() {
+        eprintln!("live remount requester: fresh handle closed");
+    }
+    combine_verification_and_cleanup(readback, closed)
+}
+
 /// Executes startup discovery, native I/O and reattachment while the same driver remains loaded.
 /// # Errors
 /// Returns load, Verifier, discovery, filesystem, hot-attach or required detachment failures.
@@ -1030,25 +1057,11 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     let remount = (|| -> TaskResult<()> {
         dismount_filesystem(session)?;
         println!("live remount: read through a fresh open while the old handle remains");
-        let path = windows::literal(mount.join("live-ci/alpha.bin").as_os_str())?;
-        let mut requester = Command::new("powershell.exe");
-        requester.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-            .stderr(Stdio::inherit())
-            .arg(format!(
-                r"$ErrorActionPreference = 'Stop'
-                  $sharing = [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete
-                  [Console]::Error.WriteLine('live remount requester: opening file')
-                  $file = [IO.File]::Open({path}, [IO.FileMode]::Open, [IO.FileAccess]::Read, $sharing)
-                  try {{
-                      [Console]::Error.WriteLine('live remount requester: fresh open completed')
-                      $file.CopyTo([Console]::OpenStandardOutput())
-                      [Console]::Error.WriteLine('live remount requester: payload read completed')
-                  }} finally {{
-                      [Console]::Error.WriteLine('live remount requester: closing fresh handle')
-                      $file.Dispose()
-                      [Console]::Error.WriteLine('live remount requester: fresh handle closed')
-                  }}"
-            ));
+        let mut requester = Command::new(env::current_exe()?);
+        requester
+            .arg(READ_REMOUNT_PAYLOAD)
+            .arg(mount.join("live-ci/alpha.bin"))
+            .stderr(Stdio::inherit());
         let readback = windows::bounded(requester, Duration::from_secs(60))
             .and_then(|outcome| windows::checked_outcome(outcome, "remount readback"));
         match &readback {

@@ -61,6 +61,9 @@ enum Task {
     PrepareLiveVhdx,
     /// Activates a prepared disposable session and requires workload and cleanup completion.
     VerifyLiveVhdx,
+    /// Performs one fresh open in an isolated live-remount requester.
+    #[cfg(windows)]
+    ReadRemountPayload,
     /// Reconciles and removes one interrupted disposable VHDX session.
     CleanupLiveVhdxSession,
 }
@@ -68,6 +71,10 @@ enum Task {
 impl Task {
     /// Parses one exact task name.
     fn parse(argument: &OsStr) -> Option<Self> {
+        #[cfg(windows)]
+        if argument == crate::live::READ_REMOUNT_PAYLOAD {
+            return Some(Self::ReadRemountPayload);
+        }
         if argument == "benchmark-multi-file" {
             Some(Self::BenchmarkMultiFile)
         } else if argument == "verify-portable" {
@@ -169,6 +176,11 @@ fn execute() -> TaskResult<()> {
             let session_id = task_argument.as_deref().ok_or_else(usage_error)?;
             verify_live_vhdx(&repository_root, session_id)
         }
+        #[cfg(windows)]
+        Task::ReadRemountPayload => {
+            let path = task_argument.as_deref().ok_or_else(usage_error)?;
+            crate::live::read_remount_payload(std::path::Path::new(path))
+        }
 
         Task::BenchmarkMultiFile
         | Task::Portable
@@ -214,6 +226,8 @@ fn execute() -> TaskResult<()> {
                 Task::ResolveDriverStoreImage => {
                     Err(io::Error::other("package mapping lost its required OEM argument").into())
                 }
+                #[cfg(windows)]
+                Task::ReadRemountPayload => Err(usage_error().into()),
             }
         }
     }
