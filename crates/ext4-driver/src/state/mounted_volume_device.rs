@@ -1076,8 +1076,8 @@ impl MountedVpb {
         .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
     }
 
-    /// Transfers a successor to the real device without altering any old FILE_OBJECT association.
-    /// The caller holds the global lock and owns the original mount reference.
+    /// Transfers new-open routing to a successor under the global VPB lock. The original VPB
+    /// remains mounted for native routing of retained FILE_OBJECTs until its last reference drains.
     #[expect(
         unsafe_code,
         reason = "the global lock encloses native association replacement and sole allocation-ownership transfer"
@@ -1101,20 +1101,16 @@ impl MountedVpb {
                 (*successor.as_ptr()).RealDevice = vpb.RealDevice;
             }
             unsafe {
-                // SAFETY: The successor receives only device-wide policy, including removal exclusion.
-                (*successor.as_ptr()).Flags = vpb.Flags
-                    & !vpb_flag(
-                        wdk_sys::VPB_MOUNTED
-                            | wdk_sys::VPB_LOCKED
-                            | wdk_sys::VPB_DIRECT_WRITES_ALLOWED,
-                    );
+                // SAFETY: The successor receives device removal and RAW-only admission flags.
+                // Mount-local state, including VPB_DISMOUNTING, belongs to the original VPB.
+                (*successor.as_ptr()).Flags =
+                    vpb.Flags & vpb_flag(wdk_sys::VPB_REMOVE_PENDING | wdk_sys::VPB_RAW_MOUNT);
             }
             unsafe {
                 // SAFETY: This atomic lock-protected publication transfers destruction to the I/O Manager.
                 (*vpb.RealDevice).Vpb = successor.as_ptr();
             }
         }
-        vpb.Flags &= !vpb_flag(wdk_sys::VPB_MOUNTED);
     }
 
     /// Closes future routing after actor/dispatch join and retains only native references already in flight.
@@ -1701,7 +1697,7 @@ mod tests {
     /// # Errors
     /// Returns allocation, label or native retirement failure.
     /// # Panics
-    /// Fails if old native references block a fresh mount or retirement mutates the successor.
+    /// Fails if retained native references lose their route, block a fresh mount, or affect its VPB.
     #[test]
     #[expect(
         clippy::panic_in_result_fn,
@@ -1715,7 +1711,7 @@ mod tests {
         let mut fixture = VpbFixture::new()?;
         fixture.original(|vpb| {
             vpb.ReferenceCount = 2;
-            vpb.Flags = vpb_flag(wdk_sys::VPB_PERSISTENT);
+            vpb.Flags = vpb_flag(wdk_sys::VPB_PERSISTENT | wdk_sys::VPB_DISMOUNTING);
         })?;
         let original = fixture.real.Vpb;
         let publication = fixture.publish()?;
@@ -1735,7 +1731,7 @@ mod tests {
             assert_eq!(vpb.DeviceObject, original_device.as_ptr());
             assert_eq!(vpb.VolumeLabelLength, 2);
             assert_eq!(vpb.VolumeLabel.first(), Some(&90));
-            assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
+            assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
             assert_eq!(vpb.ReferenceCount, 3);
         })?;
 
@@ -1750,6 +1746,13 @@ mod tests {
             KernelVpb::from_raw(fixture.real.Vpb)
         }
         .ok_or(DriverError::InvalidParameter)?;
+        {
+            let _lock = VpbSpinLock::acquire();
+            // SAFETY: The fixture retains the current successor and the global lock protects it.
+            let vpb = unsafe { supplied.as_non_null().as_ref() };
+            assert_eq!(vpb.Flags, 0);
+            assert!(vpb.DeviceObject.is_null());
+        }
         let fresh_mount = MountedVpb::publish(
             supplied,
             fresh_device,
@@ -1764,10 +1767,21 @@ mod tests {
             .err()
             .ok_or(DriverError::InternalInvariantViolation)?;
         assert_eq!(references, 3);
-        fixture.original(|vpb| vpb.ReferenceCount -= 2)?;
+        fixture.original(|vpb| {
+            assert_ne!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
+            assert_eq!(vpb.DeviceObject, original_device.as_ptr());
+            vpb.ReferenceCount -= 2;
+        })?;
         let released = retirement
             .try_finish()
             .map_err(|_| DriverError::DeviceBusy)?;
+        {
+            let _lock = VpbSpinLock::acquire();
+            // SAFETY: `released` uniquely owns the detached VPB until it is freed below.
+            let vpb = unsafe { released.allocation.as_ref() };
+            assert_eq!(vpb.Flags & vpb_flag(wdk_sys::VPB_MOUNTED), 0);
+            assert!(vpb.DeviceObject.is_null());
+        }
         drop(released);
         assert!(fixture.mounted.Vpb.is_null());
         assert_eq!(fixture.real.Vpb, successor);
