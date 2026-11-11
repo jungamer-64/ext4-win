@@ -26,12 +26,14 @@ unsafe extern "system" {
     pub(crate) fn ext4win_file_set_flags(file: wdk_sys::PFILE_OBJECT, flags: wdk_sys::ULONG);
 }
 
-// Host tests execute the user-mode implementation of the WDK shared-memory copy contract.
-#[cfg(test)]
-#[link(name = "volatileaccessu", kind = "static")]
+// The driver's Rust and native requestor boundaries consume the WDK shared-memory copy, so the
+// driver links the library implementing it for its execution domain; host tests use the
+// user-mode implementation of the same contract.
+#[cfg_attr(not(test), link(name = "volatileaccessk", kind = "static"))]
+#[cfg_attr(test, link(name = "volatileaccessu", kind = "static"))]
 #[expect(
     unsafe_code,
-    reason = "host execution of the WDK copy binding requires its user-mode static library"
+    reason = "the WDK copy binding must link the library matching the kernel or host execution domain"
 )]
 unsafe extern "C" {}
 
