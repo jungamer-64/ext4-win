@@ -15,6 +15,7 @@
 #include "directory_notification.h"
 #include "notification_access.h"
 #include "paging_file.h"
+#include "requestor_access.h"
 
 extern VOID NTAPI ext4win_oplock_wait_complete(_In_ PVOID context, _Inout_ PIRP irp);
 extern VOID NTAPI ext4win_oplock_prepost(_In_ PVOID context, _Inout_ PIRP irp);
@@ -1062,98 +1063,7 @@ ext4win_capture_fast_io_query_snapshot(
     return valid;
 }
 
-/* Rust prepares a local record; the requestor copy is entirely contained by SEH. */
-static BOOLEAN NTAPI ext4win_fast_io_query_basic_info(PFILE_OBJECT file, BOOLEAN wait,
-    PFILE_BASIC_INFORMATION buffer, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device)
-{
-    PEXT4WIN_STREAM_CONTEXT stream;
-    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
-    FILE_BASIC_INFORMATION prepared;
-    UNREFERENCED_PARAMETER(device);
-    if ((buffer == NULL) || (status == NULL)) { return FALSE; }
-    status->Status = STATUS_NOT_SUPPORTED;
-    status->Information = 0;
-    if (!ext4win_acquire_fast_io_query_stream(file, wait, &stream)) { return FALSE; }
-    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
-        wdk_sys_release_resource(&stream->MainResource);
-        return FALSE;
-    }
-    RtlZeroMemory(&prepared, sizeof(prepared));
-    ext4win_fast_io_basic_record(&snapshot, &prepared);
-    __try {
-        *buffer = prepared;
-        status->Status = STATUS_SUCCESS;
-        status->Information = sizeof(prepared);
-    }
-    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
-        status->Status = GetExceptionCode();
-        status->Information = 0;
-    }
-    wdk_sys_release_resource(&stream->MainResource);
-    return TRUE;
-}
-
-/* Rust prepares a local record; the requestor copy is entirely contained by SEH. */
-static BOOLEAN NTAPI ext4win_fast_io_query_standard_info(PFILE_OBJECT file, BOOLEAN wait,
-    PFILE_STANDARD_INFORMATION buffer, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device)
-{
-    PEXT4WIN_STREAM_CONTEXT stream;
-    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
-    FILE_STANDARD_INFORMATION prepared;
-    UNREFERENCED_PARAMETER(device);
-    if ((buffer == NULL) || (status == NULL)) { return FALSE; }
-    status->Status = STATUS_NOT_SUPPORTED;
-    status->Information = 0;
-    if (!ext4win_acquire_fast_io_query_stream(file, wait, &stream)) { return FALSE; }
-    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
-        wdk_sys_release_resource(&stream->MainResource);
-        return FALSE;
-    }
-    RtlZeroMemory(&prepared, sizeof(prepared));
-    ext4win_fast_io_standard_record(&snapshot, &prepared);
-    __try {
-        *buffer = prepared;
-        status->Status = STATUS_SUCCESS;
-        status->Information = sizeof(prepared);
-    }
-    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
-        status->Status = GetExceptionCode();
-        status->Information = 0;
-    }
-    wdk_sys_release_resource(&stream->MainResource);
-    return TRUE;
-}
-
-/* Rust prepares a local record; the requestor copy is entirely contained by SEH. */
-static BOOLEAN NTAPI ext4win_fast_io_query_network_open_info(PFILE_OBJECT file, BOOLEAN wait,
-    PFILE_NETWORK_OPEN_INFORMATION buffer, PIO_STATUS_BLOCK status, PDEVICE_OBJECT device)
-{
-    PEXT4WIN_STREAM_CONTEXT stream;
-    EXT4WIN_FAST_IO_QUERY_SNAPSHOT snapshot;
-    FILE_NETWORK_OPEN_INFORMATION prepared;
-    UNREFERENCED_PARAMETER(device);
-    if ((buffer == NULL) || (status == NULL)) { return FALSE; }
-    status->Status = STATUS_NOT_SUPPORTED;
-    status->Information = 0;
-    if (!ext4win_acquire_fast_io_query_stream(file, wait, &stream)) { return FALSE; }
-    if (!ext4win_capture_fast_io_query_snapshot(stream, &snapshot)) {
-        wdk_sys_release_resource(&stream->MainResource);
-        return FALSE;
-    }
-    RtlZeroMemory(&prepared, sizeof(prepared));
-    ext4win_fast_io_network_record(&snapshot, &prepared);
-    __try {
-        *buffer = prepared;
-        status->Status = STATUS_SUCCESS;
-        status->Information = sizeof(prepared);
-    }
-    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
-        status->Status = GetExceptionCode();
-        status->Information = 0;
-    }
-    wdk_sys_release_resource(&stream->MainResource);
-    return TRUE;
-}
+#include "fast_io_query.h"
 
 #include "fast_io_lock.h"
 

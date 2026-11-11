@@ -269,9 +269,19 @@ fn verify_native_synchronization(root: &Path) -> TaskResult<()> {
             "native tunnel lifetime, counted-name, opaque creation-time and miss contracts",
         ),
         (
+            "requestor-access",
+            "requestor_access.tests.c",
+            "native requestor-memory fault containment and status contract",
+        ),
+        (
             "fast-io-transfer",
             "fast_io_transfer.tests.c",
             "native Fast I/O transfer admission contract",
+        ),
+        (
+            "fast-io-query",
+            "fast_io_query.tests.c",
+            "native Fast I/O query resource release before requestor publication",
         ),
         (
             "fast-io-lock",

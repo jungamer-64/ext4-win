@@ -13,25 +13,12 @@
 #include "input_validation.h"
 
 #include "cluster_control_capture.h"
+#include "requestor_access.h"
 
 static BOOLEAN
 ext4win_is_requestor_mode_valid(_In_ KPROCESSOR_MODE requestor_mode)
 {
     return (requestor_mode == KernelMode) || (requestor_mode == UserMode);
-}
-
-static NTSTATUS
-ext4win_normalize_buffer_exception(_In_ LONG exception_code)
-{
-    const NTSTATUS status = (NTSTATUS)exception_code;
-
-    if ((status == STATUS_ACCESS_VIOLATION) ||
-        (status == STATUS_DATATYPE_MISALIGNMENT) ||
-        (status == STATUS_IN_PAGE_ERROR)) {
-        return status;
-    }
-
-    return STATUS_INVALID_USER_BUFFER;
 }
 
 /* Fixed Type3 input is snapshotted in requestor context before actor admission. */
@@ -40,7 +27,7 @@ NTSTATUS NTAPI
 ext4win_capture_allocation_start(_In_ PIRP irp, _Out_ PLONGLONG value)
 {
     PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(irp);
-    NTSTATUS status = STATUS_SUCCESS;
+    NTSTATUS status;
     PVOID source;
     if ((value == NULL) || (stack->MajorFunction != IRP_MJ_FILE_SYSTEM_CONTROL) ||
         ((stack->Parameters.FileSystemControl.FsControlCode != FSCTL_GET_RETRIEVAL_POINTERS) &&
@@ -49,13 +36,8 @@ ext4win_capture_allocation_start(_In_ PIRP irp, _Out_ PLONGLONG value)
         !ext4win_is_requestor_mode_valid(irp->RequestorMode)) { return STATUS_INVALID_PARAMETER; }
     source = stack->Parameters.FileSystemControl.Type3InputBuffer;
     if (source == NULL) { return STATUS_INVALID_USER_BUFFER; }
-    __try {
-        if (irp->RequestorMode == UserMode) { ProbeForRead(source, sizeof(*value), TYPE_ALIGNMENT(LONGLONG)); }
-        RtlCopyVolatileMemory(value, source, sizeof(*value));
-    }
-    __except (EXT4WIN_CATCH_EXPECTED_EXCEPTIONS) {
-        status = ext4win_normalize_buffer_exception(GetExceptionCode());
-    }
+    status = ext4win_requestor_read(irp->RequestorMode, source, value, sizeof(*value),
+        TYPE_ALIGNMENT(LONGLONG));
     if (NT_SUCCESS(status) && (*value < 0)) { return STATUS_INVALID_PARAMETER; }
     return status;
 }
