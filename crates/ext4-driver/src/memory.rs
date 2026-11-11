@@ -7,7 +7,7 @@ use alloc::{
     vec::Vec,
 };
 use core::{
-    alloc::{AllocError, Allocator, Layout},
+    alloc::{AllocError, Allocator},
     fmt,
     marker::PhantomData,
     ptr::NonNull,
@@ -595,30 +595,6 @@ pub(crate) fn boxed_try_map<S, T>(
         }
     };
     Ok(Box::write(slot, map(source)))
-}
-
-/// Allocates an exact-length, zero-initialized byte slice with the global allocator.
-/// # Errors
-///
-/// Returns [`DriverError::InvalidBufferSize`] when `length` cannot form a byte-slice layout, or
-/// [`DriverError::InsufficientResources`] when the allocation fails.
-#[expect(
-    unsafe_code,
-    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
-)]
-pub(crate) fn boxed_zeroed_bytes(length: usize) -> DriverResult<Box<[u8]>> {
-    if Layout::array::<u8>(length).is_err() {
-        return Err(DriverError::InvalidBufferSize);
-    }
-
-    let bytes =
-        Box::<[u8], Global>::try_new_zeroed_slice_in(length, Global).map_err(alloc_failed)?;
-    let bytes = unsafe {
-        // SAFETY: The allocator initialized every byte to zero, and every possible
-        // `u8` bit pattern represents a valid initialized value.
-        bytes.assume_init()
-    };
-    Ok(bytes)
 }
 
 #[cfg(test)]

@@ -175,9 +175,143 @@ impl IrpCompletion {
 /// create symlink completion installs the allocation in `IRP::Tail.Overlay.AuxiliaryBuffer`.
 #[derive(Debug)]
 pub(crate) struct CreateSymlinkReparseBuffer {
-    /// Nonpaged bytes in driver builds and ordinary globally allocated bytes in tests.
+    /// Storage whose release authority the I/O Manager can assume.
+    bytes: ReparseBytes,
+}
+
+/// Pool tag identifying create reparse buffers until the I/O Manager releases them.
+#[cfg(not(test))]
+const REPARSE_POOL_TAG: wdk_sys::ULONG = u32::from_le_bytes(*b"E4rp");
+
+/// Exact-length reparse storage released by `ExFreePool`, by this owner or by the I/O Manager.
+///
+/// The I/O Manager frees `IRP::Tail.Overlay.AuxiliaryBuffer` as a pool block. The storage is
+/// therefore a direct executive-pool allocation rather than a global-allocator layout, whose
+/// pointer need not identify a pool block. Host tests have no executive pool and own a box.
+#[derive(Debug)]
+struct ReparseBytes {
+    /// First byte of the nonpaged pool block.
+    #[cfg(not(test))]
+    address: NonNull<u8>,
+    /// Exact initialized byte count of the pool block.
+    #[cfg(not(test))]
+    length: usize,
+    /// Host storage reconstructed by the test that observes the installed pointer.
+    #[cfg(test)]
     bytes: Box<[u8]>,
 }
+
+impl ReparseBytes {
+    /// Allocates zero-initialized storage of exactly `length` nonzero bytes.
+    /// # Errors
+    ///
+    /// Returns an error when the length is not representable or the allocation fails.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the executive pool returns one exclusively owned zero-initialized block"
+        )
+    )]
+    fn try_zeroed(length: usize) -> DriverResult<Self> {
+        #[cfg(not(test))]
+        {
+            let size =
+                wdk_sys::SIZE_T::try_from(length).map_err(|_| DriverError::InvalidBufferSize)?;
+            let storage = unsafe {
+                // SAFETY: The caller supplies a nonzero size; the tag and nonpaged flag request
+                // zero-initialized, non-executable pool owned solely by the returned value.
+                wdk_sys::ntddk::ExAllocatePool2(
+                    wdk_sys::POOL_FLAG_NON_PAGED,
+                    size,
+                    REPARSE_POOL_TAG,
+                )
+            };
+            let address =
+                NonNull::new(storage.cast::<u8>()).ok_or(DriverError::InsufficientResources)?;
+            Ok(Self { address, length })
+        }
+        #[cfg(test)]
+        {
+            Ok(Self {
+                bytes: alloc::vec![0_u8; length].into_boxed_slice(),
+            })
+        }
+    }
+
+    /// Borrows the initialized bytes while this owner retains the allocation.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the unique owner borrows its initialized pool block"
+        )
+    )]
+    fn as_slice(&self) -> &[u8] {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The pool zero-initialized exactly `length` bytes, and this borrow cannot
+            // outlive the sole owner of the block.
+            core::slice::from_raw_parts(self.address.as_ptr(), self.length)
+        }
+        #[cfg(test)]
+        &self.bytes
+    }
+
+    /// Exclusively borrows the initialized bytes for packing.
+    #[cfg_attr(
+        not(test),
+        expect(
+            unsafe_code,
+            reason = "the exclusive owner borrow excludes every other access to its pool block"
+        )
+    )]
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The block holds `length` initialized bytes and the exclusive borrow of
+            // its sole owner excludes every other access.
+            core::slice::from_raw_parts_mut(self.address.as_ptr(), self.length)
+        }
+        #[cfg(test)]
+        &mut self.bytes
+    }
+
+    /// Transfers release authority to the receiver of the thin block pointer.
+    fn into_raw(self) -> *mut u8 {
+        #[cfg(not(test))]
+        {
+            core::mem::ManuallyDrop::new(self).address.as_ptr()
+        }
+        #[cfg(test)]
+        {
+            Box::into_raw(self.bytes).cast::<u8>()
+        }
+    }
+}
+
+#[cfg(not(test))]
+impl Drop for ReparseBytes {
+    #[expect(
+        unsafe_code,
+        reason = "the sole owner releases its untransferred pool block exactly once"
+    )]
+    fn drop(&mut self) {
+        unsafe {
+            // SAFETY: This owner allocated the block and did not transfer it to the I/O Manager.
+            wdk_sys::ntddk::ExFreePool(self.address.as_ptr().cast());
+        }
+    }
+}
+
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the pool block has no thread affinity and moves only with its unique owner"
+)]
+// SAFETY: The block is exclusively owned nonpaged memory; moving the owner moves no storage and
+// release is valid on any thread.
+unsafe impl Send for ReparseBytes {}
 
 impl CreateSymlinkReparseBuffer {
     /// Allocates, packs, and seals one exact-length symbolic-link reparse buffer.
@@ -193,19 +327,17 @@ impl CreateSymlinkReparseBuffer {
         if length == 0 {
             return Err(DriverError::InvalidBufferSize);
         }
-        let mut bytes = memory::boxed_zeroed_bytes(length)?;
-        if pack(&mut bytes)? != length {
+        let mut bytes = ReparseBytes::try_zeroed(length)?;
+        if pack(bytes.as_mut_slice())? != length {
             return Err(DriverError::InternalInvariantViolation);
         }
-        Self::validate_header(&bytes)?;
+        Self::validate_header(bytes.as_slice())?;
         Ok(Self { bytes })
     }
 
     /// Transfers the allocation as the thin pool pointer expected by the IRP auxiliary field.
     pub(super) fn into_raw(self) -> *mut wdk_sys::CHAR {
-        Box::into_raw(self.bytes)
-            .cast::<u8>()
-            .cast::<wdk_sys::CHAR>()
+        self.bytes.into_raw().cast::<wdk_sys::CHAR>()
     }
 
     /// Verifies the tag and exact `ReparseDataLength` before the buffer becomes completable.

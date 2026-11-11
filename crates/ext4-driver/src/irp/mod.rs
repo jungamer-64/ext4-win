@@ -11,7 +11,6 @@ use wdk_sys::{NTSTATUS, PDEVICE_OBJECT, PIO_STACK_LOCATION, PIRP, STATUS_PENDING
 #[cfg(not(test))]
 use crate::kernel::ffi;
 use crate::kernel::status::{DriverError, DriverResult};
-use crate::memory;
 use crate::security_descriptor::{SecurityDescriptorRef, SecuritySelection};
 use crate::state::{
     DirectoryChangeNotifier, DirectoryNotificationRegistration, FileControlBlock, KernelDevice,
