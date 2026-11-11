@@ -20,6 +20,7 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
         fs::write(root.join("large-directory/entry-000000"), b"cold")?;
         let file = root.join("alpha.bin");
         fs::write(&file, b"remount payload")?;
+        fs::write(root.join("remount-control.bin"), b"control")?;
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .arg("read-remount-payload")
             .arg(&file)
@@ -32,8 +33,11 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
             "live remount requester: parent directory query completed",
             "live remount requester: cold-open an inode not retained by the old mount",
             "live remount requester: cold read completed (4 bytes)",
+            "live remount requester: read a closed nonempty control file",
+            "live remount requester: control read completed (7 bytes)",
             "live remount requester: opening file",
             "live remount requester: fresh open completed",
+            "live remount requester: reading payload",
             "live remount requester: payload read completed",
             "live remount requester: closing fresh handle",
             "live remount requester: fresh handle closed",

@@ -988,6 +988,9 @@ fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> 
 /// Command used to invoke the remount requester in a separate process.
 pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
 
+/// Nonempty sibling of the remount payload that no handle retains across dismount.
+const REMOUNT_CONTROL: &str = "remount-control.bin";
+
 /// Performs the fresh file open in a supervised process so a pending kernel request cannot
 /// block the live session owner. Progress goes to stderr and stdout carries only payload bytes.
 /// # Errors
@@ -1010,10 +1013,19 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         cold.len()
     );
     thread::sleep(Duration::from_secs(5));
+    eprintln!("live remount requester: read a closed nonempty control file");
+    let control = fs::read(root.join(REMOUNT_CONTROL))?;
+    eprintln!(
+        "live remount requester: control read completed ({} bytes)",
+        control.len()
+    );
+    thread::sleep(Duration::from_secs(5));
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
     eprintln!("live remount requester: fresh open completed");
+    thread::sleep(Duration::from_secs(5));
     let readback = (|| -> TaskResult<()> {
+        eprintln!("live remount requester: reading payload");
         let mut output = io::stdout().lock();
         io::copy(&mut file, &mut output)?;
         output.flush()?;
@@ -1068,6 +1080,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         )?;
         session.publish(Phase::Observed(Operation::FilesystemIo))?;
     }
+    fs::write(mount.join("live-ci").join(REMOUNT_CONTROL), &payload)?;
     let retained = OpenOptions::new()
         .read(true)
         .open(mount.join("live-ci/alpha.bin"))?;
@@ -1085,7 +1098,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
             .arg(READ_REMOUNT_PAYLOAD)
             .arg(mount.join("live-ci/alpha.bin"))
             .stderr(Stdio::inherit());
-        let readback = windows::bounded(requester, Duration::from_secs(90))
+        let readback = windows::bounded(requester, Duration::from_secs(120))
             .and_then(|outcome| windows::checked_outcome(outcome, "remount readback"));
         match &readback {
             Ok(_) => println!("live remount: fresh-open read completed"),
