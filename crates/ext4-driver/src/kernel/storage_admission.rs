@@ -7,6 +7,10 @@ use super::io_reliability::IoReliabilityObservation;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, Ordering};
 
 /// Monotonic lower-device availability, independent of filesystem close.
+///
+/// Every state after `Present` revokes storage. `Replaced` is entered only from `Present`; a later
+/// surprise removal cannot withdraw the retirement authority it grants, while final removal still
+/// supersedes it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub(super) enum MediaState {
@@ -14,8 +18,10 @@ pub(super) enum MediaState {
     Present = 0,
     /// Surprise removal has revoked storage.
     SurpriseRemoved = 1,
+    /// Verification found another medium; routing already moved to a fresh mount.
+    Replaced = 2,
     /// Final removal also permits device retirement.
-    Removed = 2,
+    Removed = 3,
 }
 
 impl MediaState {
@@ -155,6 +161,7 @@ impl StorageAdmission {
         match self.media.load(Ordering::Acquire) {
             0 => MediaState::Present,
             1 => MediaState::SurpriseRemoved,
+            2 => MediaState::Replaced,
             _ => MediaState::Removed,
         }
     }
@@ -330,6 +337,18 @@ impl StorageAdmission {
     /// Called under exclusive submission exclusion; no observation can restore media.
     pub(super) fn remove(&self, state: MediaState) {
         self.media.fetch_max(state.raw(), Ordering::AcqRel);
+    }
+
+    /// Called under exclusive submission exclusion. Returns false if removal revoked media first.
+    pub(super) fn replace_media(&self) -> bool {
+        self.media
+            .compare_exchange(
+                MediaState::Present.raw(),
+                MediaState::Replaced.raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 }
 

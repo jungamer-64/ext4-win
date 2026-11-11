@@ -98,17 +98,16 @@ impl MountedVolumeOperation for VerifyOperation {
             }
             MediaVerificationTransition::Complete(result) => {
                 let result = match result {
-                    Ok(MediaVerificationOutcome::Same) => match association.acknowledge() {
-                        Ok(()) => Ok(IrpCompletion::EMPTY),
-                        Err(error) => {
-                            access.record_media_changed();
-                            Err(error)
-                        }
-                    },
+                    // A changed association is this instance's own earlier withdrawal or removal.
+                    Ok(MediaVerificationOutcome::Same) => {
+                        association.acknowledge().map(|()| IrpCompletion::EMPTY)
+                    }
+                    // The I/O Manager mounts the device's current VPB after WRONG_VOLUME, so the
+                    // replacement must reach an unmounted successor before this IRP completes.
                     Ok(
                         MediaVerificationOutcome::Different | MediaVerificationOutcome::Invalid(_),
                     ) => {
-                        access.record_media_changed();
+                        access.publish_media_replacement(association.device());
                         Err(DriverError::WrongVolume)
                     }
                     // Failed or canceled reads never consume native verify acknowledgment.

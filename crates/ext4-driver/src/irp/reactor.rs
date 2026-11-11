@@ -148,12 +148,10 @@ impl CompletionOperation for CacheVerificationOperation {
             association,
         } = *self;
         let result = verification_completion_result(event);
-        let result = result.and_then(|()| association.confirmed());
         let result = target.with_mounted_access(|access| {
-            if result == Err(DriverError::WrongVolume) {
-                access.record_media_changed();
-            }
-            result?;
+            // Revocation outranks the association outcome it caused.
+            access.authorize_storage()?;
+            result.and_then(|()| association.confirmed())?;
             work.authorize_media_resumption(access)
         });
         match result {
@@ -189,12 +187,10 @@ impl CompletionOperation for StorageVerificationOperation {
         let ReactorTarget::MountedVolume(binding) = target else {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         };
-        let result = result.and_then(|()| association.confirmed());
         let result = binding.with_access(|access| {
-            if result == Err(DriverError::WrongVolume) {
-                access.record_media_changed();
-            }
-            result?;
+            // Revocation outranks the association outcome it caused.
+            access.authorize_storage()?;
+            result.and_then(|()| association.confirmed())?;
             access.authorize_storage_resumption(command.request())
         });
         match result {
@@ -1245,13 +1241,13 @@ impl ReactorTarget {
         }
     }
 
-    /// Applies a terminal dispatch observation without performing native writeback on the actor.
+    /// Applies a terminal storage revocation without performing native writeback on the actor.
     #[cfg(not(test))]
-    fn observe_storage_removal(&mut self) -> Option<VolumeRetirement> {
+    fn observe_storage_revocation(&mut self) -> Option<VolumeRetirement> {
         match self {
             Self::ControlDevice(_) => None,
             Self::MountedVolume(binding) => {
-                binding.with_access(|access| access.observe_storage_removal())
+                binding.with_access(|access| access.observe_storage_revocation())
             }
         }
     }
@@ -2958,7 +2954,7 @@ impl CompletionReactor {
     fn run(&self) {
         loop {
             let mut progressed = false;
-            if let Some(retirement) = self.with_target(ReactorTarget::observe_storage_removal) {
+            if let Some(retirement) = self.with_target(ReactorTarget::observe_storage_revocation) {
                 MountedVolumeDevice::unregister_shutdown_notification(self.device);
                 progressed |= self.cancel_active_for_drain();
                 self.grant_available_commit();
@@ -4254,9 +4250,6 @@ impl CompletionReactor {
         let (association, query) = match captured {
             Ok(captured) => captured,
             Err(error) => {
-                if error == DriverError::WrongVolume {
-                    self.with_mounted_access(|access| access.record_media_changed());
-                }
                 let (scheduled, request) = command.into_parts();
                 self.set_ready_storage_failure(index, scheduled.into_operation(), request, error);
                 return;
@@ -4336,9 +4329,6 @@ impl CompletionReactor {
             match MountedVolumeDevice::prepare_storage_verification(self.device) {
                 Ok(captured) => captured,
                 Err(error) => {
-                    if error == DriverError::WrongVolume {
-                        self.with_mounted_access(|access| access.record_media_changed());
-                    }
                     self.set_ready_operation_event(
                         index,
                         suspended,
@@ -5629,7 +5619,7 @@ fn driver_error_to_core(error: DriverError) -> ext4_core::Error {
         }
         DriverError::Core(error) => error,
         DriverError::VerifyRequired => ext4_core::Error::MediaVerificationRequired,
-        DriverError::WrongVolume => ext4_core::Error::MediaChanged,
+        DriverError::WrongVolume | DriverError::MediaReplaced => ext4_core::Error::MediaChanged,
         _ => ext4_core::Error::DeviceIo,
     }
 }

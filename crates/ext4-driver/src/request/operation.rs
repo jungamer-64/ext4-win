@@ -4557,23 +4557,14 @@ enum MutationStep {
 impl MutationRequestOperation {
     /// Restarts only a create's denied pre-effect admission after same-media verification.
     /// Claims, atomic oplock ownership and checkpointed paging progress remain in this operation.
-    fn verify_create_admission(
-        mut self: Box<Self>,
-        mut owned: OwnedIrp,
-        access: &mut MountedVolumeAccess<'_>,
-    ) -> OperationTransition {
+    fn verify_create_admission(mut self: Box<Self>, mut owned: OwnedIrp) -> OperationTransition {
         if let Err(error) = owned.claim_media_verification() {
             return self.complete_error(owned, error);
         }
         let device = owned.request().with_active(|active| active.device());
         let (association, query) = match MountedVolumeDevice::prepare_storage_verification(device) {
             Ok(captured) => captured,
-            Err(error) => {
-                if error == DriverError::WrongVolume {
-                    access.record_media_changed();
-                }
-                return self.complete_error(owned, error);
-            }
+            Err(error) => return self.complete_error(owned, error),
         };
         self.state = MutationOperationState::VerifyingCreateAdmission { owned, association };
         OperationTransition::SubmitPassiveWork {
@@ -5788,9 +5779,7 @@ impl MutationRequestOperation {
                     if self.request.kind() == MutationRequestKind::Create =>
                 {
                     drop(pass);
-                    return MutationStep::Transition(
-                        self.verify_create_admission(owned, operations),
-                    );
+                    return MutationStep::Transition(self.verify_create_admission(owned));
                 }
                 Err(DriverError::Core(Error::OperationSuspended)) => Err(Error::OperationSuspended),
                 Err(DriverError::CacheManagerFailure(STATUS_RETRY))
@@ -6581,11 +6570,14 @@ impl MutationRequestOperation {
                         MutationOperationState::VerifyingCreateAdmission { owned, association },
                         crate::irp::PassiveWorkCompletion::VerifyVolume(result),
                     ) => {
-                        let result = result.and_then(|()| association.confirmed());
+                        // Revocation outranks the association outcome it caused.
+                        let result = access
+                            .authorize_storage()
+                            .and(result)
+                            .and_then(|()| association.confirmed());
                         return match result {
                             Ok(()) => self.restart_resolution(owned, None, None, access),
                             Err(error) => {
-                                if error == DriverError::WrongVolume { access.record_media_changed(); }
                                 MutationStep::Transition(self.complete_error(owned, error))
                             }
                         };

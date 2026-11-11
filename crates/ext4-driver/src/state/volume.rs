@@ -140,8 +140,8 @@ pub(super) enum MountedVolumeState {
         /// Exact failure returned by the termination owner.
         error: DriverError,
     },
-    /// PnP revoked data authority; only handle release and removal remain legal.
-    StorageRemoved,
+    /// Removal or media replacement revoked data authority; only handle release remains legal.
+    StorageRevoked(crate::kernel::stream::StorageRevocation),
     /// The unique retirement worker owns physical teardown.
     Retiring,
 }
@@ -178,7 +178,7 @@ impl MountedVolumeState {
     pub(super) fn begin_lock(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
             Self::Mounted => Ok(Self::Locking { owner }),
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::StorageRevoked(revocation) => Err(revocation.error()),
             Self::Locking { .. } | Self::Locked { .. } => Err(DriverError::AccessDenied),
             _ => Err(DriverError::VolumeDismounted),
         }
@@ -205,7 +205,7 @@ impl MountedVolumeState {
     /// Returns removal or not-locked for a non-owner.
     pub(super) fn unlock(self, owner: KernelFileObject) -> DriverResult<Self> {
         match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::StorageRevoked(revocation) => Err(revocation.error()),
             Self::Locked { owner: current } if current == owner => Ok(Self::Mounted),
             Self::RawLocked { owner: current } if current == owner => Ok(Self::Dismounted {
                 access: DismountedAccess::Released,
@@ -248,7 +248,7 @@ impl MountedVolumeState {
     /// Returns removal, competing lock exclusion or terminal dismount.
     pub(super) fn prepare_close(self, target: VolumeCloseTarget) -> DriverResult<Self> {
         let lock_owner = match (self, target) {
-            (Self::StorageRemoved, _) => return Err(DriverError::DeviceRemoved),
+            (Self::StorageRevoked(revocation), _) => return Err(revocation.error()),
             (Self::Mounted, VolumeCloseTarget::Dismount(_) | VolumeCloseTarget::Shutdown) => None,
             (
                 Self::Locked { owner },
@@ -403,7 +403,7 @@ impl MountedVolumeState {
     fn permits_retirement(self) -> bool {
         matches!(
             self,
-            Self::StorageRemoved
+            Self::StorageRevoked(_)
                 | Self::Dismounted {
                     access: DismountedAccess::Released
                 }
@@ -419,7 +419,7 @@ impl MountedVolumeState {
     /// Returns removal or terminal dismount.
     pub(super) fn ensure_mounted(self) -> DriverResult<()> {
         match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::StorageRevoked(revocation) => Err(revocation.error()),
             Self::Mounted
             | Self::Locking { .. }
             | Self::Locked { .. }
@@ -435,7 +435,7 @@ impl MountedVolumeState {
     pub(super) fn authorize_create(self) -> DriverResult<()> {
         match self {
             Self::Mounted => Ok(()),
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::StorageRevoked(revocation) => Err(revocation.error()),
             Self::Locking { .. }
             | Self::Locked { .. }
             | Self::PreparingClose { .. }
@@ -451,7 +451,7 @@ impl MountedVolumeState {
         match self {
             Self::Mounted => Ok(()),
             Self::Locked { owner: current } if current == owner => Ok(()),
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::StorageRevoked(revocation) => Err(revocation.error()),
             Self::Locking { .. }
             | Self::Locked { .. }
             | Self::PreparingClose { .. }
@@ -493,7 +493,7 @@ impl MountedVolumeState {
         kind: RawVolumeOperationKind,
     ) -> DriverResult<()> {
         match self {
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::StorageRevoked(revocation) => Err(revocation.error()),
             Self::Locked { owner: current }
                 if current == owner && kind == RawVolumeOperationKind::Read =>
             {
@@ -523,7 +523,7 @@ impl MountedVolumeState {
                 Ok(())
             }
             Self::Dismounted { access } => access.authorize(owner),
-            Self::StorageRemoved => Err(DriverError::DeviceRemoved),
+            Self::StorageRevoked(revocation) => Err(revocation.error()),
             Self::Locking { .. }
             | Self::Locked { .. }
             | Self::PreparingClose { .. }
@@ -826,23 +826,49 @@ impl MountedVolumeAccess<'_> {
         }
     }
 
-    /// Reconciles the dispatch-published revocation on the sole actor. Surprise removal retains
-    /// the device even without handles until final REMOVE arrives. Existing sections and lower
-    /// completions retain their owners; no flush or clean-marker write is attempted here.
+    /// Reconciles a published storage revocation on the sole actor. Surprise removal retains
+    /// the device even without handles until final REMOVE arrives; media replacement does not.
+    /// Existing sections and lower completions retain their owners; no flush or clean-marker
+    /// write is attempted here.
     #[cfg(not(test))]
-    pub(crate) fn observe_storage_removal(&mut self) -> Option<VolumeRetirement> {
-        if self.authorize_storage().is_ok()
-            || self.volume_control.state == MountedVolumeState::Retiring
-        {
+    pub(crate) fn observe_storage_revocation(&mut self) -> Option<VolumeRetirement> {
+        let revocation = self.storage_access().revocation()?;
+        if self.volume_control.state == MountedVolumeState::Retiring {
             return None;
         }
-        if self.volume_control.state != MountedVolumeState::StorageRemoved {
-            self.volume_control.state = MountedVolumeState::StorageRemoved;
+        if !matches!(
+            self.volume_control.state,
+            MountedVolumeState::StorageRevoked(_)
+        ) {
             self.runtime.record_durability_unknown();
             self.runtime.record_read_unreliable();
             self.volume.directory_change_notifier.cleanup_all();
         }
+        // Final removal may supersede replacement; the latest cause selects caller failures.
+        self.volume_control.state = MountedVolumeState::StorageRevoked(revocation);
         Some(self.begin_retirement())
+    }
+
+    /// Ends this instance after verification observed another medium in the same device.
+    ///
+    /// Storage is revoked before the VPB moves new opens to an unmounted successor, so a fresh
+    /// mount can never race this instance's lower submissions. Physical ownership is revoked
+    /// without writing a clean marker or MMP release to the replacement medium. The actor's next
+    /// revocation observation completes the session termination and selects retirement.
+    pub(crate) fn publish_media_replacement(&mut self, device: crate::state::KernelDevice) {
+        #[expect(
+            unsafe_code,
+            reason = "the mounted actor retains the pinned VCB and native header through publication"
+        )]
+        let published = unsafe {
+            // SAFETY: The sole actor owns this pinned VCB until terminal reactor join.
+            self.volume.stream_context.publish_media_replacement()
+        }
+        .unwrap_or_else(|_| KernelWideInconsistency::mounted_volume_state_corruption().bugcheck());
+        if published {
+            self.runtime.record_media_changed();
+        }
+        crate::state::MountedVolumeDevice::withdraw_replaced_media(device);
     }
 
     /// Returns the write-only operational event capability for this mounted volume.
@@ -1060,7 +1086,9 @@ impl MountedVolumeAccess<'_> {
 
     /// Atomically moves the actor-owned volume into its one physical-retirement transition.
     fn begin_retirement(&mut self) -> VolumeRetirement {
-        if self.authorize_storage().is_err() && !self.storage_access().final_removal_received() {
+        if self.authorize_storage().is_err()
+            && !self.storage_access().revocation_permits_retirement()
+        {
             return VolumeRetirement::Retained;
         }
         let namespace_empty = self.volume.file_control_blocks.is_empty();
@@ -2213,11 +2241,6 @@ impl MountedVolumeAccess<'_> {
     /// Records that committed reads can no longer be trusted.
     pub(crate) fn record_read_unreliable(&mut self) {
         self.runtime.record_read_unreliable();
-    }
-
-    /// Revokes old epochs, commit grants and native cache access after physical identity changed.
-    pub(crate) fn record_media_changed(&mut self) {
-        self.runtime.record_media_changed();
     }
 
     /// Records an exact post-commit Cc/MM publication failure and its aggregate stream progress.

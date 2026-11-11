@@ -750,12 +750,7 @@ pub(crate) fn admit_owned(
         let device = owned.request().with_active(|active| active.device());
         let query = match crate::state::MountedVolumeDevice::prepare_verify_work(device) {
             Ok(query) => query,
-            Err(error) => {
-                if error == DriverError::WrongVolume {
-                    target.with_mounted_access(|access| access.record_media_changed());
-                }
-                return Err(AdmitOperationError::new(error, owned));
-            }
+            Err(error) => return Err(AdmitOperationError::new(error, owned)),
         };
         if let Some(query) = query {
             if let Err(error) = owned.claim_media_verification() {

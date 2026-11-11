@@ -318,6 +318,34 @@ pub(crate) enum StorageRemovalNotification {
     Final,
 }
 
+/// Terminal cause of lost storage authority; the cause selects the caller-visible failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageRevocation {
+    /// PnP removed the lower device.
+    Removed,
+    /// Verification observed another medium; new opens already route to a fresh mount.
+    MediaReplaced,
+}
+
+impl StorageRevocation {
+    /// Failure returned to every request that still reaches this mounted instance.
+    pub(crate) const fn error(self) -> DriverError {
+        match self {
+            Self::Removed => DriverError::DeviceRemoved,
+            Self::MediaReplaced => DriverError::MediaReplaced,
+        }
+    }
+
+    /// Projects one native media observation.
+    const fn of(media: MediaState) -> Option<Self> {
+        match media {
+            MediaState::Present => None,
+            MediaState::Replaced => Some(Self::MediaReplaced),
+            MediaState::SurpriseRemoved | MediaState::Removed => Some(Self::Removed),
+        }
+    }
+}
+
 /// Retained volume-scoped observation/submission capability; native callbacks borrow the same state.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct VolumeStorageAccess {
@@ -601,18 +629,24 @@ impl VolumeStorageAccess {
 
     /// Observes only media presence; lower final flush is independent of filesystem admission.
     /// # Errors
-    /// Returns device removed after either terminal revocation notification.
+    /// Returns the revocation cause's failure after any terminal revocation.
     pub(crate) fn authorize(self) -> DriverResult<()> {
-        if self.state().media() == MediaState::Present {
-            Ok(())
-        } else {
-            Err(DriverError::DeviceRemoved)
-        }
+        self.revocation()
+            .map_or(Ok(()), |revocation| Err(revocation.error()))
     }
 
-    /// Final removal grants device-retirement authority beyond surprise removal.
-    pub(crate) fn final_removal_received(self) -> bool {
-        self.state().media() == MediaState::Removed
+    /// Returns the terminal revocation cause, if storage has been revoked.
+    pub(crate) fn revocation(self) -> Option<StorageRevocation> {
+        StorageRevocation::of(self.state().media())
+    }
+
+    /// Final removal or media replacement grants device retirement; surprise removal alone
+    /// still awaits the final PnP request routed through this mount.
+    pub(crate) fn revocation_permits_retirement(self) -> bool {
+        matches!(
+            self.state().media(),
+            MediaState::Replaced | MediaState::Removed
+        )
     }
 
     /// Holds media admission through the return of IoCallDriver on the acquiring thread.
@@ -1011,6 +1045,37 @@ impl StreamContext {
             self.storage_access()
         }?;
         Ok(StorageRemovalPublisher { access })
+    }
+
+    /// Revokes storage because verification observed another medium.
+    ///
+    /// Exclusive submission exclusion guarantees that no lower request of this instance is inside
+    /// IoCallDriver once this returns; already-pending requests are not awaited. Returns false
+    /// when removal revoked storage first, which then remains the authoritative cause.
+    /// # Safety
+    /// The caller must be the mounted actor and retain this volume at its current address.
+    /// # Errors
+    /// Rejects a node stream, which has no volume-wide revocation authority.
+    pub(crate) unsafe fn publish_media_replacement(&self) -> DriverResult<bool> {
+        let access = unsafe {
+            // SAFETY: The caller retains this pinned volume through the publication.
+            self.storage_access()
+        }?;
+        #[cfg(not(test))]
+        if unsafe {
+            // SAFETY: The actor holds no submission lease and the volume header is retained.
+            ext4win_stream_acquire_submissions(access.header.as_ptr(), 1)
+        } == 0
+        {
+            KernelWideInconsistency::file_control_block_ownership_corruption().bugcheck();
+        }
+        let replaced = access.state().replace_media();
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: This same thread holds the exclusive resource and its APC scope.
+            ext4win_stream_release_submissions(access.header.as_ptr());
+        }
+        Ok(replaced)
     }
 
     /// Binds one pinned VCB as the sole direct-volume stream owner.
@@ -2012,11 +2077,7 @@ impl StreamContext {
             // SAFETY: The enclosing stream outlives every borrowed volume observation.
             state.as_ref()
         };
-        if state.media() == MediaState::Present {
-            Ok(())
-        } else {
-            Err(DriverError::DeviceRemoved)
-        }
+        StorageRevocation::of(state.media()).map_or(Ok(()), |revocation| Err(revocation.error()))
     }
 
     /// Copies native residency observations only while MainResource is retained.
@@ -2821,14 +2882,74 @@ mod tests {
             storage.acquire_submission().err(),
             Some(DriverError::DeviceRemoved)
         );
-        assert!(!storage.final_removal_received());
+        assert!(!storage.revocation_permits_retirement());
+        // Removal won first, so a later replacement cannot change the revocation cause.
+        assert!(!unsafe {
+            // SAFETY: The fixture retains its local volume through the publication.
+            volume.publish_media_replacement()
+        }?);
         publisher.publish(super::StorageRemovalNotification::Final);
         publisher.publish(super::StorageRemovalNotification::Surprise);
-        assert!(storage.final_removal_received());
+        assert!(storage.revocation_permits_retirement());
         assert_eq!(storage.authorize(), Err(DriverError::DeviceRemoved));
         assert_eq!(
             DriverError::DeviceRemoved.ntstatus(),
             wdk_sys::STATUS_DEVICE_REMOVED
+        );
+        Ok(())
+    }
+
+    /// # Errors
+    /// Returns stream allocation failure.
+    /// # Panics
+    /// Panics if a replaced medium restores I/O, awaits PnP before retirement, or reports removal.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "the local volume stream remains live and unmoved for every capability use"
+    )]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture construction is fallible; assertions verify replacement semantics"
+    )]
+    fn media_replacement_is_terminal_and_permits_retirement_without_removal() -> DriverResult<()> {
+        let volume = StreamContext::try_new_volume(
+            StreamSizes::EMPTY,
+            OperationalTrace::host_test(),
+            crate::kernel::io_reliability::IoReliabilityOwner::try_new()?.observe()?,
+        )?;
+        let storage = unsafe {
+            // SAFETY: The volume remains live at this stack location until all accesses end.
+            volume.storage_access()
+        }?;
+        let publisher = unsafe {
+            // SAFETY: The fixture is the sole removal owner and retains its local volume.
+            volume.storage_removal_publisher()
+        }?;
+        let replace = || unsafe {
+            // SAFETY: The fixture is the sole actor and retains its local volume.
+            volume.publish_media_replacement()
+        };
+        assert!(replace()?);
+        assert!(!replace()?);
+        assert_eq!(storage.authorize(), Err(DriverError::MediaReplaced));
+        assert_eq!(storage.authorize_create(), Err(DriverError::MediaReplaced));
+        assert!(storage.revocation_permits_retirement());
+        publisher.publish(super::StorageRemovalNotification::Surprise);
+        assert_eq!(
+            storage.revocation(),
+            Some(super::StorageRevocation::MediaReplaced)
+        );
+        assert!(storage.revocation_permits_retirement());
+        publisher.publish(super::StorageRemovalNotification::Final);
+        assert_eq!(
+            storage.revocation(),
+            Some(super::StorageRevocation::Removed)
+        );
+        assert!(storage.revocation_permits_retirement());
+        assert_eq!(
+            DriverError::MediaReplaced.ntstatus(),
+            wdk_sys::STATUS_FILE_INVALID
         );
         Ok(())
     }

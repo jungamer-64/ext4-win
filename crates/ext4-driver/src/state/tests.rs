@@ -645,7 +645,8 @@ fn removed_volume_retains_cleanup_and_reference_retirement() -> Result<(), Drive
         KernelFileObject::from_raw(core::ptr::from_mut(&mut file))
     }
     .ok_or(DriverError::InvalidParameter)?;
-    let removed = MountedVolumeState::StorageRemoved;
+    let removed =
+        MountedVolumeState::StorageRevoked(crate::kernel::stream::StorageRevocation::Removed);
     assert_eq!(
         removed.cleanup(owner),
         (removed, VolumeHandleCleanup::Released)
