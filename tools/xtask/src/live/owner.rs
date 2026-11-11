@@ -993,6 +993,23 @@ pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
 /// # Errors
 /// Returns native open, read, output, or explicit close errors.
 pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
+    // Temporary isolation probe: separates fresh-mount traversal, a cold open of an inode the
+    // old mount never opened, and the inode the old mount retains. Each stage pauses so hosted
+    // log streaming reports it before the next stage. Remove once the runner loss is attributed.
+    let root = path
+        .parent()
+        .ok_or_else(|| io::Error::other("remount payload lacks a parent directory"))?;
+    eprintln!("live remount requester: query parent directory");
+    fs::metadata(root)?;
+    eprintln!("live remount requester: parent directory query completed");
+    thread::sleep(Duration::from_secs(5));
+    eprintln!("live remount requester: cold-open an inode not retained by the old mount");
+    let cold = fs::read(root.join("large-directory/entry-000000"))?;
+    eprintln!(
+        "live remount requester: cold read completed ({} bytes)",
+        cold.len()
+    );
+    thread::sleep(Duration::from_secs(5));
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
     eprintln!("live remount requester: fresh open completed");
@@ -1068,7 +1085,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
             .arg(READ_REMOUNT_PAYLOAD)
             .arg(mount.join("live-ci/alpha.bin"))
             .stderr(Stdio::inherit());
-        let readback = windows::bounded(requester, Duration::from_secs(60))
+        let readback = windows::bounded(requester, Duration::from_secs(90))
             .and_then(|outcome| windows::checked_outcome(outcome, "remount readback"));
         match &readback {
             Ok(_) => println!("live remount: fresh-open read completed"),
