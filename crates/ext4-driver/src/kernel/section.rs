@@ -1,10 +1,12 @@
 //! Stream mutation ownership and callback admission. C only borrows the native resources.
 //!
 //! Preparation permits paging needed by Cc/MM. Sealing drains both main and paging resources and
-//! excludes further paging until the unique permit is released. Kernel section exclusion only
-//! acquires its resource and remains available for Cc reentry; it grants no paging or creation
-//! authority. Each admission class has a level-triggered notification projected under the phase
-//! transition lock. Preparing closes ordinary admission while keeping paging signaled.
+//! excludes further paging until the unique permit is released. Kernel section exclusion grants
+//! no paging or creation authority. From a thread that does not yet own the main resource it
+//! waits only for a sealed permit: the reactor publishes a sealed size change under that
+//! resource, and an exclusion owner may be awaiting the same reactor. Reentry by an owning
+//! thread never waits. Each admission class has a level-triggered notification projected under
+//! the phase transition lock. Preparing closes ordinary admission while keeping paging signaled.
 
 use ext4_shared::Shared;
 
@@ -208,8 +210,8 @@ impl SectionSynchronization {
         while !admission.accepts(self.phase()) {
             match admission {
                 SectionAdmission::Ordinary => self.ordinary.wait(),
-                SectionAdmission::Paging => self.paging.wait(),
-                SectionAdmission::ResourceOnly => return,
+                SectionAdmission::Paging | SectionAdmission::KernelExclusion => self.paging.wait(),
+                SectionAdmission::Reentry => return,
             }
         }
     }
@@ -236,20 +238,26 @@ unsafe impl Send for SectionSynchronization {}
 unsafe impl Sync for SectionSynchronization {}
 
 /// Callback classes differ while preparation permits Cc/MM paging to drain.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SectionAdmission {
     /// Requires the mutation owner to have released its complete publication scope.
     Ordinary,
     /// May reenter preparation until paging exclusion is sealed.
     Paging,
     /// Kernel exclusion acquires only the resource; it neither creates sections nor admits I/O.
-    ResourceOnly,
+    /// A sealed permit's publication needs that resource, so a new owner waits for its release.
+    KernelExclusion,
+    /// The calling thread already owns the resource exclusively, including Cc/MM reentry from a
+    /// sealed publication. Waiting would wait for this thread itself.
+    Reentry,
 }
 impl SectionAdmission {
-    /// Windows kernel section exclusion must remain callable during Cc preparation/publication.
-    fn for_section_sync(sync_type: wdk_sys::FS_FILTER_SECTION_SYNC_TYPE) -> Self {
-        if sync_type == wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::SyncTypeOther {
-            Self::ResourceOnly
+    /// Selects admission from the Windows synchronization type and current-thread ownership.
+    fn for_section_sync(sync_type: wdk_sys::FS_FILTER_SECTION_SYNC_TYPE, reentrant: bool) -> Self {
+        if reentrant {
+            Self::Reentry
+        } else if sync_type == wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::SyncTypeOther {
+            Self::KernelExclusion
         } else {
             Self::Ordinary
         }
@@ -259,8 +267,8 @@ impl SectionAdmission {
     fn accepts(self, phase: SectionPhase) -> bool {
         match self {
             Self::Ordinary => phase == SectionPhase::Idle,
-            Self::Paging => phase != SectionPhase::Sealed,
-            Self::ResourceOnly => true,
+            Self::Paging | Self::KernelExclusion => phase != SectionPhase::Sealed,
+            Self::Reentry => true,
         }
     }
 }
@@ -432,10 +440,11 @@ unsafe extern "system" fn ext4win_section_phase(state: *const SectionSynchroniza
     }
 }
 
-/// Acquires section synchronization without blocking kernel-only exclusion on mutation admission.
+/// Acquires section synchronization under the admission selected for its type and caller.
 /// # Safety
 /// The native callback retains state and resource through its paired same-thread release,
-/// supplies the Windows synchronization type, and runs at <= APC_LEVEL.
+/// supplies the Windows synchronization type and the calling thread's exclusive ownership of
+/// `resource`, and runs at <= APC_LEVEL.
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
@@ -446,6 +455,7 @@ unsafe extern "system" fn ext4win_section_acquire_sync(
     state: *const SectionSynchronization,
     resource: *mut wdk_sys::ERESOURCE,
     sync_type: wdk_sys::FS_FILTER_SECTION_SYNC_TYPE,
+    reentrant: u8,
 ) -> u8 {
     let state = unsafe {
         // SAFETY: The native callback retains initialized state until paired release.
@@ -464,7 +474,7 @@ unsafe extern "system" fn ext4win_section_acquire_sync(
             resource,
             true,
             true,
-            SectionAdmission::for_section_sync(sync_type),
+            SectionAdmission::for_section_sync(sync_type, reentrant != 0),
         )
         .0,
     )
@@ -703,18 +713,61 @@ mod tests {
     }
 
     /// # Panics
-    /// Fails if Cc's resource-only section exclusion waits on its own mutation admission.
+    /// Fails if an owning thread's Cc/MM reentry waits on itself, or a new kernel exclusion
+    /// owner can acquire the resource that a sealed publication still requires.
     #[test]
-    fn kernel_section_exclusion_remains_available_during_cc_reentry() {
-        let exclusion = SectionAdmission::for_section_sync(
-            wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::SyncTypeOther,
-        );
+    fn kernel_section_exclusion_waits_only_for_a_sealed_publication() {
+        use wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::{SyncTypeCreateSection, SyncTypeOther};
+        for sync_type in [SyncTypeOther, SyncTypeCreateSection] {
+            let reentry = SectionAdmission::for_section_sync(sync_type, true);
+            assert_eq!(reentry, SectionAdmission::Reentry);
+            assert!(reentry.accepts(SectionPhase::Preparing));
+            assert!(reentry.accepts(SectionPhase::Sealed));
+        }
+        let exclusion = SectionAdmission::for_section_sync(SyncTypeOther, false);
+        assert!(exclusion.accepts(SectionPhase::Idle));
         assert!(exclusion.accepts(SectionPhase::Preparing));
-        assert!(exclusion.accepts(SectionPhase::Sealed));
-        let creation = SectionAdmission::for_section_sync(
-            wdk_sys::_FS_FILTER_SECTION_SYNC_TYPE::SyncTypeCreateSection,
-        );
+        assert!(!exclusion.accepts(SectionPhase::Sealed));
+        let creation = SectionAdmission::for_section_sync(SyncTypeCreateSection, false);
         assert!(!creation.accepts(SectionPhase::Preparing));
         assert!(!creation.accepts(SectionPhase::Sealed));
+    }
+
+    /// # Errors
+    /// Returns allocation, channel or waiter failure.
+    /// # Panics
+    /// Fails if a kernel exclusion waiter resumes before the sealed permit is released, or a
+    /// successor preparation that still admits paging blocks it.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "setup/worker failures return Result while admission is checked by assertions"
+    )]
+    fn kernel_exclusion_resumes_when_the_sealed_permit_is_released() -> DriverResult<()> {
+        let owner = SectionSynchronization::try_new()?;
+        let sealed = SectionSynchronization::begin(&owner)?.seal()?;
+        let waiter = owner.try_acquire()?;
+        std::thread::scope(|scope| {
+            let (done, result) = std::sync::mpsc::channel();
+            let worker = scope.spawn(move || {
+                waiter.get().wait(SectionAdmission::KernelExclusion);
+                done.send(waiter.get().phase())
+            });
+            let blocked = result.recv_timeout(core::time::Duration::from_millis(50));
+            drop(sealed);
+            let successor = SectionSynchronization::begin(&owner)?;
+            let resumed = result.recv_timeout(core::time::Duration::from_secs(2));
+            drop(successor);
+            worker
+                .join()
+                .map_err(|_| DriverError::InternalInvariantViolation)?
+                .map_err(|_| DriverError::InternalInvariantViolation)?;
+            assert_eq!(blocked, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+            assert!(matches!(
+                resumed,
+                Ok(SectionPhase::Idle | SectionPhase::Preparing)
+            ));
+            Ok(())
+        })
     }
 }

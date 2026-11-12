@@ -4,7 +4,8 @@
 /* FsRtl can omit completion-context storage when no post callback is registered.
  * These callbacks retain no post-operation state; supplied storage receives NULL. */
 /* Section creation is a fallible authority boundary. SyncTypeOther is a resource-only
- * acquisition used by Cc/MM and must remain available while terminal writeback drains. */
+ * acquisition used by Cc/MM and must remain available while terminal writeback drains.
+ * Rust selects admission from the sync type and whether this thread already owns main. */
 static NTSTATUS NTAPI
 ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID *context)
 {
@@ -16,7 +17,8 @@ ext4win_pre_acquire_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
         return STATUS_SUCCESS;
     }
     (VOID)ext4win_section_acquire_sync(stream->SectionState, &stream->MainResource,
-        data->Parameters.AcquireForSectionSynchronization.SyncType);
+        data->Parameters.AcquireForSectionSynchronization.SyncType,
+        ExIsResourceAcquiredExclusiveLite(&stream->MainResource));
     if ((data->Parameters.AcquireForSectionSynchronization.SyncType == SyncTypeCreateSection)
         && !ext4win_stream_section_io_available(stream,
             data->Parameters.AcquireForSectionSynchronization.PageProtection)) {

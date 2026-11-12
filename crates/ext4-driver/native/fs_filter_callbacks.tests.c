@@ -109,12 +109,19 @@ static BOOLEAN ext4win_stream_fast_io_stream(
 {
     return ext4win_stream_section_callback_stream(object, output);
 }
+static BOOLEAN ExIsResourceAcquiredExclusiveLite(PERESOURCE resource)
+{
+    assert(resource == &stream.MainResource);
+    return resource->held != 0;
+}
 static BOOLEAN ext4win_section_acquire_sync(const VOID *state, PERESOURCE resource,
-    unsigned sync_type)
+    unsigned sync_type, BOOLEAN reentrant)
 {
     (void)state;
-    assert(resource == &stream.MainResource && resource->held == 0);
+    assert(resource == &stream.MainResource);
     assert(sync_type == SyncTypeOther || sync_type == SyncTypeCreateSection);
+    /* Admission learns whether this thread already owns main, so reentry never waits. */
+    assert(reentrant == (resource->held != 0));
     resource->held++;
     return TRUE;
 }
@@ -139,7 +146,7 @@ static BOOLEAN ext4win_stream_section_io_available(PEXT4WIN_STREAM_CONTEXT objec
 static void wdk_sys_release_resource(PERESOURCE resource)
 {
     assert((resource == &stream.MainResource || resource == &stream.PagingIoResource)
-        && resource->held == 1);
+        && resource->held != 0);
     resource->held--;
 }
 static void ext4win_trace_selected(PEXT4WIN_STREAM_CONTEXT object, unsigned event)
@@ -198,6 +205,20 @@ static void exercise_callbacks(BOOLEAN supply_context)
     invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
     assert(stream.MainResource.held == 0);
+
+    /* Cc/MM may reenter on the owning thread without waiting for itself. */
+    data.Parameters.AcquireForSectionSynchronization.SyncType = SyncTypeOther;
+    invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
+        STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+    invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
+        STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+    assert(stream.MainResource.held == 2);
+    invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
+        STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+    invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
+        STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+    assert(stream.MainResource.held == 0);
+    data.Parameters.AcquireForSectionSynchronization.SyncType = SyncTypeCreateSection;
 
     ordinary_io_available = FALSE;
     invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
