@@ -1019,11 +1019,18 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         "live remount requester: control read completed ({} bytes)",
         control.len()
     );
-    thread::sleep(Duration::from_secs(5));
+    // Lazy-writer teardown of the closed control stream completes during this interval.
+    for elapsed in [5, 10, 15] {
+        thread::sleep(Duration::from_secs(5));
+        eprintln!("live remount requester: control stream teardown wait {elapsed}s");
+    }
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
     eprintln!("live remount requester: fresh open completed");
-    thread::sleep(Duration::from_secs(5));
+    for elapsed in [5, 10] {
+        thread::sleep(Duration::from_secs(5));
+        eprintln!("live remount requester: retained-inode open wait {elapsed}s");
+    }
     let readback = (|| -> TaskResult<()> {
         eprintln!("live remount requester: reading payload");
         let mut output = io::stdout().lock();
