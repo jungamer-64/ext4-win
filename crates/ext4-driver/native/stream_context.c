@@ -931,7 +931,9 @@ ext4win_stream_cache_drain_for_volume_lock(_In_ PVOID stream_header)
     io_status.Status = STATUS_SUCCESS;
     io_status.Information = 0;
     status = STATUS_SUCCESS;
-    wdk_sys_acquire_resource_exclusive(&stream->MainResource, TRUE);
+    /* Cc flush acquires paging admission while this drain owns MainResource. Waiting for an
+     * idle section first keeps a sealed mutation's publication from needing this owner. */
+    (VOID)ext4win_section_acquire_main(stream->SectionState, &stream->MainResource, TRUE, TRUE, NULL);
     __try {
         if (!MmFlushImageSection(&stream->SectionObjects, MmFlushForWrite)) {
             status = STATUS_USER_MAPPED_FILE;
