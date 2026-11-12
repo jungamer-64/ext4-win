@@ -64,6 +64,9 @@ enum Task {
     /// Performs one fresh open in an isolated live-remount requester.
     #[cfg(windows)]
     ReadRemountPayload,
+    /// Reads one live partition file through the core from the raw disk in user mode.
+    #[cfg(windows)]
+    ReadRawPartitionFile,
     /// Reconciles and removes one interrupted disposable VHDX session.
     CleanupLiveVhdxSession,
 }
@@ -74,6 +77,10 @@ impl Task {
         #[cfg(windows)]
         if argument == crate::live::READ_REMOUNT_PAYLOAD {
             return Some(Self::ReadRemountPayload);
+        }
+        #[cfg(windows)]
+        if argument == crate::interop::READ_RAW_PARTITION_FILE {
+            return Some(Self::ReadRawPartitionFile);
         }
         if argument == "benchmark-multi-file" {
             Some(Self::BenchmarkMultiFile)
@@ -181,6 +188,11 @@ fn execute() -> TaskResult<()> {
             let path = task_argument.as_deref().ok_or_else(usage_error)?;
             crate::live::read_remount_payload(std::path::Path::new(path))
         }
+        #[cfg(windows)]
+        Task::ReadRawPartitionFile => {
+            let argument = task_argument.as_deref().ok_or_else(usage_error)?;
+            crate::interop::read_raw_partition_file(argument)
+        }
 
         Task::BenchmarkMultiFile
         | Task::Portable
@@ -227,7 +239,7 @@ fn execute() -> TaskResult<()> {
                     Err(io::Error::other("package mapping lost its required OEM argument").into())
                 }
                 #[cfg(windows)]
-                Task::ReadRemountPayload => Err(usage_error().into()),
+                Task::ReadRemountPayload | Task::ReadRawPartitionFile => Err(usage_error().into()),
             }
         }
     }

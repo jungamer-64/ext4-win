@@ -1112,6 +1112,29 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
             thread::sleep(Duration::from_secs(10));
             println!("live remount: post-dismount quiescence {elapsed}s");
         }
+        // Temporary isolation probe: the production core reads the same on-disk state in user
+        // mode before the kernel's fresh mount does. Remove once the runner loss is attributed.
+        let identity = storage::validate(&scope)?;
+        for name in [REMOUNT_RETAINED_CONTROL, "alpha.bin"] {
+            let mut probe = Command::new(env::current_exe()?);
+            probe
+                .arg(crate::interop::READ_RAW_PARTITION_FILE)
+                .arg(format!(
+                    "{}:{}:{}:live-ci/{name}",
+                    identity.disk, identity.offset, identity.length
+                ))
+                .stderr(Stdio::inherit());
+            match windows::bounded(probe, Duration::from_secs(120))
+                .and_then(|outcome| windows::checked_outcome(outcome, "raw partition probe"))
+            {
+                Ok(bytes) => println!(
+                    "live remount: user-mode core read {name}: {} bytes, payload match={}",
+                    bytes.len(),
+                    bytes == payload
+                ),
+                Err(error) => println!("live remount: user-mode core read {name} failed: {error}"),
+            }
+        }
         println!("live remount: read through a fresh open while the old handle remains");
         let mut requester = Command::new(env::current_exe()?);
         requester

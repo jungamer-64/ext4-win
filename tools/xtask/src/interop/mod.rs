@@ -13,6 +13,13 @@ use std::{
 /// Owns independent JBD2, HTree, crash-cut, and fixture-provenance scenarios.
 mod scenarios;
 
+/// Reads disposable live partitions from the raw disk in user mode.
+#[cfg(windows)]
+mod live_probe;
+
+#[cfg(windows)]
+pub(crate) use live_probe::{READ_RAW_PARTITION_FILE, read_raw_partition_file};
+
 pub(crate) use scenarios::{
     verify_htree_interop, verify_journal_fixture_provenance, verify_journal_interop,
     verify_ro_interop,
