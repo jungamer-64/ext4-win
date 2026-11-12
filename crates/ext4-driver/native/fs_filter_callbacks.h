@@ -63,6 +63,10 @@ ext4win_pre_release_section(_In_ PFS_FILTER_CALLBACK_DATA data, _Out_opt_ PVOID 
     if (!ext4win_stream_section_callback_stream(data->FileObject, &stream)) {
         return STATUS_SUCCESS;
     }
+    /* A paging end-of-file request served under this exclusion left Cc behind the header.
+     * This owner projects it before any other thread can enter Cc; cache initialization
+     * retries a failure under its own exclusive ownership. */
+    (VOID)ext4win_stream_project_cache_sizes(stream);
     wdk_sys_release_resource(&stream->MainResource);
     return STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY;
 }

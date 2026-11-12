@@ -585,6 +585,40 @@ impl StreamSizeChangeKind {
     }
 }
 
+/// How a selected size gate establishes its exclusion before commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SizeGatePreparation {
+    /// A passive worker acquires the stream resources, runs Cc/MM checks and seals the section.
+    Passive,
+    /// The paging end-of-file requester's own main-resource ownership is the exclusion. A
+    /// passive worker would wait for that resource while the requester waits for this request.
+    Requester,
+}
+
+/// Selects the gate covering one final stream projection, if its native sizes or reset require
+/// one. `requester` names the stream whose main resource the paging end-of-file requester owns.
+/// # Errors
+/// Rejects a requester-covered change other than growth: no purge or truncation check can run
+/// under that exclusion, and Memory Manager end-of-file requests only extend a section.
+fn select_size_gate(
+    node: NodeId,
+    current: StreamSizes,
+    target: StreamSizes,
+    reset: Option<NodeId>,
+    requester: Option<NodeId>,
+) -> DriverResult<Option<(StreamSizeChangeKind, SizeGatePreparation)>> {
+    let Some(kind) = StreamSizeChangeKind::select(node, current, target, reset) else {
+        return Ok(None);
+    };
+    if requester != Some(node) {
+        return Ok(Some((kind, SizeGatePreparation::Passive)));
+    }
+    if kind != StreamSizeChangeKind::Resize || target.file_size() < current.file_size() {
+        return Err(DriverError::InternalInvariantViolation);
+    }
+    Ok(Some((kind, SizeGatePreparation::Requester)))
+}
+
 /// Captured stream and exact size-check semantics not yet submitted to Cc/MM.
 #[derive(Debug)]
 pub(crate) struct StreamSizeChangeLease {
@@ -613,7 +647,7 @@ impl StreamSizeChangeLease {
             .stream_context
             .prepare_section_mutation(self.kind.operation(self.target_sizes), policy)?;
         Ok(PreparedStreamSizeChange {
-            _section: section,
+            exclusion: SizeChangeExclusion::Sealed { _permit: section },
             stream: self.stream,
             node: self.node,
             target_sizes: self.target_sizes,
@@ -696,11 +730,39 @@ pub(crate) struct PreparedStreamSizeChanges {
     prepared: DriverVec<PreparedStreamSizeChange>,
 }
 
+impl PreparedStreamSizeChanges {
+    /// Selects which thread brings Cc to this node's committed size, if a gate covers it.
+    pub(super) fn size_projection(&self, node: NodeId) -> Option<SizeProjection> {
+        self.prepared
+            .iter()
+            .find(|change| change.node == node)
+            .map(|change| match change.exclusion {
+                SizeChangeExclusion::Sealed { .. } => SizeProjection::Reactor,
+                SizeChangeExclusion::Requester => SizeProjection::Requester,
+            })
+    }
+}
+
+/// Exclusion that keeps other main-resource owners out of one stream's size change.
+#[derive(Debug)]
+enum SizeChangeExclusion {
+    /// Unique section release authority acquired by passive preparation.
+    Sealed {
+        /// Released when the gate ends, before the stream retention lease.
+        _permit: crate::kernel::section::SealedSectionMutation,
+    },
+    /// The synchronous paging end-of-file requester owns the main resource until its IRP
+    /// completes, and the operation retains that IRP beyond this gate. Its own ownership
+    /// excludes every ordinary and section owner; a driver thread acquiring the resource would
+    /// wait for that requester, which is waiting for this request.
+    Requester,
+}
+
 /// Successful native size-change gate retained through durable size publication.
 #[derive(Debug)]
 pub(crate) struct PreparedStreamSizeChange {
-    /// Unique section release authority drops before the stream retention lease.
-    _section: crate::kernel::section::SealedSectionMutation,
+    /// Ends before the stream retention lease.
+    exclusion: SizeChangeExclusion,
     /// Stream lease released only after the native gate is ended.
     stream: StreamCacheLease,
     /// Regular-file identity protected by this gate.
@@ -981,13 +1043,18 @@ impl StreamPublicationLease {
         &self,
         metadata: NodeStreamMetadata,
         epoch: ext4_core::EpochSequence,
+        projection: SizeProjection,
     ) -> DriverResult<StreamMetadataPublication> {
         let fcb = unsafe {
             // SAFETY: This lease keeps the FCB table entry alive until its own Drop completes.
             self.retained.fcb.as_ref()
         };
-        fcb.stream_context
-            .publish_node_metadata(metadata.sizes(), metadata.snapshot(), epoch)
+        fcb.stream_context.publish_node_metadata(
+            metadata.sizes(),
+            metadata.snapshot(),
+            epoch,
+            projection,
+        )
     }
 }
 
@@ -2245,6 +2312,7 @@ impl FileControlBlockLedger {
         updates: &PreparedStreamMetadataPublications,
         deletion: Option<NodeId>,
         reset: Option<NodeId>,
+        requester: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
         if let Some(node) = reset
             && (!matches!(node, NodeId::File(_))
@@ -2253,11 +2321,19 @@ impl FileControlBlockLedger {
         {
             return Err(DriverError::InternalInvariantViolation);
         }
+        if let Some(node) = requester
+            && (!matches!(node, NodeId::File(_)) || deletion == Some(node) || reset == Some(node))
+        {
+            return Err(DriverError::InternalInvariantViolation);
+        }
         let capacity = updates.nodes.len();
         let mut remaining: DriverVec<StreamSizeChangeLease> =
             DriverVec::try_with_capacity(capacity)?;
-        let prepared: DriverVec<PreparedStreamSizeChange> = DriverVec::try_with_capacity(capacity)?;
+        let mut prepared: DriverVec<PreparedStreamSizeChange> =
+            DriverVec::try_with_capacity(capacity)?;
+        // Lease releases reacquire the ledger resource, so failures drop them after its scope.
         let mut failed_lease = None;
+        let mut failed_change = None;
         let acquisition = {
             let _guard = self.lock.acquire();
             let table = unsafe {
@@ -2292,10 +2368,19 @@ impl FileControlBlockLedger {
                         break;
                     }
                 };
-                let Some(kind) =
-                    StreamSizeChangeKind::select(update.node(), current, update.sizes(), reset)
-                else {
-                    continue;
+                let (kind, preparation) = match select_size_gate(
+                    update.node(),
+                    current,
+                    update.sizes(),
+                    reset,
+                    requester,
+                ) {
+                    Ok(Some(gate)) => gate,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        result = Err(error);
+                        break;
+                    }
                 };
                 let mut state = ledger_file_control_block_open_state(table, fcb);
                 if let Err(error) = unsafe {
@@ -2307,13 +2392,30 @@ impl FileControlBlockLedger {
                     result = Err(error);
                     break;
                 }
-                let lease = StreamSizeChangeLease {
-                    stream: StreamCacheLease {
-                        retained: DeferredStreamLease {
-                            owner: NonNull::from(self),
-                            fcb,
-                        },
+                let stream = StreamCacheLease {
+                    retained: DeferredStreamLease {
+                        owner: NonNull::from(self),
+                        fcb,
                     },
+                };
+                if preparation == SizeGatePreparation::Requester {
+                    let change = PreparedStreamSizeChange {
+                        exclusion: SizeChangeExclusion::Requester,
+                        stream,
+                        node: update.node(),
+                        target_sizes: update.sizes(),
+                        kind,
+                    };
+                    if let Err(error) = prepared.push_reserved_owned(change) {
+                        let (error, change) = error.into_parts();
+                        failed_change = Some(change);
+                        result = Err(error);
+                        break;
+                    }
+                    continue;
+                }
+                let lease = StreamSizeChangeLease {
+                    stream,
                     node: update.node(),
                     target_sizes: update.sizes(),
                     kind,
@@ -2328,8 +2430,12 @@ impl FileControlBlockLedger {
             result
         };
         drop(failed_lease);
+        drop(failed_change);
         acquisition?;
-        let total = remaining.len();
+        let total = remaining
+            .len()
+            .checked_add(prepared.len())
+            .ok_or(DriverError::InternalInvariantViolation)?;
         Ok(StreamSizeChangePlan {
             owner: NonNull::from(self),
             remaining,
@@ -2646,7 +2752,8 @@ impl FileControlBlockLedger {
 
     /// Retires freed allocations before any fallible native projection, preserving their exact
     /// pointer lifetimes. Live streams are retained through short leases while the ledger
-    /// resource is released for each native Cc/MM call.
+    /// resource is released for each native Cc/MM call. Each size change is projected by the
+    /// thread its retained gate selects; an update without a gate has unchanged sizes.
     /// # Errors
     ///
     /// Returns the exact stream-lease or Cc/MM publication failure.
@@ -2658,6 +2765,7 @@ impl FileControlBlockLedger {
         &self,
         updates: PreparedStreamMetadataPublications,
         epoch: ext4_core::EpochSequence,
+        size_changes: Option<&PreparedStreamSizeChanges>,
     ) -> StreamProjectionOutcome {
         {
             let _guard = self.lock.acquire();
@@ -2687,7 +2795,10 @@ impl FileControlBlockLedger {
             let Some(lease) = lease else {
                 continue;
             };
-            match lease.publish(*update, epoch) {
+            let projection = size_changes
+                .and_then(|changes| changes.size_projection(update.node()))
+                .unwrap_or(SizeProjection::Reactor);
+            match lease.publish(*update, epoch, projection) {
                 Ok(StreamMetadataPublication::Complete) => {
                     published_streams = published_streams.checked_add(1).unwrap_or_else(|| {
                         KernelWideInconsistency::file_control_block_ownership_corruption()
@@ -3747,5 +3858,68 @@ mod index_tests {
             Ok(())
         })();
         assert_eq!(result, Ok(()));
+    }
+}
+
+#[cfg(test)]
+mod size_gate_tests {
+    use super::*;
+
+    /// # Errors
+    /// Returns fixture size construction failures.
+    /// # Panics
+    /// Fails if a requester-owned stream is given passive preparation, which would wait for the
+    /// main resource that requester owns, or if that exclusion admits anything but growth.
+    #[test]
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "fixture construction returns Result while assertions check gate selection"
+    )]
+    fn requester_exclusion_covers_only_its_own_growth() -> DriverResult<()> {
+        let cluster = ext4_core::ClusterSize::new(4_096)?;
+        let sizes = |bytes| {
+            StreamSizes::try_from_ext4(
+                ext4_core::FileSize::from_bytes(bytes),
+                ext4_core::FileAllocationSize::from_bytes(bytes),
+                cluster,
+            )
+        };
+        let (small, large) = (sizes(4_096)?, sizes(65_536)?);
+        // Selection depends only on stream identity; the plan restricts gates to regular files.
+        let node = NodeId::Directory(DirectoryNodeId::ROOT);
+        assert_eq!(
+            select_size_gate(node, small, small, None, Some(node)),
+            Ok(None)
+        );
+        assert_eq!(
+            select_size_gate(node, small, large, None, Some(node)),
+            Ok(Some((
+                StreamSizeChangeKind::Resize,
+                SizeGatePreparation::Requester
+            )))
+        );
+        assert_eq!(
+            select_size_gate(node, large, small, None, Some(node)),
+            Err(DriverError::InternalInvariantViolation)
+        );
+        assert_eq!(
+            select_size_gate(node, small, small, Some(node), Some(node)),
+            Err(DriverError::InternalInvariantViolation)
+        );
+        for target in [small, large] {
+            assert_eq!(
+                select_size_gate(node, large, target, None, None),
+                Ok((target != large)
+                    .then_some((StreamSizeChangeKind::Resize, SizeGatePreparation::Passive)))
+            );
+        }
+        assert_eq!(
+            select_size_gate(node, small, small, Some(node), None),
+            Ok(Some((
+                StreamSizeChangeKind::Reset,
+                SizeGatePreparation::Passive
+            )))
+        );
+        Ok(())
     }
 }

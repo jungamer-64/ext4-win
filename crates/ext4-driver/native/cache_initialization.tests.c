@@ -23,6 +23,7 @@ unsigned long __cdecl _exception_code(void);
 #define CC_ENABLE_DISK_IO_ACCOUNTING 0x00000010UL
 #define EXT4WIN_CATCH_EXPECTED_EXCEPTIONS 1
 #define GetExceptionCode() ((long)_exception_code())
+#define NT_SUCCESS(status) ((status) >= 0)
 typedef long NTSTATUS;
 typedef unsigned long ULONG;
 typedef unsigned char UCHAR, *PUCHAR, BOOLEAN;
@@ -86,9 +87,18 @@ static VOID wdk_sys_release_resource(PERESOURCE resource)
     resource->Held = 0;
     ++releases;
 }
+static unsigned projections;
+static NTSTATUS projection_status;
+static NTSTATUS ext4win_stream_project_cache_sizes(PEXT4WIN_STREAM_CONTEXT selected)
+{
+    /* A pending requester-held size reaches Cc before this owner's Cc entry. */
+    assert(selected == &stream && stream.MainResource.Held && entries == 0 && captures == 0);
+    ++projections;
+    return projection_status;
+}
 static VOID ext4win_capture_cache_sizes(PEXT4WIN_STREAM_CONTEXT selected, CC_FILE_SIZES *sizes)
 {
-    assert(selected == &stream && stream.MainResource.Held);
+    assert(selected == &stream && stream.MainResource.Held && projections == 1);
     ++captures;
     sizes->AllocationSize = 8192;
     sizes->FileSize = 4097;
@@ -131,8 +141,9 @@ static VOID reset(VOID)
     file.Flags = 0xa000;
     verify_required = closing = set_verify_on_lock = set_verify_in_cc = 0;
     gate_calls = acquisitions = releases = entries = captures = flag_updates = accounting = 0;
+    projections = 0;
     storage_present = accounting_enabled = 1;
-    cc_exception = STATUS_SUCCESS;
+    cc_exception = projection_status = STATUS_SUCCESS;
 }
 int main(void)
 {
@@ -175,7 +186,13 @@ int main(void)
 
     reset(); before = 99; file.PrivateCacheMap = &cache_identity;
     assert(ext4win_stream_cache_initialize(&stream.Header, &file, &before) == STATUS_SUCCESS && before == 0);
-    assert(entries == 0 && flag_updates == 0 && acquisitions == 1 && releases == 1);
+    assert(entries == 0 && flag_updates == 0 && acquisitions == 1 && releases == 1 && projections == 1);
+
+    /* An unprojected size refuses this Cc entry and leaves the owner released. */
+    reset(); before = 99; projection_status = STATUS_IO_DEVICE_ERROR;
+    assert(ext4win_stream_cache_initialize(&stream.Header, &file, &before) == STATUS_IO_DEVICE_ERROR && before == 0);
+    assert(projections == 1 && entries == 0 && captures == 0 && acquisitions == 1 && releases == 1);
+    assert(!stream.MainResource.Held && file.PrivateCacheMap == NULL && file.Flags == 0xa000);
 
     reset(); before = 99; storage_present = 0;
     assert(ext4win_stream_cache_initialize(&stream.Header, &file, &before) == STATUS_DEVICE_REMOVED && before == 0);

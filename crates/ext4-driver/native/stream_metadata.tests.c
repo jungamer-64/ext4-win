@@ -15,9 +15,12 @@
 #define STATUS_INVALID_PARAMETER (-1)
 #define STATUS_INTERNAL_ERROR (-2)
 #define STATUS_UNSUCCESSFUL (-3)
+#define NT_SUCCESS(status) ((status) >= 0)
+#define VOID void
 
 typedef int NTSTATUS;
 typedef int BOOLEAN;
+typedef long LONG;
 typedef unsigned ULONG;
 typedef unsigned long long ULONGLONG;
 typedef unsigned long long ULONG_PTR;
@@ -40,6 +43,7 @@ typedef struct {
     LONGLONG AllocationCharge;
     EXT4WIN_PUBLISHED_STREAM_METADATA PublishedMetadata;
     BOOLEAN MetadataValid;
+    volatile LONG CacheProjectionPending;
     ULONG Kind;
 } EXT4WIN_STREAM_CONTEXT, *PEXT4WIN_STREAM_CONTEXT;
 
@@ -57,6 +61,21 @@ static PEXT4WIN_STREAM_CONTEXT ext4win_stream_from_header(PVOID header)
 {
     assert(header == NULL || header == &stream.Header);
     return header == NULL ? NULL : &stream;
+}
+/* Every pending-projection transition happens while some thread owns MainResource. */
+static LONG InterlockedExchange(volatile LONG *target, LONG value)
+{
+    LONG previous = *target;
+    assert(target == &stream.CacheProjectionPending && stream.MainResource.writer == 1);
+    *target = value;
+    return previous;
+}
+static LONG InterlockedCompareExchange(volatile LONG *target, LONG exchange, LONG comparand)
+{
+    LONG previous = *target;
+    assert(target == &stream.CacheProjectionPending);
+    if (previous == comparand) { *target = exchange; }
+    return previous;
 }
 static void ExAcquireFastMutex(FAST_MUTEX *mutex)
 {
@@ -115,21 +134,29 @@ static void ObDereferenceObject(PFILE_OBJECT file)
 
 #include "stream_metadata.h"
 
-static void publish(ULONGLONG epoch, LONGLONG allocation, LONGLONG eof,
+static void publish_with(ULONG exclusion, ULONGLONG epoch, LONGLONG allocation, LONGLONG eof,
     LONGLONG charge, NTSTATUS expected_cache_status)
 {
     const EXT4WIN_PUBLISHED_STREAM_METADATA metadata = { epoch, 2, epoch == 1 };
+    const unsigned owner = stream.MainResource.writer;
     NTSTATUS cache_status = 99;
     assert(ext4win_stream_publish_metadata(&stream.Header, allocation, eof, eof,
-        charge, &metadata, &cache_status) == STATUS_SUCCESS);
+        charge, &metadata, exclusion, &cache_status) == STATUS_SUCCESS);
     assert(cache_status == expected_cache_status);
     assert(stream.MetadataValid && stream.PublishedMetadata.Epoch == epoch);
     assert(stream.PublishedMetadata.NumberOfLinks == 2 && stream.AllocationCharge == charge);
     assert(stream.PublishedMetadata.WritableData == (epoch == 1));
     assert(stream.Header.AllocationSize.QuadPart == allocation);
     assert(stream.Header.FileSize.QuadPart == eof && stream.Header.ValidDataLength.QuadPart == eof);
-    assert(stream.HeaderMutex.held == 0 && stream.MainResource.writer == 0);
+    assert(stream.HeaderMutex.held == 0 && stream.MainResource.writer == owner);
     assert(cache_file.references == 0);
+}
+static void publish(ULONGLONG epoch, LONGLONG allocation, LONGLONG eof,
+    LONGLONG charge, NTSTATUS expected_cache_status)
+{
+    assert(stream.MainResource.writer == 0);
+    publish_with(EXT4WIN_SIZE_PROJECTION_REACTOR, epoch, allocation, eof, charge,
+        expected_cache_status);
 }
 
 int main(void)
@@ -156,12 +183,14 @@ int main(void)
     metadata.WritableData = FALSE;
     cache_status = 99;
     assert(ext4win_stream_publish_metadata(&stream.Header, 16384, 16384, 16384,
-        8192, &metadata, &cache_status) == STATUS_INVALID_PARAMETER);
+        8192, &metadata, EXT4WIN_SIZE_PROJECTION_REACTOR, &cache_status) == STATUS_INVALID_PARAMETER);
     metadata.Epoch = 3;
     assert(ext4win_stream_publish_metadata(&stream.Header, 4096, 8192, 8192,
-        4096, &metadata, &cache_status) == STATUS_INVALID_PARAMETER);
+        4096, &metadata, EXT4WIN_SIZE_PROJECTION_REACTOR, &cache_status) == STATUS_INVALID_PARAMETER);
     assert(ext4win_stream_publish_metadata(&stream.Header, 8192, 8192, 4096,
-        4096, &metadata, &cache_status) == STATUS_INVALID_PARAMETER);
+        4096, &metadata, EXT4WIN_SIZE_PROJECTION_REACTOR, &cache_status) == STATUS_INVALID_PARAMETER);
+    assert(ext4win_stream_publish_metadata(&stream.Header, 16384, 16384, 16384,
+        8192, &metadata, 2, &cache_status) == STATUS_INVALID_PARAMETER);
     assert(stream.PublishedMetadata.Epoch == 2 && stream.Header.FileSize.QuadPart == 8192);
     assert(reference_calls == 0 && cache_calls == 0 && stream.HeaderMutex.held == 0);
 
@@ -191,5 +220,36 @@ int main(void)
     stream.SectionObjects.SharedCacheMap = NULL;
     publish(9, 32768, 24576, 8192, STATUS_SUCCESS);
     assert(cache_calls == 4 && reference_calls == 6);
+
+    /* A paging end-of-file requester owns MainResource and awaits this publication: waiting
+     * for main here would stop the reactor. The header commits; Cc is left to that owner. */
+    stream.SectionObjects.SharedCacheMap = &cache_file;
+    stream.MainResource.writer = 1;
+    publish_with(EXT4WIN_SIZE_PROJECTION_REQUESTER, 10, 65536, 40960, 8192, STATUS_SUCCESS);
+    assert(stream.CacheProjectionPending && cache_calls == 4 && reference_calls == 6);
+    publish_with(EXT4WIN_SIZE_PROJECTION_REQUESTER, 11, 65536, 40960, 12288, STATUS_SUCCESS);
+    assert(stream.CacheProjectionPending && cache_calls == 4);
+
+    /* The owner projects the latest header tuple; a failure stays pending for the next owner. */
+    cache_result = STATUS_UNSUCCESSFUL;
+    assert(ext4win_stream_project_cache_sizes(&stream) == STATUS_UNSUCCESSFUL);
+    assert(stream.CacheProjectionPending && cache_calls == 5 && cache_file.references == 0);
+    cache_result = STATUS_SUCCESS;
+    assert(ext4win_stream_project_cache_sizes(&stream) == STATUS_SUCCESS);
+    assert(!stream.CacheProjectionPending && cache_calls == 6 && cache_file.references == 0);
+    assert(cache_sizes.AllocationSize.QuadPart == 65536 && cache_sizes.FileSize.QuadPart == 40960);
+    assert(ext4win_stream_project_cache_sizes(&stream) == STATUS_SUCCESS && cache_calls == 6);
+
+    /* Without a cache map there is no Cc observer to bring forward. */
+    stream.SectionObjects.SharedCacheMap = NULL;
+    publish_with(EXT4WIN_SIZE_PROJECTION_REQUESTER, 12, 81920, 73728, 12288, STATUS_SUCCESS);
+    assert(!stream.CacheProjectionPending && cache_calls == 6 && reference_calls == 8);
+    stream.MainResource.writer = 0;
+
+    /* A sealed reactor projection supersedes a still-pending requester projection. */
+    stream.SectionObjects.SharedCacheMap = &cache_file;
+    stream.CacheProjectionPending = TRUE;
+    publish(13, 81920, 65536, 12288, STATUS_SUCCESS);
+    assert(!stream.CacheProjectionPending && cache_calls == 7);
     return 0;
 }

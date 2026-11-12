@@ -90,6 +90,14 @@ enum OrdinarySetFilePlan {
         /// Requested logical size.
         size: FileSize,
     },
+    /// Extends EOF for a Memory Manager section. Its requester may own section synchronization,
+    /// under which no purge or truncation check can run, so the size cannot decrease.
+    SectionEndOfFile {
+        /// Target regular file.
+        file: FileNodeId,
+        /// Requested logical size, at least the current size.
+        size: FileSize,
+    },
     /// Updates visible EOF while retaining the active fixed map's initialized physical interval.
     PagingEndOfFile {
         /// Exact regular-file inode owned by the Memory Manager's file object.
@@ -389,9 +397,12 @@ fn decode_set_file_plan(request: &mut PendingIrpLease<'_>) -> DriverResult<SetFi
             SetFileOperation::Resize => {
                 let end_of_file = read_end_of_file_input(active, stack.length())?;
                 let regular_file = OpenedRegularFile::decode(file_object)?;
-                OrdinarySetFilePlan::EndOfFile {
-                    file: regular_file.id(),
-                    size: file_size_from_large_integer(end_of_file)?,
+                let file = regular_file.id();
+                let size = file_size_from_large_integer(end_of_file)?;
+                if active.data_io_kind() == DataIoKind::Paging {
+                    OrdinarySetFilePlan::SectionEndOfFile { file, size }
+                } else {
+                    OrdinarySetFilePlan::EndOfFile { file, size }
                 }
             }
             SetFileOperation::AdvanceValidDataLength | SetFileOperation::ValidDataLength => {
@@ -559,6 +570,13 @@ fn apply_set_file_plan(
             }
         },
         OrdinarySetFilePlan::EndOfFile { file, size } => {
+            set_regular_file_size(mutation, file, size)?;
+            SetFileResolution::Mutation(SetFilePublication::None)
+        }
+        OrdinarySetFilePlan::SectionEndOfFile { file, size } => {
+            if size < regular_file_size(mutation, file)? {
+                return Err(DriverError::InvalidParameter);
+            }
             set_regular_file_size(mutation, file, size)?;
             SetFileResolution::Mutation(SetFilePublication::None)
         }

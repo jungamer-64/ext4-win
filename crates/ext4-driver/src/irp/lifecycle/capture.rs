@@ -853,8 +853,7 @@ impl QueueContext {
             _ => {}
         }
         let (prepared, cancellation_key) = PreparedRequest::capture(target, stack, major)?;
-        let paging = matches!(&prepared, PreparedRequest::Read(read) if read.kind() == DataIoKind::Paging)
-            || matches!(&prepared, PreparedRequest::Write(write) if write.kind() == DataIoKind::Paging);
+        let paging = prepared.is_paging();
         let release = if major == DispatchMajor::LockControl {
             stack.releases_byte_range_lock()
         } else if major == DispatchMajor::FileSystemControl
@@ -921,13 +920,7 @@ impl QueueContext {
 
     /// Returns whether CLEANUP may cancel this not-yet-started ordinary request.
     pub(super) fn cleanup_cancel_eligible(&self) -> bool {
-        !matches!(
-            &self.prepared,
-            PreparedRequest::Read(read) if read.kind() == DataIoKind::Paging
-        ) && !matches!(
-            &self.prepared,
-            PreparedRequest::Write(write) if write.kind() == DataIoKind::Paging
-        ) && !matches!(&self.prepared, PreparedRequest::FlushBuffers)
+        !self.prepared.is_paging() && !matches!(&self.prepared, PreparedRequest::FlushBuffers)
     }
 
     /// Returns the request variant sealed before the IRP entered the queue.
@@ -1106,10 +1099,14 @@ pub(crate) enum PreparedRequest {
     Read(PreparedRead),
     /// Write request with scalar parameters and input mapping captured.
     Write(PreparedWrite),
-    /// File information query.
-    QueryInformation,
+    /// File information query. A paging query is a Memory Manager size query whose
+    /// synchronous requester may own the stream's section synchronization.
+    QueryInformation(DataIoKind),
     /// File information mutation.
     SetInformation,
+    /// Memory Manager end-of-file extension from a synchronous paging requester, with the
+    /// section synchronization that requester owned when it dispatched this IRP.
+    SectionEndOfFile(crate::kernel::stream::RequesterSectionExclusion),
     /// Namespace mutations retain the original requestor for replacement checks.
     NamespaceInformation(crate::kernel::requestor_subject::RequestorSubject),
     /// Volume information query.
@@ -1170,10 +1167,27 @@ pub(crate) enum PreparedRequest {
 }
 
 impl PreparedRequest {
+    /// Cache and Memory Manager requests whose synchronous requester may own stream resources
+    /// that ordinary work waits for. They need independent execution capacity, bypass handle
+    /// ordering, and are never cancelled by CLEANUP.
+    pub(crate) fn is_paging(&self) -> bool {
+        match self {
+            Self::Read(read) => read.kind() == DataIoKind::Paging,
+            Self::Write(write) => write.kind() == DataIoKind::Paging,
+            Self::QueryInformation(kind) => *kind == DataIoKind::Paging,
+            Self::SectionEndOfFile(_) => true,
+            _ => false,
+        }
+    }
+
     /// Captures one queued request and its stable cancellation identity.
     /// # Errors
     ///
     /// Returns a completion payload when the major is not queueable or security capture fails.
+    #[expect(
+        unsafe_code,
+        reason = "the requesting dispatch thread observes its own ownership of a retained stream"
+    )]
     fn capture(
         target: &ActiveIrp<'_>,
         stack: super::CurrentIrpStackLocation<'_>,
@@ -1253,10 +1267,27 @@ impl PreparedRequest {
                 },
                 generic_key(),
             )),
-            DispatchMajor::QueryInformation => Ok((Self::QueryInformation, generic_key())),
+            DispatchMajor::QueryInformation => {
+                Ok((Self::QueryInformation(target.data_io_kind()), generic_key()))
+            }
             DispatchMajor::SetInformation => {
-                if matches!(
-                    stack.set_file().map(|set| set.operation()),
+                let operation = stack.set_file().map(|set| set.operation());
+                if target.data_io_kind() == DataIoKind::Paging
+                    && matches!(operation, Ok(super::SetFileOperation::Resize))
+                {
+                    let header = stack
+                        .file_object()
+                        .map_err(IrpCompletion::from_error)?
+                        .stream_header();
+                    // Dispatch runs on the requesting thread; ownership observed here persists
+                    // until this synchronous request completes.
+                    let exclusion = unsafe {
+                        // SAFETY: The active request retains this FILE_OBJECT's FsContext.
+                        crate::kernel::stream::RequesterSectionExclusion::observe(header)
+                    };
+                    Ok((Self::SectionEndOfFile(exclusion), generic_key()))
+                } else if matches!(
+                    operation,
                     Ok(super::SetFileOperation::Rename(_)
                         | super::SetFileOperation::RenameEx(_)
                         | super::SetFileOperation::Link(_)
@@ -3065,10 +3096,128 @@ mod tests {
         let ordinary = QueueContext {
             verification: super::VerificationBudget::Available,
             execution: super::super::scheduler::ExecutionClass::Ordinary,
-            prepared: PreparedRequest::QueryInformation,
+            prepared: PreparedRequest::QueryInformation(super::DataIoKind::Handle),
             cancellation_key: QueueCancellationKey::Device,
         };
         assert!(ordinary.cleanup_cancel_eligible());
+
+        for prepared in [
+            PreparedRequest::QueryInformation(super::DataIoKind::Paging),
+            PreparedRequest::SectionEndOfFile(
+                crate::kernel::stream::RequesterSectionExclusion::Held,
+            ),
+        ] {
+            let memory_manager = QueueContext {
+                verification: super::VerificationBudget::Available,
+                execution: super::super::scheduler::ExecutionClass::Paging,
+                prepared,
+                cancellation_key: QueueCancellationKey::Device,
+            };
+            assert!(!memory_manager.cleanup_cancel_eligible());
+        }
+    }
+
+    /// # Panics
+    /// Fails if a Memory Manager size query or extension can share ordinary execution capacity,
+    /// or waits for a snapshot cache drain that may need its requester's section synchronization.
+    #[test]
+    #[expect(
+        unsafe_code,
+        reason = "native stack and file fixtures outlive capture and owner drop"
+    )]
+    fn memory_manager_size_requests_progress_on_the_paging_lane() {
+        use super::super::scheduler::ExecutionClass;
+        use crate::kernel::stream::SnapshotPhase;
+        let mut device = wdk_sys::DEVICE_OBJECT::default();
+        let mut file = wdk_sys::FILE_OBJECT::default();
+        for (major, flags, expected, waits_draining, waits_frozen) in [
+            (
+                DispatchMajor::QueryInformation,
+                0,
+                ExecutionClass::Ordinary,
+                true,
+                true,
+            ),
+            (
+                DispatchMajor::QueryInformation,
+                wdk_sys::IRP_PAGING_IO,
+                ExecutionClass::Paging,
+                false,
+                false,
+            ),
+            (
+                DispatchMajor::SetInformation,
+                0,
+                ExecutionClass::Ordinary,
+                true,
+                true,
+            ),
+            (
+                DispatchMajor::SetInformation,
+                wdk_sys::IRP_PAGING_IO,
+                ExecutionClass::Paging,
+                false,
+                true,
+            ),
+        ] {
+            let query = major == DispatchMajor::QueryInformation;
+            let mut irp = wdk_sys::IRP {
+                Flags: flags,
+                ..wdk_sys::IRP::default()
+            };
+            let mut stack = wdk_sys::IO_STACK_LOCATION {
+                MajorFunction: if query { 0x05 } else { 0x06 },
+                FileObject: &raw mut file,
+                ..wdk_sys::IO_STACK_LOCATION::default()
+            };
+            if query {
+                stack.Parameters.QueryFile.FileInformationClass =
+                    wdk_sys::_FILE_INFORMATION_CLASS::FileStandardInformation;
+                stack.Parameters.QueryFile.Length = 24;
+            } else {
+                stack.Parameters.SetFile.FileInformationClass =
+                    wdk_sys::_FILE_INFORMATION_CLASS::FileEndOfFileInformation;
+                stack.Parameters.SetFile.Length = 8;
+            }
+            let target = unsafe {
+                // SAFETY: These local allocations retain every native identity.
+                build_target(&raw mut device, &raw mut irp, &raw mut stack)
+            };
+            assert!(target.is_some());
+            let Some(target) = target else {
+                continue;
+            };
+            let captured = PendingIrp::capture(target, major);
+            assert!(captured.is_ok(), "{major:?} flags={flags:x}");
+            let Ok(captured) = captured else {
+                continue;
+            };
+            assert_eq!(
+                captured.execution_class(),
+                expected,
+                "{major:?} flags={flags:x}"
+            );
+            let device = captured.target.device;
+            let irp = captured.publish();
+            let mut owned = unsafe {
+                // SAFETY: Publication transfers this fixture's sole queued ownership; the local
+                // IRP, stack and file remain live until completion below.
+                super::super::OwnedIrp::from_queued_raw(device, irp)
+            };
+            for (phase, waits) in [
+                (SnapshotPhase::Draining, waits_draining),
+                (SnapshotPhase::Frozen, waits_frozen),
+            ] {
+                assert_eq!(
+                    crate::request::operation::snapshot_should_wait(&mut owned, phase),
+                    waits,
+                    "{major:?} flags={flags:x} during {phase:?}"
+                );
+            }
+            let _status = owned
+                .prepare_result(Ok(super::super::IrpCompletion::EMPTY))
+                .notify();
+        }
     }
 
     /// # Panics

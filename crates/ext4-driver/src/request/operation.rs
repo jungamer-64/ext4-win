@@ -4575,8 +4575,10 @@ impl MutationRequestOperation {
     /// Retains the current node stream when this request class can break an oplock.
     ///
     /// Position-only updates and paging writeback do not change stream or namespace state, so
-    /// they bypass this break protocol. CREATE has a separate admission protocol; CLEANUP derives
-    /// its FsRtl flags from the exact opened handle before releasing any handle-owned state.
+    /// they bypass this break protocol. A Memory Manager end-of-file extension belongs to section
+    /// creation, whose writable acquisition already broke oplocks, and its requester may own the
+    /// main resource a break check acquires. CREATE has a separate admission protocol; CLEANUP
+    /// derives its FsRtl flags from the exact opened handle before releasing handle-owned state.
     /// # Errors
     ///
     /// Returns request decoding, FILE_OBJECT identity, or finite stream-lease failures before any
@@ -4605,11 +4607,14 @@ impl MutationRequestOperation {
             PreparedMutationRequest::SetInformation(_) => {
                 owned.request().with_active(|active| {
                     let class = active.current_stack()?.set_file()?.operation();
-                    Ok::<_, DriverError>(!matches!(
-                        class,
-                        crate::irp::SetFileOperation::Position
-                            | crate::irp::SetFileOperation::AdvanceValidDataLength
-                    ))
+                    Ok::<_, DriverError>(
+                        active.data_io_kind() == crate::irp::DataIoKind::Handle
+                            && !matches!(
+                                class,
+                                crate::irp::SetFileOperation::Position
+                                    | crate::irp::SetFileOperation::AdvanceValidDataLength
+                            ),
+                    )
                 })?
             }
             PreparedMutationRequest::SetEa
@@ -6287,6 +6292,26 @@ impl OplockContinuation for MutationRequestOperation {
     }
 }
 
+/// Names the regular file whose main resource the synchronous paging end-of-file requester owns.
+/// That requester waits for this request while owning the resource, so no driver thread may
+/// acquire it to prepare or publish this request's size change.
+/// # Errors
+/// Returns a FILE_OBJECT decoding failure for a request observed with a held exclusion.
+fn requester_size_exclusion(owned: &mut OwnedIrp) -> DriverResult<Option<ext4_core::NodeId>> {
+    if !matches!(
+        owned.actor_request(),
+        crate::irp::ActorRequest::Captured(crate::irp::PreparedRequest::SectionEndOfFile(
+            crate::kernel::stream::RequesterSectionExclusion::Held
+        ))
+    ) {
+        return Ok(None);
+    }
+    owned.request().with_active(|active| {
+        let file = crate::state::OpenedRegularFile::decode(active.current_stack()?.file_object()?)?;
+        Ok(Some(ext4_core::NodeId::File(file.id())))
+    })
+}
+
 impl MutationRequestOperation {
     /// Revalidates an intent grant and prepares native gates and epoch publication storage.
     /// Preparation scratch is released before the executor dispatches the next phase.
@@ -6297,7 +6322,7 @@ impl MutationRequestOperation {
         access: &mut MountedVolumeAccess<'_>,
     ) -> MutationStep {
         let MutationOperationState::AwaitingIntent {
-            owned,
+            mut owned,
             resolved,
             publication,
             size_changes,
@@ -6405,11 +6430,19 @@ impl MutationRequestOperation {
             }
             None => None,
         };
+        let mut size_changes = size_changes;
         if size_changes.is_none() {
+            let requester_node = match requester_size_exclusion(&mut owned) {
+                Ok(node) => node,
+                Err(error) => {
+                    return MutationStep::Transition(self.complete_error(owned, error));
+                }
+            };
             let mut plan = match access.prepare_stream_size_changes(
                 &stream_metadata,
                 deletion_node,
                 reset_node,
+                requester_node,
             ) {
                 Ok(plan) => plan,
                 Err(error) => {
@@ -6430,17 +6463,14 @@ impl MutationRequestOperation {
                     suspended: self,
                 });
             }
-            let empty = match plan.into_prepared() {
-                Ok(empty) => empty,
+            // Only gates covered by the requester's own exclusion can exist without native work;
+            // they were selected from this exact projection.
+            size_changes = match plan.into_prepared() {
+                Ok(prepared) => prepared,
                 Err(error) => {
                     return MutationStep::Transition(self.complete_error(owned, error));
                 }
             };
-            if empty.is_some() {
-                return MutationStep::Transition(
-                    self.complete_error(owned, DriverError::InternalInvariantViolation),
-                );
-            }
         }
         let publication = match publication.prepare(stream_metadata, access) {
             Ok(publication) => publication,
@@ -7219,6 +7249,7 @@ impl PreparedPublication for MutationRequestOperation {
                     durable_slot,
                     checkpoint_slot,
                     stream_metadata,
+                    size_changes.as_ref(),
                 ) {
                     Ok(publication) => publication,
                     Err((error, stream_metadata)) => {

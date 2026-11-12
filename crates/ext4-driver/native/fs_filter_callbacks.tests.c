@@ -73,8 +73,8 @@ static FS_FILTER_CALLBACKS registered;
 static BOOLEAN ordinary_io_available = TRUE;
 static BOOLEAN paging_available = TRUE;
 static NTSTATUS registration_status;
-static unsigned breaks, projections;
-static NTSTATUS break_status;
+static unsigned breaks, projections, projected_releases;
+static NTSTATUS break_status, projection_status;
 static PIRP top_level, expected_top_level;
 __declspec(dllimport) void __stdcall RaiseException(unsigned, unsigned, unsigned, const unsigned long long *);
 
@@ -124,6 +124,13 @@ static BOOLEAN ext4win_section_acquire_sync(const VOID *state, PERESOURCE resour
     assert(reentrant == (resource->held != 0));
     resource->held++;
     return TRUE;
+}
+static NTSTATUS ext4win_stream_project_cache_sizes(PEXT4WIN_STREAM_CONTEXT object)
+{
+    /* Cc observes requester-held sizes before this owner's exclusion ends. */
+    assert(object == &stream && stream.MainResource.held != 0);
+    projected_releases++;
+    return projection_status;
 }
 static BOOLEAN ext4win_section_acquire_paging(const VOID *state, PERESOURCE resource,
     BOOLEAN exclusive, BOOLEAN wait)
@@ -202,19 +209,24 @@ static void exercise_callbacks(BOOLEAN supply_context)
     invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
     assert(stream.MainResource.held == 1);
-    invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
-        STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
-    assert(stream.MainResource.held == 0);
+    {
+        unsigned before = projected_releases;
+        invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
+            STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+        assert(stream.MainResource.held == 0 && projected_releases == before + 1);
+    }
 
-    /* Cc/MM may reenter on the owning thread without waiting for itself. */
+    /* Cc/MM may reenter on the owning thread; a failed projection cannot retain the owner. */
     data.Parameters.AcquireForSectionSynchronization.SyncType = SyncTypeOther;
     invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
     invoke(registered.PreAcquireForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
     assert(stream.MainResource.held == 2);
+    projection_status = STATUS_CANT_WAIT;
     invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
+    projection_status = STATUS_SUCCESS;
     invoke(registered.PreReleaseForSectionSynchronization, &data, supply_context,
         STATUS_FSFILTER_OP_COMPLETED_SUCCESSFULLY);
     assert(stream.MainResource.held == 0);

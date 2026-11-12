@@ -9,6 +9,8 @@ use crate::state::StreamCacheLease;
 /// Keeps oplock responses, media verification and mandatory handle releases available.
 /// Paging is admitted only during writeback; new changes retain their captured IRPs until thaw.
 /// Kernel verification resumes lower commands that may retain snapshot exclusion themselves.
+/// Memory Manager size requests may own section synchronization that the cache drain needs:
+/// a size query never waits, and an extension waits only once that drain has finished.
 pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, phase: SnapshotPhase) -> bool {
     if phase == SnapshotPhase::Open {
         return false;
@@ -17,7 +19,13 @@ pub(crate) fn snapshot_should_wait(owned: &mut OwnedIrp, phase: SnapshotPhase) -
     match owned.actor_request() {
         ActorRequest::Cleanup
         | ActorRequest::Close
-        | ActorRequest::Captured(PreparedRequest::VerifyVolume(_)) => false,
+        | ActorRequest::Captured(
+            PreparedRequest::VerifyVolume(_)
+            | PreparedRequest::QueryInformation(DataIoKind::Paging),
+        ) => false,
+        ActorRequest::Captured(PreparedRequest::SectionEndOfFile(_)) => {
+            phase == SnapshotPhase::Frozen
+        }
         ActorRequest::Captured(PreparedRequest::LockControl) => {
             execution != ExecutionClass::Release
         }

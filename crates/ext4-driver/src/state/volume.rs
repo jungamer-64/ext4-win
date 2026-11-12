@@ -1487,7 +1487,9 @@ impl MountedVolumeAccess<'_> {
     }
 
     /// Preallocates final size gates, combining image exclusion with any existing-file reset.
-    /// Resets require admission even when their cache dimensions are unchanged.
+    /// Resets require admission even when their cache dimensions are unchanged. `requester` names
+    /// the regular file whose main resource the synchronous paging end-of-file requester owns;
+    /// its growth is covered by that ownership and needs no passive preparation.
     /// # Errors
     ///
     /// Returns the exact allocation, stream-retention, or native size-snapshot failure before the
@@ -1497,10 +1499,11 @@ impl MountedVolumeAccess<'_> {
         updates: &PreparedStreamMetadataPublications,
         deletion: Option<NodeId>,
         reset: Option<NodeId>,
+        requester: Option<NodeId>,
     ) -> DriverResult<StreamSizeChangePlan> {
         self.volume
             .file_control_blocks
-            .prepare_stream_size_changes(updates, deletion, reset)
+            .prepare_stream_size_changes(updates, deletion, reset, requester)
     }
 
     /// Verifies that retained native gates still match the latest resolved size projection.
@@ -2187,6 +2190,7 @@ impl MountedVolumeAccess<'_> {
     ///
     /// The core durability/visibility capabilities are required here, so a caller cannot install
     /// prepared stream metadata through the mounted-volume boundary before the commit is durable.
+    /// `size_changes` are the gates that covered every size change being published.
     /// # Errors
     /// Returns ownership loss and the unpublished native projection for mandatory cleanup.
     #[inline(never)]
@@ -2197,6 +2201,7 @@ impl MountedVolumeAccess<'_> {
         durable_slot: EpochPublicationSlot,
         checkpoint_slot: EpochPublicationSlot,
         stream_metadata: PreparedStreamMetadataPublications,
+        size_changes: Option<&PreparedStreamSizeChanges>,
     ) -> Result<DurablePublicationOutcome, (DriverError, PreparedStreamMetadataPublications)> {
         let checkpoint =
             match self
@@ -2207,10 +2212,11 @@ impl MountedVolumeAccess<'_> {
                 Err(error) => return Err((error, stream_metadata)),
             };
         let epoch = checkpoint.epoch();
-        let stream_projection = self
-            .volume
-            .file_control_blocks
-            .publish_stream_metadata(stream_metadata, epoch);
+        let stream_projection = self.volume.file_control_blocks.publish_stream_metadata(
+            stream_metadata,
+            epoch,
+            size_changes,
+        );
         Ok(DurablePublicationOutcome {
             checkpoint,
             stream_projection,

@@ -41,6 +41,13 @@ ext4win_stream_cache_initialize(
         wdk_sys_release_resource(&stream->MainResource);
         return status;
     }
+    /* Every Cc entry from the IRP path follows this exclusive owner, including a stream whose
+     * requester-held size publication could not be projected when that requester released. */
+    status = ext4win_stream_project_cache_sizes(stream);
+    if (!NT_SUCCESS(status)) {
+        wdk_sys_release_resource(&stream->MainResource);
+        return status;
+    }
     __try {
         if (file_object->PrivateCacheMap == NULL) {
             ext4win_capture_cache_sizes(stream, &sizes);

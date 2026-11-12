@@ -192,6 +192,68 @@ impl StreamMetadata {
     }
 }
 
+/// Thread that brings the Cache Manager to a changed native stream size.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SizeProjection {
+    /// The reactor briefly owns the main resource while Cc observes the sizes. Every size change
+    /// projected this way is covered by a sealed section permit, so no other owner of that
+    /// resource can be waiting for the reactor.
+    Reactor,
+    /// The synchronous paging end-of-file requester owns the main resource until its IRP
+    /// completes. The header commits without that resource, and the owner projects Cc before
+    /// releasing it.
+    Requester,
+}
+
+impl SizeProjection {
+    /// Native selector consumed by the metadata publication boundary.
+    #[cfg(not(test))]
+    const fn native_tag(self) -> u32 {
+        match self {
+            Self::Reactor => 0,
+            Self::Requester => 1,
+        }
+    }
+}
+
+/// Section synchronization that a synchronous paging end-of-file requester holds on its own
+/// thread for the FILE_OBJECT stream, observed during dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RequesterSectionExclusion {
+    /// The requester owns the stream's main resource exclusively and retains it until this IRP
+    /// completes. No driver thread may wait for that resource on the request's behalf.
+    Held,
+    /// The requester owns no stream resource; ordinary preparation establishes exclusion.
+    Unheld,
+}
+
+impl RequesterSectionExclusion {
+    /// Observes the dispatching thread's ownership of one FILE_OBJECT stream.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the dispatch routine running on the requesting thread, and `header`
+    /// must be the FsContext of a FILE_OBJECT that the request retains. Native code validates
+    /// the header before observing its resource.
+    #[expect(
+        unsafe_code,
+        reason = "the dispatching thread observes only its own ownership of a retained header"
+    )]
+    pub(crate) unsafe fn observe(header: *mut c_void) -> Self {
+        #[cfg(not(test))]
+        let held = unsafe {
+            // SAFETY: The caller retains the FILE_OBJECT; native code rejects foreign headers.
+            ext4win_stream_main_owned_exclusive(header)
+        } != 0;
+        #[cfg(test)]
+        let held = {
+            let _header = header;
+            false
+        };
+        if held { Self::Held } else { Self::Unheld }
+    }
+}
+
 /// Result after the native header has committed one epoch-tagged metadata projection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum StreamMetadataPublication {
@@ -1398,6 +1460,7 @@ impl StreamContext {
     /// The native header is the commit point. A Cache Manager failure occurs after that point and
     /// is therefore returned as [`StreamMetadataPublication::CacheProjectionFailed`], not `Err`.
     /// Callers may invoke this only after ext4 durability and visibility publication for `epoch`.
+    /// `projection` must come from the gate that covers a size change of this stream.
     /// # Errors
     ///
     /// Returns an invariant error only when no native header commit occurred, such as a malformed
@@ -1407,6 +1470,7 @@ impl StreamContext {
         sizes: StreamSizes,
         snapshot: WindowsNodeMetadata,
         epoch: EpochSequence,
+        projection: SizeProjection,
     ) -> DriverResult<StreamMetadataPublication> {
         if self.runtime.kind() != StreamOwnerKind::Node {
             return Err(DriverError::InternalInvariantViolation);
@@ -1425,6 +1489,7 @@ impl StreamContext {
                     sizes.valid_data_length,
                     sizes.allocation_charge,
                     core::ptr::from_ref(&metadata),
+                    projection.native_tag(),
                     core::ptr::addr_of_mut!(cache_status),
                 )
             };
@@ -1439,6 +1504,8 @@ impl StreamContext {
         }
         #[cfg(test)]
         {
+            // Host streams have no Cache Manager observer for either projection owner.
+            let _projection = projection;
             let mut current_metadata = self
                 .metadata
                 .lock()
@@ -2469,6 +2536,7 @@ unsafe extern "system" {
         valid_data_length: i64,
         allocation_charge: i64,
         metadata: *const StreamMetadata,
+        size_projection: u32,
         cache_status_out: *mut NTSTATUS,
     ) -> NTSTATUS;
 
@@ -2497,6 +2565,7 @@ unsafe extern "system" {
     fn ext4win_stream_cache_drain_for_volume_lock(stream_header: wdk_sys::PVOID) -> NTSTATUS;
 
     fn ext4win_stream_main_resource(header: *mut c_void) -> *mut wdk_sys::ERESOURCE;
+    fn ext4win_stream_main_owned_exclusive(header: *mut c_void) -> u8;
     fn ext4win_stream_paging_resource(header: *mut c_void) -> *mut wdk_sys::ERESOURCE;
     fn ext4win_stream_storage_admission(header: *mut c_void) -> *const c_void;
     fn ext4win_stream_section_residency(header: *mut c_void) -> u32;

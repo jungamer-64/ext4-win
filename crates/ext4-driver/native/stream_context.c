@@ -97,6 +97,9 @@ typedef struct _EXT4WIN_STREAM_CONTEXT {
     const VOID *SectionState;
     volatile LONG MetadataValid;
     volatile LONG NamespaceQueryFallback;
+    /* Header sizes published under a requester's exclusion that Cc has not yet observed.
+     * Set and cleared only while some thread owns MainResource exclusively. */
+    volatile LONG CacheProjectionPending;
     ULONG Signature;
     ULONG Kind;
     /* Rust owns the shared paging lifecycle and acknowledged physical map. */
@@ -336,6 +339,10 @@ ext4win_stream_fast_io_candidate(
     volume = stream->VolumeStream;
     if (volume == NULL) { return FALSE; }
     *stream_out = stream;
+    /* Cc copies must not run against sizes it has not observed; the IRP path projects them. */
+    if (InterlockedCompareExchange(&stream->CacheProjectionPending, FALSE, FALSE) != FALSE) {
+        return FALSE;
+    }
     return ext4win_fast_io_admit(ext4win_file_flags(file_object), file_object->PrivateCacheMap != NULL,
         ext4win_storage_media_state(volume->RustState), ext4win_storage_close_phase(volume->RustState),
         (UCHAR)ext4win_section_phase(stream->SectionState), ext4win_storage_io_policy(volume->RustState));
@@ -1453,6 +1460,9 @@ BOOLEAN NTAPI ext4win_fast_io_observe(PFILE_OBJECT file, EXT4WIN_FAST_IO_TRANSFE
     if (!ext4win_stream_fast_io_stream(file, &stream) || (output == NULL)) { return FALSE; }
     volume = stream->VolumeStream;
     if (volume == NULL) { return FALSE; }
+    if (InterlockedCompareExchange(&stream->CacheProjectionPending, FALSE, FALSE) != FALSE) {
+        return FALSE;
+    }
     RtlZeroMemory(output, sizeof(*output));
     ExAcquireFastMutex(&stream->HeaderMutex);
     output->Eof = stream->Header.FileSize.QuadPart;
@@ -1495,6 +1505,14 @@ PERESOURCE NTAPI ext4win_stream_paging_resource(PVOID header)
 {
     PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
     return stream == NULL ? NULL : &stream->PagingIoResource;
+}
+/* Observes the calling thread's exclusive MainResource ownership of a node stream. */
+_IRQL_requires_max_(DISPATCH_LEVEL)
+BOOLEAN NTAPI ext4win_stream_main_owned_exclusive(PVOID header)
+{
+    PEXT4WIN_STREAM_CONTEXT stream = ext4win_stream_from_header(header);
+    return (stream != NULL) && (stream->Kind == 1) &&
+        ExIsResourceAcquiredExclusiveLite(&stream->MainResource);
 }
 const VOID * NTAPI ext4win_stream_storage_admission(PVOID header)
 {

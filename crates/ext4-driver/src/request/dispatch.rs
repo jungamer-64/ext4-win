@@ -821,7 +821,7 @@ pub(crate) fn admit_owned(
         }
         ActorRequest::Captured(PreparedRequest::Mdl(action)) => Admission::Mdl(*action),
         ActorRequest::Captured(PreparedRequest::Read(_)) => Admission::Read(ReadRequestKind::Read),
-        ActorRequest::Captured(PreparedRequest::QueryInformation) => {
+        ActorRequest::Captured(PreparedRequest::QueryInformation(_)) => {
             Admission::Read(ReadRequestKind::QueryInformation)
         }
         ActorRequest::Captured(PreparedRequest::DirectoryControl(
@@ -841,7 +841,9 @@ pub(crate) fn admit_owned(
             Admission::Mutation(MutationRequestKind::Write)
         }
         ActorRequest::Captured(
-            PreparedRequest::SetInformation | PreparedRequest::NamespaceInformation(_),
+            PreparedRequest::SetInformation
+            | PreparedRequest::NamespaceInformation(_)
+            | PreparedRequest::SectionEndOfFile(_),
         ) => {
             let admission = owned.request().with_active(|active| {
                 Ok(match active.current_stack()?.set_file()?.operation() {
@@ -1005,6 +1007,8 @@ pub(crate) fn admit_owned(
     let data_io_kind = match owned.actor_request() {
         ActorRequest::Captured(PreparedRequest::Read(read)) => Some(read.kind()),
         ActorRequest::Captured(PreparedRequest::Write(write)) => Some(write.kind()),
+        ActorRequest::Captured(PreparedRequest::QueryInformation(kind)) => Some(*kind),
+        ActorRequest::Captured(PreparedRequest::SectionEndOfFile(_)) => Some(DataIoKind::Paging),
         _ => None,
     };
     let raw_kind = match (&admission, data_io_kind) {
@@ -1032,7 +1036,12 @@ pub(crate) fn admit_owned(
         | Admission::Mount(_)
         | Admission::Verify(_)
         | Admission::QueryRemove => HandleRequestClass::Device,
-        Admission::Read(ReadRequestKind::Read) if data_io_kind == Some(DataIoKind::Paging) => {
+        // Memory Manager may own section synchronization while it waits for its size query or
+        // extension; neither may queue behind handle work that needs that synchronization.
+        Admission::Read(ReadRequestKind::Read | ReadRequestKind::QueryInformation)
+        | Admission::Mutation(MutationRequestKind::SetInformation)
+            if data_io_kind == Some(DataIoKind::Paging) =>
+        {
             HandleRequestClass::Paging
         }
         Admission::Directory | Admission::Read(_) | Admission::Raw(_) | Admission::VolumeQuery => {
