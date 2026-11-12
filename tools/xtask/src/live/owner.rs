@@ -1027,7 +1027,7 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
     eprintln!("live remount requester: fresh open completed");
-    for elapsed in [5, 10] {
+    for elapsed in [5, 10, 15, 20, 25, 30] {
         thread::sleep(Duration::from_secs(5));
         eprintln!("live remount requester: retained-inode open wait {elapsed}s");
     }
