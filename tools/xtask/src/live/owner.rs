@@ -991,6 +991,9 @@ pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
 /// Nonempty sibling of the remount payload that no handle retains across dismount.
 const REMOUNT_CONTROL: &str = "remount-control.bin";
 
+/// Nonempty sibling written just before dismount and retained by the old mount like the payload.
+const REMOUNT_RETAINED_CONTROL: &str = "remount-retained-control.bin";
+
 /// Performs the fresh file open in a supervised process so a pending kernel request cannot
 /// block the live session owner. Progress goes to stderr and stdout carries only payload bytes.
 /// # Errors
@@ -1024,13 +1027,20 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         thread::sleep(Duration::from_secs(5));
         eprintln!("live remount requester: control stream teardown wait {elapsed}s");
     }
+    eprintln!("live remount requester: read a freshly written control retained by the old mount");
+    let retained_control = fs::read(root.join(REMOUNT_RETAINED_CONTROL))?;
+    eprintln!(
+        "live remount requester: retained control read completed ({} bytes)",
+        retained_control.len()
+    );
+    for elapsed in [5, 10, 15] {
+        thread::sleep(Duration::from_secs(5));
+        eprintln!("live remount requester: retained control wait {elapsed}s");
+    }
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
     eprintln!("live remount requester: fresh open completed");
-    for elapsed in [5, 10, 15, 20, 25, 30] {
-        thread::sleep(Duration::from_secs(5));
-        eprintln!("live remount requester: retained-inode open wait {elapsed}s");
-    }
+    thread::sleep(Duration::from_secs(5));
     let readback = (|| -> TaskResult<()> {
         eprintln!("live remount requester: reading payload");
         let mut output = io::stdout().lock();
@@ -1088,6 +1098,9 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         session.publish(Phase::Observed(Operation::FilesystemIo))?;
     }
     fs::write(mount.join("live-ci").join(REMOUNT_CONTROL), &payload)?;
+    let retained_control_path = mount.join("live-ci").join(REMOUNT_RETAINED_CONTROL);
+    fs::write(&retained_control_path, &payload)?;
+    let retained_control = OpenOptions::new().read(true).open(retained_control_path)?;
     let retained = OpenOptions::new()
         .read(true)
         .open(mount.join("live-ci/alpha.bin"))?;
@@ -1122,7 +1135,11 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     println!("live remount: close the retained old handle");
     let released = windows_host::close_file(retained).map_err(Into::into);
     println!("live remount: old-handle close result={released:?}");
-    combine_verification_and_cleanup(remount, released)?;
+    let released_control = windows_host::close_file(retained_control).map_err(Into::into);
+    combine_verification_and_cleanup(
+        combine_verification_and_cleanup(remount, released),
+        released_control,
+    )?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     exercise_offline_online(session, &payload)?;
