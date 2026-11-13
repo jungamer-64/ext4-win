@@ -1067,9 +1067,28 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
     eprintln!("live remount requester: fresh open completed");
     thread::sleep(Duration::from_secs(5));
     let readback = (|| -> TaskResult<()> {
-        eprintln!("live remount requester: reading payload");
+        let length = usize::try_from(file.metadata()?.len())?;
+        eprintln!("live remount requester: reading first payload byte");
+        let mut bytes = vec![0_u8; length];
+        let (first, rest) = bytes
+            .split_first_mut()
+            .ok_or_else(|| io::Error::other("remount payload is empty"))?;
+        io::Read::read_exact(&mut file, core::slice::from_mut(first))?;
+        eprintln!("live remount requester: first payload byte read");
+        thread::sleep(Duration::from_secs(10));
+        eprintln!(
+            "live remount requester: reading remaining {} bytes",
+            rest.len()
+        );
+        io::Read::read_exact(&mut file, rest)?;
+        eprintln!("live remount requester: remaining payload read");
+        thread::sleep(Duration::from_secs(10));
+        eprintln!("live remount requester: reading at EOF");
+        let mut probe = [0_u8; 8192];
+        let eof = io::Read::read(&mut file, &mut probe)?;
+        eprintln!("live remount requester: EOF read returned {eof} bytes");
         let mut output = io::stdout().lock();
-        io::copy(&mut file, &mut output)?;
+        output.write_all(&bytes)?;
         output.flush()?;
         eprintln!("live remount requester: payload read completed");
         Ok(())
