@@ -289,11 +289,11 @@ pub(crate) use wdk_sys::ntddk::{
     IoGetNextIrpStackLocation, IoGetRequestorProcess, IoQueueWorkItem,
     IoRegisterShutdownNotification, IoReleaseVpbSpinLock, IoSetCompletionRoutineEx,
     IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeCancelTimer,
-    KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer,
-    KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject,
-    MmBuildMdlForNonPagedPool, MmUnlockPages, ObDereferenceObjectDeferDelete, ObfDereferenceObject,
-    ObfReferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
-    ZwWaitForSingleObject,
+    KeExpandKernelStackAndCalloutEx, KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent,
+    KeInitializeSpinLock, KeInitializeTimer, KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent,
+    KeSetTimer, KeWaitForSingleObject, MmBuildMdlForNonPagedPool, MmUnlockPages,
+    ObDereferenceObjectDeferDelete, ObfDereferenceObject, ObfReferenceObject, PsCreateSystemThread,
+    PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]

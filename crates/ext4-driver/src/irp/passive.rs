@@ -28,7 +28,7 @@ use crate::state::KernelDevice;
 #[cfg(not(test))]
 use super::lower::CompletionRundownLease;
 #[cfg(not(test))]
-use super::reactor::{CompletionOperation, CompletionReactor};
+use super::reactor::{CompletionReactor, PassiveContinuation};
 #[cfg(not(test))]
 use super::scheduler::SlotId;
 
@@ -656,8 +656,8 @@ pub(super) struct PassiveWorkEnvelope {
 pub(super) enum PassiveReclaim {
     /// Native work ended; finalization can recover its dormant storage.
     Completed {
-        /// Original operation consuming the native result.
-        operation: Box<dyn CompletionOperation>,
+        /// Original owner consuming the native result.
+        continuation: PassiveContinuation,
         /// Authoritative result, including transferred IRP ownership.
         completion: PassiveWorkCompletion,
         /// Terminal execution storage, absent for ordinary work.
@@ -681,10 +681,10 @@ enum PassiveLifetime {
 struct PassiveJob {
     /// Destination retained by the envelope's lifetime lease.
     reactor: NonNull<CompletionReactor>,
-    /// Exact active slot generation that owns the suspended operation.
+    /// Exact active slot generation that owns the suspended continuation.
     identity: SlotId,
-    /// Unique operation whose resources cannot release before the native call returns.
-    suspended: Box<dyn CompletionOperation>,
+    /// Unique owner whose resources cannot release before the native call returns.
+    suspended: PassiveContinuation,
 }
 
 /// Ownership phases of a prepared native call; only the owning worker can publish completion.
@@ -757,7 +757,7 @@ impl PassiveWorkEnvelope {
         reactor: NonNull<CompletionReactor>,
         identity: SlotId,
         work: PassiveWork,
-        suspended: Box<dyn CompletionOperation>,
+        suspended: PassiveContinuation,
     ) -> Box<Self> {
         if !matches!(self.state, PassiveState::Dormant) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
@@ -786,7 +786,7 @@ impl PassiveWorkEnvelope {
     /// Consumes ordinary work before submission; finalization reserves are non-cancellable.
     pub(super) fn cancel_before_queue(
         mut envelope: Box<Self>,
-    ) -> (PassiveWork, Box<dyn CompletionOperation>) {
+    ) -> (PassiveWork, PassiveContinuation) {
         if !matches!(envelope.lifetime, PassiveLifetime::Request(_)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -857,7 +857,7 @@ impl PassiveWorkEnvelope {
             None
         };
         PassiveReclaim::Completed {
-            operation: job.suspended,
+            continuation: job.suspended,
             completion,
             reserve,
         }

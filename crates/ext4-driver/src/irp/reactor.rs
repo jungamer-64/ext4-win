@@ -79,45 +79,41 @@ impl ScheduledStorageOperation {
     }
 }
 
-/// A zero-progress lower gate keeps the exact operation frozen through native verification.
+/// Reactor-owned media verification that freezes one operation's exact zero-progress phase.
+///
+/// Verification is a reactor protocol, not an operation: it is never stored as a
+/// [`CompletionOperation`], so an operation can never be nested inside another verification.
 #[cfg(not(test))]
 #[derive(Debug)]
-struct StorageVerificationOperation {
-    /// Only this typed command may be resubmitted after same-media confirmation.
-    command: VerifyingStorageCommand<ScheduledStorageOperation>,
-    /// Original VPB relation must still be current after I/O Manager reentry.
-    association: crate::state::MediaVerificationAssociation,
+pub(super) enum MediaVerification {
+    /// A zero-progress lower gate keeps the exact operation frozen through native verification.
+    Storage {
+        /// Only this typed command may be resubmitted after same-media confirmation.
+        command: VerifyingStorageCommand<ScheduledStorageOperation>,
+        /// Original VPB relation must still be current after I/O Manager reentry.
+        association: crate::state::MediaVerificationAssociation,
+    },
+    /// The exact denied cached work resumes only after its original mounted association is confirmed.
+    Cache {
+        /// Retains FILE_OBJECT, stream lease, original captures and exact transfer parameters.
+        work: super::PassiveWork,
+        /// Caller state (including its handle lane and prepared publication) remains unchanged.
+        suspended: SuspendedOperation,
+        /// No native VPB or resource borrow crosses native verification.
+        association: crate::state::MediaVerificationAssociation,
+    },
 }
 
 #[cfg(not(test))]
 #[expect(
     unsafe_code,
-    reason = "active reactor rundown retains its original mounted VPB through worker completion"
+    reason = "active reactor rundown retains its original mounted VPB and native identities through worker completion"
 )]
-// SAFETY: The worker moves only owned commands and scalar retained association identities. VPB
-// access occurs under its global lock after return to the sole mounted actor, without cross-thread borrows.
-unsafe impl Send for StorageVerificationOperation {}
-
-/// The exact denied cached work resumes only after its original mounted association is confirmed.
-#[cfg(not(test))]
-#[derive(Debug)]
-struct CacheVerificationOperation {
-    /// Retains FILE_OBJECT, stream lease, original captures and exact transfer parameters.
-    work: super::PassiveWork,
-    /// Caller state (including its handle lane and prepared publication) remains unchanged.
-    suspended: SuspendedOperation,
-    /// No native VPB or resource borrow crosses native verification.
-    association: crate::state::MediaVerificationAssociation,
-}
-
-#[cfg(not(test))]
-#[expect(
-    unsafe_code,
-    reason = "the original work, stream lease and active slot retain all native identities through verification"
-)]
-// SAFETY: The queued verification owns only a real-device reference. The actor retains the exact
-// work/VPB identities without borrowing native resources, and alone consumes their continuation.
-unsafe impl Send for CacheVerificationOperation {}
+// SAFETY: The queued verification owns only a real-device reference. The worker moves only owned
+// commands, the original work with its stream lease, and scalar retained association identities.
+// VPB access occurs under its global lock after return to the sole mounted actor, without
+// cross-thread borrows, and only the actor consumes the continuation.
+unsafe impl Send for MediaVerification {}
 
 /// Interprets the native verification worker protocol, including cancellation before queueing.
 /// # Errors
@@ -136,96 +132,79 @@ fn verification_completion_result(event: CompletionEvent) -> DriverResult<()> {
 }
 
 #[cfg(not(test))]
-impl CompletionOperation for CacheVerificationOperation {
-    fn advance(
-        self: Box<Self>,
-        event: CompletionEvent,
-        target: &mut ReactorTarget,
-    ) -> OperationTransition {
-        let Self {
-            work,
-            suspended,
-            association,
-        } = *self;
+impl MediaVerification {
+    /// Resolves the verification outcome into the original operation's next step.
+    fn resolve(self, event: CompletionEvent, target: &mut ReactorTarget) -> OperationTransition {
         let result = verification_completion_result(event);
-        let result = target.with_mounted_access(|access| {
-            // Revocation outranks the association outcome it caused.
-            access.authorize_storage()?;
-            result.and_then(|()| association.confirmed())?;
-            work.authorize_media_resumption(access)
-        });
-        match result {
-            Ok(()) => OperationTransition::SubmitPassiveWork { work, suspended },
-            Err(error) => suspended.advance(
-                CompletionEvent::PassiveCompleted(work.failed(error)),
-                target,
-            ),
-        }
-    }
-
-    fn record_storage_failure(
-        &mut self,
-        _failure: StorageFailureClass,
-        _target: &mut ReactorTarget,
-    ) {
-        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-    }
-}
-
-#[cfg(not(test))]
-impl CompletionOperation for StorageVerificationOperation {
-    fn advance(
-        self: Box<Self>,
-        event: CompletionEvent,
-        target: &mut ReactorTarget,
-    ) -> OperationTransition {
-        let Self {
-            command,
-            association,
-        } = *self;
-        let result = verification_completion_result(event);
-        let ReactorTarget::MountedVolume(binding) = target else {
-            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-        };
-        let result = binding.with_access(|access| {
-            // Revocation outranks the association outcome it caused.
-            access.authorize_storage()?;
-            result.and_then(|()| association.confirmed())?;
-            access.authorize_storage_resumption(command.request())
-        });
-        match result {
-            Ok(()) => match command.verified() {
-                Ok(prepared) => OperationTransition::ResumeVerifiedStorage { prepared },
-                Err(error) => {
-                    let (error, scheduled, request) = error.into_parts();
-                    scheduled.into_operation().advance(
-                        CompletionEvent::Core(OperationEvent::StorageCompleted(
-                            failed_unsubmitted_request(request, driver_error_to_core(error)),
-                        )),
-                        target,
-                    )
+        match self {
+            Self::Cache {
+                work,
+                suspended,
+                association,
+            } => {
+                let result = target.with_mounted_access(|access| {
+                    // Revocation outranks the association outcome it caused.
+                    access.authorize_storage()?;
+                    result.and_then(|()| association.confirmed())?;
+                    work.authorize_media_resumption(access)
+                });
+                match result {
+                    Ok(()) => OperationTransition::SubmitPassiveWork { work, suspended },
+                    Err(error) => OperationTransition::DeliverEvent {
+                        operation: suspended,
+                        event: CompletionEvent::PassiveCompleted(work.failed(error)),
+                    },
                 }
-            },
-            Err(error) => {
-                let (scheduled, request) = command.into_parts();
-                scheduled.into_operation().advance(
-                    CompletionEvent::Core(OperationEvent::StorageCompleted(
+            }
+            Self::Storage {
+                command,
+                association,
+            } => {
+                let ReactorTarget::MountedVolume(binding) = target else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
+                let result = binding.with_access(|access| {
+                    // Revocation outranks the association outcome it caused.
+                    access.authorize_storage()?;
+                    result.and_then(|()| association.confirmed())?;
+                    access.authorize_storage_resumption(command.request())
+                });
+                let (scheduled, request, error) = match result {
+                    Ok(()) => match command.verified() {
+                        Ok(prepared) => {
+                            return OperationTransition::ResumeVerifiedStorage { prepared };
+                        }
+                        Err(error) => {
+                            let (error, scheduled, request) = error.into_parts();
+                            (scheduled, request, error)
+                        }
+                    },
+                    Err(error) => {
+                        let (scheduled, request) = command.into_parts();
+                        (scheduled, request, error)
+                    }
+                };
+                OperationTransition::DeliverEvent {
+                    operation: scheduled.into_operation(),
+                    event: CompletionEvent::Core(OperationEvent::StorageCompleted(
                         failed_unsubmitted_request(request, driver_error_to_core(error)),
                     )),
-                    target,
-                )
+                }
             }
         }
     }
-
-    fn record_storage_failure(
-        &mut self,
-        _failure: StorageFailureClass,
-        _target: &mut ReactorTarget,
-    ) {
-        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-    }
 }
+
+/// The actor-side owner that consumes one native worker result.
+#[cfg(not(test))]
+#[derive(Debug)]
+pub(super) enum PassiveContinuation {
+    /// An operation receives the result as its next event.
+    Operation(SuspendedOperation),
+    /// The reactor resolves its own media verification.
+    Verification(Box<MediaVerification>),
+}
+
 /// One concrete storage command captured by a private lower IRP.
 #[cfg(not(test))]
 type ReactorStorageCommand = StorageCommand<ScheduledStorageOperation>;
@@ -771,6 +750,18 @@ pub(crate) enum OperationTransition {
         /// Operation resumed only by its commit grant.
         suspended: Box<dyn CompletionOperation>,
     },
+    /// Deliver one exact event to another operation in a later actor turn.
+    ///
+    /// A wrapper that finishes its own protocol hands the original operation back to the
+    /// executor instead of advancing it inside its own frame. The event is delivered unchanged;
+    /// a pending cancellation stays pending for the operation's next suspension.
+    #[cfg(not(test))]
+    DeliverEvent {
+        /// Operation that owns this slot from now on.
+        operation: Box<dyn CompletionOperation>,
+        /// Event the operation would have received from the wrapped protocol.
+        event: CompletionEvent,
+    },
     /// Yield actor admission while retaining the exact operation and cancellation authority.
     DeferOperation {
         /// Pre-effect operation resumed after a ten-millisecond delay.
@@ -833,33 +824,69 @@ pub(crate) enum OperationTransition {
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReactorState {
+    /// The system thread has not yet acquired its expanded stack; the device is unpublished.
+    Starting = 0,
+    /// The expanded stack could not be acquired; the thread terminates without running.
+    StartRefused = 1,
     /// Admission is open and concrete events are processed.
-    Running = 0,
+    Running = 2,
     /// Admission is closed while queued and active work drains.
-    Draining = 1,
+    Draining = 3,
     /// The system thread and every completion envelope have terminated.
-    Stopped = 2,
+    Stopped = 4,
 }
 
 impl ReactorState {
     /// Stable atomic representation.
     const fn as_raw(self) -> u8 {
         match self {
-            Self::Running => 0,
-            Self::Draining => 1,
-            Self::Stopped => 2,
+            Self::Starting => 0,
+            Self::StartRefused => 1,
+            Self::Running => 2,
+            Self::Draining => 3,
+            Self::Stopped => 4,
         }
     }
 
     /// Checked atomic decoding.
     fn from_raw(raw: u8) -> Option<Self> {
         match raw {
-            0 => Some(Self::Running),
-            1 => Some(Self::Draining),
-            2 => Some(Self::Stopped),
+            0 => Some(Self::Starting),
+            1 => Some(Self::StartRefused),
+            2 => Some(Self::Running),
+            3 => Some(Self::Draining),
+            4 => Some(Self::Stopped),
             _ => None,
         }
     }
+}
+
+/// Stack bytes guaranteed to every reactor actor turn.
+///
+/// Each actor turn runs ext4 resolution, journal preparation and publication to completion on
+/// one stack, then calls lower drivers, Cache Manager, FsRtl and pool routines from that depth.
+/// The reactor therefore runs its whole lifetime inside one expanded-stack callout of the largest
+/// size the kernel supports. `production-reachability` reads this argument from the emitted call
+/// and requires the deepest Rust frame chain reachable from the callout to leave one standard
+/// kernel stack for those foreign callouts.
+#[cfg(not(test))]
+const REACTOR_STACK_BYTES: u32 = wdk_sys::MAXIMUM_EXPANSION_SIZE;
+
+/// Proof that the current thread executes inside the reactor's expanded-stack callout.
+///
+/// Only [`completion_reactor_on_expanded_stack`] constructs it, so operation execution cannot be
+/// started on a standard-size system-thread stack.
+#[cfg(not(test))]
+struct ExpandedReactorStack(());
+
+/// The only two outcomes a starting reactor thread may publish.
+#[cfg(not(test))]
+#[derive(Clone, Copy, Debug)]
+enum StartOutcome {
+    /// The expanded stack is active and the actor loop follows.
+    Running,
+    /// The kernel refused the expanded stack; no actor work will execute.
+    Refused,
 }
 
 /// Pending-queue admission rolled back on drop unless transferred to queue-owned bookkeeping.
@@ -918,6 +945,14 @@ enum SlotPayload {
         /// Concrete event selected by the scheduler shell.
         event: Option<CompletionEvent>,
     },
+    /// Reactor-owned media verification ready to resolve its worker outcome.
+    #[cfg(not(test))]
+    Verification {
+        /// Frozen operation phase awaiting the verification outcome.
+        verification: Box<MediaVerification>,
+        /// Worker outcome or a cancellation that supersedes it.
+        event: CompletionEvent,
+    },
     /// One retry command retaining its original operation.
     #[cfg(not(test))]
     Retry(RetryingStorageCommand<ScheduledStorageOperation>),
@@ -943,6 +978,8 @@ impl fmt::Debug for SlotPayload {
             Self::Empty => formatter.write_str("Empty"),
             Self::Operation { event: Some(_), .. } => formatter.write_str("ReadyOperation"),
             Self::Operation { event: None, .. } => formatter.write_str("SuspendedOperation"),
+            #[cfg(not(test))]
+            Self::Verification { .. } => formatter.write_str("ReadyVerification"),
             #[cfg(not(test))]
             Self::Retry(_) => formatter.write_str("Retry"),
             #[cfg(not(test))]
@@ -1383,13 +1420,15 @@ pub(crate) struct CompletionReactor {
     journal_close_work: UnsafeCell<Option<Box<PassiveWorkEnvelope>>>,
     /// Auto-reset event signaled only when a concrete event is published.
     wake_event: UnsafeCell<wdk_sys::KEVENT>,
+    /// Notification event signaled once the thread leaves `Starting`; only initialization waits.
+    startup_event: UnsafeCell<wdk_sys::KEVENT>,
     /// Bitset of retry timer events published by DPC callbacks.
     timer_ready: AtomicU64,
     /// Shared delayed-close timer event published by its DPC callback.
     delayed_close_ready: AtomicU8,
     /// Bitset of active top-level cancel events published by cancel routines.
     cancel_ready: AtomicU64,
-    /// Running/draining/stopped lifecycle.
+    /// Starting/running/draining/stopped lifecycle.
     lifecycle: AtomicU8,
     /// Lifetime gate retained by every lower completion envelope.
     completion_rundown: CompletionRundown,
@@ -1725,6 +1764,14 @@ impl CompletionReactor {
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
+            core::ptr::addr_of_mut!((*reactor).startup_event)
+        };
+        unsafe {
+            // SAFETY: This field is initialized exactly once before any reactor observer exists.
+            destination.write(UnsafeCell::new(wdk_sys::KEVENT::default()));
+        }
+        let destination = unsafe {
+            // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
             core::ptr::addr_of_mut!((*reactor).timer_ready)
         };
         unsafe {
@@ -1753,7 +1800,7 @@ impl CompletionReactor {
         };
         unsafe {
             // SAFETY: This field is initialized exactly once before any reactor observer exists.
-            destination.write(AtomicU8::new(ReactorState::Running.as_raw()));
+            destination.write(AtomicU8::new(ReactorState::Starting.as_raw()));
         }
         let destination = unsafe {
             // SAFETY: Raw projection into the caller's exclusive, final-address reactor storage.
@@ -1946,6 +1993,7 @@ impl CompletionReactor {
             #[cfg(not(test))]
                 journal_close_work: _,
             wake_event: _,
+            startup_event: _,
             timer_ready: _,
             delayed_close_ready: _,
             cancel_ready: _,
@@ -2041,6 +2089,14 @@ impl CompletionReactor {
                     0,
                 );
             }
+            unsafe {
+                // SAFETY: Stable event storage initialized before thread publication.
+                ffi::KeInitializeEvent(
+                    reactor.startup_event.get(),
+                    wdk_sys::_EVENT_TYPE::NotificationEvent,
+                    0,
+                );
+            }
             let mut attributes = wdk_sys::OBJECT_ATTRIBUTES {
                 Length: u32::try_from(core::mem::size_of::<wdk_sys::OBJECT_ATTRIBUTES>())
                     .map_err(|_| DriverError::InvalidParameter)?,
@@ -2072,9 +2128,117 @@ impl CompletionReactor {
             reactor
                 .thread_handle
                 .store(thread_handle.cast::<c_void>(), Ordering::Release);
+            if let Err(error) = reactor.await_start() {
+                unsafe {
+                    // SAFETY: The refused thread no longer touches reactor storage; joining it
+                    // precedes guard rollback of the unpublished reactor.
+                    reactor.join_refused_thread();
+                }
+                return Err(error);
+            }
         }
+        // Host tests drive the actor directly on their own stack.
+        #[cfg(test)]
+        reactor
+            .lifecycle
+            .store(ReactorState::Running.as_raw(), Ordering::Release);
         initialization.publish();
         Ok(())
+    }
+
+    /// Waits until the new thread reports whether it entered its expanded stack.
+    /// # Errors
+    ///
+    /// Returns resource exhaustion when the kernel refused the expanded stack. The thread then
+    /// terminates without having executed any reactor work.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "initialization is the sole waiter on its own startup notification event"
+    )]
+    fn await_start(&self) -> DriverResult<()> {
+        let status = unsafe {
+            // SAFETY: The initialized notification event remains in unpublished stable storage.
+            ffi::KeWaitForSingleObject(
+                self.startup_event.get().cast::<c_void>(),
+                wdk_sys::_KWAIT_REASON::Executive,
+                i8::try_from(wdk_sys::_MODE::KernelMode).unwrap_or(0),
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        if status < STATUS_SUCCESS {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        match self.state() {
+            ReactorState::Running => Ok(()),
+            ReactorState::StartRefused => Err(DriverError::InsufficientResources),
+            ReactorState::Starting | ReactorState::Draining | ReactorState::Stopped => {
+                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
+            }
+        }
+    }
+
+    /// Joins and releases the handle of a thread that refused to start.
+    /// # Safety
+    ///
+    /// The thread must have published `StartRefused`; the reactor must still be unpublished.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "joining the sole refused system thread before unpublished storage rollback"
+    )]
+    unsafe fn join_refused_thread(&self) {
+        let thread_handle = self
+            .thread_handle
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if thread_handle.is_null() {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let wait_status = unsafe {
+            // SAFETY: Initialization stored the sole system-thread kernel handle.
+            ffi::ZwWaitForSingleObject(thread_handle, 0, core::ptr::null_mut())
+        };
+        if wait_status < STATUS_SUCCESS {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        let close_status = unsafe {
+            // SAFETY: The joined thread can no longer use this handle.
+            ffi::ZwClose(thread_handle)
+        };
+        if close_status < STATUS_SUCCESS {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+    }
+
+    /// Publishes the thread's startup outcome; nothing else may follow `StartRefused`.
+    #[cfg(not(test))]
+    #[expect(
+        unsafe_code,
+        reason = "the startup event is initialized before thread creation and outlives this call"
+    )]
+    fn publish_start(&self, outcome: StartOutcome) {
+        let next = match outcome {
+            StartOutcome::Running => ReactorState::Running,
+            StartOutcome::Refused => ReactorState::StartRefused,
+        };
+        if self
+            .lifecycle
+            .compare_exchange(
+                ReactorState::Starting.as_raw(),
+                next.as_raw(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        unsafe {
+            // SAFETY: Initialization keeps the storage live until it observes this event and,
+            // for a refusal, joins the terminating thread.
+            let _previous = ffi::KeSetEvent(self.startup_event.get(), 0, 0);
+        }
     }
 
     /// Captures a request under the device owner's dispatch lease and emits its admission event.
@@ -2577,6 +2741,37 @@ impl CompletionReactor {
         );
     }
 
+    /// Installs one native worker result for the continuation that owns this slot.
+    #[cfg(not(test))]
+    fn set_ready_continuation(
+        &self,
+        index: usize,
+        continuation: PassiveContinuation,
+        event: CompletionEvent,
+    ) {
+        let verification = match continuation {
+            PassiveContinuation::Operation(operation) => {
+                self.set_ready_operation_event(index, operation, event);
+                return;
+            }
+            PassiveContinuation::Verification(verification) => verification,
+        };
+        let event = event.prefer_cancellation(self.cancellation_is_pending(index));
+        let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index)) else {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        };
+        if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Ready)) {
+            KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+        }
+        self.install_payload(
+            index,
+            SlotPayload::Verification {
+                verification,
+                event,
+            },
+        );
+    }
+
     /// Atomically consumes this fixed slot's callback-published cancel bit.
     fn take_cancel_bit(&self, index: usize) -> bool {
         let mask = slot_bit(index);
@@ -2675,15 +2870,27 @@ impl CompletionReactor {
                     let Some(slot) = payloads.get_mut(index) else {
                         KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
                     };
-                    let SlotPayload::Operation { event, .. } = &mut slot.payload else {
-                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
-                    };
-                    *event = Some(
-                        event
-                            .take()
-                            .unwrap_or(CompletionEvent::Core(OperationEvent::CancelRequested))
-                            .prefer_cancellation(true),
-                    );
+                    match &mut slot.payload {
+                        SlotPayload::Operation { event, .. } => {
+                            *event = Some(
+                                event
+                                    .take()
+                                    .unwrap_or(CompletionEvent::Core(
+                                        OperationEvent::CancelRequested,
+                                    ))
+                                    .prefer_cancellation(true),
+                            );
+                        }
+                        SlotPayload::Verification { event, .. } => {
+                            let ready = core::mem::replace(
+                                event,
+                                CompletionEvent::Core(OperationEvent::CancelRequested),
+                            );
+                            *event = ready.prefer_cancellation(true);
+                        }
+                        _ => KernelWideInconsistency::completion_reactor_state_corruption()
+                            .bugcheck(),
+                    }
                 });
             }
             CancelDisposition::CancelLower => {
@@ -2951,7 +3158,7 @@ impl CompletionReactor {
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
     )]
-    fn run(&self) {
+    fn run(&self, _stack: &ExpandedReactorStack) {
         loop {
             let mut progressed = false;
             if let Some(retirement) = self.with_target(ReactorTarget::observe_storage_revocation) {
@@ -3368,15 +3575,18 @@ impl CompletionReactor {
                 };
                 core::mem::replace(&mut slot.payload, SlotPayload::Empty)
             });
-            let SlotPayload::Operation {
-                operation,
-                event: Some(event),
-            } = payload
-            else {
-                KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+            let transition = match payload {
+                SlotPayload::Operation {
+                    operation,
+                    event: Some(event),
+                } => self.with_target(|target| operation.advance(event, target)),
+                SlotPayload::Verification {
+                    verification,
+                    event,
+                } => self.with_target(|target| verification.resolve(event, target)),
+                _ => KernelWideInconsistency::completion_reactor_state_corruption().bugcheck(),
             };
             progressed = true;
-            let transition = self.with_target(|target| operation.advance(event, target));
             self.apply_transition(index, transition);
         }
     }
@@ -3533,7 +3743,11 @@ impl CompletionReactor {
                     );
                 }
                 OperationTransition::SubmitPassiveWork { work, suspended } => {
-                    self.submit_passive_work(index, work, suspended);
+                    self.submit_passive_work(
+                        index,
+                        work,
+                        PassiveContinuation::Operation(suspended),
+                    );
                     self.grant_available_intents();
                 }
                 OperationTransition::CheckOplock {
@@ -3598,6 +3812,23 @@ impl CompletionReactor {
                         },
                     );
                     self.grant_available_commit();
+                }
+                OperationTransition::DeliverEvent { operation, event } => {
+                    let Some(identity) = self.with_scheduler(|scheduler| scheduler.identity(index))
+                    else {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    };
+                    if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Ready))
+                    {
+                        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                    }
+                    self.install_payload(
+                        index,
+                        SlotPayload::Operation {
+                            operation,
+                            event: Some(event),
+                        },
+                    );
                 }
                 OperationTransition::DeferOperation { suspended } => {
                     let identity = self
@@ -3938,12 +4169,12 @@ impl CompletionReactor {
         &self,
         index: usize,
         work: crate::irp::PassiveWork,
-        suspended: SuspendedOperation,
+        suspended: PassiveContinuation,
     ) {
         if let Err(error) =
             work.authorize_storage(|| self.with_mounted_access(|access| access.authorize_storage()))
         {
-            self.set_ready_operation_event(
+            self.set_ready_continuation(
                 index,
                 suspended,
                 CompletionEvent::PassiveCompleted(work.failed(error)),
@@ -3986,7 +4217,7 @@ impl CompletionReactor {
         let rundown = match self.completion_rundown.acquire() {
             Ok(Some(rundown)) => rundown,
             Ok(None) => {
-                self.set_ready_operation_event(
+                self.set_ready_continuation(
                     index,
                     suspended,
                     CompletionEvent::PassiveCompleted(
@@ -3996,7 +4227,7 @@ impl CompletionReactor {
                 return;
             }
             Err(error) => {
-                self.set_ready_operation_event(
+                self.set_ready_continuation(
                     index,
                     suspended,
                     CompletionEvent::PassiveCompleted(work.failed(error)),
@@ -4007,7 +4238,7 @@ impl CompletionReactor {
         let prepared = match PassiveWorkEnvelope::prepare_request(self.device, rundown) {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.set_ready_operation_event(
+                self.set_ready_continuation(
                     index,
                     suspended,
                     CompletionEvent::PassiveCompleted(work.failed(error)),
@@ -4018,7 +4249,7 @@ impl CompletionReactor {
         let prepared = prepared.bind(NonNull::from(self), identity, work, suspended);
         if self.cancellation_is_pending(index) {
             let (work, suspended) = PassiveWorkEnvelope::cancel_before_queue(prepared);
-            self.set_ready_operation_event(index, suspended, work.cancel_before_execution());
+            self.set_ready_continuation(index, suspended, work.cancel_before_execution());
             return;
         }
         if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Passive)) {
@@ -4257,7 +4488,7 @@ impl CompletionReactor {
         };
         let suspended =
             match crate::memory::boxed_try_map((command, association), |(command, association)| {
-                StorageVerificationOperation {
+                MediaVerification::Storage {
                     command,
                     association,
                 }
@@ -4284,9 +4515,9 @@ impl CompletionReactor {
         {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.set_ready_operation_event(
+                self.set_ready_continuation(
                     index,
-                    suspended,
+                    PassiveContinuation::Verification(suspended),
                     CompletionEvent::PassiveCompleted(work.failed(error)),
                 );
                 return;
@@ -4297,7 +4528,12 @@ impl CompletionReactor {
             .unwrap_or_else(|| {
                 KernelWideInconsistency::completion_reactor_state_corruption().bugcheck()
             });
-        let prepared = prepared.bind(NonNull::from(self), identity, work, suspended);
+        let prepared = prepared.bind(
+            NonNull::from(self),
+            identity,
+            work,
+            PassiveContinuation::Verification(suspended),
+        );
         if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Verifying)) {
             KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
         }
@@ -4339,7 +4575,7 @@ impl CompletionReactor {
             };
         let verified = match crate::memory::boxed_try_map(
             (work, suspended, association),
-            |(work, suspended, association)| CacheVerificationOperation {
+            |(work, suspended, association)| MediaVerification::Cache {
                 work,
                 suspended,
                 association,
@@ -4356,7 +4592,11 @@ impl CompletionReactor {
                 return;
             }
         };
-        self.submit_passive_work(index, super::PassiveWork::VerifyVolume(query), verified);
+        self.submit_passive_work(
+            index,
+            super::PassiveWork::VerifyVolume(query),
+            PassiveContinuation::Verification(verified),
+        );
     }
 
     /// Builds, registers, and submits the private mount-time length query.
@@ -5044,10 +5284,10 @@ impl CompletionReactor {
             };
             let (suspended, completion, reserve) = match PassiveWorkEnvelope::reclaim(envelope) {
                 super::passive::PassiveReclaim::Completed {
-                    operation,
+                    continuation,
                     completion,
                     reserve,
-                } => (operation, completion, reserve),
+                } => (continuation, completion, reserve),
                 super::passive::PassiveReclaim::Deferred(envelope) => {
                     if !self.with_scheduler(|scheduler| scheduler.set_phase(identity, Phase::Retry))
                     {
@@ -5079,10 +5319,14 @@ impl CompletionReactor {
                 }
             }
             if let super::PassiveWorkCompletion::MediaVerificationRequired(work) = completion {
+                // Only cached transfers request verification; verification work never does.
+                let PassiveContinuation::Operation(suspended) = suspended else {
+                    KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+                };
                 self.submit_cache_verification(index, work, suspended);
                 continue;
             }
-            self.set_ready_operation_event(
+            self.set_ready_continuation(
                 index,
                 suspended,
                 CompletionEvent::PassiveCompleted(completion),
@@ -5374,7 +5618,7 @@ impl CompletionReactor {
                 SlotPayload::PassiveRetry(envelope) => {
                     if self.cancellation_is_pending(index) {
                         let (work, suspended) = PassiveWorkEnvelope::cancel_before_queue(envelope);
-                        self.set_ready_operation_event(
+                        self.set_ready_continuation(
                             index,
                             suspended,
                             work.cancel_before_execution(),
@@ -5726,15 +5970,55 @@ unsafe extern "C" fn completion_reactor_thread(context: PVOID) {
         };
         return;
     };
-    unsafe {
-        // SAFETY: Thread creation passed the stable reactor address and teardown joins this thread.
-        reactor.as_ref()
+    let status = unsafe {
+        // SAFETY: The callout receives the same stable reactor address. The kernel returns only
+        // after the callout has returned, or without calling it when the stack is unavailable.
+        ffi::KeExpandKernelStackAndCalloutEx(
+            Some(completion_reactor_on_expanded_stack),
+            reactor.as_ptr().cast::<c_void>(),
+            wdk_sys::SIZE_T::from(REACTOR_STACK_BYTES),
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if status < STATUS_SUCCESS {
+        unsafe {
+            // SAFETY: Initialization waits on this startup report and joins this thread before
+            // releasing the storage; the reactor is not accessed after the report.
+            reactor.as_ref()
+        }
+        .publish_start(StartOutcome::Refused);
+        let _status = unsafe {
+            // SAFETY: No expanded-stack callout is active on this thread.
+            ffi::PsTerminateSystemThread(status)
+        };
+        return;
     }
-    .run();
     let _status = unsafe {
-        // SAFETY: Reactor published Stopped before terminating its system thread.
+        // SAFETY: The callout returned after the reactor published Stopped.
         ffi::PsTerminateSystemThread(STATUS_SUCCESS)
     };
+}
+
+/// Runs the whole reactor lifetime on the expanded stack provided by the kernel.
+/// # Safety
+///
+/// `parameter` must be the stable reactor address passed by [`completion_reactor_thread`].
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
+)]
+unsafe extern "C" fn completion_reactor_on_expanded_stack(parameter: PVOID) {
+    let Some(reactor) = NonNull::new(parameter.cast::<CompletionReactor>()) else {
+        KernelWideInconsistency::completion_reactor_state_corruption().bugcheck();
+    };
+    let reactor = unsafe {
+        // SAFETY: Thread creation passed the stable reactor address and teardown joins this thread.
+        reactor.as_ref()
+    };
+    reactor.publish_start(StartOutcome::Running);
+    reactor.run(&ExpandedReactorStack(()));
 }
 
 /// CSQ insertion callback.
