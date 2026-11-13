@@ -162,10 +162,26 @@ pub(crate) fn read_raw_partition_file(argument: &std::ffi::OsStr) -> TaskResult<
                     match (*child.node(), components.peek().is_some()) {
                         (ext4_core::NodeId::Directory(next), true) => directory = next,
                         (ext4_core::NodeId::File(file), false) => {
+                            let metadata = ext4_core::CommittedReadPass::load_node_metadata(
+                                pass,
+                                ext4_core::NodeId::File(file),
+                            );
                             let mut bytes = vec![0_u8; RAW_FILE_LIMIT];
                             let read =
                                 pass.read_file(file, ext4_core::FileOffset::ZERO, &mut bytes)?;
                             bytes.truncate(read.as_usize());
+                            // EOF-crossing ranges mirror the kernel requests that differ by length.
+                            let mut tail = vec![0_u8; 8192];
+                            let beyond = pass
+                                .read_file(file, ext4_core::FileOffset::from_bytes(8192), &mut tail)
+                                .map(ext4_core::ReadBytes::as_usize);
+                            let mut wide = vec![0_u8; 16384];
+                            let across = pass
+                                .read_file(file, ext4_core::FileOffset::ZERO, &mut wide)
+                                .map(ext4_core::ReadBytes::as_usize);
+                            eprintln!(
+                                "raw partition probe: {path}: metadata={metadata:?} read@8192+8192={beyond:?} read@0+16384={across:?}"
+                            );
                             return Ok(bytes);
                         }
                         _ => return Err(ext4_core::Error::WrongInodeKind),
