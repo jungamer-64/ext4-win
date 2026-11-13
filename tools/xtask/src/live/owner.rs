@@ -1013,23 +1013,9 @@ pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
 /// Nonempty sibling of the remount payload that no handle retains across dismount.
 const REMOUNT_CONTROL: &str = "remount-control.bin";
 
-/// Retained sibling that receives the payload's refused namespace-delete rename before dismount.
-const REMOUNT_RENAME_CONTROL: &str = "remount-rename-control.bin";
-
-/// Applies the payload's refused rename to one retained control.
-/// # Errors
-/// Returns a rename that is not refused for missing namespace DELETE authority.
-fn prepare_rename_control(path: &Path) -> TaskResult<()> {
-    match fs::rename(path, path.with_extension("renamed")) {
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-        Err(error) => Err(error.into()),
-        Ok(()) => Err(io::Error::other("control rename unexpectedly granted DELETE").into()),
-    }
-}
-
-/// Sector-aligned transfer buffer for one unbuffered payload read.
-#[repr(C, align(4096))]
-struct SectorAligned([u8; 8192]);
+/// Retained sibling whose name, like the payload's, is a valid 8.3 name with no generated short
+/// name. It is written, read and retained before dismount.
+const REMOUNT_SHORT_NAME_CONTROL: &str = "gamma.bin";
 
 /// Performs the fresh file open in a supervised process so a pending kernel request cannot
 /// block the live session owner. Progress goes to stderr and stdout carries only payload bytes.
@@ -1064,7 +1050,7 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         thread::sleep(Duration::from_secs(5));
         eprintln!("live remount requester: control stream teardown wait {elapsed}s");
     }
-    for name in [REMOUNT_RENAME_CONTROL] {
+    for name in [REMOUNT_SHORT_NAME_CONTROL] {
         eprintln!("live remount requester: read retained {name}");
         let control = fs::read(root.join(name))?;
         eprintln!(
@@ -1075,20 +1061,6 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
             thread::sleep(Duration::from_secs(5));
             eprintln!("live remount requester: {name} wait {elapsed}s");
         }
-    }
-    eprintln!("live remount requester: unbuffered payload read");
-    let mut unbuffered = OpenOptions::new()
-        .read(true)
-        .custom_flags(0x2000_0000)
-        .open(path)?;
-    let mut aligned = Box::try_new(SectorAligned([0; 8192]))?;
-    let read = io::Read::read(&mut unbuffered, &mut aligned.0);
-    let closed = windows_host::close_file(unbuffered).map_err(Into::into);
-    let read = combine_verification_and_cleanup(read.map_err(Into::into), closed)?;
-    eprintln!("live remount requester: unbuffered payload read completed ({read} bytes)");
-    for elapsed in [5, 10, 15] {
-        thread::sleep(Duration::from_secs(5));
-        eprintln!("live remount requester: unbuffered read wait {elapsed}s");
     }
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
@@ -1151,13 +1123,12 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         session.publish(Phase::Observed(Operation::FilesystemIo))?;
     }
     fs::write(mount.join("live-ci").join(REMOUNT_CONTROL), &payload)?;
-    let rename_path = mount.join("live-ci").join(REMOUNT_RENAME_CONTROL);
-    fs::write(&rename_path, &payload)?;
-    if fs::read(&rename_path)? != payload {
+    let short_name_path = mount.join("live-ci").join(REMOUNT_SHORT_NAME_CONTROL);
+    fs::write(&short_name_path, &payload)?;
+    if fs::read(&short_name_path)? != payload {
         return Err(io::Error::other("retained control readback differs from payload").into());
     }
-    prepare_rename_control(&rename_path)?;
-    let rename_control = OpenOptions::new().read(true).open(&rename_path)?;
+    let short_name_control = OpenOptions::new().read(true).open(&short_name_path)?;
     let retained = OpenOptions::new()
         .read(true)
         .open(mount.join("live-ci/alpha.bin"))?;
@@ -1172,7 +1143,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         // Temporary isolation probe: the production core reads the same on-disk state in user
         // mode before the kernel's fresh mount does. Remove once the runner loss is attributed.
         let identity = storage::validate(&scope)?;
-        for name in [REMOUNT_RENAME_CONTROL, "alpha.bin"] {
+        for name in [REMOUNT_SHORT_NAME_CONTROL, "alpha.bin"] {
             let mut probe = Command::new(env::current_exe()?);
             probe
                 .arg(crate::interop::READ_RAW_PARTITION_FILE)
@@ -1215,10 +1186,10 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     println!("live remount: close the retained old handle");
     let released = windows_host::close_file(retained).map_err(Into::into);
     println!("live remount: old-handle close result={released:?}");
-    let released_rename = windows_host::close_file(rename_control).map_err(Into::into);
+    let released_short_name = windows_host::close_file(short_name_control).map_err(Into::into);
     combine_verification_and_cleanup(
         combine_verification_and_cleanup(remount, released),
-        released_rename,
+        released_short_name,
     )?;
     if matches!(session.state().workload, LiveWorkload::RemountProbe) {
         dismount_filesystem(session)?;
