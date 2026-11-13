@@ -1050,23 +1050,30 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         thread::sleep(Duration::from_secs(5));
         eprintln!("live remount requester: control stream teardown wait {elapsed}s");
     }
-    // A whole-file IRP read followed by EOF reads of increasing requested length separates a
-    // length-dependent end-of-file completion from the payload's own state.
+    // A first-byte IRP read initializes caching so the in-EOF remainder completes through Fast
+    // I/O; the following EOF read then reaches the IRP path on the same handle.
     for name in [REMOUNT_SHORT_NAME_CONTROL] {
-        eprintln!("live remount requester: read retained {name} then probe EOF");
+        eprintln!("live remount requester: read retained {name} through Fast I/O then EOF");
         let mut control = fs::File::open(root.join(name))?;
         let length = usize::try_from(control.metadata()?.len())?;
         let staged = (|| -> TaskResult<()> {
             let mut bytes = vec![0_u8; length];
-            io::Read::read_exact(&mut control, &mut bytes)?;
-            eprintln!("live remount requester: {name} whole-file read completed");
-            for requested in [32_usize, 4096, 8192] {
-                thread::sleep(Duration::from_secs(10));
-                eprintln!("live remount requester: {name} EOF read of {requested} bytes");
-                let mut probe = vec![0_u8; requested];
-                let eof = io::Read::read(&mut control, &mut probe)?;
-                eprintln!("live remount requester: {name} EOF read returned {eof} bytes");
-            }
+            let (first, rest) = bytes
+                .split_first_mut()
+                .ok_or_else(|| io::Error::other("retained control is empty"))?;
+            io::Read::read_exact(&mut control, core::slice::from_mut(first))?;
+            eprintln!("live remount requester: {name} first byte read");
+            thread::sleep(Duration::from_secs(5));
+            io::Read::read_exact(&mut control, rest)?;
+            eprintln!(
+                "live remount requester: {name} remaining {} bytes read",
+                rest.len()
+            );
+            thread::sleep(Duration::from_secs(10));
+            eprintln!("live remount requester: {name} EOF read of 32 bytes");
+            let mut probe = [0_u8; 32];
+            let eof = io::Read::read(&mut control, &mut probe)?;
+            eprintln!("live remount requester: {name} EOF read returned {eof} bytes");
             Ok(())
         })();
         combine_verification_and_cleanup(
