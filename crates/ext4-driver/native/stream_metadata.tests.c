@@ -125,7 +125,9 @@ static NTSTATUS CcSetFileSizesEx(PFILE_OBJECT file, const CC_FILE_SIZES *sizes)
     if (cache_result == STATUS_SUCCESS) { cache_sizes = *sizes; }
     return cache_result;
 }
-static void ObDereferenceObject(PFILE_OBJECT file)
+/* Only deferred deletion is declared: the last reference must never delete the object, and
+ * so send IRP_MJ_CLOSE, on the publishing or projecting thread. */
+static void ObDereferenceObjectDeferDelete(PFILE_OBJECT file)
 {
     assert(file == &cache_file && file->references == 1);
     assert(stream.MainResource.writer == 1 && stream.HeaderMutex.held == 0);

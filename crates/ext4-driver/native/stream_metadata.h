@@ -9,6 +9,10 @@
  * the reactor; Cc observes the sizes on that owner before its ownership ends. */
 #define EXT4WIN_SIZE_PROJECTION_REQUESTER 1UL
 
+/* Cc's file object references are released with deferred deletion. Cc lazy close can drop
+ * every other reference meanwhile, and deleting the object on this thread would send a
+ * synchronous IRP_MJ_CLOSE that the reactor must process, possibly from the reactor itself. */
+
 /* Cc must observe the header sizes before any later Cc entry. Only an exclusive owner of
  * MainResource may call this; a failure leaves the projection pending for the next owner. */
 _IRQL_requires_max_(APC_LEVEL)
@@ -41,7 +45,7 @@ ext4win_stream_project_cache_sizes(_In_ PEXT4WIN_STREAM_CONTEXT stream)
         status = GetExceptionCode();
     }
     if (file_object != NULL) {
-        ObDereferenceObject(file_object);
+        ObDereferenceObjectDeferDelete(file_object);
     }
     if (NT_SUCCESS(status)) {
         (VOID)InterlockedExchange(&stream->CacheProjectionPending, FALSE);
@@ -140,7 +144,7 @@ ext4win_stream_publish_metadata(
         }
     }
     if (file_object != NULL) {
-        ObDereferenceObject(file_object);
+        ObDereferenceObjectDeferDelete(file_object);
     }
     *cache_status_out = cache_status;
     if (reactor_projection) {

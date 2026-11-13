@@ -291,8 +291,9 @@ pub(crate) use wdk_sys::ntddk::{
     IoUnregisterShutdownNotification, IofCallDriver, KeAcquireSpinLockRaiseToDpc, KeCancelTimer,
     KeFlushQueuedDpcs, KeInitializeDpc, KeInitializeEvent, KeInitializeSpinLock, KeInitializeTimer,
     KeInsertQueueDpc, KeReleaseSpinLock, KeSetEvent, KeSetTimer, KeWaitForSingleObject,
-    MmBuildMdlForNonPagedPool, MmUnlockPages, ObfDereferenceObject, ObfReferenceObject,
-    PsCreateSystemThread, PsTerminateSystemThread, ZwClose, ZwWaitForSingleObject,
+    MmBuildMdlForNonPagedPool, MmUnlockPages, ObDereferenceObjectDeferDelete, ObfDereferenceObject,
+    ObfReferenceObject, PsCreateSystemThread, PsTerminateSystemThread, ZwClose,
+    ZwWaitForSingleObject,
 };
 
 #[cfg(not(test))]

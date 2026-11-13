@@ -60,10 +60,14 @@ impl CapturedFileReference {
     reason = "this unique value owns exactly the Object Manager reference captured before deferral"
 )]
 impl Drop for CapturedFileReference {
+    /// The request completes on the reactor, and user mode may already have closed the handle,
+    /// leaving this as the last reference. Deleting the object here would send a synchronous
+    /// IRP_MJ_CLOSE to the same volume from the thread that must process it, so the deletion
+    /// runs on a system worker.
     fn drop(&mut self) {
         unsafe {
             // SAFETY: Native capture transferred one successful FILE_OBJECT reference to this value.
-            ffi::ObfDereferenceObject(self.file.as_ptr().cast());
+            ffi::ObDereferenceObjectDeferDelete(self.file.as_ptr().cast());
         }
     }
 }
