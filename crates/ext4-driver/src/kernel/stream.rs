@@ -203,6 +203,11 @@ pub(crate) enum SizeProjection {
     /// completes. The header commits without that resource, and the owner projects Cc before
     /// releasing it.
     Requester,
+    /// No gate covers this stream, so no thread may bring Cc to a new size. A publication that
+    /// would change the native cache dimensions is refused before the header commits: the
+    /// reactor would otherwise wait for the main resource without a sealed permit excluding its
+    /// owners, and such an owner may be awaiting the reactor.
+    Unchanged,
 }
 
 impl SizeProjection {
@@ -212,6 +217,7 @@ impl SizeProjection {
         match self {
             Self::Reactor => 0,
             Self::Requester => 1,
+            Self::Unchanged => 2,
         }
     }
 }
@@ -1460,11 +1466,12 @@ impl StreamContext {
     /// The native header is the commit point. A Cache Manager failure occurs after that point and
     /// is therefore returned as [`StreamMetadataPublication::CacheProjectionFailed`], not `Err`.
     /// Callers may invoke this only after ext4 durability and visibility publication for `epoch`.
-    /// `projection` must come from the gate that covers a size change of this stream.
+    /// `projection` must come from the gate that covers a size change of this stream, or be
+    /// [`SizeProjection::Unchanged`] when no gate covers it.
     /// # Errors
     ///
     /// Returns an invariant error only when no native header commit occurred, such as a malformed
-    /// stream or non-monotonic epoch.
+    /// stream, a non-monotonic epoch or an uncovered change of the native cache dimensions.
     pub(crate) fn publish_node_metadata(
         &self,
         sizes: StreamSizes,
@@ -1505,7 +1512,6 @@ impl StreamContext {
         #[cfg(test)]
         {
             // Host streams have no Cache Manager observer for either projection owner.
-            let _projection = projection;
             let mut current_metadata = self
                 .metadata
                 .lock()
@@ -1520,6 +1526,11 @@ impl StreamContext {
                 .sizes
                 .lock()
                 .map_err(|_| DriverError::InternalInvariantViolation)?;
+            if projection == SizeProjection::Unchanged
+                && !current_sizes.same_cache_dimensions(sizes)
+            {
+                return Err(DriverError::InternalInvariantViolation);
+            }
             *current_sizes = sizes;
             *current_metadata = Some(metadata);
             Ok(StreamMetadataPublication::Complete)

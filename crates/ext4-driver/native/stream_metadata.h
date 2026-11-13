@@ -8,6 +8,10 @@
 /* A synchronous requester owns MainResource exclusively until its IRP completes and awaits
  * the reactor; Cc observes the sizes on that owner before its ownership ends. */
 #define EXT4WIN_SIZE_PROJECTION_REQUESTER 1UL
+/* No gate covers the stream, so no thread may bring Cc to a new size. A size change is
+ * rejected before the header commits: waiting for MainResource without a sealed permit
+ * could wait for an owner that awaits the reactor. */
+#define EXT4WIN_SIZE_PROJECTION_UNCHANGED 2UL
 
 /* Cc's file object references are released with deferred deletion. Cc lazy close can drop
  * every other reference meanwhile, and deleting the object on this thread would send a
@@ -85,7 +89,8 @@ ext4win_stream_publish_metadata(
     if ((stream == NULL) || (stream->Kind != 1) ||
         (metadata == NULL) ||
         ((size_projection != EXT4WIN_SIZE_PROJECTION_REACTOR) &&
-            (size_projection != EXT4WIN_SIZE_PROJECTION_REQUESTER)) ||
+            (size_projection != EXT4WIN_SIZE_PROJECTION_REQUESTER) &&
+            (size_projection != EXT4WIN_SIZE_PROJECTION_UNCHANGED)) ||
         (allocation_size < 0) || (file_size < 0) ||
         (allocation_charge < 0) ||
         (valid_data_length != file_size) ||
@@ -104,6 +109,10 @@ ext4win_stream_publish_metadata(
     size_change = (stream->Header.AllocationSize.QuadPart != allocation_size) ||
         (stream->Header.FileSize.QuadPart != file_size) ||
         (stream->Header.ValidDataLength.QuadPart != valid_data_length);
+    if (size_change && (size_projection == EXT4WIN_SIZE_PROJECTION_UNCHANGED)) {
+        ExReleaseFastMutex(&stream->HeaderMutex);
+        return STATUS_INVALID_PARAMETER;
+    }
     reactor_projection = size_change && (size_projection == EXT4WIN_SIZE_PROJECTION_REACTOR);
     if (reactor_projection) {
         ExReleaseFastMutex(&stream->HeaderMutex);

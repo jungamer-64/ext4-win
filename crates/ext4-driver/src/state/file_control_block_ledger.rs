@@ -2753,7 +2753,8 @@ impl FileControlBlockLedger {
     /// Retires freed allocations before any fallible native projection, preserving their exact
     /// pointer lifetimes. Live streams are retained through short leases while the ledger
     /// resource is released for each native Cc/MM call. Each size change is projected by the
-    /// thread its retained gate selects; an update without a gate has unchanged sizes.
+    /// thread its retained gate selects; an update without a gate must leave the native cache
+    /// dimensions unchanged, and the stream rejects it before its header commits otherwise.
     /// # Errors
     ///
     /// Returns the exact stream-lease or Cc/MM publication failure.
@@ -2797,7 +2798,7 @@ impl FileControlBlockLedger {
             };
             let projection = size_changes
                 .and_then(|changes| changes.size_projection(update.node()))
-                .unwrap_or(SizeProjection::Reactor);
+                .unwrap_or(SizeProjection::Unchanged);
             match lease.publish(*update, epoch, projection) {
                 Ok(StreamMetadataPublication::Complete) => {
                     published_streams = published_streams.checked_add(1).unwrap_or_else(|| {

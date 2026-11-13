@@ -171,13 +171,26 @@ int main(void)
     stream.Header.ValidDataLength.QuadPart = 8192;
     stream.SectionObjects.SharedCacheMap = &cache_file;
 
-    /* Rename/link/timestamps and physical charge can commit while read-ahead awaits paging.
-     * Even an unavailable Cc projection has no work to perform when its dimensions agree. */
+    /* Rename/link/timestamps and physical charge commit without a size gate while read-ahead
+     * awaits paging. Even an unavailable Cc projection has no work when dimensions agree. */
     stream.MainResource.readers = 1;
     cache_result = STATUS_UNSUCCESSFUL;
-    publish(1, 8192, 8192, 4096, STATUS_SUCCESS);
-    publish(2, 8192, 8192, 12288, STATUS_SUCCESS);
+    publish_with(EXT4WIN_SIZE_PROJECTION_UNCHANGED, 1, 8192, 8192, 4096, STATUS_SUCCESS);
+    publish_with(EXT4WIN_SIZE_PROJECTION_UNCHANGED, 2, 8192, 8192, 12288, STATUS_SUCCESS);
     assert(reference_calls == 0 && cache_calls == 0 && stream.MainResource.readers == 1);
+
+    /* A size change that no gate covers is refused before the header commits, without waiting
+     * for the main resource that the read-ahead owner retains. */
+    metadata.Epoch = 3;
+    metadata.NumberOfLinks = 1;
+    metadata.WritableData = FALSE;
+    cache_status = 99;
+    assert(ext4win_stream_publish_metadata(&stream.Header, 16384, 12288, 12288,
+        8192, &metadata, EXT4WIN_SIZE_PROJECTION_UNCHANGED, &cache_status) == STATUS_INVALID_PARAMETER);
+    assert(stream.PublishedMetadata.Epoch == 2 && stream.Header.FileSize.QuadPart == 8192);
+    assert(stream.Header.AllocationSize.QuadPart == 8192 && stream.AllocationCharge == 12288);
+    assert(stream.MainResource.readers == 1 && stream.MainResource.writer == 0);
+    assert(reference_calls == 0 && cache_calls == 0 && stream.HeaderMutex.held == 0);
 
     /* Malformed input and stale epochs have no native commit or cache effect. */
     metadata.Epoch = 2;
@@ -192,7 +205,7 @@ int main(void)
     assert(ext4win_stream_publish_metadata(&stream.Header, 8192, 8192, 4096,
         4096, &metadata, EXT4WIN_SIZE_PROJECTION_REACTOR, &cache_status) == STATUS_INVALID_PARAMETER);
     assert(ext4win_stream_publish_metadata(&stream.Header, 16384, 16384, 16384,
-        8192, &metadata, 2, &cache_status) == STATUS_INVALID_PARAMETER);
+        8192, &metadata, 3, &cache_status) == STATUS_INVALID_PARAMETER);
     assert(stream.PublishedMetadata.Epoch == 2 && stream.Header.FileSize.QuadPart == 8192);
     assert(reference_calls == 0 && cache_calls == 0 && stream.HeaderMutex.held == 0);
 
