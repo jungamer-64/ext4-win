@@ -21,7 +21,8 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
         let file = root.join("alpha.bin");
         fs::write(&file, b"remount payload")?;
         fs::write(root.join("remount-control.bin"), b"control")?;
-        fs::write(root.join("remount-retained-control.bin"), b"retained")?;
+        fs::write(root.join("remount-security-control.bin"), b"security")?;
+        fs::write(root.join("remount-identity-control.bin"), b"identity")?;
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .arg("read-remount-payload")
             .arg(&file)
@@ -39,11 +40,16 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
             "live remount requester: control stream teardown wait 5s",
             "live remount requester: control stream teardown wait 10s",
             "live remount requester: control stream teardown wait 15s",
-            "live remount requester: read a freshly written control retained by the old mount",
-            "live remount requester: retained control read completed (8 bytes)",
-            "live remount requester: retained control wait 5s",
-            "live remount requester: retained control wait 10s",
-            "live remount requester: retained control wait 15s",
+            "live remount requester: read retained remount-security-control.bin",
+            "live remount requester: remount-security-control.bin read completed (8 bytes)",
+            "live remount requester: remount-security-control.bin wait 5s",
+            "live remount requester: remount-security-control.bin wait 10s",
+            "live remount requester: remount-security-control.bin wait 15s",
+            "live remount requester: read retained remount-identity-control.bin",
+            "live remount requester: remount-identity-control.bin read completed (8 bytes)",
+            "live remount requester: remount-identity-control.bin wait 5s",
+            "live remount requester: remount-identity-control.bin wait 10s",
+            "live remount requester: remount-identity-control.bin wait 15s",
             "live remount requester: opening file",
             "live remount requester: fresh open completed",
             "live remount requester: reading payload",

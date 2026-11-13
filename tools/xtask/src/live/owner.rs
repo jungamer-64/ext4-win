@@ -991,9 +991,43 @@ pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
 /// Nonempty sibling of the remount payload that no handle retains across dismount.
 const REMOUNT_CONTROL: &str = "remount-control.bin";
 
-/// Nonempty sibling written and read just before dismount, then retained by the old mount like
-/// the payload.
-const REMOUNT_RETAINED_CONTROL: &str = "remount-retained-control.bin";
+/// Retained sibling that receives the payload's metadata and security history before dismount.
+const REMOUNT_SECURITY_CONTROL: &str = "remount-security-control.bin";
+
+/// Retained sibling that receives the payload's identity-revocation write and write-through flush.
+const REMOUNT_IDENTITY_CONTROL: &str = "remount-identity-control.bin";
+
+/// Applies the payload's metadata query and unchanged DACL updates to one retained control.
+/// # Errors
+/// Returns metadata, security query or update failures.
+fn prepare_security_control(path: &Path, name: &str) -> TaskResult<()> {
+    windows_host::verify_metadata(path, &format!("\\live-ci\\{name}"), 8_192)?;
+    let descriptor = windows_host::file_security(path)?;
+    for _ in 0..2 {
+        windows_host::set_file_dacl(path, &descriptor)?;
+        if windows_host::file_security(path)? != descriptor {
+            return Err(io::Error::other("control security round trip changed metadata").into());
+        }
+    }
+    Ok(())
+}
+
+/// Applies the payload's identity-revocation write and write-through flush to one control.
+/// # Errors
+/// Returns identity replacement, write, flush or close failures.
+fn prepare_identity_control(session: &mut Session<LiveState>, path: &Path) -> TaskResult<()> {
+    exercise_identity_update(session, path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(0x8000_0000)
+        .open(path)?;
+    let operation = file.sync_all().map_err(Into::into);
+    combine_verification_and_cleanup(
+        operation,
+        windows_host::close_file(file).map_err(Into::into),
+    )
+}
 
 /// Performs the fresh file open in a supervised process so a pending kernel request cannot
 /// block the live session owner. Progress goes to stderr and stdout carries only payload bytes.
@@ -1028,15 +1062,17 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         thread::sleep(Duration::from_secs(5));
         eprintln!("live remount requester: control stream teardown wait {elapsed}s");
     }
-    eprintln!("live remount requester: read a freshly written control retained by the old mount");
-    let retained_control = fs::read(root.join(REMOUNT_RETAINED_CONTROL))?;
-    eprintln!(
-        "live remount requester: retained control read completed ({} bytes)",
-        retained_control.len()
-    );
-    for elapsed in [5, 10, 15] {
-        thread::sleep(Duration::from_secs(5));
-        eprintln!("live remount requester: retained control wait {elapsed}s");
+    for name in [REMOUNT_SECURITY_CONTROL, REMOUNT_IDENTITY_CONTROL] {
+        eprintln!("live remount requester: read retained {name}");
+        let control = fs::read(root.join(name))?;
+        eprintln!(
+            "live remount requester: {name} read completed ({} bytes)",
+            control.len()
+        );
+        for elapsed in [5, 10, 15] {
+            thread::sleep(Duration::from_secs(5));
+            eprintln!("live remount requester: {name} wait {elapsed}s");
+        }
     }
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
@@ -1099,13 +1135,18 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         session.publish(Phase::Observed(Operation::FilesystemIo))?;
     }
     fs::write(mount.join("live-ci").join(REMOUNT_CONTROL), &payload)?;
-    let retained_control_path = mount.join("live-ci").join(REMOUNT_RETAINED_CONTROL);
-    fs::write(&retained_control_path, &payload)?;
-    // The old mount caches this stream before retaining it, as it does for the payload.
-    if fs::read(&retained_control_path)? != payload {
-        return Err(io::Error::other("retained control readback differs from payload").into());
+    let security_path = mount.join("live-ci").join(REMOUNT_SECURITY_CONTROL);
+    let identity_path = mount.join("live-ci").join(REMOUNT_IDENTITY_CONTROL);
+    for path in [&security_path, &identity_path] {
+        fs::write(path, &payload)?;
+        if fs::read(path)? != payload {
+            return Err(io::Error::other("retained control readback differs from payload").into());
+        }
     }
-    let retained_control = OpenOptions::new().read(true).open(retained_control_path)?;
+    prepare_security_control(&security_path, REMOUNT_SECURITY_CONTROL)?;
+    prepare_identity_control(session, &identity_path)?;
+    let security_control = OpenOptions::new().read(true).open(&security_path)?;
+    let identity_control = OpenOptions::new().read(true).open(&identity_path)?;
     let retained = OpenOptions::new()
         .read(true)
         .open(mount.join("live-ci/alpha.bin"))?;
@@ -1120,7 +1161,11 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         // Temporary isolation probe: the production core reads the same on-disk state in user
         // mode before the kernel's fresh mount does. Remove once the runner loss is attributed.
         let identity = storage::validate(&scope)?;
-        for name in [REMOUNT_RETAINED_CONTROL, "alpha.bin"] {
+        for name in [
+            REMOUNT_SECURITY_CONTROL,
+            REMOUNT_IDENTITY_CONTROL,
+            "alpha.bin",
+        ] {
             let mut probe = Command::new(env::current_exe()?);
             probe
                 .arg(crate::interop::READ_RAW_PARTITION_FILE)
@@ -1163,10 +1208,14 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     println!("live remount: close the retained old handle");
     let released = windows_host::close_file(retained).map_err(Into::into);
     println!("live remount: old-handle close result={released:?}");
-    let released_control = windows_host::close_file(retained_control).map_err(Into::into);
+    let released_security = windows_host::close_file(security_control).map_err(Into::into);
+    let released_identity = windows_host::close_file(identity_control).map_err(Into::into);
     combine_verification_and_cleanup(
-        combine_verification_and_cleanup(remount, released),
-        released_control,
+        combine_verification_and_cleanup(
+            combine_verification_and_cleanup(remount, released),
+            released_security,
+        ),
+        released_identity,
     )?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
