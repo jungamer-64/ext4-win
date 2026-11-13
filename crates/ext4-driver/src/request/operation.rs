@@ -4821,7 +4821,7 @@ impl MutationRequestOperation {
         mut self: Box<Self>,
         owned: OwnedIrp,
         mut publication: Option<PreparedDriverPublication>,
-        continuation: CreateAbortContinuation,
+        mut continuation: CreateAbortContinuation,
     ) -> OperationTransition {
         if let Some(prepared) = publication.as_mut() {
             let result = prepared.abort(&owned);
@@ -4835,7 +4835,9 @@ impl MutationRequestOperation {
             }
             drop(publication.take());
             if let Err(error) = result {
-                return self.complete_error(owned, error);
+                // A failed publication backout still releases the remaining provisional claims
+                // and then reports its own failure.
+                continuation = CreateAbortContinuation::Complete(error);
             }
         }
         let result = self
