@@ -2,7 +2,7 @@
 use crate::{
     TaskResult, driver_load, fixture,
     process::{combine_verification_and_cleanup, run_checked, run_checked_output},
-    production::build_verified_production_bundle,
+    production::{ReleaseGates, build_verified_production_bundle},
     session::{Operation, Phase, Session, SessionId},
     storage::{self, DisposablePartition, Partition},
     windows,
@@ -32,6 +32,9 @@ enum LiveWorkload {
     Assurance,
     /// Independent random-I/O dataset and repeated native measurements.
     RandomIo,
+    /// Temporary remount isolation run: release gates are delegated to the other CI jobs and the
+    /// large-directory fixture is replaced by its one probed entry. Remove with the remount probe.
+    RemountProbe,
 }
 
 /// WSL attachment stage; interrupted intent is not assumed to have rolled back.
@@ -351,7 +354,7 @@ fn create_storage(session: &mut Session<LiveState>, workload: LiveWorkload) -> T
     let path = windows::literal(vhdx(session).as_os_str())?;
     session.publish(Phase::Intent(Operation::CreateVhdx))?;
     let bytes = match workload {
-        LiveWorkload::Assurance => 268_435_456_u64,
+        LiveWorkload::Assurance | LiveWorkload::RemountProbe => 268_435_456_u64,
         LiveWorkload::RandomIo => 2_147_483_648,
     };
     windows::management(
@@ -477,7 +480,16 @@ fn format_storage(
         );
     }
     let helper = linux_path(helper)?;
-    wsl_words(&["--exec", &helper, "live-directory", &partition])?;
+    if matches!(workload, LiveWorkload::RemountProbe) {
+        for command in [
+            "mkdir /live-ci/large-directory",
+            "write /dev/null /live-ci/large-directory/entry-000000",
+        ] {
+            wsl_words(&["--exec", "debugfs", "-w", "-R", command, &partition])?;
+        }
+    } else {
+        wsl_words(&["--exec", &helper, "live-directory", &partition])?;
+    }
     if matches!(workload, LiveWorkload::RandomIo) {
         wsl_words(&["--exec", &helper, "live-random-files", &partition])?;
     }
@@ -698,6 +710,20 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         operation,
         windows_host::close_file(file).map_err(Into::into),
     )?;
+    if !matches!(session.state().workload, LiveWorkload::RemountProbe) {
+        verify_large_directory(session, &root)?;
+    }
+    println!("live filesystem I/O: validate storage identity");
+    storage::validate(&scope(session)?)?;
+    session.publish(Phase::Observed(Operation::FilesystemIo))?;
+    println!("live filesystem I/O: PASS");
+    Ok(payload)
+}
+
+/// Requires native directory cursors and complete enumeration of the independent large fixture.
+/// # Errors
+/// Returns cursor contract, enumeration, fixture-count or evidence-write failures.
+fn verify_large_directory(session: &Session<LiveState>, root: &Path) -> TaskResult<()> {
     let directory = root.join("large-directory");
     println!("live filesystem I/O: verify native directory cursor contracts");
     windows_host::verify_directory(&directory)?;
@@ -737,11 +763,7 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
             &serde_json::json!({"entries": seen.len(), "first_ms": first, "total_ms": start.elapsed().as_secs_f64() * 1000.0}),
         )?,
     )?;
-    println!("live filesystem I/O: validate storage identity");
-    storage::validate(&scope(session)?)?;
-    session.publish(Phase::Observed(Operation::FilesystemIo))?;
-    println!("live filesystem I/O: PASS");
-    Ok(payload)
+    Ok(())
 }
 
 /// Replaces once after authoritative generation observation; acknowledgement failure is never retried.
@@ -1217,6 +1239,12 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         ),
         released_identity,
     )?;
+    if matches!(session.state().workload, LiveWorkload::RemountProbe) {
+        dismount_filesystem(session)?;
+        remove_namespace(session)?;
+        attachment(session, false)?;
+        return wait_removed(session);
+    }
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     exercise_offline_online(session, &payload)?;
@@ -1347,7 +1375,13 @@ pub(crate) fn benchmark_multi_file(root: &Path) -> TaskResult<()> {
 fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskResult<()> {
     check_live_driver_host(root)?;
     let helper = fixture::executable(root)?;
-    let bundle = build_verified_production_bundle(root)?;
+    let bundle = build_verified_production_bundle(
+        root,
+        match workload {
+            LiveWorkload::Assurance | LiveWorkload::RandomIo => ReleaseGates::Run,
+            LiveWorkload::RemountProbe => ReleaseGates::Delegated,
+        },
+    )?;
     println!("live VHDX session: {}", id.as_str());
     let state = LiveState {
         workload,
@@ -1386,6 +1420,13 @@ fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskRe
 /// Returns malformed identity, build, storage, installation or mandatory cleanup failures.
 pub(crate) fn prepare_live_vhdx(root: &Path, id: &OsStr) -> TaskResult<()> {
     prepare_session(root, LiveWorkload::Assurance, SessionId::parse(id)?)
+}
+
+/// Prepares the temporary remount isolation session; `verify-live-vhdx` consumes it.
+/// # Errors
+/// Returns malformed identity, build, storage, installation or mandatory cleanup failures.
+pub(crate) fn prepare_live_remount(root: &Path, id: &OsStr) -> TaskResult<()> {
+    prepare_session(root, LiveWorkload::RemountProbe, SessionId::parse(id)?)
 }
 
 /// Consumes a prepared session through live validation, cleanup and joined ETW completion.

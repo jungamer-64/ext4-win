@@ -330,8 +330,18 @@ impl SealedProductionArtifacts {
 /// Returns an error on non-Windows hosts, failed build or analysis commands, missing or invalid
 /// artifacts, source drift, or artifact hashing failure.
 pub(crate) fn verify_production_driver(repository_root: &Path) -> TaskResult<()> {
-    let _bundle = build_verified_production_bundle(repository_root)?;
+    let _bundle = build_verified_production_bundle(repository_root, ReleaseGates::Run)?;
     Ok(())
+}
+
+/// Development and interoperability gates bound to one production bundle.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReleaseGates {
+    /// The bundle build runs every gate against the same source snapshot.
+    Run,
+    /// Temporary remount isolation runs rely on the separate CI jobs for these gates; the bundle
+    /// is still built, signed and reachability-checked. Remove with the remount probe.
+    Delegated,
 }
 
 /// Runs the release umbrella and returns the atomically published evidence bundle.
@@ -342,6 +352,7 @@ pub(crate) fn verify_production_driver(repository_root: &Path) -> TaskResult<()>
 /// identity, source-drift, or publication failure.
 pub(crate) fn build_verified_production_bundle(
     repository_root: &Path,
+    gates: ReleaseGates,
 ) -> TaskResult<VerifiedProductionBundle> {
     if !cfg!(target_os = "windows") {
         return Err(io::Error::new(
@@ -352,6 +363,9 @@ pub(crate) fn build_verified_production_bundle(
     }
 
     let (source_before, ()) = SourceSnapshot::verify(repository_root, || {
+        if gates == ReleaseGates::Delegated {
+            return Ok(());
+        }
         verify_portable(repository_root)?;
         verify_driver(repository_root)?;
         verify_journal_fixture_provenance(repository_root)?;

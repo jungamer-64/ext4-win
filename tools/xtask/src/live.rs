@@ -7,8 +7,8 @@ use crate::TaskResult;
 pub(crate) use owner::benchmark_multi_file;
 #[cfg(windows)]
 pub(crate) use owner::{
-    READ_REMOUNT_PAYLOAD, check_live_driver_host, cleanup_live_vhdx_session, prepare_live_vhdx,
-    read_remount_payload, verify_live_vhdx,
+    READ_REMOUNT_PAYLOAD, check_live_driver_host, cleanup_live_vhdx_session, prepare_live_remount,
+    prepare_live_vhdx, read_remount_payload, verify_live_vhdx,
 };
 #[cfg(not(windows))]
 use std::{ffi::OsStr, io, path::Path};

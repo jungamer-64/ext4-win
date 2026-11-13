@@ -3,7 +3,7 @@ use super::inventory::Package;
 use crate::{
     TaskResult,
     process::{combine_verification_and_cleanup, run_checked, run_checked_output, sha256_file},
-    production::{VerifiedProductionBundle, build_verified_production_bundle},
+    production::{ReleaseGates, VerifiedProductionBundle, build_verified_production_bundle},
     session::{BundleIdentity, Operation, Phase, Session, SessionId},
     windows::{self, CommandOutcome},
 };
@@ -784,7 +784,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
 /// Returns host/build/load/trace failures while preserving mandatory completion failures.
 pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
     check_hosted_driver_host(root)?;
-    let bundle = build_verified_production_bundle(root)?;
+    let bundle = build_verified_production_bundle(root, ReleaseGates::Run)?;
     let mut shutdown = Command::new("wsl.exe");
     shutdown.arg("--shutdown");
     run_checked(shutdown, "production WSL oracle shutdown")?;
