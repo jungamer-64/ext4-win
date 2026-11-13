@@ -1070,8 +1070,8 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
                 rest.len()
             );
             thread::sleep(Duration::from_secs(10));
-            eprintln!("live remount requester: {name} EOF read of 32 bytes");
-            let mut probe = [0_u8; 32];
+            eprintln!("live remount requester: {name} EOF read of 8192 bytes");
+            let mut probe = [0_u8; 8192];
             let eof = io::Read::read(&mut control, &mut probe)?;
             eprintln!("live remount requester: {name} EOF read returned {eof} bytes");
             Ok(())
@@ -1105,14 +1105,13 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         );
         io::Read::read_exact(&mut file, rest)?;
         eprintln!("live remount requester: remaining payload read");
-        for elapsed in [5, 10, 15, 20, 25, 30] {
-            thread::sleep(Duration::from_secs(5));
-            eprintln!("live remount requester: remaining-read wait {elapsed}s");
+        for requested in [32_usize, 8192] {
+            thread::sleep(Duration::from_secs(10));
+            eprintln!("live remount requester: EOF read of {requested} bytes");
+            let mut probe = vec![0_u8; requested];
+            let eof = io::Read::read(&mut file, &mut probe)?;
+            eprintln!("live remount requester: EOF read returned {eof} bytes");
         }
-        eprintln!("live remount requester: reading at EOF");
-        let mut probe = [0_u8; 8192];
-        let eof = io::Read::read(&mut file, &mut probe)?;
-        eprintln!("live remount requester: EOF read returned {eof} bytes");
         let mut output = io::stdout().lock();
         output.write_all(&bytes)?;
         output.flush()?;
