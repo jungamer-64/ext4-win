@@ -12,6 +12,10 @@ use alloc::{
 use core::fmt;
 use std::{env, fs, io, path::PathBuf, process::ExitCode};
 
+mod stack;
+
+use stack::LinkedFrames;
+
 /// The exported driver entry point.
 const DRIVER_ENTRY: &str = "DriverEntry";
 
@@ -428,6 +432,8 @@ impl fmt::Display for FunctionSignature {
 struct IndirectCall {
     /// Normalized call-site signature.
     signature: FunctionSignature,
+    /// Function-local SSA value supplying the callee, without its `%` sigil.
+    callee: String,
     /// One-based LLVM IR line number.
     line: usize,
 }
@@ -451,6 +457,8 @@ struct Function {
     returns: Vec<String>,
     /// Whether LLVM exposes the definition outside the module.
     externally_visible: bool,
+    /// Whether the module defines a body; declarations are foreign code.
+    defined: bool,
 }
 
 /// Parsed production call graph inputs from one LLVM module.
@@ -464,6 +472,8 @@ struct IrModule {
     address_taken: BTreeSet<String>,
     /// Explicit production roots.
     roots: BTreeSet<String>,
+    /// Functions stored in Rust trait-object vtables, by byte offset within the vtable.
+    vtable_slots: BTreeMap<u64, BTreeSet<String>>,
 }
 
 /// A categorized path from a production root to a forbidden sink.
@@ -514,6 +524,8 @@ struct ArtifactBundle {
     link_map: LinkMap,
     /// Shared non-sentinel artifact identity.
     identity: ArtifactIdentity,
+    /// Fixed prolog frames of the signed image, addressed by linked symbol.
+    frames: LinkedFrames,
 }
 
 /// Final-link facts recovered from the MSVC map file.
@@ -610,7 +622,10 @@ fn main() -> ExitCode {
 fn run() -> GateResult<bool> {
     let bundle = ArtifactBundle::load(command_line_artifacts()?)?;
     let module = IrModule::parse(&bundle.ir)?;
-    let report = module.analyze_release()?;
+    let mut stack_violations = Vec::new();
+    let expanded_stacks = module.audit_expanded_stacks(&bundle.frames, &mut stack_violations)?;
+    let mut report = module.analyze_release()?;
+    report.violations.extend(stack_violations);
 
     println!("production artifact identity: {}", bundle.identity.0);
     println!("release LLVM IR: {}", bundle.paths.ir.display());
@@ -624,6 +639,9 @@ fn run() -> GateResult<bool> {
         "functions: {}, reachable: {}, address-taken: {}",
         report.function_count, report.reachable_count, report.address_taken_count
     );
+    for expanded in &expanded_stacks {
+        println!("{expanded}");
+    }
 
     if report.violations.is_empty() {
         println!("production-root reachability gate: PASS");
@@ -698,12 +716,14 @@ impl ArtifactBundle {
         let link_map = LinkMap::parse(&link_map_text)?;
         let image = PeImage::parse(&driver)?;
         link_map.verify_image(&image, &driver, &ir_identity)?;
+        let frames = LinkedFrames::parse(&link_map_text, &driver)?;
 
         Ok(Self {
             paths,
             ir,
             link_map,
             identity: ir_identity,
+            frames,
         })
     }
 }
@@ -1264,6 +1284,7 @@ impl IrModule {
     fn parse(ir: &str) -> GateResult<Self> {
         let mut functions = BTreeMap::new();
         let mut aliases = BTreeMap::new();
+        let mut vtable_slots = BTreeMap::<u64, BTreeSet<String>>::new();
         let mut pending_display: Option<String> = None;
         let mut inside_function = false;
 
@@ -1282,6 +1303,12 @@ impl IrModule {
             if let Some((symbol, target)) = parse_alias_definition(trimmed)? {
                 if aliases.insert(symbol.clone(), target).is_some() {
                     return Err(GateError::InvalidIr(format!("duplicate alias {symbol}")));
+                }
+                continue;
+            }
+            if let Some(slots) = stack::parse_vtable(trimmed)? {
+                for (offset, symbol) in slots {
+                    vtable_slots.entry(offset).or_default().insert(symbol);
                 }
                 continue;
             }
@@ -1316,6 +1343,7 @@ impl IrModule {
                     indirect_calls: Vec::new(),
                     returns: Vec::new(),
                     externally_visible,
+                    defined: definition,
                 },
             );
             inside_function = definition;
@@ -1326,6 +1354,7 @@ impl IrModule {
             aliases,
             address_taken: BTreeSet::new(),
             roots: BTreeSet::new(),
+            vtable_slots,
         };
         module.collect_edges(ir)?;
         module.collect_roots()?;
@@ -1466,10 +1495,11 @@ impl IrModule {
             }
         }
         if let Some(site) = call
-            && site.direct_target.is_none()
+            && let Some(callee) = site.indirect_callee
         {
             caller_node.indirect_calls.push(IndirectCall {
                 signature: site.signature,
+                callee,
                 line: line_number,
             });
         }
@@ -1980,8 +2010,12 @@ impl IrModule {
 struct ParsedCallSite {
     /// Direct LLVM target, or `None` for an indirect call.
     direct_target: Option<String>,
+    /// Local SSA callee of an indirect call, or `None` for a direct call.
+    indirect_callee: Option<String>,
     /// Normalized call-site signature.
     signature: FunctionSignature,
+    /// Top-level argument texts in call order.
+    arguments: Vec<String>,
 }
 
 /// Parses a `call` or `invoke` instruction while tolerating LLVM attributes.
@@ -1994,14 +2028,13 @@ fn parse_call_site(line: &str) -> Option<ParsedCallSite> {
     let after_instruction = line.get(instruction_start.saturating_add(instruction_length)..)?;
     let direct = callable_symbol(after_instruction, '@');
     let indirect = callable_symbol(after_instruction, '%');
-    let (callee_start, arguments_start, direct_target) = match (direct, indirect) {
-        (Some((start, _arguments, _symbol)), Some((indirect_start, indirect_arguments, _)))
-            if indirect_start < start =>
-        {
-            (indirect_start, indirect_arguments, None)
-        }
-        (Some((start, arguments, symbol)), _) => (start, arguments, Some(symbol)),
-        (None, Some((start, arguments, _))) => (start, arguments, None),
+    let (callee_start, arguments_start, direct_target, indirect_callee) = match (direct, indirect) {
+        (
+            Some((start, _arguments, _symbol)),
+            Some((indirect_start, indirect_arguments, callee)),
+        ) if indirect_start < start => (indirect_start, indirect_arguments, None, Some(callee)),
+        (Some((start, arguments, symbol)), _) => (start, arguments, Some(symbol), None),
+        (None, Some((start, arguments, callee))) => (start, arguments, None, Some(callee)),
         (None, None) => return None,
     };
     let arguments_end = matching_delimiter(after_instruction, arguments_start, '(', ')')?;
@@ -2009,7 +2042,13 @@ fn parse_call_site(line: &str) -> Option<ParsedCallSite> {
     let arguments = after_instruction.get(arguments_start.saturating_add(1)..arguments_end)?;
     Some(ParsedCallSite {
         direct_target,
+        indirect_callee,
         signature: signature_from_parts(prefix, arguments),
+        arguments: split_top_level(arguments, ',')
+            .into_iter()
+            .map(|argument| argument.trim().to_owned())
+            .filter(|argument| !argument.is_empty())
+            .collect(),
     })
 }
 
