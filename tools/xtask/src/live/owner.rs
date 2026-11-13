@@ -1050,14 +1050,32 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         thread::sleep(Duration::from_secs(5));
         eprintln!("live remount requester: control stream teardown wait {elapsed}s");
     }
+    // Reading the first byte through the IRP path initializes caching; the in-EOF remainder can
+    // then complete through Fast I/O, unlike a single whole-file read.
     for name in [REMOUNT_SHORT_NAME_CONTROL] {
-        eprintln!("live remount requester: read retained {name}");
-        let control = fs::read(root.join(name))?;
-        eprintln!(
-            "live remount requester: {name} read completed ({} bytes)",
-            control.len()
-        );
-        for elapsed in [5, 10, 15] {
+        eprintln!("live remount requester: read retained {name} in two steps");
+        let mut control = fs::File::open(root.join(name))?;
+        let length = usize::try_from(control.metadata()?.len())?;
+        let mut bytes = vec![0_u8; length];
+        let staged = (|| -> TaskResult<()> {
+            let (first, rest) = bytes
+                .split_first_mut()
+                .ok_or_else(|| io::Error::other("retained control is empty"))?;
+            io::Read::read_exact(&mut control, core::slice::from_mut(first))?;
+            eprintln!("live remount requester: {name} first byte read");
+            thread::sleep(Duration::from_secs(5));
+            io::Read::read_exact(&mut control, rest)?;
+            eprintln!(
+                "live remount requester: {name} remaining {} bytes read",
+                rest.len()
+            );
+            Ok(())
+        })();
+        combine_verification_and_cleanup(
+            staged,
+            windows_host::close_file(control).map_err(Into::into),
+        )?;
+        for elapsed in [5, 10, 15, 20, 25, 30] {
             thread::sleep(Duration::from_secs(5));
             eprintln!("live remount requester: {name} wait {elapsed}s");
         }
@@ -1082,7 +1100,10 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
         );
         io::Read::read_exact(&mut file, rest)?;
         eprintln!("live remount requester: remaining payload read");
-        thread::sleep(Duration::from_secs(10));
+        for elapsed in [5, 10, 15, 20, 25, 30] {
+            thread::sleep(Duration::from_secs(5));
+            eprintln!("live remount requester: remaining-read wait {elapsed}s");
+        }
         eprintln!("live remount requester: reading at EOF");
         let mut probe = [0_u8; 8192];
         let eof = io::Read::read(&mut file, &mut probe)?;
@@ -1188,7 +1209,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
             .arg(READ_REMOUNT_PAYLOAD)
             .arg(mount.join("live-ci/alpha.bin"))
             .stderr(Stdio::inherit());
-        let readback = windows::bounded(requester, Duration::from_secs(120))
+        let readback = windows::bounded(requester, Duration::from_secs(240))
             .and_then(|outcome| windows::checked_outcome(outcome, "remount readback"));
         match &readback {
             Ok(_) => println!("live remount: fresh-open read completed"),
