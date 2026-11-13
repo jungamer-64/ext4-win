@@ -21,8 +21,7 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
         let file = root.join("alpha.bin");
         fs::write(&file, b"remount payload")?;
         fs::write(root.join("remount-control.bin"), b"control")?;
-        fs::write(root.join("remount-security-control.bin"), b"security")?;
-        fs::write(root.join("remount-identity-control.bin"), b"identity")?;
+        fs::write(root.join("remount-rename-control.bin"), b"rename")?;
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .arg("read-remount-payload")
             .arg(&file)
@@ -40,16 +39,16 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
             "live remount requester: control stream teardown wait 5s",
             "live remount requester: control stream teardown wait 10s",
             "live remount requester: control stream teardown wait 15s",
-            "live remount requester: read retained remount-security-control.bin",
-            "live remount requester: remount-security-control.bin read completed (8 bytes)",
-            "live remount requester: remount-security-control.bin wait 5s",
-            "live remount requester: remount-security-control.bin wait 10s",
-            "live remount requester: remount-security-control.bin wait 15s",
-            "live remount requester: read retained remount-identity-control.bin",
-            "live remount requester: remount-identity-control.bin read completed (8 bytes)",
-            "live remount requester: remount-identity-control.bin wait 5s",
-            "live remount requester: remount-identity-control.bin wait 10s",
-            "live remount requester: remount-identity-control.bin wait 15s",
+            "live remount requester: read retained remount-rename-control.bin",
+            "live remount requester: remount-rename-control.bin read completed (6 bytes)",
+            "live remount requester: remount-rename-control.bin wait 5s",
+            "live remount requester: remount-rename-control.bin wait 10s",
+            "live remount requester: remount-rename-control.bin wait 15s",
+            "live remount requester: unbuffered payload read",
+            "live remount requester: unbuffered payload read completed (15 bytes)",
+            "live remount requester: unbuffered read wait 5s",
+            "live remount requester: unbuffered read wait 10s",
+            "live remount requester: unbuffered read wait 15s",
             "live remount requester: opening file",
             "live remount requester: fresh open completed",
             "live remount requester: reading payload",
@@ -65,8 +64,9 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8(output.stderr).map_err(io::Error::other)?;
-        assert!(stderr.contains("live remount requester: opening file"));
+        assert!(stderr.contains("live remount requester: unbuffered payload read"));
         assert!(stderr.contains("xtask failed:"));
+        assert!(!stderr.contains("unbuffered payload read completed"));
         assert!(!stderr.contains("fresh open completed"));
         Ok(())
     })();
