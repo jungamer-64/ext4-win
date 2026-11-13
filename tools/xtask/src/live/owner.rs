@@ -991,7 +991,8 @@ pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
 /// Nonempty sibling of the remount payload that no handle retains across dismount.
 const REMOUNT_CONTROL: &str = "remount-control.bin";
 
-/// Nonempty sibling written just before dismount and retained by the old mount like the payload.
+/// Nonempty sibling written and read just before dismount, then retained by the old mount like
+/// the payload.
 const REMOUNT_RETAINED_CONTROL: &str = "remount-retained-control.bin";
 
 /// Performs the fresh file open in a supervised process so a pending kernel request cannot
@@ -1100,6 +1101,10 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     fs::write(mount.join("live-ci").join(REMOUNT_CONTROL), &payload)?;
     let retained_control_path = mount.join("live-ci").join(REMOUNT_RETAINED_CONTROL);
     fs::write(&retained_control_path, &payload)?;
+    // The old mount caches this stream before retaining it, as it does for the payload.
+    if fs::read(&retained_control_path)? != payload {
+        return Err(io::Error::other("retained control readback differs from payload").into());
+    }
     let retained_control = OpenOptions::new().read(true).open(retained_control_path)?;
     let retained = OpenOptions::new()
         .read(true)
