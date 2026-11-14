@@ -21,7 +21,9 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
         let file = root.join("alpha.bin");
         fs::write(&file, b"remount payload")?;
         fs::write(root.join("remount-control.bin"), b"control")?;
-        fs::write(root.join("gamma.bin"), b"gamma")?;
+        fs::write(root.join("remount-rename-control.bin"), b"control")?;
+        fs::write(root.join("remount-security-control.bin"), b"control")?;
+        fs::write(root.join("remount-identity-control.bin"), b"control")?;
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
             .arg("read-remount-payload")
             .arg(&file)
@@ -39,14 +41,27 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
             "live remount requester: control stream teardown wait 5s",
             "live remount requester: control stream teardown wait 10s",
             "live remount requester: control stream teardown wait 15s",
-            "live remount requester: read retained gamma.bin through Fast I/O then EOF",
-            "live remount requester: gamma.bin first byte read",
-            "live remount requester: gamma.bin remaining 4 bytes read",
-            "live remount requester: gamma.bin EOF read of 8192 bytes",
-            "live remount requester: gamma.bin EOF read returned 0 bytes",
-            "live remount requester: gamma.bin wait 5s",
-            "live remount requester: gamma.bin wait 10s",
-            "live remount requester: gamma.bin wait 15s",
+            "live remount requester: read retained remount-rename-control.bin then 8192-byte EOF",
+            "live remount requester: remount-rename-control.bin whole-file read completed",
+            "live remount requester: remount-rename-control.bin EOF read of 8192 bytes",
+            "live remount requester: remount-rename-control.bin EOF read returned 0 bytes",
+            "live remount requester: remount-rename-control.bin wait 5s",
+            "live remount requester: remount-rename-control.bin wait 10s",
+            "live remount requester: remount-rename-control.bin wait 15s",
+            "live remount requester: read retained remount-security-control.bin then 8192-byte EOF",
+            "live remount requester: remount-security-control.bin whole-file read completed",
+            "live remount requester: remount-security-control.bin EOF read of 8192 bytes",
+            "live remount requester: remount-security-control.bin EOF read returned 0 bytes",
+            "live remount requester: remount-security-control.bin wait 5s",
+            "live remount requester: remount-security-control.bin wait 10s",
+            "live remount requester: remount-security-control.bin wait 15s",
+            "live remount requester: read retained remount-identity-control.bin then 8192-byte EOF",
+            "live remount requester: remount-identity-control.bin whole-file read completed",
+            "live remount requester: remount-identity-control.bin EOF read of 8192 bytes",
+            "live remount requester: remount-identity-control.bin EOF read returned 0 bytes",
+            "live remount requester: remount-identity-control.bin wait 5s",
+            "live remount requester: remount-identity-control.bin wait 10s",
+            "live remount requester: remount-identity-control.bin wait 15s",
             "live remount requester: opening file",
             "live remount requester: fresh open completed",
             "live remount requester: reading first payload byte",
