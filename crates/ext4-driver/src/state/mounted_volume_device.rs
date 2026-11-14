@@ -519,9 +519,13 @@ impl MountedVolumeDevice {
         }
         .take();
         let resumed = parked.is_some();
-        let pending = parked.unwrap_or_else(|| unsafe {
-            // SAFETY: This first invocation uniquely owns terminal teardown of the joined actor.
-            Self::begin_release(device, extension)
+        let pending = parked.unwrap_or_else(|| {
+            let pending = unsafe {
+                // SAFETY: This first invocation uniquely owns terminal teardown of the joined actor.
+                Self::begin_release(device, extension)
+            };
+            retirement_probe_pause();
+            pending
         });
         let PendingRetirement {
             vpb,
@@ -537,12 +541,14 @@ impl MountedVolumeDevice {
                     STATUS_SUCCESS,
                     OperationalOutcome::Completed,
                 );
+                retirement_probe_pause();
                 drop(binding);
                 trace.record(
                     OperationalPath::VolumeRetirement,
                     STATUS_SUCCESS,
                     OperationalOutcome::Completed,
                 );
+                retirement_probe_pause();
                 RetirementStep::Released { resumed }
             }
             Err((retained, references)) => {
@@ -1485,6 +1491,7 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
     if MountedVolumeDevice::retirement_work_item(device) != work_item {
         KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
     }
+    retirement_probe_pause();
     let step = unsafe {
         // SAFETY: Work-item ownership pins the device while release closes admission, drains the
         // actor, and either parks the teardown or destroys extension-owned resources.
@@ -1515,6 +1522,27 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
 /// Retry delay while the original VPB still has native references, in relative 100 ns units.
 #[cfg(not(test))]
 const VPB_RETIREMENT_RETRY_DELAY: i64 = -100_000;
+
+/// Temporary live-remount isolation probe: separates physical-retirement steps in time so each
+/// step's operational trace reaches the hosted log before a later step can stop the host.
+/// Remove once the runner loss after old-mount handle release is attributed.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the PASSIVE_LEVEL retirement work item performs one non-alertable relative delay"
+)]
+fn retirement_probe_pause() {
+    let mut interval = LARGE_INTEGER {
+        QuadPart: -50_000_000,
+    };
+    let status = unsafe {
+        // SAFETY: The retirement work item runs at PASSIVE_LEVEL and owns this local interval.
+        wdk_sys::ntddk::KeDelayExecutionThread(0, 0, core::ptr::addr_of_mut!(interval))
+    };
+    if status != STATUS_SUCCESS {
+        KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+    }
+}
 
 /// Physical teardown parked between retirement work-item invocations.
 #[cfg(not(test))]
