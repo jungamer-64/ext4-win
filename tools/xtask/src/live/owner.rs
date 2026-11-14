@@ -1161,6 +1161,10 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
             let eof = io::Read::read(&mut file, &mut probe)?;
             eprintln!("live remount requester: EOF read returned {eof} bytes");
         }
+        for elapsed in [5, 10, 15, 20] {
+            thread::sleep(Duration::from_secs(5));
+            eprintln!("live remount requester: post-read wait {elapsed}s");
+        }
         let mut output = io::stdout().lock();
         output.write_all(&bytes)?;
         output.flush()?;
@@ -1171,6 +1175,8 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
     let closed = windows_host::close_file(file).map_err(Into::into);
     if closed.is_ok() {
         eprintln!("live remount requester: fresh handle closed");
+        thread::sleep(Duration::from_secs(10));
+        eprintln!("live remount requester: post-close wait 10s");
     }
     combine_verification_and_cleanup(readback, closed)
 }
@@ -1284,9 +1290,19 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         }
         Ok(())
     })();
+    // Temporary isolation probe: separates requester exit from old-mount handle release and the
+    // retirement it unblocks. Remove once the runner loss is attributed.
+    for elapsed in (5..=30).step_by(5) {
+        thread::sleep(Duration::from_secs(5));
+        println!("live remount: pre-release wait {elapsed}s");
+    }
     println!("live remount: close the retained old handle");
     let released = windows_host::close_file(retained).map_err(Into::into);
     println!("live remount: old-handle close result={released:?}");
+    for elapsed in (5..=30).step_by(5) {
+        thread::sleep(Duration::from_secs(5));
+        println!("live remount: post-release wait {elapsed}s");
+    }
     let mut combined = combine_verification_and_cleanup(remount, released);
     for control in history_controls {
         combined = combine_verification_and_cleanup(

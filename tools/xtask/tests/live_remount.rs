@@ -72,9 +72,14 @@ fn remount_requester_separates_payload_and_progress() -> io::Result<()> {
             "live remount requester: EOF read returned 0 bytes",
             "live remount requester: EOF read of 8192 bytes",
             "live remount requester: EOF read returned 0 bytes",
+            "live remount requester: post-read wait 5s",
+            "live remount requester: post-read wait 10s",
+            "live remount requester: post-read wait 15s",
+            "live remount requester: post-read wait 20s",
             "live remount requester: payload read completed",
             "live remount requester: closing fresh handle",
             "live remount requester: fresh handle closed",
+            "live remount requester: post-close wait 10s",
         ]));
 
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))
