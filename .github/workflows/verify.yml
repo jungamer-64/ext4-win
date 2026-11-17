@@ -957,7 +957,7 @@ jobs:
           retention-days: 14
 
       - name: Stop job-owned Driver Verifier checks
-        if: always() && steps.live_io.outcome != 'skipped'
+        if: always() && steps.live_io.outcome != 'skipped' && env.EXT4WIN_DRIVER_SCENARIO != 'remount'
         timeout-minutes: 2
         shell: powershell
         run: |

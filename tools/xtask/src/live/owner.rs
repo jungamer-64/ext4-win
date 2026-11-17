@@ -1192,23 +1192,28 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     let artifact = driver_load::start_session(root, session.id(), Some(&scope))?;
     session.state_mut().driver = DriverStage::Running;
     session.publish(Phase::Observed(Operation::StartDriver))?;
-    session.publish(Phase::Intent(Operation::ActivateVerifier))?;
-    let mut command = Command::new("verifier.exe");
-    command.args([
-        "/dif",
-        "1",
-        "2",
-        "4",
-        "5",
-        "9",
-        "12",
-        "18",
-        "/now",
-        "/driver",
-        "ext4win.sys",
-    ]);
-    run_checked(command, "live Driver Verifier activation")?;
-    observe_verifier(session)?;
+    // Temporary isolation probe: the remount run omits Driver Verifier so the final retirement
+    // failure can be attributed to a Verifier-detected violation or an unconditional fault.
+    // Remove with the remount probe.
+    if !matches!(session.state().workload, LiveWorkload::RemountProbe) {
+        session.publish(Phase::Intent(Operation::ActivateVerifier))?;
+        let mut command = Command::new("verifier.exe");
+        command.args([
+            "/dif",
+            "1",
+            "2",
+            "4",
+            "5",
+            "9",
+            "12",
+            "18",
+            "/now",
+            "/driver",
+            "ext4win.sys",
+        ]);
+        run_checked(command, "live Driver Verifier activation")?;
+        observe_verifier(session)?;
+    }
     let mount = mount_namespace(session)?;
     configure_identity(session)?;
     let payload = exercise_io(session, &mount)?;
