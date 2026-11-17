@@ -1524,21 +1524,30 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         // the callback is permitted, and the device is not yet delete-pending.
         ffi::IoFreeWorkItem(work_item.as_ptr());
     }
-    trace.record_status(OperationalPath::VolumeRetirement, RETIREMENT_PROBE_WORK_ITEM_FREED);
+    trace.record_status(
+        OperationalPath::VolumeRetirement,
+        RETIREMENT_PROBE_WORK_ITEM_FREED,
+    );
     retirement_probe_pause();
     unsafe {
         // SAFETY: All extension resources are gone; the lifetime reference and the executing
         // work item's own reference keep the device object live through deletion.
         ffi::IoDeleteDevice(device.as_ptr());
     }
-    trace.record_status(OperationalPath::VolumeRetirement, RETIREMENT_PROBE_DEVICE_DELETED);
+    trace.record_status(
+        OperationalPath::VolumeRetirement,
+        RETIREMENT_PROBE_DEVICE_DELETED,
+    );
     retirement_probe_pause();
     unsafe {
         // SAFETY: This releases the lifetime reference acquired by successful initialization.
         // The executing work item's own device reference keeps the object live until return.
         ffi::ObfDereferenceObject(device.as_ptr().cast());
     }
-    trace.record_status(OperationalPath::VolumeRetirement, RETIREMENT_PROBE_REFERENCE_RELEASED);
+    trace.record_status(
+        OperationalPath::VolumeRetirement,
+        RETIREMENT_PROBE_REFERENCE_RELEASED,
+    );
 }
 
 /// Temporary isolation-probe markers for the final retirement steps; remove with the probe.
