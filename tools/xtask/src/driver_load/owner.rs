@@ -556,7 +556,7 @@ pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
     session.publish(Phase::Intent(Operation::PrepareUnload))?;
     let mut request = Command::new(std::env::current_exe()?);
     request.arg("prepare-driver-unload").arg(id.as_str());
-    let outcome = windows::bounded(request, Duration::from_secs(30))?;
+    let outcome = windows::bounded(request, Duration::from_secs(90))?;
     if matches!(outcome, CommandOutcome::Uncertain { .. }) {
         session.publish(Phase::Deferred(Operation::PrepareUnload))?;
     }
@@ -663,10 +663,23 @@ pub(crate) fn prepare_driver_unload(root: &Path, id: &OsStr) -> TaskResult<()> {
         &session.state().bundle.sys,
         !matches!(session.state().package, PackageState::Removed(_)),
     )?;
-    let outcome = windows_host::prepare_unload(
-        Path::new(&session.state().control.path),
-        session.state().control.ioctl,
-    )?;
+    // The driver refuses with ERROR_NOT_READY, before any retirement effect, while a mounted
+    // volume device is still live or retiring; dismounted volumes retire asynchronously.
+    let start = Instant::now();
+    let outcome = loop {
+        match windows_host::prepare_unload(
+            Path::new(&session.state().control.path),
+            session.state().control.ioctl,
+        ) {
+            Err(error)
+                if error.raw_os_error() == Some(21)
+                    && start.elapsed() < Duration::from_secs(60) =>
+            {
+                thread::sleep(Duration::from_millis(500));
+            }
+            result => break result?,
+        }
+    };
     println!("{outcome:?}");
     Ok(())
 }
@@ -739,7 +752,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
                 request
                     .arg("prepare-driver-unload")
                     .arg(session.id().as_str());
-                let outcome = windows::bounded(request, Duration::from_secs(30))?;
+                let outcome = windows::bounded(request, Duration::from_secs(90))?;
                 if matches!(outcome, CommandOutcome::Uncertain { .. }) {
                     session.publish(Phase::Deferred(Operation::PrepareUnload))?;
                 }

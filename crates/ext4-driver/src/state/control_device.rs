@@ -770,11 +770,13 @@ impl ControlDevice {
     /// A base filesystem must delete all its devices before `DriverUnload` can run. Existing
     /// control handles retain only a closed dispatch gate and lifecycle tag after this request;
     /// Cleanup/Close remain valid until their final I/O Manager reference releases the device.
-    /// Mounted volumes retire through their own dismount/last-close protocol, never DriverUnload.
+    /// Mounted volumes retire through their own dismount/last-close protocol, never DriverUnload;
+    /// this request is refused with device-busy until every mounted volume device is deleted, and
+    /// its acceptance closes mount admission for the rest of the driver's lifetime.
     /// # Errors
     ///
-    /// Returns an error for a non-control device, an unpublished state, or a concurrent prepare
-    /// request that still owns the transition.
+    /// Returns an error for a non-control device, an unpublished state, a live or retiring
+    /// mounted volume, or a concurrent prepare request that still owns the transition.
     #[expect(
         unsafe_code,
         reason = "this audited kernel or raw-memory item documents each unsafe operation with a local SAFETY invariant"
@@ -784,6 +786,7 @@ impl ControlDevice {
             // SAFETY: The active control IOCTL retains its target device for this transition.
             ControlDeviceExtension::from_device(device)?
         };
+        MountedVolumeAdmission::close_for_unload()?;
         if extension.lifecycle.begin_retirement()? == RetirementAdmission::AlreadyRetired {
             return Ok(());
         }

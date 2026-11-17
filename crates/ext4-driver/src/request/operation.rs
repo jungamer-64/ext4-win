@@ -655,6 +655,7 @@ impl MountRequestOperation {
             catalog.identities,
         )?;
 
+        let admission_count = crate::state::MountedVolumeAdmission::acquire()?;
         let extension_size =
             wdk_sys::ULONG::try_from(core::mem::size_of::<MountedVolumeDeviceExtension>())
                 .map_err(|_| DriverError::InvalidParameter)?;
@@ -688,7 +689,10 @@ impl MountRequestOperation {
             admission.vpb(),
             admission.target_device(),
         ) {
-            Ok(()) => Ok(device),
+            Ok(()) => {
+                admission_count.publish();
+                Ok(device)
+            }
             Err(error) => {
                 unsafe {
                     // SAFETY: Initialization rejected the unpublished device and retained no VCB

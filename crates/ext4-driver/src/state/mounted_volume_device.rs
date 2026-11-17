@@ -193,11 +193,6 @@ impl MountedVolumeDevice {
 
     /// Initializes an IoCreateDevice-created mounted device and takes ownership
     /// of the VCB.
-    ///
-    /// Success also acquires the device's lifetime reference, released by retirement only after
-    /// `IoDeleteDevice`. The I/O Manager defers driver unload while any device is referenced, so
-    /// `DriverUnload` cannot run while a mounted device exists, including between parked
-    /// retirement invocations that hold no work-item reference.
     /// # Errors
     ///
     /// Returns an error for invalid device/sector geometry, resource initialization failure,
@@ -433,12 +428,6 @@ impl MountedVolumeDevice {
         unsafe {
             // SAFETY: This slot is uninitialized; publication owns the unique mounted reference.
             publication_destination.write(MaybeUninit::new(publication));
-        }
-        #[cfg(not(test))]
-        unsafe {
-            // SAFETY: The mount owns this live device; retirement releases this lifetime
-            // reference after deleting it.
-            ffi::ObfReferenceObject(device.as_ptr().cast());
         }
         unsafe {
             // SAFETY: Mount owns initialization; VPB publication completed and its lock is released.
@@ -1539,14 +1528,10 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         RETIREMENT_PROBE_DEVICE_DELETED,
     );
     retirement_probe_pause();
-    unsafe {
-        // SAFETY: This releases the lifetime reference acquired by successful initialization.
-        // The executing work item's own device reference keeps the object live until return.
-        ffi::ObfDereferenceObject(device.as_ptr().cast());
-    }
+    MountedVolumeAdmission::release_retired();
     trace.record_status(
         OperationalPath::VolumeRetirement,
-        RETIREMENT_PROBE_REFERENCE_RELEASED,
+        RETIREMENT_PROBE_CENSUS_RELEASED,
     );
 }
 
@@ -1556,9 +1541,96 @@ const RETIREMENT_PROBE_WORK_ITEM_FREED: wdk_sys::NTSTATUS = 0x40EE_0001;
 /// Device deletion was requested.
 #[cfg(not(test))]
 const RETIREMENT_PROBE_DEVICE_DELETED: wdk_sys::NTSTATUS = 0x40EE_0002;
-/// The mounted device's lifetime reference was released.
+/// The deleted device left the mounted-volume census.
 #[cfg(not(test))]
-const RETIREMENT_PROBE_REFERENCE_RELEASED: wdk_sys::NTSTATUS = 0x40EE_0003;
+const RETIREMENT_PROBE_CENSUS_RELEASED: wdk_sys::NTSTATUS = 0x40EE_0003;
+
+/// Closed bit of [`MOUNTED_VOLUMES`]; the remaining bits count live mounted volumes.
+const MOUNTED_VOLUMES_CLOSED: usize = 1 << (usize::BITS - 1);
+
+/// Driver-lifetime census of mounted volume devices that have not completed `IoDeleteDevice`.
+///
+/// The I/O Manager may invoke `DriverUnload` once every device has no open references, even
+/// while mounted devices are still retiring or listed as delete-pending. Prepare-unload
+/// therefore closes this census only when it is empty, refusing new mounts afterwards, and
+/// `DriverUnload` requires the closed empty census instead of an empty device list.
+static MOUNTED_VOLUMES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// One live mounted volume counted by the census until its device is deleted.
+#[derive(Debug)]
+pub(crate) struct MountedVolumeAdmission(());
+
+impl MountedVolumeAdmission {
+    /// Counts a mount before its device is created.
+    /// # Errors
+    /// Returns invalid-device-request after prepare-unload closed the census, or resource
+    /// exhaustion when the count cannot be represented.
+    pub(crate) fn acquire() -> DriverResult<Self> {
+        MOUNTED_VOLUMES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if state & MOUNTED_VOLUMES_CLOSED != 0 {
+                    return None;
+                }
+                state
+                    .checked_add(1)
+                    .filter(|next| next & MOUNTED_VOLUMES_CLOSED == 0)
+            })
+            .map_err(|state| {
+                if state & MOUNTED_VOLUMES_CLOSED != 0 {
+                    DriverError::InvalidDeviceRequest
+                } else {
+                    DriverError::InsufficientResources
+                }
+            })?;
+        Ok(Self(()))
+    }
+
+    /// Transfers the count to the published device; retirement releases it after deletion.
+    pub(crate) fn publish(self) {
+        core::mem::forget(self);
+    }
+
+    /// Releases the count of a published device whose `IoDeleteDevice` has been called.
+    fn release_retired() {
+        if MOUNTED_VOLUMES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                if state & !MOUNTED_VOLUMES_CLOSED == 0 {
+                    return None;
+                }
+                state.checked_sub(1)
+            })
+            .is_err()
+        {
+            KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
+        }
+    }
+
+    /// Closes mount admission for driver retirement when no mounted volume remains.
+    /// # Errors
+    /// Returns device-busy while a mounted volume is live or still retiring. A closed census
+    /// stays closed, so repeated requests are idempotent.
+    pub(crate) fn close_for_unload() -> DriverResult<()> {
+        MOUNTED_VOLUMES
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| match state {
+                0 => Some(MOUNTED_VOLUMES_CLOSED),
+                MOUNTED_VOLUMES_CLOSED => Some(MOUNTED_VOLUMES_CLOSED),
+                _ => None,
+            })
+            .map(|_| ())
+            .map_err(|_| DriverError::DeviceBusy)
+    }
+
+    /// Reports whether prepare-unload closed the census with no mounted volume remaining.
+    pub(crate) fn retired_for_unload() -> bool {
+        MOUNTED_VOLUMES.load(Ordering::Acquire) == MOUNTED_VOLUMES_CLOSED
+    }
+}
+
+impl Drop for MountedVolumeAdmission {
+    fn drop(&mut self) {
+        Self::release_retired();
+    }
+}
 
 /// Retry delay while the original VPB still has native references, in relative 100 ns units.
 #[cfg(not(test))]

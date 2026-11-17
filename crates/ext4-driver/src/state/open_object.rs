@@ -2380,10 +2380,12 @@ fn file_control_block_owner(fcb: NonNull<FileControlBlock>) -> NonNull<FileContr
 
 /// Final unload notification after every control and mounted device has retired.
 ///
-/// A base filesystem's device deletion is a prerequisite for this callback, not work that can
-/// be deferred to it. Control retirement belongs to prepare-unload; mounted-device retirement
-/// belongs to dismount/last-close. Operational tracing is unregistered only after this check
-/// proves that every device, volume, stream, and copied event-write capability has retired.
+/// Device deletion is a prerequisite for this callback, not work that can be deferred to it.
+/// Control retirement belongs to prepare-unload; mounted-device retirement belongs to
+/// dismount/last-close. The I/O Manager may still list delete-pending devices here, so the
+/// closed empty mounted-volume census, which prepare-unload requires, is the checked invariant.
+/// Operational tracing is unregistered only after every volume, stream, and copied event-write
+/// capability has retired.
 ///
 /// # Safety
 /// The I/O Manager must invoke this as the registered unload routine for its live driver object.
@@ -2397,7 +2399,8 @@ pub(crate) unsafe extern "C" fn driver_unload(driver: PDRIVER_OBJECT) {
         driver.as_ref()
     }
     .unwrap_or_else(|| KernelWideInconsistency::driver_device_teardown_corruption().bugcheck());
-    if !driver.DeviceObject.is_null() {
+    let _driver = driver;
+    if !MountedVolumeAdmission::retired_for_unload() {
         KernelWideInconsistency::driver_device_teardown_corruption().bugcheck();
     }
     crate::kernel::operational_trace::unregister_published();
