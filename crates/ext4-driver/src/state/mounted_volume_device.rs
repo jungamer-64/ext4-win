@@ -193,6 +193,11 @@ impl MountedVolumeDevice {
 
     /// Initializes an IoCreateDevice-created mounted device and takes ownership
     /// of the VCB.
+    ///
+    /// Success also acquires the device's lifetime reference, released by retirement only after
+    /// `IoDeleteDevice`. The I/O Manager defers driver unload while any device is referenced, so
+    /// `DriverUnload` cannot run while a mounted device exists, including between parked
+    /// retirement invocations that hold no work-item reference.
     /// # Errors
     ///
     /// Returns an error for invalid device/sector geometry, resource initialization failure,
@@ -428,6 +433,12 @@ impl MountedVolumeDevice {
         unsafe {
             // SAFETY: This slot is uninitialized; publication owns the unique mounted reference.
             publication_destination.write(MaybeUninit::new(publication));
+        }
+        #[cfg(not(test))]
+        unsafe {
+            // SAFETY: The mount owns this live device; retirement releases this lifetime
+            // reference after deleting it.
+            ffi::ObfReferenceObject(device.as_ptr().cast());
         }
         unsafe {
             // SAFETY: Mount owns initialization; VPB publication completed and its lock is released.
@@ -1513,9 +1524,14 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         ffi::IoDeleteDevice(device.as_ptr());
     }
     unsafe {
-        // SAFETY: The system dequeued this item before invoking the callback. This final operation
-        // releases its device reference and may complete pending device deletion.
+        // SAFETY: The system dequeued this item before invoking the callback; freeing it inside
+        // the callback is permitted.
         ffi::IoFreeWorkItem(work_item.as_ptr());
+    }
+    unsafe {
+        // SAFETY: This releases the lifetime reference acquired by successful initialization.
+        // The executing work item's own device reference keeps the object live until return.
+        ffi::ObfDereferenceObject(device.as_ptr().cast());
     }
 }
 

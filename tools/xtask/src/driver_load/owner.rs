@@ -405,6 +405,29 @@ fn wait_state(expected: u32, timeout: Duration) -> TaskResult<()> {
         thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// Waits until SCM reports the service stopped and the driver image has left the kernel.
+///
+/// The I/O Manager defers image unload while mounted volume devices still finish retirement, and
+/// SCM reports stopped before that deferred unload completes. A following start requires the
+/// image to be gone, so a stop is complete only when both are observed.
+/// # Errors
+/// Returns query or deadline failure; a remaining image keeps the stop outcome uncertain.
+fn wait_stopped(timeout: Duration) -> TaskResult<()> {
+    let start = Instant::now();
+    wait_state(1, timeout)?;
+    while windows_host::driver_image_loaded("ext4win.sys")? {
+        if start.elapsed() >= timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "driver image remained loaded after SCM stop; deferred unload is incomplete",
+            )
+            .into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
 /// Requests a bounded SCM operation, publishing its intent before any accepted effect.
 /// # Errors
 /// Returns a returned SCM error or explicit uncertain-acceptance timeout.
@@ -546,7 +569,7 @@ pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
     }
     session.publish(Phase::Observed(Operation::PrepareUnload))?;
     scm(&mut session, Operation::StopDriver, "stop")?;
-    wait_state(1, Duration::from_secs(60))?;
+    wait_stopped(Duration::from_secs(60))?;
     session.publish(Phase::Observed(Operation::StopDriver))?;
     scm(&mut session, Operation::StartDriver, "start")?;
     wait_state(4, Duration::from_secs(15))?;
@@ -730,7 +753,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
                 session.publish(Phase::Observed(Operation::PrepareUnload))?;
                 scm(&mut session, Operation::StopDriver, "stop")?;
             }
-            wait_state(1, Duration::from_secs(60))?;
+            wait_stopped(Duration::from_secs(60))?;
             session.publish(Phase::Observed(Operation::StopDriver))?;
         }
     }

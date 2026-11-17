@@ -462,6 +462,68 @@ pub fn driver_path(raw: &str) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Reports whether a kernel image with this base name is currently loaded.
+///
+/// SCM reports a driver service stopped once unload is requested, while the I/O Manager may defer
+/// the image unload until the driver's remaining device objects are deleted. Only absence from
+/// the loaded-driver list establishes that a later start can load a new image.
+/// # Errors
+/// Returns native enumeration failures.
+pub fn driver_image_loaded(base_name: &str) -> io::Result<bool> {
+    let mut images: Vec<*mut core::ffi::c_void> = vec![ptr::null_mut(); 1024];
+    loop {
+        let capacity = images
+            .len()
+            .checked_mul(core::mem::size_of::<*mut core::ffi::c_void>())
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .ok_or_else(|| io::Error::other("loaded-driver list capacity overflow"))?;
+        let mut needed = 0;
+        let success = unsafe {
+            // SAFETY: the writable image array has the advertised byte capacity.
+            windows_sys::Win32::System::ProcessStatus::K32EnumDeviceDrivers(
+                images.as_mut_ptr(),
+                capacity,
+                &mut needed,
+            )
+        };
+        if success == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if needed <= capacity {
+            let count = usize::try_from(needed)
+                .map_err(io::Error::other)?
+                .checked_div(core::mem::size_of::<*mut core::ffi::c_void>())
+                .ok_or_else(|| io::Error::other("invalid loaded-driver entry size"))?;
+            images.truncate(count);
+            break;
+        }
+        let grown = images
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| io::Error::other("loaded-driver list capacity overflow"))?;
+        images.resize(grown, ptr::null_mut());
+    }
+    let mut name = vec![0_u16; 260];
+    for image in images {
+        let length = unsafe {
+            // SAFETY: the writable name buffer has the advertised UTF-16 capacity.
+            windows_sys::Win32::System::ProcessStatus::K32GetDeviceDriverBaseNameW(
+                image,
+                name.as_mut_ptr(),
+                u32::try_from(name.len()).map_err(io::Error::other)?,
+            )
+        };
+        let length = usize::try_from(length).map_err(io::Error::other)?;
+        if length != 0
+            && String::from_utf16_lossy(name.get(..length).unwrap_or_default())
+                .eq_ignore_ascii_case(base_name)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Queries SCM state; absence is distinct from a failed query.
 /// # Errors
 /// Returns native manager, service-query, or handle-release failures.
