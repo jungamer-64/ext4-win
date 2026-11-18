@@ -1248,6 +1248,25 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
             thread::sleep(Duration::from_secs(10));
             println!("live remount: post-dismount quiescence {elapsed}s");
         }
+        // Temporary isolation probe: names the filter instances attached above the mounted
+        // volume device whose deletion stops the host. Remove with the retirement probe.
+        match windows::bounded(
+            {
+                let mut instances = Command::new("fltmc.exe");
+                instances.arg("instances");
+                instances
+            },
+            Duration::from_secs(60),
+        )? {
+            windows::CommandOutcome::Exited(output) => println!(
+                "live remount: fltmc instances ({}):\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout)
+            ),
+            windows::CommandOutcome::Uncertain { .. } => {
+                println!("live remount: fltmc instances timed out")
+            }
+        }
         // Temporary isolation probe: the production core reads the same on-disk state in user
         // mode before the kernel's fresh mount does. Remove once the runner loss is attributed.
         let identity = storage::validate(&scope)?;

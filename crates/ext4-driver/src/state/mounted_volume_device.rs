@@ -1530,7 +1530,17 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         OperationalPath::VolumeRetirement,
         retirement_probe_device_state(device),
     );
-    retirement_probe_wait(RETIREMENT_PROBE_FINAL_STEP_DELAY);
+    let ordinal = RETIREMENT_PROBE_DELETION_ORDINAL
+        .fetch_add(1, Ordering::AcqRel)
+        .min(0xFF);
+    retirement_probe_wait(
+        RETIREMENT_PROBE_FINAL_STEP_DELAY
+            .saturating_add(RETIREMENT_PROBE_DELETION_SPACING.saturating_mul(i64::from(ordinal))),
+    );
+    trace.record_status(
+        OperationalPath::VolumeRetirement,
+        retirement_probe_ordinal(RETIREMENT_PROBE_DELETING, ordinal),
+    );
     unsafe {
         // SAFETY: All extension resources are gone; the executing work item's own object
         // reference keeps the device object live through deletion.
@@ -1538,7 +1548,7 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
     }
     trace.record_status(
         OperationalPath::VolumeRetirement,
-        RETIREMENT_PROBE_DEVICE_DELETED,
+        retirement_probe_ordinal(RETIREMENT_PROBE_DEVICE_DELETED, ordinal),
     );
     retirement_probe_wait(RETIREMENT_PROBE_FINAL_STEP_DELAY);
     drop(vpb);
@@ -1557,9 +1567,25 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
 /// Temporary isolation-probe markers for the final retirement steps; remove with the probe.
 #[cfg(not(test))]
 const RETIREMENT_PROBE_WORK_ITEM_FREED: wdk_sys::NTSTATUS = 0x40EE_0001;
-/// Device deletion was requested.
+/// Device deletion returned; bits 8..16 carry the deletion ordinal.
 #[cfg(not(test))]
-const RETIREMENT_PROBE_DEVICE_DELETED: wdk_sys::NTSTATUS = 0x40EE_0002;
+const RETIREMENT_PROBE_DEVICE_DELETED: u32 = 0x40EE_0002;
+/// Device deletion is about to be requested; bits 8..16 carry the deletion ordinal.
+#[cfg(not(test))]
+const RETIREMENT_PROBE_DELETING: u32 = 0x40EE_0005;
+/// Driver-wide order in which retiring devices reach deletion.
+#[cfg(not(test))]
+static RETIREMENT_PROBE_DELETION_ORDINAL: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Additional relative delay per earlier deletion, so each deletion is observed separately.
+#[cfg(not(test))]
+const RETIREMENT_PROBE_DELETION_SPACING: i64 = -250_000_000;
+
+/// Encodes a final-step marker with its deletion ordinal.
+#[cfg(not(test))]
+fn retirement_probe_ordinal(marker: u32, ordinal: u32) -> wdk_sys::NTSTATUS {
+    wdk_sys::NTSTATUS::from_ne_bytes((marker | (ordinal << 8)).to_ne_bytes())
+}
 /// The deleted device left the mounted-volume census.
 #[cfg(not(test))]
 const RETIREMENT_PROBE_CENSUS_RELEASED: wdk_sys::NTSTATUS = 0x40EE_0003;
