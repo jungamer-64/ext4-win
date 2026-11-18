@@ -1491,6 +1491,7 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
     if MountedVolumeDevice::retirement_work_item(device) != work_item {
         KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
     }
+    retirement_probe_entry(device);
     retirement_probe_pause();
     let step = unsafe {
         // SAFETY: Work-item ownership pins the device while release closes admission, drains the
@@ -1517,17 +1518,21 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         OperationalPath::VolumeRetirement,
         RETIREMENT_PROBE_WORK_ITEM_FREED,
     );
-    retirement_probe_pause();
+    retirement_probe_wait(RETIREMENT_PROBE_FINAL_STEP_DELAY);
+    trace.record_status(
+        OperationalPath::VolumeRetirement,
+        retirement_probe_device_state(device),
+    );
     unsafe {
-        // SAFETY: All extension resources are gone; the lifetime reference and the executing
-        // work item's own reference keep the device object live through deletion.
+        // SAFETY: All extension resources are gone; the executing work item's own object
+        // reference keeps the device object live through deletion.
         ffi::IoDeleteDevice(device.as_ptr());
     }
     trace.record_status(
         OperationalPath::VolumeRetirement,
         RETIREMENT_PROBE_DEVICE_DELETED,
     );
-    retirement_probe_pause();
+    retirement_probe_wait(RETIREMENT_PROBE_FINAL_STEP_DELAY);
     MountedVolumeAdmission::release_retired();
     trace.record_status(
         OperationalPath::VolumeRetirement,
@@ -1544,6 +1549,60 @@ const RETIREMENT_PROBE_DEVICE_DELETED: wdk_sys::NTSTATUS = 0x40EE_0002;
 /// The deleted device left the mounted-volume census.
 #[cfg(not(test))]
 const RETIREMENT_PROBE_CENSUS_RELEASED: wdk_sys::NTSTATUS = 0x40EE_0003;
+/// A first retirement invocation started while the dispatch gate was still open.
+#[cfg(not(test))]
+const RETIREMENT_PROBE_WORK_ITEM_RUNNING: wdk_sys::NTSTATUS = 0x40EE_0010;
+/// Base of the pre-deletion device-state marker; low bits are decoded by the probe reader.
+#[cfg(not(test))]
+const RETIREMENT_PROBE_DEVICE_STATE: u32 = 0x40EF_0000;
+/// Delay around the final steps, long enough for hosted log streaming to drain between them.
+#[cfg(not(test))]
+const RETIREMENT_PROBE_FINAL_STEP_DELAY: i64 = -150_000_000;
+
+/// Records that a retirement invocation is running before it closes the dispatch gate.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the queued retirement work item retains the mounted device extension"
+)]
+fn retirement_probe_entry(device: KernelDevice) {
+    let extension = unsafe {
+        // SAFETY: The queued work item retains this decoded mounted-volume extension.
+        &*device
+            .extension_address()
+            .cast::<MountedVolumeDeviceExtension>()
+    };
+    let _resumed = extension.header.with_reactor((), |(), reactor| {
+        reactor.retirement_probe_trace().record_status(
+            OperationalPath::VolumeRetirement,
+            RETIREMENT_PROBE_WORK_ITEM_RUNNING,
+        );
+    });
+}
+
+/// Encodes the native fields `IoDeleteDevice` acts on: bit 0 attached device, bit 1 device VPB,
+/// bit 2 shutdown registration, bits 8..16 the saturated open reference count.
+#[cfg(not(test))]
+#[expect(
+    unsafe_code,
+    reason = "the executing work item retains the device object while its fields are sampled"
+)]
+fn retirement_probe_device_state(device: KernelDevice) -> wdk_sys::NTSTATUS {
+    let object = unsafe {
+        // SAFETY: The executing work item holds an object reference on this device.
+        &*device.as_ptr()
+    };
+    let attached = u32::from(!object.AttachedDevice.is_null());
+    let vpb = u32::from(!object.Vpb.is_null()) << 1;
+    let shutdown = u32::from(object.Flags & wdk_sys::DO_SHUTDOWN_REGISTERED != 0) << 2;
+    let references = u32::try_from(object.ReferenceCount)
+        .unwrap_or(u32::MAX)
+        .min(0xFF)
+        << 8;
+    wdk_sys::NTSTATUS::from_ne_bytes(
+        (RETIREMENT_PROBE_DEVICE_STATE | attached | vpb | shutdown | references).to_ne_bytes(),
+    )
+}
 
 /// Closed bit of [`MOUNTED_VOLUMES`]; the remaining bits count live mounted volumes.
 const MOUNTED_VOLUMES_CLOSED: usize = 1 << (usize::BITS - 1);
@@ -1640,14 +1699,18 @@ const VPB_RETIREMENT_RETRY_DELAY: i64 = -100_000;
 /// step's operational trace reaches the hosted log before a later step can stop the host.
 /// Remove once the runner loss after old-mount handle release is attributed.
 #[cfg(not(test))]
+fn retirement_probe_pause() {
+    retirement_probe_wait(-50_000_000);
+}
+
+/// Waits for one relative interval in 100 ns units on the PASSIVE_LEVEL retirement work item.
+#[cfg(not(test))]
 #[expect(
     unsafe_code,
     reason = "the PASSIVE_LEVEL retirement work item performs one non-alertable relative delay"
 )]
-fn retirement_probe_pause() {
-    let mut interval = LARGE_INTEGER {
-        QuadPart: -50_000_000,
-    };
+fn retirement_probe_wait(relative: i64) {
+    let mut interval = LARGE_INTEGER { QuadPart: relative };
     let status = unsafe {
         // SAFETY: The retirement work item runs at PASSIVE_LEVEL and owns this local interval.
         wdk_sys::ntddk::KeDelayExecutionThread(0, 0, core::ptr::addr_of_mut!(interval))

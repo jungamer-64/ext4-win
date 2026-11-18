@@ -556,7 +556,7 @@ pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
     session.publish(Phase::Intent(Operation::PrepareUnload))?;
     let mut request = Command::new(std::env::current_exe()?);
     request.arg("prepare-driver-unload").arg(id.as_str());
-    let outcome = windows::bounded(request, Duration::from_secs(90))?;
+    let outcome = windows::bounded(request, Duration::from_secs(180))?;
     if matches!(outcome, CommandOutcome::Uncertain { .. }) {
         session.publish(Phase::Deferred(Operation::PrepareUnload))?;
     }
@@ -673,7 +673,7 @@ pub(crate) fn prepare_driver_unload(root: &Path, id: &OsStr) -> TaskResult<()> {
         ) {
             Err(error)
                 if error.raw_os_error() == Some(21)
-                    && start.elapsed() < Duration::from_secs(60) =>
+                    && start.elapsed() < Duration::from_secs(150) =>
             {
                 thread::sleep(Duration::from_millis(500));
             }
@@ -752,7 +752,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
                 request
                     .arg("prepare-driver-unload")
                     .arg(session.id().as_str());
-                let outcome = windows::bounded(request, Duration::from_secs(90))?;
+                let outcome = windows::bounded(request, Duration::from_secs(180))?;
                 if matches!(outcome, CommandOutcome::Uncertain { .. }) {
                     session.publish(Phase::Deferred(Operation::PrepareUnload))?;
                 }

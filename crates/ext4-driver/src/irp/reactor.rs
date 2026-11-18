@@ -2925,6 +2925,12 @@ impl CompletionReactor {
         }
     }
 
+    /// Temporary retirement-probe access to the driver-lifetime provider; remove with the probe.
+    #[cfg(not(test))]
+    pub(crate) const fn retirement_probe_trace(&self) -> OperationalTrace {
+        self.trace
+    }
+
     /// Returns whether any active slot still owns work.
     fn has_active(&self) -> bool {
         self.with_scheduler(|scheduler| scheduler.has_active())
