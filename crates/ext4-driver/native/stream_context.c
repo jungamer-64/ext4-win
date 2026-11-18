@@ -1401,6 +1401,11 @@ ext4win_stream_destroy(_In_ PVOID stream_header)
     stream->Signature = 0;
     stream->Owner = NULL;
     wdk_sys_uninitialize_oplock(&stream->Header.Oplock);
+    /* The header setup registered this slot for filter per-file contexts; their FltMgr
+     * instance links point into this allocation and must be released before it is freed. */
+    if (stream->FileContextSupport != NULL) {
+        FsRtlTeardownPerFileContexts(&stream->FileContextSupport);
+    }
     wdk_sys_teardown_fcb_header(&stream->Header);
 
     storage_status = STATUS_SUCCESS;
