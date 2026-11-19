@@ -519,13 +519,9 @@ impl MountedVolumeDevice {
         }
         .take();
         let resumed = parked.is_some();
-        let pending = parked.unwrap_or_else(|| {
-            let pending = unsafe {
-                // SAFETY: This first invocation uniquely owns terminal teardown of the joined actor.
-                Self::begin_release(device, extension)
-            };
-            retirement_probe_pause();
-            pending
+        let pending = parked.unwrap_or_else(|| unsafe {
+            // SAFETY: This first invocation uniquely owns terminal teardown of the joined actor.
+            Self::begin_release(device, extension)
         });
         let PendingRetirement {
             vpb,
@@ -535,24 +531,19 @@ impl MountedVolumeDevice {
         let trace = binding.volume().trace;
         match vpb.try_finish() {
             Ok(released) => {
+                drop(released);
                 trace.record(
                     OperationalPath::VpbRetirement,
                     STATUS_SUCCESS,
                     OperationalOutcome::Completed,
                 );
-                retirement_probe_pause();
                 drop(binding);
                 trace.record(
                     OperationalPath::VolumeRetirement,
                     STATUS_SUCCESS,
                     OperationalOutcome::Completed,
                 );
-                retirement_probe_pause();
-                RetirementStep::Released {
-                    resumed,
-                    trace,
-                    vpb: released,
-                }
+                RetirementStep::Released { resumed }
             }
             Err((retained, references)) => {
                 if reported != Some(references) {
@@ -1494,19 +1485,12 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
     if MountedVolumeDevice::retirement_work_item(device) != work_item {
         KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
     }
-    retirement_probe_entry(device);
-    retirement_probe_pause();
     let step = unsafe {
         // SAFETY: Work-item ownership pins the device while release closes admission, drains the
         // actor, and either parks the teardown or destroys extension-owned resources.
         MountedVolumeDevice::advance_release(device)
     };
-    let RetirementStep::Released {
-        resumed,
-        trace,
-        vpb,
-    } = step
-    else {
+    let RetirementStep::Released { resumed } = step else {
         // The retry timer now owns the next invocation; this one must not touch the extension.
         return;
     };
@@ -1518,154 +1502,15 @@ unsafe extern "C" fn mounted_volume_retirement(device: PDEVICE_OBJECT, context: 
         }
     }
     unsafe {
-        // SAFETY: The system dequeued this item before invoking the callback; freeing it inside
-        // the callback is permitted, and the device is not yet delete-pending.
-        ffi::IoFreeWorkItem(work_item.as_ptr());
-    }
-    trace.record_status(
-        OperationalPath::VolumeRetirement,
-        RETIREMENT_PROBE_WORK_ITEM_FREED,
-    );
-    trace.record_status(
-        OperationalPath::VolumeRetirement,
-        retirement_probe_device_state(device),
-    );
-    let ordinal = RETIREMENT_PROBE_DELETION_ORDINAL
-        .fetch_add(1, Ordering::AcqRel)
-        .min(0xFF);
-    retirement_probe_wait(
-        RETIREMENT_PROBE_FINAL_STEP_DELAY
-            .saturating_add(RETIREMENT_PROBE_DELETION_SPACING.saturating_mul(i64::from(ordinal))),
-    );
-    trace.record_status(
-        OperationalPath::VolumeRetirement,
-        retirement_probe_ordinal(RETIREMENT_PROBE_DELETING, ordinal),
-    );
-    unsafe {
-        // SAFETY: All extension resources are gone; the executing work item's own object
-        // reference keeps the device object live through deletion.
+        // SAFETY: All extension resources are gone and the work item still pins this device.
         ffi::IoDeleteDevice(device.as_ptr());
     }
-    trace.record_status(
-        OperationalPath::VolumeRetirement,
-        retirement_probe_ordinal(RETIREMENT_PROBE_DEVICE_DELETED, ordinal),
-    );
-    retirement_probe_wait(RETIREMENT_PROBE_FINAL_STEP_DELAY);
-    drop(vpb);
-    trace.record_status(
-        OperationalPath::VolumeRetirement,
-        RETIREMENT_PROBE_VPB_FREED,
-    );
-    retirement_probe_pause();
+    unsafe {
+        // SAFETY: The system dequeued this item before invoking the callback, so the callback may
+        // free it; the I/O Manager releases its device reference after the callback returns.
+        ffi::IoFreeWorkItem(work_item.as_ptr());
+    }
     MountedVolumeAdmission::release_retired();
-    trace.record_status(
-        OperationalPath::VolumeRetirement,
-        RETIREMENT_PROBE_CENSUS_RELEASED,
-    );
-}
-
-/// Temporary isolation-probe markers for the final retirement steps; remove with the probe.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_WORK_ITEM_FREED: wdk_sys::NTSTATUS = 0x40EE_0001;
-/// Device deletion returned; bits 8..16 carry the deletion ordinal.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_DEVICE_DELETED: u32 = 0x40EE_0002;
-/// Device deletion is about to be requested; bits 8..16 carry the deletion ordinal.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_DELETING: u32 = 0x40EE_0005;
-/// Driver-wide order in which retiring devices reach deletion.
-#[cfg(not(test))]
-static RETIREMENT_PROBE_DELETION_ORDINAL: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-/// Additional relative delay per earlier deletion, so each deletion is observed separately.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_DELETION_SPACING: i64 = -250_000_000;
-
-/// Encodes a final-step marker with its deletion ordinal.
-#[cfg(not(test))]
-fn retirement_probe_ordinal(marker: u32, ordinal: u32) -> wdk_sys::NTSTATUS {
-    wdk_sys::NTSTATUS::from_ne_bytes((marker | (ordinal << 8)).to_ne_bytes())
-}
-/// The deleted device left the mounted-volume census.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_CENSUS_RELEASED: wdk_sys::NTSTATUS = 0x40EE_0003;
-/// The detached original VPB allocation was freed after device deletion.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_VPB_FREED: wdk_sys::NTSTATUS = 0x40EE_0004;
-/// A first retirement invocation started while the dispatch gate was still open.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_WORK_ITEM_RUNNING: wdk_sys::NTSTATUS = 0x40EE_0010;
-/// Base of the pre-deletion device-state marker; low bits are decoded by the probe reader.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_DEVICE_STATE: u32 = 0x40EF_0000;
-/// Delay around the final steps, long enough for hosted log streaming to drain between them.
-#[cfg(not(test))]
-const RETIREMENT_PROBE_FINAL_STEP_DELAY: i64 = -150_000_000;
-
-/// Records that a retirement invocation is running before it closes the dispatch gate.
-#[cfg(not(test))]
-#[expect(
-    unsafe_code,
-    reason = "the queued retirement work item retains the mounted device extension"
-)]
-fn retirement_probe_entry(device: KernelDevice) {
-    let extension = unsafe {
-        // SAFETY: The queued work item retains this decoded mounted-volume extension.
-        &*device
-            .extension_address()
-            .cast::<MountedVolumeDeviceExtension>()
-    };
-    let _resumed = extension.header.with_reactor((), |(), reactor| {
-        reactor.retirement_probe_trace().record_status(
-            OperationalPath::VolumeRetirement,
-            RETIREMENT_PROBE_WORK_ITEM_RUNNING,
-        );
-    });
-}
-
-/// Encodes the native fields `IoDeleteDevice` acts on: bit 0 attached device, bit 1 device VPB,
-/// bit 2 shutdown registration, bit 3 the attached driver's FastIoDetachDevice, bit 4 an
-/// attached device owned by this driver, bits 8..16 the saturated open reference count.
-#[cfg(not(test))]
-#[expect(
-    unsafe_code,
-    reason = "the executing work item retains the device object while its fields are sampled"
-)]
-fn retirement_probe_device_state(device: KernelDevice) -> wdk_sys::NTSTATUS {
-    let object = unsafe {
-        // SAFETY: The executing work item holds an object reference on this device.
-        &*device.as_ptr()
-    };
-    let attached = u32::from(!object.AttachedDevice.is_null());
-    let vpb = u32::from(!object.Vpb.is_null()) << 1;
-    let shutdown = u32::from(object.Flags & wdk_sys::DO_SHUTDOWN_REGISTERED != 0) << 2;
-    let attached_device = unsafe {
-        // SAFETY: An attached device stays attached while this device is not delete-pending.
-        object.AttachedDevice.as_ref()
-    };
-    let (detach, own) = attached_device.map_or((0, 0), |attached| {
-        let driver = unsafe {
-            // SAFETY: The attached device retains its driver object.
-            attached.DriverObject.as_ref()
-        };
-        let table = driver.and_then(|driver| unsafe {
-            // SAFETY: A loaded driver's Fast I/O table outlives its attached devices.
-            driver.FastIoDispatch.as_ref()
-        });
-        let detach = table.is_some_and(|table| table.FastIoDetachDevice.is_some());
-        (
-            u32::from(detach) << 3,
-            u32::from(attached.DriverObject == object.DriverObject) << 4,
-        )
-    });
-    let references = u32::try_from(object.ReferenceCount)
-        .unwrap_or(u32::MAX)
-        .min(0xFF)
-        << 8;
-    wdk_sys::NTSTATUS::from_ne_bytes(
-        (RETIREMENT_PROBE_DEVICE_STATE | attached | vpb | shutdown | detach | own | references)
-            .to_ne_bytes(),
-    )
 }
 
 /// Closed bit of [`MOUNTED_VOLUMES`]; the remaining bits count live mounted volumes.
@@ -1759,31 +1604,6 @@ impl Drop for MountedVolumeAdmission {
 #[cfg(not(test))]
 const VPB_RETIREMENT_RETRY_DELAY: i64 = -100_000;
 
-/// Temporary live-remount isolation probe: separates physical-retirement steps in time so each
-/// step's operational trace reaches the hosted log before a later step can stop the host.
-/// Remove once the runner loss after old-mount handle release is attributed.
-#[cfg(not(test))]
-fn retirement_probe_pause() {
-    retirement_probe_wait(-50_000_000);
-}
-
-/// Waits for one relative interval in 100 ns units on the PASSIVE_LEVEL retirement work item.
-#[cfg(not(test))]
-#[expect(
-    unsafe_code,
-    reason = "the PASSIVE_LEVEL retirement work item performs one non-alertable relative delay"
-)]
-fn retirement_probe_wait(relative: i64) {
-    let mut interval = LARGE_INTEGER { QuadPart: relative };
-    let status = unsafe {
-        // SAFETY: The retirement work item runs at PASSIVE_LEVEL and owns this local interval.
-        wdk_sys::ntddk::KeDelayExecutionThread(0, 0, core::ptr::addr_of_mut!(interval))
-    };
-    if status != STATUS_SUCCESS {
-        KernelWideInconsistency::mounted_volume_state_corruption().bugcheck();
-    }
-}
-
 /// Physical teardown parked between retirement work-item invocations.
 #[cfg(not(test))]
 struct PendingRetirement {
@@ -1804,10 +1624,6 @@ enum RetirementStep {
     Released {
         /// A timer DPC queued this invocation and must be flushed before deletion.
         resumed: bool,
-        /// Provider capability for the temporary final-step probe markers.
-        trace: crate::kernel::operational_trace::OperationalTrace,
-        /// Detached original VPB allocation, freed only after device deletion.
-        vpb: PoolVpb,
     },
 }
 

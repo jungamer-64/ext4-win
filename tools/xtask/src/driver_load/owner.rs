@@ -3,7 +3,7 @@ use super::inventory::Package;
 use crate::{
     TaskResult,
     process::{combine_verification_and_cleanup, run_checked, run_checked_output, sha256_file},
-    production::{ReleaseGates, VerifiedProductionBundle, build_verified_production_bundle},
+    production::{VerifiedProductionBundle, build_verified_production_bundle},
     session::{BundleIdentity, Operation, Phase, Session, SessionId},
     windows::{self, CommandOutcome},
 };
@@ -599,7 +599,7 @@ pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
     session.publish(Phase::Intent(Operation::PrepareUnload))?;
     let mut request = Command::new(std::env::current_exe()?);
     request.arg("prepare-driver-unload").arg(id.as_str());
-    let outcome = windows::bounded(request, Duration::from_secs(180))?;
+    let outcome = windows::bounded(request, Duration::from_secs(90))?;
     if matches!(outcome, CommandOutcome::Uncertain { .. }) {
         session.publish(Phase::Deferred(Operation::PrepareUnload))?;
     }
@@ -720,7 +720,7 @@ pub(crate) fn prepare_driver_unload(root: &Path, id: &OsStr) -> TaskResult<()> {
         ) {
             Err(error)
                 if error.raw_os_error() == Some(21)
-                    && start.elapsed() < Duration::from_secs(150) =>
+                    && start.elapsed() < Duration::from_secs(60) =>
             {
                 thread::sleep(Duration::from_millis(500));
             }
@@ -806,7 +806,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
                 request
                     .arg("prepare-driver-unload")
                     .arg(session.id().as_str());
-                let outcome = windows::bounded(request, Duration::from_secs(180))?;
+                let outcome = windows::bounded(request, Duration::from_secs(90))?;
                 if matches!(outcome, CommandOutcome::Uncertain { .. }) {
                     session.publish(Phase::Deferred(Operation::PrepareUnload))?;
                 }
@@ -874,7 +874,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
 /// Returns host/build/load/trace failures while preserving mandatory completion failures.
 pub(crate) fn verify_hosted_driver_load(root: &Path) -> TaskResult<()> {
     check_hosted_driver_host(root)?;
-    let bundle = build_verified_production_bundle(root, ReleaseGates::Run)?;
+    let bundle = build_verified_production_bundle(root)?;
     let mut shutdown = Command::new("wsl.exe");
     shutdown.arg("--shutdown");
     run_checked(shutdown, "production WSL oracle shutdown")?;

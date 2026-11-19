@@ -4,12 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       driver_scenario:
-        description: Driver initialization without disposable storage, full live filesystem I/O, or the temporary remount isolation run
+        description: Driver initialization without disposable storage, or full live filesystem I/O
         type: choice
         required: true
-        default: remount
+        default: live
         options:
-          - remount
           - live
           - load
   pull_request:
@@ -120,12 +119,11 @@ jobs:
 
 
   production-driver:
-    name: ${{ inputs.driver_scenario == 'load' && 'kernel initialization (WDK 28000)' || inputs.driver_scenario == 'live' && 'live ext4 read-write (WDK 28000)' || 'live remount isolation (WDK 28000)' }}
+    name: ${{ inputs.driver_scenario == 'load' && 'kernel initialization (WDK 28000)' || 'live ext4 read-write (WDK 28000)' }}
     runs-on: windows-2025-vs2026
     timeout-minutes: 180
     env:
-      # Temporary: pushes run the remount isolation scenario until the live remount is attributed.
-      EXT4WIN_DRIVER_SCENARIO: ${{ inputs.driver_scenario || 'remount' }}
+      EXT4WIN_DRIVER_SCENARIO: ${{ inputs.driver_scenario || 'live' }}
 
     steps:
       - name: Checkout
@@ -800,7 +798,6 @@ jobs:
           switch ($env:EXT4WIN_DRIVER_SCENARIO) {
             "load" { cargo xtask check-hosted-driver-host }
             "live" { cargo xtask check-live-driver-host }
-            "remount" { cargo xtask check-live-driver-host }
             default { throw "Unsupported driver scenario: $env:EXT4WIN_DRIVER_SCENARIO" }
           }
 
@@ -837,11 +834,7 @@ jobs:
           New-Item -ItemType Directory -Path target -Force | Out-Null
           Start-Transcript -Path target/live-preparation-ci.log
           try {
-            if ($env:EXT4WIN_DRIVER_SCENARIO -eq "remount") {
-              cargo xtask prepare-live-remount $sessionId
-            } else {
-              cargo xtask prepare-live-vhdx $sessionId
-            }
+            cargo xtask prepare-live-vhdx $sessionId
             if ($LASTEXITCODE -ne 0) {
               throw "Live ext4 preparation failed with exit code $LASTEXITCODE"
             }
@@ -957,7 +950,7 @@ jobs:
           retention-days: 14
 
       - name: Stop job-owned Driver Verifier checks
-        if: always() && steps.live_io.outcome != 'skipped' && env.EXT4WIN_DRIVER_SCENARIO != 'remount'
+        if: always() && steps.live_io.outcome != 'skipped'
         timeout-minutes: 2
         shell: powershell
         run: |

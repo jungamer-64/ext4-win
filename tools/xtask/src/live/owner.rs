@@ -2,7 +2,7 @@
 use crate::{
     TaskResult, driver_load, fixture,
     process::{combine_verification_and_cleanup, run_checked, run_checked_output},
-    production::{ReleaseGates, build_verified_production_bundle},
+    production::build_verified_production_bundle,
     session::{Operation, Phase, Session, SessionId},
     storage::{self, DisposablePartition, Partition},
     windows,
@@ -32,9 +32,6 @@ enum LiveWorkload {
     Assurance,
     /// Independent random-I/O dataset and repeated native measurements.
     RandomIo,
-    /// Temporary remount isolation run: release gates are delegated to the other CI jobs and the
-    /// large-directory fixture is replaced by its one probed entry. Remove with the remount probe.
-    RemountProbe,
 }
 
 /// WSL attachment stage; interrupted intent is not assumed to have rolled back.
@@ -354,7 +351,7 @@ fn create_storage(session: &mut Session<LiveState>, workload: LiveWorkload) -> T
     let path = windows::literal(vhdx(session).as_os_str())?;
     session.publish(Phase::Intent(Operation::CreateVhdx))?;
     let bytes = match workload {
-        LiveWorkload::Assurance | LiveWorkload::RemountProbe => 268_435_456_u64,
+        LiveWorkload::Assurance => 268_435_456_u64,
         LiveWorkload::RandomIo => 2_147_483_648,
     };
     windows::management(
@@ -480,16 +477,7 @@ fn format_storage(
         );
     }
     let helper = linux_path(helper)?;
-    if matches!(workload, LiveWorkload::RemountProbe) {
-        for command in [
-            "mkdir /live-ci/large-directory",
-            "write /dev/null /live-ci/large-directory/entry-000000",
-        ] {
-            wsl_words(&["--exec", "debugfs", "-w", "-R", command, &partition])?;
-        }
-    } else {
-        wsl_words(&["--exec", &helper, "live-directory", &partition])?;
-    }
+    wsl_words(&["--exec", &helper, "live-directory", &partition])?;
     if matches!(workload, LiveWorkload::RandomIo) {
         wsl_words(&["--exec", &helper, "live-random-files", &partition])?;
     }
@@ -710,20 +698,6 @@ fn exercise_io(session: &mut Session<LiveState>, mount: &Path) -> TaskResult<Vec
         operation,
         windows_host::close_file(file).map_err(Into::into),
     )?;
-    if !matches!(session.state().workload, LiveWorkload::RemountProbe) {
-        verify_large_directory(session, &root)?;
-    }
-    println!("live filesystem I/O: validate storage identity");
-    storage::validate(&scope(session)?)?;
-    session.publish(Phase::Observed(Operation::FilesystemIo))?;
-    println!("live filesystem I/O: PASS");
-    Ok(payload)
-}
-
-/// Requires native directory cursors and complete enumeration of the independent large fixture.
-/// # Errors
-/// Returns cursor contract, enumeration, fixture-count or evidence-write failures.
-fn verify_large_directory(session: &Session<LiveState>, root: &Path) -> TaskResult<()> {
     let directory = root.join("large-directory");
     println!("live filesystem I/O: verify native directory cursor contracts");
     windows_host::verify_directory(&directory)?;
@@ -763,7 +737,11 @@ fn verify_large_directory(session: &Session<LiveState>, root: &Path) -> TaskResu
             &serde_json::json!({"entries": seen.len(), "first_ms": first, "total_ms": start.elapsed().as_secs_f64() * 1000.0}),
         )?,
     )?;
-    Ok(())
+    println!("live filesystem I/O: validate storage identity");
+    storage::validate(&scope(session)?)?;
+    session.publish(Phase::Observed(Operation::FilesystemIo))?;
+    println!("live filesystem I/O: PASS");
+    Ok(payload)
 }
 
 /// Replaces once after authoritative generation observation; acknowledgement failure is never retried.
@@ -1010,163 +988,17 @@ fn exercise_offline_online(session: &mut Session<LiveState>, payload: &[u8]) -> 
 /// Command used to invoke the remount requester in a separate process.
 pub(crate) const READ_REMOUNT_PAYLOAD: &str = "read-remount-payload";
 
-/// Nonempty sibling of the remount payload that no handle retains across dismount.
-const REMOUNT_CONTROL: &str = "remount-control.bin";
-
-/// One part of the payload's pre-dismount history, applied alone to a retained sibling.
-#[derive(Clone, Copy)]
-enum RemountHistory {
-    /// Refused namespace-delete rename.
-    Rename,
-    /// Metadata query and unchanged DACL updates.
-    Security,
-    /// Identity-revocation write and write-through flush.
-    Identity,
-}
-
-/// Retained siblings, each written, read and given one history part before dismount.
-const REMOUNT_HISTORY_CONTROLS: [(&str, RemountHistory); 3] = [
-    ("remount-rename-control.bin", RemountHistory::Rename),
-    ("remount-security-control.bin", RemountHistory::Security),
-    ("remount-identity-control.bin", RemountHistory::Identity),
-];
-
-/// Applies one history part of the payload to a retained control.
-/// # Errors
-/// Returns an unrefused rename, metadata/security, identity, write or flush failure.
-fn apply_remount_history(
-    session: &mut Session<LiveState>,
-    path: &Path,
-    name: &str,
-    history: RemountHistory,
-) -> TaskResult<()> {
-    match history {
-        RemountHistory::Rename => match fs::rename(path, path.with_extension("renamed")) {
-            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
-            Err(error) => Err(error.into()),
-            Ok(()) => Err(io::Error::other("control rename unexpectedly granted DELETE").into()),
-        },
-        RemountHistory::Security => {
-            windows_host::verify_metadata(path, &format!("\\live-ci\\{name}"), 8_192)?;
-            let descriptor = windows_host::file_security(path)?;
-            for _ in 0..2 {
-                windows_host::set_file_dacl(path, &descriptor)?;
-                if windows_host::file_security(path)? != descriptor {
-                    return Err(
-                        io::Error::other("control security round trip changed metadata").into(),
-                    );
-                }
-            }
-            Ok(())
-        }
-        RemountHistory::Identity => {
-            exercise_identity_update(session, path)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .custom_flags(0x8000_0000)
-                .open(path)?;
-            let operation = file.sync_all().map_err(Into::into);
-            combine_verification_and_cleanup(
-                operation,
-                windows_host::close_file(file).map_err(Into::into),
-            )
-        }
-    }
-}
-
 /// Performs the fresh file open in a supervised process so a pending kernel request cannot
 /// block the live session owner. Progress goes to stderr and stdout carries only payload bytes.
 /// # Errors
 /// Returns native open, read, output, or explicit close errors.
 pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
-    // Temporary isolation probe: separates fresh-mount traversal, a cold open of an inode the
-    // old mount never opened, and the inode the old mount retains. Each stage pauses so hosted
-    // log streaming reports it before the next stage. Remove once the runner loss is attributed.
-    let root = path
-        .parent()
-        .ok_or_else(|| io::Error::other("remount payload lacks a parent directory"))?;
-    eprintln!("live remount requester: query parent directory");
-    fs::metadata(root)?;
-    eprintln!("live remount requester: parent directory query completed");
-    thread::sleep(Duration::from_secs(5));
-    eprintln!("live remount requester: cold-open an inode not retained by the old mount");
-    let cold = fs::read(root.join("large-directory/entry-000000"))?;
-    eprintln!(
-        "live remount requester: cold read completed ({} bytes)",
-        cold.len()
-    );
-    thread::sleep(Duration::from_secs(5));
-    eprintln!("live remount requester: read a closed nonempty control file");
-    let control = fs::read(root.join(REMOUNT_CONTROL))?;
-    eprintln!(
-        "live remount requester: control read completed ({} bytes)",
-        control.len()
-    );
-    // Lazy-writer teardown of the closed control stream completes during this interval.
-    for elapsed in [5, 10, 15] {
-        thread::sleep(Duration::from_secs(5));
-        eprintln!("live remount requester: control stream teardown wait {elapsed}s");
-    }
-    // A whole-file IRP read followed by an 8192-byte EOF read is the request pattern that stops
-    // the host on the payload; each control carries one part of the payload's history.
-    for (name, _) in REMOUNT_HISTORY_CONTROLS {
-        eprintln!("live remount requester: read retained {name} then 8192-byte EOF");
-        let mut control = fs::File::open(root.join(name))?;
-        let length = usize::try_from(control.metadata()?.len())?;
-        let staged = (|| -> TaskResult<()> {
-            let mut bytes = vec![0_u8; length];
-            io::Read::read_exact(&mut control, &mut bytes)?;
-            eprintln!("live remount requester: {name} whole-file read completed");
-            thread::sleep(Duration::from_secs(10));
-            eprintln!("live remount requester: {name} EOF read of 8192 bytes");
-            let mut probe = vec![0_u8; 8192];
-            let eof = io::Read::read(&mut control, &mut probe)?;
-            eprintln!("live remount requester: {name} EOF read returned {eof} bytes");
-            Ok(())
-        })();
-        combine_verification_and_cleanup(
-            staged,
-            windows_host::close_file(control).map_err(Into::into),
-        )?;
-        for elapsed in [5, 10, 15] {
-            thread::sleep(Duration::from_secs(5));
-            eprintln!("live remount requester: {name} wait {elapsed}s");
-        }
-    }
     eprintln!("live remount requester: opening file");
     let mut file = fs::File::open(path)?;
     eprintln!("live remount requester: fresh open completed");
-    thread::sleep(Duration::from_secs(5));
     let readback = (|| -> TaskResult<()> {
-        let length = usize::try_from(file.metadata()?.len())?;
-        eprintln!("live remount requester: reading first payload byte");
-        let mut bytes = vec![0_u8; length];
-        let (first, rest) = bytes
-            .split_first_mut()
-            .ok_or_else(|| io::Error::other("remount payload is empty"))?;
-        io::Read::read_exact(&mut file, core::slice::from_mut(first))?;
-        eprintln!("live remount requester: first payload byte read");
-        thread::sleep(Duration::from_secs(10));
-        eprintln!(
-            "live remount requester: reading remaining {} bytes",
-            rest.len()
-        );
-        io::Read::read_exact(&mut file, rest)?;
-        eprintln!("live remount requester: remaining payload read");
-        for requested in [32_usize, 8192] {
-            thread::sleep(Duration::from_secs(10));
-            eprintln!("live remount requester: EOF read of {requested} bytes");
-            let mut probe = vec![0_u8; requested];
-            let eof = io::Read::read(&mut file, &mut probe)?;
-            eprintln!("live remount requester: EOF read returned {eof} bytes");
-        }
-        for elapsed in [5, 10, 15, 20] {
-            thread::sleep(Duration::from_secs(5));
-            eprintln!("live remount requester: post-read wait {elapsed}s");
-        }
         let mut output = io::stdout().lock();
-        output.write_all(&bytes)?;
+        io::copy(&mut file, &mut output)?;
         output.flush()?;
         eprintln!("live remount requester: payload read completed");
         Ok(())
@@ -1175,8 +1007,6 @@ pub(crate) fn read_remount_payload(path: &Path) -> TaskResult<()> {
     let closed = windows_host::close_file(file).map_err(Into::into);
     if closed.is_ok() {
         eprintln!("live remount requester: fresh handle closed");
-        thread::sleep(Duration::from_secs(10));
-        eprintln!("live remount requester: post-close wait 10s");
     }
     combine_verification_and_cleanup(readback, closed)
 }
@@ -1192,28 +1022,23 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     let artifact = driver_load::start_session(root, session.id(), Some(&scope))?;
     session.state_mut().driver = DriverStage::Running;
     session.publish(Phase::Observed(Operation::StartDriver))?;
-    // Temporary isolation probe: the remount run omits Driver Verifier so the final retirement
-    // failure can be attributed to a Verifier-detected violation or an unconditional fault.
-    // Remove with the remount probe.
-    if !matches!(session.state().workload, LiveWorkload::RemountProbe) {
-        session.publish(Phase::Intent(Operation::ActivateVerifier))?;
-        let mut command = Command::new("verifier.exe");
-        command.args([
-            "/dif",
-            "1",
-            "2",
-            "4",
-            "5",
-            "9",
-            "12",
-            "18",
-            "/now",
-            "/driver",
-            "ext4win.sys",
-        ]);
-        run_checked(command, "live Driver Verifier activation")?;
-        observe_verifier(session)?;
-    }
+    session.publish(Phase::Intent(Operation::ActivateVerifier))?;
+    let mut command = Command::new("verifier.exe");
+    command.args([
+        "/dif",
+        "1",
+        "2",
+        "4",
+        "5",
+        "9",
+        "12",
+        "18",
+        "/now",
+        "/driver",
+        "ext4win.sys",
+    ]);
+    run_checked(command, "live Driver Verifier activation")?;
+    observe_verifier(session)?;
     let mount = mount_namespace(session)?;
     configure_identity(session)?;
     let payload = exercise_io(session, &mount)?;
@@ -1226,81 +1051,18 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         )?;
         session.publish(Phase::Observed(Operation::FilesystemIo))?;
     }
-    fs::write(mount.join("live-ci").join(REMOUNT_CONTROL), &payload)?;
-    let mut history_controls = Vec::new();
-    for (name, history) in REMOUNT_HISTORY_CONTROLS {
-        let path = mount.join("live-ci").join(name);
-        fs::write(&path, &payload)?;
-        if fs::read(&path)? != payload {
-            return Err(io::Error::other("retained control readback differs from payload").into());
-        }
-        apply_remount_history(session, &path, name, history)?;
-        history_controls.push(OpenOptions::new().read(true).open(&path)?);
-    }
     let retained = OpenOptions::new()
         .read(true)
         .open(mount.join("live-ci/alpha.bin"))?;
     let remount = (|| -> TaskResult<()> {
         dismount_filesystem(session)?;
-        // Temporary isolation probe: separates post-dismount retirement failures from the fresh
-        // open that triggers remount. Remove once a hosted run attributes the runner loss.
-        for elapsed in (10..=60).step_by(10) {
-            thread::sleep(Duration::from_secs(10));
-            println!("live remount: post-dismount quiescence {elapsed}s");
-        }
-        // Temporary isolation probe: names the filter instances attached above the mounted
-        // volume device whose deletion stops the host. Remove with the retirement probe.
-        match windows::bounded(
-            {
-                let mut instances = Command::new("fltmc.exe");
-                instances.arg("instances");
-                instances
-            },
-            Duration::from_secs(60),
-        )? {
-            windows::CommandOutcome::Exited(output) => println!(
-                "live remount: fltmc instances ({}):\n{}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout)
-            ),
-            windows::CommandOutcome::Uncertain { .. } => {
-                println!("live remount: fltmc instances timed out")
-            }
-        }
-        // Temporary isolation probe: the production core reads the same on-disk state in user
-        // mode before the kernel's fresh mount does. Remove once the runner loss is attributed.
-        let identity = storage::validate(&scope)?;
-        for name in REMOUNT_HISTORY_CONTROLS
-            .map(|(name, _)| name)
-            .into_iter()
-            .chain(["alpha.bin"])
-        {
-            let mut probe = Command::new(env::current_exe()?);
-            probe
-                .arg(crate::interop::READ_RAW_PARTITION_FILE)
-                .arg(format!(
-                    "{}:{}:{}:live-ci/{name}",
-                    identity.disk, identity.offset, identity.length
-                ))
-                .stderr(Stdio::inherit());
-            match windows::bounded(probe, Duration::from_secs(120))
-                .and_then(|outcome| windows::checked_outcome(outcome, "raw partition probe"))
-            {
-                Ok(bytes) => println!(
-                    "live remount: user-mode core read {name}: {} bytes, payload match={}",
-                    bytes.len(),
-                    bytes == payload
-                ),
-                Err(error) => println!("live remount: user-mode core read {name} failed: {error}"),
-            }
-        }
         println!("live remount: read through a fresh open while the old handle remains");
         let mut requester = Command::new(env::current_exe()?);
         requester
             .arg(READ_REMOUNT_PAYLOAD)
             .arg(mount.join("live-ci/alpha.bin"))
             .stderr(Stdio::inherit());
-        let readback = windows::bounded(requester, Duration::from_secs(360))
+        let readback = windows::bounded(requester, Duration::from_secs(60))
             .and_then(|outcome| windows::checked_outcome(outcome, "remount readback"));
         match &readback {
             Ok(_) => println!("live remount: fresh-open read completed"),
@@ -1314,33 +1076,10 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
         }
         Ok(())
     })();
-    // Temporary isolation probe: separates requester exit from old-mount handle release and the
-    // retirement it unblocks. Remove once the runner loss is attributed.
-    for elapsed in (5..=30).step_by(5) {
-        thread::sleep(Duration::from_secs(5));
-        println!("live remount: pre-release wait {elapsed}s");
-    }
     println!("live remount: close the retained old handle");
     let released = windows_host::close_file(retained).map_err(Into::into);
     println!("live remount: old-handle close result={released:?}");
-    for elapsed in (5..=30).step_by(5) {
-        thread::sleep(Duration::from_secs(5));
-        println!("live remount: post-release wait {elapsed}s");
-    }
-    let mut combined = combine_verification_and_cleanup(remount, released);
-    for control in history_controls {
-        combined = combine_verification_and_cleanup(
-            combined,
-            windows_host::close_file(control).map_err(Into::into),
-        );
-    }
-    combined?;
-    if matches!(session.state().workload, LiveWorkload::RemountProbe) {
-        dismount_filesystem(session)?;
-        remove_namespace(session)?;
-        attachment(session, false)?;
-        return wait_removed(session);
-    }
+    combine_verification_and_cleanup(remount, released)?;
     dismount_filesystem(session)?;
     remove_namespace(session)?;
     exercise_offline_online(session, &payload)?;
@@ -1471,13 +1210,7 @@ pub(crate) fn benchmark_multi_file(root: &Path) -> TaskResult<()> {
 fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskResult<()> {
     check_live_driver_host(root)?;
     let helper = fixture::executable(root)?;
-    let bundle = build_verified_production_bundle(
-        root,
-        match workload {
-            LiveWorkload::Assurance | LiveWorkload::RandomIo => ReleaseGates::Run,
-            LiveWorkload::RemountProbe => ReleaseGates::Delegated,
-        },
-    )?;
+    let bundle = build_verified_production_bundle(root)?;
     println!("live VHDX session: {}", id.as_str());
     let state = LiveState {
         workload,
@@ -1516,13 +1249,6 @@ fn prepare_session(root: &Path, workload: LiveWorkload, id: SessionId) -> TaskRe
 /// Returns malformed identity, build, storage, installation or mandatory cleanup failures.
 pub(crate) fn prepare_live_vhdx(root: &Path, id: &OsStr) -> TaskResult<()> {
     prepare_session(root, LiveWorkload::Assurance, SessionId::parse(id)?)
-}
-
-/// Prepares the temporary remount isolation session; `verify-live-vhdx` consumes it.
-/// # Errors
-/// Returns malformed identity, build, storage, installation or mandatory cleanup failures.
-pub(crate) fn prepare_live_remount(root: &Path, id: &OsStr) -> TaskResult<()> {
-    prepare_session(root, LiveWorkload::RemountProbe, SessionId::parse(id)?)
 }
 
 /// Consumes a prepared session through live validation, cleanup and joined ETW completion.
