@@ -331,9 +331,14 @@ fn service_mapping(
         || configuration.image != raw
         || !same_local_path(&path, &package.image)
     {
-        return Err(io::Error::other(
-            "service policy or ImagePath differs from the package-bound identity",
-        )
+        return Err(io::Error::other(format!(
+            "service policy or ImagePath differs from the package-bound identity: \
+             Type={} Start={} ImagePath={:?} bound={raw:?} package={}",
+            configuration.kind,
+            configuration.start,
+            configuration.image,
+            package.image.display()
+        ))
         .into());
     }
     let root = PathBuf::from(
