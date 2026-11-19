@@ -317,6 +317,33 @@ fn same_local_path(left: &Path, right: &Path) -> bool {
             .all(|(left, right)| left.as_os_str().eq_ignore_ascii_case(right.as_os_str()))
 }
 
+/// Whether the session's DriverStore package still exists, which fixes the admissible service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackagePresence {
+    /// The package image must exist and the service keeps its installed demand start.
+    Present,
+    /// Package removal deletes the image and disables a service that still references it; the
+    /// demand start remains admissible because removal can commit before it is acknowledged.
+    Removed,
+}
+
+impl PackagePresence {
+    /// Admits the SCM start type that the package installation or its removal leaves behind.
+    const fn admits_start(self, start: u32) -> bool {
+        const DEMAND_START: u32 = 3;
+        const DISABLED: u32 = 4;
+        match self {
+            Self::Present => start == DEMAND_START,
+            Self::Removed => matches!(start, DEMAND_START | DISABLED),
+        }
+    }
+
+    /// Returns whether the bound image file must still exist.
+    const fn requires_image(self) -> bool {
+        matches!(self, Self::Present)
+    }
+}
+
 /// Binds a service observation to its retained raw spelling and selected package mapping.
 /// # Errors
 /// Rejects policy changes, a different package image or a path outside the machine DriverStore.
@@ -324,10 +351,11 @@ fn service_mapping(
     package: &InstalledPackage,
     configuration: &windows_host::ServiceConfiguration,
     raw: &str,
+    presence: PackagePresence,
 ) -> TaskResult<PathBuf> {
     let path = windows_host::driver_path(&configuration.image)?;
     if configuration.kind != 2
-        || configuration.start != 3
+        || !presence.admits_start(configuration.start)
         || configuration.image != raw
         || !same_local_path(&path, &package.image)
     {
@@ -372,17 +400,17 @@ fn service_identity(
     package: &InstalledPackage,
     raw: &str,
     expected: &str,
-    require_file: bool,
+    presence: PackagePresence,
 ) -> TaskResult<()> {
     let configuration = windows_host::service_configuration("ext4win")?;
-    let path = service_mapping(package, &configuration, raw)?;
+    let path = service_mapping(package, &configuration, raw, presence)?;
     if path.is_file() {
         if !sha256_file(&path)?.eq_ignore_ascii_case(expected) {
             return Err(
                 io::Error::other("service ImagePath SYS hash differs from production").into(),
             );
         }
-    } else if require_file {
+    } else if presence.requires_image() {
         return Err(io::Error::other("service DriverStore SYS is absent").into());
     }
     println!("service registry: Type=2 Start=3");
@@ -484,7 +512,7 @@ pub(crate) fn install_session(
         .arg("/install");
     run_checked(command, "ext4win package installation")?;
     bind_installed(&mut session)?;
-    bind_service(&mut session, true)?;
+    bind_service(&mut session, PackagePresence::Present)?;
     if windows_host::service_state("ext4win")? != Some(1) {
         return Err(io::Error::other("package preparation requires a Stopped service").into());
     }
@@ -525,7 +553,12 @@ pub(crate) fn start_session(
         return Err(io::Error::other("prepared signer changed").into());
     }
     crate::storage::assert_scope(scope)?;
-    service_identity(package, raw, &session.state().bundle.sys, true)?;
+    service_identity(
+        package,
+        raw,
+        &session.state().bundle.sys,
+        PackagePresence::Present,
+    )?;
     if windows_host::service_state("ext4win")? != Some(1) {
         return Err(io::Error::other(
             "initial activation requires the bound service to be Stopped",
@@ -540,7 +573,12 @@ pub(crate) fn start_session(
     let ServiceIdentity::Bound { raw } = &session.state().service else {
         return Err(io::Error::other("driver start lacks bound service identity").into());
     };
-    service_identity(package, raw, &session.state().bundle.sys, true)?;
+    service_identity(
+        package,
+        raw,
+        &session.state().bundle.sys,
+        PackagePresence::Present,
+    )?;
     println!("service state: Running");
     session.publish(Phase::Observed(Operation::StartDriver))?;
     Ok(session.state().bundle.artifact.clone())
@@ -551,7 +589,7 @@ pub(crate) fn start_session(
 /// Returns identity mismatch, an unresolved prior lifecycle state, retirement, stop or start failure.
 pub(crate) fn restart_session(root: &Path, id: &SessionId) -> TaskResult<()> {
     let mut session = recovered(root, id)?;
-    bind_service(&mut session, true)?;
+    bind_service(&mut session, PackagePresence::Present)?;
     if windows_host::service_state("ext4win")? != Some(4) {
         return Err(io::Error::other(
             "restart requires an observed Running service; reconcile prior lifecycle intent first",
@@ -609,7 +647,7 @@ fn bind_installed(session: &mut Session<DriverState>) -> TaskResult<()> {
 /// Acquires service policy independently, only against an already verified package mapping.
 /// # Errors
 /// Returns missing package authority, service configuration or exact identity mismatches.
-fn bind_service(session: &mut Session<DriverState>, require_file: bool) -> TaskResult<()> {
+fn bind_service(session: &mut Session<DriverState>, presence: PackagePresence) -> TaskResult<()> {
     let package = match &session.state().package {
         PackageState::Installed(package)
         | PackageState::Removing(package)
@@ -624,7 +662,7 @@ fn bind_service(session: &mut Session<DriverState>, require_file: bool) -> TaskR
         ServiceIdentity::Bound { raw } => raw.clone(),
         ServiceIdentity::Unobserved => windows_host::service_configuration("ext4win")?.image,
     };
-    service_identity(package, &raw, &session.state().bundle.sys, require_file)?;
+    service_identity(package, &raw, &session.state().bundle.sys, presence)?;
     session.state_mut().service = ServiceIdentity::Bound { raw };
     session.publish(Phase::Observed(Operation::BindService))
 }
@@ -666,7 +704,11 @@ pub(crate) fn prepare_driver_unload(root: &Path, id: &OsStr) -> TaskResult<()> {
             }
         },
         &session.state().bundle.sys,
-        !matches!(session.state().package, PackageState::Removed(_)),
+        if matches!(session.state().package, PackageState::Removed(_)) {
+            PackagePresence::Removed
+        } else {
+            PackagePresence::Present
+        },
     )?;
     // The driver refuses with ERROR_NOT_READY, before any retirement effect, while a mounted
     // volume device is still live or retiring; dismounted volumes retire asynchronously.
@@ -740,7 +782,14 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
     }
     let service_state = windows_host::service_state("ext4win")?;
     if service_state.is_some() || windows_host::service_registered("ext4win")? {
-        bind_service(&mut session, !inventory.is_empty())?;
+        bind_service(
+            &mut session,
+            if inventory.is_empty() {
+                PackagePresence::Removed
+            } else {
+                PackagePresence::Present
+            },
+        )?;
     }
     if let Some(state) = service_state {
         if state == 2 {
@@ -798,7 +847,7 @@ pub(crate) fn cleanup_driver_load_session(root: &Path, id: &OsStr) -> TaskResult
     {
         // Package removal may alter service visibility independently. Deletion still requires
         // the exact configuration acquired from this session's verified package mapping.
-        bind_service(&mut session, false)?;
+        bind_service(&mut session, PackagePresence::Removed)?;
         scm(&mut session, Operation::DeleteService, "delete")?;
         let start = Instant::now();
         while windows_host::service_state("ext4win")?.is_some() {
@@ -940,7 +989,12 @@ mod tests {
             image: format!(r"\SystemRoot\{relative}"),
         };
         assert_eq!(
-            service_mapping(&package, &configuration, &configuration.image)?,
+            service_mapping(
+                &package,
+                &configuration,
+                &configuration.image,
+                PackagePresence::Present
+            )?,
             package.image,
         );
         let mixed_package = InstalledPackage {
@@ -949,16 +1003,40 @@ mod tests {
                 "{root}/System32/DriverStore/FileRepository/ext4win.inf_amd64_0123456789abcdef/EXT4WIN.SYS"
             )),
         };
-        assert!(service_mapping(&mixed_package, &configuration, &configuration.image).is_ok());
+        assert!(
+            service_mapping(
+                &mixed_package,
+                &configuration,
+                &configuration.image,
+                PackagePresence::Present
+            )
+            .is_ok()
+        );
         let changed_raw = configuration.image.to_ascii_lowercase();
-        assert!(service_mapping(&package, &configuration, &changed_raw).is_err());
+        assert!(
+            service_mapping(
+                &package,
+                &configuration,
+                &changed_raw,
+                PackagePresence::Present
+            )
+            .is_err()
+        );
         let unrelated = InstalledPackage {
             oem: "oem13.inf".into(),
             image: PathBuf::from(format!(
                 r"{root}\System32\DriverStore\FileRepository\ext4win.inf_amd64_fedcba9876543210\ext4win.sys"
             )),
         };
-        assert!(service_mapping(&unrelated, &configuration, &configuration.image).is_err());
+        assert!(
+            service_mapping(
+                &unrelated,
+                &configuration,
+                &configuration.image,
+                PackagePresence::Present
+            )
+            .is_err()
+        );
         let outside = InstalledPackage {
             oem: "oem12.inf".into(),
             image: PathBuf::from(format!(
@@ -974,7 +1052,45 @@ mod tests {
             service_mapping(
                 &outside,
                 &outside_configuration,
-                &outside_configuration.image
+                &outside_configuration.image,
+                PackagePresence::Present,
+            )
+            .is_err()
+        );
+        let disabled = windows_host::ServiceConfiguration {
+            kind: 2,
+            start: 4,
+            image: configuration.image.clone(),
+        };
+        assert!(
+            service_mapping(
+                &package,
+                &disabled,
+                &disabled.image,
+                PackagePresence::Present
+            )
+            .is_err()
+        );
+        assert!(
+            service_mapping(
+                &package,
+                &disabled,
+                &disabled.image,
+                PackagePresence::Removed
+            )
+            .is_ok()
+        );
+        let automatic = windows_host::ServiceConfiguration {
+            kind: 2,
+            start: 2,
+            image: configuration.image.clone(),
+        };
+        assert!(
+            service_mapping(
+                &package,
+                &automatic,
+                &automatic.image,
+                PackagePresence::Removed
             )
             .is_err()
         );
