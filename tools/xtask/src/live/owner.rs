@@ -311,6 +311,32 @@ fn observe_verifier(session: &mut Session<LiveState>) -> TaskResult<()> {
     session.publish(Phase::Observed(Operation::ObserveVerifier))
 }
 
+/// Applies the live Driver Verifier checks to the loaded image and confirms they are active.
+///
+/// `/now` settings are volatile and belong to one image load: they do not survive the driver's
+/// unload, so every start of the session driver must be followed by a new activation.
+/// # Errors
+/// Returns activation, runtime-query or insufficient-activity failures.
+fn activate_verifier(session: &mut Session<LiveState>) -> TaskResult<()> {
+    session.publish(Phase::Intent(Operation::ActivateVerifier))?;
+    let mut command = Command::new("verifier.exe");
+    command.args([
+        "/dif",
+        "1",
+        "2",
+        "4",
+        "5",
+        "9",
+        "12",
+        "18",
+        "/now",
+        "/driver",
+        "ext4win.sys",
+    ]);
+    run_checked(command, "live Driver Verifier activation")?;
+    observe_verifier(session)
+}
+
 /// Checks live-host prerequisites without storage, package or driver mutation.
 /// # Errors
 /// Returns any hosted preflight, Hyper-V, WSL or e2fsprogs prerequisite failure.
@@ -1022,23 +1048,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     let artifact = driver_load::start_session(root, session.id(), Some(&scope))?;
     session.state_mut().driver = DriverStage::Running;
     session.publish(Phase::Observed(Operation::StartDriver))?;
-    session.publish(Phase::Intent(Operation::ActivateVerifier))?;
-    let mut command = Command::new("verifier.exe");
-    command.args([
-        "/dif",
-        "1",
-        "2",
-        "4",
-        "5",
-        "9",
-        "12",
-        "18",
-        "/now",
-        "/driver",
-        "ext4win.sys",
-    ]);
-    run_checked(command, "live Driver Verifier activation")?;
-    observe_verifier(session)?;
+    activate_verifier(session)?;
     let mount = mount_namespace(session)?;
     configure_identity(session)?;
     let payload = exercise_io(session, &mount)?;
@@ -1088,6 +1098,7 @@ fn exercise_driver(root: &Path, session: &mut Session<LiveState>) -> TaskResult<
     session.publish(Phase::Intent(Operation::StopDriver))?;
     driver_load::restart_session(root, session.id())?;
     session.publish(Phase::Observed(Operation::StartDriver))?;
+    activate_verifier(session)?;
     attachment(session, true)?;
     let mount = mount_namespace(session)?;
     if fs::read(mount.join("live-ci/alpha.bin"))? != payload {
